@@ -1,0 +1,2096 @@
+From b0af376f5b5bfdc988473e47c0d49a2cbf48a315 Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang@oracle.com>
+Date: Thu, 23 Aug 2018 08:43:25 +0800
+Subject: [PATCH 1/1] vhost: comment the vhost-net for linux-4.17.14
+
+Signed-off-by: Dongli Zhang <dongli.zhang@oracle.com>
+---
+ drivers/vhost/net.c                | 209 ++++++++++++++++-
+ drivers/vhost/vhost.c              | 464 ++++++++++++++++++++++++++++++++++++-
+ drivers/vhost/vhost.h              |  29 ++-
+ drivers/vhost/vringh.c             |   5 +
+ include/uapi/linux/vhost.h         |   3 +
+ include/uapi/linux/virtio_config.h |   1 +
+ 6 files changed, 681 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/vhost/net.c b/drivers/vhost/net.c
+index dd4eb98..c0b9de5 100644
+--- a/drivers/vhost/net.c
++++ b/drivers/vhost/net.c
+@@ -93,15 +93,15 @@ struct vhost_net_ubuf_ref {
+ 
+ #define VHOST_RX_BATCH 64
+ struct vhost_net_buf {
+-	void **queue;
++	void **queue; // queue是一个void指针数组 指针内容应该在vhost_net_virtqueue.rx_ring (似乎是sk_buff)
+ 	int tail;
+-	int head;
++	int head;  // head里是下一个可用的
+ };
+ 
+ struct vhost_net_virtqueue {
+ 	struct vhost_virtqueue vq;
+-	size_t vhost_hlen;
+-	size_t sock_hlen;
++	size_t vhost_hlen; /* 在vhost_net_set_features()中设置 */
++	size_t sock_hlen; /* 在vhost_net_set_features()中设置 */
+ 	/* vhost zerocopy support fields below: */
+ 	/* last used idx for outstanding DMA zerocopy buffers */
+ 	int upend_idx;
+@@ -114,8 +114,9 @@ struct vhost_net_virtqueue {
+ 	/* Reference counting for outstanding ubufs.
+ 	 * Protected by vq mutex. Writers must also take device mutex. */
+ 	struct vhost_net_ubuf_ref *ubufs;
+-	struct ptr_ring *rx_ring;
+-	struct vhost_net_buf rxq;
++	/* 这里rx_ring和上面ubufs.queue相关的 似乎存的sk_buff */
++	struct ptr_ring *rx_ring; // 在VHOST_NET_SET_BACKEND:vhost_net_set_backend()设置为get_tap_ptr_ring(fd)
++	struct vhost_net_buf rxq; // queue里有64个元素
+ };
+ 
+ struct vhost_net {
+@@ -134,6 +135,11 @@ struct vhost_net {
+ 
+ static unsigned vhost_net_zcopy_mask __read_mostly;
+ 
++/*
++ * 如果还有能用的 返回下一个可用的 head是下一个能用的
++ *
++ * queue是一个void指针数组 指针内容应该在vhost_net_virtqueue.rx_ring (似乎是sk_buff)
++ */
+ static void *vhost_net_buf_get_ptr(struct vhost_net_buf *rxq)
+ {
+ 	if (rxq->tail != rxq->head)
+@@ -147,18 +153,34 @@ static int vhost_net_buf_get_size(struct vhost_net_buf *rxq)
+ 	return rxq->tail - rxq->head;
+ }
+ 
++/* tail和head相等的时候为empty! */
+ static int vhost_net_buf_is_empty(struct vhost_net_buf *rxq)
+ {
+ 	return rxq->tail == rxq->head;
+ }
+ 
++/*
++ * 如果还有能用的 返回下一个可用的
++ * 然后把head++ head里是下一个可用的
++ *
++ * consume是消耗head
++ *
++ * called only by handle_rx()
++ */
+ static void *vhost_net_buf_consume(struct vhost_net_buf *rxq)
+ {
++	/* 如果还有能用的 返回下一个可用的 */
+ 	void *ret = vhost_net_buf_get_ptr(rxq);
++	/* 然后把head++ head里是下一个可用的 */
+ 	++rxq->head;
+ 	return ret;
+ }
+ 
++/*
++ * produce就是head设置成0 然后设置tail head和tail之间距离很大
++ *
++ * called only by vhost_net_buf_peek()
++ */
+ static int vhost_net_buf_produce(struct vhost_net_virtqueue *nvq)
+ {
+ 	struct vhost_net_buf *rxq = &nvq->rxq;
+@@ -169,6 +191,11 @@ static int vhost_net_buf_produce(struct vhost_net_virtqueue *nvq)
+ 	return rxq->tail;
+ }
+ 
++/*
++ * 就两个地方用到了 (都和初始化相关吧):
++ *   - vhost_net_stop_vq()
++ *   - VHOST_NET_SET_BACKEND: vhost_net_set_backend()
++ */
+ static void vhost_net_buf_unproduce(struct vhost_net_virtqueue *nvq)
+ {
+ 	struct vhost_net_buf *rxq = &nvq->rxq;
+@@ -181,6 +208,11 @@ static void vhost_net_buf_unproduce(struct vhost_net_virtqueue *nvq)
+ 	}
+ }
+ 
++/*
++ * called only by vhost_net_buf_peek()
++ *
++ * ptr是vhost_net_buf.queue中的一个元素 (void指针 从rx_ring获得的)
++ */
+ static int vhost_net_buf_peek_len(void *ptr)
+ {
+ 	if (tun_is_xdp_buff(ptr)) {
+@@ -192,17 +224,21 @@ static int vhost_net_buf_peek_len(void *ptr)
+ 	return __skb_array_len_with_tag(ptr);
+ }
+ 
++/* called only by peek_head_len() */
+ static int vhost_net_buf_peek(struct vhost_net_virtqueue *nvq)
+ {
+ 	struct vhost_net_buf *rxq = &nvq->rxq;
+ 
++	/* tail和head相等的时候为empty! */
+ 	if (!vhost_net_buf_is_empty(rxq))
+ 		goto out;
+ 
++	/* produce就是head设置成0 然后设置tail head和tail之间距离很大 */
+ 	if (!vhost_net_buf_produce(nvq))
+ 		return 0;
+ 
+ out:
++	/* vhost_net_buf_get_ptr(rxq)是如果还有能用的 返回下一个可用的 */
+ 	return vhost_net_buf_peek_len(vhost_net_buf_get_ptr(rxq));
+ }
+ 
+@@ -211,6 +247,7 @@ static void vhost_net_buf_init(struct vhost_net_buf *rxq)
+ 	rxq->head = rxq->tail = 0;
+ }
+ 
++/* called only by vhost_net_init() */
+ static void vhost_net_enable_zcopy(int vq)
+ {
+ 	vhost_net_zcopy_mask |= 0x1 << vq;
+@@ -240,12 +277,18 @@ static int vhost_net_ubuf_put(struct vhost_net_ubuf_ref *ubufs)
+ 	return r;
+ }
+ 
++/*
++ * called by:
++ *   - vhost_net_ubuf_put_wait_and_free()
++ *   - vhost_net_flush()
++ */
+ static void vhost_net_ubuf_put_and_wait(struct vhost_net_ubuf_ref *ubufs)
+ {
+ 	vhost_net_ubuf_put(ubufs);
+ 	wait_event(ubufs->wait, !atomic_read(&ubufs->refcount));
+ }
+ 
++/* called at two locations in vhost_net_set_backend() */
+ static void vhost_net_ubuf_put_wait_and_free(struct vhost_net_ubuf_ref *ubufs)
+ {
+ 	vhost_net_ubuf_put_and_wait(ubufs);
+@@ -262,6 +305,7 @@ static void vhost_net_clear_ubuf_info(struct vhost_net *n)
+ 	}
+ }
+ 
++/* called only by vhost_net_set_owner() */
+ static int vhost_net_set_ubuf_info(struct vhost_net *n)
+ {
+ 	bool zcopy;
+@@ -323,6 +367,7 @@ static bool vhost_net_tx_select_zcopy(struct vhost_net *net)
+ 		net->tx_packets / 64 >= net->tx_zcopy_err;
+ }
+ 
++/* called only by vhost_net_set_backend() */
+ static bool vhost_sock_zcopy(struct socket *sock)
+ {
+ 	return unlikely(experimental_zcopytx) &&
+@@ -334,6 +379,12 @@ static bool vhost_sock_zcopy(struct socket *sock)
+  * of used idx. Once lower device DMA done contiguously, we will signal KVM
+  * guest used idx.
+  */
++/* 分别是done_idx和upend_idx */
++/*
++ * called by:
++ *   - handle_tx()调用了两次
++ *   - vhost_net_set_backend()
++ */
+ static void vhost_zerocopy_signal_used(struct vhost_net *net,
+ 				       struct vhost_virtqueue *vq)
+ {
+@@ -348,7 +399,7 @@ static void vhost_zerocopy_signal_used(struct vhost_net *net,
+ 		if (VHOST_DMA_IS_DONE(vq->heads[i].len)) {
+ 			vq->heads[i].len = VHOST_DMA_CLEAR_LEN;
+ 			++j;
+-		} else
++		} else // 只能回收连续的 不连续就break
+ 			break;
+ 	}
+ 	while (j) {
+@@ -391,6 +442,11 @@ static inline unsigned long busy_clock(void)
+ 	return local_clock() >> 10;
+ }
+ 
++/*
++ * called by:
++ *   - vhost_net_tx_get_vq_desc()
++ *   - vhost_net_rx_peek_head_len()
++ */
+ static bool vhost_can_busy_poll(struct vhost_dev *dev,
+ 				unsigned long endtime)
+ {
+@@ -400,6 +456,7 @@ static bool vhost_can_busy_poll(struct vhost_dev *dev,
+ 	       !vhost_has_work(dev);
+ }
+ 
++/* 把vhost_net的poll在fd的poll上移除 */
+ static void vhost_net_disable_vq(struct vhost_net *n,
+ 				 struct vhost_virtqueue *vq)
+ {
+@@ -411,6 +468,12 @@ static void vhost_net_disable_vq(struct vhost_net *n,
+ 	vhost_poll_stop(poll);
+ }
+ 
++/*
++ * called by:
++ *   - handle_tx()
++ *   - handle_rx()
++ *   - VHOST_NET_SET_BACKEND:vhost_net_set_backend()
++ */
+ static int vhost_net_enable_vq(struct vhost_net *n,
+ 				struct vhost_virtqueue *vq)
+ {
+@@ -423,6 +486,7 @@ static int vhost_net_enable_vq(struct vhost_net *n,
+ 	if (!sock)
+ 		return 0;
+ 
++	/* 这里的poll是n->poll */
+ 	return vhost_poll_start(poll, sock->file);
+ }
+ 
+@@ -432,6 +496,7 @@ static int vhost_net_tx_get_vq_desc(struct vhost_net *net,
+ 				    unsigned int *out_num, unsigned int *in_num)
+ {
+ 	unsigned long uninitialized_var(endtime);
++	/* 把desc中的信息拷贝到iov (地址会转换成qemu userspace的地址) */
+ 	int r = vhost_get_vq_desc(vq, vq->iov, ARRAY_SIZE(vq->iov),
+ 				  out_num, in_num, NULL, NULL);
+ 
+@@ -489,9 +554,12 @@ static void handle_tx(struct vhost_net *net)
+ 	if (!vq_iotlb_prefetch(vq))
+ 		goto out;
+ 
++	/* 如果不支持VIRTIO_RING_F_EVENT_IDX 在vq->used->flags中通知guest VRING_USED_F_NO_NOTIFY */
+ 	vhost_disable_notify(&net->dev, vq);
++	/* 把vhost_net的poll在fd的poll上移除 */
+ 	vhost_net_disable_vq(net, vq);
+ 
++	/* nvq->vhost_hlen在vhost_net_set_features()中设置 */
+ 	hdr_size = nvq->vhost_hlen;
+ 	zcopy = nvq->ubufs;
+ 
+@@ -501,6 +569,7 @@ static void handle_tx(struct vhost_net *net)
+ 			vhost_zerocopy_signal_used(net, vq);
+ 
+ 
++		/* 把desc中的信息拷贝到iov (地址会转换成qemu userspace的地址) */
+ 		head = vhost_net_tx_get_vq_desc(net, vq, vq->iov,
+ 						ARRAY_SIZE(vq->iov),
+ 						&out, &in);
+@@ -510,6 +579,7 @@ static void handle_tx(struct vhost_net *net)
+ 		/* Nothing new?  Wait for eventfd to tell us they refilled. */
+ 		if (head == vq->num) {
+ 			if (unlikely(vhost_enable_notify(&net->dev, vq))) {
++				/* 如果不支持VIRTIO_RING_F_EVENT_IDX 在vq->used->flags中通知guest VRING_USED_F_NO_NOTIFY */
+ 				vhost_disable_notify(&net->dev, vq);
+ 				continue;
+ 			}
+@@ -568,6 +638,7 @@ static void handle_tx(struct vhost_net *net)
+ 		}
+ 
+ 		/* TODO: Check specific error and bomb out unless ENOBUFS? */
++		/* 实际是 tap_sendmsg() */
+ 		err = sock->ops->sendmsg(sock, &msg, len);
+ 		if (unlikely(err < 0)) {
+ 			if (zcopy_used) {
+@@ -589,6 +660,7 @@ static void handle_tx(struct vhost_net *net)
+ 		vhost_net_tx_packet(net);
+ 		if (unlikely(total_len >= VHOST_NET_WEIGHT) ||
+ 		    unlikely(++sent_pkts >= VHOST_NET_PKT_WEIGHT(vq))) {
++			/* 把poll->work (vhost_work)挂到poll->dev (vhost_dev)上然后唤醒vhost_dev的内核线程 */
+ 			vhost_poll_queue(&vq->poll);
+ 			break;
+ 		}
+@@ -597,12 +669,14 @@ static void handle_tx(struct vhost_net *net)
+ 	mutex_unlock(&vq->mutex);
+ }
+ 
++/* 似乎就是skb->len吧 最后间接来自__skb_array_len_with_tag()*/
+ static int peek_head_len(struct vhost_net_virtqueue *rvq, struct sock *sk)
+ {
+ 	struct sk_buff *head;
+ 	int len = 0;
+ 	unsigned long flags;
+ 
++	/* 用不用rx_ring是tun/tap说了算的 */
+ 	if (rvq->rx_ring)
+ 		return vhost_net_buf_peek(rvq);
+ 
+@@ -622,6 +696,7 @@ static int sk_has_rx_data(struct sock *sk)
+ {
+ 	struct socket *sock = sk->sk_socket;
+ 
++	/* tap_peek_len() */
+ 	if (sock->ops->peek_len)
+ 		return sock->ops->peek_len(sock);
+ 
+@@ -636,16 +711,26 @@ static void vhost_rx_signal_used(struct vhost_net_virtqueue *nvq)
+ 	if (!nvq->done_idx)
+ 		return;
+ 
++	/*
++	 * vq->heads是vring_used_elem类型
++	 *
++	 * nvq->done_idx作为count来用
++	 */
+ 	vhost_add_used_and_signal_n(dev, vq, vq->heads, nvq->done_idx);
+ 	nvq->done_idx = 0;
+ }
+ 
++/*
++ * called only by handle_rx()
++ */
++/* 似乎就是skb->len吧 最后间接来自__skb_array_len_with_tag()*/
+ static int vhost_net_rx_peek_head_len(struct vhost_net *net, struct sock *sk)
+ {
+ 	struct vhost_net_virtqueue *rvq = &net->vqs[VHOST_NET_VQ_RX];
+ 	struct vhost_net_virtqueue *nvq = &net->vqs[VHOST_NET_VQ_TX];
+ 	struct vhost_virtqueue *vq = &nvq->vq;
+ 	unsigned long uninitialized_var(endtime);
++	/* 似乎就是skb->len吧 最后间接来自__skb_array_len_with_tag()*/
+ 	int len = peek_head_len(rvq, sk);
+ 
+ 	if (!len && vq->busyloop_timeout) {
+@@ -690,6 +775,9 @@ static int vhost_net_rx_peek_head_len(struct vhost_net *net, struct sock *sk)
+  * @quota       - headcount quota, 1 for big buffer
+  *	returns number of buffer heads allocated, negative on error
+  */
++/*
++ * called only by handle_rx()!
++ */
+ static int get_rx_bufs(struct vhost_virtqueue *vq,
+ 		       struct vring_used_elem *heads,
+ 		       int datalen,
+@@ -793,16 +881,21 @@ static void handle_rx(struct vhost_net *net)
+ 	if (!vq_iotlb_prefetch(vq))
+ 		goto out;
+ 
++	/* 如果不支持VIRTIO_RING_F_EVENT_IDX 在vq->used->flags中通知guest VRING_USED_F_NO_NOTIFY */
+ 	vhost_disable_notify(&net->dev, vq);
++	/* 把vhost_net的poll在fd的poll上移除 */
+ 	vhost_net_disable_vq(net, vq);
+ 
++	/* 在vhost_net_set_features()中设置 */
+ 	vhost_hlen = nvq->vhost_hlen;
++	/* 在vhost_net_set_features()中设置 */
+ 	sock_hlen = nvq->sock_hlen;
+ 
+ 	vq_log = unlikely(vhost_has_feature(vq, VHOST_F_LOG_ALL)) ?
+ 		vq->log : NULL;
+ 	mergeable = vhost_has_feature(vq, VIRTIO_NET_F_MRG_RXBUF);
+ 
++	/* 似乎就是skb->len吧 最后间接来自__skb_array_len_with_tag()*/
+ 	while ((sock_len = vhost_net_rx_peek_head_len(net, sock->sk))) {
+ 		sock_len += sock_hlen;
+ 		vhost_len = sock_len + vhost_hlen;
+@@ -927,6 +1020,40 @@ static void handle_rx_net(struct vhost_work *work)
+ 	handle_rx(net);
+ }
+ 
++/*
++ * struct vhost_net {
++ *	struct vhost_dev dev {
++ *
++ *	}
++ *
++ *	struct vhost_net_virtqueue vqs[VHOST_NET_VQ_MAX] {
++ *		struct vhost_virtqueue vq {
++ *			struct eventfd_ctx *call_ctx;
++ *
++ *			struct vhost_poll poll {
++ *				poll_table table; (_qproc) --> vhost_poll_func()
++ *				wait_queue_head_t *wqh;
++ *				wait_queue_entry_t wait; (func) --> vhost_poll_wakeup()
++ *				struct vhost_work work; (fn) --> vq->handle_kick()
++ *				__poll_t mask;
++ *				struct vhost_dev *dev;
++ *			}
++ *
++ *			vhost_work_fn_t handle_kick; (handle_tx_kick() or handle_rx_kick())
++ *		}
++ *	}
++ *
++ *	struct vhost_poll poll[VHOST_NET_VQ_MAX] {
++ *		poll_table table; (_qproc) --> vhost_poll_func()
++ *		wait_queue_head_t *wqh;
++ *		wait_queue_entry_t wait; (func) --> vhost_poll_wakeup()
++ *		struct vhost_work work; (fn) --> handle_rx_net() or handle_tx_net()
++ *		__poll_t mask;
++ *		struct vhost_dev *dev;
++ *	}
++ * }
++ */
++
+ static int vhost_net_open(struct inode *inode, struct file *f)
+ {
+ 	struct vhost_net *n;
+@@ -935,15 +1062,18 @@ static int vhost_net_open(struct inode *inode, struct file *f)
+ 	void **queue;
+ 	int i;
+ 
++	/* 分配vhost_net */
+ 	n = kvmalloc(sizeof *n, GFP_KERNEL | __GFP_RETRY_MAYFAIL);
+ 	if (!n)
+ 		return -ENOMEM;
++	/* 分配2个vhost_virtqueue指针 */
+ 	vqs = kmalloc(VHOST_NET_VQ_MAX * sizeof(*vqs), GFP_KERNEL);
+ 	if (!vqs) {
+ 		kvfree(n);
+ 		return -ENOMEM;
+ 	}
+ 
++	/* 分配64个指针 */
+ 	queue = kmalloc_array(VHOST_RX_BATCH, sizeof(void *),
+ 			      GFP_KERNEL);
+ 	if (!queue) {
+@@ -951,9 +1081,17 @@ static int vhost_net_open(struct inode *inode, struct file *f)
+ 		kvfree(n);
+ 		return -ENOMEM;
+ 	}
++	/*
++	 * rxq是vhost_net_buf
++	 * queue是一个void指针数组 指针内容应该在vhost_net_virtqueue.rx_ring (似乎是sk_buff)
++	 */
+ 	n->vqs[VHOST_NET_VQ_RX].rxq.queue = queue;
+ 
+ 	dev = &n->dev;
++	/*
++	 * 上面分配的vqs包含2个vhost_virtqueue指针
++	 * 这里不分配不行 因为两个vhost_virtqueue不是连续的
++	 */
+ 	vqs[VHOST_NET_VQ_TX] = &n->vqs[VHOST_NET_VQ_TX].vq;
+ 	vqs[VHOST_NET_VQ_RX] = &n->vqs[VHOST_NET_VQ_RX].vq;
+ 	n->vqs[VHOST_NET_VQ_TX].vq.handle_kick = handle_tx_kick;
+@@ -968,6 +1106,27 @@ static int vhost_net_open(struct inode *inode, struct file *f)
+ 		n->vqs[i].rx_ring = NULL;
+ 		vhost_net_buf_init(&n->vqs[i].rxq);
+ 	}
++	/*
++	 * 把参数vhost_dev dev的field vqs(二维指针)设置为vqs
++	 */
++
++	/*
++	 * vhost_dev_init()-->vhost_poll_init(&vq->poll, vq->handle_kick, EPOLLIN, dev)
++	 * 1. 把n->vqs[i].vq.poll的wait->func设置为vhost_poll_wakeup()
++	 * 2. 把n->vqs[i].vq.poll的table->_qproc设置为vhost_poll_func()
++	 * 3. 把n->vqs[i].vq.poll的work->fn设置为n->vqs[i].vq.handle_kick (也就是handle_tx_kick()或者handle_rx_kick()) ---> 都是EPOLLIN
++	 *
++	 * vhost_poll_init(n->poll + VHOST_NET_VQ_TX, handle_tx_net, EPOLLOUT, dev);
++	 * 1. 把n->poll[1]的wait->func设置为vhost_poll_wakeup()
++	 * 2. 把n->poll[1]的table->_qproc设置为vhost_poll_func()
++	 * 3. 把n->poll[1]的work->fn设置为handle_tx_net ---> EPOLLOUT
++	 *
++	 * vhost_poll_init(n->poll + VHOST_NET_VQ_RX, handle_rx_net, EPOLLIN, dev);
++	 * 1. 把n->poll[0]的wait->func设置为vhost_poll_wakeup()
++	 * 2. 把n->poll[0]的table->_qproc设置为vhost_poll_func()
++	 * 3. 把n->poll[0]的work->fn设置为handle_rx_net ---> EPOLLIN
++	 */
++
+ 	vhost_dev_init(dev, vqs, VHOST_NET_VQ_MAX);
+ 
+ 	vhost_poll_init(n->poll + VHOST_NET_VQ_TX, handle_tx_net, EPOLLOUT, dev);
+@@ -987,6 +1146,7 @@ static struct socket *vhost_net_stop_vq(struct vhost_net *n,
+ 
+ 	mutex_lock(&vq->mutex);
+ 	sock = vq->private_data;
++	/* 把vhost_net的poll在fd的poll上移除 */
+ 	vhost_net_disable_vq(n, vq);
+ 	vq->private_data = NULL;
+ 	vhost_net_buf_unproduce(nvq);
+@@ -1002,12 +1162,24 @@ static void vhost_net_stop(struct vhost_net *n, struct socket **tx_sock,
+ 	*rx_sock = vhost_net_stop_vq(n, &n->vqs[VHOST_NET_VQ_RX].vq);
+ }
+ 
++/*
++ * called by:
++ *   - vhost_net_flush_vq()调用了两次
++ *   - vhost_net_flush_vq()
++ */
+ static void vhost_net_flush_vq(struct vhost_net *n, int index)
+ {
+ 	vhost_poll_flush(n->poll + index);
+ 	vhost_poll_flush(&n->vqs[index].vq.poll);
+ }
+ 
++/*
++ * called by:
++ *   - vhost_net_release()调用了两次
++ *   - vhost_net_reset_owner()
++ *   - vhost_net_set_owner()
++ *   - vhost_net_ioctl()
++ */
+ static void vhost_net_flush(struct vhost_net *n)
+ {
+ 	vhost_net_flush_vq(n, VHOST_NET_VQ_TX);
+@@ -1083,6 +1255,9 @@ static struct socket *get_raw_socket(int fd)
+ 	return ERR_PTR(r);
+ }
+ 
++/*
++ * called only by VHOST_NET_SET_BACKEND:vhost_net_set_backend()
++ */
+ static struct ptr_ring *get_tap_ptr_ring(int fd)
+ {
+ 	struct ptr_ring *ring;
+@@ -1134,6 +1309,11 @@ static struct socket *get_socket(int fd)
+ 	return ERR_PTR(-ENOTSOCK);
+ }
+ 
++/*
++ * VHOST_NET_SET_BACKEND
++ *
++ * Attach virtio net ring to a raw socket, or tap device
++ */
+ static long vhost_net_set_backend(struct vhost_net *n, unsigned index, int fd)
+ {
+ 	struct socket *sock, *oldsock;
+@@ -1176,6 +1356,7 @@ static long vhost_net_set_backend(struct vhost_net *n, unsigned index, int fd)
+ 			goto err_ubufs;
+ 		}
+ 
++		/* 把vhost_net的poll在fd的poll上移除 */
+ 		vhost_net_disable_vq(n, vq);
+ 		vq->private_data = sock;
+ 		vhost_net_buf_unproduce(nvq);
+@@ -1228,6 +1409,7 @@ static long vhost_net_set_backend(struct vhost_net *n, unsigned index, int fd)
+ 	return r;
+ }
+ 
++/* VHOST_RESET_OWNER */
+ static long vhost_net_reset_owner(struct vhost_net *n)
+ {
+ 	struct socket *tx_sock = NULL;
+@@ -1258,6 +1440,7 @@ static long vhost_net_reset_owner(struct vhost_net *n)
+ 	return err;
+ }
+ 
++/* VHOST_SET_FEATURES */
+ static int vhost_net_set_features(struct vhost_net *n, u64 features)
+ {
+ 	size_t vhost_hlen, sock_hlen, hdr_len;
+@@ -1267,6 +1450,7 @@ static int vhost_net_set_features(struct vhost_net *n, u64 features)
+ 			       (1ULL << VIRTIO_F_VERSION_1))) ?
+ 			sizeof(struct virtio_net_hdr_mrg_rxbuf) :
+ 			sizeof(struct virtio_net_hdr);
++	/* vhost-net should add virtio_net_hdr for RX, and strip for TX packets. */
+ 	if (features & (1 << VHOST_NET_F_VIRTIO_NET_HDR)) {
+ 		/* vhost provides vnet_hdr */
+ 		vhost_hlen = hdr_len;
+@@ -1301,6 +1485,7 @@ static int vhost_net_set_features(struct vhost_net *n, u64 features)
+ 	return -EFAULT;
+ }
+ 
++/* VHOST_SET_OWNER */
+ static long vhost_net_set_owner(struct vhost_net *n)
+ {
+ 	int r;
+@@ -1333,7 +1518,7 @@ static long vhost_net_ioctl(struct file *f, unsigned int ioctl,
+ 	int r;
+ 
+ 	switch (ioctl) {
+-	case VHOST_NET_SET_BACKEND:
++	case VHOST_NET_SET_BACKEND:  // Attach virtio net ring to a raw socket, or tap device.
+ 		if (copy_from_user(&backend, argp, sizeof backend))
+ 			return -EFAULT;
+ 		return vhost_net_set_backend(n, backend.index, backend.fd);
+@@ -1372,6 +1557,7 @@ static long vhost_net_compat_ioctl(struct file *f, unsigned int ioctl,
+ }
+ #endif
+ 
++/* qemu通过这个接口读取VHOST_IOTLB_MISS信息 */
+ static ssize_t vhost_net_chr_read_iter(struct kiocb *iocb, struct iov_iter *to)
+ {
+ 	struct file *file = iocb->ki_filp;
+@@ -1379,9 +1565,11 @@ static ssize_t vhost_net_chr_read_iter(struct kiocb *iocb, struct iov_iter *to)
+ 	struct vhost_dev *dev = &n->dev;
+ 	int noblock = file->f_flags & O_NONBLOCK;
+ 
++	/* qemu通过这个接口读取VHOST_IOTLB_MISS信息 */
+ 	return vhost_chr_read_iter(dev, to, noblock);
+ }
+ 
++/* qemu通过这个接口发送VHOST_IOTLB_MISS的回复给vhost */
+ static ssize_t vhost_net_chr_write_iter(struct kiocb *iocb,
+ 					struct iov_iter *from)
+ {
+@@ -1389,6 +1577,7 @@ static ssize_t vhost_net_chr_write_iter(struct kiocb *iocb,
+ 	struct vhost_net *n = file->private_data;
+ 	struct vhost_dev *dev = &n->dev;
+ 
++	/* qemu通过这个接口发送VHOST_IOTLB_MISS的回复给vhost */
+ 	return vhost_chr_write_iter(dev, from);
+ }
+ 
+@@ -1403,8 +1592,8 @@ static __poll_t vhost_net_chr_poll(struct file *file, poll_table *wait)
+ static const struct file_operations vhost_net_fops = {
+ 	.owner          = THIS_MODULE,
+ 	.release        = vhost_net_release,
+-	.read_iter      = vhost_net_chr_read_iter,
+-	.write_iter     = vhost_net_chr_write_iter,
++	.read_iter      = vhost_net_chr_read_iter,   // qemu通过这个接口读取VHOST_IOTLB_MISS信息
++	.write_iter     = vhost_net_chr_write_iter,  // qemu通过这个接口发送VHOST_IOTLB_MISS的回复给vhost
+ 	.poll           = vhost_net_chr_poll,
+ 	.unlocked_ioctl = vhost_net_ioctl,
+ #ifdef CONFIG_COMPAT
+diff --git a/drivers/vhost/vhost.c b/drivers/vhost/vhost.c
+index 9beefa6..b5d531f 100644
+--- a/drivers/vhost/vhost.c
++++ b/drivers/vhost/vhost.c
+@@ -33,10 +33,18 @@
+ 
+ #include "vhost.h"
+ 
++/*
++ * poll的函数是: vhost_poll_func()
++ * poll完了wakeup的时候是: vhost_poll_wakeup()
++ */
++
++/* 用在umem */
++/* 在VHOST_SET_MEM_TABLE:vhost_set_memory()使用 */
+ static ushort max_mem_regions = 64;
+ module_param(max_mem_regions, ushort, 0444);
+ MODULE_PARM_DESC(max_mem_regions,
+ 	"Maximum number of memory regions in memory map. (default: 64)");
++/* 用在iotlb */
+ static int max_iotlb_entries = 2048;
+ module_param(max_iotlb_entries, int, 0444);
+ MODULE_PARM_DESC(max_iotlb_entries,
+@@ -46,7 +54,18 @@ enum {
+ 	VHOST_MEMORY_F_LOG = 0x1,
+ };
+ 
++/* avail和used都是用VHOST_SET_VRING_ADDR配置的 */
++
++/*
++ * last_avail_idx表示前端处理到avail ring的哪个元素了
++ * ++之后表示下次待处理的avail ring的哪个元素
++ * 并将这个信息放入了used ring的最后一个元素
++ * 前端驱动通过读取used ring的最后一个元素就知道后端处理到哪里了
++ */
++
++/* 返回avail的最后一个元素 */
+ #define vhost_used_event(vq) ((__virtio16 __user *)&vq->avail->ring[vq->num])
++/* 返回used的最后一个元素 */
+ #define vhost_avail_event(vq) ((__virtio16 __user *)&vq->used->ring[vq->num])
+ 
+ INTERVAL_TREE_DEFINE(struct vhost_umem_node,
+@@ -69,6 +88,7 @@ static void vhost_enable_cross_endian_little(struct vhost_virtqueue *vq)
+ 	vq->user_be = false;
+ }
+ 
++/* VHOST_SET_VRING_ENDIAN */
+ static long vhost_set_vring_endian(struct vhost_virtqueue *vq, int __user *argp)
+ {
+ 	struct vhost_vring_state s;
+@@ -147,6 +167,7 @@ struct vhost_flush_struct {
+ 	struct completion wait_event;
+ };
+ 
++/* only used (not called) by vhost_work_flush() */
+ static void vhost_flush_work(struct vhost_work *work)
+ {
+ 	struct vhost_flush_struct *s;
+@@ -155,6 +176,15 @@ static void vhost_flush_work(struct vhost_work *work)
+ 	complete(&s->wait_event);
+ }
+ 
++/* 
++ * 这个函数被配置给了poll_table->_qproc
++ * socket和eventfd的poll会调用poll_wait()-->调用poll_table->_qproc=vhost_poll_func()
++ *
++ * 把&poll->wait加入到wqh
++ *
++ * 对于socket: 把n->poll->wait加入到socket的wqh
++ * 对于eventfd, 把vhost_virtqueue->poll->wait加入到socket的wqh
++ */
+ static void vhost_poll_func(struct file *file, wait_queue_head_t *wqh,
+ 			    poll_table *pt)
+ {
+@@ -162,9 +192,21 @@ static void vhost_poll_func(struct file *file, wait_queue_head_t *wqh,
+ 
+ 	poll = container_of(pt, struct vhost_poll, table);
+ 	poll->wqh = wqh;
++	/* 把&poll->wait加入到wqh */
+ 	add_wait_queue(wqh, &poll->wait);
+ }
+ 
++/*
++ * 对于socket: 把n->poll->wait加入到socket的wqh, wait的func是vhost_poll_wakeup()
++ * 对于eventfd, 把vhost_virtqueue->poll->wait加入到eventfd的wqh, wait的func是vhost_poll_wakeup()
++ *
++ * 所以对于socket和eventfd, 唤醒的waitqueue的func都是vhost_poll_wakeup()
++ *
++ * 把poll->work (vhost_work)挂到poll->dev (vhost_dev)上然后唤醒vhost_dev的内核线程
++ *
++ * socket的入口: tun_net_xmit()-->sock_def_readable()
++ * eventfd的入口: handle_ept_misconfig()-->kvm_io_bus_write()-->eventfd_signal()
++ */
+ static int vhost_poll_wakeup(wait_queue_entry_t *wait, unsigned mode, int sync,
+ 			     void *key)
+ {
+@@ -173,6 +215,7 @@ static int vhost_poll_wakeup(wait_queue_entry_t *wait, unsigned mode, int sync,
+ 	if (!(key_to_poll(key) & poll->mask))
+ 		return 0;
+ 
++	/* 把poll->work (vhost_work)挂到poll->dev (vhost_dev)上然后唤醒vhost_dev的内核线程 */
+ 	vhost_poll_queue(poll);
+ 	return 0;
+ }
+@@ -185,6 +228,12 @@ void vhost_work_init(struct vhost_work *work, vhost_work_fn_t fn)
+ EXPORT_SYMBOL_GPL(vhost_work_init);
+ 
+ /* Init poll structure */
++/*
++ * called by:
++ *   - vhost_net_open(), 初始化n->poll
++ *   - vhost_net_open(), 初始化n->poll
++ *   - vhost_dev_init(), 初始化vhost_virtqueue->poll
++ */
+ void vhost_poll_init(struct vhost_poll *poll, vhost_work_fn_t fn,
+ 		     __poll_t mask, struct vhost_dev *dev)
+ {
+@@ -200,6 +249,15 @@ EXPORT_SYMBOL_GPL(vhost_poll_init);
+ 
+ /* Start polling a file. We add ourselves to file's wait queue. The caller must
+  * keep a reference to a file until after vhost_poll_stop is called. */
++/*
++ * called by:
++ *   - vhost_net_enable_vq()  ---> poll在sock->file
++ *     这里poll是n->poll, 是handle_rx_net()
++ *
++ *
++ *   - vhost_vring_ioctl():VHOST_SET_VRING_KICK  --->设置host notifier, poll在eventfd
++ *     这里poll是vhost_virtqueue->poll, 是handle_tx_kick()
++ */
+ int vhost_poll_start(struct vhost_poll *poll, struct file *file)
+ {
+ 	__poll_t mask;
+@@ -208,6 +266,19 @@ int vhost_poll_start(struct vhost_poll *poll, struct file *file)
+ 	if (poll->wqh)
+ 		return 0;
+ 
++	/*
++	 * socket : tun_chr_poll()
++	 * eventfd: eventfd_poll()
++	 *
++	 * poll_wait()就是调用poll_table->_qproc=vhost_poll_func()
++	 *
++	 * vhost_poll_func()把&poll->wait加入到fd的wqh
++	 *
++	 * 对于socket: 把n->poll->wait加入到socket的wqh, wait的func是vhost_poll_wakeup()
++	 * 对于eventfd, 把vhost_virtqueue->poll->wait加入到eventfd的wqh, wait的func是vhost_poll_wakeup()
++	 *
++	 * 所以到时候waitqueue唤醒的时候都是调用vhost_poll_wakeup()
++	 */
+ 	mask = file->f_op->poll(file, &poll->table);
+ 	if (mask)
+ 		vhost_poll_wakeup(&poll->wait, 0, 0, poll_to_key(mask));
+@@ -224,6 +295,7 @@ EXPORT_SYMBOL_GPL(vhost_poll_start);
+  * file reference. You must also flush afterwards. */
+ void vhost_poll_stop(struct vhost_poll *poll)
+ {
++	/* poll->wqh是socket或eventd的wait_queue_head_t */
+ 	if (poll->wqh) {
+ 		remove_wait_queue(poll->wqh, &poll->wait);
+ 		poll->wqh = NULL;
+@@ -239,6 +311,7 @@ void vhost_work_flush(struct vhost_dev *dev, struct vhost_work *work)
+ 		init_completion(&flush.wait_event);
+ 		vhost_work_init(&flush.work, vhost_flush_work);
+ 
++		/* 把vhost_work挂到vhost_dev上然后唤醒内核线程 */
+ 		vhost_work_queue(dev, &flush.work);
+ 		wait_for_completion(&flush.wait_event);
+ 	}
+@@ -253,6 +326,7 @@ void vhost_poll_flush(struct vhost_poll *poll)
+ }
+ EXPORT_SYMBOL_GPL(vhost_poll_flush);
+ 
++/* 把vhost_work挂到vhost_dev上然后唤醒内核线程 */
+ void vhost_work_queue(struct vhost_dev *dev, struct vhost_work *work)
+ {
+ 	if (!dev->worker)
+@@ -276,20 +350,46 @@ bool vhost_has_work(struct vhost_dev *dev)
+ }
+ EXPORT_SYMBOL_GPL(vhost_has_work);
+ 
++/* 
++ * 很多地方都调用这里了 这里是唤醒vhost_dev内核线程的地方
++ *
++ * 把poll->work (vhost_work)挂到poll->dev (vhost_dev)上然后唤醒vhost_dev的内核线程
++ */
+ void vhost_poll_queue(struct vhost_poll *poll)
+ {
++	/* 把poll->work (vhost_work)挂到poll->dev (vhost_dev)上然后唤醒vhost_dev的内核线程 */
+ 	vhost_work_queue(poll->dev, &poll->work);
+ }
+ EXPORT_SYMBOL_GPL(vhost_poll_queue);
+ 
++/*
++ * called by:
++ *   - vhost_vq_meta_reset()
++ *   - vhost_vq_reset()
++ *
++ * enum vhost_uaddr_type {
++ *	VHOST_ADDR_DESC = 0,
++ *	VHOST_ADDR_AVAIL = 1,
++ *	VHOST_ADDR_USED = 2,
++ *	VHOST_NUM_ADDRS = 3,
++ * };
++ *
++ * 把vhost_virtqueue的VHOST_NUM_ADDRS个vq->meta_iotlb设成NULL
++ */
+ static void __vhost_vq_meta_reset(struct vhost_virtqueue *vq)
+ {
+ 	int j;
+ 
++	/*
++	 * meta_iotlb就在vhost_vq_meta_fetch()和vhost_vq_meta_update()用到过
++	 *
++	 * meta_iotlb is configured by iotlb_access_ok()-->vhost_vq_meta_update()
++	 */
+ 	for (j = 0; j < VHOST_NUM_ADDRS; j++)
+-		vq->meta_iotlb[j] = NULL;
++		vq->meta_iotlb[j] = NULL;  // vhost_umem_node类型
+ }
+ 
++/* 把vhost_dev的所有的vhost_virtqueue的VHOST_NUM_ADDRS个vq->meta_iotlb设成NULL */
+ static void vhost_vq_meta_reset(struct vhost_dev *d)
+ {
+ 	int i;
+@@ -367,6 +467,12 @@ static int vhost_worker(void *data)
+ 	return 0;
+ }
+ 
++/*
++ * 清空free:
++ *   - vq->indirect
++ *   - vq->log
++ *   - vq->heads
++ */
+ static void vhost_vq_free_iovecs(struct vhost_virtqueue *vq)
+ {
+ 	kfree(vq->indirect);
+@@ -378,6 +484,12 @@ static void vhost_vq_free_iovecs(struct vhost_virtqueue *vq)
+ }
+ 
+ /* Helper to allocate iovec buffers for all vqs. */
++/*
++ * 分配:
++ *   vq->indirect[]
++ *   vq->log
++ *   vq->heads
++ */
+ static long vhost_dev_alloc_iovecs(struct vhost_dev *dev)
+ {
+ 	struct vhost_virtqueue *vq;
+@@ -404,6 +516,12 @@ static void vhost_dev_free_iovecs(struct vhost_dev *dev)
+ {
+ 	int i;
+ 
++	/*
++	 * 清空free:
++	 *   - vq->indirect
++	 *   - vq->log
++	 *   - vq->heads
++	 */
+ 	for (i = 0; i < dev->nvqs; ++i)
+ 		vhost_vq_free_iovecs(dev->vqs[i]);
+ }
+@@ -485,6 +603,7 @@ bool vhost_dev_has_owner(struct vhost_dev *dev)
+ EXPORT_SYMBOL_GPL(vhost_dev_has_owner);
+ 
+ /* Caller should have device mutex */
++/* VHOST_SET_OWNER */
+ long vhost_dev_set_owner(struct vhost_dev *dev)
+ {
+ 	struct task_struct *worker;
+@@ -511,6 +630,12 @@ long vhost_dev_set_owner(struct vhost_dev *dev)
+ 	if (err)
+ 		goto err_cgroup;
+ 
++	/*
++	 * 为所有vq分配:
++	 *   vq->indirect[]
++	 *   vq->log
++	 *   vq->heads
++	 */
+ 	err = vhost_dev_alloc_iovecs(dev);
+ 	if (err)
+ 		goto err_cgroup;
+@@ -528,6 +653,7 @@ long vhost_dev_set_owner(struct vhost_dev *dev)
+ }
+ EXPORT_SYMBOL_GPL(vhost_dev_set_owner);
+ 
++/* called only by vhost_net_reset_owner() */
+ struct vhost_umem *vhost_dev_reset_owner_prepare(void)
+ {
+ 	return kvzalloc(sizeof(struct vhost_umem), GFP_KERNEL);
+@@ -535,6 +661,9 @@ struct vhost_umem *vhost_dev_reset_owner_prepare(void)
+ EXPORT_SYMBOL_GPL(vhost_dev_reset_owner_prepare);
+ 
+ /* Caller should have device mutex */
++/*
++ * dev->umem和dev->vqs[i]->umem指向相同得vhost_umem
++ */
+ void vhost_dev_reset_owner(struct vhost_dev *dev, struct vhost_umem *umem)
+ {
+ 	int i;
+@@ -565,6 +694,7 @@ void vhost_dev_stop(struct vhost_dev *dev)
+ }
+ EXPORT_SYMBOL_GPL(vhost_dev_stop);
+ 
++/* 把node从umem->umem_tree和umem->umem_list去掉 */
+ static void vhost_umem_free(struct vhost_umem *umem,
+ 			    struct vhost_umem_node *node)
+ {
+@@ -574,6 +704,7 @@ static void vhost_umem_free(struct vhost_umem *umem,
+ 	umem->numem--;
+ }
+ 
++/* 把vhost_umem下所有的vhost_umem_node从umem->umem_tree和umem->umem_list去掉 */
+ static void vhost_umem_clean(struct vhost_umem *umem)
+ {
+ 	struct vhost_umem_node *node, *tmp;
+@@ -582,11 +713,12 @@ static void vhost_umem_clean(struct vhost_umem *umem)
+ 		return;
+ 
+ 	list_for_each_entry_safe(node, tmp, &umem->umem_list, link)
+-		vhost_umem_free(umem, node);
++		vhost_umem_free(umem, node);  /* 把node从umem->umem_tree和umem->umem_list去掉 */
+ 
+ 	kvfree(umem);
+ }
+ 
++/* called only by vhost_dev_cleanup() */
+ static void vhost_clear_msg(struct vhost_dev *dev)
+ {
+ 	struct vhost_msg_node *node, *n;
+@@ -654,6 +786,7 @@ static bool log_access_ok(void __user *log_base, u64 addr, unsigned long sz)
+ 			 (sz + VHOST_PAGE_SIZE * 8 - 1) / VHOST_PAGE_SIZE / 8);
+ }
+ 
++/* uaddr和size不能超出u64 */
+ static bool vhost_overflow(u64 uaddr, u64 size)
+ {
+ 	/* Make sure 64 bit math will not overflow. */
+@@ -661,6 +794,12 @@ static bool vhost_overflow(u64 uaddr, u64 size)
+ }
+ 
+ /* Caller should have vq mutex and device mutex. */
++/* 遍历vhost_umem的vhost_umem_node,确认所有得userspace_addr是否都在vhost内核有访问权限 */
++/*
++ * called by:
++ *   - memory_access_ok()
++ *   - vq_log_access_ok()
++ */
+ static bool vq_memory_access_ok(void __user *log_base, struct vhost_umem *umem,
+ 				int log_all)
+ {
+@@ -687,10 +826,21 @@ static bool vq_memory_access_ok(void __user *log_base, struct vhost_umem *umem,
+ 	return true;
+ }
+ 
++/* 把guest的物理地址转换成qemu userspace的地址 */
++/*
++ * called by:
++ *   - vhost_copy_to_user()
++ *   - vhost_copy_from_user()
++ *   - __vhost_get_user()
++ *   - iotlb_access_ok()
++ */
+ static inline void __user *vhost_vq_meta_fetch(struct vhost_virtqueue *vq,
+ 					       u64 addr, unsigned int size,
+ 					       int type)
+ {
++	/*
++	 * meta_iotalb[]有三个元素: VHOST_ADDR_DESC, VHOST_ADDR_AVAIL, VHOST_ADDR_USED
++	 */
+ 	const struct vhost_umem_node *node = vq->meta_iotlb[type];
+ 
+ 	if (!node)
+@@ -701,6 +851,7 @@ static inline void __user *vhost_vq_meta_fetch(struct vhost_virtqueue *vq,
+ 
+ /* Can we switch to this memory table? */
+ /* Caller should have device mutex but not vq mutex */
++/* 遍历vhost_umem的vhost_umem_node,确认所有得userspace_addr是否都在vhost内核有访问权限 */
+ static bool memory_access_ok(struct vhost_dev *d, struct vhost_umem *umem,
+ 			     int log_all)
+ {
+@@ -713,6 +864,7 @@ static bool memory_access_ok(struct vhost_dev *d, struct vhost_umem *umem,
+ 		mutex_lock(&d->vqs[i]->mutex);
+ 		log = log_all || vhost_has_feature(d->vqs[i], VHOST_F_LOG_ALL);
+ 		/* If ring is inactive, will check when it's enabled. */
++		/* 遍历vhost_umem的vhost_umem_node,确认所有得userspace_addr是否都在vhost内核有访问权限 */
+ 		if (d->vqs[i]->private_data)
+ 			ok = vq_memory_access_ok(d->vqs[i]->log_base,
+ 						 umem, log);
+@@ -725,9 +877,17 @@ static bool memory_access_ok(struct vhost_dev *d, struct vhost_umem *umem,
+ 	return true;
+ }
+ 
++/*
++ * 把desc中的地址转换成qemu userspace的地址存放在iov中
++ *
++ * iov_size是从iov开始剩下可用的iov
++ */
+ static int translate_desc(struct vhost_virtqueue *vq, u64 addr, u32 len,
+ 			  struct iovec iov[], int iov_size, int access);
+ 
++/*
++ * called only by __vhost_add_used_n()
++ */
+ static int vhost_copy_to_user(struct vhost_virtqueue *vq, void __user *to,
+ 			      const void *from, unsigned size)
+ {
+@@ -742,6 +902,7 @@ static int vhost_copy_to_user(struct vhost_virtqueue *vq, void __user *to,
+ 		 * not happen in this case.
+ 		 */
+ 		struct iov_iter t;
++		/* 把guest的物理地址转换成qemu userspace的地址 */
+ 		void __user *uaddr = vhost_vq_meta_fetch(vq,
+ 				     (u64)(uintptr_t)to, size,
+ 				     VHOST_ADDR_USED);
+@@ -749,6 +910,7 @@ static int vhost_copy_to_user(struct vhost_virtqueue *vq, void __user *to,
+ 		if (uaddr)
+ 			return __copy_to_user(uaddr, from, size);
+ 
++		/* 把desc中的地址转换成qemu userspace的地址存放在iov中 */
+ 		ret = translate_desc(vq, (u64)(uintptr_t)to, size, vq->iotlb_iov,
+ 				     ARRAY_SIZE(vq->iotlb_iov),
+ 				     VHOST_ACCESS_WO);
+@@ -776,6 +938,7 @@ static int vhost_copy_from_user(struct vhost_virtqueue *vq, void *to,
+ 		 * could be access through iotlb. So -EAGAIN should
+ 		 * not happen in this case.
+ 		 */
++		/* 把guest的物理地址转换成qemu userspace的地址 */
+ 		void __user *uaddr = vhost_vq_meta_fetch(vq,
+ 				     (u64)(uintptr_t)from, size,
+ 				     VHOST_ADDR_DESC);
+@@ -784,6 +947,7 @@ static int vhost_copy_from_user(struct vhost_virtqueue *vq, void *to,
+ 		if (uaddr)
+ 			return __copy_from_user(to, uaddr, size);
+ 
++		/* 把desc中的地址转换成qemu userspace的地址存放在iov中 */
+ 		ret = translate_desc(vq, (u64)(uintptr_t)from, size, vq->iotlb_iov,
+ 				     ARRAY_SIZE(vq->iotlb_iov),
+ 				     VHOST_ACCESS_RO);
+@@ -803,12 +967,15 @@ static int vhost_copy_from_user(struct vhost_virtqueue *vq, void *to,
+ 	return ret;
+ }
+ 
++/* 把desc中的地址转换成qemu userspace的地址存放在iov中 然后返回iotlb_iov[0].iov_base */
++/* called only by __vhost_get_user() */
+ static void __user *__vhost_get_user_slow(struct vhost_virtqueue *vq,
+ 					  void __user *addr, unsigned int size,
+ 					  int type)
+ {
+ 	int ret;
+ 
++	/* 把desc中的地址转换成qemu userspace的地址存放在iov中 */
+ 	ret = translate_desc(vq, (u64)(uintptr_t)addr, size, vq->iotlb_iov,
+ 			     ARRAY_SIZE(vq->iotlb_iov),
+ 			     VHOST_ACCESS_RO);
+@@ -834,18 +1001,36 @@ static void __user *__vhost_get_user_slow(struct vhost_virtqueue *vq,
+  * could be access through iotlb. So -EAGAIN should
+  * not happen in this case.
+  */
++/* 把guest的物理地址转换成qemu userspace的地址 */
++/*
++ * called by (都是在不支持iotlb的情况下):
++ *   - vhost_put_user()
++ *   - vhost_get_user()
++ */
+ static inline void __user *__vhost_get_user(struct vhost_virtqueue *vq,
+ 					    void *addr, unsigned int size,
+ 					    int type)
+ {
++	/* 把guest的物理地址转换成qemu userspace的地址 */
+ 	void __user *uaddr = vhost_vq_meta_fetch(vq,
+ 			     (u64)(uintptr_t)addr, size, type);
+ 	if (uaddr)
+ 		return uaddr;
+ 
++	/* 把desc中的地址转换成qemu userspace的地址存放在iov中 然后返回iotlb_iov[0].iov_base */
+ 	return __vhost_get_user_slow(vq, addr, size, type);
+ }
+ 
++/*
++ * 把x拷贝到ptr, 在需要的时候先把ptr转换成qemu的userspace地址
++ *
++ * called by:
++ *   - vhost_update_used_flags()
++ *   - vhost_update_avail_event()
++ *   - __vhost_add_used_n()
++ *   - __vhost_add_used_n()
++ *   - vhost_add_used_n()
++ */
+ #define vhost_put_user(vq, x, ptr)		\
+ ({ \
+ 	int ret = -EFAULT; \
+@@ -863,6 +1048,13 @@ static inline void __user *__vhost_get_user(struct vhost_virtqueue *vq,
+ 	ret; \
+ })
+ 
++/*
++ * 从ptr拷贝到x, 在需要的时候先把ptr转换成qemu的userspace地址
++ *
++ * called by:
++ *   - vhost_get_avail()
++ *   - vhost_get_used()
++ */
+ #define vhost_get_user(vq, x, ptr, type)		\
+ ({ \
+ 	int ret; \
+@@ -881,9 +1073,11 @@ static inline void __user *__vhost_get_user(struct vhost_virtqueue *vq,
+ 	ret; \
+ })
+ 
++/* 从ptr拷贝到x, 在需要的时候先把ptr转换成qemu的userspace地址 */
+ #define vhost_get_avail(vq, x, ptr) \
+ 	vhost_get_user(vq, x, ptr, VHOST_ADDR_AVAIL)
+ 
++/* 从ptr拷贝到x, 在需要的时候先把ptr转换成qemu的userspace地址 */
+ #define vhost_get_used(vq, x, ptr) \
+ 	vhost_get_user(vq, x, ptr, VHOST_ADDR_USED)
+ 
+@@ -901,6 +1095,13 @@ static void vhost_dev_unlock_vqs(struct vhost_dev *d)
+ 		mutex_unlock(&d->vqs[i]->mutex);
+ }
+ 
++/*
++ * 把地址们做成一个vhost_umem_node, 放入vhost_umem
++ *
++ * called by:
++ *   - vhost_process_iotlb_msg()
++ *   - vhost_set_memory()  ---> 这是iotlb的
++ */
+ static int vhost_new_umem_range(struct vhost_umem *umem,
+ 				u64 start, u64 size, u64 end,
+ 				u64 userspace_addr, int perm)
+@@ -910,8 +1111,10 @@ static int vhost_new_umem_range(struct vhost_umem *umem,
+ 	if (!node)
+ 		return -ENOMEM;
+ 
++	/* 如果满了就要释放一个 */
+ 	if (umem->numem == max_iotlb_entries) {
+ 		tmp = list_first_entry(&umem->umem_list, typeof(*tmp), link);
++		/* 把node从umem->umem_tree和umem->umem_list去掉 */
+ 		vhost_umem_free(umem, tmp);
+ 	}
+ 
+@@ -928,6 +1131,9 @@ static int vhost_new_umem_range(struct vhost_umem *umem,
+ 	return 0;
+ }
+ 
++/*
++ * called only by vhost_process_iotlb_msg()
++ */
+ static void vhost_del_umem_range(struct vhost_umem *umem,
+ 				 u64 start, u64 end)
+ {
+@@ -935,9 +1141,14 @@ static void vhost_del_umem_range(struct vhost_umem *umem,
+ 
+ 	while ((node = vhost_umem_interval_tree_iter_first(&umem->umem_tree,
+ 							   start, end)))
+-		vhost_umem_free(umem, node);
++		vhost_umem_free(umem, node); /* 把node从umem->umem_tree和umem->umem_list去掉 */
+ }
+ 
++/*
++ * called only by vhost_process_iotlb_msg()
++ *
++ * 回复唤醒vhost_chr_read_iter()插入的pending_list中的元素
++ */
+ static void vhost_iotlb_notify_vq(struct vhost_dev *d,
+ 				  struct vhost_iotlb_msg *msg)
+ {
+@@ -945,6 +1156,7 @@ static void vhost_iotlb_notify_vq(struct vhost_dev *d,
+ 
+ 	spin_lock(&d->iotlb_lock);
+ 
++	/* pending_list是由vhost_chr_read_iter()插入的 */
+ 	list_for_each_entry_safe(node, n, &d->pending_list, node) {
+ 		struct vhost_iotlb_msg *vq_msg = &node->msg.iotlb;
+ 		if (msg->iova <= vq_msg->iova &&
+@@ -959,11 +1171,14 @@ static void vhost_iotlb_notify_vq(struct vhost_dev *d,
+ 	spin_unlock(&d->iotlb_lock);
+ }
+ 
++/* uaddr在内核是否可以访问 */
++/* called only by vhost_process_iotlb_msg() */
+ static bool umem_access_ok(u64 uaddr, u64 size, int access)
+ {
+ 	unsigned long a = uaddr;
+ 
+ 	/* Make sure 64 bit math will not overflow. */
++	/* uaddr和size不能超出u64 */
+ 	if (vhost_overflow(uaddr, size))
+ 		return false;
+ 
+@@ -976,6 +1191,9 @@ static bool umem_access_ok(u64 uaddr, u64 size, int access)
+ 	return true;
+ }
+ 
++/*
++ * called only by vhost_chr_write_iter()
++ */
+ static int vhost_process_iotlb_msg(struct vhost_dev *dev,
+ 				   struct vhost_iotlb_msg *msg)
+ {
+@@ -993,7 +1211,16 @@ static int vhost_process_iotlb_msg(struct vhost_dev *dev,
+ 			ret = -EFAULT;
+ 			break;
+ 		}
++		/* 把vhost_dev的所有的vhost_virtqueue的VHOST_NUM_ADDRS个vq->meta_iotlb设成NULL */
++		/*
++		 * enum vhost_uaddr_type {
++		 *	VHOST_ADDR_DESC = 0,
++		 *	VHOST_ADDR_AVAIL = 1,
++		 *	VHOST_ADDR_USED = 2,
++		 *	VHOST_NUM_ADDRS = 3,
++		 */
+ 		vhost_vq_meta_reset(dev);
++		/* 把地址们做成一个vhost_umem_node, 放入dev->iotlb (vhost_umem类型) */
+ 		if (vhost_new_umem_range(dev->iotlb, msg->iova, msg->size,
+ 					 msg->iova + msg->size - 1,
+ 					 msg->uaddr, msg->perm)) {
+@@ -1007,6 +1234,7 @@ static int vhost_process_iotlb_msg(struct vhost_dev *dev,
+ 			ret = -EFAULT;
+ 			break;
+ 		}
++		/* 把vhost_dev的所有的vhost_virtqueue的VHOST_NUM_ADDRS个vq->meta_iotlb设成NULL */
+ 		vhost_vq_meta_reset(dev);
+ 		vhost_del_umem_range(dev->iotlb, msg->iova,
+ 				     msg->iova + msg->size - 1);
+@@ -1021,6 +1249,7 @@ static int vhost_process_iotlb_msg(struct vhost_dev *dev,
+ 
+ 	return ret;
+ }
++/* qemu通过这个接口发送VHOST_IOTLB_MISS的回复给vhost */
+ ssize_t vhost_chr_write_iter(struct vhost_dev *dev,
+ 			     struct iov_iter *from)
+ {
+@@ -1058,6 +1287,7 @@ __poll_t vhost_chr_poll(struct file *file, struct vhost_dev *dev,
+ 
+ 	poll_wait(file, &dev->wait, wait);
+ 
++	/* 由vhost_iotlb_miss()插入 */
+ 	if (!list_empty(&dev->read_list))
+ 		mask |= EPOLLIN | EPOLLRDNORM;
+ 
+@@ -1065,6 +1295,7 @@ __poll_t vhost_chr_poll(struct file *file, struct vhost_dev *dev,
+ }
+ EXPORT_SYMBOL(vhost_chr_poll);
+ 
++/* qemu通过这个接口读取VHOST_IOTLB_MISS信息 */
+ ssize_t vhost_chr_read_iter(struct vhost_dev *dev, struct iov_iter *to,
+ 			    int noblock)
+ {
+@@ -1081,6 +1312,7 @@ ssize_t vhost_chr_read_iter(struct vhost_dev *dev, struct iov_iter *to,
+ 			prepare_to_wait(&dev->wait, &wait,
+ 					TASK_INTERRUPTIBLE);
+ 
++		/* 从dev->read_list中取出vhost_msg_node (由vhost_iotlb_miss()插入) */
+ 		node = vhost_dequeue_msg(dev, &dev->read_list);
+ 		if (node)
+ 			break;
+@@ -1088,6 +1320,7 @@ ssize_t vhost_chr_read_iter(struct vhost_dev *dev, struct iov_iter *to,
+ 			ret = -EAGAIN;
+ 			break;
+ 		}
++		/* 判断p,TIF_SIGPENDING */
+ 		if (signal_pending(current)) {
+ 			ret = -ERESTARTSYS;
+ 			break;
+@@ -1118,12 +1351,45 @@ ssize_t vhost_chr_read_iter(struct vhost_dev *dev, struct iov_iter *to,
+ }
+ EXPORT_SYMBOL_GPL(vhost_chr_read_iter);
+ 
++/*
++ *    This patch tries to implement an device IOTLB for vhost. This could be
++ *    used with userspace(qemu) implementation of DMA remapping
++ *    to emulate an IOMMU for the guest.
++ *
++ *    The idea is simple, cache the translation in a software device IOTLB
++ *    (which is implemented as an interval tree) in vhost and use vhost_net
++ *    file descriptor for reporting IOTLB miss and IOTLB
++ *    update/invalidation. When vhost meets an IOTLB miss, the fault
++ *    address, size and access can be read from the file. After userspace
++ *    finishes the translation, it writes the translated address to the
++ *    vhost_net file to update the device IOTLB.
++ *
++ *    When device IOTLB is enabled by setting VIRTIO_F_IOMMU_PLATFORM all vq
++ *    addresses set by ioctl are treated as iova instead of virtual address and
++ *    the accessing can only be done through IOTLB instead of direct userspace
++ *    memory access. Before each round or vq processing, all vq metadata is
++ *    prefetched in device IOTLB to make sure no translation fault happens
++ *    during vq processing.
++ *
++ *    In most cases, virtqueues are contiguous even in virtual address space.
++ *    The IOTLB translation for virtqueue itself may make it a little
++ *    slower. We might add fast path cache on top of this patch.
++ */
++
++/*
++ * called by:
++ *   - iotlb_access_ok()
++ *   - translate_desc()
++ *
++ * 生成一个iotlb请求 插入read_list
++ */
+ static int vhost_iotlb_miss(struct vhost_virtqueue *vq, u64 iova, int access)
+ {
+ 	struct vhost_dev *dev = vq->dev;
+ 	struct vhost_msg_node *node;
+ 	struct vhost_iotlb_msg *msg;
+ 
++	/* 分配一个struct vhost_msg_node */
+ 	node = vhost_new_msg(vq, VHOST_IOTLB_MISS);
+ 	if (!node)
+ 		return -ENOMEM;
+@@ -1138,6 +1404,12 @@ static int vhost_iotlb_miss(struct vhost_virtqueue *vq, u64 iova, int access)
+ 	return 0;
+ }
+ 
++/* num是vq->num */
++/*
++ * called by:
++ *   - vhost_vq_access_ok()
++ *   - vhost_vring_ioctl()
++ */
+ static bool vq_access_ok(struct vhost_virtqueue *vq, unsigned int num,
+ 			 struct vring_desc __user *desc,
+ 			 struct vring_avail __user *avail,
+@@ -1153,6 +1425,8 @@ static bool vq_access_ok(struct vhost_virtqueue *vq, unsigned int num,
+ 			sizeof *used + num * sizeof *used->ring + s);
+ }
+ 
++/* called only by iotlb_access_ok() */
++/* 更新meta_iotlb的地方!!! */
+ static void vhost_vq_meta_update(struct vhost_virtqueue *vq,
+ 				 const struct vhost_umem_node *node,
+ 				 int type)
+@@ -1164,6 +1438,7 @@ static void vhost_vq_meta_update(struct vhost_virtqueue *vq,
+ 		vq->meta_iotlb[type] = node;
+ }
+ 
++/* called only by vq_iotlb_prefetch() */
+ static bool iotlb_access_ok(struct vhost_virtqueue *vq,
+ 			    int access, u64 addr, u64 len, int type)
+ {
+@@ -1171,14 +1446,17 @@ static bool iotlb_access_ok(struct vhost_virtqueue *vq,
+ 	struct vhost_umem *umem = vq->iotlb;
+ 	u64 s = 0, size, orig_addr = addr, last = addr + len - 1;
+ 
++	/* 把guest的物理地址转换成qemu userspace的地址 */
+ 	if (vhost_vq_meta_fetch(vq, addr, len, type))
+ 		return true;
+ 
+ 	while (len > s) {
++		/* umem在上面来自vq->iotlb */
+ 		node = vhost_umem_interval_tree_iter_first(&umem->umem_tree,
+ 							   addr,
+ 							   last);
+ 		if (node == NULL || node->start > addr) {
++			/* 生成一个iotlb请求 插入read_list */
+ 			vhost_iotlb_miss(vq, addr, access);
+ 			return false;
+ 		} else if (!(node->perm & access)) {
+@@ -1202,12 +1480,22 @@ static bool iotlb_access_ok(struct vhost_virtqueue *vq,
+ 
+ int vq_iotlb_prefetch(struct vhost_virtqueue *vq)
+ {
++	/* The Guest publishes the used index for which it expects an interrupt
++	 * at the end of the avail ring. Host should ignore the avail->flags field. */
++	/* The Host publishes the avail index for which it expects a kick
++	 * at the end of the used ring. Guest should ignore the used->flags field. */
+ 	size_t s = vhost_has_feature(vq, VIRTIO_RING_F_EVENT_IDX) ? 2 : 0;
+ 	unsigned int num = vq->num;
+ 
++	/*
++	 * 在VIRTIO_F_IOMMU_PLATFORM支持时才使用
++	 *
++	 * 似乎在qemu中默认是不支持的 (需要iommu_platform=true参数)
++	 */
+ 	if (!vq->iotlb)
+ 		return 1;
+ 
++	/* 不行的话在iotlb_access_ok()会生成iotlb miss! */
+ 	return iotlb_access_ok(vq, VHOST_ACCESS_RO, (u64)(uintptr_t)vq->desc,
+ 			       num * sizeof(*vq->desc), VHOST_ADDR_DESC) &&
+ 	       iotlb_access_ok(vq, VHOST_ACCESS_RO, (u64)(uintptr_t)vq->avail,
+@@ -1236,6 +1524,7 @@ static bool vq_log_access_ok(struct vhost_virtqueue *vq,
+ {
+ 	size_t s = vhost_has_feature(vq, VIRTIO_RING_F_EVENT_IDX) ? 2 : 0;
+ 
++	/* 遍历vhost_umem的vhost_umem_node,确认所有得userspace_addr是否都在vhost内核有访问权限 */
+ 	return vq_memory_access_ok(log_base, vq->umem,
+ 				   vhost_has_feature(vq, VHOST_F_LOG_ALL)) &&
+ 		(!vq->log_used || log_access_ok(log_base, vq->log_addr,
+@@ -1272,6 +1561,36 @@ static struct vhost_umem *vhost_umem_alloc(void)
+ 	return umem;
+ }
+ 
++/*
++ * VHOST_SET_MEM_TABLE
++ *
++ * 这个函数设置的vhost_umem, 和iotlb无关
++ *
++ * 似乎vhost_dev和vhost_virtqueue指向的相同的umem
++ */
++
++/*
++ * guest内存3000M的一个例子:
++ *    addr=0xfffc0000, size=0x40000, uaddr=0x7f14eca00000
++ *    addr=0x0, size=0xa0000, uaddr=0x7f1424600000
++ *    addr=0xc0000, size=0xbb740000, uaddr=0x7f14246c0000
++ *    addr=0xfffc0000, size=0x40000, uaddr=0x7f14eca00000
++ *    addr=0x0, size=0xa0000, uaddr=0x7f1424600000
++ *    addr=0xc0000, size=0xbb740000, uaddr=0x7f14246c0000
++ */
++
++/*
++ * guest内存8000M的一个例子:
++ *    addr=0x100000000, size=0x134000000, uaddr=0x7efae3e00000
++ *    addr=0xfffc0000, size=0x40000, uaddr=0x7efc26c00000
++ *    addr=0x0, size=0xa0000, uaddr=0x7efa23e00000
++ *    addr=0xc0000, size=0xbff40000, uaddr=0x7efa23ec0000
++ *    addr=0x100000000, size=0x134000000, uaddr=0x7efae3e00000
++ *    addr=0xfffc0000, size=0x40000, uaddr=0x7efc26c00000
++ *    addr=0x0, size=0xa0000, uaddr=0x7efa23e00000
++ *    addr=0xc0000, size=0xbff40000, uaddr=0x7efa23ec0000
++ */
++
+ static long vhost_set_memory(struct vhost_dev *d, struct vhost_memory __user *m)
+ {
+ 	struct vhost_memory mem, *newmem;
+@@ -1286,26 +1605,58 @@ static long vhost_set_memory(struct vhost_dev *d, struct vhost_memory __user *m)
+ 		return -EOPNOTSUPP;
+ 	if (mem.nregions > max_mem_regions)
+ 		return -E2BIG;
++	/* 分配的时候把vhost_memory尾部的也分配 */
++	/* 该函数最后会kvfree()掉 */
+ 	newmem = kvzalloc(size + mem.nregions * sizeof(*m->regions), GFP_KERNEL);
+ 	if (!newmem)
+ 		return -ENOMEM;
+ 
++	/* 这里把参数的m拷贝到了newmem */
+ 	memcpy(newmem, &mem, size);
++	/* 这里真正把m尾部的成员拷贝到了newmem */
+ 	if (copy_from_user(newmem->regions, m->regions,
+ 			   mem.nregions * sizeof *m->regions)) {
+ 		kvfree(newmem);
+ 		return -EFAULT;
+ 	}
+ 
++	/*
++	 * newmem  是 vhost_memory 该函数最后会kvfree()掉
++	 * newumem 是 vhost_umem
++	 */
+ 	newumem = vhost_umem_alloc();
+ 	if (!newumem) {
+ 		kvfree(newmem);
+ 		return -ENOMEM;
+ 	}
+ 
++	/*
++	 * guest内存3000M的一个例子:
++	 *    addr=0xfffc0000, size=0x40000, uaddr=0x7f14eca00000
++	 *    addr=0x0, size=0xa0000, uaddr=0x7f1424600000
++	 *    addr=0xc0000, size=0xbb740000, uaddr=0x7f14246c0000
++	 *    addr=0xfffc0000, size=0x40000, uaddr=0x7f14eca00000
++	 *    addr=0x0, size=0xa0000, uaddr=0x7f1424600000
++	 *    addr=0xc0000, size=0xbb740000, uaddr=0x7f14246c0000
++	 */
++
++	/*
++	 * guest内存8000M的一个例子:
++	 *    addr=0x100000000, size=0x134000000, uaddr=0x7efae3e00000
++	 *    addr=0xfffc0000, size=0x40000, uaddr=0x7efc26c00000
++	 *    addr=0x0, size=0xa0000, uaddr=0x7efa23e00000
++	 *    addr=0xc0000, size=0xbff40000, uaddr=0x7efa23ec0000
++	 *    addr=0x100000000, size=0x134000000, uaddr=0x7efae3e00000
++	 *    addr=0xfffc0000, size=0x40000, uaddr=0x7efc26c00000
++	 *    addr=0x0, size=0xa0000, uaddr=0x7efa23e00000
++	 *    addr=0xc0000, size=0xbff40000, uaddr=0x7efa23ec0000
++	 */
++
++	/* newmem是从参数m拷贝过来的 */
+ 	for (region = newmem->regions;
+ 	     region < newmem->regions + mem.nregions;
+ 	     region++) {
++		/* 把地址们做成一个vhost_umem_node, 放入vhost_umem */
+ 		if (vhost_new_umem_range(newumem,
+ 					 region->guest_phys_addr,
+ 					 region->memory_size,
+@@ -1316,15 +1667,18 @@ static long vhost_set_memory(struct vhost_dev *d, struct vhost_memory __user *m)
+ 			goto err;
+ 	}
+ 
++	/* 遍历vhost_umem的vhost_umem_node,确认所有得userspace_addr是否都在vhost内核有访问权限 */
+ 	if (!memory_access_ok(d, newumem, 0))
+ 		goto err;
+ 
+ 	oldumem = d->umem;
++	/* 似乎vhost_dev和vhost_virtqueue指向的相同的umem */
+ 	d->umem = newumem;
+ 
+ 	/* All memory accesses are done under some VQ mutex. */
+ 	for (i = 0; i < d->nvqs; ++i) {
+ 		mutex_lock(&d->vqs[i]->mutex);
++		/* 似乎vhost_dev和vhost_virtqueue指向的相同的umem */
+ 		d->vqs[i]->umem = newumem;
+ 		mutex_unlock(&d->vqs[i]->mutex);
+ 	}
+@@ -1363,7 +1717,7 @@ long vhost_vring_ioctl(struct vhost_dev *d, unsigned int ioctl, void __user *arg
+ 	mutex_lock(&vq->mutex);
+ 
+ 	switch (ioctl) {
+-	case VHOST_SET_VRING_NUM:
++	case VHOST_SET_VRING_NUM:  // 设置vq->num
+ 		/* Resizing ring with an active backend?
+ 		 * You don't want to do that. */
+ 		if (vq->private_data) {
+@@ -1380,7 +1734,7 @@ long vhost_vring_ioctl(struct vhost_dev *d, unsigned int ioctl, void __user *arg
+ 		}
+ 		vq->num = s.num;
+ 		break;
+-	case VHOST_SET_VRING_BASE:
++	case VHOST_SET_VRING_BASE:  // 同时更新vq->last_avail_idx和vq->avail_idx
+ 		/* Moving base with an active backend?
+ 		 * You don't want to do that. */
+ 		if (vq->private_data) {
+@@ -1395,6 +1749,7 @@ long vhost_vring_ioctl(struct vhost_dev *d, unsigned int ioctl, void __user *arg
+ 			r = -EINVAL;
+ 			break;
+ 		}
++		/* 同时更新vq->last_avail_idx和vq->avail_idx */
+ 		vq->last_avail_idx = s.num;
+ 		/* Forget the cached index value. */
+ 		vq->avail_idx = vq->last_avail_idx;
+@@ -1406,6 +1761,7 @@ long vhost_vring_ioctl(struct vhost_dev *d, unsigned int ioctl, void __user *arg
+ 			r = -EFAULT;
+ 		break;
+ 	case VHOST_SET_VRING_ADDR:
++		/* a 是 struct vhost_vring_addr */
+ 		if (copy_from_user(&a, argp, sizeof a)) {
+ 			r = -EFAULT;
+ 			break;
+@@ -1414,6 +1770,7 @@ long vhost_vring_ioctl(struct vhost_dev *d, unsigned int ioctl, void __user *arg
+ 			r = -EOPNOTSUPP;
+ 			break;
+ 		}
++		/* 下面的a是内核空间的 */
+ 		/* For 32bit, verify that the top 32bits of the user
+ 		   data are set to zero. */
+ 		if ((u64)(unsigned long)a.desc_user_addr != a.desc_user_addr ||
+@@ -1455,13 +1812,14 @@ long vhost_vring_ioctl(struct vhost_dev *d, unsigned int ioctl, void __user *arg
+ 			}
+ 		}
+ 
++		/* 就是一个赋值 和iotlb无关 */
+ 		vq->log_used = !!(a.flags & (0x1 << VHOST_VRING_F_LOG));
+ 		vq->desc = (void __user *)(unsigned long)a.desc_user_addr;
+ 		vq->avail = (void __user *)(unsigned long)a.avail_user_addr;
+ 		vq->log_addr = a.log_guest_addr;
+ 		vq->used = (void __user *)(unsigned long)a.used_user_addr;
+ 		break;
+-	case VHOST_SET_VRING_KICK:
++	case VHOST_SET_VRING_KICK: // 设置host notifier
+ 		if (copy_from_user(&f, argp, sizeof f)) {
+ 			r = -EFAULT;
+ 			break;
+@@ -1477,7 +1835,7 @@ long vhost_vring_ioctl(struct vhost_dev *d, unsigned int ioctl, void __user *arg
+ 		} else
+ 			filep = eventfp;
+ 		break;
+-	case VHOST_SET_VRING_CALL:
++	case VHOST_SET_VRING_CALL: // 设置guest notifier
+ 		if (copy_from_user(&f, argp, sizeof f)) {
+ 			r = -EFAULT;
+ 			break;
+@@ -1532,6 +1890,7 @@ long vhost_vring_ioctl(struct vhost_dev *d, unsigned int ioctl, void __user *arg
+ 	if (filep)
+ 		fput(filep);
+ 
++	/* 这里的poll是vq->poll */
+ 	if (pollstart && vq->handle_kick)
+ 		r = vhost_poll_start(&vq->poll, vq->kick);
+ 
+@@ -1543,6 +1902,13 @@ long vhost_vring_ioctl(struct vhost_dev *d, unsigned int ioctl, void __user *arg
+ }
+ EXPORT_SYMBOL_GPL(vhost_vring_ioctl);
+ 
++/*
++ * called only by vhost_net_set_features()
++ *
++ * 在VIRTIO_F_IOMMU_PLATFORM支持时才使用
++ *
++ * 似乎在qemu中默认是不支持的 (需要iommu_platform=true参数)
++ */
+ int vhost_init_device_iotlb(struct vhost_dev *d, bool enabled)
+ {
+ 	struct vhost_umem *niotlb, *oiotlb;
+@@ -1663,6 +2029,14 @@ static int set_bit_to_user(int nr, void __user *addr)
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - vhost_log_write()
++ *   - vhost_update_used_flags()
++ *   - vhost_update_avail_event()
++ *   - __vhost_add_used_n()
++ *   - vhost_add_used_n()
++ */
+ static int log_write(void __user *log_base,
+ 		     u64 write_address, u64 write_length)
+ {
+@@ -1689,6 +2063,9 @@ static int log_write(void __user *log_base,
+ 	return r;
+ }
+ 
++/*
++ * called only by handle_rx()
++ */
+ int vhost_log_write(struct vhost_virtqueue *vq, struct vhost_log *log,
+ 		    unsigned int log_num, u64 len)
+ {
+@@ -1714,9 +2091,11 @@ int vhost_log_write(struct vhost_virtqueue *vq, struct vhost_log *log,
+ }
+ EXPORT_SYMBOL_GPL(vhost_log_write);
+ 
++/* 把vq->used_flags写入vq->used->flags */
+ static int vhost_update_used_flags(struct vhost_virtqueue *vq)
+ {
+ 	void __user *used;
++	/* 把x拷贝到ptr, 在需要的时候先把ptr转换成qemu的userspace地址 */
+ 	if (vhost_put_user(vq, cpu_to_vhost16(vq, vq->used_flags),
+ 			   &vq->used->flags) < 0)
+ 		return -EFAULT;
+@@ -1734,8 +2113,10 @@ static int vhost_update_used_flags(struct vhost_virtqueue *vq)
+ 	return 0;
+ }
+ 
++/* 把vq->avail_idx放入vq->used->ring[vq->num] */
+ static int vhost_update_avail_event(struct vhost_virtqueue *vq, u16 avail_event)
+ {
++	/* 把vq->avail_idx放入vq->used->ring[vq->num] */
+ 	if (vhost_put_user(vq, cpu_to_vhost16(vq, vq->avail_idx),
+ 			   vhost_avail_event(vq)))
+ 		return -EFAULT;
+@@ -1765,6 +2146,7 @@ int vhost_vq_init_access(struct vhost_virtqueue *vq)
+ 
+ 	vhost_init_is_le(vq);
+ 
++	/* 把vq->used_flags写入vq->used->flags */
+ 	r = vhost_update_used_flags(vq);
+ 	if (r)
+ 		goto err;
+@@ -1789,6 +2171,11 @@ int vhost_vq_init_access(struct vhost_virtqueue *vq)
+ }
+ EXPORT_SYMBOL_GPL(vhost_vq_init_access);
+ 
++/*
++ * 把desc中的地址转换成qemu userspace的地址存放在iov中
++ *
++ * iov_size是从iov开始剩下可用的iov
++ */
+ static int translate_desc(struct vhost_virtqueue *vq, u64 addr, u32 len,
+ 			  struct iovec iov[], int iov_size, int access)
+ {
+@@ -1801,6 +2188,7 @@ static int translate_desc(struct vhost_virtqueue *vq, u64 addr, u32 len,
+ 
+ 	while ((u64)len > s) {
+ 		u64 size;
++		/* iov_size是从iov开始剩下可用的iov */
+ 		if (unlikely(ret >= iov_size)) {
+ 			ret = -ENOBUFS;
+ 			break;
+@@ -1820,7 +2208,9 @@ static int translate_desc(struct vhost_virtqueue *vq, u64 addr, u32 len,
+ 			break;
+ 		}
+ 
++		/* _iov是本地临时变量 指向iov+ret*/
+ 		_iov = iov + ret;
++		/* addr是desc的addr */
+ 		size = node->size - addr + node->start;
+ 		_iov->iov_len = min((u64)len - s, size);
+ 		_iov->iov_base = (void __user *)(unsigned long)
+@@ -1957,6 +2347,11 @@ static int get_indirect(struct vhost_virtqueue *vq,
+  * This function returns the descriptor number found, or vq->num (which is
+  * never a valid descriptor number) if none was found.  A negative code is
+  * returned on error. */
++/*
++ * 把desc中的信息拷贝到iov (地址会转换成qemu userspace的地址)
++ *
++ * iov_size的一种可能是ARRAY_SIZE(vq->iov)
++ */
+ int vhost_get_vq_desc(struct vhost_virtqueue *vq,
+ 		      struct iovec iov[], unsigned int iov_size,
+ 		      unsigned int *out_num, unsigned int *in_num,
+@@ -1972,12 +2367,15 @@ int vhost_get_vq_desc(struct vhost_virtqueue *vq,
+ 	/* Check it isn't doing very strange things with descriptor numbers. */
+ 	last_avail_idx = vq->last_avail_idx;
+ 
++	/* 其实一般来说vq->avail_idx应该比vq->last_avail_idx更新的 */
+ 	if (vq->avail_idx == vq->last_avail_idx) {
++		/* 把&vq->avail->idx放入avail_idx */
+ 		if (unlikely(vhost_get_avail(vq, avail_idx, &vq->avail->idx))) {
+ 			vq_err(vq, "Failed to access avail idx at %p\n",
+ 				&vq->avail->idx);
+ 			return -EFAULT;
+ 		}
++		/* ------------>>>>>>>>>>> 更新vq->avail_idx */
+ 		vq->avail_idx = vhost16_to_cpu(vq, avail_idx);
+ 
+ 		if (unlikely((u16)(vq->avail_idx - last_avail_idx) > vq->num)) {
+@@ -2000,6 +2398,7 @@ int vhost_get_vq_desc(struct vhost_virtqueue *vq,
+ 
+ 	/* Grab the next descriptor number they're advertising, and increment
+ 	 * the index we've seen. */
++	/* 在vq->avail->ring中获取desc head */
+ 	if (unlikely(vhost_get_avail(vq, ring_head,
+ 		     &vq->avail->ring[last_avail_idx & (vq->num - 1)]))) {
+ 		vq_err(vq, "Failed to read head: idx %d address %p\n",
+@@ -2008,6 +2407,7 @@ int vhost_get_vq_desc(struct vhost_virtqueue *vq,
+ 		return -EFAULT;
+ 	}
+ 
++	/* ring_head来自上面的vq->avail->ring中 */
+ 	head = vhost16_to_cpu(vq, ring_head);
+ 
+ 	/* If their number is silly, that's an error. */
+@@ -2024,18 +2424,23 @@ int vhost_get_vq_desc(struct vhost_virtqueue *vq,
+ 
+ 	i = head;
+ 	do {
++		/* 第一次进入的时候iov_count, in_num, out_num都是 0 */
+ 		unsigned iov_count = *in_num + *out_num;
+ 		if (unlikely(i >= vq->num)) {
+ 			vq_err(vq, "Desc index is %u > %u, head = %u",
+ 			       i, vq->num, head);
+ 			return -EINVAL;
+ 		}
++		/* 第一次进入的时候found也是 0 */
+ 		if (unlikely(++found > vq->num)) {
+ 			vq_err(vq, "Loop detected: last one at %u "
+ 			       "vq size %u head %u\n",
+ 			       i, vq->num, head);
+ 			return -EINVAL;
+ 		}
++		/*
++		 * desc是在本地申请的变量
++		 */
+ 		ret = vhost_copy_from_user(vq, &desc, vq->desc + i,
+ 					   sizeof desc);
+ 		if (unlikely(ret)) {
+@@ -2056,10 +2461,13 @@ int vhost_get_vq_desc(struct vhost_virtqueue *vq,
+ 			continue;
+ 		}
+ 
++		/* This marks a buffer as write-only (otherwise read-only). */
+ 		if (desc.flags & cpu_to_vhost16(vq, VRING_DESC_F_WRITE))
+ 			access = VHOST_ACCESS_WO;
+ 		else
+ 			access = VHOST_ACCESS_RO;
++		/* 第一次进入的时候iov_count是0 */
++		/* 把desc中的地址转换成qemu userspace的地址存放在iov中 */
+ 		ret = translate_desc(vq, vhost64_to_cpu(vq, desc.addr),
+ 				     vhost32_to_cpu(vq, desc.len), iov + iov_count,
+ 				     iov_size - iov_count, access);
+@@ -2088,7 +2496,7 @@ int vhost_get_vq_desc(struct vhost_virtqueue *vq,
+ 			}
+ 			*out_num += ret;
+ 		}
+-	} while ((i = next_desc(vq, &desc)) != -1);
++	} while ((i = next_desc(vq, &desc)) != -1); // ----> VRING_DESC_F_NEXT
+ 
+ 	/* On success, increment avail index. */
+ 	vq->last_avail_idx++;
+@@ -2172,6 +2580,7 @@ int vhost_add_used_n(struct vhost_virtqueue *vq, struct vring_used_elem *heads,
+ 
+ 	start = vq->last_used_idx & (vq->num - 1);
+ 	n = vq->num - start;
++	/* n是从当前last_used_idx到一处前的数目 */
+ 	if (n < count) {
+ 		r = __vhost_add_used_n(vq, heads, n);
+ 		if (r < 0)
+@@ -2214,6 +2623,10 @@ static bool vhost_notify(struct vhost_dev *dev, struct vhost_virtqueue *vq)
+ 	    unlikely(vq->avail_idx == vq->last_avail_idx))
+ 		return true;
+ 
++	/* The Guest publishes the used index for which it expects an interrupt
++	 * at the end of the avail ring. Host should ignore the avail->flags field. */
++	/* The Host publishes the avail index for which it expects a kick
++	 * at the end of the used ring. Guest should ignore the used->flags field. */
+ 	if (!vhost_has_feature(vq, VIRTIO_RING_F_EVENT_IDX)) {
+ 		__virtio16 flags;
+ 		if (vhost_get_avail(vq, flags, &vq->avail->flags)) {
+@@ -2238,6 +2651,7 @@ static bool vhost_notify(struct vhost_dev *dev, struct vhost_virtqueue *vq)
+ }
+ 
+ /* This actually signals the guest, using eventfd. */
++/* 根据情况用eventfd_signal()通知call_ctx */
+ void vhost_signal(struct vhost_dev *dev, struct vhost_virtqueue *vq)
+ {
+ 	/* Signal the Guest tell them we used something up. */
+@@ -2262,11 +2676,17 @@ void vhost_add_used_and_signal_n(struct vhost_dev *dev,
+ 				 struct vring_used_elem *heads, unsigned count)
+ {
+ 	vhost_add_used_n(vq, heads, count);
++	/* 根据情况用eventfd_signal()通知call_ctx */
+ 	vhost_signal(dev, vq);
+ }
+ EXPORT_SYMBOL_GPL(vhost_add_used_and_signal_n);
+ 
+ /* return true if we're sure that avaiable ring is empty */
++/*
++ * 判断vq->avail_idx是否等于vq->last_avail_idx
++ *   - vq->avail_idx是刚刚从ring buffer获得的index
++ *   - vq->last_avail_idx是上次使用到的index
++ */
+ bool vhost_vq_avail_empty(struct vhost_dev *dev, struct vhost_virtqueue *vq)
+ {
+ 	__virtio16 avail_idx;
+@@ -2275,6 +2695,7 @@ bool vhost_vq_avail_empty(struct vhost_dev *dev, struct vhost_virtqueue *vq)
+ 	if (vq->avail_idx != vq->last_avail_idx)
+ 		return false;
+ 
++	/* 从&vq->avail->idx拷贝到avail_idx, 在需要的时候先把ptr转换成qemu的userspace地址 */
+ 	r = vhost_get_avail(vq, avail_idx, &vq->avail->idx);
+ 	if (unlikely(r))
+ 		return false;
+@@ -2285,15 +2706,23 @@ bool vhost_vq_avail_empty(struct vhost_dev *dev, struct vhost_virtqueue *vq)
+ EXPORT_SYMBOL_GPL(vhost_vq_avail_empty);
+ 
+ /* OK, now we need to know about added descriptors. */
++/*
++ * 根据情况 去掉VRING_USED_F_NO_NOTIFY
++ * 如果不支持VIRTIO_RING_F_EVENT_IDX 把vq->used_flags写入vq->used->flags
++ */
+ bool vhost_enable_notify(struct vhost_dev *dev, struct vhost_virtqueue *vq)
+ {
+ 	__virtio16 avail_idx;
+ 	int r;
+ 
++	/* 如果没有设置VRING_USED_F_NO_NOTIFY 返回false 就不用enable了*/
+ 	if (!(vq->used_flags & VRING_USED_F_NO_NOTIFY))
+ 		return false;
++	/* 否则得话去掉VRING_USED_F_NO_NOTIFY */
+ 	vq->used_flags &= ~VRING_USED_F_NO_NOTIFY;
++	/* 如果不支持VIRTIO_RING_F_EVENT_IDX 把vq->used_flags写入vq->used->flags */
+ 	if (!vhost_has_feature(vq, VIRTIO_RING_F_EVENT_IDX)) {
++		/* 把vq->used_flags写入vq->used->flags */
+ 		r = vhost_update_used_flags(vq);
+ 		if (r) {
+ 			vq_err(vq, "Failed to enable notification at %p: %d\n",
+@@ -2323,6 +2752,7 @@ bool vhost_enable_notify(struct vhost_dev *dev, struct vhost_virtqueue *vq)
+ EXPORT_SYMBOL_GPL(vhost_enable_notify);
+ 
+ /* We don't need to be notified again. */
++/* 如果不支持VIRTIO_RING_F_EVENT_IDX 在vq->used->flags中通知guest VRING_USED_F_NO_NOTIFY */
+ void vhost_disable_notify(struct vhost_dev *dev, struct vhost_virtqueue *vq)
+ {
+ 	int r;
+@@ -2330,7 +2760,12 @@ void vhost_disable_notify(struct vhost_dev *dev, struct vhost_virtqueue *vq)
+ 	if (vq->used_flags & VRING_USED_F_NO_NOTIFY)
+ 		return;
+ 	vq->used_flags |= VRING_USED_F_NO_NOTIFY;
++	/* The Guest publishes the used index for which it expects an interrupt
++	 * at the end of the avail ring. Host should ignore the avail->flags field. */
++	/* The Host publishes the avail index for which it expects a kick
++	 * at the end of the used ring. Guest should ignore the used->flags field. */
+ 	if (!vhost_has_feature(vq, VIRTIO_RING_F_EVENT_IDX)) {
++		/* 把vq->used_flags写入vq->used->flags */
+ 		r = vhost_update_used_flags(vq);
+ 		if (r)
+ 			vq_err(vq, "Failed to enable notification at %p: %d\n",
+@@ -2340,6 +2775,9 @@ void vhost_disable_notify(struct vhost_dev *dev, struct vhost_virtqueue *vq)
+ EXPORT_SYMBOL_GPL(vhost_disable_notify);
+ 
+ /* Create a new message. */
++/*
++ * called only by vhost_iotlb_miss()
++ */
+ struct vhost_msg_node *vhost_new_msg(struct vhost_virtqueue *vq, int type)
+ {
+ 	struct vhost_msg_node *node = kmalloc(sizeof *node, GFP_KERNEL);
+@@ -2354,6 +2792,11 @@ struct vhost_msg_node *vhost_new_msg(struct vhost_virtqueue *vq, int type)
+ }
+ EXPORT_SYMBOL_GPL(vhost_new_msg);
+ 
++/*
++ * called by:
++ *   - vhost_chr_read_iter()
++ *   - vhost_iotlb_mis()
++ */
+ void vhost_enqueue_msg(struct vhost_dev *dev, struct list_head *head,
+ 		       struct vhost_msg_node *node)
+ {
+@@ -2365,6 +2808,11 @@ void vhost_enqueue_msg(struct vhost_dev *dev, struct list_head *head,
+ }
+ EXPORT_SYMBOL_GPL(vhost_enqueue_msg);
+ 
++/*
++ * called only by vhost_chr_read_iter()
++ *
++ * 从head中取出vhost_msg_node
++ */
+ struct vhost_msg_node *vhost_dequeue_msg(struct vhost_dev *dev,
+ 					 struct list_head *head)
+ {
+diff --git a/drivers/vhost/vhost.h b/drivers/vhost/vhost.h
+index 6c844b9..cff49b1 100644
+--- a/drivers/vhost/vhost.h
++++ b/drivers/vhost/vhost.h
+@@ -58,10 +58,10 @@ struct vhost_log {
+ struct vhost_umem_node {
+ 	struct rb_node rb;
+ 	struct list_head link;
+-	__u64 start;
++	__u64 start;            // 似乎是guest中的物理地址
+ 	__u64 last;
+ 	__u64 size;
+-	__u64 userspace_addr;
++	__u64 userspace_addr;   // 似乎是guest在qemu userspace的地址
+ 	__u32 perm;
+ 	__u32 flags_padding;
+ 	__u64 __subtree_last;
+@@ -69,7 +69,7 @@ struct vhost_umem_node {
+ 
+ struct vhost_umem {
+ 	struct rb_root_cached umem_tree;
+-	struct list_head umem_list;
++	struct list_head umem_list;  // 链接上面的struct vhost_umem_node
+ 	int numem;
+ };
+ 
+@@ -90,7 +90,7 @@ struct vhost_virtqueue {
+ 	struct vring_desc __user *desc;
+ 	struct vring_avail __user *avail;
+ 	struct vring_used __user *used;
+-	const struct vhost_umem_node *meta_iotlb[VHOST_NUM_ADDRS];
++	const struct vhost_umem_node *meta_iotlb[VHOST_NUM_ADDRS]; // VHOST_NUM_ADDRS定义在上面
+ 	struct file *kick;
+ 	struct eventfd_ctx *call_ctx;
+ 	struct eventfd_ctx *error_ctx;
+@@ -128,9 +128,9 @@ struct vhost_virtqueue {
+ 	struct iovec *indirect;
+ 	struct vring_used_elem *heads;
+ 	/* Protected by virtqueue mutex. */
+-	struct vhost_umem *umem;
++	struct vhost_umem *umem;  // 似乎vhost_dev和vhost_virtqueue指向的相同的umem
+ 	struct vhost_umem *iotlb;
+-	void *private_data;
++	void *private_data; // 存着tap的struct socket
+ 	u64 acked_features;
+ 	/* Log write descriptors */
+ 	void __user *log_base;
+@@ -143,7 +143,7 @@ struct vhost_virtqueue {
+ 	/* Ring endianness requested by userspace for cross-endian support. */
+ 	bool user_be;
+ #endif
+-	u32 busyloop_timeout;
++	u32 busyloop_timeout; /* 通过VHOST_SET_VRING_BUSYLOOP_TIMEOUT设置 */
+ };
+ 
+ struct vhost_msg_node {
+@@ -158,13 +158,18 @@ struct vhost_dev {
+ 	struct vhost_virtqueue **vqs;
+ 	int nvqs;
+ 	struct eventfd_ctx *log_ctx;
+-	struct llist_head work_list;
++	struct llist_head work_list;  // work_list的work被下面的worker处理
+ 	struct task_struct *worker;
+-	struct vhost_umem *umem;
+-	struct vhost_umem *iotlb;
++	struct vhost_umem *umem;  // iotlb和umem好像优先使用iotlb 似乎vhost_dev和vhost_virtqueue指向的相同的umem
++	/*
++	 * 在VIRTIO_F_IOMMU_PLATFORM支持时才使用
++	 *
++	 * 似乎在qemu中默认是不支持的 (需要iommu_platform=true参数)
++	 */
++	struct vhost_umem *iotlb; // iotlb和umem好像优先使用iotlb
+ 	spinlock_t iotlb_lock;
+-	struct list_head read_list;
+-	struct list_head pending_list;
++	struct list_head read_list;  // 由vhost_iotlb_miss()插入
++	struct list_head pending_list;  // 存放的vhost_msg_node 由vhost_chr_read_iter插入
+ 	wait_queue_head_t wait;
+ };
+ 
+diff --git a/drivers/vhost/vringh.c b/drivers/vhost/vringh.c
+index bb8971f..736773a 100644
+--- a/drivers/vhost/vringh.c
++++ b/drivers/vhost/vringh.c
+@@ -29,6 +29,7 @@ static __printf(1,2) __cold void vringh_bad(const char *fmt, ...)
+ }
+ 
+ /* Returns vring->num if empty, -ve on error. */
++/* 把vrh->vring.avail->ring中的下一个desc的index放入*last_avail_idx */
+ static inline int __vringh_get_head(const struct vringh *vrh,
+ 				    int (*getu16)(const struct vringh *vrh,
+ 						  u16 *val, const __virtio16 *p),
+@@ -37,6 +38,7 @@ static inline int __vringh_get_head(const struct vringh *vrh,
+ 	u16 avail_idx, i, head;
+ 	int err;
+ 
++	/* getu16的定义把*p拷入val */
+ 	err = getu16(vrh, &avail_idx, &vrh->vring.avail->idx);
+ 	if (err) {
+ 		vringh_bad("Failed to access avail idx at %p",
+@@ -77,6 +79,8 @@ static inline ssize_t vringh_iov_xfer(struct vringh_kiov *iov,
+ {
+ 	int err, done = 0;
+ 
++	/* 一个xfer的例子是xfer_kern() 就是把ptr拷贝到addr */
++
+ 	while (len && iov->i < iov->used) {
+ 		size_t partlen;
+ 
+@@ -470,6 +474,7 @@ static inline int __vringh_need_notify(struct vringh *vrh,
+ 				   &vrh->vring.avail->flags);
+ 			return err;
+ 		}
++		/* 如果配置了VRING_AVAIL_F_NO_INTERRUPT就不用通知guest */
+ 		return (!(flags & VRING_AVAIL_F_NO_INTERRUPT));
+ 	}
+ 
+diff --git a/include/uapi/linux/vhost.h b/include/uapi/linux/vhost.h
+index c51f8e5..e13a590 100644
+--- a/include/uapi/linux/vhost.h
++++ b/include/uapi/linux/vhost.h
+@@ -114,6 +114,7 @@ struct vhost_memory {
+ /* Memory writes can optionally be logged by setting bit at an offset
+  * (calculated from the physical address) from specified log base.
+  * The bit is set using an atomic 32 bit operation. */
++/* 用于guest在线迁移????? */
+ /* Set base address for logging. */
+ #define VHOST_SET_LOG_BASE _IOW(VHOST_VIRTIO, 0x04, __u64)
+ /* Specify an eventfd file descriptor to signal on log write. */
+@@ -148,8 +149,10 @@ struct vhost_memory {
+  * for events. */
+ 
+ /* Set eventfd to poll for added buffers */
++/* 设置host notifier */
+ #define VHOST_SET_VRING_KICK _IOW(VHOST_VIRTIO, 0x20, struct vhost_vring_file)
+ /* Set eventfd to signal when buffers have beed used */
++/* 设置guest notifier */
+ #define VHOST_SET_VRING_CALL _IOW(VHOST_VIRTIO, 0x21, struct vhost_vring_file)
+ /* Set eventfd to signal an error */
+ #define VHOST_SET_VRING_ERR _IOW(VHOST_VIRTIO, 0x22, struct vhost_vring_file)
+diff --git a/include/uapi/linux/virtio_config.h b/include/uapi/linux/virtio_config.h
+index 308e209..846cd32 100644
+--- a/include/uapi/linux/virtio_config.h
++++ b/include/uapi/linux/virtio_config.h
+@@ -70,5 +70,6 @@
+  * Note the reverse polarity (compared to most other features),
+  * this is for compatibility with legacy systems.
+  */
++/* 似乎用在iotlb */
+ #define VIRTIO_F_IOMMU_PLATFORM		33
+ #endif /* _UAPI_LINUX_VIRTIO_CONFIG_H */
+-- 
+2.7.4
+
