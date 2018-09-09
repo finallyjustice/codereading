@@ -1,0 +1,2495 @@
+From 4db7d86cabf2188b53141abf2cff29beb997cf27 Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang@oracle.com>
+Date: Sun, 9 Sep 2018 21:34:58 +0800
+Subject: [PATCH 1/1] intel iommu, irq, vfio and pci for 4.17.14
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ arch/x86/kernel/apic/vector.c       |   1 +
+ arch/x86/kernel/tboot.c             |   1 +
+ drivers/iommu/dmar.c                |  89 +++++
+ drivers/iommu/intel-iommu.c         | 669 +++++++++++++++++++++++++++++++++++-
+ drivers/iommu/intel_irq_remapping.c | 132 ++++++-
+ drivers/iommu/iommu.c               |  83 +++++
+ drivers/iommu/iova.c                |  18 +-
+ drivers/iommu/irq_remapping.c       |   1 +
+ include/linux/dmar.h                |   1 +
+ include/linux/iommu.h               |   8 +
+ lib/dma-direct.c                    |   3 +
+ 11 files changed, 985 insertions(+), 21 deletions(-)
+
+diff --git a/arch/x86/kernel/apic/vector.c b/arch/x86/kernel/apic/vector.c
+index b708f59..4db5675 100644
+--- a/arch/x86/kernel/apic/vector.c
++++ b/arch/x86/kernel/apic/vector.c
+@@ -809,6 +809,7 @@ static int apic_retrigger_irq(struct irq_data *irqd)
+ 	return 1;
+ }
+ 
++/* struct irq_chip intel_ir_chip.irq_ack = apic_ack_irq() */
+ void apic_ack_irq(struct irq_data *irqd)
+ {
+ 	irq_move_irq(irqd);
+diff --git a/arch/x86/kernel/tboot.c b/arch/x86/kernel/tboot.c
+index a2486f4..75325dc 100644
+--- a/arch/x86/kernel/tboot.c
++++ b/arch/x86/kernel/tboot.c
+@@ -520,6 +520,7 @@ struct acpi_table_header *tboot_get_dmar_table(struct acpi_table_header *dmar_tb
+ 	return dmar_tbl;
+ }
+ 
++/* 如果有CONFIG_INTEL_TXT会用如下函数 */
+ int tboot_force_iommu(void)
+ {
+ 	if (!tboot_enabled())
+diff --git a/drivers/iommu/dmar.c b/drivers/iommu/dmar.c
+index 460bed4..ddb212a 100644
+--- a/drivers/iommu/dmar.c
++++ b/drivers/iommu/dmar.c
+@@ -65,6 +65,9 @@ struct dmar_res_callback {
+  * 2) Use RCU in interrupt context
+  */
+ DECLARE_RWSEM(dmar_global_lock);
++/*
++ * 链接着所有的struct dmar_drhd_unit (有个field是intel_iommu指针)
++ */
+ LIST_HEAD(dmar_drhd_units);
+ 
+ struct acpi_table_header * __initdata dmar_tbl;
+@@ -76,6 +79,13 @@ static void free_iommu(struct intel_iommu *iommu);
+ 
+ extern const struct iommu_ops intel_iommu_ops;
+ 
++/*
++ * called only by dmar_parse_one_drhd()
++ *
++ * drhd中有一个field是intel_iommu的指针
++ *
++ * 把struct dmar_drhd_unit (有个field是intel_iommu指针)链入链表dmar_drhd_units
++ */
+ static void dmar_register_drhd_unit(struct dmar_drhd_unit *drhd)
+ {
+ 	/*
+@@ -88,6 +98,12 @@ static void dmar_register_drhd_unit(struct dmar_drhd_unit *drhd)
+ 		list_add_rcu(&drhd->list, &dmar_drhd_units);
+ }
+ 
++/*
++ * called by:
++ *   - dmar_parse_one_drhd()
++ *   - dmar_parse_one_rmrr()
++ *   - dmar_parse_one_atsr()
++ */
+ void *dmar_alloc_dev_scope(void *start, void *end, int *cnt)
+ {
+ 	struct acpi_dmar_device_scope *scope;
+@@ -369,6 +385,7 @@ static struct notifier_block dmar_pci_bus_nb = {
+ 	.priority = INT_MIN,
+ };
+ 
++/* 在dmar_drhd_units链表里搜索 */
+ static struct dmar_drhd_unit *
+ dmar_find_dmaru(struct acpi_dmar_hardware_unit *drhd)
+ {
+@@ -387,17 +404,27 @@ dmar_find_dmaru(struct acpi_dmar_hardware_unit *drhd)
+  * structure which uniquely represent one DMA remapping hardware unit
+  * present in the platform
+  */
++/*
++ * 非常主要的函数 初始化了unit的iommu!!
++ *
++ * used at 2 locations:
++ *   - ACPI_DMAR_TYPE_HARDWARE_UNIT的callback
++ *   - 在dmar_hotplug_insert()用到过
++ */
+ static int dmar_parse_one_drhd(struct acpi_dmar_header *header, void *arg)
+ {
+ 	struct acpi_dmar_hardware_unit *drhd;
+ 	struct dmar_drhd_unit *dmaru;
+ 	int ret;
+ 
++	/* struct acpi_dmar_hardware_unit开始包含了一个acpi_dmar_header */
+ 	drhd = (struct acpi_dmar_hardware_unit *)header;
++	/* 在dmar_drhd_units链表里搜索 */
+ 	dmaru = dmar_find_dmaru(drhd);
+ 	if (dmaru)
+ 		goto out;
+ 
++	/* 分配一个struct dmar_drhd_unit, 里面有一个struct intel_iommu指针 */
+ 	dmaru = kzalloc(sizeof(*dmaru) + header->length, GFP_KERNEL);
+ 	if (!dmaru)
+ 		return -ENOMEM;
+@@ -408,9 +435,11 @@ static int dmar_parse_one_drhd(struct acpi_dmar_header *header, void *arg)
+ 	 */
+ 	dmaru->hdr = (void *)(dmaru + 1);
+ 	memcpy(dmaru->hdr, header, header->length);
++	/* iommu寄存器的基地址 */
+ 	dmaru->reg_base_addr = drhd->address;
+ 	dmaru->segment = drhd->segment;
+ 	dmaru->include_all = drhd->flags & 0x1; /* BIT0: INCLUDE_ALL */
++	/* 分配了一些struct dmar_dev_scope */
+ 	dmaru->devices = dmar_alloc_dev_scope((void *)(drhd + 1),
+ 					      ((void *)drhd) + drhd->header.length,
+ 					      &dmaru->devices_cnt);
+@@ -419,6 +448,7 @@ static int dmar_parse_one_drhd(struct acpi_dmar_header *header, void *arg)
+ 		return -ENOMEM;
+ 	}
+ 
++	/* 非常重要的函数 为struct dmar_drhd_unit分配intel_iommu */
+ 	ret = alloc_iommu(dmaru);
+ 	if (ret) {
+ 		dmar_free_dev_scope(&dmaru->devices,
+@@ -426,6 +456,7 @@ static int dmar_parse_one_drhd(struct acpi_dmar_header *header, void *arg)
+ 		kfree(dmaru);
+ 		return ret;
+ 	}
++	/* 把struct dmar_drhd_unit (有个field是intel_iommu指针)链入链表dmar_drhd_units */
+ 	dmar_register_drhd_unit(dmaru);
+ 
+ out:
+@@ -539,6 +570,11 @@ dmar_table_print_dmar_entry(struct acpi_dmar_header *header)
+ /**
+  * dmar_table_detect - checks to see if the platform supports DMAR devices
+  */
++/*
++ * called by:
++ *   - parse_dmar_table()
++ *   - detect_intel_iommu()
++ */
+ static int __init dmar_table_detect(void)
+ {
+ 	acpi_status status = AE_OK;
+@@ -812,11 +848,18 @@ void __init dmar_register_bus_notifier(void)
+ }
+ 
+ 
++/*
++ * called by:
++ *   - intel_iommu_init()
++ *   - intel_prepare_irq_remapping()
++ */
+ int __init dmar_table_init(void)
+ {
++	/* 这个static变量只在dmar_table_init()改变! */
+ 	static int dmar_table_initialized;
+ 	int ret;
+ 
++	/* 这个static变量只在dmar_table_init()改变! */
+ 	if (dmar_table_initialized == 0) {
+ 		ret = parse_dmar_table();
+ 		if (ret < 0) {
+@@ -827,12 +870,14 @@ int __init dmar_table_init(void)
+ 			ret = -ENODEV;
+ 		}
+ 
++		/* 这个static变量只在dmar_table_init()改变! */
+ 		if (ret < 0)
+ 			dmar_table_initialized = ret;
+ 		else
+ 			dmar_table_initialized = 1;
+ 	}
+ 
++	/* 这个static变量只在dmar_table_init()改变! */
+ 	return dmar_table_initialized < 0 ? dmar_table_initialized : 0;
+ }
+ 
+@@ -870,6 +915,7 @@ dmar_validate_one_drhd(struct acpi_dmar_header *entry, void *arg)
+ 		return -EINVAL;
+ 	}
+ 
++	/* Hardware supported capabilities */
+ 	cap = dmar_readq(addr + DMAR_CAP_REG);
+ 	ecap = dmar_readq(addr + DMAR_ECAP_REG);
+ 
+@@ -886,6 +932,9 @@ dmar_validate_one_drhd(struct acpi_dmar_header *entry, void *arg)
+ 	return 0;
+ }
+ 
++/*
++ * 探测平台环境上是否有IOMMU硬件
++ */
+ int __init detect_intel_iommu(void)
+ {
+ 	int ret;
+@@ -933,6 +982,9 @@ static void unmap_iommu(struct intel_iommu *iommu)
+  * Memory map the iommu's registers.  Start w/ a single page, and
+  * possibly expand if that turns out to be insufficent.
+  */
++/*
++ * called only by alloc_iommu()
++ */
+ static int map_iommu(struct intel_iommu *iommu, u64 phys_addr)
+ {
+ 	int map_size, err=0;
+@@ -1016,6 +1068,16 @@ static void dmar_free_seq_id(struct intel_iommu *iommu)
+ 	}
+ }
+ 
++/*
++ * 除了AMD特别的部分, 仅仅被dmar_parse_one_drhd()调用
++ *
++ * The host platform may support one or more remapping hardware units. Each hardware unit
++ * supports remapping DMA requests originating within its hardware scope. For example, a
++ * desktop platform may expose a single remapping hardware unit that translates all DMA
++ * transactions at the memory controller hub (MCH) component. A server platform with one
++ * or more core components may support independent translation hardware units in each
++ * component.
++ */
+ static int alloc_iommu(struct dmar_drhd_unit *drhd)
+ {
+ 	struct intel_iommu *iommu;
+@@ -1024,6 +1086,7 @@ static int alloc_iommu(struct dmar_drhd_unit *drhd)
+ 	int msagaw = 0;
+ 	int err;
+ 
++	/* 此unit的iommu的寄存器基地址 */
+ 	if (!drhd->reg_base_addr) {
+ 		warn_invalid_dmar(0, "");
+ 		return -EINVAL;
+@@ -1039,6 +1102,9 @@ static int alloc_iommu(struct dmar_drhd_unit *drhd)
+ 		goto error;
+ 	}
+ 
++	/*
++	 * map这个iommu的寄存器 比如base, cap等
++	 */
+ 	err = map_iommu(iommu, drhd->reg_base_addr);
+ 	if (err) {
+ 		pr_err("Failed to map %s\n", iommu->name);
+@@ -1046,12 +1112,18 @@ static int alloc_iommu(struct dmar_drhd_unit *drhd)
+ 	}
+ 
+ 	err = -EINVAL;
++	/*
++	 * Adjusted Guest-Address Width (AGAW)
++	 */
+ 	agaw = iommu_calculate_agaw(iommu);
+ 	if (agaw < 0) {
+ 		pr_err("Cannot get a valid agaw for iommu (seq_id = %d)\n",
+ 			iommu->seq_id);
+ 		goto err_unmap;
+ 	}
++	/*
++	 * Supported Adjusted Guest-Address Width (SAGAW)
++	 */
+ 	msagaw = iommu_calculate_max_sagaw(iommu);
+ 	if (msagaw < 0) {
+ 		pr_err("Cannot get a valid max agaw for iommu (seq_id = %d)\n",
+@@ -1064,6 +1136,7 @@ static int alloc_iommu(struct dmar_drhd_unit *drhd)
+ 
+ 	iommu->node = -1;
+ 
++	/* Arch version supported by this IOMMU */
+ 	ver = readl(iommu->reg + DMAR_VER_REG);
+ 	pr_info("%s: reg_base_addr %llx ver %d:%d cap %llx ecap %llx\n",
+ 		iommu->name,
+@@ -1612,6 +1685,9 @@ static int dmar_fault_do_one(struct intel_iommu *iommu, int type,
+ }
+ 
+ #define PRIMARY_FAULT_REG_LEN (16)
++/*
++ * DMA Remapping 缺页的中断函数
++ */
+ irqreturn_t dmar_fault(int irq, void *dev_id)
+ {
+ 	struct intel_iommu *iommu = dev_id;
+@@ -1687,6 +1763,12 @@ irqreturn_t dmar_fault(int irq, void *dev_id)
+ 	return IRQ_HANDLED;
+ }
+ 
++/*
++ * called by:
++ *   - enable_drhd_fault_handling()
++ *   - init_dmars()
++ *   - intel_iommu_add()
++ */
+ int dmar_set_interrupt(struct intel_iommu *iommu)
+ {
+ 	int irq, ret;
+@@ -1697,6 +1779,9 @@ int dmar_set_interrupt(struct intel_iommu *iommu)
+ 	if (iommu->irq)
+ 		return 0;
+ 
++	/*
++	 * sequence id of the iommu
++	 */
+ 	irq = dmar_alloc_hwirq(iommu->seq_id, iommu->node, iommu);
+ 	if (irq > 0) {
+ 		iommu->irq = irq;
+@@ -1711,6 +1796,9 @@ int dmar_set_interrupt(struct intel_iommu *iommu)
+ 	return ret;
+ }
+ 
++/*
++ *  struct irq_remap_ops intel_irq_remap_ops.enable_faulting = enable_drhd_fault_handling()
++ */
+ int __init enable_drhd_fault_handling(void)
+ {
+ 	struct dmar_drhd_unit *drhd;
+@@ -2035,6 +2123,7 @@ static int dmar_device_hotplug(acpi_handle handle, bool insert)
+ 	return ret;
+ }
+ 
++/* called only by acpi_pci_root_add() */
+ int dmar_device_add(acpi_handle handle)
+ {
+ 	return dmar_device_hotplug(handle, true);
+diff --git a/drivers/iommu/intel-iommu.c b/drivers/iommu/intel-iommu.c
+index 6392a49..2b33df6 100644
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@ -53,6 +53,47 @@
+ 
+ #include "irq_remapping.h"
+ 
++/*
++ * Host平台上可能会存在一个或者多个DMA Remapping硬件单元, 而每个硬件单元支持在它管理的
++ * 设备范围内的所有设备的DMA Remapping. 例如, 你的台式机CPU Core i7 7700k在MCH中只集成
++ * 一个DMA Remapping硬件单元(IOMMU), 但在多路服务器上可能集成有多个DMA Remapping硬件单
++ * 元. 每个硬件单元负责管理挂载到它所在的PCIe Root Port下所有设备的DMA请求. BIOS会将平
++ * 台上的DMA Remapping硬件信息通过ACPI协议报告给操作系统, 再由操作系统来初始化和管理这
++ * 些硬件设备.
++ *
++ * 在多路服务器上我们可以有多个DMAR Unit (这里可以直接理解为多个IOMMU硬件), 每个DMAR会
++ * 负责处理其下挂载设备的DMA请求进行地址翻译. 例如, PCIE Root Port (dev:fun) (14:0)下面
++ * 挂载的所有设备的DMA请求由DMAR #1负责处理, PCIE Root Port (dev:fun) (14:1)下面挂载的
++ * 所有设备的DMA请求由DMAR #2负责处理, 而DMAR #3下挂载的是一个Root-Complex集成设备[29:0],
++ * 这个设备的DMA请求被DMAR #3承包, DMAR #4的情况比较复杂, 它负责处理Root-Complex集成设
++ * 备[30:0]以及I/OxAPIC设备的DMA请求.
++ *
++ * 这些和IOMMU相关的硬件拓扑信息需要BIOS通过ACPI表呈现给OS, 这样OS才能正确驱动IOMMU硬件工作。
++ */
++
++/*
++ * DRHD: DMA Remapping Hardware Unit Definition 用来描述DMAR Unit(IOMMU)的基本信息
++ *
++ * RMRR: Reserved Memory Region Reporting 用来描述那些保留的物理地址, 这段地址空间不被重映射
++ *
++ * ATSR: Root Port ATS Capability 仅限于有Device-TLB的情形, Root Port需要向OS报告支持ATS的能力
++ *
++ * RHSA: Remapping Hardware Static Affinity Remapping亲和性, 在有NUMA的系统下可以提升DMA Remapping的性能
++ */
++
++/*
++ * IOMMU硬件会截获直通设备发出的请求, 然后根据其Request ID查表找到对应的Address Translation Structure
++ * 即该Domain的IOMMU页表基地址, 这样一来该设备的DMA地址翻译就只会按这个Domain的IOMMU页表的方式进行翻译,
++ * 翻译后的HPA必然落在此Domain的地址空间内(这个过程由IOMMU硬件中自动完成), 而不会访问到其他Domain的地址
++ * 空间, 这样就达到了DMA隔离的目的.
++ */
++
++/*
++ * # acpidump -b
++ * # iasl -d dmar.dat
++ * # vim dmar.dsl
++ */
++
+ #define ROOT_SIZE		VTD_PAGE_SIZE
+ #define CONTEXT_SIZE		VTD_PAGE_SIZE
+ 
+@@ -172,6 +213,7 @@ static inline unsigned long virt_to_dma_pfn(void *p)
+ }
+ 
+ /* global iommu list, set NULL for ignored DMAR units */
++/* 数组是在init_dmars()上分配的 */
+ static struct intel_iommu **g_iommus;
+ 
+ static void __init check_tylersburg_isoch(void);
+@@ -194,12 +236,18 @@ struct root_entry {
+ 	u64	lo;
+ 	u64	hi;
+ };
++/*
++ * VT-d hardware uses 4KiB page size regardless of host page size.
++ *
++ * Used only by free_context_table()
++ */
+ #define ROOT_ENTRY_NR (VTD_PAGE_SIZE/sizeof(struct root_entry))
+ 
+ /*
+  * Take a root_entry and return the Lower Context Table Pointer (LCTP)
+  * if marked present.
+  */
++/* called only by copy_context_table() */
+ static phys_addr_t root_entry_lctp(struct root_entry *re)
+ {
+ 	if (!(re->lo & 1))
+@@ -212,6 +260,7 @@ static phys_addr_t root_entry_lctp(struct root_entry *re)
+  * Take a root_entry and return the Upper Context Table Pointer (UCTP)
+  * if marked present.
+  */
++/* called only by copy_context_table() */
+ static phys_addr_t root_entry_uctp(struct root_entry *re)
+ {
+ 	if (!(re->hi & 1))
+@@ -284,6 +333,11 @@ static inline void context_set_translation_type(struct context_entry *context,
+ 	context->lo |= (value & 3) << 2;
+ }
+ 
++/*
++ * called only by domain_context_mapping_one()
++ *
++ * 设置context entry的页表base
++ */
+ static inline void context_set_address_root(struct context_entry *context,
+ 					    unsigned long value)
+ {
+@@ -297,12 +351,19 @@ static inline void context_set_address_width(struct context_entry *context,
+ 	context->hi |= value & 7;
+ }
+ 
++/* called only by domain_context_mapping_one() */
+ static inline void context_set_domain_id(struct context_entry *context,
+ 					 unsigned long value)
+ {
+ 	context->hi |= (value & ((1 << 16) - 1)) << 8;
+ }
+ 
++/*
++ * called by:
++ *   - domain_context_mapping_one()
++ *   - domain_context_clear_one()
++ *   - copy_context_table()
++ */
+ static inline int context_domain_id(struct context_entry *c)
+ {
+ 	return((c->hi >> 8) & 0xffff);
+@@ -375,6 +436,7 @@ static int hw_pass_through = 1;
+ /* si_domain contains mulitple devices */
+ #define DOMAIN_FLAG_STATIC_IDENTITY	(1 << 1)
+ 
++/* 每个iommu unit引用这个domain的iommu_refcnt */
+ #define for_each_domain_iommu(idx, domain)			\
+ 	for (idx = 0; idx < g_num_of_iommus; idx++)		\
+ 		if (domain->iommu_refcnt[idx])
+@@ -382,7 +444,7 @@ static int hw_pass_through = 1;
+ struct dmar_domain {
+ 	int	nid;			/* node id */
+ 
+-	unsigned	iommu_refcnt[DMAR_UNITS_SUPPORTED];
++	unsigned	iommu_refcnt[DMAR_UNITS_SUPPORTED]; // 每个iommu unit引用这个domain的cnt
+ 					/* Refcount of devices per iommu */
+ 
+ 
+@@ -395,6 +457,10 @@ struct dmar_domain {
+ 	struct list_head devices;	/* all devices' list */
+ 	struct iova_domain iovad;	/* iova's that belong to this domain */
+ 
++	/*
++	 * iommu domain的root entry, 不是iommu的root
++	 * 在domain_init()分配
++	 */
+ 	struct dma_pte	*pgd;		/* virtual address */
+ 	int		gaw;		/* max guest address width */
+ 
+@@ -425,7 +491,7 @@ struct device_domain_info {
+ 	u8 pasid_enabled:1;
+ 	u8 pri_supported:1;
+ 	u8 pri_enabled:1;
+-	u8 ats_supported:1;
++	u8 ats_supported:1;  /* Address Translation Services */
+ 	u8 ats_enabled:1;
+ 	u8 ats_qdep;
+ 	struct device *dev; /* it's NULL for PCIe-to-PCI bridge */
+@@ -470,12 +536,17 @@ static void domain_context_clear(struct intel_iommu *iommu,
+ static int domain_detach_iommu(struct dmar_domain *domain,
+ 			       struct intel_iommu *iommu);
+ 
++/*
++ * 如果intel_iommu=on, dmar_disabled = 0
++ * 如果intel_iommu=off, dmar_disabled = 1
++ */
+ #ifdef CONFIG_INTEL_IOMMU_DEFAULT_ON
+ int dmar_disabled = 0;
+ #else
+ int dmar_disabled = 1;
+ #endif /*CONFIG_INTEL_IOMMU_DEFAULT_ON*/
+ 
++/* 在intel_iommu_init()设置成1 */
+ int intel_iommu_enabled = 0;
+ EXPORT_SYMBOL_GPL(intel_iommu_enabled);
+ 
+@@ -483,7 +554,7 @@ static int dmar_map_gfx = 1;
+ static int dmar_forcedac;
+ static int intel_iommu_strict;
+ static int intel_iommu_superpage = 1;
+-static int intel_iommu_ecs = 1;
++static int intel_iommu_ecs = 1;  // 是否支持extended context table, 如果intel_iommu=ecs_off就一定是0
+ static int intel_iommu_pasid28;
+ static int iommu_identity_mapping;
+ 
+@@ -535,6 +606,10 @@ static void clear_translation_pre_enabled(struct intel_iommu *iommu)
+ 	iommu->flags &= ~VTD_FLAG_TRANS_PRE_ENABLED;
+ }
+ 
++/*
++ * 对于intel, 只被init_dmars()调用
++ * 对于amd, 只被init_iommu_one()调用
++ */
+ static void init_translation_status(struct intel_iommu *iommu)
+ {
+ 	u32 gsts;
+@@ -550,6 +625,9 @@ static struct dmar_domain *to_dmar_domain(struct iommu_domain *dom)
+ 	return container_of(dom, struct dmar_domain, domain);
+ }
+ 
++/*
++ * 在下面用来解析"intel_iommu="
++ */
+ static int __init intel_iommu_setup(char *str)
+ {
+ 	if (!str)
+@@ -707,6 +785,9 @@ static int __iommu_calculate_agaw(struct intel_iommu *iommu, int max_gaw)
+ /*
+  * Calculate max SAGAW for each iommu.
+  */
++/*
++ * Supported Adjusted Guest-Address Width (SAGAW)
++ */
+ int iommu_calculate_max_sagaw(struct intel_iommu *iommu)
+ {
+ 	return __iommu_calculate_agaw(iommu, MAX_AGAW_WIDTH);
+@@ -717,18 +798,31 @@ int iommu_calculate_max_sagaw(struct intel_iommu *iommu)
+  * "SAGAW" may be different across iommus, use a default agaw, and
+  * get a supported less agaw for iommus that don't support the default agaw.
+  */
++/*
++ * Adjusted Guest-Address Width (AGAW)
++ * Supported Adjusted Guest-Address Width (SAGAW)
++ */
+ int iommu_calculate_agaw(struct intel_iommu *iommu)
+ {
+ 	return __iommu_calculate_agaw(iommu, DEFAULT_DOMAIN_ADDRESS_WIDTH);
+ }
+ 
+ /* This functionin only returns single iommu in a domain */
++/*
++ * called by:
++ *   - __intel_map_single()
++ *   - intel_unmap()
++ *   - intel_map_sg()
++ *
++ * 把一个struct dmar_domain转换成struct intel_iommu: 最终还是通过g_iommus
++ */
+ static struct intel_iommu *domain_get_iommu(struct dmar_domain *domain)
+ {
+ 	int iommu_id;
+ 
+ 	/* si_domain and vm domain should not get here. */
+ 	BUG_ON(domain_type_is_vm_or_si(domain));
++	/* 对于每一个iommu的idx, 查看domain->iommu_refcnt[idx]是否为 0 */
+ 	for_each_domain_iommu(iommu_id, domain)
+ 		break;
+ 
+@@ -768,6 +862,12 @@ static void domain_update_iommu_coherency(struct dmar_domain *domain)
+ 	rcu_read_unlock();
+ }
+ 
++/*
++ * called by:
++ *   - domain_update_iommu_cap()
++ *   - intel_iommu_add()
++ *   - intel_iommu_capable()
++ */
+ static int domain_update_iommu_snooping(struct intel_iommu *skip)
+ {
+ 	struct dmar_drhd_unit *drhd;
+@@ -788,6 +888,11 @@ static int domain_update_iommu_snooping(struct intel_iommu *skip)
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - domain_update_iommu_cap()
++ *   - intel_iommu_add()
++ */
+ static int domain_update_iommu_superpage(struct intel_iommu *skip)
+ {
+ 	struct dmar_drhd_unit *drhd;
+@@ -820,14 +925,42 @@ static void domain_update_iommu_cap(struct dmar_domain *domain)
+ 	domain->iommu_superpage = domain_update_iommu_superpage(NULL);
+ }
+ 
++/*
++ * called by:
++ *   - device_context_mapped()
++ *   - free_context_table() --> 两次
++ *   - domain_context_mapping_one()
++ *   - domain_context_clear_one()
++ *   - intel_iommu_enable_pasid()
++ *
++ * 根据bus, dev和func号 获取对于context entry的地址
++ */
+ static inline struct context_entry *iommu_context_addr(struct intel_iommu *iommu,
+ 						       u8 bus, u8 devfn, int alloc)
+ {
++	/* 根据bus号从root entry table中获取相应entry */
+ 	struct root_entry *root = &iommu->root_entry[bus];
+ 	struct context_entry *context;
+ 	u64 *entry;
+ 
++	/* 根据root table entry获取其指向的context entry table */
+ 	entry = &root->lo;
++	/*
++	 * For implementations supporting Extended-Context-Support (ECS=1 in Extended
++	 * Capability Register), the Root Table Address Register (RTADDR_REG) points to
++	 * an extended-root-table when Root-Table-Type field in the Register is Set (RTT=1).
++	 *
++	 * For implementations supporting Extended-Context-Support (ECS=1 in Extended
++	 * Capability Register), when using extended-root-table, each extended-root-entry
++	 * references a lower-context-table and a upper-context-table.
++	 *
++	 * The lower-context-table is 4-Kbye in size and contains 128-extended-context-entries
++	 * corresponding to PCI functions in device range 0-15 on the bus.
++	 *
++	 * The upper-context-table is also 4-Kbyte in size and contains 128
++	 * extended-context-entries corresponding to PCI functions in device range 16-21 on
++	 * the bus.
++	 */
+ 	if (ecs_enabled(iommu)) {
+ 		if (devfn >= 0x80) {
+ 			devfn -= 0x80;
+@@ -851,6 +984,7 @@ static inline struct context_entry *iommu_context_addr(struct intel_iommu *iommu
+ 		*entry = phy_addr | 1;
+ 		__iommu_flush_cache(iommu, entry, sizeof(*entry));
+ 	}
++	/* 根据devfn, 返回context entry table中的entry */
+ 	return &context[devfn];
+ }
+ 
+@@ -859,6 +993,20 @@ static int iommu_dummy(struct device *dev)
+ 	return dev->archdata.iommu == DUMMY_DEVICE_DOMAIN_INFO;
+ }
+ 
++/*
++ * called by
++ *   - domain_context_mapped() 2次
++ *   - find_or_alloc_domain()
++ *   - set_domain_for_dev()
++ *   - domain_add_dev_info()
++ *   - intel_iommu_attach_device()
++ *   - intel_iommu_add_device()
++ *   - intel_iommu_remove_device()
++ *   - intel_svm_device_to_iommu()
++ *
++ * 遍历所有dmar_drhd_units链表中的iommu hardware unit 寻找满足某种条件的iommu
++ * 其实就是返回device所属的iommu
++ */
+ static struct intel_iommu *device_to_iommu(struct device *dev, u8 *bus, u8 *devfn)
+ {
+ 	struct dmar_drhd_unit *drhd = NULL;
+@@ -891,6 +1039,7 @@ static struct intel_iommu *device_to_iommu(struct device *dev, u8 *bus, u8 *devf
+ 		dev = &ACPI_COMPANION(dev)->dev;
+ 
+ 	rcu_read_lock();
++	/* 遍历所有dmar_drhd_units链表中的iommu hardware unit */
+ 	for_each_active_iommu(iommu, drhd) {
+ 		if (pdev && segment != drhd->segment)
+ 			continue;
+@@ -941,6 +1090,10 @@ static void domain_flush_cache(struct dmar_domain *domain,
+ 		clflush_cache_range(addr, size);
+ }
+ 
++/*
++ * root entry中存着bus number的指针
++ * context entry中存折dev和fn组合的指针
++ */
+ static int device_context_mapped(struct intel_iommu *iommu, u8 bus, u8 devfn)
+ {
+ 	struct context_entry *context;
+@@ -955,6 +1108,9 @@ static int device_context_mapped(struct intel_iommu *iommu, u8 bus, u8 devfn)
+ 	return ret;
+ }
+ 
++/*
++ * called only by free_dmar_iommu()
++ */
+ static void free_context_table(struct intel_iommu *iommu)
+ {
+ 	int i;
+@@ -966,6 +1122,7 @@ static void free_context_table(struct intel_iommu *iommu)
+ 		goto out;
+ 	}
+ 	for (i = 0; i < ROOT_ENTRY_NR; i++) {
++		/* 根据bus, dev和func号 获取对于context entry的地址 */
+ 		context = iommu_context_addr(iommu, i, 0, 0);
+ 		if (context)
+ 			free_pgtable_page(context);
+@@ -984,6 +1141,12 @@ static void free_context_table(struct intel_iommu *iommu)
+ 	spin_unlock_irqrestore(&iommu->lock, flags);
+ }
+ 
++/*
++ * called by:
++ *   - __domain_mapping()
++ *   - intel_iommu_unmap()
++ *   - intel_iommu_iova_to_phys()
++ */
+ static struct dma_pte *pfn_to_dma_pte(struct dmar_domain *domain,
+ 				      unsigned long pfn, int *target_level)
+ {
+@@ -1250,6 +1413,13 @@ static struct page *dma_pte_clear_level(struct dmar_domain *domain, int level,
+ /* We can't just free the pages because the IOMMU may still be walking
+    the page tables, and may have cached the intermediate levels. The
+    pages can only be freed after the IOTLB flush has been done. */
++/*
++ * called by:
++ *   - domain_exit()
++ *   - intel_unmap()
++ *   - intel_iommu_memory_notifier()
++ *   - intel_iommu_unmap()
++ */
+ static struct page *domain_unmap(struct dmar_domain *domain,
+ 				 unsigned long start_pfn,
+ 				 unsigned long last_pfn)
+@@ -1294,11 +1464,20 @@ static void iova_entry_free(unsigned long data)
+ }
+ 
+ /* iommu handling */
++/*
++ * called by:
++ *   - init_dmars()
++ *   - intel_iommu_add()
++ *
++ * 为当前iommu (unit)分配第一层的root_entry (里面存着bus entry) 虚拟地址
++ * 在别的地方会用iommu_set_root_entry()写入寄存器
++ */
+ static int iommu_alloc_root_entry(struct intel_iommu *iommu)
+ {
+ 	struct root_entry *root;
+ 	unsigned long flags;
+ 
++	/* 分配一个page (order=0), 返回虚拟地址 */
+ 	root = (struct root_entry *)alloc_pgtable_page(iommu->node);
+ 	if (!root) {
+ 		pr_err("Allocating root entry for %s failed\n",
+@@ -1315,6 +1494,34 @@ static int iommu_alloc_root_entry(struct intel_iommu *iommu)
+ 	return 0;
+ }
+ 
++/*
++ * DMAR_RTADDR_REG: Root entry table
++ *
++ * The root-table functions as the top level structure to map devices to their
++ * respective domains. The location of the root-table in system memory is programmed
++ * through the Root Table Address Register. The root-table is 4-KByte in size and
++ * contains 256 root-entries to cover the PCI bus number space (0-255).
++ *
++ * The bus number (upper 8-bits) encoded in a request's source-id field is used to
++ * index into the root-entry structure.
++ *
++ * The Root Entry contains the Context-table pointer, which references the
++ * context-table for devices on the bus identified by the root-entry.
++ *
++ * The Extended Root Entry has has more fields than Root Entry:
++ *   - Lower Present Flag
++ *   - Lower Context-table pointer
++ *   - Upper Present flag
++ *   - Upper Context-table pointer
++ *
++ *
++ * Called by:
++ *   - init_dmars()
++ *   - init_iommu_hw()
++ *   - intel_iommu_add()
++ *
++ * 把iommu的root table的地址写入DMAR_RTADDR_REG: Root entry table
++ */
+ static void iommu_set_root_entry(struct intel_iommu *iommu)
+ {
+ 	u64 addr;
+@@ -1641,6 +1848,18 @@ static void iommu_disable_protect_mem_regions(struct intel_iommu *iommu)
+ 	raw_spin_unlock_irqrestore(&iommu->register_lock, flags);
+ }
+ 
++/*
++ * DMA_GCMD_TE: Software writes to this field to request hardware to
++ *              enable/disable DMA remapping
++ *
++ * 0: Disable DMA remapping
++ * 1: Enable DMA remapping
++ *
++ * called by:
++ *   - init_dmars()
++ *   - init_iommu_hw()
++ *   - intel_iommu_add()
++ */
+ static void iommu_enable_translation(struct intel_iommu *iommu)
+ {
+ 	u32 sts;
+@@ -1657,6 +1876,14 @@ static void iommu_enable_translation(struct intel_iommu *iommu)
+ 	raw_spin_unlock_irqrestore(&iommu->register_lock, flags);
+ }
+ 
++/*
++ * called by:
++ *   - disable_dmar_iommu()
++ *   - init_dmars() 两次
++ *   - iommu_suspend()
++ *   - intel_iommu_add()
++ *   - intel_disable_iommus()
++ */
+ static void iommu_disable_translation(struct intel_iommu *iommu)
+ {
+ 	u32 sts;
+@@ -1674,18 +1901,31 @@ static void iommu_disable_translation(struct intel_iommu *iommu)
+ }
+ 
+ 
++/*
++ * called by:
++ *   - init_dmars()
++ *   - intel_iommu_add()
++ *
++ * 初始化intel_iommu的二维(struct dmar_domain *)数组
++ */
+ static int iommu_init_domains(struct intel_iommu *iommu)
+ {
+ 	u32 ndomains, nlongs;
+ 	size_t size;
+ 
++	/* 获取该iommu unit支持的最大domain数目 */
+ 	ndomains = cap_ndoms(iommu->cap);
+ 	pr_debug("%s: Number of Domains supported <%d>\n",
+ 		 iommu->name, ndomains);
++	/*
++	 * ndomains是bit
++	 * nlongs是数目
++	 */
+ 	nlongs = BITS_TO_LONGS(ndomains);
+ 
+ 	spin_lock_init(&iommu->lock);
+ 
++	/* 分配 bitmap of domains */
+ 	iommu->domain_ids = kcalloc(nlongs, sizeof(unsigned long), GFP_KERNEL);
+ 	if (!iommu->domain_ids) {
+ 		pr_err("%s: Allocating domain id array failed\n",
+@@ -1693,7 +1933,15 @@ static int iommu_init_domains(struct intel_iommu *iommu)
+ 		return -ENOMEM;
+ 	}
+ 
++	/*
++	 * iommu->domains是三维数组
++	 *
++	 * 其实一共两维 第二维存的指针 (struct dmar_domain *)
++	 *
++	 * 第一维指向若干indirect内存 indirect内存有256个 (struct dmar_domain *)
++	 */
+ 	size = (ALIGN(ndomains, 256) >> 8) * sizeof(struct dmar_domain **);
++	/* struct dmar_domain ***domains; */
+ 	iommu->domains = kzalloc(size, GFP_KERNEL);
+ 
+ 	if (iommu->domains) {
+@@ -1793,10 +2041,76 @@ static void free_dmar_iommu(struct intel_iommu *iommu)
+ #endif
+ }
+ 
++/*
++ * alloc_domain()的几个例子
++ *
++ * [    0.328140]  alloc_domain
++ * [    0.328140]  find_or_alloc_domain.constprop
++ * [    0.328140]  iommu_prepare_identity_map
++ * [    0.328140]  intel_iommu_init
++ * [    0.328140]  pci_iommu_init
++ * [    0.328140]  do_one_initcall
++ * [    0.328140]  kernel_init_freeable
++ * [    0.328140]  kernel_init
++ * [    0.328140]  ret_from_fork
++ *
++ * [    0.407810]  alloc_domain
++ * [    0.407810]  find_or_alloc_domain.constprop
++ * [    0.407810]  get_valid_domain_for_dev
++ * [    0.407810]  __intel_map_single
++ * [    0.407810]  intel_alloc_coherent
++ * [    0.407810]  dmam_alloc_coherent
++ * [    0.407810]  ahci_port_start
++ * [    0.407810]  ata_host_start.part.36
++ * [    0.407810]  ata_host_activate
++ * [    0.407810]  ahci_init_one
++ * [    0.407810]  local_pci_probe
++ * [    0.407810]  pci_device_probe
++ * [    0.407810]  driver_probe_device
++ * [    0.407810]  __driver_attach
++ * [    0.407810]  bus_for_each_dev
++ * [    0.407810]  bus_add_driver
++ * [    0.407810]  driver_register
++ * [    0.407810]  do_one_initcall
++ * [    0.407810]  kernel_init_freeable
++ * [    0.407810]  kernel_init
++ * [    0.407810]  ret_from_fork
++ *
++ * [    4.233537]  alloc_domain
++ * [    4.233539]  find_or_alloc_domain.constprop
++ * [    4.233541]  get_valid_domain_for_dev
++ * [    4.233543]  __intel_map_single
++ * [    4.233544]  intel_alloc_coherent
++ * [    4.233547]  e1000e_setup_tx_resources
++ * [    4.233548]  e1000e_open
++ * [    4.233550]  __dev_open
++ * [    4.233552]  __dev_change_flags
++ * [    4.233554]  dev_change_flags
++ * [    4.233555]  do_setlink
++ * [    4.233566]  rtnl_newlink
++ * [    4.233571]  rtnetlink_rcv_msg
++ * [    4.233576]  netlink_rcv_skb
++ * [    4.233578]  netlink_unicast
++ * [    4.233579]  netlink_sendmsg
++ * [    4.233581]  sock_sendmsg
++ * [    4.233582]  ___sys_sendmsg
++ * [    4.233592]  __sys_sendmsg
++ * [    4.233594]  do_syscall_64
++ * [    4.233597]  entry_SYSCALL_64_after_hwframe
++ */
++/*
++ * called by:
++ *   - find_or_alloc_domain()
++ *   - si_domain_init()
++ *   - intel_iommu_domain_alloc()
++ *
++ * 在qemu模拟的vIOMMU上, e1000和sata/ata用的不是同一个domain
++ */
+ static struct dmar_domain *alloc_domain(int flags)
+ {
+ 	struct dmar_domain *domain;
+ 
++	/* 通过kmem cache分配 */
+ 	domain = alloc_domain_mem();
+ 	if (!domain)
+ 		return NULL;
+@@ -1811,6 +2125,9 @@ static struct dmar_domain *alloc_domain(int flags)
+ }
+ 
+ /* Must be called with iommu->lock */
++/*
++ * called only by dmar_insert_one_dev_info()
++ */
+ static int domain_attach_iommu(struct dmar_domain *domain,
+ 			       struct intel_iommu *iommu)
+ {
+@@ -1870,6 +2187,9 @@ static int domain_detach_iommu(struct dmar_domain *domain,
+ static struct iova_domain reserved_iova_list;
+ static struct lock_class_key reserved_rbtree_key;
+ 
++/*
++ * called only by intel_iommu_init()
++ */
+ static int dmar_init_reserved_ranges(void)
+ {
+ 	struct pci_dev *pdev = NULL;
+@@ -1882,6 +2202,7 @@ static int dmar_init_reserved_ranges(void)
+ 		&reserved_rbtree_key);
+ 
+ 	/* IOAPIC ranges shouldn't be accessed by DMA */
++	/* 预留IOAPIC_RANGE_START和IOAPIC_RANGE_END一段 */
+ 	iova = reserve_iova(&reserved_iova_list, IOVA_PFN(IOAPIC_RANGE_START),
+ 		IOVA_PFN(IOAPIC_RANGE_END));
+ 	if (!iova) {
+@@ -1928,6 +2249,9 @@ static inline int guestwidth_to_adjustwidth(int gaw)
+ 	return agaw;
+ }
+ 
++/*
++ * called only by find_or_alloc_domain()
++ */
+ static int domain_init(struct dmar_domain *domain, struct intel_iommu *iommu,
+ 		       int guest_width)
+ {
+@@ -1978,6 +2302,9 @@ static int domain_init(struct dmar_domain *domain, struct intel_iommu *iommu,
+ 	domain->nid = iommu->node;
+ 
+ 	/* always allocate the top pgd */
++	/*
++	 * 这里分配的pgd 不是iommu那个256个bus entry的root
++	 */
+ 	domain->pgd = (struct dma_pte *)alloc_pgtable_page(domain->nid);
+ 	if (!domain->pgd)
+ 		return -ENOMEM;
+@@ -2008,6 +2335,14 @@ static void domain_exit(struct dmar_domain *domain)
+ 	free_domain_mem(domain);
+ }
+ 
++/*
++ * called by:
++ *   - domain_context_mapping_cb()
++ *   - domain_context_mapping()
++ *
++ * 每个domain一个context, bus:devfn可能共享一些domain
++ * 这里为某个bus:devfn设置某个已有的domain的页表
++ */
+ static int domain_context_mapping_one(struct dmar_domain *domain,
+ 				      struct intel_iommu *iommu,
+ 				      u8 bus, u8 devfn)
+@@ -2034,6 +2369,7 @@ static int domain_context_mapping_one(struct dmar_domain *domain,
+ 	spin_lock(&iommu->lock);
+ 
+ 	ret = -ENOMEM;
++	/* 根据bus, dev和func号 获取对于context entry的地址 */
+ 	context = iommu_context_addr(iommu, bus, devfn, 1);
+ 	if (!context)
+ 		goto out_unlock;
+@@ -2087,6 +2423,7 @@ static int domain_context_mapping_one(struct dmar_domain *domain,
+ 		else
+ 			translation = CONTEXT_TT_MULTI_LEVEL;
+ 
++		/* 设置context entry的页表base */
+ 		context_set_address_root(context, virt_to_phys(pgd));
+ 		context_set_address_width(context, iommu->agaw);
+ 	} else {
+@@ -2143,6 +2480,9 @@ static int domain_context_mapping_cb(struct pci_dev *pdev,
+ 					  PCI_BUS_NUM(alias), alias & 0xff);
+ }
+ 
++/*
++ * called only by dmar_insert_one_dev_info()
++ */
+ static int
+ domain_context_mapping(struct dmar_domain *domain, struct device *dev)
+ {
+@@ -2224,6 +2564,9 @@ static inline int hardware_largepage_caps(struct dmar_domain *domain,
+ 	return level;
+ }
+ 
++/*
++ * 先假设iov_pfn和phys_pfn都是基于4k吧
++ */
+ static int __domain_mapping(struct dmar_domain *domain, unsigned long iov_pfn,
+ 			    struct scatterlist *sg, unsigned long phys_pfn,
+ 			    unsigned long nr_pages, int prot)
+@@ -2249,6 +2592,10 @@ static int __domain_mapping(struct dmar_domain *domain, unsigned long iov_pfn,
+ 	while (nr_pages > 0) {
+ 		uint64_t tmp;
+ 
++		/*
++		 * 上面若sg为NULL, sg_res = nr_pages
++		 * pteval = ((phys_addr_t)phys_pfn << VTD_PAGE_SHIFT) | prot;
++		 */
+ 		if (!sg_res) {
+ 			unsigned int pgoff = sg->offset & ~PAGE_MASK;
+ 
+@@ -2259,6 +2606,9 @@ static int __domain_mapping(struct dmar_domain *domain, unsigned long iov_pfn,
+ 			phys_pfn = pteval >> VTD_PAGE_SHIFT;
+ 		}
+ 
++		/*
++		 * pte一开始是NULL
++		 */
+ 		if (!pte) {
+ 			largepage_lvl = hardware_largepage_caps(domain, iov_pfn, phys_pfn, sg_res);
+ 
+@@ -2346,6 +2696,12 @@ static inline int domain_sg_mapping(struct dmar_domain *domain, unsigned long io
+ 	return __domain_mapping(domain, iov_pfn, sg, 0, nr_pages, prot);
+ }
+ 
++/*
++ * called by:
++ *   - iommu_domain_identity_map()
++ *   - __intel_map_single()
++ *   - intel_iommu_map() = intel_iommu_ops.map
++ */
+ static inline int domain_pfn_mapping(struct dmar_domain *domain, unsigned long iov_pfn,
+ 				     unsigned long phys_pfn, unsigned long nr_pages,
+ 				     int prot)
+@@ -2432,12 +2788,20 @@ dmar_search_domain_by_dev_info(int segment, int bus, int devfn)
+ 	return NULL;
+ }
+ 
++/*
++ * called by:
++ *   - set_domain_for_dev() 两次
++ *   - domain_add_dev_info()
++ *
++ * 把bus:devfn代表的dev添加到domain
++ */
+ static struct dmar_domain *dmar_insert_one_dev_info(struct intel_iommu *iommu,
+ 						    int bus, int devfn,
+ 						    struct device *dev,
+ 						    struct dmar_domain *domain)
+ {
+ 	struct dmar_domain *found = NULL;
++	/* PCI domain-device relationship */
+ 	struct device_domain_info *info;
+ 	unsigned long flags;
+ 	int ret;
+@@ -2446,13 +2810,14 @@ static struct dmar_domain *dmar_insert_one_dev_info(struct intel_iommu *iommu,
+ 	if (!info)
+ 		return NULL;
+ 
+-	info->bus = bus;
+-	info->devfn = devfn;
++	/* info是PCI domain-device relationship, 类似一个one-one mapping*/
++	info->bus = bus;  // bus number
++	info->devfn = devfn; // dev fn number
+ 	info->ats_supported = info->pasid_supported = info->pri_supported = 0;
+ 	info->ats_enabled = info->pasid_enabled = info->pri_enabled = 0;
+ 	info->ats_qdep = 0;
+-	info->dev = dev;
+-	info->domain = domain;
++	info->dev = dev; // struct device
++	info->domain = domain; // struct dmar_domain
+ 	info->iommu = iommu;
+ 
+ 	if (dev && dev_is_pci(dev)) {
+@@ -2461,6 +2826,7 @@ static struct dmar_domain *dmar_insert_one_dev_info(struct intel_iommu *iommu,
+ 		if (ecap_dev_iotlb_support(iommu->ecap) &&
+ 		    pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_ATS) &&
+ 		    dmar_find_matched_atsr_unit(pdev))
++			/* Address Translation Services */
+ 			info->ats_supported = 1;
+ 
+ 		if (ecs_enabled(iommu)) {
+@@ -2482,6 +2848,7 @@ static struct dmar_domain *dmar_insert_one_dev_info(struct intel_iommu *iommu,
+ 
+ 	if (!found) {
+ 		struct device_domain_info *info2;
++		/* 在链表device_domain_list中搜索 */
+ 		info2 = dmar_search_domain_by_dev_info(iommu->segment, bus, devfn);
+ 		if (info2) {
+ 			found      = info2->domain;
+@@ -2507,6 +2874,7 @@ static struct dmar_domain *dmar_insert_one_dev_info(struct intel_iommu *iommu,
+ 	}
+ 
+ 	list_add(&info->link, &domain->devices);
++	/* 上面在device_domain_list搜索不到, 这里链接进去 */
+ 	list_add(&info->global, &device_domain_list);
+ 	if (dev)
+ 		dev->archdata.iommu = info;
+@@ -2527,6 +2895,11 @@ static int get_last_alias(struct pci_dev *pdev, u16 alias, void *opaque)
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - get_domain_for_dev()
++ *   - get_valid_domain_for_dev()
++ */
+ static struct dmar_domain *find_or_alloc_domain(struct device *dev, int gaw)
+ {
+ 	struct device_domain_info *info = NULL;
+@@ -2536,6 +2909,7 @@ static struct dmar_domain *find_or_alloc_domain(struct device *dev, int gaw)
+ 	unsigned long flags;
+ 	u8 bus, devfn;
+ 
++	/* 遍历所有dmar_drhd_units链表中的iommu hardware unit 寻找满足某种条件的iommu */
+ 	iommu = device_to_iommu(dev, &bus, &devfn);
+ 	if (!iommu)
+ 		return NULL;
+@@ -2576,6 +2950,11 @@ static struct dmar_domain *find_or_alloc_domain(struct device *dev, int gaw)
+ 	return domain;
+ }
+ 
++/*
++ * called by:
++ *   - get_domain_for_dev()
++ *   - get_valid_domain_for_dev()
++ */
+ static struct dmar_domain *set_domain_for_dev(struct device *dev,
+ 					      struct dmar_domain *domain)
+ {
+@@ -2801,6 +3180,14 @@ static int identity_mapping(struct device *dev)
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - intel_iommu_attach_device()
++ *   - iommu_no_mapping()
++ *   - dev_prepare_static_identity_mapping()
++ *
++ * 把device添加到domain的核心函数
++ */
+ static int domain_add_dev_info(struct dmar_domain *domain, struct device *dev)
+ {
+ 	struct dmar_domain *ndomain;
+@@ -3004,6 +3391,9 @@ static int __init iommu_prepare_static_identity_mapping(int hw)
+ 	return 0;
+ }
+ 
++/*
++ * Queued invalidation info
++ */
+ static void intel_iommu_init_qi(struct intel_iommu *iommu)
+ {
+ 	/*
+@@ -3039,6 +3429,9 @@ static void intel_iommu_init_qi(struct intel_iommu *iommu)
+ 	}
+ }
+ 
++/*
++ * called only by copy_translation_tables()
++ */
+ static int copy_context_table(struct intel_iommu *iommu,
+ 			      struct root_entry *old_re,
+ 			      struct context_entry **tbl,
+@@ -3141,6 +3534,9 @@ static int copy_context_table(struct intel_iommu *iommu,
+ 	return ret;
+ }
+ 
++/*
++ * called only by init_dmars()
++ */
+ static int copy_translation_tables(struct intel_iommu *iommu)
+ {
+ 	struct context_entry **ctxt_tbls;
+@@ -3223,6 +3619,20 @@ static int copy_translation_tables(struct intel_iommu *iommu)
+ 	return ret;
+ }
+ 
++/*
++ * called only by intel_iommu_init()
++ *
++ * 1. 计算正确的g_num_of_iommus
++ *
++ * 2. 如果没有超过上限 预先分配g_num_of_iommus (DMAR_UNITS_SUPPORTED)个intel_iommu指针.
++ *    g_iommus是全局变量
++ *
++ * 3. 对于每一个drhd (iommu)
++ *    a) 初始化intel_iommu的二维(struct dmar_domain *)数组
++ *    b) 为当前iommu (unit)分配第一层的root_entry (里面存着bus entry) 虚拟地址
++ *    c) 把iommu的root table的地址写入DMAR_RTADDR_REG: Root entry table
++ *    d) 分配错误处理的中断
++ */
+ static int __init init_dmars(void)
+ {
+ 	struct dmar_drhd_unit *drhd;
+@@ -3244,6 +3654,7 @@ static int __init init_dmars(void)
+ 		 * threaded kernel __init code path all other access are read
+ 		 * only
+ 		 */
++		/* 最多支持 64个 ??? */
+ 		if (g_num_of_iommus < DMAR_UNITS_SUPPORTED) {
+ 			g_num_of_iommus++;
+ 			continue;
+@@ -3252,9 +3663,14 @@ static int __init init_dmars(void)
+ 	}
+ 
+ 	/* Preallocate enough resources for IOMMU hot-addition */
++	/* 预分配支持 hot add! */
+ 	if (g_num_of_iommus < DMAR_UNITS_SUPPORTED)
+ 		g_num_of_iommus = DMAR_UNITS_SUPPORTED;
+ 
++	/*
++	 * g_iommus是全局变量
++	 * 如果没有超过上限 预先分配g_num_of_iommus (DMAR_UNITS_SUPPORTED)个intel_iommu指针
++	 */
+ 	g_iommus = kcalloc(g_num_of_iommus, sizeof(struct intel_iommu *),
+ 			GFP_KERNEL);
+ 	if (!g_iommus) {
+@@ -3264,10 +3680,13 @@ static int __init init_dmars(void)
+ 	}
+ 
+ 	for_each_active_iommu(iommu, drhd) {
++		/* 右边的iommu来自drhd的intel_iommu指针, 在dmar_parse_one_drhd()初始化和分配的 */
+ 		g_iommus[iommu->seq_id] = iommu;
+ 
++		/* Queued invalidation info */
+ 		intel_iommu_init_qi(iommu);
+ 
++		/* 初始化intel_iommu的二维(struct dmar_domain *)数组 */
+ 		ret = iommu_init_domains(iommu);
+ 		if (ret)
+ 			goto free_iommu;
+@@ -3286,6 +3705,10 @@ static int __init init_dmars(void)
+ 		 * we could share the same root & context tables
+ 		 * among all IOMMU's. Need to Split it later.
+ 		 */
++		/*
++		 * 为当前iommu (unit)分配第一层的root_entry (里面存着bus entry) 虚拟地址
++		 * 稍后会用iommu_set_root_entry()写入寄存器
++		 */
+ 		ret = iommu_alloc_root_entry(iommu);
+ 		if (ret)
+ 			goto free_iommu;
+@@ -3330,6 +3753,7 @@ static int __init init_dmars(void)
+ 	 */
+ 	for_each_active_iommu(iommu, drhd) {
+ 		iommu_flush_write_buffer(iommu);
++		/* 把iommu的root table的地址写入DMAR_RTADDR_REG: Root entry table */
+ 		iommu_set_root_entry(iommu);
+ 		iommu->flush.flush_context(iommu, 0, 0, 0, DMA_CCMD_GLOBAL_INVL);
+ 		iommu->flush.flush_iotlb(iommu, 0, 0, 0, DMA_TLB_GLOBAL_FLUSH);
+@@ -3342,6 +3766,7 @@ static int __init init_dmars(void)
+ 	iommu_identity_mapping |= IDENTMAP_GFX;
+ #endif
+ 
++	/* 这个函数只被init_dmars()调用 */
+ 	check_tylersburg_isoch();
+ 
+ 	if (iommu_identity_mapping) {
+@@ -3428,10 +3853,14 @@ static int __init init_dmars(void)
+ 				goto free_iommu;
+ 		}
+ #endif
++		/* 设置dmar fault中断 */
+ 		ret = dmar_set_interrupt(iommu);
+ 		if (ret)
+ 			goto free_iommu;
+ 
++		/*
++		 * 反正iommu_enable_translation()是激活页表mapping的
++		 */
+ 		if (!translation_pre_enabled(iommu))
+ 			iommu_enable_translation(iommu);
+ 
+@@ -3453,6 +3882,11 @@ static int __init init_dmars(void)
+ }
+ 
+ /* This takes a number of _MM_ pages, not VTD pages */
++/*
++ * called by:
++ *   - __intel_map_single()
++ *   - intel_map_sg()
++ */
+ static unsigned long intel_alloc_iova(struct device *dev,
+ 				     struct dmar_domain *domain,
+ 				     unsigned long nrpages, uint64_t dma_mask)
+@@ -3462,6 +3896,7 @@ static unsigned long intel_alloc_iova(struct device *dev,
+ 	/* Restrict dma_mask to the width that the iommu can handle */
+ 	dma_mask = min_t(uint64_t, DOMAIN_MAX_ADDR(domain->gaw), dma_mask);
+ 	/* Ensure we reserve the whole size-aligned region */
++	/* round up to nearest power of two */
+ 	nrpages = __roundup_pow_of_two(nrpages);
+ 
+ 	if (!dmar_forcedac && dma_mask > DMA_BIT_MASK(32)) {
+@@ -3493,6 +3928,7 @@ static struct dmar_domain *get_valid_domain_for_dev(struct device *dev)
+ 	struct device *i_dev;
+ 	int i, ret;
+ 
++	/* dev->archdata.iommu */
+ 	domain = find_domain(dev);
+ 	if (domain)
+ 		goto out;
+@@ -3577,6 +4013,13 @@ static int iommu_no_mapping(struct device *dev)
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - intel_map_page()
++ *   - intel_alloc_coherent()
++ *
++ * 这个函数返回的应该是iommu map后的iova?
++ */
+ static dma_addr_t __intel_map_single(struct device *dev, phys_addr_t paddr,
+ 				     size_t size, int dir, u64 dma_mask)
+ {
+@@ -3597,9 +4040,15 @@ static dma_addr_t __intel_map_single(struct device *dev, phys_addr_t paddr,
+ 	if (!domain)
+ 		return 0;
+ 
++	/* 把一个struct dmar_domain转换成struct intel_iommu: 最终还是通过g_iommus */
+ 	iommu = domain_get_iommu(domain);
+ 	size = aligned_nrpages(paddr, size);
+ 
++	/*
++	 * 分配一个iova
++	 *
++	 * iova应该是低端有要求吧 也算是一种资源
++	 */
+ 	iova_pfn = intel_alloc_iova(dev, domain, dma_to_mm_pfn(size), dma_mask);
+ 	if (!iova_pfn)
+ 		goto error;
+@@ -3619,6 +4068,9 @@ static dma_addr_t __intel_map_single(struct device *dev, phys_addr_t paddr,
+ 	 * might have two guest_addr mapping to the same host paddr, but this
+ 	 * is not a big problem
+ 	 */
++	/*
++	 * 建立iova到paddr的mapping
++	 */
+ 	ret = domain_pfn_mapping(domain, mm_to_dma_pfn(iova_pfn),
+ 				 mm_to_dma_pfn(paddr_pfn), size, prot);
+ 	if (ret)
+@@ -3644,6 +4096,9 @@ static dma_addr_t __intel_map_single(struct device *dev, phys_addr_t paddr,
+ 	return 0;
+ }
+ 
++/*
++ * struct dma_map_ops intel_dma_ops.map_page = intel_map_page()
++ */
+ static dma_addr_t intel_map_page(struct device *dev, struct page *page,
+ 				 unsigned long offset, size_t size,
+ 				 enum dma_data_direction dir,
+@@ -3697,6 +4152,9 @@ static void intel_unmap(struct device *dev, dma_addr_t dev_addr, size_t size)
+ 	}
+ }
+ 
++/*
++ * struct dma_map_ops intel_dma_ops.unmap_page = intel_unmap_page()
++ */
+ static void intel_unmap_page(struct device *dev, dma_addr_t dev_addr,
+ 			     size_t size, enum dma_data_direction dir,
+ 			     unsigned long attrs)
+@@ -3704,6 +4162,12 @@ static void intel_unmap_page(struct device *dev, dma_addr_t dev_addr,
+ 	intel_unmap(dev, dev_addr, size);
+ }
+ 
++/*
++ * struct dma_map_ops intel_dma_ops.alloc = intel_alloc_coherent()
++ *
++ * dma_handle是输出的dma地址
++ * 返回值应该是内存虚拟地址
++ */
+ static void *intel_alloc_coherent(struct device *dev, size_t size,
+ 				  dma_addr_t *dma_handle, gfp_t flags,
+ 				  unsigned long attrs)
+@@ -3726,6 +4190,9 @@ static void *intel_alloc_coherent(struct device *dev, size_t size,
+ 	if (gfpflags_allow_blocking(flags)) {
+ 		unsigned int count = size >> PAGE_SHIFT;
+ 
++		/*
++		 * 这个函数有没有功能看CONFIG_DMA_CMA是否可用
++		 */
+ 		page = dma_alloc_from_contiguous(dev, count, order, flags);
+ 		if (page && iommu_no_mapping(dev) &&
+ 		    page_to_phys(page) + size > dev->coherent_dma_mask) {
+@@ -3745,12 +4212,16 @@ static void *intel_alloc_coherent(struct device *dev, size_t size,
+ 					 dev->coherent_dma_mask);
+ 	if (*dma_handle)
+ 		return page_address(page);
++	/* dma_release_from_contiguous()依赖CONFIG_DMA_CMA */
+ 	if (!dma_release_from_contiguous(dev, page, size >> PAGE_SHIFT))
+ 		__free_pages(page, order);
+ 
+ 	return NULL;
+ }
+ 
++/*
++ * struct dma_map_ops intel_dma_ops.free = intel_free_coherent()
++ */
+ static void intel_free_coherent(struct device *dev, size_t size, void *vaddr,
+ 				dma_addr_t dma_handle, unsigned long attrs)
+ {
+@@ -3765,6 +4236,9 @@ static void intel_free_coherent(struct device *dev, size_t size, void *vaddr,
+ 		__free_pages(page, order);
+ }
+ 
++/*
++ * struct dma_map_ops intel_dma_ops.unmap_sg = intel_unmap_sg()
++ */
+ static void intel_unmap_sg(struct device *dev, struct scatterlist *sglist,
+ 			   int nelems, enum dma_data_direction dir,
+ 			   unsigned long attrs)
+@@ -3795,6 +4269,9 @@ static int intel_nontranslate_map_sg(struct device *hddev,
+ 	return nelems;
+ }
+ 
++/*
++ * struct dma_map_ops intel_dma_ops.map_sg = intel_map_sg()
++ */
+ static int intel_map_sg(struct device *dev, struct scatterlist *sglist, int nelems,
+ 			enum dma_data_direction dir, unsigned long attrs)
+ {
+@@ -3858,6 +4335,9 @@ static int intel_map_sg(struct device *dev, struct scatterlist *sglist, int nele
+ 	return nelems;
+ }
+ 
++/*
++ * struct dma_map_ops intel_dma_ops.mapping_error = intel_mapping_error()
++ */
+ static int intel_mapping_error(struct device *dev, dma_addr_t dma_addr)
+ {
+ 	return !dma_addr;
+@@ -3914,14 +4394,17 @@ static inline int iommu_devinfo_cache_init(void)
+ static int __init iommu_init_mempool(void)
+ {
+ 	int ret;
++	/* 申请iommu_iova kmem cache */
+ 	ret = iova_cache_get();
+ 	if (ret)
+ 		return ret;
+ 
++	/* 申请iommu_domain kmem cache */
+ 	ret = iommu_domain_cache_init();
+ 	if (ret)
+ 		goto domain_error;
+ 
++	/* 申请iommu_devinfo kmem cache */
+ 	ret = iommu_devinfo_cache_init();
+ 	if (!ret)
+ 		return ret;
+@@ -4286,6 +4769,9 @@ int dmar_check_one_atsr(struct acpi_dmar_header *hdr, void *arg)
+ 	return 0;
+ }
+ 
++/*
++ * called only by dmar_iommu_hotplug()
++ */
+ static int intel_iommu_add(struct dmar_drhd_unit *dmaru)
+ {
+ 	int sp, ret = 0;
+@@ -4534,6 +5020,9 @@ static struct notifier_block device_nb = {
+ 	.notifier_call = device_notifier,
+ };
+ 
++/*
++ * struct notifier_block intel_iommu_memory_nb.notifier_call()
++ */
+ static int intel_iommu_memory_notifier(struct notifier_block *nb,
+ 				       unsigned long val, void *v)
+ {
+@@ -4545,6 +5034,12 @@ static int intel_iommu_memory_notifier(struct notifier_block *nb,
+ 	case MEM_GOING_ONLINE:
+ 		start = mhp->start_pfn << PAGE_SHIFT;
+ 		end = ((mhp->start_pfn + mhp->nr_pages) << PAGE_SHIFT) - 1;
++		/*
++		 * This domain is a statically identity mapping domain.
++		 *	1. This domain creats a static 1:1 mapping to all usable memory.
++		 *	2. It maps to each iommu if successful.
++		 *	3. Each iommu mapps to this domain if successful.
++		 */
+ 		if (iommu_domain_identity_map(si_domain, start, end)) {
+ 			pr_warn("Failed to build identity map for [%llx-%llx]\n",
+ 				start, end);
+@@ -4723,6 +5218,27 @@ const struct attribute_group *intel_iommu_groups[] = {
+ 	NULL,
+ };
+ 
++/*
++ * 开机的时候调用detect_intel_iommu()检测iommu
++ * x86_init.iommu.iommu_init = intel_iommu_init
++ * 检测的时候会初始化dmar_tbl但是最后会free掉
++ *
++ * 在pci_iommu_init()调用x86_init.iommu.iommu_init() 其实是intel_iommu_init()
++ *
++ * intel_iommu_init()流程:
++ *   - dmar_table_init() --> parse_dmar_table()
++ *        1. 用dmar_table_detect()再初始化一次&dmar_tbl
++ *        2. 注册很多callback, 然后dmar_walk_dmar_table()对table的每一条entry调用对应callback
++ *               比如ACPI_DMAR_TYPE_HARDWARE_UNIT的callback是dmar_parse_one_drhd()
++ *               dmar_parse_one_drhd()会分配一个struct dmar_drhd_unit, 用alloc_iommu()分配
++ *               并初始化里面的struct intel_iommu指针 然后把struct dmar_drhd_unit (有个field
++ *               是intel_iommu指针)链入链表dmar_drhd_units
++ *   - init_dmars()
++ *   - 设置dma_ops = &intel_dma_ops;
++ *   - 对于每一个iommu 把iommu->iommu添加到&iommu_device_list链表
++ *   - 把intel_iommu_enabled=1
++ */
++
+ int __init intel_iommu_init(void)
+ {
+ 	int ret = -ENODEV;
+@@ -4732,6 +5248,9 @@ int __init intel_iommu_init(void)
+ 	/* VT-d is required for a TXT/tboot launch, so enforce that */
+ 	force_on = tboot_force_iommu();
+ 
++	/*
++	 * 申请iommu_iova, iommu_domain和iommu_devinfo三个kmem cache
++	 */
+ 	if (iommu_init_mempool()) {
+ 		if (force_on)
+ 			panic("tboot: Failed to initialize iommu memory\n");
+@@ -4813,6 +5332,7 @@ int __init intel_iommu_init(void)
+ #endif
+ 	dma_ops = &intel_dma_ops;
+ 
++	/* 根据CONFIG_PM是否激活了实现不一样 */
+ 	init_iommu_pm_ops();
+ 
+ 	for_each_active_iommu(iommu, drhd) {
+@@ -4864,6 +5384,9 @@ static void domain_context_clear(struct intel_iommu *iommu, struct device *dev)
+ 	pci_for_each_dma_alias(to_pci_dev(dev), &domain_context_clear_one_cb, iommu);
+ }
+ 
++/*
++ * device_domain_info存储PCI domain-device relationship, 并挂在某链表中
++ */
+ static void __dmar_remove_one_dev_info(struct device_domain_info *info)
+ {
+ 	struct intel_iommu *iommu;
+@@ -4902,6 +5425,13 @@ static void dmar_remove_one_dev_info(struct dmar_domain *domain,
+ 	spin_unlock_irqrestore(&device_domain_lock, flags);
+ }
+ 
++/*
++ * called by:
++ *   - intel_iommu_domain_alloc()
++ *   - si_domain_init()
++ *
++ * 初始化dmar_domain并分配pgd
++ */
+ static int md_domain_init(struct dmar_domain *domain, int guest_width)
+ {
+ 	int adjust_width;
+@@ -4927,6 +5457,11 @@ static int md_domain_init(struct dmar_domain *domain, int guest_width)
+ 	return 0;
+ }
+ 
++/*
++ * struct iommu_ops intel_iommu_ops.domain_alloc()
++ *
++ * 创建新的domain
++ */
+ static struct iommu_domain *intel_iommu_domain_alloc(unsigned type)
+ {
+ 	struct dmar_domain *dmar_domain;
+@@ -4935,11 +5470,13 @@ static struct iommu_domain *intel_iommu_domain_alloc(unsigned type)
+ 	if (type != IOMMU_DOMAIN_UNMANAGED)
+ 		return NULL;
+ 
++	/* 在qemu模拟的vIOMMU上, e1000和sata/ata用的不是同一个domain */
+ 	dmar_domain = alloc_domain(DOMAIN_FLAG_VIRTUAL_MACHINE);
+ 	if (!dmar_domain) {
+ 		pr_err("Can't allocate dmar_domain\n");
+ 		return NULL;
+ 	}
++	/* 初始化dmar_domain并分配pgd */
+ 	if (md_domain_init(dmar_domain, DEFAULT_DOMAIN_ADDRESS_WIDTH)) {
+ 		pr_err("Domain initialization failed\n");
+ 		domain_exit(dmar_domain);
+@@ -4955,14 +5492,27 @@ static struct iommu_domain *intel_iommu_domain_alloc(unsigned type)
+ 	return domain;
+ }
+ 
++/*
++ * struct iommu_ops intel_iommu_ops.domain_free = intel_iommu_domain_free()
++ *
++ * 释放domain
++ */
+ static void intel_iommu_domain_free(struct iommu_domain *domain)
+ {
+ 	domain_exit(to_dmar_domain(domain));
+ }
+ 
++/*
++ * struct iommu_ops intel_iommu_ops.attach_dev = intel_iommu_attach_device()
++ *
++ * 把一个dev添加到某个domain
++ *
++ * domain和iommu是不同的概念 一个iommu unit可能有很多domain
++ */
+ static int intel_iommu_attach_device(struct iommu_domain *domain,
+ 				     struct device *dev)
+ {
++	/* struct dmar_domain包含一个struct iommu_domain */
+ 	struct dmar_domain *dmar_domain = to_dmar_domain(domain);
+ 	struct intel_iommu *iommu;
+ 	int addr_width;
+@@ -5024,12 +5574,22 @@ static int intel_iommu_attach_device(struct iommu_domain *domain,
+ 	return domain_add_dev_info(dmar_domain, dev);
+ }
+ 
++/*
++ * struct iommu_ops intel_iommu_ops.detach_dev = intel_iommu_detach_device()
++ *
++ * 把设备从domain移除
++ */
+ static void intel_iommu_detach_device(struct iommu_domain *domain,
+ 				      struct device *dev)
+ {
+ 	dmar_remove_one_dev_info(to_dmar_domain(domain), dev);
+ }
+ 
++/*
++ * struct iommu_ops intel_iommu_ops.map = intel_iommu_map()
++ *
++ * 把iova给map到pfn
++ */
+ static int intel_iommu_map(struct iommu_domain *domain,
+ 			   unsigned long iova, phys_addr_t hpa,
+ 			   size_t size, int iommu_prot)
+@@ -5068,6 +5628,9 @@ static int intel_iommu_map(struct iommu_domain *domain,
+ 	return ret;
+ }
+ 
++/*
++ * struct iommu_ops intel_iommu_ops.unmap = intel_iommu_unmap()
++ */
+ static size_t intel_iommu_unmap(struct iommu_domain *domain,
+ 				unsigned long iova, size_t size)
+ {
+@@ -5103,21 +5666,33 @@ static size_t intel_iommu_unmap(struct iommu_domain *domain,
+ 	return size;
+ }
+ 
++/*
++ * struct iommu_ops intel_iommu_ops.iova_to_phys = intel_iommu_iova_to_phys()
++ *
++ * 根据domain的页表, 把iova转换成phys addr
++ */
+ static phys_addr_t intel_iommu_iova_to_phys(struct iommu_domain *domain,
+ 					    dma_addr_t iova)
+ {
++	/* dmar_domain 包含 iommu_domain */
+ 	struct dmar_domain *dmar_domain = to_dmar_domain(domain);
+ 	struct dma_pte *pte;
+ 	int level = 0;
+ 	u64 phys = 0;
+ 
++	/* 根据domain的页表, 把iova的pte找到 */
+ 	pte = pfn_to_dma_pte(dmar_domain, iova >> VTD_PAGE_SHIFT, &level);
+ 	if (pte)
+-		phys = dma_pte_addr(pte);
++		phys = dma_pte_addr(pte); // 把找到的pte转换成phys addr
+ 
+ 	return phys;
+ }
+ 
++/*
++ * struct iommu_ops intel_iommu_ops.capable = intel_iommu_capable()
++ *
++ * check capability
++ */
+ static bool intel_iommu_capable(enum iommu_cap cap)
+ {
+ 	if (cap == IOMMU_CAP_CACHE_COHERENCY)
+@@ -5128,6 +5703,11 @@ static bool intel_iommu_capable(enum iommu_cap cap)
+ 	return false;
+ }
+ 
++/*
++ * struct iommu_ops intel_iommu_ops.add_device = intel_iommu_add_device()
++ *
++ * Find or create the IOMMU group for a device
++ */
+ static int intel_iommu_add_device(struct device *dev)
+ {
+ 	struct intel_iommu *iommu;
+@@ -5140,6 +5720,13 @@ static int intel_iommu_add_device(struct device *dev)
+ 
+ 	iommu_device_link(&iommu->iommu, dev);
+ 
++	/*
++	 * This function is intended to be called by IOMMU drivers and extended to
++	 * support common, bus-defined algorithms when determining or creating the
++	 * IOMMU group for a device.  On success, the caller will hold a reference
++	 * to the returned IOMMU group, which will already include the provided
++	 * device.  The reference should be released with iommu_group_put().
++	 */
+ 	group = iommu_group_get_for_dev(dev);
+ 
+ 	if (IS_ERR(group))
+@@ -5149,6 +5736,11 @@ static int intel_iommu_add_device(struct device *dev)
+ 	return 0;
+ }
+ 
++/*
++ * struct iommu_ops intel_iommu_ops.remove_device = intel_iommu_remove_device()
++ *
++ * remove the device from current group
++ */
+ static void intel_iommu_remove_device(struct device *dev)
+ {
+ 	struct intel_iommu *iommu;
+@@ -5163,6 +5755,11 @@ static void intel_iommu_remove_device(struct device *dev)
+ 	iommu_device_unlink(&iommu->iommu, dev);
+ }
+ 
++/*
++ * struct iommu_ops intel_iommu_ops.get_resv_regions = intel_iommu_get_resv_regions()
++ *
++ * equest list of reserved regions for a device
++ */
+ static void intel_iommu_get_resv_regions(struct device *device,
+ 					 struct list_head *head)
+ {
+@@ -5191,6 +5788,11 @@ static void intel_iommu_get_resv_regions(struct device *device,
+ 	list_add_tail(&reg->list, head);
+ }
+ 
++/*
++ * struct iommu_ops intel_iommu_ops.put_resv_regions = intel_iommu_put_resv_regions()
++ *
++ * Free list of reserved regions for a device
++ */
+ static void intel_iommu_put_resv_regions(struct device *dev,
+ 					 struct list_head *head)
+ {
+@@ -5222,6 +5824,13 @@ static inline unsigned long intel_iommu_get_pts(struct intel_iommu *iommu)
+ 			MAX_NR_PASID_BITS) - 5;
+ }
+ 
++/*
++ * PASID: Process Address Space Ientifier
++ *     DMA requests with virtual address (or guest virtual address) are tagged with
++ *     a PASID value that identifies the targeted virtual address space
++ *
++ * 只被intel_svm_bind_mm()调用
++ */
+ int intel_iommu_enable_pasid(struct intel_iommu *iommu, struct intel_svm_dev *sdev)
+ {
+ 	struct device_domain_info *info;
+@@ -5306,6 +5915,9 @@ int intel_iommu_enable_pasid(struct intel_iommu *iommu, struct intel_svm_dev *sd
+ 	return ret;
+ }
+ 
++/*
++ * SVM: Shared Virtual Memory
++ */
+ struct intel_iommu *intel_svm_device_to_iommu(struct device *dev)
+ {
+ 	struct intel_iommu *iommu;
+@@ -5332,24 +5944,31 @@ struct intel_iommu *intel_svm_device_to_iommu(struct device *dev)
+ }
+ #endif /* CONFIG_INTEL_IOMMU_SVM */
+ 
++/*
++ * used by:
++ *   - alloc_iommu() --> iommu_device_set_ops()
++ *   - intel_iommu_init() --> iommu_device_set_ops()
++ *   - intel_iommu_init() --> bus_set_iommu()
++ */
+ const struct iommu_ops intel_iommu_ops = {
+-	.capable		= intel_iommu_capable,
+-	.domain_alloc		= intel_iommu_domain_alloc,
++	.capable		= intel_iommu_capable,           // check capability
++	.domain_alloc		= intel_iommu_domain_alloc,      // 创建新的domain
+ 	.domain_free		= intel_iommu_domain_free,
+-	.attach_dev		= intel_iommu_attach_device,
++	.attach_dev		= intel_iommu_attach_device,     // 把设备添加到domain
+ 	.detach_dev		= intel_iommu_detach_device,
+-	.map			= intel_iommu_map,
++	.map			= intel_iommu_map,               // 把iova给map到pfn
+ 	.unmap			= intel_iommu_unmap,
+-	.map_sg			= default_iommu_map_sg,
+-	.iova_to_phys		= intel_iommu_iova_to_phys,
+-	.add_device		= intel_iommu_add_device,
+-	.remove_device		= intel_iommu_remove_device,
+-	.get_resv_regions	= intel_iommu_get_resv_regions,
+-	.put_resv_regions	= intel_iommu_put_resv_regions,
+-	.device_group		= pci_device_group,
++	.map_sg			= default_iommu_map_sg,          // 会间接调用domain->ops->map
++	.iova_to_phys		= intel_iommu_iova_to_phys,      // 根据domain的页表, 把iova转换成phys addr
++	.add_device		= intel_iommu_add_device,        // Find or create the IOMMU group for a device
++	.remove_device		= intel_iommu_remove_device,     // remove the device from current group
++	.get_resv_regions	= intel_iommu_get_resv_regions,  // equest list of reserved regions for a device
++	.put_resv_regions	= intel_iommu_put_resv_regions,  // Free list of reserved regions for a device
++	.device_group		= pci_device_group,              // find iommu group for a particular device
+ 	.pgsize_bitmap		= INTEL_IOMMU_PGSIZES,
+ };
+ 
++/* 只在下面的DECLARE_PCI_FIXUP_HEADER()被调用 */
+ static void quirk_iommu_g4x_gfx(struct pci_dev *dev)
+ {
+ 	/* G4x/GM45 integrated gfx dmar support is totally busted. */
+@@ -5365,6 +5984,7 @@ DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_INTEL, 0x2e30, quirk_iommu_g4x_gfx);
+ DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_INTEL, 0x2e40, quirk_iommu_g4x_gfx);
+ DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_INTEL, 0x2e90, quirk_iommu_g4x_gfx);
+ 
++/* 只在下面DECLARE_PCI_FIXUP_HEADER()被用到 */
+ static void quirk_iommu_rwbf(struct pci_dev *dev)
+ {
+ 	/*
+@@ -5393,6 +6013,9 @@ DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_INTEL, 0x2e90, quirk_iommu_rwbf);
+ #define GGC_MEMORY_SIZE_3M_VT	(0xa << 8)
+ #define GGC_MEMORY_SIZE_4M_VT	(0xb << 8)
+ 
++/*
++ * 只在下面DECLARE_PCI_FIXUP_HEADER()被用到
++ */
+ static void quirk_calpella_no_shadow_gtt(struct pci_dev *dev)
+ {
+ 	unsigned short ggc;
+@@ -5409,6 +6032,11 @@ static void quirk_calpella_no_shadow_gtt(struct pci_dev *dev)
+ 		intel_iommu_strict = 1;
+        }
+ }
++/*
++ * 注册函数修复pcie的bug
++ * 当在scan root port的时候发现vendor id是XXX的话，就会调用注册的函数
++ * 注册回调函数来修复硬件bug  
++ */
+ DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_INTEL, 0x0040, quirk_calpella_no_shadow_gtt);
+ DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_INTEL, 0x0044, quirk_calpella_no_shadow_gtt);
+ DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_INTEL, 0x0062, quirk_calpella_no_shadow_gtt);
+@@ -5421,6 +6049,9 @@ DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_INTEL, 0x006a, quirk_calpella_no_shadow_g
+    quirk, because we don't want to print the obnoxious "BIOS broken"
+    message if VT-d is actually disabled.
+ */
++/*
++ * called only by init_dmars()
++ */
+ static void __init check_tylersburg_isoch(void)
+ {
+ 	struct pci_dev *pdev;
+diff --git a/drivers/iommu/intel_irq_remapping.c b/drivers/iommu/intel_irq_remapping.c
+index 967450b..8208ab2 100644
+--- a/drivers/iommu/intel_irq_remapping.c
++++ b/drivers/iommu/intel_irq_remapping.c
+@@ -23,6 +23,25 @@
+ 
+ #include "irq_remapping.h"
+ 
++/*
++ * 在没有使能 Interrupt Remapping的情况下, 设备中断请求格式称之为Compatibility format,
++ * 其结构主要包含一个32bit的Address和一个32bit的Data字段, Address字段包含了中断要投递的
++ * 目标CPU的APIC ID信息, Data字段主要包含了要投递的vecotr号和投递方式. 其中Address的
++ * bit 4为Interrupt Format位, 用来标志这个Request是Compatibility format（bit4=0）还是
++ * Remapping format (bit 4=1).
++ *
++ * 在开启了Interrupt Remapping之后, 设备的中断请求格式称之为Remapping format, 其结构同样
++ * 由一个32bit的Address和一个32bit的Data字段构成. 但与Compatibility format不同的是此时
++ * Adress字段不再包含目标CPU的APIC ID信息而是提供了一个16bit的HANDLE索引,并且Address的
++ * bit 4为"1"表示Request为Remapping format. 同时bit 3是一个标识位(SHV), 用来标志Request
++ * 是否包含了SubHandle,当该位置位时表示Data字段的低16bit为SubHandle索引.
++ *
++ * 在Interrupt Remapping模式下, 硬件查询系统软件在内存中预设的中断重映射表
++ * (Interrupt Remapping Table)来投递中断. 中断重映射表由中断重映射表项
++ * (Interrupt Remapping Table Entry)构成, 每个IRTE占用128bit（具体格式介绍见文末, 中断
++ * 重映射表的基地址存放在Interrupt Remapping Table Address Register中.
++ */
++
+ enum irq_mode {
+ 	IRQ_REMAPPING,
+ 	IRQ_POSTING,
+@@ -101,6 +120,9 @@ static void init_ir_status(struct intel_iommu *iommu)
+ 		iommu->flags |= VTD_FLAG_IRQ_REMAP_PRE_ENABLED;
+ }
+ 
++/*
++ * called only by intel_irq_remapping_alloc()
++ */
+ static int alloc_irte(struct intel_iommu *iommu, int irq,
+ 		      struct irq_2_iommu *irq_iommu, u16 count)
+ {
+@@ -125,6 +147,14 @@ static int alloc_irte(struct intel_iommu *iommu, int irq,
+ 	}
+ 
+ 	raw_spin_lock_irqsave(&irq_2_ir_lock, flags);
++	/*
++	 * find a contiguous aligned mem region
++	 *
++	 * Find a region of free (zero) bits in a @bitmap of @bits bits and
++	 * allocate them (set them to one).  Only consider regions of length
++	 * a power (@order) of two, aligned to that power of two, which
++	 * makes the search algorithm much faster.
++	 */
+ 	index = bitmap_find_free_region(table->bitmap,
+ 					INTR_REMAP_TABLE_ENTRIES, mask);
+ 	if (index < 0) {
+@@ -152,6 +182,12 @@ static int qi_flush_iec(struct intel_iommu *iommu, int index, int mask)
+ 	return qi_submit_sync(&desc, iommu);
+ }
+ 
++/*
++ * 除了amd, 被如下调用:
++ *   - intel_ir_reconfigure_irte()
++ *   - intel_ir_set_vcpu_affinity() 两次
++ *   - intel_irq_remapping_deactivate()
++ */
+ static int modify_irte(struct irq_2_iommu *irq_iommu,
+ 		       struct irte *irte_modified)
+ {
+@@ -211,6 +247,11 @@ static struct intel_iommu *map_hpet_to_ir(u8 hpet_id)
+ 	return NULL;
+ }
+ 
++/*
++ * called by:
++ *   - parse_ioapics_under_ir()
++ *   - intel_get_ir_irq_domain()
++ */
+ static struct intel_iommu *map_ioapic_to_ir(int apic)
+ {
+ 	int i;
+@@ -221,6 +262,11 @@ static struct intel_iommu *map_ioapic_to_ir(int apic)
+ 	return NULL;
+ }
+ 
++/*
++ * called by:
++ *   - intel_get_ir_irq_domain()
++ *   - intel_get_irq_domain()
++ */
+ static struct intel_iommu *map_dev_to_ir(struct pci_dev *dev)
+ {
+ 	struct dmar_drhd_unit *drhd;
+@@ -410,6 +456,7 @@ static int iommu_load_old_irte(struct intel_iommu *iommu)
+ 	u64 irta;
+ 
+ 	/* Check whether the old ir-table has the same size as ours */
++	/* DMAR_IRTA_REG: Interrupt remapping table addr register */
+ 	irta = dmar_readq(iommu->reg + DMAR_IRTA_REG);
+ 	if ((irta & INTR_REMAP_TABLE_REG_SIZE_MASK)
+ 	     != INTR_REMAP_TABLE_REG_SIZE)
+@@ -443,16 +490,23 @@ static int iommu_load_old_irte(struct intel_iommu *iommu)
+ }
+ 
+ 
++/*
++ * called by:
++ *   - intel_setup_irq_remapping()
++ *   - reenable_irq_remapping()
++ */
+ static void iommu_set_irq_remapping(struct intel_iommu *iommu, int mode)
+ {
+ 	unsigned long flags;
+ 	u64 addr;
+ 	u32 sts;
+ 
++	/* Interrupt remapping table addr register 存储的地方 */
+ 	addr = virt_to_phys((void *)iommu->ir_table->base);
+ 
+ 	raw_spin_lock_irqsave(&iommu->register_lock, flags);
+ 
++	/* Interrupt remapping table addr register */
+ 	dmar_writeq(iommu->reg + DMAR_IRTA_REG,
+ 		    (addr) | IR_X2APIC_MODE(mode) | INTR_REMAP_TABLE_REG_SIZE);
+ 
+@@ -470,6 +524,12 @@ static void iommu_set_irq_remapping(struct intel_iommu *iommu, int mode)
+ 	qi_global_iec(iommu);
+ }
+ 
++/*
++ * called by:
++ *   - intel_enable_irq_remapping()
++ *   - reenable_irq_remapping()
++ *   - dmar_ir_add()
++ */
+ static void iommu_enable_irq_remapping(struct intel_iommu *iommu)
+ {
+ 	unsigned long flags;
+@@ -498,6 +558,11 @@ static void iommu_enable_irq_remapping(struct intel_iommu *iommu)
+ 	raw_spin_unlock_irqrestore(&iommu->register_lock, flags);
+ }
+ 
++/*
++ * called by:
++ *   - intel_prepare_irq_remapping()
++ *   - dmar_ir_add()
++ */
+ static int intel_setup_irq_remapping(struct intel_iommu *iommu)
+ {
+ 	struct ir_table *ir_table;
+@@ -676,6 +741,9 @@ static void __init intel_cleanup_irq_remapping(void)
+ 		pr_warn("Failed to enable irq remapping. You are vulnerable to irq-injection attacks.\n");
+ }
+ 
++/*
++ * struct irq_remap_ops intel_irq_remap_ops.prepare = intel_prepare_irq_remapping()
++ */
+ static int __init intel_prepare_irq_remapping(void)
+ {
+ 	struct dmar_drhd_unit *drhd;
+@@ -773,6 +841,9 @@ static inline void set_irq_posting_cap(void)
+ 	}
+ }
+ 
++/*
++ *  struct irq_remap_ops intel_irq_remap_ops.enable = intel_enable_irq_remapping()
++ */
+ static int __init intel_enable_irq_remapping(void)
+ {
+ 	struct dmar_drhd_unit *drhd;
+@@ -986,6 +1057,9 @@ static int __init ir_dev_scope_init(void)
+ }
+ rootfs_initcall(ir_dev_scope_init);
+ 
++/*
++ * struct irq_remap_ops intel_irq_remap_ops.disable = disable_irq_remapping()
++ */
+ static void disable_irq_remapping(void)
+ {
+ 	struct dmar_drhd_unit *drhd;
+@@ -1008,6 +1082,9 @@ static void disable_irq_remapping(void)
+ 		intel_irq_remap_ops.capability &= ~(1 << IRQ_POSTING_CAP);
+ }
+ 
++/*
++ * struct irq_remap_ops intel_irq_remap_ops.reenable = reenable_irq_remapping()
++ */
+ static int reenable_irq_remapping(int eim)
+ {
+ 	struct dmar_drhd_unit *drhd;
+@@ -1065,6 +1142,9 @@ static void prepare_irte(struct irte *irte, int vector, unsigned int dest)
+ 	irte->redir_hint = 1;
+ }
+ 
++/*
++ * struct irq_remap_ops intel_irq_remap_ops.get_ir_irq_domain = intel_get_ir_irq_domain()
++ */
+ static struct irq_domain *intel_get_ir_irq_domain(struct irq_alloc_info *info)
+ {
+ 	struct intel_iommu *iommu = NULL;
+@@ -1091,6 +1171,9 @@ static struct irq_domain *intel_get_ir_irq_domain(struct irq_alloc_info *info)
+ 	return iommu ? iommu->ir_domain : NULL;
+ }
+ 
++/*
++ * struct irq_remap_ops intel_irq_remap_ops.get_irq_domain = intel_get_irq_domain()
++ */
+ static struct irq_domain *intel_get_irq_domain(struct irq_alloc_info *info)
+ {
+ 	struct intel_iommu *iommu;
+@@ -1154,6 +1237,9 @@ static void intel_ir_reconfigure_irte(struct irq_data *irqd, bool force)
+  * As the migration is a simple atomic update of IRTE, the same mechanism
+  * is used to migrate MSI irq's in the presence of interrupt-remapping.
+  */
++/*
++ * struct irq_chip intel_ir_chip.irq_set_affinity = intel_ir_set_affinity()
++ */
+ static int
+ intel_ir_set_affinity(struct irq_data *data, const struct cpumask *mask,
+ 		      bool force)
+@@ -1177,6 +1263,13 @@ intel_ir_set_affinity(struct irq_data *data, const struct cpumask *mask,
+ 	return IRQ_SET_MASK_OK_DONE;
+ }
+ 
++/*
++ * struct irq_chip intel_ir_chipi.irq_compose_msi_msg = intel_ir_compose_msi_msg()
++ *
++ * optional to compose message content for MSI
++ *
++ * 编辑irq remap的address和data
++ */
+ static void intel_ir_compose_msi_msg(struct irq_data *irq_data,
+ 				     struct msi_msg *msg)
+ {
+@@ -1185,6 +1278,7 @@ static void intel_ir_compose_msi_msg(struct irq_data *irq_data,
+ 	*msg = ir_data->msi_entry;
+ }
+ 
++/* struct irq_chip intel_ir_chip.irq_set_vcpu_affinity = intel_ir_set_vcpu_affinity() */
+ static int intel_ir_set_vcpu_affinity(struct irq_data *data, void *info)
+ {
+ 	struct intel_ir_data *ir_data = data->chip_data;
+@@ -1221,14 +1315,20 @@ static int intel_ir_set_vcpu_affinity(struct irq_data *data, void *info)
+ 	return 0;
+ }
+ 
++/* used only at intel_irq_remapping_alloc() */
+ static struct irq_chip intel_ir_chip = {
+ 	.name			= "INTEL-IR",
+ 	.irq_ack		= apic_ack_irq,
+ 	.irq_set_affinity	= intel_ir_set_affinity,
+-	.irq_compose_msi_msg	= intel_ir_compose_msi_msg,
++	.irq_compose_msi_msg	= intel_ir_compose_msi_msg,   // optional to compose message content for MSI
+ 	.irq_set_vcpu_affinity	= intel_ir_set_vcpu_affinity,
+ };
+ 
++/*
++ * called only by intel_irq_remapping_alloc()
++ *
++ * 编辑irq的address和msg
++ */
+ static void intel_irq_remapping_prepare_irte(struct intel_ir_data *data,
+ 					     struct irq_cfg *irq_cfg,
+ 					     struct irq_alloc_info *info,
+@@ -1313,6 +1413,11 @@ static void intel_free_irq_resources(struct irq_domain *domain,
+ 	}
+ }
+ 
++/*
++ * struct irq_domain_ops intel_ir_domain_ops.alloc = intel_irq_remapping_alloc()
++ *
++ * 只被irq_domain_alloc_irqs_hierarchy()调用
++ */
+ static int intel_irq_remapping_alloc(struct irq_domain *domain,
+ 				     unsigned int virq, unsigned int nr_irqs,
+ 				     void *arg)
+@@ -1389,6 +1494,9 @@ static int intel_irq_remapping_alloc(struct irq_domain *domain,
+ 	return ret;
+ }
+ 
++/*
++ * struct irq_domain_ops intel_ir_domain_ops.free = intel_irq_remapping_free()
++ */
+ static void intel_irq_remapping_free(struct irq_domain *domain,
+ 				     unsigned int virq, unsigned int nr_irqs)
+ {
+@@ -1396,6 +1504,9 @@ static void intel_irq_remapping_free(struct irq_domain *domain,
+ 	irq_domain_free_irqs_common(domain, virq, nr_irqs);
+ }
+ 
++/*
++ * struct irq_domain_ops intel_ir_domain_ops.activate = intel_irq_remapping_activate()
++ */
+ static int intel_irq_remapping_activate(struct irq_domain *domain,
+ 					struct irq_data *irq_data, bool reserve)
+ {
+@@ -1403,6 +1514,9 @@ static int intel_irq_remapping_activate(struct irq_domain *domain,
+ 	return 0;
+ }
+ 
++/*
++ * struct irq_domain_ops intel_ir_domain_ops.deactivate = intel_irq_remapping_deactivate()
++ */
+ static void intel_irq_remapping_deactivate(struct irq_domain *domain,
+ 					   struct irq_data *irq_data)
+ {
+@@ -1413,6 +1527,22 @@ static void intel_irq_remapping_deactivate(struct irq_domain *domain,
+ 	modify_irte(&data->irq_2_iommu, &entry);
+ }
+ 
++/*
++ * used by irq_domain_create_hierarchy() in intel_setup_irq_remapping()
++ *
++ * Interrupt Remapping的出现改变了x86体系结构上的中断投递方式, 外部中断源
++ * 发出的中断请求格式发生了较大的改变, 中断请求会先被中断重映射硬件截获后
++ * 再通过查询中断重映射表的方式最终投递到目标CPU上. 这些外部设备中断源则包
++ * 括了中断控制器(I/O xAPICs)以及MSI/MSIX兼容设备PCI/PCIe设备等.
++ *
++ * Interrupt-remapping hardware utilizes a memory-resident single-level table, called the
++ * Interrupt Remapping Table. The interrupt remapping table is expected to be setup by system
++ * software, and its base address and size is specified through the Interrupt Remap Table
++ * Address Register.
++ *
++ * Each entry in the table is 128-bits in size and is referred to as Interrupt Remapping
++ * Table Entry (IRTE).
++ */
+ static const struct irq_domain_ops intel_ir_domain_ops = {
+ 	.alloc = intel_irq_remapping_alloc,
+ 	.free = intel_irq_remapping_free,
+diff --git a/drivers/iommu/iommu.c b/drivers/iommu/iommu.c
+index d2aa232..8c9552d 100644
+--- a/drivers/iommu/iommu.c
++++ b/drivers/iommu/iommu.c
+@@ -34,6 +34,12 @@
+ #include <linux/property.h>
+ #include <trace/events/iommu.h>
+ 
++/*
++ * - intel vt-d
++ * - amd iommu或者gart
++ * - arm的smmu
++ */
++
+ static struct kset *iommu_group_kset;
+ static DEFINE_IDA(iommu_group_ida);
+ static unsigned int iommu_def_domain_type = IOMMU_DOMAIN_DMA;
+@@ -85,6 +91,7 @@ struct iommu_group_attribute iommu_group_attr_##_name =		\
+ #define to_iommu_group(_kobj)		\
+ 	container_of(_kobj, struct iommu_group, kobj)
+ 
++/* 链接着所有的intel_iommu->iommu_device */
+ static LIST_HEAD(iommu_device_list);
+ static DEFINE_SPINLOCK(iommu_device_lock);
+ 
+@@ -535,6 +542,40 @@ static int iommu_group_create_direct_mappings(struct iommu_group *group,
+ 	return ret;
+ }
+ 
++/*
++ * iommu_group_add_device()打印的例子
++ *
++ * [    0.635453] iommu: Adding device 0000:00:00.0 to group 0
++ * [    0.635498] iommu: Adding device 0000:00:02.0 to group 1
++ * [    0.635545] iommu: Adding device 0000:00:16.0 to group 2
++ * [    0.635590] iommu: Adding device 0000:00:16.3 to group 2
++ * [    0.635634] iommu: Adding device 0000:00:19.0 to group 3
++ * [    0.635678] iommu: Adding device 0000:00:1a.0 to group 4
++ * [    0.635722] iommu: Adding device 0000:00:1b.0 to group 5
++ * [    0.635766] iommu: Adding device 0000:00:1c.0 to group 6
++ * [    0.635811] iommu: Adding device 0000:00:1c.2 to group 7
++ * [    0.635856] iommu: Adding device 0000:00:1d.0 to group 8
++ * [    0.635900] iommu: Adding device 0000:00:1e.0 to group 9
++ * [    0.635948] iommu: Adding device 0000:00:1f.0 to group 10
++ * [    0.635992] iommu: Adding device 0000:00:1f.2 to group 10
++ * [    0.636036] iommu: Adding device 0000:00:1f.3 to group 10
++ */
++/*
++ * Group 是IOMMU能够进行DMA隔离的最小硬件单元, 一个group内可能只有一个device, 也可能有多
++ * 个device, 这取决于物理平台上硬件的IOMMU拓扑结构. 设备直通的时候一个group里面的设备必须
++ * 都直通给一个虚拟机. 不能够让一个group里的多个device分别从属于2个不同的VM, 也不允许部分
++ * device在host上而另一部分被分配到guest里, 因为就这样一个guest中的device可以利用DMA攻击获
++ * 取另外一个guest里的数据, 就无法做到物理上的DMA隔离. 另外, VFIO中的group和iommu group可
++ * 以认为是同一个概念.
++ *
++ * Device 指的是我们要操作的硬件设备, 不过这里的"设备"需要从IOMMU拓扑的角度去理解. 如果该设
++ * 备是一个硬件拓扑上独立的设备, 那么它自己就构成一个iommu group. 如果这里是一个
++ * multi-function设备, 那么它和其他的function一起组成一个iommu group, 因为多个function设备
++ * 在物理硬件上就是互联的, 他们可以互相访问对方的数据所以必须放到一个group里隔离起来. 值得
++ * 一提的是, 对于支持PCIe ACS特性的硬件设备, 我们可以认为他们在物理上是互相隔离的.
++ *
++ * Container 是一个和地址空间相关联的概念, 这里可以简单把它理解为一个VM Domain的物理内存空间.
++ */
+ /**
+  * iommu_group_add_device - add a device to an iommu group
+  * @group: the group into which to add the device (reference should be held)
+@@ -543,6 +584,13 @@ static int iommu_group_create_direct_mappings(struct iommu_group *group,
+  * This function is called by an iommu driver to add a device into a
+  * group.  Adding a device increments the group reference count.
+  */
++/*
++ * 对于常用的x86的设备 被如下调用:
++ *   - iommu_group_get_for_dev() -- drivers/iommu/iommu.c 开机信息应该是这个打印的
++ *   - mtk_iommu_add_device() -- drivers/iommu/mtk_iommu_v1.c 也许用不到
++ *   - mdev_attach_iommu() -- drivers/vfio/mdev/mdev_driver.c 也许用不到
++ *   - vfio_iommu_group_get() -- drivers/vfio/vfio.c
++ */
+ int iommu_group_add_device(struct iommu_group *group, struct device *dev)
+ {
+ 	int ret, i = 0;
+@@ -629,6 +677,22 @@ EXPORT_SYMBOL_GPL(iommu_group_add_device);
+  * This function is called by an iommu driver to remove the device from
+  * it's current group.  This decrements the iommu group reference count.
+  */
++/*
++ * Group 是IOMMU能够进行DMA隔离的最小硬件单元, 一个group内可能只有一个device, 也可能有多
++ * 个device, 这取决于物理平台上硬件的IOMMU拓扑结构. 设备直通的时候一个group里面的设备必须
++ * 都直通给一个虚拟机. 不能够让一个group里的多个device分别从属于2个不同的VM, 也不允许部分
++ * device在host上而另一部分被分配到guest里, 因为就这样一个guest中的device可以利用DMA攻击获
++ * 取另外一个guest里的数据, 就无法做到物理上的DMA隔离. 另外, VFIO中的group和iommu group可
++ * 以认为是同一个概念.
++ *
++ * Device 指的是我们要操作的硬件设备, 不过这里的"设备"需要从IOMMU拓扑的角度去理解. 如果该设
++ * 备是一个硬件拓扑上独立的设备, 那么它自己就构成一个iommu group. 如果这里是一个
++ * multi-function设备, 那么它和其他的function一起组成一个iommu group, 因为多个function设备
++ * 在物理硬件上就是互联的, 他们可以互相访问对方的数据所以必须放到一个group里隔离起来. 值得
++ * 一提的是, 对于支持PCIe ACS特性的硬件设备, 我们可以认为他们在物理上是互相隔离的.
++ *
++ * Container 是一个和地址空间相关联的概念, 这里可以简单把它理解为一个VM Domain的物理内存空间.
++ */
+ void iommu_group_remove_device(struct device *dev)
+ {
+ 	struct iommu_group *group = dev->iommu_group;
+@@ -924,6 +988,11 @@ struct iommu_group *generic_device_group(struct device *dev)
+  * Use standard PCI bus topology, isolation features, and DMA alias quirks
+  * to find or create an IOMMU group for a device.
+  */
++/*
++ * struct iommu_ops intel_iommu_ops.device_group = pci_device_group()
++ *
++ * find iommu group for a particular device
++ */
+ struct iommu_group *pci_device_group(struct device *dev)
+ {
+ 	struct pci_dev *pdev = to_pci_dev(dev);
+@@ -1248,6 +1317,14 @@ void iommu_set_fault_handler(struct iommu_domain *domain,
+ }
+ EXPORT_SYMBOL_GPL(iommu_set_fault_handler);
+ 
++/*
++ * called by:
++ *   - iommu_group_get_for_dev() 两次
++ *   - iommu_domain_alloc()
++ *   - iommu_request_dm_for_dev()
++ *
++ *   在qemu模拟的vIOMMU没有调用到
++ */
+ static struct iommu_domain *__iommu_domain_alloc(struct bus_type *bus,
+ 						 unsigned type)
+ {
+@@ -1636,6 +1713,11 @@ size_t iommu_unmap_fast(struct iommu_domain *domain,
+ }
+ EXPORT_SYMBOL_GPL(iommu_unmap_fast);
+ 
++/*
++ * struct iommu_ops intel_iommu_ops.map_sg = default_iommu_map_sg()
++ *
++ * 会间接调用domain->ops->map
++ */
+ size_t default_iommu_map_sg(struct iommu_domain *domain, unsigned long iova,
+ 			 struct scatterlist *sg, unsigned int nents, int prot)
+ {
+@@ -1661,6 +1743,7 @@ size_t default_iommu_map_sg(struct iommu_domain *domain, unsigned long iova,
+ 		if (!IS_ALIGNED(s->offset, min_pagesz))
+ 			goto out_err;
+ 
++		/* 会间接调用domain->ops->map */
+ 		ret = iommu_map(domain, iova + mapped, phys, s->length, prot);
+ 		if (ret)
+ 			goto out_err;
+diff --git a/drivers/iommu/iova.c b/drivers/iommu/iova.c
+index 83fe262..6cec549 100644
+--- a/drivers/iommu/iova.c
++++ b/drivers/iommu/iova.c
+@@ -38,6 +38,7 @@ static void free_iova_rcaches(struct iova_domain *iovad);
+ static void fq_destroy_all_entries(struct iova_domain *iovad);
+ static void fq_flush_timeout(struct timer_list *t);
+ 
++/* iova被maintain在一棵rb tree */
+ void
+ init_iova_domain(struct iova_domain *iovad, unsigned long granule,
+ 	unsigned long start_pfn)
+@@ -148,6 +149,12 @@ __cached_rbnode_delete_update(struct iova_domain *iovad, struct iova *free)
+ }
+ 
+ /* Insert the iova into domain rbtree by holding writer lock */
++/*
++ * called only by:
++ *   - __alloc_and_insert_iova_range()
++ *   - __insert_new_range()
++ *   - split_and_remove_iova() 两次
++ */
+ static void
+ iova_insert_rbtree(struct rb_root *root, struct iova *iova,
+ 		   struct rb_node *start)
+@@ -394,12 +401,17 @@ EXPORT_SYMBOL_GPL(free_iova);
+  * alloc_iova_fast - allocates an iova from rcache
+  * @iovad: - iova domain in question
+  * @size: - size of page frames to allocate
+- * @limit_pfn: - max limit address
++ * @limit_pfn: - max limit address 不能大于这个地址
+  * @flush_rcache: - set to flush rcache on regular allocation failure
+  * This function tries to satisfy an iova allocation from the rcache,
+  * and falls back to regular allocation on failure. If regular allocation
+  * fails too and the flush_rcache flag is set then the rcache will be flushed.
+ */
++/*
++ * called by (去掉amd):
++ *   - iommu_dma_alloc_iova() 两次
++ *   - intel_alloc_iova() 两次
++ */
+ unsigned long
+ alloc_iova_fast(struct iova_domain *iovad, unsigned long size,
+ 		unsigned long limit_pfn, bool flush_rcache)
+@@ -706,6 +718,10 @@ copy_reserved_iova(struct iova_domain *from, struct iova_domain *to)
+ 		if (iova->pfn_lo == IOVA_ANCHOR)
+ 			continue;
+ 
++		/*
++		 * This function allocates reserves the address range from pfn_lo to pfn_hi so
++		 * that this address is not dished out as part of alloc_iova.
++		 */
+ 		new_iova = reserve_iova(to, iova->pfn_lo, iova->pfn_hi);
+ 		if (!new_iova)
+ 			printk(KERN_ERR "Reserve iova range %lx@%lx failed\n",
+diff --git a/drivers/iommu/irq_remapping.c b/drivers/iommu/irq_remapping.c
+index 7d0f307..23ae7aa 100644
+--- a/drivers/iommu/irq_remapping.c
++++ b/drivers/iommu/irq_remapping.c
+@@ -78,6 +78,7 @@ static __init int setup_irqremap(char *str)
+ 
+ 	return 0;
+ }
++/* 设置中断重映射功能 */
+ early_param("intremap", setup_irqremap);
+ 
+ void set_irq_remapping_broken(void)
+diff --git a/include/linux/dmar.h b/include/linux/dmar.h
+index e2433bc..470220a 100644
+--- a/include/linux/dmar.h
++++ b/include/linux/dmar.h
+@@ -87,6 +87,7 @@ extern struct list_head dmar_drhd_units;
+ 	list_for_each_entry_rcu(drhd, &dmar_drhd_units, list)		\
+ 		if (drhd->ignored) {} else
+ 
++/* 遍历所有dmar_drhd_units链表中的iommu hardware unit */
+ #define for_each_active_iommu(i, drhd)					\
+ 	list_for_each_entry_rcu(drhd, &dmar_drhd_units, list)		\
+ 		if (i=drhd->iommu, drhd->ignored) {} else
+diff --git a/include/linux/iommu.h b/include/linux/iommu.h
+index 19938ee..c12ea09 100644
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@ -86,6 +86,14 @@ struct iommu_domain_geometry {
+ #define IOMMU_DOMAIN_DMA	(__IOMMU_DOMAIN_PAGING |	\
+ 				 __IOMMU_DOMAIN_DMA_API)
+ 
++/*
++ * A domain is abstractly define as an isolated environment in the platform, to
++ * which a subset of the host physical memory is allocated. I/O devices that are
++ * allowed to access physical memory directly are allocated to a domain and the
++ * devices are referred to as the domain's assigned devices.
++ *
++ * For virtualization usages, software may treat each VM as a separate domain.
++ */
+ struct iommu_domain {
+ 	unsigned type;
+ 	const struct iommu_ops *ops;
+diff --git a/lib/dma-direct.c b/lib/dma-direct.c
+index 970d391..2cbc304 100644
+--- a/lib/dma-direct.c
++++ b/lib/dma-direct.c
+@@ -157,6 +157,9 @@ static int dma_direct_map_sg(struct device *dev, struct scatterlist *sgl,
+ 	return nents;
+ }
+ 
++/*
++ * struct dma_map_ops intel_dma_ops.dma_supported = dma_direct_supported()
++ */
+ int dma_direct_supported(struct device *dev, u64 mask)
+ {
+ #ifdef CONFIG_ZONE_DMA
+-- 
+2.7.4
+
