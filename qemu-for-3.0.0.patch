@@ -1,24 +1,24 @@
-From fcaf7382ff715c5674bb4eb376fcd10e0bce4349 Mon Sep 17 00:00:00 2001
+From 27a1ebb56455c691c3f603e934776628eeeed57a Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang@oracle.com>
-Date: Mon, 15 Oct 2018 15:59:40 +0800
+Date: Wed, 17 Oct 2018 16:04:42 +0800
 Subject: [PATCH 1/1] qemu for 3.0.0
-
+ 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
  accel/kvm/kvm-all.c          |   18 +-
  bootdevice.c                 |   27 +
  comment.txt                  |  775 +++++++++++++++++++++++
- exec.c                       |    4 +
+ exec.c                       |   66 ++
  hmp.c                        |    7 +
- hw/block/nvme.c              |   64 ++
+ hw/block/nvme.c              |   82 +++
  hw/core/bus.c                |   62 ++
  hw/core/machine.c            |  136 +++-
  hw/core/qdev-fw.c            |   13 +
  hw/core/qdev-properties.c    |    6 +
  hw/core/qdev.c               |  186 ++++++
  hw/core/reset.c              |   41 ++
- hw/i386/pc.c                 |   51 ++
- hw/i386/pc_piix.c            |   44 ++
+ hw/i386/pc.c                 |   63 ++
+ hw/i386/pc_piix.c            |   55 +-
  hw/i386/pc_q35.c             |   24 +
  hw/i386/x86-iommu.c          |    6 +
  hw/net/e1000.c               |   37 ++
@@ -26,8 +26,9 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  hw/pci/msix.c                |   15 +
  hw/pci/pci.c                 |  133 ++++
  hw/virtio/virtio-balloon.c   |    6 +
- include/exec/memory.h        |    4 +
- include/hw/boards.h          |   12 +
+ include/exec/memory.h        |   65 ++
+ include/exec/ram_addr.h      |   11 +
+ include/hw/boards.h          |   16 +
  include/hw/i386/pc.h         |   76 ++-
  include/hw/pci/pci.h         |    8 +
  include/hw/pci/pci_bus.h     |    1 +
@@ -40,20 +41,21 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  include/sysemu/iothread.h    |    1 +
  include/sysemu/kvm_int.h     |    1 +
  linux-headers/linux/kvm.h    |    4 +
- memory.c                     |   83 +++
+ memory.c                     |  464 +++++++++++++-
  numa.c                       |    4 +
  qapi/qobject-input-visitor.c |   10 +
  qdev-monitor.c               |   20 +
  qom/container.c              |   84 +++
- qom/object.c                 | 1413 +++++++++++++++++++++++++++++++++++++++++-
+ qom/object.c                 | 1426 +++++++++++++++++++++++++++++++++++++++++-
  qom/object_interfaces.c      |    3 +
  qom/qom-qobject.c            |   47 ++
  target/i386/kvm.c            |    4 +
  ui/console.c                 |    6 +
  util/module.c                |   59 +-
  util/qemu-config.c           |   95 +++
- vl.c                         |   83 ++-
- 48 files changed, 3765 insertions(+), 12 deletions(-)
+ util/qemu-option.c           |   22 +
+ vl.c                         |   84 ++-
+ 50 files changed, 4357 insertions(+), 16 deletions(-)
  create mode 100644 comment.txt
 
 diff --git a/accel/kvm/kvm-all.c b/accel/kvm/kvm-all.c
@@ -930,10 +932,120 @@ index 0000000..513c174
 +
 +
 diff --git a/exec.c b/exec.c
-index 4f5df07..526b7b8 100644
+index 4f5df07..dca90b6 100644
 --- a/exec.c
 +++ b/exec.c
-@@ -3093,6 +3093,10 @@ static void tcg_commit(MemoryListener *listener)
+@@ -1305,15 +1305,31 @@ void cpu_abort(CPUState *cpu, const char *fmt, ...)
+ 
+ #if !defined(CONFIG_USER_ONLY)
+ /* Called from RCU critical section */
++/*
++ * called by:
++ *   - exec.c|1358| <<tlb_reset_dirty_range_all>> block = qemu_get_ram_block(start);
++ *   - exec.c|1359| <<tlb_reset_dirty_range_all>> assert(block == qemu_get_ram_block(end - 1));
++ *   - exec.c|2510| <<qemu_map_ram_ptr>> block = qemu_get_ram_block(addr);
++ *   - exec.c|2542| <<qemu_ram_ptr_length>> block = qemu_get_ram_block(addr);
++ *   - exec.c|2599| <<qemu_ram_block_from_host>> block = qemu_get_ram_block(ram_addr);
++ *
++ * 根据给定的模拟的物理地址 返回对应的RAMBlock
++ */
+ static RAMBlock *qemu_get_ram_block(ram_addr_t addr)
+ {
+     RAMBlock *block;
+ 
++    /*
++     * mru: most recently used
++     */
+     block = atomic_rcu_read(&ram_list.mru_block);
+     if (block && addr - block->offset < block->max_length) {
+         return block;
+     }
+     RAMBLOCK_FOREACH(block) {
++        /*
++	 * offset是RAMBlock在内存中代表的基地址
++	 */
+         if (addr - block->offset < block->max_length) {
+             goto found;
+         }
+@@ -1621,6 +1637,10 @@ static void register_multipage(FlatView *fv,
+     phys_page_set(d, start_addr >> TARGET_PAGE_BITS, num_pages, section_index);
+ }
+ 
++/*
++ * called only by:
++ *   - memory.c|795| <<generate_memory_topology>> flatview_add_to_dispatch(view, &mrs);
++ */
+ void flatview_add_to_dispatch(FlatView *fv, MemoryRegionSection *section)
+ {
+     MemoryRegionSection now = *section, remain = *section;
+@@ -1909,6 +1929,10 @@ static void *file_ram_alloc(RAMBlock *block,
+  * dirty bitmaps.
+  * Called with the ramlist lock held.
+  */
++/*
++ * called only by:
++ *   - exec.c|2212| <<ram_block_add>> new_block->offset = find_ram_offset(new_block->max_length);
++ */
+ static ram_addr_t find_ram_offset(ram_addr_t size)
+ {
+     RAMBlock *block, *next_block;
+@@ -2179,6 +2203,29 @@ static void dirty_memory_extend(ram_addr_t old_ram_size,
+     }
+ }
+ 
++/*
++ * 一个例子:
++ * (gdb) bt
++ * #0  ram_block_add (new_block=0x5555568fb9d0, errp=0x7fffffffdd58, shared=false) at /home/zhang/kvm/qemu-3.0.0/exec.c:2183
++ * #1  0x0000555555801ea9 in qemu_ram_alloc_internal (size=2097152000, max_size=2097152000, resized=0x0, host=0x0, resizeable=false, share=false, mr=0x5555568fb440, errp=0x555556751598 <error_fatal>)
++ *     at /home/zhang/kvm/qemu-3.0.0/exec.c:2375
++ * #2  0x0000555555801f84 in qemu_ram_alloc (size=2097152000, share=false, mr=0x5555568fb440, errp=0x555556751598 <error_fatal>) at /home/zhang/kvm/qemu-3.0.0/exec.c:2394
++ * #3  0x0000555555867b1a in memory_region_init_ram_shared_nomigrate (mr=0x5555568fb440, owner=0x0, name=0x555555ea76a7 "pc.ram", size=2097152000, share=false, errp=0x555556751598 <error_fatal>)
++ *     at /home/zhang/kvm/qemu-3.0.0/memory.c:1525
++ * #4  0x0000555555867aa3 in memory_region_init_ram_nomigrate (mr=0x5555568fb440, owner=0x0, name=0x555555ea76a7 "pc.ram", size=2097152000, errp=0x555556751598 <error_fatal>)
++ *     at /home/zhang/kvm/qemu-3.0.0/memory.c:1511
++ * #5  0x000055555585f53a in allocate_system_memory_nonnuma (mr=0x5555568fb440, owner=0x0, name=0x555555ea76a7 "pc.ram", ram_size=2097152000) at /home/zhang/kvm/qemu-3.0.0/numa.c:502
++ * #6  0x000055555585f5a9 in memory_region_allocate_system_memory (mr=0x5555568fb440, owner=0x0, name=0x555555ea76a7 "pc.ram", ram_size=2097152000) at /home/zhang/kvm/qemu-3.0.0/numa.c:515
++ * #7  0x0000555555918fdb in pc_memory_init (pcms=0x55555684f780, system_memory=0x555556850d40, rom_memory=0x5555568faff0, ram_memory=0x7fffffffdfc8) at /home/zhang/kvm/qemu-3.0.0/hw/i386/pc.c:1346
++ * #8  0x000055555591ceb7 in pc_init1 (machine=0x55555684f780, host_type=0x555555ea8834 "i440FX-pcihost", pci_type=0x555555ea882d "i440FX") at /home/zhang/kvm/qemu-3.0.0/hw/i386/pc_piix.c:181
++ * #9  0x000055555591da26 in pc_init_v3_0 (machine=0x55555684f780) at /home/zhang/kvm/qemu-3.0.0/hw/i386/pc_piix.c:438
++ * #10 0x0000555555a7c472 in machine_run_board_init (machine=0x55555684f780) at hw/core/machine.c:830
++ * #11 0x00005555559dfb8f in main (argc=14, argv=0x7fffffffe408, envp=0x7fffffffe480) at vl.c:4516
++ *
++ * called by:
++ *   - exec.c|2353| <<qemu_ram_alloc_from_fd>> ram_block_add(new_block, &local_err, share);
++ *   - exec.c|2418| <<qemu_ram_alloc_internal>> ram_block_add(new_block, &local_err, share);
++ */
+ static void ram_block_add(RAMBlock *new_block, Error **errp, bool shared)
+ {
+     RAMBlock *block;
+@@ -2344,6 +2391,12 @@ RAMBlock *qemu_ram_alloc_from_file(ram_addr_t size, MemoryRegion *mr,
+ }
+ #endif
+ 
++/*
++ * called by:
++ *   - exec.c|2430| <<qemu_ram_alloc_from_ptr>> return qemu_ram_alloc_internal(size, size, NULL, host, false,
++ *   - exec.c|2437| <<qemu_ram_alloc>> return qemu_ram_alloc_internal(size, size, NULL, NULL, false,
++ *   - exec.c|2447| <<qemu_ram_alloc_resizeable>> return qemu_ram_alloc_internal(size, maxsz, resized, NULL, true,
++ */
+ static
+ RAMBlock *qemu_ram_alloc_internal(ram_addr_t size, ram_addr_t max_size,
+                                   void (*resized)(const char*,
+@@ -2388,6 +2441,12 @@ RAMBlock *qemu_ram_alloc_from_ptr(ram_addr_t size, void *host,
+                                    false, mr, errp);
+ }
+ 
++/*
++ * called by:
++ *   - memory.c|1647| <<memory_region_init_ram_shared_nomigrate>> mr->ram_block = qemu_ram_alloc(size, share, mr, errp);
++ *   - memory.c|1758| <<memory_region_init_rom_nomigrate>> mr->ram_block = qemu_ram_alloc(size, false, mr, errp);
++ *   - memory.c|1777| <<memory_region_init_rom_device_nomigrate>> mr->ram_block = qemu_ram_alloc(size, false, mr, errp);
++ */
+ RAMBlock *qemu_ram_alloc(ram_addr_t size, bool share,
+                          MemoryRegion *mr, Error **errp)
+ {
+@@ -3093,6 +3152,10 @@ static void tcg_commit(MemoryListener *listener)
      tlb_flush(cpuas->cpu);
  }
  
@@ -944,6 +1056,16 @@ index 4f5df07..526b7b8 100644
  static void memory_map_init(void)
  {
      system_memory = g_malloc(sizeof(*system_memory));
+@@ -3519,6 +3582,9 @@ void cpu_register_map_client(QEMUBH *bh)
+     qemu_mutex_unlock(&map_client_list_lock);
+ }
+ 
++/*
++ * 只被vl.c的main()调用
++ */
+ void cpu_exec_init_all(void)
+ {
+     qemu_mutex_init(&ram_list.mutex);
 diff --git a/hmp.c b/hmp.c
 index 2aafb50..2a2f4d0 100644
 --- a/hmp.c
@@ -963,10 +1085,35 @@ index 2aafb50..2a2f4d0 100644
  {
      const char *path = qdict_get_try_str(qdict, "path");
 diff --git a/hw/block/nvme.c b/hw/block/nvme.c
-index 5e508ab..556eea4 100644
+index 5e508ab..a44d423 100644
 --- a/hw/block/nvme.c
 +++ b/hw/block/nvme.c
-@@ -1197,6 +1197,24 @@ static const MemoryRegionOps nvme_cmb_ops = {
+@@ -1041,6 +1041,24 @@ static void nvme_write_bar(NvmeCtrl *n, hwaddr offset, uint64_t data,
+     }
+ }
+ 
++/*
++ * (gdb) bt
++ * #0  nvme_mmio_read (opaque=0x5555579a9f90, addr=0, size=4) at hw/block/nvme.c:1045
++ * #1  0x0000555555864736 in memory_region_read_accessor (mr=0x5555579aa870, addr=0, value=0x7fffec8b0858, size=4, shift=0, mask=4294967295, attrs=...) at /home/zhang/kvm/qemu-3.0.0/memory.c:436
++ * #2  0x0000555555864d45 in access_with_adjusted_size (addr=0, value=0x7fffec8b0858, size=4, access_size_min=2, access_size_max=8, access_fn=0x5555558646f8 <memory_region_read_accessor>, mr=0x5555579aa870, 
++ *     attrs=...) at /home/zhang/kvm/qemu-3.0.0/memory.c:594
++ * #3  0x00005555558675d1 in memory_region_dispatch_read1 (mr=0x5555579aa870, addr=0, pval=0x7fffec8b0858, size=4, attrs=...) at /home/zhang/kvm/qemu-3.0.0/memory.c:1392
++ * #4  0x00005555558676dc in memory_region_dispatch_read (mr=0x5555579aa870, addr=0, pval=0x7fffec8b0858, size=4, attrs=...) at /home/zhang/kvm/qemu-3.0.0/memory.c:1423
++ * #5  0x0000555555803bbc in flatview_read_continue (fv=0x7fffe024d810, addr=4273930240, attrs=..., buf=0x7ffff7fef028 "", len=4, addr1=0, l=4, mr=0x5555579aa870) at /home/zhang/kvm/qemu-3.0.0/exec.c:3316
++ * #6  0x0000555555803d14 in flatview_read (fv=0x7fffe024d810, addr=4273930240, attrs=..., buf=0x7ffff7fef028 "", len=4) at /home/zhang/kvm/qemu-3.0.0/exec.c:3354
++ * #7  0x0000555555803d88 in address_space_read_full (as=0x555556721a80 <address_space_memory>, addr=4273930240, attrs=..., buf=0x7ffff7fef028 "", len=4) at /home/zhang/kvm/qemu-3.0.0/exec.c:3367
++ * #8  0x0000555555803e5f in address_space_rw (as=0x555556721a80 <address_space_memory>, addr=4273930240, attrs=..., buf=0x7ffff7fef028 "", len=4, is_write=false) at /home/zhang/kvm/qemu-3.0.0/exec.c:3397
++ * #9  0x0000555555882b7d in kvm_cpu_exec (cpu=0x55555688a170) at /home/zhang/kvm/qemu-3.0.0/accel/kvm/kvm-all.c:1979
++ * #10 0x0000555555849eac in qemu_kvm_cpu_thread_fn (arg=0x55555688a170) at /home/zhang/kvm/qemu-3.0.0/cpus.c:1215
++ * #11 0x0000555555d92dd7 in qemu_thread_start (args=0x5555568abcb0) at util/qemu-thread-posix.c:504
++ * #12 0x00007ffff4ca06ba in start_thread (arg=0x7fffec8b1700) at pthread_create.c:333
++ * #13 0x00007ffff49d641d in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:109
++ */
+ static uint64_t nvme_mmio_read(void *opaque, hwaddr addr, unsigned size)
+ {
+     NvmeCtrl *n = (NvmeCtrl *)opaque;
+@@ -1197,6 +1215,24 @@ static const MemoryRegionOps nvme_cmb_ops = {
      },
  };
  
@@ -991,7 +1138,7 @@ index 5e508ab..556eea4 100644
  static void nvme_realize(PCIDevice *pci_dev, Error **errp)
  {
      NvmeCtrl *n = NVME(pci_dev);
-@@ -1339,6 +1357,9 @@ static void nvme_exit(PCIDevice *pci_dev)
+@@ -1339,6 +1375,9 @@ static void nvme_exit(PCIDevice *pci_dev)
      msix_uninit_exclusive_bar(pci_dev);
  }
  
@@ -1001,7 +1148,7 @@ index 5e508ab..556eea4 100644
  static Property nvme_props[] = {
      DEFINE_BLOCK_PROPERTIES(NvmeCtrl, conf),
      DEFINE_PROP_STRING("serial", NvmeCtrl, serial),
-@@ -1352,11 +1373,32 @@ static const VMStateDescription nvme_vmstate = {
+@@ -1352,11 +1391,32 @@ static const VMStateDescription nvme_vmstate = {
      .unmigratable = 1,
  };
  
@@ -1034,7 +1181,7 @@ index 5e508ab..556eea4 100644
      pc->realize = nvme_realize;
      pc->exit = nvme_exit;
      pc->class_id = PCI_CLASS_STORAGE_EXPRESS;
-@@ -1370,6 +1412,23 @@ static void nvme_class_init(ObjectClass *oc, void *data)
+@@ -1370,6 +1430,23 @@ static void nvme_class_init(ObjectClass *oc, void *data)
      dc->vmsd = &nvme_vmstate;
  }
  
@@ -1058,7 +1205,7 @@ index 5e508ab..556eea4 100644
  static void nvme_instance_init(Object *obj)
  {
      NvmeCtrl *s = NVME(obj);
-@@ -1393,7 +1452,12 @@ static const TypeInfo nvme_info = {
+@@ -1393,7 +1470,12 @@ static const TypeInfo nvme_info = {
  
  static void nvme_register_types(void)
  {
@@ -1923,10 +2070,44 @@ index 84c8869..563a36f 100644
  {
      QEMUResetEntry *re, *nre;
 diff --git a/hw/i386/pc.c b/hw/i386/pc.c
-index 83a4444..dfa9a33 100644
+index 83a4444..15faacc 100644
 --- a/hw/i386/pc.c
 +++ b/hw/i386/pc.c
-@@ -1633,6 +1633,11 @@ void pc_basic_device_init(ISABus *isa_bus, qemu_irq *gsi,
+@@ -1321,6 +1321,11 @@ void xen_load_linux(PCMachineState *pcms)
+     pcms->fw_cfg = fw_cfg;
+ }
+ 
++/*
++ * called by:
++ *   - hw/i386/pc_piix.c|194| <<pc_init1>> pc_memory_init(pcms, system_memory,
++ *   - hw/i386/pc_q35.c|167| <<pc_q35_init>> pc_memory_init(pcms, get_system_memory(),
++ */
+ void pc_memory_init(PCMachineState *pcms,
+                     MemoryRegion *system_memory,
+                     MemoryRegion *rom_memory,
+@@ -1333,6 +1338,9 @@ void pc_memory_init(PCMachineState *pcms,
+     MachineState *machine = MACHINE(pcms);
+     PCMachineClass *pcmc = PC_MACHINE_GET_CLASS(pcms);
+ 
++    /*
++     * 在pc_init1()中初始化了pcms->below_4g_mem_size和pcms->above_4g_mem_size
++     */
+     assert(machine->ram_size == pcms->below_4g_mem_size +
+                                 pcms->above_4g_mem_size);
+ 
+@@ -1342,7 +1350,11 @@ void pc_memory_init(PCMachineState *pcms,
+      * aliases to address portions of it, mostly for backwards compatibility
+      * with older qemus that used qemu_ram_alloc().
+      */
++    /* ram是MemoryRegion */
+     ram = g_malloc(sizeof(*ram));
++    /*
++     * 这里的machine->ram_size就是qemu参数中的内存
++     */
+     memory_region_allocate_system_memory(ram, NULL, "pc.ram",
+                                          machine->ram_size);
+     *ram_memory = ram;
+@@ -1633,6 +1645,11 @@ void pc_basic_device_init(ISABus *isa_bus, qemu_irq *gsi,
      pc_superio_init(isa_bus, create_fdctrl, no_vmport);
  }
  
@@ -1938,7 +2119,7 @@ index 83a4444..dfa9a33 100644
  void pc_nic_init(PCMachineClass *pcmc, ISABus *isa_bus, PCIBus *pci_bus)
  {
      int i;
-@@ -2258,6 +2263,12 @@ static void pc_machine_set_pit(Object *obj, bool value, Error **errp)
+@@ -2258,6 +2275,12 @@ static void pc_machine_set_pit(Object *obj, bool value, Error **errp)
      pcms->pit = value;
  }
  
@@ -1951,7 +2132,7 @@ index 83a4444..dfa9a33 100644
  static void pc_machine_initfn(Object *obj)
  {
      PCMachineState *pcms = PC_MACHINE(obj);
-@@ -2274,6 +2285,9 @@ static void pc_machine_initfn(Object *obj)
+@@ -2274,6 +2297,9 @@ static void pc_machine_initfn(Object *obj)
      pcms->pit = true;
  }
  
@@ -1961,7 +2142,7 @@ index 83a4444..dfa9a33 100644
  static void pc_machine_reset(void)
  {
      CPUState *cs;
-@@ -2363,6 +2377,12 @@ static void x86_nmi(NMIState *n, int cpu_index, Error **errp)
+@@ -2363,6 +2389,12 @@ static void x86_nmi(NMIState *n, int cpu_index, Error **errp)
      }
  }
  
@@ -1974,7 +2155,7 @@ index 83a4444..dfa9a33 100644
  static void pc_machine_class_init(ObjectClass *oc, void *data)
  {
      MachineClass *mc = MACHINE_CLASS(oc);
-@@ -2443,6 +2463,28 @@ static void pc_machine_class_init(ObjectClass *oc, void *data)
+@@ -2443,6 +2475,28 @@ static void pc_machine_class_init(ObjectClass *oc, void *data)
          pc_machine_get_pit, pc_machine_set_pit, &error_abort);
  }
  
@@ -2003,7 +2184,7 @@ index 83a4444..dfa9a33 100644
  static const TypeInfo pc_machine_info = {
      .name = TYPE_PC_MACHINE,
      .parent = TYPE_MACHINE,
-@@ -2460,7 +2502,16 @@ static const TypeInfo pc_machine_info = {
+@@ -2460,7 +2514,16 @@ static const TypeInfo pc_machine_info = {
  
  static void pc_machine_register_types(void)
  {
@@ -2021,10 +2202,10 @@ index 83a4444..dfa9a33 100644
 + */
  type_init(pc_machine_register_types)
 diff --git a/hw/i386/pc_piix.c b/hw/i386/pc_piix.c
-index dc09466..928505b 100644
+index dc09466..b8976c7 100644
 --- a/hw/i386/pc_piix.c
 +++ b/hw/i386/pc_piix.c
-@@ -66,6 +66,19 @@ static const int ide_iobase2[MAX_IDE_BUS] = { 0x3f6, 0x376 };
+@@ -66,13 +66,26 @@ static const int ide_iobase2[MAX_IDE_BUS] = { 0x3f6, 0x376 };
  static const int ide_irq[MAX_IDE_BUS] = { 14, 15 };
  
  /* PC hardware initialisation */
@@ -2044,7 +2225,45 @@ index dc09466..928505b 100644
  static void pc_init1(MachineState *machine,
                       const char *host_type, const char *pci_type)
  {
-@@ -404,6 +417,37 @@ static void pc_xen_hvm_init(MachineState *machine)
+     PCMachineState *pcms = PC_MACHINE(machine);
+     PCMachineClass *pcmc = PC_MACHINE_GET_CLASS(pcms);
+-    MemoryRegion *system_memory = get_system_memory();
+-    MemoryRegion *system_io = get_system_io();
++    MemoryRegion *system_memory = get_system_memory();  // 返回system_memory (MemoryRegion)
++    MemoryRegion *system_io = get_system_io();          // 返回system_io (MemoryRegion)
+     int i;
+     PCIBus *pci_bus;
+     ISABus *isa_bus;
+@@ -123,7 +136,7 @@ static void pc_init1(MachineState *machine,
+     if (xen_enabled()) {
+         xen_hvm_init(pcms, &ram_memory);
+     } else {
+-        if (!pcms->max_ram_below_4g) {
++        if (!pcms->max_ram_below_4g) { // gdb调试的时候pcms->max_ram_below_4g是0
+             pcms->max_ram_below_4g = 0xe0000000; /* default: 3.5G */
+         }
+         lowmem = pcms->max_ram_below_4g;
+@@ -156,7 +169,9 @@ static void pc_init1(MachineState *machine,
+         kvmclock_create();
+     }
+ 
++    /* pcmc->pci_enabled在debug的时候是true */
+     if (pcmc->pci_enabled) {
++        /* 分配一个MemoryRegion */
+         pci_memory = g_new(MemoryRegion, 1);
+         memory_region_init(pci_memory, NULL, "pci", UINT64_MAX);
+         rom_memory = pci_memory;
+@@ -178,6 +193,9 @@ static void pc_init1(MachineState *machine,
+ 
+     /* allocate ram and load rom/bios */
+     if (!xen_enabled()) {
++        /*
++	 * 刚刚在上面初始化完了above_4g_mem_size和below_4g_mem_size
++	 */
+         pc_memory_init(pcms, system_memory,
+                        rom_memory, &ram_memory);
+     } else if (machine->kernel_filename != NULL) {
+@@ -404,6 +422,37 @@ static void pc_xen_hvm_init(MachineState *machine)
  }
  #endif
  
@@ -2556,7 +2775,7 @@ index 1f7a87f..e64942a 100644
          DeviceState *dev = DEVICE(obj);
          if (dev->realized) { /* only realized DIMMs matter */
 diff --git a/include/exec/memory.h b/include/exec/memory.h
-index 448d41a..d2f9eca 100644
+index 448d41a..0adc90c 100644
 --- a/include/exec/memory.h
 +++ b/include/exec/memory.h
 @@ -32,6 +32,7 @@
@@ -2567,18 +2786,152 @@ index 448d41a..d2f9eca 100644
  #define TYPE_MEMORY_REGION "qemu:memory-region"
  #define MEMORY_REGION(obj) \
          OBJECT_CHECK(MemoryRegion, (obj), TYPE_MEMORY_REGION)
-@@ -336,6 +337,9 @@ typedef struct IOMMUMemoryRegionClass {
+@@ -336,6 +337,18 @@ typedef struct IOMMUMemoryRegionClass {
  typedef struct CoalescedMemoryRange CoalescedMemoryRange;
  typedef struct MemoryRegionIoeventfd MemoryRegionIoeventfd;
  
 +/*
 + * TYPE_MEMORY_REGION的instance
++ *
++ * MemoryRegion是树状父子结构的,每一个ramblock都有一个对应的MemoryRegion,
++ * 一般而言,这个MemoryRegion是最顶级的MemoryRegion,它还有很多子MemoryRegion,
++ * 比如在这个ramblock地址范围内的MMIO等.
++ *
++ * MemoryRegion有多种类型,可以表示一段ram,rom,MMIO,alias,alias表示一个
++ * MemoryRegion的一部分区域,MemoryRegion也可以表示一个container,这就表示它
++ * 只是其他若干个MemoryRegion的容器.在MemoryRegion中,'ram_block'表示的是分配
++ * 的实际内存.
 + */
  struct MemoryRegion {
      Object parent_obj;
  
+@@ -351,6 +364,16 @@ struct MemoryRegion {
+     bool global_locking;
+     uint8_t dirty_log_mask;
+     bool is_iommu;
++    /*
++     * 被以下初始化:
++     *   - memory.c|1647| <<memory_region_init_ram_shared_nomigrate>> mr->ram_block = qemu_ram_alloc(size, share, mr, errp);
++     *   - memory.c|1665| <<memory_region_init_resizeable_ram>> mr->ram_block = qemu_ram_alloc_resizeable(size, max_size, resized,
++     *   - memory.c|1685| <<memory_region_init_ram_from_file>> mr->ram_block = qemu_ram_alloc_from_file(size, mr, share, path, errp);
++     *   - memory.c|1701| <<memory_region_init_ram_from_fd>> mr->ram_block = qemu_ram_alloc_from_fd(size, mr, share, fd, errp);
++     *   - memory.c|1720| <<memory_region_init_ram_ptr>> mr->ram_block = qemu_ram_alloc_from_ptr(size, ptr, mr, &error_fatal);
++     *   - memory.c|1758| <<memory_region_init_rom_nomigrate>> mr->ram_block = qemu_ram_alloc(size, false, mr, errp);
++     *   - memory.c|1777| <<memory_region_init_rom_device_nomigrate>> mr->ram_block = qemu_ram_alloc(size, false, mr, errp);
++     */
+     RAMBlock *ram_block;
+     Object *owner;
+ 
+@@ -358,6 +381,7 @@ struct MemoryRegion {
+     void *opaque;
+     MemoryRegion *container;
+     Int128 size;
++    /* 在AddressSpace中的地址 */
+     hwaddr addr;
+     void (*destructor)(MemoryRegion *mr);
+     uint64_t align;
+@@ -424,6 +448,10 @@ struct MemoryListener {
+ /**
+  * AddressSpace: describes a mapping of addresses to #MemoryRegion objects
+  */
++/*
++ * qemu中用AddressSpace用来表示CPU/设备看到的内存,一个AddressSpace下面包含
++ * 多个MemoryRegion,这些MemoryRegion结构通过树连接起来,树的根是AddressSpace的root域
++ */
+ struct AddressSpace {
+     /* All fields are private. */
+     struct rcu_head rcu;
+@@ -431,11 +459,42 @@ struct AddressSpace {
+     MemoryRegion *root;
+ 
+     /* Accessed via RCU.  */
++    /*
++     * AddressSpace的一张平面视图,它是AddressSpace所有正在使用的MemoryRegion的集合,这是从CPU的视角来看到的
++     */
+     struct FlatView *current_map;
+ 
+     int ioeventfd_nb;
+     struct MemoryRegionIoeventfd *ioeventfds;
++    /*
++     * 使用listerner的地方:
++     *   - memory.c|162| <<MEMORY_LISTENER_CALL>> struct memory_listeners_as *list = &(_as)->listeners; \
++     *   - memory.c|1034| <<address_space_set_flatview>> if (!QTAILQ_EMPTY(&as->listeners)) {
++     *   - memory.c|2777| <<memory_listener_register>> if (QTAILQ_EMPTY(&as->listeners)
++     *   - memory.c|2778| <<memory_listener_register>> || listener->priority >= QTAILQ_LAST(&as->listeners,
++     *   - memory.c|2780| <<memory_listener_register>> QTAILQ_INSERT_TAIL(&as->listeners, listener, link_as);
++     *   - memory.c|2782| <<memory_listener_register>> QTAILQ_FOREACH(other, &as->listeners, link_as) {
++     *   - memory.c|2801| <<memory_listener_unregister>> QTAILQ_REMOVE(&listener->address_space->listeners, listener, link_as);
++     *   - memory.c|2931| <<address_space_init>> QTAILQ_INIT(&as->listeners);
++     *   - memory.c|2944| <<do_address_space_destroy>> assert(QTAILQ_EMPTY(&as->listeners));
++     */
+     QTAILQ_HEAD(memory_listeners_as, MemoryListener) listeners;
++    /*
++     * 添加:
++     *   - memory.c|2933| <<address_space_init>> QTAILQ_INSERT_TAIL(&address_spaces, as, address_spaces_link);
++     *
++     * 删除:
++     *   - memory.c|2960| <<address_space_destroy>> QTAILQ_REMOVE(&address_spaces, as, address_spaces_link);
++     *
++     * 使用:
++     *   - memory.c|638| <<memory_region_to_address_space>> QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
++     *   - memory.c|1005| <<flatviews_reset>> QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
++     *   - memory.c|1096| <<memory_region_transaction_commit>> QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
++     *   - memory.c|1104| <<memory_region_transaction_commit>> QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
++     *   - memory.c|2260| <<memory_region_update_coalesced_range>> QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
++     *   - memory.c|3255| <<mtree_info>> QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
++     *   - memory.c|3279| <<mtree_info>> QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
++     */
+     QTAILQ_ENTRY(AddressSpace) address_spaces_link;
+ };
+ 
+@@ -448,13 +507,19 @@ typedef struct FlatRange FlatRange;
+ struct FlatView {
+     struct rcu_head rcu;
+     unsigned ref;
++    /* nr_allocated个 数组 */
+     FlatRange *ranges;
++    /* 当前正在使用的ranges */
+     unsigned nr;
++    /* ranges数组中元素的数目 */
+     unsigned nr_allocated;
+     struct AddressSpaceDispatch *dispatch;
+     MemoryRegion *root;
+ };
+ 
++/*
++ * 返回AddressSpace的current_map
++ */
+ static inline FlatView *address_space_to_flatview(AddressSpace *as)
+ {
+     return atomic_rcu_read(&as->current_map);
+diff --git a/include/exec/ram_addr.h b/include/exec/ram_addr.h
+index cf4ce06..0f12b75 100644
+--- a/include/exec/ram_addr.h
++++ b/include/exec/ram_addr.h
+@@ -23,10 +23,21 @@
+ #include "hw/xen/xen.h"
+ #include "exec/ramlist.h"
+ 
++/*
++ * 是真正分配了host内存的地方
++ *
++ * 每一个ram_block还会被连接到全局的'ram_list'链表上
++ */
+ struct RAMBlock {
+     struct rcu_head rcu;
+     struct MemoryRegion *mr;
++    /*
++     * 'host'指向了动态分配的内存,用于表示实际的虚拟机物理内存
++     */
+     uint8_t *host;
++    /*
++     * offset表示了这块内存在虚拟机物理内存中的偏移
++     */
+     ram_addr_t offset;
+     ram_addr_t used_length;
+     ram_addr_t max_length;
 diff --git a/include/hw/boards.h b/include/hw/boards.h
-index d139a43..69062f0 100644
+index d139a43..42479d0 100644
 --- a/include/hw/boards.h
 +++ b/include/hw/boards.h
 @@ -48,6 +48,7 @@ void memory_region_allocate_system_memory(MemoryRegion *mr, Object *owner,
@@ -2608,6 +2961,17 @@ index d139a43..69062f0 100644
      void (*reset)(void);
      void (*hot_add_cpu)(const int64_t id, Error **errp);
      int (*kvm_type)(const char *arg);
+@@ -258,6 +270,10 @@ struct MachineState {
+     char *memory_encryption;
+     DeviceMemoryState *device_memory;
+ 
++    /*
++     * 设定的地方:
++     *   - vl.c|4581| <<main>> current_machine->ram_size = ram_size;
++     */
+     ram_addr_t ram_size;
+     ram_addr_t maxram_size;
+     uint64_t   ram_slots;
 diff --git a/include/hw/i386/pc.h b/include/hw/i386/pc.h
 index 6894f37..c814d44 100644
 --- a/include/hw/i386/pc.h
@@ -3047,10 +3411,35 @@ index 98f389a..b8b9320 100644
  #define KVM_GET_MSR_INDEX_LIST    _IOWR(KVMIO, 0x02, struct kvm_msr_list)
  
 diff --git a/memory.c b/memory.c
-index e9cd446..bbfa6cd 100644
+index e9cd446..42fbcb4 100644
 --- a/memory.c
 +++ b/memory.c
-@@ -40,9 +40,39 @@ static bool memory_region_update_pending;
+@@ -36,16 +36,80 @@
+ //#define DEBUG_UNASSIGNED
+ 
+ static unsigned memory_region_transaction_depth;
++/*
++ * 设置的地方:
++ *   - memory.c|1254| <<memory_region_transaction_commit>> memory_region_update_pending = false;
++ *   - memory.c|2245| <<memory_region_set_log>> memory_region_update_pending |= mr->enabled;
++ *   - memory.c|2318| <<memory_region_set_readonly>> memory_region_update_pending |= mr->enabled;
++ *   - memory.c|2328| <<memory_region_rom_device_set_romd>> memory_region_update_pending |= mr->enabled;
++ *   - memory.c|2601| <<memory_region_update_container_subregions>> memory_region_update_pending |= mr->enabled && subregion->enabled;
++ *   - memory.c|2666| <<memory_region_del_subregion>> memory_region_update_pending |= mr->enabled && subregion->enabled;
++ *   - memory.c|2677| <<memory_region_set_enabled>> memory_region_update_pending = true;
++ *   - memory.c|2693| <<memory_region_set_size>> memory_region_update_pending = true;
++ *   - memory.c|2747| <<memory_region_set_alias_offset>> memory_region_update_pending |= mr->enabled;
++ *   - memory.c|2870| <<memory_global_dirty_log_start>> memory_region_update_pending = true;
++ *   - memory.c|2880| <<memory_global_dirty_log_do_stop>> memory_region_update_pending = true;
++ */
+ static bool memory_region_update_pending;
++/*
++ * 设置的地方:
++ *   - memory.c|1273| <<memory_region_transaction_commit>> ioeventfd_update_pending = false;
++ *   - memory.c|1282| <<memory_region_transaction_commit>> ioeventfd_update_pending = false;
++ *   - memory.c|2556| <<memory_region_add_eventfd>> ioeventfd_update_pending |= mr->enabled;
++ *   - memory.c|2591| <<memory_region_del_eventfd>> ioeventfd_update_pending |= mr->enabled;
++ */
  static bool ioeventfd_update_pending;
  static bool global_dirty_log = false;
  
@@ -3090,7 +3479,527 @@ index e9cd446..bbfa6cd 100644
  static QTAILQ_HEAD(, AddressSpace) address_spaces
      = QTAILQ_HEAD_INITIALIZER(address_spaces);
  
-@@ -1022,6 +1052,10 @@ static void address_space_set_flatview(AddressSpace *as)
++/*
++ * 用到flat_views的地方:
++ *   - memory.c|819| <<generate_memory_topology>> g_hash_table_replace(flat_views, mr, view);
++ *   - memory.c|999| <<flatviews_init>> if (flat_views) {
++ *   - memory.c|1003| <<flatviews_init>> flat_views = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL,
++ *   - memory.c|1010| <<flatviews_init>> g_hash_table_replace(flat_views, NULL, empty_view);
++ *   - memory.c|1019| <<flatviews_reset>> if (flat_views) {
++ *   - memory.c|1020| <<flatviews_reset>> g_hash_table_unref(flat_views);
++ *   - memory.c|1021| <<flatviews_reset>> flat_views = NULL;
++ *   - memory.c|1029| <<flatviews_reset>> if (g_hash_table_lookup(flat_views, physmr)) {
++ *   - memory.c|1041| <<address_space_set_flatview>> FlatView *new_view = g_hash_table_lookup(flat_views, physmr);
++ *   - memory.c|1091| <<address_space_update_topology>> if (!g_hash_table_lookup(flat_views, physmr)) {
++ */
+ static GHashTable *flat_views;
+ 
+ typedef struct AddrRange AddrRange;
+@@ -59,39 +123,46 @@ struct AddrRange {
+     Int128 size;
+ };
+ 
++/* 用start和size制作成一个AddrRange */
+ static AddrRange addrrange_make(Int128 start, Int128 size)
+ {
+     return (AddrRange) { start, size };
+ }
+ 
++/* 比较两个AddrRange的start的size是否完全相同 */
+ static bool addrrange_equal(AddrRange r1, AddrRange r2)
+ {
+     return int128_eq(r1.start, r2.start) && int128_eq(r1.size, r2.size);
+ }
+ 
++/* 返回AddrRange的start+size (也就是end) */
+ static Int128 addrrange_end(AddrRange r)
+ {
+     return int128_add(r.start, r.size);
+ }
+ 
++/* AddrRange的start加上delta并更新start */
+ static AddrRange addrrange_shift(AddrRange range, Int128 delta)
+ {
+     int128_addto(&range.start, delta);
+     return range;
+ }
+ 
++/* 判断一个addr是否在AddrRange的范围内 */
+ static bool addrrange_contains(AddrRange range, Int128 addr)
+ {
+     return int128_ge(addr, range.start)
+         && int128_lt(addr, addrrange_end(range));
+ }
+ 
++/* 判断两个AddrRange是否intersect */
+ static bool addrrange_intersects(AddrRange r1, AddrRange r2)
+ {
+     return addrrange_contains(r1, r2.start)
+         || addrrange_contains(r2, r1.start);
+ }
+ 
++/* 返回两个AddrRange相交的地方并返回新生成的AddrRange */
+ static AddrRange addrrange_intersection(AddrRange r1, AddrRange r2)
+ {
+     Int128 start = int128_max(r1.start, r2.start);
+@@ -101,6 +172,16 @@ static AddrRange addrrange_intersection(AddrRange r1, AddrRange r2)
+ 
+ enum ListenerDirection { Forward, Reverse };
+ 
++/*
++ * called by:
++ *   - memory.c|1135| <<memory_region_transaction_commit>> MEMORY_LISTENER_CALL_GLOBAL(begin, Forward);
++ *   - memory.c|1143| <<memory_region_transaction_commit>> MEMORY_LISTENER_CALL_GLOBAL(commit, Forward);
++ *   - memory.c|2737| <<memory_global_dirty_log_start>> MEMORY_LISTENER_CALL_GLOBAL(log_global_start, Forward);
++ *   - memory.c|2754| <<memory_global_dirty_log_do_stop>> MEMORY_LISTENER_CALL_GLOBAL(log_global_stop, Reverse);
++ *
++ * 根据_direction的方向, 从前向后或者从后向前遍历调用memory_listeners中的每个MemoryListener
++ * 并调用指定的_callback (比如commit, begin等)
++ */
+ #define MEMORY_LISTENER_CALL_GLOBAL(_callback, _direction, _args...)    \
+     do {                                                                \
+         MemoryListener *_listener;                                      \
+@@ -126,6 +207,17 @@ enum ListenerDirection { Forward, Reverse };
+         }                                                               \
+     } while (0)
+ 
++/*
++ * called by:
++ *   - memory.c|217| <<MEMORY_LISTENER_UPDATE_REGION>> MEMORY_LISTENER_CALL(as, callback, dir, &mrs, ##_args); \
++ *   - memory.c|877| <<address_space_add_del_ioeventfds>> MEMORY_LISTENER_CALL(as, eventfd_del, Forward, &section,
++ *   - memory.c|890| <<address_space_add_del_ioeventfds>> MEMORY_LISTENER_CALL(as, eventfd_add, Reverse, &section,
++ *   - memory.c|2304| <<memory_region_update_coalesced_range_as>> MEMORY_LISTENER_CALL(as, coalesced_mmio_del, Reverse, &section,
++ *   - memory.c|2315| <<memory_region_update_coalesced_range_as>> MEMORY_LISTENER_CALL(as, coalesced_mmio_add, Forward, &section,
++ *
++ * 根据_direction的方向, 从前向后或者从后向前遍历调用某个AddressSpace自己的每个MemoryListener
++ * 并调用指定的_callback (比如eventfd_add, coalesced_mmio_add等)
++ */
+ #define MEMORY_LISTENER_CALL(_as, _callback, _direction, _section, _args...) \
+     do {                                                                \
+         MemoryListener *_listener;                                      \
+@@ -153,6 +245,14 @@ enum ListenerDirection { Forward, Reverse };
+     } while (0)
+ 
+ /* No need to ref/unref .mr, the FlatRange keeps it alive.  */
++/*
++ * called by:
++ *   - memory.c|995| <<address_space_update_topology_pass>> MEMORY_LISTENER_UPDATE_REGION(frold, as, Reverse, region_del);
++ *   - memory.c|1003| <<address_space_update_topology_pass>> MEMORY_LISTENER_UPDATE_REGION(frnew, as, Forward, region_nop);
++ *   - memory.c|1005| <<address_space_update_topology_pass>> MEMORY_LISTENER_UPDATE_REGION(frnew, as, Forward, log_start,
++ *   - memory.c|1010| <<address_space_update_topology_pass>> MEMORY_LISTENER_UPDATE_REGION(frnew, as, Reverse, log_stop,
++ *   - memory.c|1022| <<address_space_update_topology_pass>> MEMORY_LISTENER_UPDATE_REGION(frnew, as, Forward, region_add);
++ */
+ #define MEMORY_LISTENER_UPDATE_REGION(fr, as, dir, callback, _args...)  \
+     do {                                                                \
+         MemoryRegionSection mrs = section_from_flat_range(fr,           \
+@@ -161,17 +261,20 @@ enum ListenerDirection { Forward, Reverse };
+     } while(0)
+ 
+ struct CoalescedMemoryRange {
++    /* 包括start和size */
+     AddrRange addr;
+     QTAILQ_ENTRY(CoalescedMemoryRange) link;
+ };
+ 
+ struct MemoryRegionIoeventfd {
++    /* 包括start和size */
+     AddrRange addr;
+     bool match_data;
+     uint64_t data;
+     EventNotifier *e;
+ };
+ 
++/* 判断第一个MemoryRegionIoeventfd是否在第二个前面 */
+ static bool memory_region_ioeventfd_before(MemoryRegionIoeventfd *a,
+                                            MemoryRegionIoeventfd *b)
+ {
+@@ -202,6 +305,7 @@ static bool memory_region_ioeventfd_before(MemoryRegionIoeventfd *a,
+     return false;
+ }
+ 
++/* 判断两个MemoryRegionIoeventfd是否相等 */
+ static bool memory_region_ioeventfd_equal(MemoryRegionIoeventfd *a,
+                                           MemoryRegionIoeventfd *b)
+ {
+@@ -210,18 +314,33 @@ static bool memory_region_ioeventfd_equal(MemoryRegionIoeventfd *a,
+ }
+ 
+ /* Range of memory in the global map.  Addresses are absolute. */
++/*
++ * 似乎主要用在FlatView中
++ */
+ struct FlatRange {
+     MemoryRegion *mr;
+     hwaddr offset_in_region;
++    /* 包含start和size */
+     AddrRange addr;
+     uint8_t dirty_log_mask;
+     bool romd_mode;
+     bool readonly;
+ };
+ 
++/* 遍历FlatView中的每一个FlatRange */
+ #define FOR_EACH_FLAT_RANGE(var, view)          \
+     for (var = (view)->ranges; var < (view)->ranges + (view)->nr; ++var)
+ 
++/*
++ * called by:
++ *   - memory.c|237| <<MEMORY_LISTENER_UPDATE_REGION>> MemoryRegionSection mrs = section_from_flat_range(fr, \
++ *   - memory.c|867| <<generate_memory_topology>> section_from_flat_range(&view->ranges[i], view);
++ *   - memory.c|2202| <<memory_region_sync_dirty_bitmap>> MemoryRegionSection mrs = section_from_flat_range(fr, view);
++ *   - memory.c|2833| <<listener_add_address_space>> MemoryRegionSection section = section_from_flat_range(fr, view);
++ *   - memory.c|2859| <<listener_del_address_space>> MemoryRegionSection section = section_from_flat_range(fr, view);
++ *
++ * 根据参数的FlatRange和FlatView, 返回一个临时的MemoryRegionSection
++ */
+ static inline MemoryRegionSection
+ section_from_flat_range(FlatRange *fr, FlatView *fv)
+ {
+@@ -235,6 +354,9 @@ section_from_flat_range(FlatRange *fr, FlatView *fv)
+     };
+ }
+ 
++/*
++ * 比较两个FlatRange是否完全相同
++ */
+ static bool flatrange_equal(FlatRange *a, FlatRange *b)
+ {
+     return a->mr == b->mr
+@@ -244,6 +366,11 @@ static bool flatrange_equal(FlatRange *a, FlatRange *b)
+         && a->readonly == b->readonly;
+ }
+ 
++/*
++ * called only by generate_memory_topology()
++ *
++ * 分配一个FlatView, 让其root指向参数的MemoryRegion
++ */
+ static FlatView *flatview_new(MemoryRegion *mr_root)
+ {
+     FlatView *view;
+@@ -260,13 +387,33 @@ static FlatView *flatview_new(MemoryRegion *mr_root)
+ /* Insert a range into a given position.  Caller is responsible for maintaining
+  * sorting order.
+  */
++/*
++ * called by:
++ *   - memory.c|789| <<render_memory_region>> flatview_insert(view, i, &fr);
++ *   - memory.c|805| <<render_memory_region>> flatview_insert(view, i, &fr);
++ *
++ * FlatView的ranges数组(FlatRange)中的后面pos个都往后移一个
++ * 把参数中的FlatRange放在pos的位置
++ * 如果FlatView->nr_allocated不够了要扩容一下
++ */
+ static void flatview_insert(FlatView *view, unsigned pos, FlatRange *range)
+ {
++    /*
++     * 如果view (FlatView)的nr_allocated不够了, 扩大一下
++     * 最大也就10个
++     */
+     if (view->nr == view->nr_allocated) {
+         view->nr_allocated = MAX(2 * view->nr, 10);
++	/* ranges[nr_allocated]是一个FlatRange的数组 */
+         view->ranges = g_realloc(view->ranges,
+                                     view->nr_allocated * sizeof(*view->ranges));
+     }
++    /*
++     * ranges[nr_allocated]是一个FlatRange的数组
++     *
++     * FlatView的ranges数组(FlatRange)中的后面pos个都往后移一个
++     * 把参数中的FlatRange放在pos的位置
++     */
+     memmove(view->ranges + pos + 1, view->ranges + pos,
+             (view->nr - pos) * sizeof(FlatRange));
+     view->ranges[pos] = *range;
+@@ -274,6 +421,10 @@ static void flatview_insert(FlatView *view, unsigned pos, FlatRange *range)
+     ++view->nr;
+ }
+ 
++/*
++ * called only by:
++ *   - memory.c|405| <<flatview_unref>> call_rcu(view, flatview_destroy, rcu);
++ */
+ static void flatview_destroy(FlatView *view)
+ {
+     int i;
+@@ -304,6 +455,9 @@ void flatview_unref(FlatView *view)
+     }
+ }
+ 
++/*
++ * 判断两个FlatRange是否想连续可以merge
++ */
+ static bool can_merge(FlatRange *r1, FlatRange *r2)
+ {
+     return int128_eq(addrrange_end(r1->addr), r2->addr.start)
+@@ -317,6 +471,13 @@ static bool can_merge(FlatRange *r1, FlatRange *r2)
+ }
+ 
+ /* Attempt to simplify a view by merging adjacent ranges */
++/*
++ * called only by:
++ *   - memory.c|905| <<generate_memory_topology>> flatview_simplify(view);
++ *
++ * 把FlatView中的ranges(FlatRange)数组中的FlatRange们合并一下
++ * 合并后nr也许会减少
++ */
+ static void flatview_simplify(FlatView *view)
+ {
+     unsigned i, j;
+@@ -354,6 +515,13 @@ static bool memory_region_wrong_endianness(MemoryRegion *mr)
+ #endif
+ }
+ 
++/*
++ * called by:
++ *   - memory.c|1660| <<memory_region_dispatch_read>> adjust_endianness(mr, pval, size);
++ *   - memory.c|1701| <<memory_region_dispatch_write>> adjust_endianness(mr, &data, size);
++ *   - memory.c|2494| <<memory_region_add_eventfd>> adjust_endianness(mr, &mrfd.data, size);
++ *   - memory.c|2529| <<memory_region_del_eventfd>> adjust_endianness(mr, &mrfd.data, size);
++ */
+ static void adjust_endianness(MemoryRegion *mr, uint64_t *data, unsigned size)
+ {
+     if (memory_region_wrong_endianness(mr)) {
+@@ -375,6 +543,32 @@ static void adjust_endianness(MemoryRegion *mr, uint64_t *data, unsigned size)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - memory.c|449| <<memory_region_oldmmio_read_accessor>> hwaddr abs_addr = memory_region_to_absolute_addr(mr, addr);
++ *   - memory.c|475| <<memory_region_read_accessor>> hwaddr abs_addr = memory_region_to_absolute_addr(mr, addr);
++ *   - memory.c|502| <<memory_region_read_with_attrs_accessor>> hwaddr abs_addr = memory_region_to_absolute_addr(mr, addr);
++ *   - memory.c|528| <<memory_region_oldmmio_write_accessor>> hwaddr abs_addr = memory_region_to_absolute_addr(mr, addr);
++ *   - memory.c|554| <<memory_region_write_accessor>> hwaddr abs_addr = memory_region_to_absolute_addr(mr, addr);
++ *   - memory.c|580| <<memory_region_write_with_attrs_accessor>> hwaddr abs_addr = memory_region_to_absolute_addr(mr, addr);
++ *
++ * (gdb) bt
++ * #0  memory_region_to_absolute_addr (mr=0x555557498b60, offset=0) at /home/zhang/kvm/qemu-3.0.0/memory.c:381
++ * #1  0x0000555555864ae7 in memory_region_write_accessor (mr=0x555557498b60, addr=0, value=0x7fffec8b07a8, size=1, shift=0, mask=255, attrs=...) at /home/zhang/kvm/qemu-3.0.0/memory.c:524
++ * #2  0x0000555555864d45 in access_with_adjusted_size (addr=0, value=0x7fffec8b07a8, size=1, access_size_min=1, access_size_max=1, access_fn=0x555555864a43 <memory_region_write_accessor>,
++ *     mr=0x555557498b60,attrs=...) at /home/zhang/kvm/qemu-3.0.0/memory.c:594
++ * #3  0x000055555586796d in memory_region_dispatch_write (mr=0x555557498b60, addr=0, data=143, size=1, attrs=...) at /home/zhang/kvm/qemu-3.0.0/memory.c:1473
++ * #4  0x000055555580399f in flatview_write_continue (fv=0x555557bb3600, addr=112, attrs=..., buf=0x7ffff7ff0000 "\217", len=1, addr1=0, l=1, mr=0x555557498b60) at /home/zhang/kvm/qemu-3.0.0/exec.c:3255
++ * #5  0x0000555555803ae9 in flatview_write (fv=0x555557bb3600, addr=112, attrs=..., buf=0x7ffff7ff0000 "\217", len=1) at /home/zhang/kvm/qemu-3.0.0/exec.c:3294
++ * #6  0x0000555555803def in address_space_write (as=0x555556721a20 <address_space_io>, addr=112, attrs=..., buf=0x7ffff7ff0000 "\217", len=1) at /home/zhang/kvm/qemu-3.0.0/exec.c:3384
++ * #7  0x0000555555803e40 in address_space_rw (as=0x555556721a20 <address_space_io>, addr=112, attrs=..., buf=0x7ffff7ff0000 "\217", len=1, is_write=true) at /home/zhang/kvm/qemu-3.0.0/exec.c:3395
++ * #8  0x00005555558823ec in kvm_handle_io (port=112, attrs=..., data=0x7ffff7ff0000, direction=1, size=1, count=1) at /home/zhang/kvm/qemu-3.0.0/accel/kvm/kvm-all.c:1729
++ * #9  0x0000555555882b30 in kvm_cpu_exec (cpu=0x55555688a170) at /home/zhang/kvm/qemu-3.0.0/accel/kvm/kvm-all.c:1969
++ * #10 0x0000555555849eac in qemu_kvm_cpu_thread_fn (arg=0x55555688a170) at /home/zhang/kvm/qemu-3.0.0/cpus.c:1215
++ * #11 0x0000555555d92dd7 in qemu_thread_start (args=0x5555568abcb0) at util/qemu-thread-posix.c:504
++ * #12 0x00007ffff4ca06ba in start_thread (arg=0x7fffec8b1700) at pthread_create.c:333
++ * #13 0x00007ffff49d641d in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:109
++ */
+ static hwaddr memory_region_to_absolute_addr(MemoryRegion *mr, hwaddr offset)
+ {
+     MemoryRegion *root;
+@@ -389,6 +583,7 @@ static hwaddr memory_region_to_absolute_addr(MemoryRegion *mr, hwaddr offset)
+     return abs_addr;
+ }
+ 
++/* 如果current_cpu存在 返回current_cpu->cpu_index */
+ static int get_cpu_index(void)
+ {
+     if (current_cpu) {
+@@ -553,6 +748,11 @@ static MemTxResult memory_region_write_with_attrs_accessor(MemoryRegion *mr,
+     return mr->ops->write_with_attrs(mr->opaque, addr, tmp, size, attrs);
+ }
+ 
++/*
++ * called by:
++ *   - memory_region_dispatch_read1()
++ *   - memory_region_dispatch_write()
++ */
+ static MemTxResult access_with_adjusted_size(hwaddr addr,
+                                       uint64_t *value,
+                                       unsigned size,
+@@ -598,13 +798,21 @@ static MemTxResult access_with_adjusted_size(hwaddr addr,
+     return r;
+ }
+ 
++/*
++ * 一直从mr->container递归遍历 找到不再有container的MemeoryRegion
++ * 遍历address_spaces链表中所有的AddressSpace, 找到root是上面MemoryRegion的那个
++ */
+ static AddressSpace *memory_region_to_address_space(MemoryRegion *mr)
+ {
+     AddressSpace *as;
+ 
++    /* 一直从mr->container递归遍历 找到不再有container的MemeoryRegion */
+     while (mr->container) {
+         mr = mr->container;
+     }
++    /*
++     * 遍历address_spaces链表中所有的AddressSpace, 找到root是上面MemoryRegion的那个
++     */
+     QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
+         if (mr == as->root) {
+             return as;
+@@ -616,6 +824,12 @@ static AddressSpace *memory_region_to_address_space(MemoryRegion *mr)
+ /* Render a memory region into the global view.  Ranges in @view obscure
+  * ranges in @mr.
+  */
++/*
++ * called by:
++ *   - memory.c|859| <<render_memory_region>> render_memory_region(view, mr->alias, base, clip, readonly);
++ *   - memory.c|865| <<render_memory_region>> render_memory_region(view, subregion, base, clip, readonly);
++ *   - memory.c|977| <<generate_memory_topology>> render_memory_region(view, mr, int128_zero(),
++ */
+ static void render_memory_region(FlatView *view,
+                                  MemoryRegion *mr,
+                                  Int128 base,
+@@ -634,20 +848,29 @@ static void render_memory_region(FlatView *view,
+         return;
+     }
+ 
++    /*
++     * 如果一开始是generate_memory_topology()调用进来的话, base是0
++     */
+     int128_addto(&base, int128_make64(mr->addr));
+     readonly |= mr->readonly;
+ 
++    /* 用start和size制作成一个AddrRange */
+     tmp = addrrange_make(base, mr->size);
+ 
++    /* 判断两个AddrRange(tmp和clip)是否intersect */
+     if (!addrrange_intersects(tmp, clip)) {
+         return;
+     }
+ 
++    /* 返回两个AddrRange相交的地方并返回新生成的AddrRange */
+     clip = addrrange_intersection(tmp, clip);
+ 
+     if (mr->alias) {
+         int128_subfrom(&base, int128_make64(mr->alias->addr));
+         int128_subfrom(&base, int128_make64(mr->alias_offset));
++	/*
++	 * view是参数中的view
++	 */
+         render_memory_region(view, mr->alias, base, clip, readonly);
+         return;
+     }
+@@ -665,6 +888,9 @@ static void render_memory_region(FlatView *view,
+     base = clip.start;
+     remain = clip.size;
+ 
++    /*
++     * fr是FlatRange
++     */
+     fr.mr = mr;
+     fr.dirty_log_mask = memory_region_get_dirty_log_mask(mr);
+     fr.romd_mode = mr->romd_mode;
+@@ -686,6 +912,9 @@ static void render_memory_region(FlatView *view,
+             offset_in_region += int128_get64(now);
+             int128_subfrom(&remain, now);
+         }
++	/*
++	 * addrrange_end(): 返回AddrRange的start+size (也就是end)
++	 */
+         now = int128_sub(int128_min(int128_add(base, remain),
+                                     addrrange_end(view->ranges[i].addr)),
+                          base);
+@@ -695,11 +924,23 @@ static void render_memory_region(FlatView *view,
+     }
+     if (int128_nz(remain)) {
+         fr.offset_in_region = offset_in_region;
++	/* 用start和size制作成一个AddrRange */
+         fr.addr = addrrange_make(base, remain);
++	/*
++	 * FlatView的ranges数组(FlatRange)中的后面pos个都往后移一个
++	 * 把参数中的FlatRange放在pos的位置
++	 * 如果FlatView->nr_allocated不够了要扩容一下
++	 */
+         flatview_insert(view, i, &fr);
+     }
+ }
+ 
++/*
++ * called by:
++ *   - memory.c|1006| <<flatviews_reset>> MemoryRegion *physmr = memory_region_get_flatview_root(as->root);
++ *   - memory.c|1019| <<address_space_set_flatview>> MemoryRegion *physmr = memory_region_get_flatview_root(as->root);
++ *   - memory.c|1067| <<address_space_update_topology>> MemoryRegion *physmr = memory_region_get_flatview_root(as->root);
++ */
+ static MemoryRegion *memory_region_get_flatview_root(MemoryRegion *mr)
+ {
+     while (mr->enabled) {
+@@ -745,26 +986,48 @@ static MemoryRegion *memory_region_get_flatview_root(MemoryRegion *mr)
+ }
+ 
+ /* Render a memory topology into a list of disjoint absolute ranges. */
++/*
++ * called by:
++ *   - memory.c|985| <<flatviews_init>> empty_view = generate_memory_topology(NULL);
++ *   - memory.c|1012| <<flatviews_reset>> generate_memory_topology(physmr);
++ *   - memory.c|1071| <<address_space_update_topology>> generate_memory_topology(physmr);
++ */
+ static FlatView *generate_memory_topology(MemoryRegion *mr)
+ {
+     int i;
+     FlatView *view;
+ 
++    /*
++     * 分配一个FlatView, 让其root指向参数的mr(MemoryRegion)
++     *
++     * 刚分配的话nr和nr_allocated都是0吧
++     */
+     view = flatview_new(mr);
+ 
+     if (mr) {
+         render_memory_region(view, mr, int128_zero(),
+                              addrrange_make(int128_zero(), int128_2_64()), false);
+     }
++    /*
++     * 把FlatView中的ranges(FlatRange)数组中的FlatRange们合并一下
++     * 合并后nr也许会减少
++     *
++     * 如果参数mr是NULL (从flatviews_init()进来), 下面的flatview_simplify()似乎就不运行了
++     */
+     flatview_simplify(view);
+ 
+     view->dispatch = address_space_dispatch_new(view);
++    /*
++     * 如果参数mr是NULL (从flatviews_init()进来), 下面的for循环似乎就不运行了
++     */
+     for (i = 0; i < view->nr; i++) {
++        /* 根据参数的FlatRange和FlatView, 返回一个临时的MemoryRegionSection */
+         MemoryRegionSection mrs =
+             section_from_flat_range(&view->ranges[i], view);
+         flatview_add_to_dispatch(view, &mrs);
+     }
+     address_space_dispatch_compact(view->dispatch);
++    /* 把新分配的FlatView换成全局的flat_views */
+     g_hash_table_replace(flat_views, mr, view);
+ 
+     return view;
+@@ -834,6 +1097,12 @@ FlatView *address_space_get_flatview(AddressSpace *as)
+     return view;
+ }
+ 
++/*
++ * called by:
++ *   - memory.c|1092| <<memory_region_transaction_commit>> address_space_update_ioeventfds(as);
++ *   - memory.c|1099| <<memory_region_transaction_commit>> address_space_update_ioeventfds(as);
++ *   - memory.c|2933| <<address_space_init>> address_space_update_ioeventfds(as);
++ */
+ static void address_space_update_ioeventfds(AddressSpace *as)
+ {
+     FlatView *view;
+@@ -937,12 +1206,14 @@ static void address_space_update_topology_pass(AddressSpace *as,
+ 
+ static void flatviews_init(void)
+ {
++    /* FlatView是内存最终的体现 */
+     static FlatView *empty_view;
+ 
+     if (flat_views) {
+         return;
+     }
+ 
++    /* flat_views是GHashTable的指针 */
+     flat_views = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL,
+                                        (GDestroyNotify) flatview_unref);
+     if (!empty_view) {
+@@ -1022,6 +1293,10 @@ static void address_space_set_flatview(AddressSpace *as)
      }
  }
  
@@ -3101,7 +4010,33 @@ index e9cd446..bbfa6cd 100644
  static void address_space_update_topology(AddressSpace *as)
  {
      MemoryRegion *physmr = memory_region_get_flatview_root(as->root);
-@@ -1112,6 +1146,11 @@ static char *memory_region_escape_name(const char *name)
+@@ -1051,8 +1326,15 @@ void memory_region_transaction_commit(void)
+         if (memory_region_update_pending) {
+             flatviews_reset();
+ 
++	    /*
++	     * 从前向后遍历调用memory_listeners中的每个MemoryListener,
++	     * 并调用begin方法
++	     */
+             MEMORY_LISTENER_CALL_GLOBAL(begin, Forward);
+ 
++	    /*
++	     * address_spaces是一个链表 装着所有的AddressSpace
++	     */
+             QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
+                 address_space_set_flatview(as);
+                 address_space_update_ioeventfds(as);
+@@ -1061,6 +1343,9 @@ void memory_region_transaction_commit(void)
+             ioeventfd_update_pending = false;
+             MEMORY_LISTENER_CALL_GLOBAL(commit, Forward);
+         } else if (ioeventfd_update_pending) {
++            /*
++	     * address_spaces是一个链表 装着所有的AddressSpace
++	     */
+             QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
+                 address_space_update_ioeventfds(as);
+             }
+@@ -1112,6 +1397,13 @@ static char *memory_region_escape_name(const char *name)
      return escaped;
  }
  
@@ -3109,16 +4044,43 @@ index e9cd446..bbfa6cd 100644
 + * called by:
 + *   - memory.c|1158| <<memory_region_init>> memory_region_do_init(mr, owner, name, size);
 + *   - memory.c|1691| <<memory_region_init_iommu>> memory_region_do_init(mr, owner, name, size);
++ *
++ * 比如system_memory的name是"system", size是UINT64_MAX, owner是NULL
 + */
  static void memory_region_do_init(MemoryRegion *mr,
                                    Object *owner,
                                    const char *name,
-@@ -1140,11 +1179,20 @@ static void memory_region_do_init(MemoryRegion *mr,
+@@ -1127,6 +1419,19 @@ static void memory_region_do_init(MemoryRegion *mr,
+ 
+     if (name) {
+         char *escaped_name = memory_region_escape_name(name);
++	/*
++	 * 对于system的内存, 这里执行完了就是system[*], 在object_property_add()会把[*]改动了
++	 *
++	 * (gdb) bt
++	 * #0  object_property_add (obj=0x5555568512d0, name=0x555556851250 "system[*]", type=0x555556851530 "child<qemu:memory-region>", get=0x555555c5f037 <object_get_child_property>, set=0x0, 
++	 *     release=0x555555c5f0cb <object_finalize_child_property>, opaque=0x555556850cd0, errp=0x7fffffffe060) at qom/object.c:990
++	 * #1  0x0000555555c5f1e6 in object_property_add_child (obj=0x5555568512d0, name=0x555556851250 "system[*]", child=0x555556850cd0, errp=0x555556751590 <error_abort>) at qom/object.c:1507
++	 * #2  0x0000555555866c8c in memory_region_do_init (mr=0x555556850cd0, owner=0x5555568512d0, name=0x555555e7f09d "system", size=18446744073709551615) at /home/zhang/kvm/qemu-3.0.0/memory.c:1136
++	 * #3  0x0000555555866cfb in memory_region_init (mr=0x555556850cd0, owner=0x0, name=0x555555e7f09d "system", size=18446744073709551615) at /home/zhang/kvm/qemu-3.0.0/memory.c:1149
++	 * #4  0x0000555555803699 in memory_map_init () at /home/zhang/kvm/qemu-3.0.0/exec.c:3100
++	 * #5  0x0000555555804201 in cpu_exec_init_all () at /home/zhang/kvm/qemu-3.0.0/exec.c:3534
++	 * #6  0x00005555559dea90 in main (argc=14, argv=0x7fffffffe408, envp=0x7fffffffe480) at vl.c:4046
++	 */
+         char *name_array = g_strdup_printf("%s[*]", escaped_name);
+ 
+         if (!owner) {
+@@ -1140,12 +1445,29 @@ static void memory_region_do_init(MemoryRegion *mr,
      }
  }
  
 +/*
 + * 被非常多的外部调用
++ *
++ * 初始化MemoryRegion,比如:
++ *     根据TypeImpl初始化data头部的Object, 递归调用自己parent的instance_init()和instance_post_init()
++ *     MemoryRegion (TYPE_MEMORY_REGION) 的instance_init(): memory_region_initfn()
++ *     然后简单初始化MemoryRegion的各个field
 + */
  void memory_region_init(MemoryRegion *mr,
                          Object *owner,
@@ -3132,9 +4094,13 @@ index e9cd446..bbfa6cd 100644
 +     * MemoryRegion (TYPE_MEMORY_REGION) 的instance_init(): memory_region_initfn()
 +     */
      object_initialize(mr, sizeof(*mr), TYPE_MEMORY_REGION);
++    /*
++     * 简单初始化MemoryRegion的各个field
++     */
      memory_region_do_init(mr, owner, name, size);
  }
-@@ -1166,6 +1214,10 @@ static void memory_region_get_container(Object *obj, Visitor *v,
+ 
+@@ -1166,6 +1488,10 @@ static void memory_region_get_container(Object *obj, Visitor *v,
      gchar *path = (gchar *)"";
  
      if (mr->container) {
@@ -3145,7 +4111,7 @@ index e9cd446..bbfa6cd 100644
          path = object_get_canonical_path(OBJECT(mr->container));
      }
      visit_type_str(v, name, &path, errp);
-@@ -1201,6 +1253,12 @@ static void memory_region_get_size(Object *obj, Visitor *v, const char *name,
+@@ -1201,6 +1527,12 @@ static void memory_region_get_size(Object *obj, Visitor *v, const char *name,
      visit_type_uint64(v, name, &value, errp);
  }
  
@@ -3158,7 +4124,44 @@ index e9cd446..bbfa6cd 100644
  static void memory_region_initfn(Object *obj)
  {
      MemoryRegion *mr = MEMORY_REGION(obj);
-@@ -1235,6 +1293,12 @@ static void memory_region_initfn(Object *obj)
+@@ -1214,6 +1546,10 @@ static void memory_region_initfn(Object *obj)
+     QTAILQ_INIT(&mr->subregions);
+     QTAILQ_INIT(&mr->coalesced);
+ 
++    /*
++     * 核心思想是分配并初始化一个ObjectProperty
++     * 然后插入Object->properties (GHashTable)
++     */
+     op = object_property_add(OBJECT(mr), "container",
+                              "link<" TYPE_MEMORY_REGION ">",
+                              memory_region_get_container,
+@@ -1221,20 +1557,38 @@ static void memory_region_initfn(Object *obj)
+                              NULL, NULL, &error_abort);
+     op->resolve = memory_region_resolve_container;
+ 
++    /*
++     * 核心思想是分配并初始化一个ObjectProperty
++     * 然后插入Object->properties (GHashTable)
++     */
+     object_property_add(OBJECT(mr), "addr", "uint64",
+                         memory_region_get_addr,
+                         NULL, /* memory_region_set_addr */
+                         NULL, NULL, &error_abort);
++    /*
++     * 核心思想是分配并初始化一个ObjectProperty
++     * 然后插入Object->properties (GHashTable)
++     */
+     object_property_add(OBJECT(mr), "priority", "uint32",
+                         memory_region_get_priority,
+                         NULL, /* memory_region_set_priority */
+                         NULL, NULL, &error_abort);
++    /*
++     * 核心思想是分配并初始化一个ObjectProperty
++     * 然后插入Object->properties (GHashTable)
++     */
+     object_property_add(OBJECT(mr), "size", "uint64",
+                         memory_region_get_size,
+                         NULL, /* memory_region_set_size, */
                          NULL, NULL, &error_abort);
  }
  
@@ -3171,7 +4174,33 @@ index e9cd446..bbfa6cd 100644
  static void iommu_memory_region_initfn(Object *obj)
  {
      MemoryRegion *mr = MEMORY_REGION(obj);
-@@ -1674,6 +1738,12 @@ void memory_region_init_iommu(void *_iommu_mr,
+@@ -1502,6 +1856,13 @@ void memory_region_init_io(MemoryRegion *mr,
+     mr->terminates = true;
+ }
+ 
++/*
++ * called by:
++ *   - memory.c|3349| <<memory_region_init_ram>> memory_region_init_ram_nomigrate(mr, owner, name, size, &err);
++ *   - numa.c|499| <<allocate_system_memory_nonnuma>> memory_region_init_ram_nomigrate(mr, owner, name, ram_size, &error_fatal);
++ *   - numa.c|506| <<allocate_system_memory_nonnuma>> memory_region_init_ram_nomigrate(mr, owner, name, ram_size, &error_fatal);
++ *   - hw/pci-host/prep.c|308| <<raven_realize>> memory_region_init_ram_nomigrate(&s->bios, OBJECT(s), "bios", BIOS_SIZE,
++ */
+ void memory_region_init_ram_nomigrate(MemoryRegion *mr,
+                                       Object *owner,
+                                       const char *name,
+@@ -1511,6 +1872,11 @@ void memory_region_init_ram_nomigrate(MemoryRegion *mr,
+     memory_region_init_ram_shared_nomigrate(mr, owner, name, size, false, errp);
+ }
+ 
++/*
++ * called by:
++ *   - memory.c|1633| <<memory_region_init_ram_nomigrate>> memory_region_init_ram_shared_nomigrate(mr, owner, name, size, false, errp);
++ *   - backends/hostmem-ram.c|31| <<ram_backend_memory_alloc>> memory_region_init_ram_shared_nomigrate(&backend->mr, OBJECT(backend), path,
++ */
+ void memory_region_init_ram_shared_nomigrate(MemoryRegion *mr,
+                                              Object *owner,
+                                              const char *name,
+@@ -1674,6 +2040,12 @@ void memory_region_init_iommu(void *_iommu_mr,
      iommu_mr->iommu_notify_flags = IOMMU_NOTIFIER_NONE;
  }
  
@@ -3184,25 +4213,149 @@ index e9cd446..bbfa6cd 100644
  static void memory_region_finalize(Object *obj)
  {
      MemoryRegion *mr = MEMORY_REGION(obj);
-@@ -2788,6 +2858,9 @@ void memory_region_invalidate_mmio_ptr(MemoryRegion *mr, hwaddr offset,
+@@ -2292,24 +2664,37 @@ void memory_region_del_eventfd(MemoryRegion *mr,
+ 
+ static void memory_region_update_container_subregions(MemoryRegion *subregion)
+ {
++    /* container里存着subregion上一层的MemoryRegion */
+     MemoryRegion *mr = subregion->container;
+     MemoryRegion *other;
+ 
+     memory_region_transaction_begin();
+ 
+     memory_region_ref(subregion);
++    /*
++     * mr是参数subregion的上一层的MemoryRegion
++     *
++     * 按照priority把subregion插入到上一层的MemoryRegion的subregions链表
++     */
+     QTAILQ_FOREACH(other, &mr->subregions, subregions_link) {
+         if (subregion->priority >= other->priority) {
+             QTAILQ_INSERT_BEFORE(other, subregion, subregions_link);
+             goto done;
+         }
+     }
++    /* 没有好的位置就插入到最后 */
+     QTAILQ_INSERT_TAIL(&mr->subregions, subregion, subregions_link);
+ done:
++    /* 如果memory_region_update_pending了memory_region_transaction_commit()就会做很多工作 */
+     memory_region_update_pending |= mr->enabled && subregion->enabled;
+     memory_region_transaction_commit();
+ }
+ 
++/*
++ * called by:
++ *   - memory.c|2627| <<memory_region_add_subregion>> memory_region_add_subregion_common(mr, offset, subregion);
++ *   - memory.c|2636| <<memory_region_add_subregion_overlap>> memory_region_add_subregion_common(mr, offset, subregion);
++ */
+ static void memory_region_add_subregion_common(MemoryRegion *mr,
+                                                hwaddr offset,
+                                                MemoryRegion *subregion)
+@@ -2320,6 +2705,27 @@ static void memory_region_add_subregion_common(MemoryRegion *mr,
+     memory_region_update_container_subregions(subregion);
+ }
+ 
++/*
++ * 设置内存地址的地方
++ *
++ * 一些使用的例子:
++ *   - hw/i386/pc.c|1352| <<pc_memory_init>> memory_region_add_subregion(system_memory, 0, ram_below_4g);
++ *   - hw/i386/pc.c|1359| <<pc_memory_init>> memory_region_add_subregion(system_memory, 0x100000000ULL,
++ *   - hw/i386/pc.c|1412| <<pc_memory_init>> memory_region_add_subregion(system_memory, machine->device_memory->base,
++ *   - hw/i386/pc.c|1578| <<pc_basic_device_init>> memory_region_add_subregion(isa_bus->address_space_io, 0x80, ioport80_io);
++ *   - hw/i386/pc.c|1581| <<pc_basic_device_init>> memory_region_add_subregion(isa_bus->address_space_io, 0xf0, ioportF0_io);
++ *   - hw/vfio/common.c|858| <<vfio_region_mmap>> memory_region_add_subregion(region->mem, region->mmaps[i].offset,
++ *   - hw/vfio/pci-quirks.c|429| <<vfio_vga_probe_ati_3c3_quirk>> memory_region_add_subregion(&vdev->vga->region[QEMU_PCI_VGA_IO_HI].mem,
++ *   - hw/vfio/pci-quirks.c|686| <<vfio_vga_probe_nvidia_3d0_quirk>> memory_region_add_subregion(&vdev->vga->region[QEMU_PCI_VGA_IO_HI].mem,
++ *   - hw/vfio/pci-quirks.c|691| <<vfio_vga_probe_nvidia_3d0_quirk>> memory_region_add_subregion(&vdev->vga->region[QEMU_PCI_VGA_IO_HI].mem,
++ *   - hw/vfio/pci.c|1676| <<vfio_bar_register>> memory_region_add_subregion(bar->mr, 0, bar->region.mem);
++ *   - hw/virtio/virtio-pci.c|1517| <<virtio_pci_modern_region_map>> memory_region_add_subregion(mr, region->offset, &region->mr);
++ *   - hw/pci/msix.c|348| <<msix_init>> memory_region_add_subregion(table_bar, table_offset, &dev->msix_table_mmio);
++ *   - hw/pci/msix.c|351| <<msix_init>> memory_region_add_subregion(pba_bar, pba_offset, &dev->msix_pba_mmio);
++ *   - hw/pci/pci.c|97| <<pci_init_bus_master>> memory_region_add_subregion(&pci_dev->bus_master_container_region, 0,
++ *   - hw/pci/pcie_host.c|118| <<pcie_host_mmcfg_map>> memory_region_add_subregion(get_system_memory(), e->base_addr, &e->mmio);
++ *   - hw/i386/xen/xen-hvm.c|241| <<xen_ram_init>> memory_region_add_subregion(sysmem, 0xc0000, &ram_lo);
++ */
+ void memory_region_add_subregion(MemoryRegion *mr,
+                                  hwaddr offset,
+                                  MemoryRegion *subregion)
+@@ -2391,6 +2797,23 @@ static void memory_region_readd_subregion(MemoryRegion *mr)
+     }
+ }
+ 
++/*
++ * 被很多看似无关的调用:
++ *   - hw/acpi/ich9.c|130| <<ich9_pm_iospace_update>> memory_region_set_address(&pm->io, pm->pm_io_base);
++ *   - hw/acpi/piix4.c|140| <<pm_io_space_update>> memory_region_set_address(&s->io, s->io_base);
++ *   - hw/acpi/piix4.c|153| <<smbus_io_space_update>> memory_region_set_address(&s->smb.io, s->smb_io_base);
++ *   - hw/isa/vt82c686.c|223| <<pm_io_space_update>> memory_region_set_address(&s->io, pm_io_base);
++ *   - hw/misc/mips_cmgcr.c|37| <<update_gcr_base>> memory_region_set_address(&gcr->iomem, gcr->gcr_base);
++ *   - hw/misc/mips_cmgcr.c|50| <<update_cpc_base>> memory_region_set_address(gcr->cpc_mr,
++ *   - hw/misc/mips_cmgcr.c|63| <<update_gic_base>> memory_region_set_address(gcr->gic_mr,
++ *   - hw/misc/mips_itu.c|91| <<itc_reconfigure>> memory_region_set_address(mr, address);
++ *   - hw/pci-host/designware.c|89| <<designware_pcie_root_update_msi_mapping>> memory_region_set_address(mem, base);
++ *   - hw/pci-host/designware.c|269| <<designware_pcie_update_viewport>> memory_region_set_address(current, base);
++ *   - hw/pci-host/q35.c|423| <<mch_update_smram>> memory_region_set_address(&mch->tseg_window,
++ *   - hw/ppc/rs6000_mc.c|112| <<rs6000mc_port0820_write>> memory_region_set_address(&s->simm[socket - 1],
++ *   - hw/ppc/rs6000_mc.c|186| <<rs6000mc_realize>> memory_region_set_address(&s->simm[socket], start_address);
++ *   - hw/ssi/aspeed_smc.c|373| <<aspeed_smc_flash_set_segment>> memory_region_set_address(&fl->mmio, seg.addr - s->ctrl->flash_window_base);
++ */
+ void memory_region_set_address(MemoryRegion *mr, hwaddr addr)
+ {
+     if (addr != mr->addr) {
+@@ -2633,6 +3056,22 @@ static void listener_del_address_space(MemoryListener *listener,
+     flatview_unref(view);
+ }
+ 
++/*
++ * accel/kvm/kvm-all.c|899| <<kvm_memory_listener_register>> memory_listener_register(&kml->listener, as);
++ * accel/kvm/kvm-all.c|1699| <<kvm_init>> memory_listener_register(&kvm_io_listener,
++ *								   &address_space_io);
++ * exec.c|929| <<cpu_address_space_init>> memory_listener_register(&newas->tcg_as_listener, as);
++ * hw/i386/xen/xen-hvm.c|1472| <<xen_hvm_init>> memory_listener_register(&state->memory_listener, &address_space_memory);
++ * hw/i386/xen/xen-hvm.c|1476| <<xen_hvm_init>> memory_listener_register(&state->io_listener, &address_space_io);
++ * hw/vfio/common.c|1151| <<vfio_connect_container>> memory_listener_register(&container->prereg_listener,
++ * hw/vfio/common.c|1210| <<vfio_connect_container>> memory_listener_register(&container->listener, container->space->as);
++ * hw/virtio/vhost.c|1277| <<vhost_dev_init>> memory_listener_register(&hdev->memory_listener, &address_space_memory);
++ * hw/virtio/vhost.c|1503| <<vhost_dev_start>> memory_listener_register(&hdev->iommu_listener, vdev->dma_as);
++ * hw/virtio/virtio.c|2533| <<virtio_device_realize>> memory_listener_register(&vdev->listener, vdev->dma_as);
++ * hw/xen/xen_pt.c|910| <<xen_pt_realize>> memory_listener_register(&s->memory_listener, &address_space_memory);
++ * hw/xen/xen_pt.c|911| <<xen_pt_realize>> memory_listener_register(&s->io_listener, &address_space_io);
++ * memory_mapping.c|270| <<guest_phys_blocks_append>> memory_listener_register(&g.listener, &address_space_memory);
++ */
+ void memory_listener_register(MemoryListener *listener, AddressSpace *as)
+ {
+     MemoryListener *other = NULL;
+@@ -2788,6 +3227,16 @@ void memory_region_invalidate_mmio_ptr(MemoryRegion *mr, hwaddr offset,
                            RUN_ON_CPU_HOST_PTR(invalidate_data));
  }
  
 +/*
-+ * 被很多外部调用
++ * 被很多外部调用, 一些调用的例子:
++ *   - exec.c|3109| <<memory_map_init>> address_space_init(&address_space_memory, system_memory, "memory");
++ *   - exec.c|3114| <<memory_map_init>> address_space_init(&address_space_io, system_io, "I/O");
++ *   - exec.c|906| <<cpu_address_space_init>> address_space_init(as, mr, as_name);
++ *   - hw/i386/amd_iommu.c|1055| <<amdvi_host_dma_iommu>> address_space_init(&iommu_as[devfn]->as,
++ *   - hw/i386/intel_iommu.c|2934| <<vtd_find_add_as>> address_space_init(&vtd_dev_as->as, &vtd_dev_as->root, name);
++ *   - hw/pci/pci.c|1047| <<do_pci_register_device>> address_space_init(&pci_dev->bus_master_as,
++ *   - target/i386/kvm.c|1372| <<register_smram_listener>> address_space_init(&smram_address_space, &smram_as_root, "KVM-SMRAM");
 + */
  void address_space_init(AddressSpace *as, MemoryRegion *root, const char *name)
  {
      memory_region_ref(root);
-@@ -2796,6 +2869,7 @@ void address_space_init(AddressSpace *as, MemoryRegion *root, const char *name)
+@@ -2796,7 +3245,11 @@ void address_space_init(AddressSpace *as, MemoryRegion *root, const char *name)
      as->ioeventfd_nb = 0;
      as->ioeventfds = NULL;
      QTAILQ_INIT(&as->listeners);
 +    /* 把AddressSpace插入全局链表address_spaces */
      QTAILQ_INSERT_TAIL(&address_spaces, as, address_spaces_link);
++    /*
++     * 从memory_map_init()调用来的时候, name的例子是"memory"或者"I/O"
++     */
      as->name = g_strdup(name ? name : "anonymous");
      address_space_update_topology(as);
-@@ -2867,6 +2941,10 @@ static void mtree_expand_owner(fprintf_function mon_printf, void *f,
+     address_space_update_ioeventfds(as);
+@@ -2867,6 +3320,10 @@ static void mtree_expand_owner(fprintf_function mon_printf, void *f,
      if (dev && dev->id) {
          mon_printf(f, " id=%s", dev->id);
      } else {
@@ -3213,7 +4366,16 @@ index e9cd446..bbfa6cd 100644
          gchar *canonical_path = object_get_canonical_path(obj);
          if (canonical_path) {
              mon_printf(f, " path=%s", canonical_path);
-@@ -3247,8 +3325,13 @@ static const TypeInfo iommu_memory_region_info = {
+@@ -3232,7 +3689,7 @@ static const TypeInfo memory_region_info = {
+     .parent             = TYPE_OBJECT,
+     .name               = TYPE_MEMORY_REGION,
+     .instance_size      = sizeof(MemoryRegion),
+-    .instance_init      = memory_region_initfn,
++    .instance_init      = memory_region_initfn, // 一个MemoryRegion有addr和size等属性
+     .instance_finalize  = memory_region_finalize,
+ };
+ 
+@@ -3247,8 +3704,13 @@ static const TypeInfo iommu_memory_region_info = {
  
  static void memory_register_types(void)
  {
@@ -3428,7 +4590,7 @@ index f6ccaf7..2b95881 100644
 + */
  type_init(container_register_types)
 diff --git a/qom/object.c b/qom/object.c
-index 75d1d48..d0d7266 100644
+index 75d1d48..823a9c7 100644
 --- a/qom/object.c
 +++ b/qom/object.c
 @@ -31,6 +31,15 @@
@@ -4864,15 +6026,28 @@ index 75d1d48..d0d7266 100644
  ObjectProperty *
  object_property_add(Object *obj, const char *name, const char *type,
                      ObjectPropertyAccessor *get,
-@@ -989,6 +1774,7 @@ object_property_add(Object *obj, const char *name, const char *type,
+@@ -989,6 +1774,20 @@ object_property_add(Object *obj, const char *name, const char *type,
      ObjectProperty *prop;
      size_t name_len = strlen(name);
  
-+    /* 感觉一般的都不满足这个什么[*]吧 */
++    /*
++     * 感觉一般的都不满足这个什么[*]吧
++     *
++     * system_memory进来的时候
++     * (gdb) bt
++     * #0  object_property_add (obj=0x5555568512d0, name=0x555556851250 "system[*]", type=0x555556851530 "child<qemu:memory-region>", get=0x555555c5f037 <object_get_child_property>, set=0x0, 
++     *     release=0x555555c5f0cb <object_finalize_child_property>, opaque=0x555556850cd0, errp=0x7fffffffe060) at qom/object.c:990
++     * #1  0x0000555555c5f1e6 in object_property_add_child (obj=0x5555568512d0, name=0x555556851250 "system[*]", child=0x555556850cd0, errp=0x555556751590 <error_abort>) at qom/object.c:1507
++     * #2  0x0000555555866c8c in memory_region_do_init (mr=0x555556850cd0, owner=0x5555568512d0, name=0x555555e7f09d "system", size=18446744073709551615) at /home/zhang/kvm/qemu-3.0.0/memory.c:1136
++     * #3  0x0000555555866cfb in memory_region_init (mr=0x555556850cd0, owner=0x0, name=0x555555e7f09d "system", size=18446744073709551615) at /home/zhang/kvm/qemu-3.0.0/memory.c:1149
++     * #4  0x0000555555803699 in memory_map_init () at /home/zhang/kvm/qemu-3.0.0/exec.c:3100
++     * #5  0x0000555555804201 in cpu_exec_init_all () at /home/zhang/kvm/qemu-3.0.0/exec.c:3534
++     * #6  0x00005555559dea90 in main (argc=14, argv=0x7fffffffe408, envp=0x7fffffffe480) at vl.c:4046
++     */
      if (name_len >= 3 && !memcmp(name + name_len - 3, "[*]", 4)) {
          int i;
          ObjectProperty *ret;
-@@ -1009,6 +1795,11 @@ object_property_add(Object *obj, const char *name, const char *type,
+@@ -1009,6 +1808,11 @@ object_property_add(Object *obj, const char *name, const char *type,
          return ret;
      }
  
@@ -4884,7 +6059,7 @@ index 75d1d48..d0d7266 100644
      if (object_property_find(obj, name, NULL) != NULL) {
          error_setg(errp, "attempt to add duplicate property '%s'"
                     " to object (type '%s')", name,
-@@ -1024,12 +1815,17 @@ object_property_add(Object *obj, const char *name, const char *type,
+@@ -1024,12 +1828,17 @@ object_property_add(Object *obj, const char *name, const char *type,
      prop->get = get;
      prop->set = set;
      prop->release = release;
@@ -4902,7 +6077,7 @@ index 75d1d48..d0d7266 100644
  ObjectProperty *
  object_class_property_add(ObjectClass *klass,
                            const char *name,
-@@ -1064,17 +1860,29 @@ object_class_property_add(ObjectClass *klass,
+@@ -1064,17 +1873,29 @@ object_class_property_add(ObjectClass *klass,
      return prop;
  }
  
@@ -4932,7 +6107,7 @@ index 75d1d48..d0d7266 100644
      prop = g_hash_table_lookup(obj->properties, name);
      if (prop) {
          return prop;
-@@ -1111,20 +1919,33 @@ void object_class_property_iter_init(ObjectPropertyIterator *iter,
+@@ -1111,20 +1932,33 @@ void object_class_property_iter_init(ObjectPropertyIterator *iter,
      iter->nextclass = klass;
  }
  
@@ -4966,7 +6141,7 @@ index 75d1d48..d0d7266 100644
      prop = g_hash_table_lookup(klass->properties, name);
      if (!prop) {
          error_setg(errp, "Property '.%s' not found", name);
-@@ -1147,9 +1968,17 @@ void object_property_del(Object *obj, const char *name, Error **errp)
+@@ -1147,9 +1981,17 @@ void object_property_del(Object *obj, const char *name, Error **errp)
      g_hash_table_remove(obj->properties, name);
  }
  
@@ -4984,7 +6159,7 @@ index 75d1d48..d0d7266 100644
      ObjectProperty *prop = object_property_find(obj, name, errp);
      if (prop == NULL) {
          return;
-@@ -1162,9 +1991,38 @@ void object_property_get(Object *obj, Visitor *v, const char *name,
+@@ -1162,9 +2004,38 @@ void object_property_get(Object *obj, Visitor *v, const char *name,
      }
  }
  
@@ -5023,7 +6198,7 @@ index 75d1d48..d0d7266 100644
      ObjectProperty *prop = object_property_find(obj, name, errp);
      if (prop == NULL) {
          return;
-@@ -1173,13 +2031,19 @@ void object_property_set(Object *obj, Visitor *v, const char *name,
+@@ -1173,13 +2044,19 @@ void object_property_set(Object *obj, Visitor *v, const char *name,
      if (!prop->set) {
          error_setg(errp, QERR_PERMISSION_DENIED);
      } else {
@@ -5044,7 +6219,7 @@ index 75d1d48..d0d7266 100644
      QString *qstr = qstring_from_str(value);
      object_property_set_qobject(obj, QOBJECT(qstr), name, errp);
  
-@@ -1209,6 +2073,10 @@ void object_property_set_link(Object *obj, Object *value,
+@@ -1209,6 +2086,10 @@ void object_property_set_link(Object *obj, Object *value,
                                const char *name, Error **errp)
  {
      if (value) {
@@ -5055,7 +6230,7 @@ index 75d1d48..d0d7266 100644
          gchar *path = object_get_canonical_path(value);
          object_property_set_str(obj, path, name, errp);
          g_free(path);
-@@ -1235,6 +2103,20 @@ Object *object_property_get_link(Object *obj, const char *name,
+@@ -1235,6 +2116,20 @@ Object *object_property_get_link(Object *obj, const char *name,
      return target;
  }
  
@@ -5076,7 +6251,7 @@ index 75d1d48..d0d7266 100644
  void object_property_set_bool(Object *obj, bool value,
                                const char *name, Error **errp)
  {
-@@ -1395,10 +2277,20 @@ out:
+@@ -1395,10 +2290,20 @@ out:
      visit_free(v);
  }
  
@@ -5097,7 +6272,7 @@ index 75d1d48..d0d7266 100644
      object_property_set(obj, v, name, errp);
      visit_free(v);
  }
-@@ -1434,11 +2326,19 @@ const char *object_property_get_type(Object *obj, const char *name, Error **errp
+@@ -1434,11 +2339,19 @@ const char *object_property_get_type(Object *obj, const char *name, Error **errp
      return prop->type;
  }
  
@@ -5117,7 +6292,7 @@ index 75d1d48..d0d7266 100644
          root = object_new("container");
      }
  
-@@ -1450,6 +2350,21 @@ Object *object_get_objects_root(void)
+@@ -1450,6 +2363,21 @@ Object *object_get_objects_root(void)
      return container_get(object_get_root(), "/objects");
  }
  
@@ -5139,7 +6314,7 @@ index 75d1d48..d0d7266 100644
  Object *object_get_internal_root(void)
  {
      static Object *internal_root;
-@@ -1461,6 +2376,11 @@ Object *object_get_internal_root(void)
+@@ -1461,6 +2389,11 @@ Object *object_get_internal_root(void)
      return internal_root;
  }
  
@@ -5151,7 +6326,7 @@ index 75d1d48..d0d7266 100644
  static void object_get_child_property(Object *obj, Visitor *v,
                                        const char *name, void *opaque,
                                        Error **errp)
-@@ -1468,16 +2388,31 @@ static void object_get_child_property(Object *obj, Visitor *v,
+@@ -1468,16 +2401,31 @@ static void object_get_child_property(Object *obj, Visitor *v,
      Object *child = opaque;
      gchar *path;
  
@@ -5183,7 +6358,7 @@ index 75d1d48..d0d7266 100644
  static void object_finalize_child_property(Object *obj, const char *name,
                                             void *opaque)
  {
-@@ -1490,6 +2425,12 @@ static void object_finalize_child_property(Object *obj, const char *name,
+@@ -1490,6 +2438,12 @@ static void object_finalize_child_property(Object *obj, const char *name,
      object_unref(child);
  }
  
@@ -5196,7 +6371,7 @@ index 75d1d48..d0d7266 100644
  void object_property_add_child(Object *obj, const char *name,
                                 Object *child, Error **errp)
  {
-@@ -1504,6 +2445,10 @@ void object_property_add_child(Object *obj, const char *name,
+@@ -1504,6 +2458,10 @@ void object_property_add_child(Object *obj, const char *name,
  
      type = g_strdup_printf("child<%s>", object_get_typename(OBJECT(child)));
  
@@ -5207,7 +6382,7 @@ index 75d1d48..d0d7266 100644
      op = object_property_add(obj, name, type, object_get_child_property, NULL,
                               object_finalize_child_property, child, &local_err);
      if (local_err) {
-@@ -1540,6 +2485,10 @@ static void object_get_link_property(Object *obj, Visitor *v,
+@@ -1540,6 +2498,10 @@ static void object_get_link_property(Object *obj, Visitor *v,
      gchar *path;
  
      if (*child) {
@@ -5218,7 +6393,7 @@ index 75d1d48..d0d7266 100644
          path = object_get_canonical_path(*child);
          visit_type_str(v, name, &path, errp);
          g_free(path);
-@@ -1679,6 +2628,12 @@ out:
+@@ -1679,6 +2641,12 @@ out:
      g_free(full_type);
  }
  
@@ -5231,7 +6406,7 @@ index 75d1d48..d0d7266 100644
  void object_property_add_const_link(Object *obj, const char *name,
                                      Object *target, Error **errp)
  {
-@@ -1686,15 +2641,24 @@ void object_property_add_const_link(Object *obj, const char *name,
+@@ -1686,15 +2654,24 @@ void object_property_add_const_link(Object *obj, const char *name,
      ObjectProperty *op;
  
      link_type = g_strdup_printf("link<%s>", object_get_typename(target));
@@ -5256,7 +6431,7 @@ index 75d1d48..d0d7266 100644
  gchar *object_get_canonical_path_component(Object *obj)
  {
      ObjectProperty *prop = NULL;
-@@ -1705,7 +2669,9 @@ gchar *object_get_canonical_path_component(Object *obj)
+@@ -1705,7 +2682,9 @@ gchar *object_get_canonical_path_component(Object *obj)
      }
  
      g_hash_table_iter_init(&iter, obj->parent->properties);
@@ -5266,7 +6441,7 @@ index 75d1d48..d0d7266 100644
          if (!object_property_is_child(prop)) {
              continue;
          }
-@@ -1720,16 +2686,26 @@ gchar *object_get_canonical_path_component(Object *obj)
+@@ -1720,16 +2699,26 @@ gchar *object_get_canonical_path_component(Object *obj)
      return NULL;
  }
  
@@ -5293,7 +6468,7 @@ index 75d1d48..d0d7266 100644
          char *component = object_get_canonical_path_component(obj);
  
          if (!component) {
-@@ -1740,6 +2716,7 @@ gchar *object_get_canonical_path(Object *obj)
+@@ -1740,6 +2729,7 @@ gchar *object_get_canonical_path(Object *obj)
              return NULL;
          }
  
@@ -5301,7 +6476,7 @@ index 75d1d48..d0d7266 100644
          newpath = g_strdup_printf("/%s%s", component, path ? path : "");
          g_free(path);
          g_free(component);
-@@ -1750,8 +2727,16 @@ gchar *object_get_canonical_path(Object *obj)
+@@ -1750,8 +2740,16 @@ gchar *object_get_canonical_path(Object *obj)
      return path;
  }
  
@@ -5318,7 +6493,7 @@ index 75d1d48..d0d7266 100644
      ObjectProperty *prop = object_property_find(parent, part, NULL);
      if (prop == NULL) {
          return NULL;
-@@ -1764,6 +2749,13 @@ Object *object_resolve_path_component(Object *parent, const gchar *part)
+@@ -1764,6 +2762,13 @@ Object *object_resolve_path_component(Object *parent, const gchar *part)
      }
  }
  
@@ -5332,7 +6507,7 @@ index 75d1d48..d0d7266 100644
  static Object *object_resolve_abs_path(Object *parent,
                                            gchar **parts,
                                            const char *typename,
-@@ -1779,14 +2771,25 @@ static Object *object_resolve_abs_path(Object *parent,
+@@ -1779,14 +2784,25 @@ static Object *object_resolve_abs_path(Object *parent,
          return object_resolve_abs_path(parent, parts, typename, index + 1);
      }
  
@@ -5358,7 +6533,7 @@ index 75d1d48..d0d7266 100644
  static Object *object_resolve_partial_path(Object *parent,
                                                gchar **parts,
                                                const char *typename,
-@@ -1830,17 +2833,41 @@ Object *object_resolve_path_type(const char *path, const char *typename,
+@@ -1830,17 +2846,41 @@ Object *object_resolve_path_type(const char *path, const char *typename,
      Object *obj;
      gchar **parts;
  
@@ -5400,7 +6575,7 @@ index 75d1d48..d0d7266 100644
          obj = object_resolve_abs_path(object_get_root(), parts, typename, 1);
      }
  
-@@ -1854,12 +2881,20 @@ Object *object_resolve_path(const char *path, bool *ambiguous)
+@@ -1854,12 +2894,20 @@ Object *object_resolve_path(const char *path, bool *ambiguous)
      return object_resolve_path_type(path, TYPE_OBJECT, ambiguous);
  }
  
@@ -5421,7 +6596,7 @@ index 75d1d48..d0d7266 100644
  static void property_get_str(Object *obj, Visitor *v, const char *name,
                               void *opaque, Error **errp)
  {
-@@ -1877,6 +2912,11 @@ static void property_get_str(Object *obj, Visitor *v, const char *name,
+@@ -1877,6 +2925,11 @@ static void property_get_str(Object *obj, Visitor *v, const char *name,
      g_free(value);
  }
  
@@ -5433,7 +6608,7 @@ index 75d1d48..d0d7266 100644
  static void property_set_str(Object *obj, Visitor *v, const char *name,
                               void *opaque, Error **errp)
  {
-@@ -1894,6 +2934,11 @@ static void property_set_str(Object *obj, Visitor *v, const char *name,
+@@ -1894,6 +2947,11 @@ static void property_set_str(Object *obj, Visitor *v, const char *name,
      g_free(value);
  }
  
@@ -5445,7 +6620,7 @@ index 75d1d48..d0d7266 100644
  static void property_release_str(Object *obj, const char *name,
                                   void *opaque)
  {
-@@ -1901,6 +2946,13 @@ static void property_release_str(Object *obj, const char *name,
+@@ -1901,6 +2959,13 @@ static void property_release_str(Object *obj, const char *name,
      g_free(prop);
  }
  
@@ -5459,7 +6634,7 @@ index 75d1d48..d0d7266 100644
  void object_property_add_str(Object *obj, const char *name,
                             char *(*get)(Object *, Error **),
                             void (*set)(Object *, const char *, Error **),
-@@ -1909,9 +2961,14 @@ void object_property_add_str(Object *obj, const char *name,
+@@ -1909,9 +2974,14 @@ void object_property_add_str(Object *obj, const char *name,
      Error *local_err = NULL;
      StringProperty *prop = g_malloc0(sizeof(*prop));
  
@@ -5474,7 +6649,7 @@ index 75d1d48..d0d7266 100644
      object_property_add(obj, name, "string",
                          get ? property_get_str : NULL,
                          set ? property_set_str : NULL,
-@@ -1923,6 +2980,13 @@ void object_property_add_str(Object *obj, const char *name,
+@@ -1923,6 +2993,13 @@ void object_property_add_str(Object *obj, const char *name,
      }
  }
  
@@ -5488,7 +6663,7 @@ index 75d1d48..d0d7266 100644
  void object_class_property_add_str(ObjectClass *klass, const char *name,
                                     char *(*get)(Object *, Error **),
                                     void (*set)(Object *, const char *,
-@@ -1932,9 +2996,14 @@ void object_class_property_add_str(ObjectClass *klass, const char *name,
+@@ -1932,9 +3009,14 @@ void object_class_property_add_str(ObjectClass *klass, const char *name,
      Error *local_err = NULL;
      StringProperty *prop = g_malloc0(sizeof(*prop));
  
@@ -5503,7 +6678,7 @@ index 75d1d48..d0d7266 100644
      object_class_property_add(klass, name, "string",
                                get ? property_get_str : NULL,
                                set ? property_set_str : NULL,
-@@ -1946,12 +3015,20 @@ void object_class_property_add_str(ObjectClass *klass, const char *name,
+@@ -1946,12 +3028,20 @@ void object_class_property_add_str(ObjectClass *klass, const char *name,
      }
  }
  
@@ -5524,7 +6699,7 @@ index 75d1d48..d0d7266 100644
  static void property_get_bool(Object *obj, Visitor *v, const char *name,
                                void *opaque, Error **errp)
  {
-@@ -1968,6 +3045,34 @@ static void property_get_bool(Object *obj, Visitor *v, const char *name,
+@@ -1968,6 +3058,34 @@ static void property_get_bool(Object *obj, Visitor *v, const char *name,
      visit_type_bool(v, name, &value, errp);
  }
  
@@ -5559,7 +6734,7 @@ index 75d1d48..d0d7266 100644
  static void property_set_bool(Object *obj, Visitor *v, const char *name,
                                void *opaque, Error **errp)
  {
-@@ -1984,6 +3089,11 @@ static void property_set_bool(Object *obj, Visitor *v, const char *name,
+@@ -1984,6 +3102,11 @@ static void property_set_bool(Object *obj, Visitor *v, const char *name,
      prop->set(obj, value, errp);
  }
  
@@ -5571,7 +6746,7 @@ index 75d1d48..d0d7266 100644
  static void property_release_bool(Object *obj, const char *name,
                                    void *opaque)
  {
-@@ -1991,6 +3101,28 @@ static void property_release_bool(Object *obj, const char *name,
+@@ -1991,6 +3114,28 @@ static void property_release_bool(Object *obj, const char *name,
      g_free(prop);
  }
  
@@ -5600,7 +6775,7 @@ index 75d1d48..d0d7266 100644
  void object_property_add_bool(Object *obj, const char *name,
                                bool (*get)(Object *, Error **),
                                void (*set)(Object *, bool, Error **),
-@@ -1999,9 +3131,14 @@ void object_property_add_bool(Object *obj, const char *name,
+@@ -1999,9 +3144,14 @@ void object_property_add_bool(Object *obj, const char *name,
      Error *local_err = NULL;
      BoolProperty *prop = g_malloc0(sizeof(*prop));
  
@@ -5615,7 +6790,7 @@ index 75d1d48..d0d7266 100644
      object_property_add(obj, name, "bool",
                          get ? property_get_bool : NULL,
                          set ? property_set_bool : NULL,
-@@ -2013,6 +3150,13 @@ void object_property_add_bool(Object *obj, const char *name,
+@@ -2013,6 +3163,13 @@ void object_property_add_bool(Object *obj, const char *name,
      }
  }
  
@@ -5629,7 +6804,7 @@ index 75d1d48..d0d7266 100644
  void object_class_property_add_bool(ObjectClass *klass, const char *name,
                                      bool (*get)(Object *, Error **),
                                      void (*set)(Object *, bool, Error **),
-@@ -2021,9 +3165,14 @@ void object_class_property_add_bool(ObjectClass *klass, const char *name,
+@@ -2021,9 +3178,14 @@ void object_class_property_add_bool(ObjectClass *klass, const char *name,
      Error *local_err = NULL;
      BoolProperty *prop = g_malloc0(sizeof(*prop));
  
@@ -5644,7 +6819,7 @@ index 75d1d48..d0d7266 100644
      object_class_property_add(klass, name, "bool",
                                get ? property_get_bool : NULL,
                                set ? property_set_bool : NULL,
-@@ -2035,6 +3184,11 @@ void object_class_property_add_bool(ObjectClass *klass, const char *name,
+@@ -2035,6 +3197,11 @@ void object_class_property_add_bool(ObjectClass *klass, const char *name,
      }
  }
  
@@ -5656,7 +6831,7 @@ index 75d1d48..d0d7266 100644
  static void property_get_enum(Object *obj, Visitor *v, const char *name,
                                void *opaque, Error **errp)
  {
-@@ -2051,6 +3205,11 @@ static void property_get_enum(Object *obj, Visitor *v, const char *name,
+@@ -2051,6 +3218,11 @@ static void property_get_enum(Object *obj, Visitor *v, const char *name,
      visit_type_enum(v, name, &value, prop->lookup, errp);
  }
  
@@ -5668,7 +6843,7 @@ index 75d1d48..d0d7266 100644
  static void property_set_enum(Object *obj, Visitor *v, const char *name,
                                void *opaque, Error **errp)
  {
-@@ -2066,6 +3225,11 @@ static void property_set_enum(Object *obj, Visitor *v, const char *name,
+@@ -2066,6 +3238,11 @@ static void property_set_enum(Object *obj, Visitor *v, const char *name,
      prop->set(obj, value, errp);
  }
  
@@ -5680,7 +6855,7 @@ index 75d1d48..d0d7266 100644
  static void property_release_enum(Object *obj, const char *name,
                                    void *opaque)
  {
-@@ -2073,6 +3237,13 @@ static void property_release_enum(Object *obj, const char *name,
+@@ -2073,6 +3250,13 @@ static void property_release_enum(Object *obj, const char *name,
      g_free(prop);
  }
  
@@ -5694,7 +6869,7 @@ index 75d1d48..d0d7266 100644
  void object_property_add_enum(Object *obj, const char *name,
                                const char *typename,
                                const QEnumLookup *lookup,
-@@ -2083,10 +3254,15 @@ void object_property_add_enum(Object *obj, const char *name,
+@@ -2083,10 +3267,15 @@ void object_property_add_enum(Object *obj, const char *name,
      Error *local_err = NULL;
      EnumProperty *prop = g_malloc(sizeof(*prop));
  
@@ -5710,7 +6885,7 @@ index 75d1d48..d0d7266 100644
      object_property_add(obj, name, typename,
                          get ? property_get_enum : NULL,
                          set ? property_set_enum : NULL,
-@@ -2098,6 +3274,13 @@ void object_property_add_enum(Object *obj, const char *name,
+@@ -2098,6 +3287,13 @@ void object_property_add_enum(Object *obj, const char *name,
      }
  }
  
@@ -5724,7 +6899,7 @@ index 75d1d48..d0d7266 100644
  void object_class_property_add_enum(ObjectClass *klass, const char *name,
                                      const char *typename,
                                      const QEnumLookup *lookup,
-@@ -2108,10 +3291,15 @@ void object_class_property_add_enum(ObjectClass *klass, const char *name,
+@@ -2108,10 +3304,15 @@ void object_class_property_add_enum(ObjectClass *klass, const char *name,
      Error *local_err = NULL;
      EnumProperty *prop = g_malloc(sizeof(*prop));
  
@@ -5740,7 +6915,7 @@ index 75d1d48..d0d7266 100644
      object_class_property_add(klass, name, typename,
                                get ? property_get_enum : NULL,
                                set ? property_set_enum : NULL,
-@@ -2127,6 +3315,11 @@ typedef struct TMProperty {
+@@ -2127,6 +3328,11 @@ typedef struct TMProperty {
      void (*get)(Object *, struct tm *, Error **);
  } TMProperty;
  
@@ -5752,7 +6927,7 @@ index 75d1d48..d0d7266 100644
  static void property_get_tm(Object *obj, Visitor *v, const char *name,
                              void *opaque, Error **errp)
  {
-@@ -2175,6 +3368,11 @@ out:
+@@ -2175,6 +3381,11 @@ out:
  
  }
  
@@ -5764,7 +6939,7 @@ index 75d1d48..d0d7266 100644
  static void property_release_tm(Object *obj, const char *name,
                                  void *opaque)
  {
-@@ -2182,6 +3380,12 @@ static void property_release_tm(Object *obj, const char *name,
+@@ -2182,6 +3393,12 @@ static void property_release_tm(Object *obj, const char *name,
      g_free(prop);
  }
  
@@ -5777,7 +6952,7 @@ index 75d1d48..d0d7266 100644
  void object_property_add_tm(Object *obj, const char *name,
                              void (*get)(Object *, struct tm *, Error **),
                              Error **errp)
-@@ -2189,8 +3393,13 @@ void object_property_add_tm(Object *obj, const char *name,
+@@ -2189,8 +3406,13 @@ void object_property_add_tm(Object *obj, const char *name,
      Error *local_err = NULL;
      TMProperty *prop = g_malloc0(sizeof(*prop));
  
@@ -5791,7 +6966,7 @@ index 75d1d48..d0d7266 100644
      object_property_add(obj, name, "struct tm",
                          get ? property_get_tm : NULL, NULL,
                          property_release_tm,
-@@ -2201,6 +3410,12 @@ void object_property_add_tm(Object *obj, const char *name,
+@@ -2201,6 +3423,12 @@ void object_property_add_tm(Object *obj, const char *name,
      }
  }
  
@@ -5804,7 +6979,7 @@ index 75d1d48..d0d7266 100644
  void object_class_property_add_tm(ObjectClass *klass, const char *name,
                                    void (*get)(Object *, struct tm *, Error **),
                                    Error **errp)
-@@ -2208,8 +3423,13 @@ void object_class_property_add_tm(ObjectClass *klass, const char *name,
+@@ -2208,8 +3436,13 @@ void object_class_property_add_tm(ObjectClass *klass, const char *name,
      Error *local_err = NULL;
      TMProperty *prop = g_malloc0(sizeof(*prop));
  
@@ -5818,7 +6993,7 @@ index 75d1d48..d0d7266 100644
      object_class_property_add(klass, name, "struct tm",
                                get ? property_get_tm : NULL, NULL,
                                property_release_tm,
-@@ -2220,11 +3440,19 @@ void object_class_property_add_tm(ObjectClass *klass, const char *name,
+@@ -2220,11 +3453,19 @@ void object_class_property_add_tm(ObjectClass *klass, const char *name,
      }
  }
  
@@ -5838,7 +7013,7 @@ index 75d1d48..d0d7266 100644
  static void property_get_uint8_ptr(Object *obj, Visitor *v, const char *name,
                                     void *opaque, Error **errp)
  {
-@@ -2232,6 +3460,11 @@ static void property_get_uint8_ptr(Object *obj, Visitor *v, const char *name,
+@@ -2232,6 +3473,11 @@ static void property_get_uint8_ptr(Object *obj, Visitor *v, const char *name,
      visit_type_uint8(v, name, &value, errp);
  }
  
@@ -5850,7 +7025,7 @@ index 75d1d48..d0d7266 100644
  static void property_get_uint16_ptr(Object *obj, Visitor *v, const char *name,
                                      void *opaque, Error **errp)
  {
-@@ -2239,6 +3472,11 @@ static void property_get_uint16_ptr(Object *obj, Visitor *v, const char *name,
+@@ -2239,6 +3485,11 @@ static void property_get_uint16_ptr(Object *obj, Visitor *v, const char *name,
      visit_type_uint16(v, name, &value, errp);
  }
  
@@ -5862,7 +7037,7 @@ index 75d1d48..d0d7266 100644
  static void property_get_uint32_ptr(Object *obj, Visitor *v, const char *name,
                                      void *opaque, Error **errp)
  {
-@@ -2246,6 +3484,11 @@ static void property_get_uint32_ptr(Object *obj, Visitor *v, const char *name,
+@@ -2246,6 +3497,11 @@ static void property_get_uint32_ptr(Object *obj, Visitor *v, const char *name,
      visit_type_uint32(v, name, &value, errp);
  }
  
@@ -5874,7 +7049,7 @@ index 75d1d48..d0d7266 100644
  static void property_get_uint64_ptr(Object *obj, Visitor *v, const char *name,
                                      void *opaque, Error **errp)
  {
-@@ -2253,58 +3496,122 @@ static void property_get_uint64_ptr(Object *obj, Visitor *v, const char *name,
+@@ -2253,58 +3509,122 @@ static void property_get_uint64_ptr(Object *obj, Visitor *v, const char *name,
      visit_type_uint64(v, name, &value, errp);
  }
  
@@ -5997,7 +7172,7 @@ index 75d1d48..d0d7266 100644
      object_class_property_add(klass, name, "uint64", property_get_uint64_ptr,
                                NULL, NULL, (void *)v, errp);
  }
-@@ -2314,30 +3621,51 @@ typedef struct {
+@@ -2314,30 +3634,51 @@ typedef struct {
      char *target_name;
  } AliasProperty;
  
@@ -6049,7 +7224,7 @@ index 75d1d48..d0d7266 100644
  static void property_release_alias(Object *obj, const char *name, void *opaque)
  {
      AliasProperty *prop = opaque;
-@@ -2346,6 +3674,10 @@ static void property_release_alias(Object *obj, const char *name, void *opaque)
+@@ -2346,6 +3687,10 @@ static void property_release_alias(Object *obj, const char *name, void *opaque)
      g_free(prop);
  }
  
@@ -6060,7 +7235,7 @@ index 75d1d48..d0d7266 100644
  void object_property_add_alias(Object *obj, const char *name,
                                 Object *target_obj, const char *target_name,
                                 Error **errp)
-@@ -2356,11 +3688,17 @@ void object_property_add_alias(Object *obj, const char *name,
+@@ -2356,11 +3701,17 @@ void object_property_add_alias(Object *obj, const char *name,
      gchar *prop_type;
      Error *local_err = NULL;
  
@@ -6078,7 +7253,7 @@ index 75d1d48..d0d7266 100644
      if (object_property_is_child(target_prop)) {
          prop_type = g_strdup_printf("link%s",
                                      target_prop->type + strlen("child"));
-@@ -2372,6 +3710,10 @@ void object_property_add_alias(Object *obj, const char *name,
+@@ -2372,6 +3723,10 @@ void object_property_add_alias(Object *obj, const char *name,
      prop->target_obj = target_obj;
      prop->target_name = g_strdup(target_name);
  
@@ -6089,7 +7264,7 @@ index 75d1d48..d0d7266 100644
      op = object_property_add(obj, name, prop_type,
                               property_get_alias,
                               property_set_alias,
-@@ -2384,6 +3726,12 @@ void object_property_add_alias(Object *obj, const char *name,
+@@ -2384,6 +3739,12 @@ void object_property_add_alias(Object *obj, const char *name,
      }
      op->resolve = property_resolve_alias;
  
@@ -6102,7 +7277,7 @@ index 75d1d48..d0d7266 100644
      object_property_set_description(obj, op->name,
                                      target_prop->description,
                                      &error_abort);
-@@ -2392,11 +3740,22 @@ out:
+@@ -2392,11 +3753,22 @@ out:
      g_free(prop_type);
  }
  
@@ -6125,7 +7300,7 @@ index 75d1d48..d0d7266 100644
      op = object_property_find(obj, name, errp);
      if (!op) {
          return;
-@@ -2406,6 +3765,10 @@ void object_property_set_description(Object *obj, const char *name,
+@@ -2406,6 +3778,10 @@ void object_property_set_description(Object *obj, const char *name,
      op->description = g_strdup(description);
  }
  
@@ -6136,7 +7311,7 @@ index 75d1d48..d0d7266 100644
  void object_class_property_set_description(ObjectClass *klass,
                                             const char *name,
                                             const char *description,
-@@ -2423,11 +3786,30 @@ void object_class_property_set_description(ObjectClass *klass,
+@@ -2423,11 +3799,30 @@ void object_class_property_set_description(ObjectClass *klass,
      op->description = g_strdup(description);
  }
  
@@ -6167,7 +7342,7 @@ index 75d1d48..d0d7266 100644
  static void register_types(void)
  {
      static TypeInfo interface_info = {
-@@ -2443,8 +3825,31 @@ static void register_types(void)
+@@ -2443,8 +3838,31 @@ static void register_types(void)
          .abstract = true,
      };
  
@@ -6630,8 +7805,69 @@ index 9d2e278..68da2f3 100644
  void qemu_config_parse_qdict(QDict *options, QemuOptsList **lists,
                               Error **errp)
  {
+diff --git a/util/qemu-option.c b/util/qemu-option.c
+index 01886ef..03d3ac8 100644
+--- a/util/qemu-option.c
++++ b/util/qemu-option.c
+@@ -601,6 +601,9 @@ QemuOpts *qemu_opts_find(QemuOptsList *list, const char *id)
+     return NULL;
+ }
+ 
++/*
++ * 核心思想是分配简单初始化一个QemuOpts, 插入QemuOptsList的head
++ */
+ QemuOpts *qemu_opts_create(QemuOptsList *list, const char *id,
+                            int fail_if_exists, Error **errp)
+ {
+@@ -749,6 +752,11 @@ void qemu_opts_print(QemuOpts *opts, const char *separator)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - util/qemu-option.c|817| <<qemu_opts_do_parse>> opts_do_parse(opts, params, firstname, false, errp);
++ *   - util/qemu-option.c|861| <<opts_parse>> opts_do_parse(opts, params, firstname, defaults, &local_err);
++ */
+ static void opts_do_parse(QemuOpts *opts, const char *params,
+                           const char *firstname, bool prepend, Error **errp)
+ {
+@@ -817,6 +825,14 @@ void qemu_opts_do_parse(QemuOpts *opts, const char *params,
+     opts_do_parse(opts, params, firstname, false, errp);
+ }
+ 
++/*
++ * called by:
++ *   - util/qemu-option.c|876| <<qemu_opts_parse>> return opts_parse(list, params, permit_abbrev, false, errp);
++ *   - util/qemu-option.c|896| <<qemu_opts_parse_noisily>> opts = opts_parse(list, params, permit_abbrev, false, &err);
++ *   - util/qemu-option.c|908| <<qemu_opts_set_defaults>> opts = opts_parse(list, params, permit_abbrev, true, NULL);
++ *
++ * 从qemu_opts_parse_noisily()调用过来的一个例子: list=qemu_mem_opts, params="3000M", permit_abbrev=true, defaults=false
++ */
+ static QemuOpts *opts_parse(QemuOptsList *list, const char *params,
+                             bool permit_abbrev, bool defaults, Error **errp)
+ {
+@@ -843,6 +859,9 @@ static QemuOpts *opts_parse(QemuOptsList *list, const char *params,
+      * (if unlikely) future misuse:
+      */
+     assert(!defaults || list->merge_lists);
++    /*
++     * 核心思想是分配简单初始化一个QemuOpts, 插入QemuOptsList的head
++     */
+     opts = qemu_opts_create(list, id, !defaults, &local_err);
+     g_free(id);
+     if (opts == NULL) {
+@@ -881,6 +900,9 @@ QemuOpts *qemu_opts_parse(QemuOptsList *list, const char *params,
+  * QMP context.  Do not use this function there!
+  * Return the new QemuOpts on success, null pointer on error.
+  */
++/*
++ * 调用的一个例子是: list=qemu_mem_opts, params="3000M", permit_abbrev=true
++ */
+ QemuOpts *qemu_opts_parse_noisily(QemuOptsList *list, const char *params,
+                                   bool permit_abbrev)
+ {
 diff --git a/vl.c b/vl.c
-index 16b913f..e2dba50 100644
+index 16b913f..b929f62 100644
 --- a/vl.c
 +++ b/vl.c
 @@ -1389,6 +1389,10 @@ static int usb_parse(const char *cmdline)
@@ -6746,7 +7982,15 @@ index 16b913f..e2dba50 100644
  static MachineClass *select_machine(void)
  {
      MachineClass *machine_class = find_default_machine();
-@@ -3021,12 +3068,13 @@ int main(int argc, char **argv, char **envp)
+@@ -2788,6 +2835,7 @@ static void set_memory_options(uint64_t *ram_slots, ram_addr_t *maxram_size,
+ {
+     uint64_t sz;
+     const char *mem_str;
++    /* hw/core/machine.c|547| <<machine_class_init>> mc->default_ram_size = 128 * MiB; */
+     const ram_addr_t default_ram_size = mc->default_ram_size;
+     QemuOpts *opts = qemu_find_opts_singleton("memory");
+     Location loc;
+@@ -3021,12 +3069,13 @@ int main(int argc, char **argv, char **envp)
      optind = 1;
      while (optind < argc) {
          if (argv[optind][0] != '-') {
@@ -6761,7 +8005,7 @@ index 16b913f..e2dba50 100644
              switch (popt->index) {
              case QEMU_OPTION_nodefconfig:
              case QEMU_OPTION_nouserconfig:
-@@ -3043,16 +3091,26 @@ int main(int argc, char **argv, char **envp)
+@@ -3043,16 +3092,26 @@ int main(int argc, char **argv, char **envp)
      }
  
      /* second pass of option parsing */
@@ -6789,7 +8033,7 @@ index 16b913f..e2dba50 100644
              if (!(popt->arch_mask & arch_type)) {
                  error_report("Option not supported for this target");
                  exit(1);
-@@ -3245,6 +3303,9 @@ int main(int argc, char **argv, char **envp)
+@@ -3245,6 +3304,9 @@ int main(int argc, char **argv, char **envp)
                  exit(0);
                  break;
              case QEMU_OPTION_m:
@@ -6799,7 +8043,7 @@ index 16b913f..e2dba50 100644
                  opts = qemu_opts_parse_noisily(qemu_find_opts("memory"),
                                                 optarg, true);
                  if (!opts) {
-@@ -4026,11 +4087,29 @@ int main(int argc, char **argv, char **envp)
+@@ -4026,11 +4088,29 @@ int main(int argc, char **argv, char **envp)
      }
  #endif
  
