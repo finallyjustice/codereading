@@ -1,0 +1,205 @@
+From f48f98825c8ee30f1d6b1fd6d700996c626ff4a5 Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang@oracle.com>
+Date: Wed, 17 Oct 2018 15:23:57 +0800
+Subject: [PATCH 1/1] xen-blkback comment for uek4 v4.1.12-124.19.2
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ drivers/block/xen-blkback/blkback.c | 32 ++++++++++++++++++++++++
+ drivers/block/xen-blkback/xenbus.c  | 50 +++++++++++++++++++++++++++++++++++--
+ 2 files changed, 80 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/block/xen-blkback/blkback.c b/drivers/block/xen-blkback/blkback.c
+index 523769d..2f421c2 100644
+--- a/drivers/block/xen-blkback/blkback.c
++++ b/drivers/block/xen-blkback/blkback.c
+@@ -461,6 +461,11 @@ out:
+  * For direct requests, retrieve a free entry from list 'pending_free'.
+  * For indirect, allocate with the appropriate number of segements.
+  */
++/*
++ * 只被__do_block_io_op()调用
++ *
++ * 从ring的pending_free分配一个pending_req
++ */
+ static struct pending_req *alloc_req(struct xen_blkif_ring *ring, unsigned int nsegs)
+ {
+ 	struct pending_req *req = NULL;
+@@ -492,6 +497,11 @@ static struct pending_req *alloc_req(struct xen_blkif_ring *ring, unsigned int n
+  * Return the 'pending_req' structure back to the freepool. We also
+  * wake up the thread if it was waiting for a free page.
+  */
++/*
++ * called by:
++ *   - xen_blkbk_unmap_and_respond_callback()
++ *   - dispatch_rw_block_io()
++ */
+ static void free_req(struct xen_blkif_ring *ring, struct pending_req *req)
+ {
+ 	unsigned long flags;
+@@ -760,12 +770,28 @@ static void xen_blkbk_unmap_and_respond_callback(int result, struct gntab_unmap_
+ 	 * pending_free_wq if there's a drain going on, but it has
+ 	 * to be taken into account if the current model is changed.
+ 	 */
++	/*
++	 * 修改inflight的地方:
++	 *   - drivers/block/xen-blkback/blkback.c|1408| <<dispatch_rw_block_io>> atomic_inc(&ring->inflight);
++	 *   - drivers/block/xen-blkback/blkback.c|773| <<xen_blkbk_unmap_and_respond_callback>> if (atomic_dec_and_test(&ring->inflight) && atomic_read(&blkif->drain)) {
++	 *
++	 * 使用inflight的地方:
++	 *   - drivers/block/xen-blkback/blkback.c|1090| <<xen_blk_drain_io>> if (atomic_read(&ring->inflight) == 0)
++	 *   - drivers/block/xen-blkback/xenbus.c|261| <<xen_blkif_disconnect>> if (atomic_read(&ring->inflight) > 0) {
++	 */
+ 	if (atomic_dec_and_test(&ring->inflight) && atomic_read(&blkif->drain)) {
+ 		complete(&blkif->drain_complete);
+ 	}
+ 	xen_blkif_put(blkif);
+ }
+ 
++/*
++ * called only by:
++ *   - __end_block_io_op()
++ *
++ * 1138         if (atomic_dec_and_test(&pending_req->pendcnt))
++ * 1139                 xen_blkbk_unmap_and_respond(pending_req);
++ */
+ static void xen_blkbk_unmap_and_respond(struct pending_req *req)
+ {
+ 	struct gntab_unmap_queue_data* work = &req->gnttab_unmap_data;
+@@ -1116,6 +1142,12 @@ static void __end_block_io_op(struct pending_req *pending_req, int error)
+ 	 * the grant references associated with 'request' and provide
+ 	 * the proper response on the ring.
+ 	 */
++	/*
++	 * 修改pendcnt的地方:
++	 *   - drivers/block/xen-blkback/blkback.c|1145| <<__end_block_io_op>> if (atomic_dec_and_test(&pending_req->pendcnt)) --> 当前调用的地方
++	 *   - drivers/block/xen-blkback/blkback.c|1461| <<dispatch_rw_block_io>> atomic_set(&pending_req->pendcnt, nbio);  --> 初始化成bio的数目
++	 *   - drivers/block/xen-blkback/blkback.c|1490| <<dispatch_rw_block_io>> atomic_set(&pending_req->pendcnt, 1);  --> 错误处理!
++	 */
+ 	if (atomic_dec_and_test(&pending_req->pendcnt))
+ 		xen_blkbk_unmap_and_respond(pending_req);
+ }
+diff --git a/drivers/block/xen-blkback/xenbus.c b/drivers/block/xen-blkback/xenbus.c
+index 59dd6c6..9f064b6 100644
+--- a/drivers/block/xen-blkback/xenbus.c
++++ b/drivers/block/xen-blkback/xenbus.c
+@@ -239,6 +239,13 @@ static int xen_blkif_map(struct xen_blkif_ring *ring, grant_ref_t *gref,
+ 	return 0;
+ }
+ 
++/*
++ * alloc_req(): 只有__do_block_io_op()调用
++ * free_req(): 被xen_blkbk_unmap_and_respond_callback()和dispatch_rw_block_io()调用 后者用来错误处理inflight还没增加 
++ *
++ * inflight增加: dispatch_rw_block_io()
++ * inflight减少: xen_blkbk_unmap_and_respond_callback()
++ */
+ static int xen_blkif_disconnect(struct xen_blkif *blkif)
+ {
+ 	struct pending_req *req, *n;
+@@ -258,6 +265,11 @@ static int xen_blkif_disconnect(struct xen_blkif *blkif)
+ 		 * don't have any discard_io or other_io requests. So, checking
+ 		 * for inflight IO is enough.
+ 		 */
++		/*
++		 * 增加减少的地方:
++		 *   - drivers/block/xen-blkback/blkback.c|1417| <<dispatch_rw_block_io>> atomic_inc(&ring->inflight);
++		 *   - drivers/block/xen-blkback/blkback.c|782| <<xen_blkbk_unmap_and_respond_callback>> if (atomic_dec_and_test(&ring->inflight) && atomic_read(&blkif->drain)) {
++		 */
+ 		if (atomic_read(&ring->inflight) > 0) {
+ 			busy = true;
+ 			continue;
+@@ -277,10 +289,35 @@ static int xen_blkif_disconnect(struct xen_blkif *blkif)
+ 		xen_blkbk_free_caches(ring);
+ 
+ 		/* Check that there is no request in use */
++		/*
++		 * drivers/block/xen-blkback/blkback.c|477| <<alloc_req>> req = list_entry(ring->pending_free.next, ---> 分配的时候用
++		 * drivers/block/xen-blkback/blkback.c|513| <<free_req>> list_add(&req->free_list, &ring->pending_free);  ---> 用完了放回去
++		 * drivers/block/xen-blkback/xenbus.c|291| <<xen_blkif_disconnect>> list_for_each_entry_safe(req, n, &ring->pending_free, free_list) { ---> 报bug的地方
++		 * drivers/block/xen-blkback/xenbus.c|1052| <<read_per_ring_refs>> list_add_tail(&req->free_list, &ring->pending_free); ---> 初始化分配
++		 * drivers/block/xen-blkback/xenbus.c|1068| <<read_per_ring_refs>> list_for_each_entry_safe(req, n, &ring->pending_free, free_list) { ---> 初始化失败立刻回收
++		 *
++		 * 在read_per_ring_refs()添加的:
++		 * 1037         for (i = 0; i < nr_grefs * XEN_BLKIF_REQS_PER_PAGE; i++) {
++		 * 1038                 req = xen_blkbk_alloc_req(BLKIF_MAX_SEGMENTS_PER_REQUEST, false);
++		 * 1039        
++		 * 1040                 if (!req)
++		 * 1041                         goto fail;
++		 * 1042        
++		 * 1043                 list_add_tail(&req->free_list, &ring->pending_free);
++		 * 1044         }
++		 */
+ 		list_for_each_entry_safe(req, n, &ring->pending_free, free_list) {
+ 			list_del(&req->free_list);
+ 
++			/*
++			 * called by:
++			 *   - drivers/block/xen-blkback/blkback.c|519| <<free_req>> xen_blkbk_free_req(req); ---> free的不是链表上的
++			 *   - drivers/block/xen-blkback/xenbus.c|294| <<xen_blkif_disconnect>> xen_blkbk_free_req(req); ---> 报bug的xen_blkif_disconnect()
++			 *   - drivers/block/xen-blkback/xenbus.c|978| <<xen_blkbk_alloc_req>> xen_blkbk_free_req(req); ---> 现分配 和list无关
++			 *   - drivers/block/xen-blkback/xenbus.c|1070| <<read_per_ring_refs>> xen_blkbk_free_req(req);  ---> 失败了遍历所有pending_req一个一个删除via list_del(&req->free_list);
++			 */
+ 			xen_blkbk_free_req(req);
++			/* 唯一修改i的地方 */
+ 			i++;
+ 		}
+ 
+@@ -975,6 +1012,7 @@ struct pending_req *xen_blkbk_alloc_req(unsigned int nseg, bool indirect)
+  */
+ static int read_per_ring_refs(struct xen_blkif_ring *ring, const char *dir)
+ {
++	/* 对mq的ring的数量有限制 */
+ 	unsigned int ring_ref[XENBUS_MAX_RING_GRANTS];
+ 	struct pending_req *req, *n;
+ 	int err, i;
+@@ -992,7 +1030,7 @@ static int read_per_ring_refs(struct xen_blkif_ring *ring, const char *dir)
+ 
+ 	err = xenbus_scanf(XBT_NIL, dev->otherend, "ring-page-order", "%u",
+ 			  &ring_page_order);
+-	if (err != 1) {
++	if (err != 1) { // 如果只有一个ring
+ 		err = xenbus_scanf(XBT_NIL, dir, "ring-ref", "%u", &ring_ref[0]);
+ 		if (err != 1) {
+ 			err = -EINVAL;
+@@ -1000,7 +1038,7 @@ static int read_per_ring_refs(struct xen_blkif_ring *ring, const char *dir)
+ 			return err;
+ 		}
+ 		nr_grefs = 1;
+-	} else {
++	} else { // 如果有多个ring
+ 		unsigned int i;
+ 
+ 		if (ring_page_order > xen_blkif_max_ring_order) {
+@@ -1027,6 +1065,8 @@ static int read_per_ring_refs(struct xen_blkif_ring *ring, const char *dir)
+ 		}
+ 	}
+ 	blkif->nr_ring_pages = nr_grefs;
++	
++	/* 上面把blkif->nr_ring_pages个ring的gref都读到了本地数组ring_ref[] */
+ 
+ 	for (i = 0; i < nr_grefs * XEN_BLKIF_REQS_PER_PAGE; i++) {
+ 		req = xen_blkbk_alloc_req(BLKIF_MAX_SEGMENTS_PER_REQUEST, false /* direct */);
+@@ -1038,6 +1078,9 @@ static int read_per_ring_refs(struct xen_blkif_ring *ring, const char *dir)
+ 	}
+ 
+ 	/* Map the shared frame, irq etc. */
++	/*
++	 * 初始化每一个ring的map和irq
++	 */
+ 	err = xen_blkif_map(ring, ring_ref, nr_grefs, evtchn);
+ 	if (err) {
+ 		xenbus_dev_fatal(dev, err, "mapping ring-ref port %u", evtchn);
+@@ -1103,6 +1146,9 @@ static int connect_ring(struct backend_info *be)
+ 		return -ENOSYS;
+ 	}
+ 	be->blkif->nr_rings = requested_num_queues;
++	/*
++	 * 分配并初始化be->blkif->nr_rings个xen_blkif_ring (blkif->rings[])
++	 */
+ 	if (xen_blkif_alloc_rings(be->blkif))
+ 		return -ENOMEM;
+ 
+-- 
+2.7.4
+
