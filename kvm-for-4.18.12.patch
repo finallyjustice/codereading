@@ -1,6 +1,6 @@
-From f9f6cbe473aa300e5007284c2f8e564e8b77ce3d Mon Sep 17 00:00:00 2001
+From f58be62da3d27f04efc3f11655706c3ff6323cd1 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang@oracle.com>
-Date: Thu, 25 Oct 2018 16:02:15 +0800
+Date: Fri, 26 Oct 2018 15:16:05 +0800
 Subject: [PATCH 1/1] kvm for 4.18.12
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
@@ -10,7 +10,8 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  arch/x86/kernel/kvmclock.c      |  77 ++++++
  arch/x86/kvm/i8254.c            |  10 +
  arch/x86/kvm/lapic.c            |  30 +++
- arch/x86/kvm/mmu.c              | 174 +++++++++++++-
+ arch/x86/kvm/mmu.c              | 238 ++++++++++++++++++-
+ arch/x86/kvm/mmu.h              |   6 +
  arch/x86/kvm/pmu_intel.c        |  39 +++
  arch/x86/kvm/vmx.c              | 509 ++++++++++++++++++++++++++++++++++++++++
  arch/x86/kvm/x86.c              |  86 +++++++
@@ -19,7 +20,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  virt/kvm/irqchip.c              |   4 +
  virt/kvm/kvm_main.c             | 157 ++++++++++++-
  virt/kvm/vfio.c                 |  27 +++
- 14 files changed, 1192 insertions(+), 4 deletions(-)
+ 15 files changed, 1262 insertions(+), 4 deletions(-)
 
 diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
 index 0722b77..e4fa369 100644
@@ -359,10 +360,33 @@ index b5cd846..78ba778 100644
  
  	/*
 diff --git a/arch/x86/kvm/mmu.c b/arch/x86/kvm/mmu.c
-index 97d4175..0ccbb7a 100644
+index 97d4175..31eea0d 100644
 --- a/arch/x86/kvm/mmu.c
 +++ b/arch/x86/kvm/mmu.c
-@@ -56,6 +56,11 @@
+@@ -50,12 +50,34 @@
+ #include "trace.h"
+ 
+ /*
++ * 当QEMU通过ioctl创建vcpu时,调用kvm_mmu_create初始化mmu相关信息,
++ * 为页表项结构分配slab cache.
++ *
++ * 当KVM要进入Guest前,vcpu_enter_guest => kvm_mmu_reload会将根级
++ * 页表地址加载到VMCS,让Guest使用该页表.
++ *
++ * 当EPT Violation发生时,VMEXIT到KVM中.如果是缺页,则拿到对应的GPA,
++ * 根据GPA算出gfn,根据gfn找到对应的memory slot,得到对应的HVA.然后
++ * 根据HVA找到对应的pfn,确保该page位于内存.在把缺的页填上后,需要更
++ * 新EPT,完善其中缺少的页表项.于是从L4开始,逐层补全页表,对于在某层
++ * 上缺少的页表页,会从slab中分配后将新页的HPA填入到上一级页表中.
++ *
++ * 除了建立上级页表到下级页表的关联外,KVM 还会建立反向映射,可以直
++ * 接根据GPA找到gfn相关的页表项,而无需再次走EPT查询.
++ */
++
++/*
+  * When setting this variable to true it enables Two-Dimensional-Paging
+  * where the hardware walks 2 page tables:
+  * 1. the guest-virtual to guest-physical
   * 2. while doing 1. it walks guest-physical to host-physical
   * If the hardware supports that we don't need to do shadow paging.
   */
@@ -374,7 +398,23 @@ index 97d4175..0ccbb7a 100644
  bool tdp_enabled = false;
  
  enum {
-@@ -1134,6 +1139,12 @@ gfn_to_memslot_dirty_bitmap(struct kvm_vcpu *vcpu, gfn_t gfn,
+@@ -171,10 +193,15 @@ struct pte_list_desc {
+ };
+ 
+ struct kvm_shadow_walk_iterator {
++	/* 发生page fault的GPA,迭代过程就是要把GPA所涉及的页表项都填上 */
+ 	u64 addr;
++	/* 当前页表项的 HPA，在 shadow_walk_init 中设置为 vcpu->arch.mmu.root_hpa */
+ 	hpa_t shadow_addr;
++	/* 指向当前页表项, 在shadow_walk_okay()中更新 */
+ 	u64 *sptep;
++	/* 当前层级,在shadow_walk_okay()中设置为4 (x86_64 PT64_ROOT_LEVEL), 在shadow_walk_next()中减1 */
+ 	int level;
++	/* 在当前level页表中的索引,在shadow_walk_okey中更新 */
+ 	unsigned index;
+ };
+ 
+@@ -1134,6 +1161,12 @@ gfn_to_memslot_dirty_bitmap(struct kvm_vcpu *vcpu, gfn_t gfn,
  	return slot;
  }
  
@@ -387,7 +427,7 @@ index 97d4175..0ccbb7a 100644
  static int mapping_level(struct kvm_vcpu *vcpu, gfn_t large_gfn,
  			 bool *force_pt_level)
  {
-@@ -1143,6 +1154,12 @@ static int mapping_level(struct kvm_vcpu *vcpu, gfn_t large_gfn,
+@@ -1143,6 +1176,12 @@ static int mapping_level(struct kvm_vcpu *vcpu, gfn_t large_gfn,
  	if (unlikely(*force_pt_level))
  		return PT_PAGE_TABLE_LEVEL;
  
@@ -400,7 +440,7 @@ index 97d4175..0ccbb7a 100644
  	slot = kvm_vcpu_gfn_to_memslot(vcpu, large_gfn);
  	*force_pt_level = !memslot_valid_for_gpte(slot, true);
  	if (unlikely(*force_pt_level))
-@@ -2334,6 +2351,16 @@ static void clear_sp_write_flooding_count(u64 *spte)
+@@ -2334,6 +2373,16 @@ static void clear_sp_write_flooding_count(u64 *spte)
  	__clear_sp_write_flooding_count(sp);
  }
  
@@ -417,7 +457,7 @@ index 97d4175..0ccbb7a 100644
  static struct kvm_mmu_page *kvm_mmu_get_page(struct kvm_vcpu *vcpu,
  					     gfn_t gfn,
  					     gva_t gaddr,
-@@ -2999,6 +3026,11 @@ static void direct_pte_prefetch(struct kvm_vcpu *vcpu, u64 *sptep)
+@@ -2999,9 +3048,19 @@ static void direct_pte_prefetch(struct kvm_vcpu *vcpu, u64 *sptep)
  	__direct_pte_prefetch(vcpu, sp, sptep);
  }
  
@@ -425,21 +465,51 @@ index 97d4175..0ccbb7a 100644
 + * called by:
 + *   - arch/x86/kvm/mmu.c|3999| <<tdp_page_fault>> r = __direct_map(vcpu, write, map_writable, level, gfn, pfn, prefault);
 + *   - arch/x86/kvm/mmu.c|3372| <<nonpaging_map>> r = __direct_map(vcpu, write, map_writable, level, gfn, pfn, prefault);
++ *
++ * 该函数建立了gfn到pfn的映射,同时将该page pin死在host的内存中
 + */
  static int __direct_map(struct kvm_vcpu *vcpu, int write, int map_writable,
  			int level, gfn_t gfn, kvm_pfn_t pfn, bool prefault)
  {
-@@ -3010,6 +3042,9 @@ static int __direct_map(struct kvm_vcpu *vcpu, int write, int map_writable,
++	/*
++	 * 通过迭代器将ept中与该gpa相关的页表补充完整
++	 */
+ 	struct kvm_shadow_walk_iterator iterator;
+ 	struct kvm_mmu_page *sp;
+ 	int emulate = 0;
+@@ -3010,6 +3069,31 @@ static int __direct_map(struct kvm_vcpu *vcpu, int write, int map_writable,
  	if (!VALID_PAGE(vcpu->arch.mmu.root_hpa))
  		return 0;
  
 +	/*
-+	 * 从leve4(root)开始,逐层补全也表对于每一层:
++	 * 从leve4(root)开始,逐层补全页表对于每一层.
++	 *
++	 * 在每轮迭代中,sptep都会指向GPA在当前级页表中所对应的页表项,
++	 * 我们的目的就是把下一级页表的GPA填到该页表项内(即设置 sptep).
++	 * 因为是缺页,可能会出现下一级的页表页不存在的问题,这时候需要
++	 * 分配一个页表页,然后再将该页的GPA填进到sptep中.
++	 *
++	 * 举个例子,对于GPA(如0xfffff001),其二进制为:
++	 *
++	 * 000000000 000000011 111111111 111111111 000000000001
++	 *   PML4      PDPT       PD        PT        Offset
++	 *
++	 * 初始化状态: level = 4, shadow_addr = root_hpa, addr = GPA
++	 *
++	 * 执行流程：
++	 *
++	 * 1. index = addr在当前 level分段的值.如在level = 4时为0(000000000),在level = 3时为3(000000011)
++	 * 2. sptep = va(shadow_addr) + index, 得到GPA在当前地址中所对应的页表项HVA
++	 * 3. 如果sptep没值,分配一个page作为下级页表,同时将sptep设置为该page的HPA
++	 * 4. shadow_addr = *sptep,进入下级页表,循环
++	 *
++	 * 开启hugepage时,由于页表项管理的范围变大,所需页表级数减少,
++	 * 在默认情况下pag大小为2M,因此无需 level 1.
 +	 */
  	for_each_shadow_entry(vcpu, (u64)gfn << PAGE_SHIFT, iterator) {
  		if (iterator.level == level) {
  			emulate = mmu_set_spte(vcpu, iterator.sptep, ACC_ALL,
-@@ -3021,11 +3056,17 @@ static int __direct_map(struct kvm_vcpu *vcpu, int write, int map_writable,
+@@ -3021,14 +3105,23 @@ static int __direct_map(struct kvm_vcpu *vcpu, int write, int map_writable,
  		}
  
  		drop_large_spte(vcpu, iterator.sptep);
@@ -457,7 +527,13 @@ index 97d4175..0ccbb7a 100644
  			sp = kvm_mmu_get_page(vcpu, pseudo_gfn, iterator.addr,
  					      iterator.level - 1, 1, ACC_ALL);
  
-@@ -3213,6 +3254,11 @@ static bool is_access_allowed(u32 fault_err_code, u64 spte)
++			/*
++			 * 将新页表的hpa填入到当前页表项目(sptep)中
++			 */
+ 			link_shadow_page(vcpu, iterator.sptep, sp);
+ 		}
+ 	}
+@@ -3213,6 +3306,11 @@ static bool is_access_allowed(u32 fault_err_code, u64 spte)
   * - true: let the vcpu to access on the same address again.
   * - false: let the real page fault path to fix it.
   */
@@ -469,7 +545,7 @@ index 97d4175..0ccbb7a 100644
  static bool fast_page_fault(struct kvm_vcpu *vcpu, gva_t gva, int level,
  			    u32 error_code)
  {
-@@ -3430,6 +3476,12 @@ static int mmu_check_root(struct kvm_vcpu *vcpu, gfn_t root_gfn)
+@@ -3430,6 +3528,12 @@ static int mmu_check_root(struct kvm_vcpu *vcpu, gfn_t root_gfn)
  	return ret;
  }
  
@@ -482,7 +558,7 @@ index 97d4175..0ccbb7a 100644
  static int mmu_alloc_direct_roots(struct kvm_vcpu *vcpu)
  {
  	struct kvm_mmu_page *sp;
-@@ -3470,6 +3522,10 @@ static int mmu_alloc_direct_roots(struct kvm_vcpu *vcpu)
+@@ -3470,6 +3574,10 @@ static int mmu_alloc_direct_roots(struct kvm_vcpu *vcpu)
  	return 0;
  }
  
@@ -493,7 +569,7 @@ index 97d4175..0ccbb7a 100644
  static int mmu_alloc_shadow_roots(struct kvm_vcpu *vcpu)
  {
  	struct kvm_mmu_page *sp;
-@@ -3571,12 +3627,24 @@ static int mmu_alloc_shadow_roots(struct kvm_vcpu *vcpu)
+@@ -3571,12 +3679,24 @@ static int mmu_alloc_shadow_roots(struct kvm_vcpu *vcpu)
  	return 0;
  }
  
@@ -520,7 +596,7 @@ index 97d4175..0ccbb7a 100644
  }
  
  static void mmu_sync_roots(struct kvm_vcpu *vcpu)
-@@ -3834,6 +3902,12 @@ bool kvm_can_do_async_pf(struct kvm_vcpu *vcpu)
+@@ -3834,6 +3954,20 @@ bool kvm_can_do_async_pf(struct kvm_vcpu *vcpu)
  	return kvm_x86_ops->interrupt_allowed(vcpu);
  }
  
@@ -529,11 +605,19 @@ index 97d4175..0ccbb7a 100644
 + *   - arch/x86/kvm/mmu.c|4003| <<tdp_page_fault>> if (try_async_pf(vcpu, prefault, gfn, gpa, &pfn, write, &map_writable))
 + *   - arch/x86/kvm/mmu.c|3376| <<nonpaging_map>> if (try_async_pf(vcpu, prefault, gfn, v, &pfn, write, &map_writable))
 + *   - arch/x86/kvm/paging_tmpl.h|797| <<FNAME(page_fault)>> if (try_async_pf(vcpu, prefault, walker.gfn, addr, &pfn, write_fault,
++ *
++ * 1. 根据gfn找到对应的memslot
++ * 2. 用memslot的起始hva(userspace_addr)+(gfn-slot中的起始gfn(base_gfn))*页大小(PAGE_SIZE)
++ *    得到gfn对应的起始hva
++ * 3. 为该hva分配一个物理页,有hva_to_pfn_fast()和hva_to_pfn_slow()两种,hva_to_pfn_fast()
++ *    实际上是调用__get_user_pages_fast(),会尝试去pin该page,即确保该地址所在的物理页在内存中.
++ *    如果失败,退化到hva_to_pfn_slow(),会先去拿mm->mmap_sem的锁然后调用__get_user_pages()来pin
++ * 4. 如果分配成功,对其返回的struct page调用page_to_pfn()得到对应的pfn
 + */
  static bool try_async_pf(struct kvm_vcpu *vcpu, bool prefault, gfn_t gfn,
  			 gva_t gva, kvm_pfn_t *pfn, bool write, bool *writable)
  {
-@@ -3848,8 +3922,14 @@ static bool try_async_pf(struct kvm_vcpu *vcpu, bool prefault, gfn_t gfn,
+@@ -3848,8 +3982,14 @@ static bool try_async_pf(struct kvm_vcpu *vcpu, bool prefault, gfn_t gfn,
  		return false;
  	}
  
@@ -548,7 +632,7 @@ index 97d4175..0ccbb7a 100644
  	*pfn = __gfn_to_pfn_memslot(slot, gfn, false, &async, write, writable);
  	if (!async)
  		return false; /* *pfn has correct page already */
-@@ -3868,6 +3948,11 @@ static bool try_async_pf(struct kvm_vcpu *vcpu, bool prefault, gfn_t gfn,
+@@ -3868,6 +4008,11 @@ static bool try_async_pf(struct kvm_vcpu *vcpu, bool prefault, gfn_t gfn,
  	return false;
  }
  
@@ -560,7 +644,7 @@ index 97d4175..0ccbb7a 100644
  int kvm_handle_page_fault(struct kvm_vcpu *vcpu, u64 error_code,
  				u64 fault_address, char *insn, int insn_len)
  {
-@@ -3910,6 +3995,14 @@ check_hugepage_cache_consistency(struct kvm_vcpu *vcpu, gfn_t gfn, int level)
+@@ -3910,6 +4055,18 @@ check_hugepage_cache_consistency(struct kvm_vcpu *vcpu, gfn_t gfn, int level)
  	return kvm_mtrr_check_gfn_range_consistency(vcpu, gfn, page_num);
  }
  
@@ -571,11 +655,15 @@ index 97d4175..0ccbb7a 100644
 + * called by:
 + *   - arch/x86/kvm/mmu.c|5000| <<kvm_mmu_page_fault>> r = vcpu->arch.mmu.page_fault(vcpu, cr2, lower_32_bits(error_code),
 + *   - arch/x86/kvm/x86.c|9270| <<kvm_arch_async_page_ready>> vcpu->arch.mmu.page_fault(vcpu, work->gva, 0, true);
++ *
++ * 主要有两步:
++ * 1. 获取gpa对应的物理页,如果没有会进行分配
++ * 2. 更新ept
 + */
  static int tdp_page_fault(struct kvm_vcpu *vcpu, gva_t gpa, u32 error_code,
  			  bool prefault)
  {
-@@ -3947,6 +4040,9 @@ static int tdp_page_fault(struct kvm_vcpu *vcpu, gva_t gpa, u32 error_code,
+@@ -3947,6 +4104,9 @@ static int tdp_page_fault(struct kvm_vcpu *vcpu, gva_t gpa, u32 error_code,
  	mmu_seq = vcpu->kvm->mmu_notifier_seq;
  	smp_rmb();
  
@@ -585,7 +673,7 @@ index 97d4175..0ccbb7a 100644
  	if (try_async_pf(vcpu, prefault, gfn, gpa, &pfn, write, &map_writable))
  		return RET_PF_RETRY;
  
-@@ -3960,6 +4056,9 @@ static int tdp_page_fault(struct kvm_vcpu *vcpu, gva_t gpa, u32 error_code,
+@@ -3960,6 +4120,9 @@ static int tdp_page_fault(struct kvm_vcpu *vcpu, gva_t gpa, u32 error_code,
  		goto out_unlock;
  	if (likely(!force_pt_level))
  		transparent_hugepage_adjust(vcpu, &gfn, &pfn, &level);
@@ -595,7 +683,7 @@ index 97d4175..0ccbb7a 100644
  	r = __direct_map(vcpu, write, map_writable, level, gfn, pfn, prefault);
  	spin_unlock(&vcpu->kvm->mmu_lock);
  
-@@ -4505,6 +4604,12 @@ static void paging32E_init_context(struct kvm_vcpu *vcpu,
+@@ -4505,6 +4668,12 @@ static void paging32E_init_context(struct kvm_vcpu *vcpu,
  	paging64_init_context_common(vcpu, context, PT32E_ROOT_LEVEL);
  }
  
@@ -608,7 +696,7 @@ index 97d4175..0ccbb7a 100644
  static void init_kvm_tdp_mmu(struct kvm_vcpu *vcpu)
  {
  	struct kvm_mmu *context = &vcpu->arch.mmu;
-@@ -4666,11 +4771,18 @@ static void init_kvm_nested_mmu(struct kvm_vcpu *vcpu)
+@@ -4666,11 +4835,18 @@ static void init_kvm_nested_mmu(struct kvm_vcpu *vcpu)
  	update_last_nonleaf_level(vcpu, g_context);
  }
  
@@ -628,7 +716,7 @@ index 97d4175..0ccbb7a 100644
  		init_kvm_tdp_mmu(vcpu);
  	else
  		init_kvm_softmmu(vcpu);
-@@ -4683,6 +4795,11 @@ void kvm_mmu_reset_context(struct kvm_vcpu *vcpu)
+@@ -4683,6 +4859,11 @@ void kvm_mmu_reset_context(struct kvm_vcpu *vcpu)
  }
  EXPORT_SYMBOL_GPL(kvm_mmu_reset_context);
  
@@ -640,7 +728,7 @@ index 97d4175..0ccbb7a 100644
  int kvm_mmu_load(struct kvm_vcpu *vcpu)
  {
  	int r;
-@@ -4695,6 +4812,10 @@ int kvm_mmu_load(struct kvm_vcpu *vcpu)
+@@ -4695,6 +4876,10 @@ int kvm_mmu_load(struct kvm_vcpu *vcpu)
  	if (r)
  		goto out;
  	/* set_cr3() should ensure TLB has been flushed */
@@ -651,7 +739,7 @@ index 97d4175..0ccbb7a 100644
  	vcpu->arch.mmu.set_cr3(vcpu, vcpu->arch.mmu.root_hpa);
  out:
  	return r;
-@@ -4957,14 +5078,30 @@ static int make_mmu_pages_available(struct kvm_vcpu *vcpu)
+@@ -4957,14 +5142,30 @@ static int make_mmu_pages_available(struct kvm_vcpu *vcpu)
  	return 0;
  }
  
@@ -682,7 +770,7 @@ index 97d4175..0ccbb7a 100644
  	if (vcpu->arch.mmu.direct_map) {
  		vcpu->arch.gpa_available = true;
  		vcpu->arch.gpa_val = cr2;
-@@ -4977,7 +5114,15 @@ int kvm_mmu_page_fault(struct kvm_vcpu *vcpu, gva_t cr2, u64 error_code,
+@@ -4977,7 +5178,15 @@ int kvm_mmu_page_fault(struct kvm_vcpu *vcpu, gva_t cr2, u64 error_code,
  			goto emulate;
  	}
  
@@ -698,7 +786,7 @@ index 97d4175..0ccbb7a 100644
  		r = vcpu->arch.mmu.page_fault(vcpu, cr2, lower_32_bits(error_code),
  					      false);
  		WARN_ON(r == RET_PF_INVALID);
-@@ -5049,6 +5194,11 @@ void kvm_mmu_invlpg(struct kvm_vcpu *vcpu, gva_t gva)
+@@ -5049,6 +5258,11 @@ void kvm_mmu_invlpg(struct kvm_vcpu *vcpu, gva_t gva)
  }
  EXPORT_SYMBOL_GPL(kvm_mmu_invlpg);
  
@@ -710,7 +798,7 @@ index 97d4175..0ccbb7a 100644
  void kvm_enable_tdp(void)
  {
  	tdp_enabled = true;
-@@ -5067,6 +5217,10 @@ static void free_mmu_pages(struct kvm_vcpu *vcpu)
+@@ -5067,6 +5281,10 @@ static void free_mmu_pages(struct kvm_vcpu *vcpu)
  	free_page((unsigned long)vcpu->arch.mmu.lm_root);
  }
  
@@ -721,7 +809,7 @@ index 97d4175..0ccbb7a 100644
  static int alloc_mmu_pages(struct kvm_vcpu *vcpu)
  {
  	struct page *page;
-@@ -5088,6 +5242,9 @@ static int alloc_mmu_pages(struct kvm_vcpu *vcpu)
+@@ -5088,6 +5306,9 @@ static int alloc_mmu_pages(struct kvm_vcpu *vcpu)
  	return 0;
  }
  
@@ -731,7 +819,7 @@ index 97d4175..0ccbb7a 100644
  int kvm_mmu_create(struct kvm_vcpu *vcpu)
  {
  	vcpu->arch.walk_mmu = &vcpu->arch.mmu;
-@@ -5098,10 +5255,18 @@ int kvm_mmu_create(struct kvm_vcpu *vcpu)
+@@ -5098,10 +5319,18 @@ int kvm_mmu_create(struct kvm_vcpu *vcpu)
  	return alloc_mmu_pages(vcpu);
  }
  
@@ -750,7 +838,7 @@ index 97d4175..0ccbb7a 100644
  	init_kvm_mmu(vcpu);
  }
  
-@@ -5538,6 +5703,9 @@ static void mmu_destroy_caches(void)
+@@ -5538,6 +5767,9 @@ static void mmu_destroy_caches(void)
  	kmem_cache_destroy(mmu_page_header_cache);
  }
  
@@ -760,6 +848,23 @@ index 97d4175..0ccbb7a 100644
  int kvm_mmu_module_init(void)
  {
  	int ret = -ENOMEM;
+diff --git a/arch/x86/kvm/mmu.h b/arch/x86/kvm/mmu.h
+index 5b408c0..60c5781 100644
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@ -77,6 +77,12 @@ static inline unsigned int kvm_mmu_available_pages(struct kvm *kvm)
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/vmx.c|9303| <<nested_vmx_eptp_switching>> kvm_mmu_reload(vcpu);
++ *   - arch/x86/kvm/x86.c|7450| <<vcpu_enter_guest>> r = kvm_mmu_reload(vcpu); --> 进入guest mode前更新eptp
++ *   - arch/x86/kvm/x86.c|9309| <<kvm_arch_async_page_ready>> r = kvm_mmu_reload(vcpu);
++ */
+ static inline int kvm_mmu_reload(struct kvm_vcpu *vcpu)
+ {
+ 	if (likely(vcpu->arch.mmu.root_hpa != INVALID_PAGE))
 diff --git a/arch/x86/kvm/pmu_intel.c b/arch/x86/kvm/pmu_intel.c
 index 5ab4a36..9842174 100644
 --- a/arch/x86/kvm/pmu_intel.c
