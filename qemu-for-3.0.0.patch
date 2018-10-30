@@ -1,6 +1,6 @@
-From 2360121e60f5c9d9a23f32d8ec9726a7ba6088e7 Mon Sep 17 00:00:00 2001
+From 2986dbf6a782fc7fa2093c86ff85f13ae26a7f12 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang@oracle.com>
-Date: Tue, 30 Oct 2018 15:58:52 +0800
+Date: Wed, 31 Oct 2018 05:49:03 +0800
 Subject: [PATCH 1/1] qemu for 3.0.0
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
@@ -43,7 +43,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  hw/virtio/virtio-bus.c                       |   92 ++
  hw/virtio/virtio-pci.c                       |  234 +++++
  hw/virtio/virtio-pci.h                       |    3 +
- hw/virtio/virtio.c                           |  483 +++++++++
+ hw/virtio/virtio.c                           |  529 ++++++++++
  include/exec/cpu-all.h                       |    2 +
  include/exec/memory.h                        |  153 +++
  include/exec/ram_addr.h                      |   11 +
@@ -84,7 +84,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  util/qemu-option.c                           |   22 +
  util/thread-pool.c                           |    3 +
  vl.c                                         |   84 +-
- 79 files changed, 8367 insertions(+), 17 deletions(-)
+ 79 files changed, 8413 insertions(+), 17 deletions(-)
  create mode 100644 data/drive_config_groups.txt
  create mode 100644 data/index.txt
  create mode 100644 data/info_mtree.txt
@@ -6862,7 +6862,7 @@ index 813082b..6b6f4aa 100644
  #define VIRTIO_BLK_PCI(obj) \
          OBJECT_CHECK(VirtIOBlkPCI, (obj), TYPE_VIRTIO_BLK_PCI)
 diff --git a/hw/virtio/virtio.c b/hw/virtio/virtio.c
-index d4e4d98..2ab2804 100644
+index d4e4d98..0eee660 100644
 --- a/hw/virtio/virtio.c
 +++ b/hw/virtio/virtio.c
 @@ -111,20 +111,37 @@ struct VirtQueue
@@ -7571,7 +7571,7 @@ index d4e4d98..2ab2804 100644
  static void virtqueue_map_iovec(VirtIODevice *vdev, struct iovec *sg,
                                  hwaddr *addr, unsigned int *num_sg,
                                  int is_write)
-@@ -811,9 +1119,23 @@ static void virtqueue_map_iovec(VirtIODevice *vdev, struct iovec *sg,
+@@ -811,14 +1119,47 @@ static void virtqueue_map_iovec(VirtIODevice *vdev, struct iovec *sg,
      }
  }
  
@@ -7595,7 +7595,46 @@ index d4e4d98..2ab2804 100644
      virtqueue_map_iovec(vdev, elem->out_sg, elem->out_addr, &elem->out_num, 0);
  }
  
-@@ -858,6 +1180,11 @@ void *virtqueue_pop(VirtQueue *vq, size_t sz)
++/*
++ * called by:
++ *   - hw/virtio/virtio.c|1290| <<virtqueue_pop>> elem = virtqueue_alloc_element(sz, out_num, in_num);
++ *   - hw/virtio/virtio.c|1386| <<qemu_get_virtqueue_element>> elem = virtqueue_alloc_element(sz, data.out_num, data.in_num);
++ *
++ * 分配一个VirtQueueElement, 在VirtQueueElement后面附着in_addr, out_addr等数据
++ */
+ static void *virtqueue_alloc_element(size_t sz, unsigned out_num, unsigned in_num)
+ {
++    /*
++     * 44 typedef struct VirtQueueElement 
++     * 45 {    
++     * 46     unsigned int index;
++     * 47     unsigned int out_num;
++     * 48     unsigned int in_num;
++     * 49     hwaddr *in_addr;
++     * 50     hwaddr *out_addr;
++     * 51     struct iovec *in_sg;
++     * 52     struct iovec *out_sg;
++     * 53 } VirtQueueElement;
++     */
+     VirtQueueElement *elem;
+     size_t in_addr_ofs = QEMU_ALIGN_UP(sz, __alignof__(elem->in_addr[0]));
+     size_t out_addr_ofs = in_addr_ofs + in_num * sizeof(elem->in_addr[0]);
+@@ -839,6 +1180,14 @@ static void *virtqueue_alloc_element(size_t sz, unsigned out_num, unsigned in_nu
+     return elem;
+ }
+ 
++/*
++ * 一个例子:
++ *   - hw/block/virtio-blk.c|271| <<virtio_blk_get_request>> VirtIOBlockReq *req = virtqueue_pop(vq, sizeof(VirtIOBlockReq));
++ *
++ * 从ring buffer把下一个avail的所有desc读出来
++ * 分配一个VirtQueueElement, 后面附着一段内存存储着VirtQueueElement指向的元素
++ * 
++ */
+ void *virtqueue_pop(VirtQueue *vq, size_t sz)
+ {
+     unsigned int i, head, max;
+@@ -858,6 +1207,11 @@ void *virtqueue_pop(VirtQueue *vq, size_t sz)
          return NULL;
      }
      rcu_read_lock();
@@ -7607,13 +7646,15 @@ index d4e4d98..2ab2804 100644
      if (virtio_queue_empty_rcu(vq)) {
          goto done;
      }
-@@ -875,16 +1202,26 @@ void *virtqueue_pop(VirtQueue *vq, size_t sz)
+@@ -875,16 +1229,29 @@ void *virtqueue_pop(VirtQueue *vq, size_t sz)
          goto done;
      }
  
 +    /*
 +     * 把VRingAvail.ring[idx]的内容存入*head
 +     * 其实就是得到VRingAvail.ring[idx]的内容
++     *
++     * 获得下一个avail的第一个desc
 +     */
      if (!virtqueue_get_head(vq, vq->last_avail_idx++, &head)) {
          goto done;
@@ -7624,25 +7665,64 @@ index d4e4d98..2ab2804 100644
 +     * 同时前端使用avail ring的最后一个元素告诉后端,处理到那个used ring了
 +     */
      if (virtio_vdev_has_feature(vdev, VIRTIO_RING_F_EVENT_IDX)) {
-+        /* 把vq->last_avail_idx写入used的vring的最后一个元素的位置 */
++        /* 把vq->last_avail_idx(下一个要处理的avail)写入used的vring的最后一个元素的位置 */
          vring_set_avail_event(vq, vq->last_avail_idx);
      }
  
++    /* i就是要处理的avail的第一个desc */
      i = head;
  
 +    /* 获得VRingMemoryRegionCaches类型的vq->vring.caches */
      caches = vring_get_region_caches(vq);
      if (caches->desc.len < max * sizeof(VRingDesc)) {
          virtio_error(vdev, "Cannot map descriptor ring");
-@@ -892,6 +1229,7 @@ void *virtqueue_pop(VirtQueue *vq, size_t sz)
+@@ -892,6 +1259,10 @@ void *virtqueue_pop(VirtQueue *vq, size_t sz)
      }
  
      desc_cache = &caches->desc;
-+    /* 把第i个VRingDesc读入参数desc */
++    /*
++     * 把第i个VRingDesc读入参数desc
++     * 此时i就是要处理的avail的第一个desc
++     */
      vring_desc_read(vdev, &desc, desc_cache, i);
      if (desc.flags & VRING_DESC_F_INDIRECT) {
          if (desc.len % sizeof(VRingDesc)) {
-@@ -2227,14 +2565,73 @@ static void virtio_vmstate_change(void *opaque, int running, RunState state)
+@@ -917,6 +1288,10 @@ void *virtqueue_pop(VirtQueue *vq, size_t sz)
+     do {
+         bool map_ok;
+ 
++	/*
++	 * addr[]和iov[]都是本地的数组
++	 */
++
+         if (desc.flags & VRING_DESC_F_WRITE) {
+             map_ok = virtqueue_map_desc(vdev, &in_num, addr + out_num,
+                                         iov + out_num,
+@@ -941,6 +1316,11 @@ void *virtqueue_pop(VirtQueue *vq, size_t sz)
+             goto err_undo_map;
+         }
+ 
++	/*
++	 * 如果desc的VRING_DESC_F_NEXT没设置, 说明当前的sk_buff或者io request结束了
++	 * 否则从desc->next获取下一个desc的index读入参数&i
++	 * 把第i个VRingDesc读入参数desc
++	 */
+         rc = virtqueue_read_next_desc(vdev, &desc, desc_cache, max, &i);
+     } while (rc == VIRTQUEUE_READ_DESC_MORE);
+ 
+@@ -949,7 +1329,11 @@ void *virtqueue_pop(VirtQueue *vq, size_t sz)
+     }
+ 
+     /* Now copy what we have collected and mapped */
++    /*
++     * 分配一个VirtQueueElement, 在VirtQueueElement后面附着in_addr, out_addr等数据
++     */
+     elem = virtqueue_alloc_element(sz, out_num, in_num);
++    /* head是当前处理的avail的第一个desc的index */
+     elem->index = head;
+     for (i = 0; i < out_num; i++) {
+         elem->out_addr[i] = addr[i];
+@@ -2227,14 +2611,73 @@ static void virtio_vmstate_change(void *opaque, int running, RunState state)
      }
  }
  
@@ -7716,7 +7796,7 @@ index d4e4d98..2ab2804 100644
      qdev_alias_all_properties(vdev, proxy_obj);
  }
  
-@@ -2298,14 +2695,21 @@ hwaddr virtio_queue_get_desc_size(VirtIODevice *vdev, int n)
+@@ -2298,14 +2741,21 @@ hwaddr virtio_queue_get_desc_size(VirtIODevice *vdev, int n)
      return sizeof(VRingDesc) * vdev->vq[n].vring.num;
  }
  
@@ -7738,7 +7818,7 @@ index d4e4d98..2ab2804 100644
      return offsetof(VRingUsed, ring) +
          sizeof(VRingUsedElem) * vdev->vq[n].vring.num;
  }
-@@ -2505,6 +2909,40 @@ static void virtio_memory_listener_commit(MemoryListener *listener)
+@@ -2505,6 +2955,40 @@ static void virtio_memory_listener_commit(MemoryListener *listener)
      }
  }
  
@@ -7779,7 +7859,7 @@ index d4e4d98..2ab2804 100644
  static void virtio_device_realize(DeviceState *dev, Error **errp)
  {
      VirtIODevice *vdev = VIRTIO_DEVICE(dev);
-@@ -2515,6 +2953,9 @@ static void virtio_device_realize(DeviceState *dev, Error **errp)
+@@ -2515,6 +2999,9 @@ static void virtio_device_realize(DeviceState *dev, Error **errp)
      assert(!vdc->vmsd || !vdc->load);
  
      if (vdc->realize != NULL) {
@@ -7789,7 +7869,7 @@ index d4e4d98..2ab2804 100644
          vdc->realize(dev, &err);
          if (err != NULL) {
              error_propagate(errp, err);
-@@ -2569,6 +3010,12 @@ static void virtio_device_free_virtqueues(VirtIODevice *vdev)
+@@ -2569,6 +3056,12 @@ static void virtio_device_free_virtqueues(VirtIODevice *vdev)
      g_free(vdev->vq);
  }
  
@@ -7802,7 +7882,7 @@ index d4e4d98..2ab2804 100644
  static void virtio_device_instance_finalize(Object *obj)
  {
      VirtIODevice *vdev = VIRTIO_DEVICE(obj);
-@@ -2585,6 +3032,15 @@ static Property virtio_properties[] = {
+@@ -2585,6 +3078,15 @@ static Property virtio_properties[] = {
      DEFINE_PROP_END_OF_LIST(),
  };
  
@@ -7818,7 +7898,7 @@ index d4e4d98..2ab2804 100644
  static int virtio_device_start_ioeventfd_impl(VirtIODevice *vdev)
  {
      VirtioBusState *qbus = VIRTIO_BUS(qdev_get_parent_bus(DEVICE(vdev)));
-@@ -2639,6 +3095,13 @@ assign_error:
+@@ -2639,6 +3141,13 @@ assign_error:
      return err;
  }
  
@@ -7832,7 +7912,7 @@ index d4e4d98..2ab2804 100644
  int virtio_device_start_ioeventfd(VirtIODevice *vdev)
  {
      BusState *qbus = qdev_get_parent_bus(DEVICE(vdev));
-@@ -2697,6 +3160,12 @@ void virtio_device_release_ioeventfd(VirtIODevice *vdev)
+@@ -2697,6 +3206,12 @@ void virtio_device_release_ioeventfd(VirtIODevice *vdev)
      virtio_bus_release_ioeventfd(vbus);
  }
  
@@ -7845,7 +7925,7 @@ index d4e4d98..2ab2804 100644
  static void virtio_device_class_init(ObjectClass *klass, void *data)
  {
      /* Set the default value here. */
-@@ -2707,6 +3176,15 @@ static void virtio_device_class_init(ObjectClass *klass, void *data)
+@@ -2707,6 +3222,15 @@ static void virtio_device_class_init(ObjectClass *klass, void *data)
      dc->unrealize = virtio_device_unrealize;
      dc->bus_type = TYPE_VIRTIO_BUS;
      dc->props = virtio_properties;
@@ -7861,7 +7941,7 @@ index d4e4d98..2ab2804 100644
      vdc->start_ioeventfd = virtio_device_start_ioeventfd_impl;
      vdc->stop_ioeventfd = virtio_device_stop_ioeventfd_impl;
  
-@@ -2733,7 +3211,12 @@ static const TypeInfo virtio_device_info = {
+@@ -2733,7 +3257,12 @@ static const TypeInfo virtio_device_info = {
  
  static void virtio_register_types(void)
  {
