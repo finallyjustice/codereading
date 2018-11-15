@@ -1,6 +1,6 @@
-From e61bc3745044d3c9e14807dd34604e1ef33d8e0b Mon Sep 17 00:00:00 2001
+From 4b944de76985f26ba3122a0dae30345cdabf0276 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang@oracle.com>
-Date: Thu, 15 Nov 2018 16:08:58 +0800
+Date: Fri, 16 Nov 2018 05:49:46 +0800
 Subject: [PATCH 1/1] qemu for 3.0.0
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
@@ -56,7 +56,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  hw/virtio/virtio-pci.c                       |  281 +++++
  hw/virtio/virtio-pci.h                       |   12 +
  hw/virtio/virtio.c                           | 1084 +++++++++++++++++
- include/block/aio.h                          |    9 +
+ include/block/aio.h                          |   33 +
  include/block/block_int.h                    |  165 ++-
  include/exec/cpu-all.h                       |    2 +
  include/exec/memory.h                        |  153 +++
@@ -94,7 +94,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  target/i386/cpu.c                            |   16 +
  target/i386/kvm.c                            |    4 +
  ui/console.c                                 |    6 +
- util/aio-posix.c                             |  117 ++
+ util/aio-posix.c                             |  191 +++
  util/async.c                                 |   46 +
  util/cutils.c                                |   17 +
  util/event_notifier-posix.c                  |   49 +
@@ -104,10 +104,11 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  util/qemu-config.c                           |   95 ++
  util/qemu-option.c                           |   31 +
  util/qemu-thread-posix.c                     |   14 +
+ util/qemu-timer.c                            |   22 +
  util/thread-pool.c                           |    3 +
  util/vfio-helpers.c                          |   58 +
  vl.c                                         |   92 +-
- 102 files changed, 12700 insertions(+), 36 deletions(-)
+ 103 files changed, 12820 insertions(+), 36 deletions(-)
  create mode 100644 data/drive_config_groups.txt
  create mode 100644 data/index.txt
  create mode 100644 data/info_mtree.txt
@@ -12903,7 +12904,7 @@ index d4e4d98..2706f8b 100644
 + */
  type_init(virtio_register_types)
 diff --git a/include/block/aio.h b/include/block/aio.h
-index f08630c..20a906f 100644
+index f08630c..9e04d11 100644
 --- a/include/block/aio.h
 +++ b/include/block/aio.h
 @@ -83,6 +83,15 @@ struct AioContext {
@@ -12922,6 +12923,42 @@ index f08630c..20a906f 100644
      uint32_t notify_me;
  
      /* A lock to protect between QEMUBH and AioHandler adders and deleter,
+@@ -141,11 +150,35 @@ struct AioContext {
+     int64_t poll_shrink;    /* polling time shrink factor */
+ 
+     /* Are we in polling mode or monitoring file descriptors? */
++    /*
++     * 只被poll_set_started()这一个函数修改和使用:
++     *   - util/aio-posix.c|433| <<poll_set_started>> if (started == ctx->poll_started) {
++     *   - util/aio-posix.c|437| <<poll_set_started>> ctx->poll_started = started;
++     */
+     bool poll_started;
+ 
+     /* epoll(7) state used when built with CONFIG_EPOLL */
+     int epollfd;
++    /*
++     * 设置epoll_enabled的地方:
++     *   - util/aio-posix.c|105| <<aio_epoll_disable>> ctx->epoll_enabled = false;
++     *   - util/aio-posix.c|142| <<aio_epoll_try_enable>> ctx->epoll_enabled = true;
++     *
++     * 被以下使用:
++     *   - util/aio-posix.c|158| <<aio_epoll_update>> if (!ctx->epoll_enabled) {
++     *   - util/aio-posix.c|214| <<aio_epoll_enabled>> return !aio_external_disabled(ctx) && ctx->epoll_enabled;
++     */
+     bool epoll_enabled;
++    /*
++     * 被以下设置:
++     *   - util/aio-posix.c|874| <<aio_context_setup>> ctx->epoll_available = true;
++     *   - util/aio-posix.c|872| <<aio_context_setup>> ctx->epoll_available = false;
++     *   - util/aio-posix.c|121| <<aio_epoll_disable>> ctx->epoll_available = false;
++     *
++     * 被以下使用:
++     *   - util/aio-posix.c|118| <<aio_epoll_disable>> if (!ctx->epoll_available) {
++     *   - util/aio-posix.c|238| <<aio_epoll_check_poll>> if (!ctx->epoll_available) {
++     */
+     bool epoll_available;
+ };
+ 
 diff --git a/include/block/block_int.h b/include/block/block_int.h
 index 903b9c1..957f212 100644
 --- a/include/block/block_int.h
@@ -20271,10 +20308,10 @@ index bc58458..b4144cb 100644
  {
      gchar *name;
 diff --git a/util/aio-posix.c b/util/aio-posix.c
-index 118bf57..434c218 100644
+index 118bf57..73a1f59 100644
 --- a/util/aio-posix.c
 +++ b/util/aio-posix.c
-@@ -24,12 +24,59 @@
+@@ -24,12 +24,63 @@
  #include <sys/epoll.h>
  #endif
  
@@ -20330,11 +20367,15 @@ index 118bf57..434c218 100644
 +     * 356         if (fn) {
 +     * 357             fn(node->opaque);
 +     * 358         }
++     *
++     * 只在以下被设置:
++     *   - util/aio-posix.c|387| <<aio_set_fd_poll>> node->io_poll_begin = io_poll_begin;
++     *   - util/aio-posix.c|388| <<aio_set_fd_poll>> node->io_poll_end = io_poll_end;
 +     */
      IOHandler *io_poll_begin;
      IOHandler *io_poll_end;
      int deleted;
-@@ -43,6 +90,12 @@ struct AioHandler
+@@ -43,16 +94,51 @@ struct AioHandler
  /* The fd number threashold to switch to epoll */
  #define EPOLL_ENABLE_THRESHOLD 64
  
@@ -20343,22 +20384,85 @@ index 118bf57..434c218 100644
 + *   - util/aio-posix.c|128| <<aio_epoll_update>> aio_epoll_disable(ctx);
 + *   - util/aio-posix.c|183| <<aio_epoll_check_poll>> aio_epoll_disable(ctx);
 + *   - util/aio-posix.c|746| <<aio_context_destroy>> aio_epoll_disable(ctx);
++ *
++ * 核心思想是把AioContext->epoll_enabled设置成false
++ * 然后根据情况把AioContext->epoll_available设置成false
 + */
  static void aio_epoll_disable(AioContext *ctx)
  {
++   /*
++    * 设置epoll_enabled的地方:
++    * *   - util/aio-posix.c|105| <<aio_epoll_disable>> ctx->epoll_enabled = false;
++    * *   - util/aio-posix.c|142| <<aio_epoll_try_enable>> ctx->epoll_enabled = true;
++    *
++    * 被以下使用:
++    *   - util/aio-posix.c|158| <<aio_epoll_update>> if (!ctx->epoll_enabled) {
++    *   - util/aio-posix.c|214| <<aio_epoll_enabled>> return !aio_external_disabled(ctx) && ctx->epoll_enabled;
++    */
      ctx->epoll_enabled = false;
-@@ -61,6 +114,10 @@ static inline int epoll_events_from_pfd(int pfd_events)
+     if (!ctx->epoll_available) {
+         return;
+     }
++    /*
++     * 被以下设置:
++     *   - util/aio-posix.c|874| <<aio_context_setup>> ctx->epoll_available = true;
++     *   - util/aio-posix.c|872| <<aio_context_setup>> ctx->epoll_available = false;
++     *   - util/aio-posix.c|121| <<aio_epoll_disable>> ctx->epoll_available = false;
++     *
++     * 被以下使用:
++     *   - util/aio-posix.c|118| <<aio_epoll_disable>> if (!ctx->epoll_available) {
++     *   - util/aio-posix.c|238| <<aio_epoll_check_poll>> if (!ctx->epoll_available) {
++     */
+     ctx->epoll_available = false;
+     close(ctx->epollfd);
+ }
+ 
++/*
++ * called by:
++ *   - util/aio-posix.c|157| <<aio_epoll_try_enable>> event.events = epoll_events_from_pfd(node->pfd.events);
++ *   - util/aio-posix.c|193| <<aio_epoll_update>> event.events = epoll_events_from_pfd(node->pfd.events);
++ *
++ * 把GPollFD.events转换成EPOLLIN,EPOLLOUT等等
++ */
+ static inline int epoll_events_from_pfd(int pfd_events)
+ {
+     return (pfd_events & G_IO_IN ? EPOLLIN : 0) |
+@@ -61,6 +147,11 @@ static inline int epoll_events_from_pfd(int pfd_events)
             (pfd_events & G_IO_ERR ? EPOLLERR : 0);
  }
  
 +/*
 + * 核心思想是遍历ctx->aio_handlers上每一个AioHandler
 + * 用EPOLL_CTL_ADD将其挂到ctx->epollfd
++ * 最后设置ctx->epoll_enabled = true
 + */
  static bool aio_epoll_try_enable(AioContext *ctx)
  {
      AioHandler *node;
-@@ -82,6 +139,9 @@ static bool aio_epoll_try_enable(AioContext *ctx)
+@@ -71,6 +162,9 @@ static bool aio_epoll_try_enable(AioContext *ctx)
+         if (node->deleted || !node->pfd.events) {
+             continue;
+         }
++	/*
++	 * 把GPollFD.events转换成EPOLLIN,EPOLLOUT等等
++	 */
+         event.events = epoll_events_from_pfd(node->pfd.events);
+         event.data.ptr = node;
+         r = epoll_ctl(ctx->epollfd, EPOLL_CTL_ADD, node->pfd.fd, &event);
+@@ -78,10 +172,22 @@ static bool aio_epoll_try_enable(AioContext *ctx)
+             return false;
+         }
+     }
++    /*
++     * 设置epoll_enabled的地方:
++     *   - util/aio-posix.c|105| <<aio_epoll_disable>> ctx->epoll_enabled = false;
++     *   - util/aio-posix.c|142| <<aio_epoll_try_enable>> ctx->epoll_enabled = true;
++     *
++     * 被以下使用:
++     *   - util/aio-posix.c|158| <<aio_epoll_update>> if (!ctx->epoll_enabled) {
++     *   - util/aio-posix.c|214| <<aio_epoll_enabled>> return !aio_external_disabled(ctx) && ctx->epoll_enabled;
++     */
+     ctx->epoll_enabled = true;
      return true;
  }
  
@@ -20368,7 +20472,24 @@ index 118bf57..434c218 100644
  static void aio_epoll_update(AioContext *ctx, AioHandler *node, bool is_new)
  {
      struct epoll_event event;
-@@ -105,6 +165,10 @@ static void aio_epoll_update(AioContext *ctx, AioHandler *node, bool is_new)
+@@ -95,16 +201,27 @@ static void aio_epoll_update(AioContext *ctx, AioHandler *node, bool is_new)
+         ctl = EPOLL_CTL_DEL;
+     } else {
+         event.data.ptr = node;
++	/*
++	 * 把GPollFD.events转换成EPOLLIN,EPOLLOUT等等
++	 */
+         event.events = epoll_events_from_pfd(node->pfd.events);
+         ctl = is_new ? EPOLL_CTL_ADD : EPOLL_CTL_MOD;
+     }
+ 
+     r = epoll_ctl(ctx->epollfd, ctl, node->pfd.fd, &event);
+     if (r) {
++        /*
++	 * 核心思想是把AioContext->epoll_enabled设置成false
++	 * 然后根据情况把AioContext->epoll_available设置成false
++	 */
+         aio_epoll_disable(ctx);
      }
  }
  
@@ -20379,7 +20500,7 @@ index 118bf57..434c218 100644
  static int aio_epoll(AioContext *ctx, GPollFD *pfds,
                       unsigned npfd, int64_t timeout)
  {
-@@ -187,6 +251,13 @@ static bool aio_epoll_check_poll(AioContext *ctx, GPollFD *pfds,
+@@ -187,6 +304,13 @@ static bool aio_epoll_check_poll(AioContext *ctx, GPollFD *pfds,
  
  #endif
  
@@ -20393,7 +20514,7 @@ index 118bf57..434c218 100644
  static AioHandler *find_aio_handler(AioContext *ctx, int fd)
  {
      AioHandler *node;
-@@ -200,6 +271,19 @@ static AioHandler *find_aio_handler(AioContext *ctx, int fd)
+@@ -200,6 +324,19 @@ static AioHandler *find_aio_handler(AioContext *ctx, int fd)
      return NULL;
  }
  
@@ -20413,7 +20534,7 @@ index 118bf57..434c218 100644
  void aio_set_fd_handler(AioContext *ctx,
                          int fd,
                          bool is_external,
-@@ -214,9 +298,13 @@ void aio_set_fd_handler(AioContext *ctx,
+@@ -214,9 +351,13 @@ void aio_set_fd_handler(AioContext *ctx,
  
      qemu_lockcnt_lock(&ctx->list_lock);
  
@@ -20427,7 +20548,7 @@ index 118bf57..434c218 100644
      if (!io_read && !io_write && !io_poll) {
          if (node == NULL) {
              qemu_lockcnt_unlock(&ctx->list_lock);
-@@ -255,11 +343,13 @@ void aio_set_fd_handler(AioContext *ctx,
+@@ -255,11 +396,13 @@ void aio_set_fd_handler(AioContext *ctx,
              node->pfd.fd = fd;
              QLIST_INSERT_HEAD_RCU(&ctx->aio_handlers, node, node);
  
@@ -20441,7 +20562,7 @@ index 118bf57..434c218 100644
              ctx->poll_disable_cnt += !io_poll - !node->io_poll;
          }
  
-@@ -274,6 +364,7 @@ void aio_set_fd_handler(AioContext *ctx,
+@@ -274,6 +417,7 @@ void aio_set_fd_handler(AioContext *ctx,
          node->pfd.events |= (io_write ? G_IO_OUT | G_IO_ERR : 0);
      }
  
@@ -20449,7 +20570,7 @@ index 118bf57..434c218 100644
      aio_epoll_update(ctx, node, is_new);
      qemu_lockcnt_unlock(&ctx->list_lock);
      aio_notify(ctx);
-@@ -303,6 +394,18 @@ void aio_set_event_notifier(AioContext *ctx,
+@@ -303,6 +447,18 @@ void aio_set_event_notifier(AioContext *ctx,
                              EventNotifierHandler *io_read,
                              AioPollFn *io_poll)
  {
@@ -20468,7 +20589,46 @@ index 118bf57..434c218 100644
      aio_set_fd_handler(ctx, event_notifier_get_fd(notifier), is_external,
                         (IOHandler *)io_read, NULL, io_poll, notifier);
  }
-@@ -573,6 +676,17 @@ static bool try_poll_mode(AioContext *ctx, bool blocking)
+@@ -317,10 +473,26 @@ void aio_set_event_notifier_poll(AioContext *ctx,
+                     (IOHandler *)io_poll_end);
+ }
+ 
++/*
++ * called by:
++ *   - util/aio-posix.c|458| <<aio_prepare>> poll_set_started(ctx, false);
++ *   - util/aio-posix.c|663| <<try_poll_mode>> poll_set_started(ctx, true);
++ *   - util/aio-posix.c|671| <<try_poll_mode>> poll_set_started(ctx, false);
++ *
++ * 根据参数started,如果started和ctx->poll_started一样则什么不干直接退出
++ * 否则,设置ctx->poll_started = started
++ * 遍历AioContext->aio_handlers的每个AioHandler,
++ * 如果started==true调用其io_poll_begin,否则调用io_poll_end
++ */
+ static void poll_set_started(AioContext *ctx, bool started)
+ {
+     AioHandler *node;
+ 
++    /*
++     * poll_started只被poll_set_started()这一个函数修改和使用:
++     *   - util/aio-posix.c|433| <<poll_set_started>> if (started == ctx->poll_started) {
++     *   - util/aio-posix.c|437| <<poll_set_started>> ctx->poll_started = started;
++     */
+     if (started == ctx->poll_started) {
+         return;
+     }
+@@ -335,6 +507,11 @@ static void poll_set_started(AioContext *ctx, bool started)
+             continue;
+         }
+ 
++	/*
++	 * 只在以下被设置:
++	 *   - util/aio-posix.c|387| <<aio_set_fd_poll>> node->io_poll_begin = io_poll_begin;
++	 *   - util/aio-posix.c|388| <<aio_set_fd_poll>> node->io_poll_end = io_poll_end;
++	 */
+         if (started) {
+             fn = node->io_poll_begin;
+         } else {
+@@ -573,6 +750,17 @@ static bool try_poll_mode(AioContext *ctx, bool blocking)
      return run_poll_handlers_once(ctx);
  }
  
@@ -20486,7 +20646,7 @@ index 118bf57..434c218 100644
  bool aio_poll(AioContext *ctx, bool blocking)
  {
      AioHandler *node;
-@@ -590,6 +704,9 @@ bool aio_poll(AioContext *ctx, bool blocking)
+@@ -590,6 +778,9 @@ bool aio_poll(AioContext *ctx, bool blocking)
       * so disable the optimization now.
       */
      if (blocking) {
@@ -21157,6 +21317,39 @@ index dfa66ff..409e22d 100644
  void qemu_thread_create(QemuThread *thread, const char *name,
                         void *(*start_routine)(void*),
                         void *arg, int mode)
+diff --git a/util/qemu-timer.c b/util/qemu-timer.c
+index 86bfe84..f0d518a 100644
+--- a/util/qemu-timer.c
++++ b/util/qemu-timer.c
+@@ -334,6 +334,28 @@ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
+         return ppoll((struct pollfd *)fds, nfds, &ts, NULL);
+     }
+ #else
++    /*
++     * Polls fds, as with the poll() system call, but portably. (On systems
++     * that don't have poll(), it is emulated using select().) This is used
++     * internally by GMainContext, but it can be called directly if you
++     * need to block until a file descriptor is ready, but don't want to
++     * run the full main loop.
++     *
++     * Each element of fds is a GPollFD describing a single file descriptor
++     * to poll. The fd field indicates the file descriptor, and the events
++     * field indicates the events to poll for. On return, the revents
++     * fields will be filled with the events that actually occurred.
++     *
++     * On POSIX systems, the file descriptors in fds can be any sort of
++     * file descriptor, but the situation is much more complicated on
++     * Windows. If you need to use g_poll() in code that has to run on
++     * Windows, the easiest solution is to construct all of your GPollFDs
++     * with g_io_channel_win32_make_pollfd()
++     *
++     * Returns the number of entries in fds whose revents fields were
++     * filled in, or 0 if the operation timed out, or -1 on error or if the
++     * call was interrupted.
++     */
+     return g_poll(fds, nfds, qemu_timeout_ns_to_ms(timeout));
+ #endif
+ }
 diff --git a/util/thread-pool.c b/util/thread-pool.c
 index 610646d..62f6e3d 100644
 --- a/util/thread-pool.c
