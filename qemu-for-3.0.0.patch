@@ -1,6 +1,6 @@
-From 4b944de76985f26ba3122a0dae30345cdabf0276 Mon Sep 17 00:00:00 2001
+From b18357fb988fd9d4b505022d4bb89e61327ba5bf Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang@oracle.com>
-Date: Fri, 16 Nov 2018 05:49:46 +0800
+Date: Fri, 16 Nov 2018 16:07:51 +0800
 Subject: [PATCH 1/1] qemu for 3.0.0
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
@@ -56,7 +56,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  hw/virtio/virtio-pci.c                       |  281 +++++
  hw/virtio/virtio-pci.h                       |   12 +
  hw/virtio/virtio.c                           | 1084 +++++++++++++++++
- include/block/aio.h                          |   33 +
+ include/block/aio.h                          |   55 +
  include/block/block_int.h                    |  165 ++-
  include/exec/cpu-all.h                       |    2 +
  include/exec/memory.h                        |  153 +++
@@ -94,7 +94,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  target/i386/cpu.c                            |   16 +
  target/i386/kvm.c                            |    4 +
  ui/console.c                                 |    6 +
- util/aio-posix.c                             |  191 +++
+ util/aio-posix.c                             |  211 ++++
  util/async.c                                 |   46 +
  util/cutils.c                                |   17 +
  util/event_notifier-posix.c                  |   49 +
@@ -104,11 +104,11 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  util/qemu-config.c                           |   95 ++
  util/qemu-option.c                           |   31 +
  util/qemu-thread-posix.c                     |   14 +
- util/qemu-timer.c                            |   22 +
+ util/qemu-timer.c                            |   29 +
  util/thread-pool.c                           |    3 +
  util/vfio-helpers.c                          |   58 +
  vl.c                                         |   92 +-
- 103 files changed, 12820 insertions(+), 36 deletions(-)
+ 103 files changed, 12869 insertions(+), 36 deletions(-)
  create mode 100644 data/drive_config_groups.txt
  create mode 100644 data/index.txt
  create mode 100644 data/info_mtree.txt
@@ -12904,7 +12904,7 @@ index d4e4d98..2706f8b 100644
 + */
  type_init(virtio_register_types)
 diff --git a/include/block/aio.h b/include/block/aio.h
-index f08630c..9e04d11 100644
+index f08630c..e792bd0 100644
 --- a/include/block/aio.h
 +++ b/include/block/aio.h
 @@ -83,6 +83,15 @@ struct AioContext {
@@ -12923,7 +12923,25 @@ index f08630c..9e04d11 100644
      uint32_t notify_me;
  
      /* A lock to protect between QEMUBH and AioHandler adders and deleter,
-@@ -141,11 +150,35 @@ struct AioContext {
+@@ -129,6 +138,17 @@ struct AioContext {
+      */
+     QEMUTimerListGroup tlg;
+ 
++    /*
++     * 增加的地方:
++     *   - include/block/aio.h|482| <<aio_disable_external>> atomic_inc(&ctx->external_disable_cnt);
++     *
++     * 减少的地方:
++     *   - include/block/aio.h|495| <<aio_enable_external>> old = atomic_fetch_dec(&ctx->external_disable_cnt);
++     *
++     * 使用的地方:
++     *   - include/block/aio.h|511| <<aio_external_disabled>> return atomic_read(&ctx->external_disable_cnt);
++     *   - include/block/aio.h|524| <<aio_node_check>> return !is_external || !atomic_read(&ctx->external_disable_cnt);
++     */
+     int external_disable_cnt;
+ 
+     /* Number of AioHandlers without .io_poll() */
+@@ -141,11 +161,35 @@ struct AioContext {
      int64_t poll_shrink;    /* polling time shrink factor */
  
      /* Are we in polling mode or monitoring file descriptors? */
@@ -12958,6 +12976,24 @@ index f08630c..9e04d11 100644
 +     */
      bool epoll_available;
  };
+ 
+@@ -475,6 +519,17 @@ static inline void aio_enable_external(AioContext *ctx)
+  */
+ static inline bool aio_external_disabled(AioContext *ctx)
+ {
++    /*
++     * 增加的地方:
++     *   - include/block/aio.h|482| <<aio_disable_external>> atomic_inc(&ctx->external_disable_cnt);
++     *
++     * 减少的地方:
++     *   - include/block/aio.h|495| <<aio_enable_external>> old = atomic_fetch_dec(&ctx->external_disable_cnt);
++     *
++     * 使用的地方:
++     *   - include/block/aio.h|511| <<aio_external_disabled>> return atomic_read(&ctx->external_disable_cnt);
++     *   - include/block/aio.h|524| <<aio_node_check>> return !is_external || !atomic_read(&ctx->external_disable_cnt);
++     */
+     return atomic_read(&ctx->external_disable_cnt);
+ }
  
 diff --git a/include/block/block_int.h b/include/block/block_int.h
 index 903b9c1..957f212 100644
@@ -20308,7 +20344,7 @@ index bc58458..b4144cb 100644
  {
      gchar *name;
 diff --git a/util/aio-posix.c b/util/aio-posix.c
-index 118bf57..73a1f59 100644
+index 118bf57..4e226e7 100644
 --- a/util/aio-posix.c
 +++ b/util/aio-posix.c
 @@ -24,12 +24,63 @@
@@ -20500,7 +20536,28 @@ index 118bf57..73a1f59 100644
  static int aio_epoll(AioContext *ctx, GPollFD *pfds,
                       unsigned npfd, int64_t timeout)
  {
-@@ -187,6 +304,13 @@ static bool aio_epoll_check_poll(AioContext *ctx, GPollFD *pfds,
+@@ -115,9 +232,20 @@ static int aio_epoll(AioContext *ctx, GPollFD *pfds,
+     assert(npfd == 1);
+     assert(pfds[0].fd == ctx->epollfd);
+     if (timeout > 0) {
++        /*
++	 * 这里应该是判断有没有事件
++	 */
+         ret = qemu_poll_ns(pfds, npfd, timeout);
+     }
+     if (timeout <= 0 || ret > 0) {
++        /*
++	 * The  epoll_wait()  system  call waits for events on the epoll(7)
++	 * instance referred to by the file descriptor epfd.  The memory area
++	 * pointed to by events will contain the events that will be available
++	 * for the caller.
++	 *
++	 * 这里应该是判断哪一个事件???
++	 */
+         ret = epoll_wait(ctx->epollfd, events,
+                          ARRAY_SIZE(events),
+                          timeout);
+@@ -187,6 +315,13 @@ static bool aio_epoll_check_poll(AioContext *ctx, GPollFD *pfds,
  
  #endif
  
@@ -20514,7 +20571,7 @@ index 118bf57..73a1f59 100644
  static AioHandler *find_aio_handler(AioContext *ctx, int fd)
  {
      AioHandler *node;
-@@ -200,6 +324,19 @@ static AioHandler *find_aio_handler(AioContext *ctx, int fd)
+@@ -200,6 +335,19 @@ static AioHandler *find_aio_handler(AioContext *ctx, int fd)
      return NULL;
  }
  
@@ -20534,7 +20591,7 @@ index 118bf57..73a1f59 100644
  void aio_set_fd_handler(AioContext *ctx,
                          int fd,
                          bool is_external,
-@@ -214,9 +351,13 @@ void aio_set_fd_handler(AioContext *ctx,
+@@ -214,9 +362,13 @@ void aio_set_fd_handler(AioContext *ctx,
  
      qemu_lockcnt_lock(&ctx->list_lock);
  
@@ -20548,7 +20605,7 @@ index 118bf57..73a1f59 100644
      if (!io_read && !io_write && !io_poll) {
          if (node == NULL) {
              qemu_lockcnt_unlock(&ctx->list_lock);
-@@ -255,11 +396,13 @@ void aio_set_fd_handler(AioContext *ctx,
+@@ -255,11 +407,13 @@ void aio_set_fd_handler(AioContext *ctx,
              node->pfd.fd = fd;
              QLIST_INSERT_HEAD_RCU(&ctx->aio_handlers, node, node);
  
@@ -20562,7 +20619,7 @@ index 118bf57..73a1f59 100644
              ctx->poll_disable_cnt += !io_poll - !node->io_poll;
          }
  
-@@ -274,6 +417,7 @@ void aio_set_fd_handler(AioContext *ctx,
+@@ -274,6 +428,7 @@ void aio_set_fd_handler(AioContext *ctx,
          node->pfd.events |= (io_write ? G_IO_OUT | G_IO_ERR : 0);
      }
  
@@ -20570,7 +20627,7 @@ index 118bf57..73a1f59 100644
      aio_epoll_update(ctx, node, is_new);
      qemu_lockcnt_unlock(&ctx->list_lock);
      aio_notify(ctx);
-@@ -303,6 +447,18 @@ void aio_set_event_notifier(AioContext *ctx,
+@@ -303,6 +458,18 @@ void aio_set_event_notifier(AioContext *ctx,
                              EventNotifierHandler *io_read,
                              AioPollFn *io_poll)
  {
@@ -20589,7 +20646,7 @@ index 118bf57..73a1f59 100644
      aio_set_fd_handler(ctx, event_notifier_get_fd(notifier), is_external,
                         (IOHandler *)io_read, NULL, io_poll, notifier);
  }
-@@ -317,10 +473,26 @@ void aio_set_event_notifier_poll(AioContext *ctx,
+@@ -317,10 +484,26 @@ void aio_set_event_notifier_poll(AioContext *ctx,
                      (IOHandler *)io_poll_end);
  }
  
@@ -20616,7 +20673,7 @@ index 118bf57..73a1f59 100644
      if (started == ctx->poll_started) {
          return;
      }
-@@ -335,6 +507,11 @@ static void poll_set_started(AioContext *ctx, bool started)
+@@ -335,6 +518,11 @@ static void poll_set_started(AioContext *ctx, bool started)
              continue;
          }
  
@@ -20628,7 +20685,18 @@ index 118bf57..73a1f59 100644
          if (started) {
              fn = node->io_poll_begin;
          } else {
-@@ -573,6 +750,17 @@ static bool try_poll_mode(AioContext *ctx, bool blocking)
+@@ -549,6 +737,10 @@ static bool run_poll_handlers(AioContext *ctx, int64_t max_ns)
+  *
+  * Returns: true if progress was made, false otherwise
+  */
++/*
++ * 只被以下调用:
++ *   - util/aio-posix.c|793| <<aio_poll>> progress = try_poll_mode(ctx, blocking);
++ */
+ static bool try_poll_mode(AioContext *ctx, bool blocking)
+ {
+     if (blocking && ctx->poll_max_ns && ctx->poll_disable_cnt == 0) {
+@@ -573,6 +765,17 @@ static bool try_poll_mode(AioContext *ctx, bool blocking)
      return run_poll_handlers_once(ctx);
  }
  
@@ -20646,7 +20714,7 @@ index 118bf57..73a1f59 100644
  bool aio_poll(AioContext *ctx, bool blocking)
  {
      AioHandler *node;
-@@ -590,6 +778,9 @@ bool aio_poll(AioContext *ctx, bool blocking)
+@@ -590,6 +793,9 @@ bool aio_poll(AioContext *ctx, bool blocking)
       * so disable the optimization now.
       */
      if (blocking) {
@@ -20656,6 +20724,18 @@ index 118bf57..73a1f59 100644
          atomic_add(&ctx->notify_me, 2);
      }
  
+@@ -720,6 +926,11 @@ void aio_context_destroy(AioContext *ctx)
+ #endif
+ }
+ 
++/*
++ * called by:
++ *   - iothread.c|251| <<iothread_complete>> aio_context_set_poll_params(iothread->ctx,
++ *   - iothread.c|338| <<iothread_set_poll_param>> aio_context_set_poll_params(iothread->ctx,
++ */
+ void aio_context_set_poll_params(AioContext *ctx, int64_t max_ns,
+                                  int64_t grow, int64_t shrink, Error **errp)
+ {
 diff --git a/util/async.c b/util/async.c
 index 05979f8..30e2fdc 100644
 --- a/util/async.c
@@ -21318,10 +21398,20 @@ index dfa66ff..409e22d 100644
                         void *(*start_routine)(void*),
                         void *arg, int mode)
 diff --git a/util/qemu-timer.c b/util/qemu-timer.c
-index 86bfe84..f0d518a 100644
+index 86bfe84..ad009c8 100644
 --- a/util/qemu-timer.c
 +++ b/util/qemu-timer.c
-@@ -334,6 +334,28 @@ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
+@@ -331,9 +331,38 @@ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
+         }
+         ts.tv_sec = tvsec;
+         ts.tv_nsec = timeout % 1000000000LL;
++	/*
++	 * On success, a positive number is returned; this is the number of
++	 * structures which have nonzero revents fields (in other words,
++	 * those descriptors with events or errors reported).  A value of 0
++	 * indicates that the call timed out and no file descriptors were
++	 * ready.  On error, -1 is returned, and errno is set appropriately.
++	 */
          return ppoll((struct pollfd *)fds, nfds, &ts, NULL);
      }
  #else
