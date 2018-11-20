@@ -1,6 +1,6 @@
-From 8cb8e8dcddce45f21f9ba11472cb9f0d58ac0897 Mon Sep 17 00:00:00 2001
+From 7d95d9997fc58d8f60910f5b47613b753043e1c2 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang@oracle.com>
-Date: Sun, 18 Nov 2018 22:10:23 +0800
+Date: Tue, 20 Nov 2018 13:15:20 +0800
 Subject: [PATCH 1/1] qemu for 3.0.0
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
@@ -79,7 +79,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  include/sysemu/accel.h                       |    1 +
  include/sysemu/iothread.h                    |   14 +
  include/sysemu/kvm_int.h                     |    1 +
- iothread.c                                   |  180 +++
+ iothread.c                                   |  189 +++
  linux-headers/linux/kvm.h                    |    4 +
  memory.c                                     | 1040 +++++++++++++++-
  migration/migration.c                        |   32 +
@@ -94,21 +94,22 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  target/i386/cpu.c                            |   16 +
  target/i386/kvm.c                            |    4 +
  ui/console.c                                 |    6 +
- util/aio-posix.c                             |  697 +++++++++++
- util/async.c                                 |   74 ++
+ util/aio-posix.c                             |  734 ++++++++++++
+ util/async.c                                 |  125 ++
  util/cutils.c                                |   17 +
  util/event_notifier-posix.c                  |   49 +
- util/iohandler.c                             |   18 +
- util/main-loop.c                             |    4 +
+ util/iohandler.c                             |   33 +
+ util/main-loop.c                             |  262 ++++
  util/module.c                                |   59 +-
  util/qemu-config.c                           |   95 ++
  util/qemu-option.c                           |   31 +
  util/qemu-thread-posix.c                     |   14 +
  util/qemu-timer.c                            |   29 +
+ util/rcu.c                                   |    5 +
  util/thread-pool.c                           |    3 +
  util/vfio-helpers.c                          |   58 +
  vl.c                                         |   92 +-
- 103 files changed, 13476 insertions(+), 36 deletions(-)
+ 104 files changed, 13851 insertions(+), 36 deletions(-)
  create mode 100644 data/drive_config_groups.txt
  create mode 100644 data/index.txt
  create mode 100644 data/info_mtree.txt
@@ -14644,7 +14645,7 @@ index f838412..7be68df 100644
  
  #define KVM_STATE(obj) \
 diff --git a/iothread.c b/iothread.c
-index aff1281..010b73c 100644
+index aff1281..bfbe06a 100644
 --- a/iothread.c
 +++ b/iothread.c
 @@ -24,6 +24,15 @@
@@ -14909,7 +14910,23 @@ index aff1281..010b73c 100644
  static gpointer iothread_g_main_context_init(gpointer opaque)
  {
      AioContext *ctx;
-@@ -352,17 +494,46 @@ static gpointer iothread_g_main_context_init(gpointer opaque)
+@@ -345,6 +487,15 @@ static gpointer iothread_g_main_context_init(gpointer opaque)
+ 
+     ctx = iothread_get_aio_context(iothread);
+     source = aio_get_g_source(ctx);
++    /*
++     * guint
++     * g_source_attach (GSource *source,
++     *                  GMainContext *context);
++     *
++     * Adds a GSource to a context so that it will be executed within that
++     * context. Remove it by calling g_source_destroy().
++     * Returns the ID (greater than 0) for the source within the GMainContext. 
++     */
+     g_source_attach(source, iothread->worker_context);
+     g_source_unref(source);
+ 
+@@ -352,17 +503,46 @@ static gpointer iothread_g_main_context_init(gpointer opaque)
      return NULL;
  }
  
@@ -14956,7 +14973,7 @@ index aff1281..010b73c 100644
      obj = object_new_with_props(TYPE_IOTHREAD,
                                  object_get_internal_root(),
                                  id, errp, NULL);
-@@ -370,6 +541,11 @@ IOThread *iothread_create(const char *id, Error **errp)
+@@ -370,6 +550,11 @@ IOThread *iothread_create(const char *id, Error **errp)
      return IOTHREAD(obj);
  }
  
@@ -14968,7 +14985,7 @@ index aff1281..010b73c 100644
  void iothread_destroy(IOThread *iothread)
  {
      object_unparent(OBJECT(iothread));
-@@ -377,6 +553,10 @@ void iothread_destroy(IOThread *iothread)
+@@ -377,6 +562,10 @@ void iothread_destroy(IOThread *iothread)
  
  /* Lookup IOThread by its id.  Only finds user-created objects, not internal
   * iothread_create() objects. */
@@ -20481,10 +20498,10 @@ index bc58458..b4144cb 100644
  {
      gchar *name;
 diff --git a/util/aio-posix.c b/util/aio-posix.c
-index 118bf57..18a3fab 100644
+index 118bf57..a3acdb4 100644
 --- a/util/aio-posix.c
 +++ b/util/aio-posix.c
-@@ -24,16 +24,123 @@
+@@ -24,16 +24,141 @@
  #include <sys/epoll.h>
  #endif
  
@@ -20603,12 +20620,30 @@ index 118bf57..18a3fab 100644
 +     * 只在如下被设置:
 +     *   - util/aio-posix.c|451| <<aio_set_fd_handler>> node->is_external = is_external;
 +     *
++     * aio_set_fd_handler()被以下调用:
++     *   - util/aio-posix.c|507| <<aio_set_event_notifier>> aio_set_fd_handler(ctx, event_notifier_get_fd(notifier), is_external,
++     *                                                                         (IOHandler *)io_read, NULL, io_poll, notifier);
++     *   - util/iohandler.c|74| <<qemu_set_fd_handler>> aio_set_fd_handler(iohandler_ctx, fd, false,
++     *                                                                     fd_read, fd_write, NULL, opaque);
++     *
++     * 用qemu_set_fd_handler()的is_external是false
++     *
++     *  77 void qemu_set_fd_handler(int fd,
++     *  78                          IOHandler *fd_read,
++     *  79                          IOHandler *fd_write,
++     *  80                          void *opaque)
++     *  81 {
++     *  82     iohandler_init();
++     *  83     aio_set_fd_handler(iohandler_ctx, fd, false,
++     *  84                        fd_read, fd_write, NULL, opaque);
++     *  85 }
++     *
 +     * 好像主要被aio_node_check()检查
 +     */
      bool is_external;
      QLIST_ENTRY(AioHandler) node;
  };
-@@ -43,16 +150,60 @@ struct AioHandler
+@@ -43,16 +168,60 @@ struct AioHandler
  /* The fd number threashold to switch to epoll */
  #define EPOLL_ENABLE_THRESHOLD 64
  
@@ -20669,7 +20704,7 @@ index 118bf57..18a3fab 100644
  static inline int epoll_events_from_pfd(int pfd_events)
  {
      return (pfd_events & G_IO_IN ? EPOLLIN : 0) |
-@@ -61,33 +212,79 @@ static inline int epoll_events_from_pfd(int pfd_events)
+@@ -61,33 +230,79 @@ static inline int epoll_events_from_pfd(int pfd_events)
             (pfd_events & G_IO_ERR ? EPOLLERR : 0);
  }
  
@@ -20749,7 +20784,7 @@ index 118bf57..18a3fab 100644
      if (!ctx->epoll_enabled) {
          return;
      }
-@@ -95,29 +292,68 @@ static void aio_epoll_update(AioContext *ctx, AioHandler *node, bool is_new)
+@@ -95,29 +310,68 @@ static void aio_epoll_update(AioContext *ctx, AioHandler *node, bool is_new)
          ctl = EPOLL_CTL_DEL;
      } else {
          event.data.ptr = node;
@@ -20818,7 +20853,7 @@ index 118bf57..18a3fab 100644
          ret = epoll_wait(ctx->epollfd, events,
                           ARRAY_SIZE(events),
                           timeout);
-@@ -137,25 +373,75 @@ out:
+@@ -137,25 +391,75 @@ out:
      return ret;
  }
  
@@ -20894,7 +20929,7 @@ index 118bf57..18a3fab 100644
              aio_epoll_disable(ctx);
          }
      }
-@@ -187,6 +473,13 @@ static bool aio_epoll_check_poll(AioContext *ctx, GPollFD *pfds,
+@@ -187,6 +491,13 @@ static bool aio_epoll_check_poll(AioContext *ctx, GPollFD *pfds,
  
  #endif
  
@@ -20908,7 +20943,7 @@ index 118bf57..18a3fab 100644
  static AioHandler *find_aio_handler(AioContext *ctx, int fd)
  {
      AioHandler *node;
-@@ -200,6 +493,29 @@ static AioHandler *find_aio_handler(AioContext *ctx, int fd)
+@@ -200,6 +511,29 @@ static AioHandler *find_aio_handler(AioContext *ctx, int fd)
      return NULL;
  }
  
@@ -20938,7 +20973,7 @@ index 118bf57..18a3fab 100644
  void aio_set_fd_handler(AioContext *ctx,
                          int fd,
                          bool is_external,
-@@ -214,9 +530,13 @@ void aio_set_fd_handler(AioContext *ctx,
+@@ -214,9 +548,13 @@ void aio_set_fd_handler(AioContext *ctx,
  
      qemu_lockcnt_lock(&ctx->list_lock);
  
@@ -20952,11 +20987,17 @@ index 118bf57..18a3fab 100644
      if (!io_read && !io_write && !io_poll) {
          if (node == NULL) {
              qemu_lockcnt_unlock(&ctx->list_lock);
-@@ -255,11 +575,13 @@ void aio_set_fd_handler(AioContext *ctx,
+@@ -255,11 +593,19 @@ void aio_set_fd_handler(AioContext *ctx,
              node->pfd.fd = fd;
              QLIST_INSERT_HEAD_RCU(&ctx->aio_handlers, node, node);
  
-+	    /* 重要!!! 把fd挂到ctx->source */
++	    /*
++	     * 重要!!! 把fd挂到ctx->source
++	     *
++	     * 在glib: source->poll_fds = g_slist_prepend (source->poll_fds, fd);
++	     *
++	     * node->pfd是GPollFD
++	     */
              g_source_add_poll(&ctx->source, &node->pfd);
              is_new = true;
  
@@ -20966,7 +21007,7 @@ index 118bf57..18a3fab 100644
              ctx->poll_disable_cnt += !io_poll - !node->io_poll;
          }
  
-@@ -274,6 +596,12 @@ void aio_set_fd_handler(AioContext *ctx,
+@@ -274,6 +620,12 @@ void aio_set_fd_handler(AioContext *ctx,
          node->pfd.events |= (io_write ? G_IO_OUT | G_IO_ERR : 0);
      }
  
@@ -20979,7 +21020,7 @@ index 118bf57..18a3fab 100644
      aio_epoll_update(ctx, node, is_new);
      qemu_lockcnt_unlock(&ctx->list_lock);
      aio_notify(ctx);
-@@ -283,6 +611,10 @@ void aio_set_fd_handler(AioContext *ctx,
+@@ -283,6 +635,10 @@ void aio_set_fd_handler(AioContext *ctx,
      }
  }
  
@@ -20990,7 +21031,7 @@ index 118bf57..18a3fab 100644
  void aio_set_fd_poll(AioContext *ctx, int fd,
                       IOHandler *io_poll_begin,
                       IOHandler *io_poll_end)
-@@ -297,16 +629,49 @@ void aio_set_fd_poll(AioContext *ctx, int fd,
+@@ -297,16 +653,52 @@ void aio_set_fd_poll(AioContext *ctx, int fd,
      node->io_poll_end = io_poll_end;
  }
  
@@ -21026,6 +21067,9 @@ index 118bf57..18a3fab 100644
 +     * is_external = true
 +     * io_read = virtio_queue_host_notifier_aio_read
 +     * io_poll = virtio_queue_host_notifier_aio_poll
++     *
++     * !!! aio_set_fd_handler()-->aio_epoll_update()的时候如果ctx->epoll_enabled支持,则把fd添加到ctx->epollfd
++     * 在aio_epoll_check_poll()只有npfd >= EPOLL_ENABLE_THRESHOLD时才会试着用aio_epoll_try_enable()激活epoll_enabled
 +     */
      aio_set_fd_handler(ctx, event_notifier_get_fd(notifier), is_external,
                         (IOHandler *)io_read, NULL, io_poll, notifier);
@@ -21040,7 +21084,7 @@ index 118bf57..18a3fab 100644
  void aio_set_event_notifier_poll(AioContext *ctx,
                                   EventNotifier *notifier,
                                   EventNotifierHandler *io_poll_begin,
-@@ -317,14 +682,35 @@ void aio_set_event_notifier_poll(AioContext *ctx,
+@@ -317,14 +709,35 @@ void aio_set_event_notifier_poll(AioContext *ctx,
                      (IOHandler *)io_poll_end);
  }
  
@@ -21076,7 +21120,7 @@ index 118bf57..18a3fab 100644
      ctx->poll_started = started;
  
      qemu_lockcnt_inc(&ctx->list_lock);
-@@ -335,6 +721,11 @@ static void poll_set_started(AioContext *ctx, bool started)
+@@ -335,6 +748,11 @@ static void poll_set_started(AioContext *ctx, bool started)
              continue;
          }
  
@@ -21088,7 +21132,7 @@ index 118bf57..18a3fab 100644
          if (started) {
              fn = node->io_poll_begin;
          } else {
-@@ -349,6 +740,10 @@ static void poll_set_started(AioContext *ctx, bool started)
+@@ -349,6 +767,10 @@ static void poll_set_started(AioContext *ctx, bool started)
  }
  
  
@@ -21099,7 +21143,7 @@ index 118bf57..18a3fab 100644
  bool aio_prepare(AioContext *ctx)
  {
      /* Poll mode cannot be used with glib's event loop, disable it. */
-@@ -357,6 +752,10 @@ bool aio_prepare(AioContext *ctx)
+@@ -357,6 +779,10 @@ bool aio_prepare(AioContext *ctx)
      return false;
  }
  
@@ -21110,7 +21154,27 @@ index 118bf57..18a3fab 100644
  bool aio_pending(AioContext *ctx)
  {
      AioHandler *node;
-@@ -388,14 +787,35 @@ bool aio_pending(AioContext *ctx)
+@@ -368,9 +794,19 @@ bool aio_pending(AioContext *ctx)
+      */
+     qemu_lockcnt_inc(&ctx->list_lock);
+ 
++    /*
++     * ctx->aio_handlers只被如下修改:
++     *   -  util/aio-posix.c|521| <<aio_set_fd_handler>> QLIST_INSERT_HEAD_RCU(&ctx->aio_handlers, node, node);
++     */
+     QLIST_FOREACH_RCU(node, &ctx->aio_handlers, node) {
+         int revents;
+ 
++        /*
++	 * node->pfd是GPollFD类型
++	 *
++	 * 在aio_set_fd_handler()调用g_source_add_poll(&ctx->source, &node->pfd);, node->pfd是GPollFD
++	 * 所以GSource可以识别GPollFD为我们设置GPollFD的结果
++	 */
+         revents = node->pfd.revents & node->pfd.events;
+         if (revents & (G_IO_IN | G_IO_HUP | G_IO_ERR) && node->io_read &&
+             aio_node_check(ctx, node->is_external)) {
+@@ -388,14 +824,35 @@ bool aio_pending(AioContext *ctx)
      return result;
  }
  
@@ -21146,7 +21210,7 @@ index 118bf57..18a3fab 100644
          revents = node->pfd.revents & node->pfd.events;
          node->pfd.revents = 0;
  
-@@ -430,6 +850,10 @@ static bool aio_dispatch_handlers(AioContext *ctx)
+@@ -430,6 +887,10 @@ static bool aio_dispatch_handlers(AioContext *ctx)
      return progress;
  }
  
@@ -21157,7 +21221,7 @@ index 118bf57..18a3fab 100644
  void aio_dispatch(AioContext *ctx)
  {
      qemu_lockcnt_inc(&ctx->list_lock);
-@@ -451,11 +875,45 @@ void aio_dispatch(AioContext *ctx)
+@@ -451,11 +912,45 @@ void aio_dispatch(AioContext *ctx)
   * any lock, the arrays cannot be stored in AioContext.  Thread-local data
   * has none of the disadvantages of these three options.
   */
@@ -21203,7 +21267,7 @@ index 118bf57..18a3fab 100644
  static void pollfds_cleanup(Notifier *n, void *unused)
  {
      g_assert(npfd == 0);
-@@ -464,6 +922,13 @@ static void pollfds_cleanup(Notifier *n, void *unused)
+@@ -464,6 +959,13 @@ static void pollfds_cleanup(Notifier *n, void *unused)
      nalloc = 0;
  }
  
@@ -21217,7 +21281,7 @@ index 118bf57..18a3fab 100644
  static void add_pollfd(AioHandler *node)
  {
      if (npfd == nalloc) {
-@@ -486,15 +951,33 @@ static void add_pollfd(AioHandler *node)
+@@ -486,15 +988,33 @@ static void add_pollfd(AioHandler *node)
      npfd++;
  }
  
@@ -21251,7 +21315,7 @@ index 118bf57..18a3fab 100644
              progress = true;
          }
  
-@@ -517,6 +1000,20 @@ static bool run_poll_handlers_once(AioContext *ctx)
+@@ -517,6 +1037,20 @@ static bool run_poll_handlers_once(AioContext *ctx)
   *
   * Returns: true if progress was made, false otherwise
   */
@@ -21272,7 +21336,7 @@ index 118bf57..18a3fab 100644
  static bool run_poll_handlers(AioContext *ctx, int64_t max_ns)
  {
      bool progress;
-@@ -549,30 +1046,95 @@ static bool run_poll_handlers(AioContext *ctx, int64_t max_ns)
+@@ -549,30 +1083,95 @@ static bool run_poll_handlers(AioContext *ctx, int64_t max_ns)
   *
   * Returns: true if progress was made, false otherwise
   */
@@ -21368,7 +21432,7 @@ index 118bf57..18a3fab 100644
  bool aio_poll(AioContext *ctx, bool blocking)
  {
      AioHandler *node;
-@@ -590,6 +1152,17 @@ bool aio_poll(AioContext *ctx, bool blocking)
+@@ -590,6 +1189,17 @@ bool aio_poll(AioContext *ctx, bool blocking)
       * so disable the optimization now.
       */
      if (blocking) {
@@ -21386,7 +21450,7 @@ index 118bf57..18a3fab 100644
          atomic_add(&ctx->notify_me, 2);
      }
  
-@@ -599,16 +1172,48 @@ bool aio_poll(AioContext *ctx, bool blocking)
+@@ -599,16 +1209,48 @@ bool aio_poll(AioContext *ctx, bool blocking)
          start = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
      }
  
@@ -21435,7 +21499,7 @@ index 118bf57..18a3fab 100644
                      add_pollfd(node);
                  }
              }
-@@ -617,15 +1222,43 @@ bool aio_poll(AioContext *ctx, bool blocking)
+@@ -617,15 +1259,43 @@ bool aio_poll(AioContext *ctx, bool blocking)
          timeout = blocking ? aio_compute_timeout(ctx) : 0;
  
          /* wait until next event */
@@ -21479,7 +21543,7 @@ index 118bf57..18a3fab 100644
              ret = qemu_poll_ns(pollfds, npfd, timeout);
          }
      }
-@@ -677,35 +1310,94 @@ bool aio_poll(AioContext *ctx, bool blocking)
+@@ -677,35 +1347,94 @@ bool aio_poll(AioContext *ctx, bool blocking)
  
      aio_notify_accept(ctx);
  
@@ -21574,7 +21638,7 @@ index 118bf57..18a3fab 100644
          ctx->epoll_available = false;
      } else {
          ctx->epoll_available = true;
-@@ -720,6 +1412,11 @@ void aio_context_destroy(AioContext *ctx)
+@@ -720,6 +1449,11 @@ void aio_context_destroy(AioContext *ctx)
  #endif
  }
  
@@ -21587,7 +21651,7 @@ index 118bf57..18a3fab 100644
                                   int64_t grow, int64_t shrink, Error **errp)
  {
 diff --git a/util/async.c b/util/async.c
-index 05979f8..29c9617 100644
+index 05979f8..413e070 100644
 --- a/util/async.c
 +++ b/util/async.c
 @@ -34,6 +34,15 @@
@@ -21669,47 +21733,98 @@ index 05979f8..29c9617 100644
  int aio_bh_poll(AioContext *ctx)
  {
      QEMUBH *bh, **bhp, *next;
-@@ -216,6 +260,9 @@ aio_compute_timeout(AioContext *ctx)
+@@ -216,6 +260,23 @@ aio_compute_timeout(AioContext *ctx)
      }
  }
  
 +/*
++ * (gdb) bt
++ * #0  aio_ctx_prepare (source=0x5555568868a0, timeout=0x7fffffffdfa4) at util/async.c:222
++ * #1  0x00007ffff50df91d in g_main_context_prepare () from /lib/x86_64-linux-gnu/libglib-2.0.so.0
++ * #2  0x0000555555db0bef in glib_pollfds_fill (cur_timeout=0x7fffffffe078) at util/main-loop.c:187
++ * #3  0x0000555555db0d64 in os_host_main_loop_wait (timeout=499000000) at util/main-loop.c:228
++ * #4  0x0000555555db0e5b in main_loop_wait (nonblocking=0) at util/main-loop.c:497
++ * #5  0x00005555559dee92 in main_loop () at vl.c:1866
++ * #6  0x00005555559e66a5 in main (argc=16, argv=0x7fffffffe3d8, envp=0x7fffffffe460) at vl.c:4644
++ *
++ * prepare(): 进入睡眠前,在g_main_context_prepare()里,mainloop调用所有的
++ * GSource的prepare函数,计算最小的timeout时间,该时间决定下一次睡眠的时间.
++ *
++ * 根据glib的源码, 会遍历每一个source调用其prepare
++ *
 + * static GSourceFuncs aio_source_funcs.prepare = aio_ctx_prepare()
 + */
  static gboolean
  aio_ctx_prepare(GSource *source, gint    *timeout)
  {
-@@ -233,6 +280,9 @@ aio_ctx_prepare(GSource *source, gint    *timeout)
+@@ -233,6 +294,22 @@ aio_ctx_prepare(GSource *source, gint    *timeout)
      return *timeout == 0;
  }
  
 +/*
++ * (gdb) bt
++ * #0  aio_ctx_check (source=0x5555567f3390) at util/async.c:239
++ * #1  0x00007ffff50dfdc1 in g_main_context_check () from /lib/x86_64-linux-gnu/libglib-2.0.so.0
++ * #2  0x0000555555db0d24 in glib_pollfds_poll () at util/main-loop.c:214
++ * #3  0x0000555555db0da2 in os_host_main_loop_wait (timeout=0) at util/main-loop.c:238
++ * #4  0x0000555555db0e5b in main_loop_wait (nonblocking=0) at util/main-loop.c:497
++ * #5  0x00005555559dee92 in main_loop () at vl.c:1866
++ * #6  0x00005555559e66a5 in main (argc=16, argv=0x7fffffffe3d8, envp=0x7fffffffe460) at vl.c:4644
++ *
++ * check(): poll()被唤醒后,在g_main_context_check()里,mainloop调用所有的
++ * GSource的check函数,检查是否有GSOurce预警准备好了.如果poll是由于错误或
++ * 超时等原因唤醒的,就不必dispatch了.
++ *
 + * static GSourceFuncs aio_source_funcs.check = aio_ctx_check()
 + */
  static gboolean
  aio_ctx_check(GSource *source)
  {
-@@ -250,6 +300,9 @@ aio_ctx_check(GSource *source)
+@@ -250,6 +327,18 @@ aio_ctx_check(GSource *source)
      return aio_pending(ctx) || (timerlistgroup_deadline_ns(&ctx->tlg) == 0);
  }
  
 +/*
++ * (gdb) bt
++ * #0  aio_ctx_dispatch (source=0x5555568868a0, callback=0x0, user_data=0x0) at util/async.c:258
++ * #1  0x00007ffff50e0197 in g_main_context_dispatch () from /lib/x86_64-linux-gnu/libglib-2.0.so.0
++ * #2  0x0000555555db0d34 in glib_pollfds_poll () at util/main-loop.c:215
++ * #3  0x0000555555db0da2 in os_host_main_loop_wait (timeout=0) at util/main-loop.c:238
++ * #4  0x0000555555db0e5b in main_loop_wait (nonblocking=0) at util/main-loop.c:497
++ * #5  0x00005555559dee92 in main_loop () at vl.c:1866
++ * #6  0x00005555559e66a5 in main (argc=16, argv=0x7fffffffe3d8, envp=0x7fffffffe460) at vl.c:4644
++ *
 + * static GSourceFuncs aio_source_funcs.dispatch = aio_ctx_dispatch()
 + */
  static gboolean
  aio_ctx_dispatch(GSource     *source,
                   GSourceFunc  callback,
-@@ -262,6 +315,9 @@ aio_ctx_dispatch(GSource     *source,
+@@ -262,6 +351,24 @@ aio_ctx_dispatch(GSource     *source,
      return true;
  }
  
 +/*
++ * (gdb) bt
++ * #0  aio_ctx_finalize (source=0x5555567f25d0) at util/async.c:268
++ * #1  0x00007ffff50dd336 in ?? () from /lib/x86_64-linux-gnu/libglib-2.0.so.0
++ * #2  0x0000555555dae402 in aio_context_unref (ctx=0x5555567f25d0) at util/async.c:506
++ * #3  0x00005555559d6106 in iothread_instance_finalize (obj=0x5555567f22e0) at iothread.c:131
++ * #4  0x0000555555c7e825 in object_deinit (obj=0x5555567f22e0, type=0x5555567c52e0) at qom/object.c:516
++ * #5  0x0000555555c7e897 in object_finalize (data=0x5555567f22e0) at qom/object.c:530
++ * #6  0x0000555555c7f80c in object_unref (obj=0x5555567f22e0) at qom/object.c:978
++ * #7  0x0000555555c80c30 in object_finalize_child_property (obj=0x5555567f0ef0, name=0x5555567f2590 "mon_iothread", opaque=0x5555567f22e0) at qom/object.c:1490
++ * #8  0x0000555555c7e714 in object_property_del_child (obj=0x5555567f0ef0, child=0x5555567f22e0, errp=0x0) at qom/object.c:490
++ * #9  0x0000555555c7e7f4 in object_unparent (obj=0x5555567f22e0) at qom/object.c:509
++ * #10 0x00005555559d69b6 in iothread_destroy (iothread=0x5555567f22e0) at iothread.c:375
++ * #11 0x000055555585e32a in monitor_cleanup () at /home/zhang/kvm/qemu-3.0.0/monitor.c:4736
++ * #12 0x00005555559e66d2 in main (argc=16, argv=0x7fffffffe3d8, envp=0x7fffffffe460) at vl.c:4660
++ *
 + * static GSourceFuncs aio_source_funcs.finalize = aio_ctx_finalize()
 + */
  static void
  aio_ctx_finalize(GSource     *source)
  {
-@@ -308,6 +364,12 @@ static GSourceFuncs aio_source_funcs = {
+@@ -308,6 +415,12 @@ static GSourceFuncs aio_source_funcs = {
      aio_ctx_finalize
  };
  
@@ -21722,7 +21837,7 @@ index 05979f8..29c9617 100644
  GSource *aio_get_g_source(AioContext *ctx)
  {
      g_source_ref(&ctx->source);
-@@ -405,14 +467,26 @@ static void co_schedule_bh_cb(void *opaque)
+@@ -405,14 +518,26 @@ static void co_schedule_bh_cb(void *opaque)
      }
  }
  
@@ -21872,7 +21987,7 @@ index 73c4046..1b47249 100644
          value |= (len > 0);
      } while ((len == -1 && errno == EINTR) || len == sizeof(buffer));
 diff --git a/util/iohandler.c b/util/iohandler.c
-index 623b55b..a1c0da9 100644
+index 623b55b..7dd170b 100644
 --- a/util/iohandler.c
 +++ b/util/iohandler.c
 @@ -33,8 +33,26 @@
@@ -21882,8 +21997,8 @@ index 623b55b..a1c0da9 100644
 +/*
 + * 在qemu里主要有3种AioContext (AioContext的aio_handlers存着所有该context当前poll的handler和fd):
 + *
-+ * * qemu_aio_context : 似乎不太用,比如vnc或者qmp命令
-+ * * iohhandler_ctx   : main loop用这个
++ * * qemu_aio_context : main loop用这个
++ * * iohandler_ctx    : 
 + * * iothread->ctx    : iothread用的. qemu的block device决定是用mainloop的还是
 + *                      iothread的context, 比如virtio_blk_dataplane_create()
 + */
@@ -21902,12 +22017,174 @@ index 623b55b..a1c0da9 100644
  static AioContext *iohandler_ctx;
  
  static void iohandler_init(void)
+@@ -44,12 +62,23 @@ static void iohandler_init(void)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - monitor.c|4551| <<monitor_iothread_init>> qmp_dispatcher_bh = aio_bh_new(iohandler_get_aio_context(),
++ *   - io/channel.c|437| <<qio_channel_set_aio_fd_handlers>> ctx = ioc->ctx ? ioc->ctx : iohandler_get_aio_context();
++ */
+ AioContext *iohandler_get_aio_context(void)
+ {
+     iohandler_init();
+     return iohandler_ctx;
+ }
+ 
++/*
++ * called by:
++ *   - util/main-loop.c|175| <<qemu_init_main_loop>> src = iohandler_get_g_source();
++ *
++ * 核心函数!!!
++ */
+ GSource *iohandler_get_g_source(void)
+ {
+     iohandler_init();
+@@ -70,6 +99,10 @@ void event_notifier_set_handler(EventNotifier *e,
+                                 EventNotifierHandler *handler)
+ {
+     iohandler_init();
++    /*
++     * !!! aio_set_fd_handler()-->aio_epoll_update()的时候如果ctx->epoll_enabled支持,则把fd添加到ctx->epollfd
++     * 在aio_epoll_check_poll()只有npfd >= EPOLL_ENABLE_THRESHOLD时才会试着用aio_epoll_try_enable()激活epoll_enabled
++     */
+     aio_set_event_notifier(iohandler_ctx, e, false,
+                            handler, NULL);
+ }
 diff --git a/util/main-loop.c b/util/main-loop.c
-index affe040..7074557 100644
+index affe040..e6c9add 100644
 --- a/util/main-loop.c
 +++ b/util/main-loop.c
-@@ -140,6 +140,10 @@ void qemu_notify_event(void)
+@@ -35,6 +35,57 @@
+ #include "block/aio.h"
+ #include "qemu/error-report.h"
  
++/*
++ * GMainLoop --> GMainContext --> {GSource1, GSource2, GSource3 ...}
++ *
++ * 每个GMainLoop都包含一个GMainContext成员,而这个GMainContext成员可以装各
++ * 种各样的GSource.GSource则是具体的各种Event处理逻辑了.可以把GMainContext
++ * 理解为GSource的容器(不过它的用处不只是装GSource).
++ *
++ *
++ * GSource的接口:
++ *
++ * - prepare(): 进入睡眠前,在g_main_context_prepare()里,mainloop调用所有的
++ *   GSource的prepare函数,计算最小的timeout时间,该时间决定下一次睡眠的时间.
++ *
++ * - check(): poll()被唤醒后,在g_main_context_check()里,mainloop调用所有的
++ *   GSource的check函数,检查是否有GSOurce预警准备好了.如果poll是由于错误或
++ *   超时等原因唤醒的,就不必dispatch了.
++ *
++ * - dispatch(): 当前有GSource准备好了,在g_main_context_dispatch()里,
++ *   mainloop调用所有的GSource的dispatch去分发消息.
++ *
++ * - finalize()在GSource被移出时,mainloop调用该函数去销毁GSource.
++ *
++ *
++ * (gdb) bt
++ * #0  aio_ctx_prepare (source=0x5555568868a0, timeout=0x7fffffffdfa4) at util/async.c:222
++ * #1  0x00007ffff50df91d in g_main_context_prepare () from /lib/x86_64-linux-gnu/libglib-2.0.so.0
++ * #2  0x0000555555db0bef in glib_pollfds_fill (cur_timeout=0x7fffffffe078) at util/main-loop.c:187
++ * #3  0x0000555555db0d64 in os_host_main_loop_wait (timeout=499000000) at util/main-loop.c:228
++ * #4  0x0000555555db0e5b in main_loop_wait (nonblocking=0) at util/main-loop.c:497
++ * #5  0x00005555559dee92 in main_loop () at vl.c:1866
++ * #6  0x00005555559e66a5 in main (argc=16, argv=0x7fffffffe3d8, envp=0x7fffffffe460) at vl.c:4644
++ *
++ * (gdb) bt
++ * #0  aio_ctx_check (source=0x5555567f3390) at util/async.c:239
++ * #1  0x00007ffff50dfdc1 in g_main_context_check () from /lib/x86_64-linux-gnu/libglib-2.0.so.0
++ * #2  0x0000555555db0d24 in glib_pollfds_poll () at util/main-loop.c:214
++ * #3  0x0000555555db0da2 in os_host_main_loop_wait (timeout=0) at util/main-loop.c:238
++ * #4  0x0000555555db0e5b in main_loop_wait (nonblocking=0) at util/main-loop.c:497
++ * #5  0x00005555559dee92 in main_loop () at vl.c:1866
++ * #6  0x00005555559e66a5 in main (argc=16, argv=0x7fffffffe3d8, envp=0x7fffffffe460) at vl.c:4644
++ *
++ * (gdb) bt
++ * #0  aio_ctx_dispatch (source=0x5555568868a0, callback=0x0, user_data=0x0) at util/async.c:258
++ * #1  0x00007ffff50e0197 in g_main_context_dispatch () from /lib/x86_64-linux-gnu/libglib-2.0.so.0
++ * #2  0x0000555555db0d34 in glib_pollfds_poll () at util/main-loop.c:215
++ * #3  0x0000555555db0da2 in os_host_main_loop_wait (timeout=0) at util/main-loop.c:238
++ * #4  0x0000555555db0e5b in main_loop_wait (nonblocking=0) at util/main-loop.c:497
++ * #5  0x00005555559dee92 in main_loop () at vl.c:1866
++ * #6  0x00005555559e66a5 in main (argc=16, argv=0x7fffffffe3d8, envp=0x7fffffffe460) at vl.c:4644
++ */
++
+ #ifndef _WIN32
+ 
+ /* If we have signalfd, we mask out the signals we want to handle and then
+@@ -71,6 +122,11 @@ static void sigfd_handler(void *opaque)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - util/main-loop.c|163| <<qemu_signal_init>> static int qemu_signal_init(void )
++ *   - util/main-loop.c|224| <<qemu_init_main_loop>> ret = qemu_signal_init();
++ */
+ static int qemu_signal_init(void)
+ {
+     int sigfd;
+@@ -115,9 +171,28 @@ static int qemu_signal_init(void)
+ }
+ #endif
+ 
++/*
++ * main loop使用的context!!!!
++ */
+ static AioContext *qemu_aio_context;
++/*
++ * 初始化:
++ *   - util/main-loop.c|173| <<qemu_init_main_loop>> qemu_notify_bh = qemu_bh_new(notify_event_cb, NULL);
++ *
++ * 调用:
++ *   - util/main-loop.c|146| <<qemu_notify_event>> qemu_bh_schedule(qemu_notify_bh);
++ */
+ static QEMUBH *qemu_notify_bh;
+ 
++/*
++ * 只被如下使用:
++ *   - util/main-loop.c|169| <<qemu_init_main_loop>> qemu_notify_bh = qemu_bh_new(notify_event_cb, NULL);
++ *
++ * 调用:
++ *   - util/main-loop.c|146| <<qemu_notify_event>> qemu_bh_schedule(qemu_notify_bh);
++ *
++ * 什么也不做,就是为了唤醒context
++ */
+ static void notify_event_cb(void *opaque)
+ {
+     /* No need to do anything; this bottom half is only used to
+@@ -125,6 +200,10 @@ static void notify_event_cb(void *opaque)
+      */
+ }
+ 
++/*
++ * 一个例子:
++ *   - hw/block/dataplane/virtio-blk.c|266| <<virtio_blk_data_plane_create>> s->ctx = qemu_get_aio_context();
++ */
+ AioContext *qemu_get_aio_context(void)
+ {
+     return qemu_aio_context;
+@@ -135,11 +214,27 @@ void qemu_notify_event(void)
+     if (!qemu_aio_context) {
+         return;
+     }
++    /*
++     * qemu_notify_bh = qemu_bh_new(notify_event_cb, NULL);
++     *
++     * 什么也不做,主要靠qemu_bh_schedule()调用aio_notify()来唤醒context
++     */
+     qemu_bh_schedule(qemu_notify_bh);
+ }
+ 
++/*
++ * struct _GArray
++ * {   
++ *     gchar *data;
++ *     guint len;
++ * };
++ */
  static GArray *gpollfds;
  
 +/*
@@ -21917,6 +22194,340 @@ index affe040..7074557 100644
  int qemu_init_main_loop(Error **errp)
  {
      int ret;
+@@ -153,30 +248,96 @@ int qemu_init_main_loop(Error **errp)
+         return ret;
+     }
+ 
++    /*
++     * 分配很重要的一点:
++     *   ctx = (AioContext *) g_source_new(&aio_source_funcs, sizeof(AioContext));
++     *
++     * 360 static GSourceFuncs aio_source_funcs = {
++     * 361     aio_ctx_prepare, 
++     * 362     aio_ctx_check,
++     * 363     aio_ctx_dispatch,
++     * 364     aio_ctx_finalize
++     * 365 };
++     */
+     qemu_aio_context = aio_context_new(&local_error);
+     if (!qemu_aio_context) {
+         error_propagate(errp, local_error);
+         return -EMFILE;
+     }
++    /*
++     * notify_event_cb()本身什么也不做
++     * 主要靠qemu_notify_event()调用qemu_bh_schedule(qemu_notify_bh)会触发aio_notify()来唤醒context
++     */
+     qemu_notify_bh = qemu_bh_new(notify_event_cb, NULL);
+     gpollfds = g_array_new(FALSE, FALSE, sizeof(GPollFD));
+     src = aio_get_g_source(qemu_aio_context);
+     g_source_set_name(src, "aio-context");
++    /*
++     * guint
++     * g_source_attach (GSource *source,
++     *                  GMainContext *context);
++     *
++     * Adds a GSource to a context so that it will be executed within that
++     * context. Remove it by calling g_source_destroy().
++     * Returns the ID (greater than 0) for the source within the GMainContext.
++     *
++     * result = g_source_attach_unlocked (source, context, TRUE);
++     */
+     g_source_attach(src, NULL);
+     g_source_unref(src);
+     src = iohandler_get_g_source();
+     g_source_set_name(src, "io-handler");
++    /*
++     * guint
++     * g_source_attach (GSource *source,
++     *                  GMainContext *context);
++     *
++     * Adds a GSource to a context so that it will be executed within that
++     * context. Remove it by calling g_source_destroy().
++     * Returns the ID (greater than 0) for the source within the GMainContext.
++     *
++     * result = g_source_attach_unlocked (source, context, TRUE);
++     */
+     g_source_attach(src, NULL);
+     g_source_unref(src);
+     return 0;
+ }
+ 
++/*
++ * 被以下使用:
++ *   - util/main-loop.c|343| <<glib_pollfds_fill>> g_main_context_prepare(context, &max_priority);
++ *   - util/main-loop.c|352| <<glib_pollfds_fill>> n = g_main_context_query(context, max_priority, &timeout, pfds,
++ *   - util/main-loop.c|374| <<glib_pollfds_poll>> if (g_main_context_check(context, max_priority, pfds, glib_n_poll_fds)) {
++ *   - util/main-loop.c|630| <<os_host_main_loop_wait>> g_main_context_prepare(context, &max_priority);
++ *   - util/main-loop.c|631| <<os_host_main_loop_wait>> n_poll_fds = g_main_context_query(context, max_priority, &poll_timeout,
++ *   - util/main-loop.c|668| <<os_host_main_loop_wait>> if (g_main_context_check(context, max_priority, poll_fds, n_poll_fds)) {
++ */
+ static int max_priority;
+ 
+ #ifndef _WIN32
++/*
++ * 被使用的地方:
++ *   - util/main-loop.c|315| <<glib_pollfds_fill>> glib_pollfds_idx = gpollfds->len;
++ *   - util/main-loop.c|320| <<glib_pollfds_fill>> g_array_set_size(gpollfds, glib_pollfds_idx + glib_n_poll_fds);
++ *   - util/main-loop.c|321| <<glib_pollfds_fill>> pfds = &g_array_index(gpollfds, GPollFD, glib_pollfds_idx);
++ *   - util/main-loop.c|342| <<glib_pollfds_poll>> GPollFD *pfds = &g_array_index(gpollfds, GPollFD, glib_pollfds_idx);
++ */
+ static int glib_pollfds_idx;
++/*
++ * 被使用的地方:
++ *   - util/main-loop.c|307| <<glib_pollfds_fill>> n = glib_n_poll_fds;
++ *   - util/main-loop.c|310| <<glib_pollfds_fill>> glib_n_poll_fds = n;
++ *   - util/main-loop.c|311| <<glib_pollfds_fill>> g_array_set_size(gpollfds, glib_pollfds_idx + glib_n_poll_fds);
++ *   - util/main-loop.c|314| <<glib_pollfds_fill>> glib_n_poll_fds);
++ *   - util/main-loop.c|315| <<glib_pollfds_fill>> } while (n != glib_n_poll_fds);
++ *   - util/main-loop.c|335| <<glib_pollfds_poll>> if (g_main_context_check(context, max_priority, pfds, glib_n_poll_fds)) {
++ */
+ static int glib_n_poll_fds;
+ 
++/*
++ * called only by:
++ *   - util/main-loop.c|250| <<os_host_main_loop_wait>> glib_pollfds_fill(&timeout);
++ */
+ static void glib_pollfds_fill(int64_t *cur_timeout)
+ {
+     GMainContext *context = g_main_context_default();
+@@ -184,9 +345,23 @@ static void glib_pollfds_fill(int64_t *cur_timeout)
+     int64_t timeout_ns;
+     int n;
+ 
++    /*
++     * gboolean
++     * g_main_context_prepare (GMainContext *context,
++     *                         gint *priority);
++     *
++     * Prepares to poll sources within a main loop. The resulting information
++     * for polling is determined by calling g_main_context_query().
++     *
++     * You must have successfully acquired the context with
++     * g_main_context_acquire() before you may call this function.
++     *
++     * 对每一个source, 调用aio_ctx_prepare()计算timeout的时间
++     */
+     g_main_context_prepare(context, &max_priority);
+ 
+     glib_pollfds_idx = gpollfds->len;
++    /* 要poll的fd的数目 */
+     n = glib_n_poll_fds;
+     do {
+         GPollFD *pfds;
+@@ -206,23 +381,69 @@ static void glib_pollfds_fill(int64_t *cur_timeout)
+     *cur_timeout = qemu_soonest_timeout(timeout_ns, *cur_timeout);
+ }
+ 
++/*
++ * called only by:
++ *   - util/main-loop.c|264| <<os_host_main_loop_wait>> glib_pollfds_poll();
++ */
+ static void glib_pollfds_poll(void)
+ {
++    /*
++     * 在os_host_main_loop_wait()中,
++     * qemu_poll_ns()已经用ppoll()或者g_poll()更新过GPollFD(等价pollfd)的revents
++     */
+     GMainContext *context = g_main_context_default();
+     GPollFD *pfds = &g_array_index(gpollfds, GPollFD, glib_pollfds_idx);
+ 
++    /*
++     * check(): poll()被唤醒后,在g_main_context_check()里,mainloop调用所有的
++     * GSource的check函数,检查是否有GSOurce预警准备好了.如果poll是由于错误或
++     * 超时等原因唤醒的,就不必dispatch了.
++     *
++     * 最终为每个source间接调用: aio_ctx_check()
++     */
+     if (g_main_context_check(context, max_priority, pfds, glib_n_poll_fds)) {
++        /*
++	 * 用g_source_add_poll()把fd加到某个source
++	 *
++	 * 根据glib的源码,遍历所有的source,执行每一个source的callback
++	 *
++	 * 最终间接调用: aio_ctx_dispatch()
++	 */
+         g_main_context_dispatch(context);
+     }
+ }
+ 
+ #define MAX_MAIN_LOOP_SPIN (1000)
+ 
++/*
++ * called by only:
++ *   - util/main-loop.c|653| <<main_loop_wait>> ret = os_host_main_loop_wait(timeout_ns);
++ */
+ static int os_host_main_loop_wait(int64_t timeout)
+ {
++    /*
++     * src = aio_get_g_source(qemu_aio_context);
++     * g_source_set_name(src, "aio-context");
++     * g_source_attach(src, NULL);
++     *
++     * src = iohandler_get_g_source();
++     * g_source_set_name(src, "io-handler");
++     * g_source_attach(src, NULL);
++     */
+     GMainContext *context = g_main_context_default();
+     int ret;
+ 
++    /*
++     * Tries to become the owner of the specified context. If some other thread
++     * is the owner of the context, returns FALSE immediately. Ownership is
++     * properly recursive: the owner can require ownership again and will
++     * release ownership when g_main_context_release() is called as many times
++     * as g_main_context_acquire().
++     *
++     * You must be the owner of a context before you can call
++     * g_main_context_prepare(), g_main_context_query(),
++     * g_main_context_check(), g_main_context_dispatch().
++     */
+     g_main_context_acquire(context);
+ 
+     glib_pollfds_fill(&timeout);
+@@ -230,11 +451,23 @@ static int os_host_main_loop_wait(int64_t timeout)
+     qemu_mutex_unlock_iothread();
+     replay_mutex_unlock();
+ 
++    /*
++     * 核心的等待函数!!!
++     *
++     * 这里要poll的fd们的参数类型是GPollFD!!!!!!
++     *
++     * 要么调用ppoll(), 要么调用g_poll()都是以GPollFD(等价pollfd)作为参数
++     * 所以到期后会自动更新revents!
++     */
+     ret = qemu_poll_ns((GPollFD *)gpollfds->data, gpollfds->len, timeout);
+ 
+     replay_mutex_lock();
+     qemu_mutex_lock_iothread();
+ 
++    /*
++     * 上面qemu_poll_ns()已经用ppoll()或者g_poll()更新过GPollFD(等价pollfd)的revents
++     * 可以aio_ctx_check()和aio_ctx_dispatch()
++     */
+     glib_pollfds_poll();
+ 
+     g_main_context_release(context);
+@@ -245,14 +478,17 @@ static int os_host_main_loop_wait(int64_t timeout)
+ /***********************************************************/
+ /* Polling handling */
+ 
++/* windows */
+ typedef struct PollingEntry {
+     PollingFunc *func;
+     void *opaque;
+     struct PollingEntry *next;
+ } PollingEntry;
+ 
++/* windows */
+ static PollingEntry *first_polling_entry;
+ 
++/* windows */
+ int qemu_add_polling_cb(PollingFunc *func, void *opaque)
+ {
+     PollingEntry **ppe, *pe;
+@@ -264,6 +500,7 @@ int qemu_add_polling_cb(PollingFunc *func, void *opaque)
+     return 0;
+ }
+ 
++/* windows */
+ void qemu_del_polling_cb(PollingFunc *func, void *opaque)
+ {
+     PollingEntry **ppe, *pe;
+@@ -279,6 +516,7 @@ void qemu_del_polling_cb(PollingFunc *func, void *opaque)
+ 
+ /***********************************************************/
+ /* Wait objects support */
++/* windows */
+ typedef struct WaitObjects {
+     int num;
+     int revents[MAXIMUM_WAIT_OBJECTS + 1];
+@@ -287,8 +525,10 @@ typedef struct WaitObjects {
+     void *opaque[MAXIMUM_WAIT_OBJECTS + 1];
+ } WaitObjects;
+ 
++/* windows */
+ static WaitObjects wait_objects = {0};
+ 
++/* windows */
+ int qemu_add_wait_object(HANDLE handle, WaitObjectFunc *func, void *opaque)
+ {
+     WaitObjects *w = &wait_objects;
+@@ -303,6 +543,7 @@ int qemu_add_wait_object(HANDLE handle, WaitObjectFunc *func, void *opaque)
+     return 0;
+ }
+ 
++/* windows */
+ void qemu_del_wait_object(HANDLE handle, WaitObjectFunc *func, void *opaque)
+ {
+     int i, found;
+@@ -325,6 +566,7 @@ void qemu_del_wait_object(HANDLE handle, WaitObjectFunc *func, void *opaque)
+     }
+ }
+ 
++/* windows */
+ void qemu_fd_register(int fd)
+ {
+     WSAEventSelect(fd, event_notifier_get_handle(&qemu_aio_context->notifier),
+@@ -332,6 +574,7 @@ void qemu_fd_register(int fd)
+                    FD_CONNECT | FD_WRITE | FD_OOB);
+ }
+ 
++/* windows */
+ static int pollfds_fill(GArray *pollfds, fd_set *rfds, fd_set *wfds,
+                         fd_set *xfds)
+ {
+@@ -358,6 +601,7 @@ static int pollfds_fill(GArray *pollfds, fd_set *rfds, fd_set *wfds,
+     return nfds;
+ }
+ 
++/* windows */
+ static void pollfds_poll(GArray *pollfds, int nfds, fd_set *rfds,
+                          fd_set *wfds, fd_set *xfds)
+ {
+@@ -381,6 +625,7 @@ static void pollfds_poll(GArray *pollfds, int nfds, fd_set *rfds,
+     }
+ }
+ 
++/* windows */
+ static int os_host_main_loop_wait(int64_t timeout)
+ {
+     GMainContext *context = g_main_context_default();
+@@ -469,6 +714,9 @@ static int os_host_main_loop_wait(int64_t timeout)
+ }
+ #endif
+ 
++/*
++ * 对于vl.c: vl.c|1881| <<main_loop>> main_loop_wait(false);
++ */
+ void main_loop_wait(int nonblocking)
+ {
+     int ret;
+@@ -479,9 +727,23 @@ void main_loop_wait(int nonblocking)
+         timeout = 0;
+     }
+ 
++    /*
++     * static GArray *gpollfds;
++     * 在文件内全局
++     *
++     * struct _GArray
++     * {   
++     *     gchar *data;
++     *     guint len;
++     * };
++     */
++
+     /* poll any events */
+     g_array_set_size(gpollfds, 0); /* reset for new iteration */
+     /* XXX: separate device handlers from system ones */
++    /*
++     * 会更改gpollfds->data和gpollfds->len
++     */
+     slirp_pollfds_fill(gpollfds, &timeout);
+ 
+     if (timeout == UINT32_MAX) {
 diff --git a/util/module.c b/util/module.c
 index c909737..4a9b8ec 100644
 --- a/util/module.c
@@ -22372,6 +22983,22 @@ index 86bfe84..ad009c8 100644
      return g_poll(fds, nfds, qemu_timeout_ns_to_ms(timeout));
  #endif
  }
+diff --git a/util/rcu.c b/util/rcu.c
+index 5676c22..243829f 100644
+--- a/util/rcu.c
++++ b/util/rcu.c
+@@ -235,6 +235,11 @@ retry:
+     return node;
+ }
+ 
++/*
++ * 仅仅在以下被使用:
++ *   - util/rcu.c|327| <<rcu_init_complete>> qemu_thread_create(&thread, "call_rcu", call_rcu_thread,
++ *                                                              NULL, QEMU_THREAD_DETACHED);
++ */
+ static void *call_rcu_thread(void *opaque)
+ {
+     struct rcu_head *node;
 diff --git a/util/thread-pool.c b/util/thread-pool.c
 index 610646d..62f6e3d 100644
 --- a/util/thread-pool.c
