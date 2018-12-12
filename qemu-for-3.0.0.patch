@@ -1,6 +1,6 @@
-From 9f243f6d8de7ef682bb39948f8404c76cdfdcb53 Mon Sep 17 00:00:00 2001
+From a633c0e139d4b5e0c8fb193f431bb1b0ba1e2132 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang@oracle.com>
-Date: Tue, 11 Dec 2018 00:21:27 +0800
+Date: Wed, 12 Dec 2018 13:29:23 +0800
 Subject: [PATCH 1/1] qemu for 3.0.0
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
@@ -24,7 +24,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  exec.c                                       |  414 ++++++-
  hmp.c                                        |    7 +
  hw/block/dataplane/virtio-blk.c              |  221 ++++
- hw/block/nvme.c                              |  115 ++
+ hw/block/nvme.c                              |  157 +++
  hw/block/vhost-user-blk.c                    |   21 +
  hw/block/virtio-blk.c                        | 1161 ++++++++++++++++++
  hw/core/bus.c                                |   88 ++
@@ -47,10 +47,10 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  hw/net/vhost_net.c                           |   28 +
  hw/nvram/fw_cfg.c                            |   13 +
  hw/pci-host/piix.c                           |  152 +++
- hw/pci-host/q35.c                            |   38 +
+ hw/pci-host/q35.c                            |   80 ++
  hw/pci/msi.c                                 |   30 +
  hw/pci/msix.c                                |   76 ++
- hw/pci/pci.c                                 |  424 +++++++
+ hw/pci/pci.c                                 |  518 ++++++++
  hw/pci/pci_host.c                            |   68 ++
  hw/vfio/common.c                             |   65 +
  hw/vfio/pci.c                                |  193 +++
@@ -116,7 +116,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  util/thread-pool.c                           |    3 +
  util/vfio-helpers.c                          |   58 +
  vl.c                                         |   92 +-
- 111 files changed, 14445 insertions(+), 36 deletions(-)
+ 111 files changed, 14623 insertions(+), 36 deletions(-)
  create mode 100644 data/drive_config_groups.txt
  create mode 100644 data/index.txt
  create mode 100644 data/info_mtree.txt
@@ -4912,10 +4912,59 @@ index 8c37bd3..3773cc0 100644
  {
      VirtIOBlock *vblk = VIRTIO_BLK(vdev);
 diff --git a/hw/block/nvme.c b/hw/block/nvme.c
-index 5e508ab..7b1711e 100644
+index 5e508ab..ce5a51d 100644
 --- a/hw/block/nvme.c
 +++ b/hw/block/nvme.c
-@@ -94,6 +94,13 @@ static uint8_t nvme_sq_empty(NvmeSQueue *sq)
+@@ -41,6 +41,48 @@
+ #include "trace.h"
+ #include "nvme.h"
+ 
++/*
++ * q35有两个ioport, MCH_HOST_BRIDGE_CONFIG_ADDR和MCH_HOST_BRIDGE_CONFIG_DATA
++ *
++ * pci的操作要通过这两个port,
++ * 比如先往MCH_HOST_BRIDGE_CONFIG_ADDR写入想操作设备的bdf和寄存器的offset,
++ * 然后把要写入寄存器的值写入MCH_HOST_BRIDGE_CONFIG_DATA
++ *
++ * 比如以下在seabios是想把bdf的config space的ofs区域(比如bar0的地址)写入addr:
++ *
++ * pci_config_writel(pci->bdf, ofs, addr);
++ *
++ * 实际实现(PORT_PCI_CMD就是MCH_HOST_BRIDGE_CONFIG_ADDR, PORT_PCI_DATA就是MCH_HOST_BRIDGE_CONFIG_DATA):
++ *
++ * void pci_config_writel(u16 bdf, u32 addr, u32 val)
++ * {
++ *     outl(0x80000000 | (bdf << 8) | (addr & 0xfc), PORT_PCI_CMD);
++ *     outl(val, PORT_PCI_DATA);
++ * }
++ *
++ *
++ * 假设guest或者bios想更新config space中某个bar的地址, 会调用上面的pci_config_writel()类似的函数
++ *
++ * qemu会拦截对MCH_HOST_BRIDGE_CONFIG_ADDR和MCH_HOST_BRIDGE_CONFIG_DATA的写,
++ * 根据bdf调用对于的pci设备的write_config, 比如pci_default_write_config()
++ *
++ * pci_default_write_config()会判断,
++ * 如果写的地址是一个bar地址, 会调用pci_update_mappings()
++ *
++ * 一个MemoryRegion, 如果其ram不是true(默认false), 就不会绑定真正的内存
++ * 这样guest写这个读bar的时候kvm就会trap到qemu,
++ * 调用PCIDevice->io_regions[i]的对应的MemoryRegion的read/write callback
++ *
++ *
++ * 比如nvme的某个bar的初始化, 里面n->iomem->ram是false!!!
++ *
++ * 1314     memory_region_init_io(&n->iomem, OBJECT(n), &nvme_mmio_ops, n,
++ * 1315                           "nvme", n->reg_size);
++ * 1316     pci_register_bar(&n->parent_obj, 0,
++ * 1317         PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_TYPE_64,
++ * 1318         &n->iomem);
++ */
++
+ #define NVME_GUEST_ERR(trace, fmt, ...) \
+     do { \
+         (trace_##trace)(__VA_ARGS__); \
+@@ -94,6 +136,13 @@ static uint8_t nvme_sq_empty(NvmeSQueue *sq)
      return sq->head == sq->tail;
  }
  
@@ -4929,7 +4978,7 @@ index 5e508ab..7b1711e 100644
  static void nvme_irq_check(NvmeCtrl *n)
  {
      if (msix_enabled(&(n->parent_obj))) {
-@@ -1041,6 +1048,24 @@ static void nvme_write_bar(NvmeCtrl *n, hwaddr offset, uint64_t data,
+@@ -1041,6 +1090,24 @@ static void nvme_write_bar(NvmeCtrl *n, hwaddr offset, uint64_t data,
      }
  }
  
@@ -4954,7 +5003,7 @@ index 5e508ab..7b1711e 100644
  static uint64_t nvme_mmio_read(void *opaque, hwaddr addr, unsigned size)
  {
      NvmeCtrl *n = (NvmeCtrl *)opaque;
-@@ -1150,6 +1175,29 @@ static void nvme_process_db(NvmeCtrl *n, hwaddr addr, int val)
+@@ -1150,6 +1217,29 @@ static void nvme_process_db(NvmeCtrl *n, hwaddr addr, int val)
      }
  }
  
@@ -4984,7 +5033,7 @@ index 5e508ab..7b1711e 100644
  static void nvme_mmio_write(void *opaque, hwaddr addr, uint64_t data,
      unsigned size)
  {
-@@ -1197,6 +1245,24 @@ static const MemoryRegionOps nvme_cmb_ops = {
+@@ -1197,6 +1287,24 @@ static const MemoryRegionOps nvme_cmb_ops = {
      },
  };
  
@@ -5009,7 +5058,7 @@ index 5e508ab..7b1711e 100644
  static void nvme_realize(PCIDevice *pci_dev, Error **errp)
  {
      NvmeCtrl *n = NVME(pci_dev);
-@@ -1242,6 +1308,9 @@ static void nvme_realize(PCIDevice *pci_dev, Error **errp)
+@@ -1242,6 +1350,9 @@ static void nvme_realize(PCIDevice *pci_dev, Error **errp)
      n->sq = g_new0(NvmeSQueue *, n->num_queues);
      n->cq = g_new0(NvmeCQueue *, n->num_queues);
  
@@ -5019,7 +5068,7 @@ index 5e508ab..7b1711e 100644
      memory_region_init_io(&n->iomem, OBJECT(n), &nvme_mmio_ops, n,
                            "nvme", n->reg_size);
      pci_register_bar(&n->parent_obj, 0,
-@@ -1339,6 +1408,9 @@ static void nvme_exit(PCIDevice *pci_dev)
+@@ -1339,6 +1450,9 @@ static void nvme_exit(PCIDevice *pci_dev)
      msix_uninit_exclusive_bar(pci_dev);
  }
  
@@ -5029,7 +5078,7 @@ index 5e508ab..7b1711e 100644
  static Property nvme_props[] = {
      DEFINE_BLOCK_PROPERTIES(NvmeCtrl, conf),
      DEFINE_PROP_STRING("serial", NvmeCtrl, serial),
-@@ -1352,11 +1424,32 @@ static const VMStateDescription nvme_vmstate = {
+@@ -1352,11 +1466,32 @@ static const VMStateDescription nvme_vmstate = {
      .unmigratable = 1,
  };
  
@@ -5062,7 +5111,7 @@ index 5e508ab..7b1711e 100644
      pc->realize = nvme_realize;
      pc->exit = nvme_exit;
      pc->class_id = PCI_CLASS_STORAGE_EXPRESS;
-@@ -1370,6 +1463,23 @@ static void nvme_class_init(ObjectClass *oc, void *data)
+@@ -1370,6 +1505,23 @@ static void nvme_class_init(ObjectClass *oc, void *data)
      dc->vmsd = &nvme_vmstate;
  }
  
@@ -5086,7 +5135,7 @@ index 5e508ab..7b1711e 100644
  static void nvme_instance_init(Object *obj)
  {
      NvmeCtrl *s = NVME(obj);
-@@ -1393,7 +1503,12 @@ static const TypeInfo nvme_info = {
+@@ -1393,7 +1545,12 @@ static const TypeInfo nvme_info = {
  
  static void nvme_register_types(void)
  {
@@ -9083,10 +9132,58 @@ index 0e60834..da10632 100644
 + */
  type_init(i440fx_register_types)
 diff --git a/hw/pci-host/q35.c b/hw/pci-host/q35.c
-index 02f9576..1b24689 100644
+index 02f9576..10c81e0 100644
 --- a/hw/pci-host/q35.c
 +++ b/hw/pci-host/q35.c
-@@ -39,6 +39,20 @@
+@@ -33,12 +33,68 @@
+ #include "qapi/error.h"
+ #include "qapi/visitor.h"
+ 
++/*
++ * q35有两个ioport, MCH_HOST_BRIDGE_CONFIG_ADDR和MCH_HOST_BRIDGE_CONFIG_DATA
++ *
++ * pci的操作要通过这两个port,
++ * 比如先往MCH_HOST_BRIDGE_CONFIG_ADDR写入想操作设备的bdf和寄存器的offset,
++ * 然后把要写入寄存器的值写入MCH_HOST_BRIDGE_CONFIG_DATA
++ *
++ * 比如以下在seabios是想把bdf的config space的ofs区域(比如bar0的地址)写入addr:
++ *
++ * pci_config_writel(pci->bdf, ofs, addr);
++ *
++ * 实际实现(PORT_PCI_CMD就是MCH_HOST_BRIDGE_CONFIG_ADDR, PORT_PCI_DATA就是MCH_HOST_BRIDGE_CONFIG_DATA):
++ *
++ * void pci_config_writel(u16 bdf, u32 addr, u32 val)
++ * {
++ *     outl(0x80000000 | (bdf << 8) | (addr & 0xfc), PORT_PCI_CMD);
++ *     outl(val, PORT_PCI_DATA);
++ * }
++ *
++ *
++ * 假设guest或者bios想更新config space中某个bar的地址, 会调用上面的pci_config_writel()类似的函数
++ *
++ * qemu会拦截对MCH_HOST_BRIDGE_CONFIG_ADDR和MCH_HOST_BRIDGE_CONFIG_DATA的写,
++ * 根据bdf调用对于的pci设备的write_config, 比如pci_default_write_config()
++ *
++ * pci_default_write_config()会判断,
++ * 如果写的地址是一个bar地址, 会调用pci_update_mappings()
++ *
++ * 一个MemoryRegion, 如果其ram不是true(默认false), 就不会绑定真正的内存
++ * 这样guest写这个读bar的时候kvm就会trap到qemu,
++ * 调用PCIDevice->io_regions[i]的对应的MemoryRegion的read/write callback
++ *
++ *
++ * 比如nvme的某个bar的初始化, 里面n->iomem->ram是false!!!
++ *
++ * 1314     memory_region_init_io(&n->iomem, OBJECT(n), &nvme_mmio_ops, n,
++ * 1315                           "nvme", n->reg_size);
++ * 1316     pci_register_bar(&n->parent_obj, 0,
++ * 1317         PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_TYPE_64,
++ * 1318         &n->iomem);
++ */
++
+ /****************************************************************************
+  * Q35 host
+  */
  
  #define Q35_PCI_HOST_HOLE64_SIZE_DEFAULT (1ULL << 35)
  
@@ -9107,7 +9204,7 @@ index 02f9576..1b24689 100644
  static void q35_host_realize(DeviceState *dev, Error **errp)
  {
      PCIHostState *pci = PCI_HOST_BRIDGE(dev);
-@@ -195,6 +209,20 @@ static void q35_host_class_init(ObjectClass *klass, void *data)
+@@ -195,6 +251,20 @@ static void q35_host_class_init(ObjectClass *klass, void *data)
      dc->fw_name = "pci";
  }
  
@@ -9128,7 +9225,7 @@ index 02f9576..1b24689 100644
  static void q35_host_initfn(Object *obj)
  {
      Q35PCIHost *s = Q35_HOST_DEVICE(obj);
-@@ -605,6 +633,10 @@ static Property mch_props[] = {
+@@ -605,6 +675,10 @@ static Property mch_props[] = {
      DEFINE_PROP_END_OF_LIST(),
  };
  
@@ -9139,7 +9236,7 @@ index 02f9576..1b24689 100644
  static void mch_class_init(ObjectClass *klass, void *data)
  {
      PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
-@@ -641,8 +673,14 @@ static const TypeInfo mch_info = {
+@@ -641,8 +715,14 @@ static const TypeInfo mch_info = {
  
  static void q35_register(void)
  {
@@ -9309,10 +9406,63 @@ index c944c02..aff97ec 100644
  {
      MSIMessage msg;
 diff --git a/hw/pci/pci.c b/hw/pci/pci.c
-index 80bc459..fb50597 100644
+index 80bc459..66cc66b 100644
 --- a/hw/pci/pci.c
 +++ b/hw/pci/pci.c
-@@ -86,18 +86,37 @@ static const VMStateDescription vmstate_pcibus = {
+@@ -44,6 +44,52 @@
+ #include "qapi/qapi-commands-misc.h"
+ #include "qemu/cutils.h"
+ 
++/*
++ * 在seabios上的log:
++ *
++ * === PCI new allocation pass #2 ===
++ * PCI: IO: c000 - c07f
++ * PCI: 32: 00000000c0000000 - 00000000fec00000
++ * PCI: map device bdf=00:1f.3  bar 4, addr 0000c000, size 00000040 [io]
++ * PCI: map device bdf=00:02.0  bar 2, addr 0000c040, size 00000020 [io]
++ * PCI: map device bdf=00:1f.2  bar 4, addr 0000c060, size 00000020 [io]
++ * PCI: map device bdf=00:02.0  bar 6, addr fea00000, size 00040000 [mem]
++ * PCI: map device bdf=00:02.0  bar 0, addr fea40000, size 00020000 [mem]
++ * PCI: map device bdf=00:02.0  bar 1, addr fea60000, size 00020000 [mem]
++ * PCI: map device bdf=00:01.0  bar 6, addr fea80000, size 00010000 [mem]
++ * PCI: map device bdf=00:02.0  bar 3, addr fea90000, size 00004000 [mem]
++ * PCI: map device bdf=00:03.0  bar 0, addr fea94000, size 00002000 [mem]
++ * PCI: map device bdf=00:01.0  bar 2, addr fea96000, size 00001000 [mem]
++ * PCI: map device bdf=00:03.0  bar 4, addr fea97000, size 00001000 [mem]
++ * PCI: map device bdf=00:04.0  bar 0, addr fea98000, size 00001000 [mem]
++ * PCI: map device bdf=00:1f.2  bar 5, addr fea99000, size 00001000 [mem]
++ * PCI: map device bdf=00:01.0  bar 0, addr fd000000, size 01000000 [prefmem]
++ *
++ *
++ * 在虚拟机中的iomem
++ *
++ * c0000000-febfffff : PCI Bus 0000:00
++ *   fd000000-fdffffff : 0000:00:01.0
++ *   fe000000-fe1fffff : PCI Bus 0000:01
++ *   fe800000-fe9fffff : PCI Bus 0000:01
++ *   fea00000-fea3ffff : 0000:00:02.0
++ *   fea40000-fea5ffff : 0000:00:02.0
++ *     fea40000-fea5ffff : e1000e
++ *   fea60000-fea7ffff : 0000:00:02.0
++ *     fea60000-fea7ffff : e1000e
++ *   fea90000-fea93fff : 0000:00:02.0
++ *     fea90000-fea93fff : e1000e
++ *   fea94000-fea95fff : 0000:00:03.0
++ *     fea94000-fea95fff : nvme
++ *   fea96000-fea96fff : 0000:00:01.0
++ *   fea97000-fea97fff : 0000:00:03.0
++ *     fea97000-fea97fff : nvme
++ *   fea98000-fea98fff : 0000:00:04.0
++ *   fea99000-fea99fff : 0000:00:1f.2
++ *     fea99000-fea99fff : ahci
++ * 100000000-8ffffffff : PCI Bus 0000:00
++ */
++
+ //#define DEBUG_PCI
+ #ifdef DEBUG_PCI
+ # define PCI_DPRINTF(format, ...)       printf(format, ## __VA_ARGS__)
+@@ -86,18 +132,37 @@ static const VMStateDescription vmstate_pcibus = {
      }
  };
  
@@ -9350,7 +9500,7 @@ index 80bc459..fb50597 100644
  static void pcibus_machine_done(Notifier *notifier, void *data)
  {
      PCIBus *bus = container_of(notifier, PCIBus, machine_done);
-@@ -147,6 +166,9 @@ static uint16_t pcibus_numa_node(PCIBus *bus)
+@@ -147,6 +212,9 @@ static uint16_t pcibus_numa_node(PCIBus *bus)
      return NUMA_NODE_UNASSIGNED;
  }
  
@@ -9360,7 +9510,7 @@ index 80bc459..fb50597 100644
  static void pci_bus_class_init(ObjectClass *klass, void *data)
  {
      BusClass *k = BUS_CLASS(klass);
-@@ -231,6 +253,9 @@ static void pci_change_irq_level(PCIDevice *pci_dev, int irq_num, int change)
+@@ -231,6 +299,9 @@ static void pci_change_irq_level(PCIDevice *pci_dev, int irq_num, int change)
          pci_dev = bus->parent_dev;
      }
      bus->irq_count[irq_num] += change;
@@ -9370,7 +9520,7 @@ index 80bc459..fb50597 100644
      bus->set_irq(bus->irq_opaque, irq_num, bus->irq_count[irq_num] != 0);
  }
  
-@@ -260,6 +285,11 @@ void pci_device_deassert_intx(PCIDevice *dev)
+@@ -260,6 +331,11 @@ void pci_device_deassert_intx(PCIDevice *dev)
      }
  }
  
@@ -9382,7 +9532,7 @@ index 80bc459..fb50597 100644
  static void pci_do_device_reset(PCIDevice *dev)
  {
      int r;
-@@ -310,6 +340,10 @@ void pci_device_reset(PCIDevice *dev)
+@@ -310,6 +386,10 @@ void pci_device_reset(PCIDevice *dev)
   * Called via qbus_reset_all on RST# assert, after the devices
   * have been reset qdev_reset_all-ed already.
   */
@@ -9393,7 +9543,7 @@ index 80bc459..fb50597 100644
  static void pcibus_reset(BusState *qbus)
  {
      PCIBus *bus = DO_UPCAST(PCIBus, qbus, qbus);
-@@ -362,6 +396,23 @@ const char *pci_root_bus_path(PCIDevice *dev)
+@@ -362,6 +442,23 @@ const char *pci_root_bus_path(PCIDevice *dev)
      return rootbus->qbus.name;
  }
  
@@ -9417,7 +9567,7 @@ index 80bc459..fb50597 100644
  static void pci_root_bus_init(PCIBus *bus, DeviceState *parent,
                                MemoryRegion *address_space_mem,
                                MemoryRegion *address_space_io,
-@@ -846,10 +897,15 @@ static void pci_init_multifunction(PCIBus *bus, PCIDevice *dev, Error **errp)
+@@ -846,10 +943,15 @@ static void pci_init_multifunction(PCIBus *bus, PCIDevice *dev, Error **errp)
      }
  }
  
@@ -9433,7 +9583,7 @@ index 80bc459..fb50597 100644
      pci_dev->config = g_malloc0(config_size);
      pci_dev->cmask = g_malloc0(config_size);
      pci_dev->wmask = g_malloc0(config_size);
-@@ -964,15 +1020,91 @@ static bool pci_bus_devfn_reserved(PCIBus *bus, int devfn)
+@@ -964,15 +1066,91 @@ static bool pci_bus_devfn_reserved(PCIBus *bus, int devfn)
  }
  
  /* -1 for devfn means auto assign */
@@ -9525,7 +9675,7 @@ index 80bc459..fb50597 100644
      PCIBus *bus = pci_get_bus(pci_dev);
  
      /* Only pci bridges can be attached to extra PCI root buses */
-@@ -1021,17 +1153,31 @@ static PCIDevice *do_pci_register_device(PCIDevice *pci_dev,
+@@ -1021,17 +1199,31 @@ static PCIDevice *do_pci_register_device(PCIDevice *pci_dev,
      pci_dev->requester_id_cache = pci_req_id_cache_get(pci_dev);
      pstrcpy(pci_dev->name, sizeof(pci_dev->name), name);
  
@@ -9557,17 +9707,57 @@ index 80bc459..fb50597 100644
      pci_config_set_vendor_id(pci_dev->config, pc->vendor_id);
      pci_config_set_device_id(pci_dev->config, pc->device_id);
      pci_config_set_revision(pci_dev->config, pc->revision);
-@@ -1106,6 +1252,9 @@ static void pci_qdev_unrealize(DeviceState *dev, Error **errp)
+@@ -1106,6 +1298,49 @@ static void pci_qdev_unrealize(DeviceState *dev, Error **errp)
      do_pci_unregister_device(pci_dev);
  }
  
 +/*
++ * q35有两个ioport, MCH_HOST_BRIDGE_CONFIG_ADDR和MCH_HOST_BRIDGE_CONFIG_DATA
++ *
++ * pci的操作要通过这两个port,
++ * 比如先往MCH_HOST_BRIDGE_CONFIG_ADDR写入想操作设备的bdf和寄存器的offset,
++ * 然后把要写入寄存器的值写入MCH_HOST_BRIDGE_CONFIG_DATA
++ *
++ * 比如以下在seabios是想把bdf的config space的ofs区域(比如bar0的地址)写入addr:
++ *
++ * pci_config_writel(pci->bdf, ofs, addr);
++ *
++ * 实际实现(PORT_PCI_CMD就是MCH_HOST_BRIDGE_CONFIG_ADDR, PORT_PCI_DATA就是MCH_HOST_BRIDGE_CONFIG_DATA):
++ *
++ * void pci_config_writel(u16 bdf, u32 addr, u32 val)
++ * {
++ *     outl(0x80000000 | (bdf << 8) | (addr & 0xfc), PORT_PCI_CMD);
++ *     outl(val, PORT_PCI_DATA);
++ * }
++ *
++ *
++ * 假设guest或者bios想更新config space中某个bar的地址, 会调用上面的pci_config_writel()类似的函数
++ *
++ * qemu会拦截对MCH_HOST_BRIDGE_CONFIG_ADDR和MCH_HOST_BRIDGE_CONFIG_DATA的写,
++ * 根据bdf调用对于的pci设备的write_config, 比如pci_default_write_config()
++ *
++ * pci_default_write_config()会判断,
++ * 如果写的地址是一个bar地址, 会调用pci_update_mappings()
++ *
++ * 一个MemoryRegion, 如果其ram不是true(默认false), 就不会绑定真正的内存
++ * 这样guest写这个读bar的时候kvm就会trap到qemu,
++ * 调用PCIDevice->io_regions[i]的对应的MemoryRegion的read/write callback
++ *
++ *
++ * 比如nvme的某个bar的初始化, 里面n->iomem->ram是false!!!
++ *
++ * 1314     memory_region_init_io(&n->iomem, OBJECT(n), &nvme_mmio_ops, n,
++ * 1315                           "nvme", n->reg_size);
++ * 1316     pci_register_bar(&n->parent_obj, 0,
++ * 1317         PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_TYPE_64,
++ * 1318         &n->iomem);
++ *
 + * 被好多好多函数调用,增加新的bar
 + */
  void pci_register_bar(PCIDevice *pci_dev, int region_num,
                        uint8_t type, MemoryRegion *memory)
  {
-@@ -1127,10 +1276,17 @@ void pci_register_bar(PCIDevice *pci_dev, int region_num,
+@@ -1127,10 +1362,17 @@ void pci_register_bar(PCIDevice *pci_dev, int region_num,
      r->size = size;
      r->type = type;
      r->memory = memory;
@@ -9585,7 +9775,7 @@ index 80bc459..fb50597 100644
      wmask = ~(size - 1);
      if (region_num == PCI_ROM_SLOT) {
          /* ROM enable bit is writable */
-@@ -1211,11 +1367,21 @@ void pci_unregister_vga(PCIDevice *pci_dev)
+@@ -1211,11 +1453,21 @@ void pci_unregister_vga(PCIDevice *pci_dev)
      pci_dev->has_vga = false;
  }
  
@@ -9607,7 +9797,7 @@ index 80bc459..fb50597 100644
  static pcibus_t pci_bar_address(PCIDevice *d,
  				int reg, uint8_t type, pcibus_t size)
  {
-@@ -1288,6 +1454,158 @@ static pcibus_t pci_bar_address(PCIDevice *d,
+@@ -1288,6 +1540,158 @@ static pcibus_t pci_bar_address(PCIDevice *d,
      return new_addr;
  }
  
@@ -9766,7 +9956,7 @@ index 80bc459..fb50597 100644
  static void pci_update_mappings(PCIDevice *d)
  {
      PCIIORegion *r;
-@@ -1301,6 +1619,7 @@ static void pci_update_mappings(PCIDevice *d)
+@@ -1301,6 +1705,7 @@ static void pci_update_mappings(PCIDevice *d)
          if (!r->size)
              continue;
  
@@ -9774,7 +9964,29 @@ index 80bc459..fb50597 100644
          new_addr = pci_bar_address(d, i, r->type, r->size);
  
          /* This bar isn't changed */
-@@ -1924,6 +2243,16 @@ static bool pci_root_bus_in_range(PCIBus *bus, int bus_num)
+@@ -1321,6 +1726,10 @@ static void pci_update_mappings(PCIDevice *d)
+                                           PCI_SLOT(d->devfn),
+                                           PCI_FUNC(d->devfn),
+                                           i, r->addr, r->size);
++	    /*
++	     * 如果MemoryRegion->ram不为true, 没有实际分配内存
++	     * 这样就会从kvm trap到qemu
++	     */
+             memory_region_add_subregion_overlap(r->address_space,
+                                                 r->addr, r->memory, 1);
+         }
+@@ -1369,6 +1778,10 @@ void pci_default_write_config(PCIDevice *d, uint32_t addr, uint32_t val_in, int
+         d->config[addr + i] = (d->config[addr + i] & ~wmask) | (val & wmask);
+         d->config[addr + i] &= ~(val & w1cmask); /* W1C: Write 1 to Clear */
+     }
++    /*
++     * 如果更新的config是某个bar的地址
++     * 则要重新update mapping, 以使在读写bar的时候kvm能trap到qemu
++     */
+     if (ranges_overlap(addr, l, PCI_BASE_ADDRESS_0, 24) ||
+         ranges_overlap(addr, l, PCI_ROM_ADDRESS, 4) ||
+         ranges_overlap(addr, l, PCI_ROM_ADDRESS1, 4) ||
+@@ -1924,6 +2337,16 @@ static bool pci_root_bus_in_range(PCIBus *bus, int bus_num)
      return false;
  }
  
@@ -9791,7 +10003,7 @@ index 80bc459..fb50597 100644
  static PCIBus *pci_find_bus_nr(PCIBus *bus, int bus_num)
  {
      PCIBus *sec;
-@@ -1932,6 +2261,10 @@ static PCIBus *pci_find_bus_nr(PCIBus *bus, int bus_num)
+@@ -1932,6 +2355,10 @@ static PCIBus *pci_find_bus_nr(PCIBus *bus, int bus_num)
          return NULL;
      }
  
@@ -9802,7 +10014,7 @@ index 80bc459..fb50597 100644
      if (pci_bus_num(bus) == bus_num) {
          return bus;
      }
-@@ -1992,6 +2325,9 @@ void pci_for_each_bus_depth_first(PCIBus *bus,
+@@ -1992,6 +2419,9 @@ void pci_for_each_bus_depth_first(PCIBus *bus,
  }
  
  
@@ -9812,7 +10024,7 @@ index 80bc459..fb50597 100644
  PCIDevice *pci_find_device(PCIBus *bus, int bus_num, uint8_t devfn)
  {
      bus = pci_find_bus_nr(bus, bus_num);
-@@ -2002,6 +2338,26 @@ PCIDevice *pci_find_device(PCIBus *bus, int bus_num, uint8_t devfn)
+@@ -2002,6 +2432,26 @@ PCIDevice *pci_find_device(PCIBus *bus, int bus_num, uint8_t devfn)
      return bus->devices[devfn];
  }
  
@@ -9839,7 +10051,7 @@ index 80bc459..fb50597 100644
  static void pci_qdev_realize(DeviceState *qdev, Error **errp)
  {
      PCIDevice *pci_dev = (PCIDevice *)qdev;
-@@ -2013,6 +2369,13 @@ static void pci_qdev_realize(DeviceState *qdev, Error **errp)
+@@ -2013,6 +2463,13 @@ static void pci_qdev_realize(DeviceState *qdev, Error **errp)
      /* initialize cap_present for pci_is_express() and pci_config_size(),
       * Note that hybrid PCIs are not set automatically and need to manage
       * QEMU_PCI_CAP_EXPRESS manually */
@@ -9853,7 +10065,7 @@ index 80bc459..fb50597 100644
      if (object_class_dynamic_cast(klass, INTERFACE_PCIE_DEVICE) &&
         !object_class_dynamic_cast(klass, INTERFACE_CONVENTIONAL_PCI_DEVICE)) {
          pci_dev->cap_present |= QEMU_PCI_CAP_EXPRESS;
-@@ -2048,6 +2411,20 @@ static void pci_qdev_realize(DeviceState *qdev, Error **errp)
+@@ -2048,6 +2505,20 @@ static void pci_qdev_realize(DeviceState *qdev, Error **errp)
      }
  }
  
@@ -9874,7 +10086,7 @@ index 80bc459..fb50597 100644
  PCIDevice *pci_create_multifunction(PCIBus *bus, int devfn, bool multifunction,
                                      const char *name)
  {
-@@ -2059,6 +2436,18 @@ PCIDevice *pci_create_multifunction(PCIBus *bus, int devfn, bool multifunction,
+@@ -2059,6 +2530,18 @@ PCIDevice *pci_create_multifunction(PCIBus *bus, int devfn, bool multifunction,
      return PCI_DEVICE(dev);
  }
  
@@ -9893,7 +10105,7 @@ index 80bc459..fb50597 100644
  PCIDevice *pci_create_simple_multifunction(PCIBus *bus, int devfn,
                                             bool multifunction,
                                             const char *name)
-@@ -2073,11 +2462,18 @@ PCIDevice *pci_create(PCIBus *bus, int devfn, const char *name)
+@@ -2073,11 +2556,18 @@ PCIDevice *pci_create(PCIBus *bus, int devfn, const char *name)
      return pci_create_multifunction(bus, devfn, false, name);
  }
  
@@ -9912,7 +10124,7 @@ index 80bc459..fb50597 100644
  static uint8_t pci_find_space(PCIDevice *pdev, uint8_t size)
  {
      int offset = PCI_CONFIG_HEADER_SIZE;
-@@ -2517,16 +2913,32 @@ MemoryRegion *pci_address_space_io(PCIDevice *dev)
+@@ -2517,16 +3007,32 @@ MemoryRegion *pci_address_space_io(PCIDevice *dev)
      return pci_get_bus(dev)->address_space_io;
  }
  
@@ -9945,7 +10157,7 @@ index 80bc459..fb50597 100644
  static void pci_device_class_base_init(ObjectClass *klass, void *data)
  {
      if (!object_class_is_abstract(klass)) {
-@@ -2538,6 +2950,9 @@ static void pci_device_class_base_init(ObjectClass *klass, void *data)
+@@ -2538,6 +3044,9 @@ static void pci_device_class_base_init(ObjectClass *klass, void *data)
      }
  }
  
@@ -9955,7 +10167,7 @@ index 80bc459..fb50597 100644
  AddressSpace *pci_device_iommu_address_space(PCIDevice *dev)
  {
      PCIBus *bus = pci_get_bus(dev);
-@@ -2669,6 +3084,11 @@ static const TypeInfo pci_device_type_info = {
+@@ -2669,6 +3178,11 @@ static const TypeInfo pci_device_type_info = {
  
  static void pci_register_types(void)
  {
@@ -9967,7 +10179,7 @@ index 80bc459..fb50597 100644
      type_register_static(&pci_bus_info);
      type_register_static(&pcie_bus_info);
      type_register_static(&conventional_pci_interface_info);
-@@ -2676,4 +3096,8 @@ static void pci_register_types(void)
+@@ -2676,4 +3190,8 @@ static void pci_register_types(void)
      type_register_static(&pci_device_type_info);
  }
  
