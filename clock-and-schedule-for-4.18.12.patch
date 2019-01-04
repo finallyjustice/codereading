@@ -1,0 +1,247 @@
+From 18319f230035c3a20fec079a261e6863fe0da9c1 Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang@oracle.com>
+Date: Fri, 4 Jan 2019 15:10:20 +0800
+Subject: [PATCH 1/1] clock and schedule for 4.18.12
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ arch/x86/kernel/apic/apic.c |  4 ++++
+ include/linux/clockchips.h  | 27 +++++++++++++++++++++++++++
+ kernel/time/hrtimer.c       |  5 +++++
+ kernel/time/tick-common.c   | 32 ++++++++++++++++++++++++++++++++
+ kernel/time/tick-oneshot.c  |  9 +++++++++
+ kernel/time/tick-sched.c    |  6 ++++++
+ kernel/time/tick-sched.h    | 12 ++++++++++++
+ kernel/time/timekeeping.c   | 23 +++++++++++++++++++++++
+ 8 files changed, 118 insertions(+)
+
+diff --git a/arch/x86/kernel/apic/apic.c b/arch/x86/kernel/apic/apic.c
+index 3b3a2d0..adcf106 100644
+--- a/arch/x86/kernel/apic/apic.c
++++ b/arch/x86/kernel/apic/apic.c
+@@ -1026,6 +1026,10 @@ static void local_apic_timer_interrupt(void)
+ 	 */
+ 	inc_irq_stat(apic_timer_irqs);
+ 
++	/*
++	 * 一个例子是:
++	 *   - hrtimer_interrupt()
++	 */
+ 	evt->event_handler(evt);
+ }
+ 
+diff --git a/include/linux/clockchips.h b/include/linux/clockchips.h
+index 8ae9a95..1a5f1f3 100644
+--- a/include/linux/clockchips.h
++++ b/include/linux/clockchips.h
+@@ -98,6 +98,33 @@ enum clock_event_state {
+  * @owner:		module reference
+  */
+ struct clock_event_device {
++	/*
++	 * 在以下调用:
++	 *   - arch/x86/kernel/apic/apic.c|1029| <<local_apic_timer_interrupt>> evt->event_handler(evt);
++	 *   - arch/x86/kernel/hpet.c|531| <<hpet_interrupt_handler>> hevt->event_handler(hevt);
++	 *   - arch/x86/kernel/time.c|61| <<timer_interrupt>> global_clock_event->event_handler(global_clock_event);
++	 *   - arch/x86/platform/uv/uv_time.c|344| <<uv_rtc_interrupt>> ced->event_handler(ced);
++	 *   - arch/x86/xen/time.c|303| <<xen_timer_interrupt>> evt->event_handler(evt);
++	 *   - kernel/time/tick-broadcast-hrtimer.c|98| <<bc_handler>> ce_broadcast_hrtimer.event_handler(&ce_broadcast_hrtimer);
++	 *   - kernel/time/tick-broadcast.c|254| <<tick_receive_broadcast>> evt->event_handler(evt);
++	 *   - kernel/time/tick-broadcast.c|344| <<tick_handle_periodic_broadcast>> td->evtdev->event_handler(td->evtdev);
++	 *   - kernel/time/tick-broadcast.c|677| <<tick_handle_oneshot_broadcast>> td->evtdev->event_handler(td->evtdev);
++	 *
++	 * 设置的地方:
++	 *   - arch/x86/kernel/apic/apic.c|837| <<calibrate_APIC_clock>> global_clock_event->event_handler = lapic_cal_handler;
++	 *   - arch/x86/kernel/apic/apic.c|854| <<calibrate_APIC_clock>> global_clock_event->event_handler = real_handler;
++	 *   - arch/x86/kernel/apic/apic.c|916| <<calibrate_APIC_clock>> levt->event_handler = lapic_cal_handler;
++	 *   - kernel/time/tick-broadcast.c|104| <<tick_install_broadcast_device>> cur->event_handler = clockevents_handle_noop;
++	 *   - kernel/time/tick-broadcast.c|176| <<tick_device_uses_broadcast>> dev->event_handler = tick_handle_periodic;
++	 *   - kernel/time/tick-broadcast.c|435| <<tick_set_periodic_handler>> dev->event_handler = tick_handle_periodic;
++	 *   - kernel/time/tick-broadcast.c|437| <<tick_set_periodic_handler>> dev->event_handler = tick_handle_periodic_broadcast;
++	 *   - kernel/time/tick-broadcast.c|891| <<tick_broadcast_setup_oneshot>> bc->event_handler = tick_handle_oneshot_broadcast;
++	 *   - kernel/time/tick-common.c|240| <<tick_setup_device>> td->evtdev->event_handler = clockevents_handle_noop;
++	 *   - kernel/time/tick-common.c|434| <<tick_shutdown>> dev->event_handler = clockevents_handle_noop;
++	 *   - kernel/time/tick-internal.h|91| <<tick_set_periodic_handler>> dev->event_handler = tick_handle_periodic;
++	 *   - kernel/time/tick-oneshot.c|69| <<tick_setup_oneshot>> newdev->event_handler = handler;
++	 *   - kernel/time/tick-oneshot.c|104| <<tick_switch_to_oneshot>> dev->event_handler = handler;
++	 */
+ 	void			(*event_handler)(struct clock_event_device *);
+ 	int			(*set_next_event)(unsigned long evt, struct clock_event_device *);
+ 	int			(*set_next_ktime)(ktime_t expires, struct clock_event_device *);
+diff --git a/kernel/time/hrtimer.c b/kernel/time/hrtimer.c
+index 3e93c54..e4bb5a8 100644
+--- a/kernel/time/hrtimer.c
++++ b/kernel/time/hrtimer.c
+@@ -1485,6 +1485,11 @@ static __latent_entropy void hrtimer_run_softirq(struct softirq_action *h)
+  * High resolution timer interrupt
+  * Called with interrupts disabled
+  */
++/*
++ * called and used by:
++ *   - kernel/time/hrtimer.c|1590| <<__hrtimer_peek_ahead_timers>> hrtimer_interrupt(td->evtdev);
++ *   - kernel/time/tick-oneshot.c|130| <<tick_init_highres>> return tick_switch_to_oneshot(hrtimer_interrupt);
++ */
+ void hrtimer_interrupt(struct clock_event_device *dev)
+ {
+ 	struct hrtimer_cpu_base *cpu_base = this_cpu_ptr(&hrtimer_bases);
+diff --git a/kernel/time/tick-common.c b/kernel/time/tick-common.c
+index 14de372..3705cfe 100644
+--- a/kernel/time/tick-common.c
++++ b/kernel/time/tick-common.c
+@@ -49,6 +49,16 @@ ktime_t tick_period;
+  *    at it will take over and keep the time keeping alive.  The handover
+  *    procedure also covers cpu hotplug.
+  */
++/*
++ * 在以下被修改:
++ *   - kernel/time/tick-common.c|194| <<tick_setup_device>> tick_do_timer_cpu = cpu;
++ *   - kernel/time/tick-common.c|377| <<tick_handover_do_timer>> tick_do_timer_cpu = (cpu < nr_cpu_ids) ? cpu :
++ *   - kernel/time/tick-sched.c|130| <<tick_sched_do_timer>> tick_do_timer_cpu = cpu; 
++ *   - kernel/time/tick-common.c|52| <<global>> int tick_do_timer_cpu __read_mostly = TICK_DO_TIMER_BOOT;
++ *   - kernel/time/tick-common.c|196| <<tick_setup_device>> tick_do_timer_cpu = TICK_DO_TIMER_NONE;
++ *   - kernel/time/tick-sched.c|751| <<tick_nohz_stop_tick>> tick_do_timer_cpu = TICK_DO_TIMER_NONE;
++ *   - kernel/time/tick-sched.c|873| <<can_stop_idle_tick>> tick_do_timer_cpu = TICK_DO_TIMER_NONE;
++ */
+ int tick_do_timer_cpu __read_mostly = TICK_DO_TIMER_BOOT;
+ 
+ /*
+@@ -76,6 +86,11 @@ int tick_is_oneshot_available(void)
+ /*
+  * Periodic tick
+  */
++/*
++ * called by:
++ *   - kernel/time/tick-common.c|114| <<tick_handle_periodic>> tick_periodic(cpu);
++ *   - kernel/time/tick-common.c|147| <<tick_handle_periodic>> tick_periodic(cpu);
++ */
+ static void tick_periodic(int cpu)
+ {
+ 	if (tick_do_timer_cpu == cpu) {
+@@ -96,6 +111,23 @@ static void tick_periodic(int cpu)
+ /*
+  * Event handler for periodic ticks
+  */
++/*
++ * 在以下被设置为handler (dev是struct clock_event_device):
++ *   - kernel/time/tick-broadcast.c|176| <<tick_device_uses_broadcast>> dev->event_handler = tick_handle_periodic;
++ *   - kernel/time/tick-broadcast.c|435| <<tick_set_periodic_handler>> dev->event_handler = tick_handle_periodic;
++ *   - kernel/time/tick-internal.h|91| <<tick_set_periodic_handler>> dev->event_handler = tick_handle_periodic;
++ *
++ * 在以下调用event_handler:
++ *   - arch/x86/kernel/apic/apic.c|1029| <<local_apic_timer_interrupt>> evt->event_handler(evt);
++ *   - arch/x86/kernel/hpet.c|531| <<hpet_interrupt_handler>> hevt->event_handler(hevt);
++ *   - arch/x86/kernel/time.c|61| <<timer_interrupt>> global_clock_event->event_handler(global_clock_event);
++ *   - arch/x86/platform/uv/uv_time.c|344| <<uv_rtc_interrupt>> ced->event_handler(ced);
++ *   - arch/x86/xen/time.c|303| <<xen_timer_interrupt>> evt->event_handler(evt);
++ *   - kernel/time/tick-broadcast-hrtimer.c|98| <<bc_handler>> ce_broadcast_hrtimer.event_handler(&ce_broadcast_hrtimer);
++ *   - kernel/time/tick-broadcast.c|254| <<tick_receive_broadcast>> evt->event_handler(evt);
++ *   - kernel/time/tick-broadcast.c|344| <<tick_handle_periodic_broadcast>> td->evtdev->event_handler(td->evtdev);
++ *   - kernel/time/tick-broadcast.c|677| <<tick_handle_oneshot_broadcast>> td->evtdev->event_handler(td->evtdev);
++ */
+ void tick_handle_periodic(struct clock_event_device *dev)
+ {
+ 	int cpu = smp_processor_id();
+diff --git a/kernel/time/tick-oneshot.c b/kernel/time/tick-oneshot.c
+index 6fe615d..eacbe29 100644
+--- a/kernel/time/tick-oneshot.c
++++ b/kernel/time/tick-oneshot.c
+@@ -74,6 +74,11 @@ void tick_setup_oneshot(struct clock_event_device *newdev,
+ /**
+  * tick_switch_to_oneshot - switch to oneshot mode
+  */
++/*
++ * called by:
++ *   - kernel/time/tick-oneshot.c|130| <<tick_init_highres>> return tick_switch_to_oneshot(hrtimer_interrupt);
++ *   - kernel/time/tick-sched.c|1210| <<tick_nohz_switch_to_nohz>> if (tick_switch_to_oneshot(tick_nohz_handler))
++ */
+ int tick_switch_to_oneshot(void (*handler)(struct clock_event_device *))
+ {
+ 	struct tick_device *td = this_cpu_ptr(&tick_cpu_device);
+@@ -125,6 +130,10 @@ int tick_oneshot_mode_active(void)
+  *
+  * Called with interrupts disabled.
+  */
++/*
++ * called by:
++ *   - kernel/time/hrtimer.c|720| <<hrtimer_switch_to_hres>> if (tick_init_highres()) {
++ */
+ int tick_init_highres(void)
+ {
+ 	return tick_switch_to_oneshot(hrtimer_interrupt);
+diff --git a/kernel/time/tick-sched.c b/kernel/time/tick-sched.c
+index 5b33e2f..5f5c7c2 100644
+--- a/kernel/time/tick-sched.c
++++ b/kernel/time/tick-sched.c
+@@ -54,6 +54,12 @@ static ktime_t last_jiffies_update;
+ /*
+  * Must be called with interrupts disabled !
+  */
++/*
++ * called by:
++ *   - kernel/time/tick-sched.c|135| <<tick_sched_do_timer>> tick_do_update_jiffies64(now);
++ *   - kernel/time/tick-sched.c|499| <<tick_nohz_update_jiffies>> tick_do_update_jiffies64(now);
++ *   - kernel/time/tick-sched.c|824| <<tick_nohz_restart_sched_tick>> tick_do_update_jiffies64(now);
++ */
+ static void tick_do_update_jiffies64(ktime_t now)
+ {
+ 	unsigned long ticks = 0;
+diff --git a/kernel/time/tick-sched.h b/kernel/time/tick-sched.h
+index 6de959a..e031a7b 100644
+--- a/kernel/time/tick-sched.h
++++ b/kernel/time/tick-sched.h
+@@ -6,6 +6,18 @@
+ 
+ enum tick_device_mode {
+ 	TICKDEV_MODE_PERIODIC,
++	/*
++	 * used by:
++	 *   - kernel/time/tick-broadcast.c|82| <<tick_check_broadcast_device>> if (tick_broadcast_device.mode == TICKDEV_MODE_ONESHOT &&
++	 *   - kernel/time/tick-broadcast.c|202| <<tick_device_uses_broadcast>> case TICKDEV_MODE_ONESHOT:
++	 *   - kernel/time/tick-broadcast.c|488| <<tick_resume_check_broadcast>> if (tick_broadcast_device.mode == TICKDEV_MODE_ONESHOT)
++	 *   - kernel/time/tick-broadcast.c|511| <<tick_resume_broadcast>> case TICKDEV_MODE_ONESHOT:
++	 *   - kernel/time/tick-broadcast.c|591| <<tick_check_oneshot_broadcast_this_cpu>> if (td->mode == TICKDEV_MODE_ONESHOT) {
++	 *   - kernel/time/tick-broadcast.c|933| <<tick_broadcast_switch_to_oneshot>> tick_broadcast_device.mode = TICKDEV_MODE_ONESHOT;
++	 *   - kernel/time/tick-broadcast.c|983| <<tick_broadcast_oneshot_active>> return tick_broadcast_device.mode == TICKDEV_MODE_ONESHOT;
++	 *   - kernel/time/tick-oneshot.c|103| <<tick_switch_to_oneshot>> td->mode = TICKDEV_MODE_ONESHOT;
++	 *   - kernel/time/tick-oneshot.c|121| <<tick_oneshot_mode_active>> ret = __this_cpu_read(tick_cpu_device.mode) == TICKDEV_MODE_ONESHOT;
++	 */
+ 	TICKDEV_MODE_ONESHOT,
+ };
+ 
+diff --git a/kernel/time/timekeeping.c b/kernel/time/timekeeping.c
+index 4786df9..0a721c0 100644
+--- a/kernel/time/timekeeping.c
++++ b/kernel/time/timekeeping.c
+@@ -2167,6 +2167,29 @@ EXPORT_SYMBOL(ktime_get_coarse_ts64);
+ /*
+  * Must hold jiffies_lock
+  */
++/*
++ * CPU0, CPU1:
++ * [0] do_timer
++ * [0] tick_do_update_jiffies64.part.10
++ * [0] tick_sched_do_timer
++ * [0] tick_sched_timer
++ * [0] __hrtimer_run_queues
++ * [0] hrtimer_interrupt
++ * [0] smp_apic_timer_interrupt
++ * [0] apic_timer_interrupt
++ *
++ * [0] do_timer
++ * [0] tick_do_update_jiffies64.part.10
++ * [0] tick_irq_enter
++ * [0] irq_enter
++ * [0] do_IRQ
++ * [0] common_interrupt
++ *
++ * called by:
++ *   - kernel/time/tick-common.c|87| <<tick_periodic>> do_timer(1);
++ *   - kernel/time/tick-sched.c|88| <<tick_do_update_jiffies64>> do_timer(++ticks);
++ *   - kernel/time/timekeeping.c|2366| <<xtime_update>> do_timer(ticks);
++ */
+ void do_timer(unsigned long ticks)
+ {
+ 	jiffies_64 += ticks;
+-- 
+2.7.4
+
