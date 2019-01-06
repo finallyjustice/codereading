@@ -1,20 +1,72 @@
-From 18319f230035c3a20fec079a261e6863fe0da9c1 Mon Sep 17 00:00:00 2001
+From 0e0ffd586261d5d09c080681b4ce61427516a9b8 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang@oracle.com>
-Date: Fri, 4 Jan 2019 15:10:20 +0800
+Date: Sun, 6 Jan 2019 13:29:45 +0800
 Subject: [PATCH 1/1] clock and schedule for 4.18.12
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
- arch/x86/kernel/apic/apic.c |  4 ++++
- include/linux/clockchips.h  | 27 +++++++++++++++++++++++++++
- kernel/time/hrtimer.c       |  5 +++++
- kernel/time/tick-common.c   | 32 ++++++++++++++++++++++++++++++++
- kernel/time/tick-oneshot.c  |  9 +++++++++
- kernel/time/tick-sched.c    |  6 ++++++
- kernel/time/tick-sched.h    | 12 ++++++++++++
- kernel/time/timekeeping.c   | 23 +++++++++++++++++++++++
- 8 files changed, 118 insertions(+)
+ arch/x86/include/asm/pvclock.h |  25 +++++++
+ arch/x86/kernel/apic/apic.c    |   4 +
+ arch/x86/kernel/pvclock.c      |   8 ++
+ arch/x86/xen/time.c            | 161 +++++++++++++++++++++++++++++++++++++++++
+ include/linux/clockchips.h     |  34 +++++++++
+ kernel/sched/loadavg.c         |   4 +
+ kernel/time/clockevents.c      |  18 +++++
+ kernel/time/hrtimer.c          |   5 ++
+ kernel/time/tick-broadcast.c   |   4 +
+ kernel/time/tick-common.c      |  39 ++++++++++
+ kernel/time/tick-oneshot.c     |   9 +++
+ kernel/time/tick-sched.c       |  30 ++++++++
+ kernel/time/tick-sched.h       |  12 +++
+ kernel/time/timekeeping.c      |  27 +++++++
+ 14 files changed, 380 insertions(+)
 
+diff --git a/arch/x86/include/asm/pvclock.h b/arch/x86/include/asm/pvclock.h
+index b603368..a85a2b3 100644
+--- a/arch/x86/include/asm/pvclock.h
++++ b/arch/x86/include/asm/pvclock.h
+@@ -26,6 +26,10 @@ unsigned pvclock_read_begin(const struct pvclock_vcpu_time_info *src)
+ 	return version;
+ }
+ 
++/*
++ * 判断参数的version和pvclock_vcpu_time_info->version是否相等
++ * 不相等返回true
++ */
+ static __always_inline
+ bool pvclock_read_retry(const struct pvclock_vcpu_time_info *src,
+ 			unsigned version)
+@@ -78,9 +82,30 @@ static inline u64 pvclock_scale_delta(u64 delta, u32 mul_frac, int shift)
+ 	return product;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kernel/pvclock.c|87| <<pvclock_clocksource_read>> ret = __pvclock_read_cycles(src, rdtsc_ordered());
++ *   - arch/x86/kvm/x86.c|1963| <<get_kvmclock_ns>> ret = __pvclock_read_cycles(&hv_clock, rdtsc());
++ *   - arch/x86/entry/vdso/vclock_gettime.c|138| <<vread_pvclock>> ret = __pvclock_read_cycles(pvti, rdtsc_ordered());
++ *   - drivers/ptp/ptp_kvm.c|80| <<ptp_kvm_get_time_fn>> ret = __pvclock_read_cycles(src, clock_pair.tsc);
++ */
+ static __always_inline
+ u64 __pvclock_read_cycles(const struct pvclock_vcpu_time_info *src, u64 tsc)
+ {
++	/*
++	 * struct pvclock_vcpu_time_info {
++	 *      u32   version;
++	 *      u32   pad0;
++	 *      u64   tsc_timestamp;
++	 *      u64   system_time;
++	 *      u32   tsc_to_system_mul;
++	 *      s8    tsc_shift;
++	 *      u8    flags;
++	 *      u8    pad[2];
++	 * }
++	 *
++	 * PerCPUTime = ((RDTSC() - tsc_timestamp) >> tsc_shift) * tsc_to_system_mul + system_time
++	 */
+ 	u64 delta = tsc - src->tsc_timestamp;
+ 	u64 offset = pvclock_scale_delta(delta, src->tsc_to_system_mul,
+ 					     src->tsc_shift);
 diff --git a/arch/x86/kernel/apic/apic.c b/arch/x86/kernel/apic/apic.c
 index 3b3a2d0..adcf106 100644
 --- a/arch/x86/kernel/apic/apic.c
@@ -30,11 +82,376 @@ index 3b3a2d0..adcf106 100644
  	evt->event_handler(evt);
  }
  
+diff --git a/arch/x86/kernel/pvclock.c b/arch/x86/kernel/pvclock.c
+index 637982e..2004572 100644
+--- a/arch/x86/kernel/pvclock.c
++++ b/arch/x86/kernel/pvclock.c
+@@ -83,10 +83,18 @@ u64 pvclock_clocksource_read(struct pvclock_vcpu_time_info *src)
+ 	u8 flags;
+ 
+ 	do {
++		/* 返回pvclock_vcpu_time_info->version */
+ 		version = pvclock_read_begin(src);
++		/*
++		 * rdtsc_ordered()会调用rdtsc()
++		 */
+ 		ret = __pvclock_read_cycles(src, rdtsc_ordered());
+ 		flags = src->flags;
+ 	} while (pvclock_read_retry(src, version));
++	/*
++	 * 判断参数的version和pvclock_vcpu_time_info->version是否相等
++	 * 不相等返回true
++	 */
+ 
+ 	if (unlikely((flags & PVCLOCK_GUEST_STOPPED) != 0)) {
+ 		src->flags &= ~PVCLOCK_GUEST_STOPPED;
+diff --git a/arch/x86/xen/time.c b/arch/x86/xen/time.c
+index e0f1bcf..5c25dbc 100644
+--- a/arch/x86/xen/time.c
++++ b/arch/x86/xen/time.c
+@@ -28,10 +28,31 @@
+ 
+ #include "xen-ops.h"
+ 
++/*
++ * struct clocksource xen_clocksource (name是"xen")
++ * struct clock_event_device xen_timerop_clockevent (name是"xen")
++ * struct clock_event_device xen_vcpuop_clockevent (name也是xen)
++ *
++ * 其他的clocksource:
++ *   - clocksource_tsc
++ *   - clocksource_hpet
++ *
++ * 其他的clockevent:
++ *   - lapic_clockevent
++ *   - hpet_clockevent
++ */
++
+ /* Xen may fire a timer up to this many ns early */
+ #define TIMER_SLOP	100000
+ 
+ /* Get the TSC speed from Xen */
++/*
++ * 在以下被使用:
++ *   - arch/x86/xen/time.c|556| <<xen_init_time_ops>> x86_platform.calibrate_tsc = xen_tsc_khz;
++ *   - arch/x86/xen/time.c|604| <<xen_hvm_init_time_ops>> x86_platform.calibrate_tsc = xen_tsc_khz;
++ *
++ * 返回xen的tsc speed
++ */
+ static unsigned long xen_tsc_khz(void)
+ {
+ 	struct pvclock_vcpu_time_info *info =
+@@ -40,23 +61,66 @@ static unsigned long xen_tsc_khz(void)
+ 	return pvclock_tsc_khz(info);
+ }
+ 
++/*
++ * 被以下使用:
++ *   - arch/x86/xen/time.c|57| <<xen_clocksource_get_cycles>> return xen_clocksource_read();
++ *   - arch/x86/xen/time.c|109| <<xen_pvclock_gtod_notify>> op.u.settime64.system_time = xen_clocksource_read();
++ *   - arch/x86/xen/time.c|114| <<xen_pvclock_gtod_notify>> op.u.settime32.system_time = xen_clocksource_read();
++ *   - arch/x86/xen/time.c|188| <<get_abs_timeout>> return xen_clocksource_read() + delta;
++ *   - arch/x86/xen/time.c|399| <<global>> .sched_clock = xen_clocksource_read,
++ *
++ * 通过当前vcpu的pvclock_vcpu_time_info返回:
++ * PerCPUTime = ((RDTSC() - tsc_timestamp) >> tsc_shift) * tsc_to_system_mul + system_time
++ */
+ u64 xen_clocksource_read(void)
+ {
+         struct pvclock_vcpu_time_info *src;
+ 	u64 ret;
+ 
++	/*
++	 * struct pvclock_vcpu_time_info {
++	 *	u32   version;
++	 *	u32   pad0;
++	 *	u64   tsc_timestamp;
++	 *	u64   system_time;
++	 *	u32   tsc_to_system_mul;
++	 *	s8    tsc_shift;
++	 *	u8    flags;
++	 *	u8    pad[2];
++	 * }
++	 *
++	 * PerCPUTime = ((RDTSC() - tsc_timestamp) >> tsc_shift) * tsc_to_system_mul + system_time
++	 */
++
+ 	preempt_disable_notrace();
++	/*
++	 * xen_vcpu是struct vcpu_info
++	 */
+ 	src = &__this_cpu_read(xen_vcpu)->time;
+ 	ret = pvclock_clocksource_read(src);
+ 	preempt_enable_notrace();
+ 	return ret;
+ }
+ 
++/*
++ * 和参数没任何关系
++ * 通过当前vcpu的pvclock_vcpu_time_info返回:
++ * PerCPUTime = ((RDTSC() - tsc_timestamp) >> tsc_shift) * tsc_to_system_mul + system_time
++ */
+ static u64 xen_clocksource_get_cycles(struct clocksource *cs)
+ {
++	/*
++	 * 通过当前vcpu的pvclock_vcpu_time_info返回:
++	 * PerCPUTime = ((RDTSC() - tsc_timestamp) >> tsc_shift) * tsc_to_system_mul + system_time
++	 */
+ 	return xen_clocksource_read();
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/xen/time.c|89| <<xen_get_wallclock>> xen_read_wallclock(now);
++ *   - arch/x86/xen/time.c|540| <<xen_time_init>> xen_read_wallclock(&tp);
++ */
+ static void xen_read_wallclock(struct timespec64 *ts)
+ {
+ 	struct shared_info *s = HYPERVISOR_shared_info;
+@@ -78,6 +142,9 @@ static int xen_set_wallclock(const struct timespec64 *now)
+ 	return -ENODEV;
+ }
+ 
++/*
++ * struct notifier_block xen_pvclock_gtod_notifier.notifier_call = xen_pvclock_gtod_notify()
++ */
+ static int xen_pvclock_gtod_notify(struct notifier_block *nb,
+ 				   unsigned long was_set, void *priv)
+ {
+@@ -138,6 +205,12 @@ static struct notifier_block xen_pvclock_gtod_notifier = {
+ 	.notifier_call = xen_pvclock_gtod_notify,
+ };
+ 
++/*
++ * 在以下被使用:
++ *   - arch/x86/xen/time.c|470| <<xen_time_init>> clocksource_register_hz(&xen_clocksource, NSEC_PER_SEC);
++ *   - arch/x86/xen/time.c|468| <<xen_time_init>> xen_clocksource.rating = 275;
++ *   - arch/x86/xen/time.c|457| <<xen_setup_vsyscall_time_info>> xen_clocksource.archdata.vclock_mode = VCLOCK_PVCLOCK;
++ */
+ static struct clocksource xen_clocksource __read_mostly = {
+ 	.name = "xen",
+ 	.rating = 400,
+@@ -182,6 +255,9 @@ static s64 get_abs_timeout(unsigned long delta)
+ 	return xen_clocksource_read() + delta;
+ }
+ 
++/*
++ * struct clock_event_device xen_timerop_clockevent.set_state_shutdown = xen_timerop_shutdown()
++ */
+ static int xen_timerop_shutdown(struct clock_event_device *evt)
+ {
+ 	/* cancel timeout */
+@@ -190,6 +266,9 @@ static int xen_timerop_shutdown(struct clock_event_device *evt)
+ 	return 0;
+ }
+ 
++/*
++ * struct clock_event_device xen_timerop_clockevent.set_next_event = xen_timerop_set_next_event()
++ */
+ static int xen_timerop_set_next_event(unsigned long delta,
+ 				      struct clock_event_device *evt)
+ {
+@@ -222,6 +301,9 @@ static const struct clock_event_device xen_timerop_clockevent = {
+ 	.set_next_event		= xen_timerop_set_next_event,
+ };
+ 
++/*
++ * struct clock_event_device xen_vcpuop_clockevent.set_state_shutdown = xen_vcpuop_shutdown()
++ */
+ static int xen_vcpuop_shutdown(struct clock_event_device *evt)
+ {
+ 	int cpu = smp_processor_id();
+@@ -235,6 +317,9 @@ static int xen_vcpuop_shutdown(struct clock_event_device *evt)
+ 	return 0;
+ }
+ 
++/*
++ * struct clock_event_device xen_vcpuop_clockevent.set_state_oneshot = xen_vcpuop_set_oneshot()
++ */
+ static int xen_vcpuop_set_oneshot(struct clock_event_device *evt)
+ {
+ 	int cpu = smp_processor_id();
+@@ -246,6 +331,9 @@ static int xen_vcpuop_set_oneshot(struct clock_event_device *evt)
+ 	return 0;
+ }
+ 
++/*
++ * struct clock_event_device xen_vcpuop_clockevent.set_next_event = xen_vcpuop_set_next_event()
++ */
+ static int xen_vcpuop_set_next_event(unsigned long delta,
+ 				     struct clock_event_device *evt)
+ {
+@@ -266,6 +354,11 @@ static int xen_vcpuop_set_next_event(unsigned long delta,
+ 	return ret;
+ }
+ 
++/*
++ * used by:
++ *   - arch/x86/xen/time.c|383| <<xen_timer_resume>> if (xen_clockevent != &xen_vcpuop_clockevent)
++ *   - arch/x86/xen/time.c|515| <<xen_time_init>> xen_clockevent = &xen_vcpuop_clockevent;
++ */
+ static const struct clock_event_device xen_vcpuop_clockevent = {
+ 	.name = "xen",
+ 	.features = CLOCK_EVT_FEAT_ONESHOT,
+@@ -284,6 +377,12 @@ static const struct clock_event_device xen_vcpuop_clockevent = {
+ 	.set_next_event = xen_vcpuop_set_next_event,
+ };
+ 
++/*
++ * used by:
++ *   - arch/x86/xen/time.c|347| <<xen_setup_timer>> memcpy(evt, xen_clockevent, sizeof(*evt));
++ *   - arch/x86/xen/time.c|365| <<xen_timer_resume>> if (xen_clockevent != &xen_vcpuop_clockevent)
++ *   - arch/x86/xen/time.c|488| <<xen_time_init>> xen_clockevent = &xen_vcpuop_clockevent;
++ */
+ static const struct clock_event_device *xen_clockevent =
+ 	&xen_timerop_clockevent;
+ 
+@@ -293,6 +392,10 @@ struct xen_clock_event_device {
+ };
+ static DEFINE_PER_CPU(struct xen_clock_event_device, xen_clock_events) = { .evt.irq = -1 };
+ 
++/*
++ * 在以下被使用:
++ *   - arch/x86/xen/time.c|404| <<xen_setup_timer>> irq = bind_virq_to_irqhandler(VIRQ_TIMER, cpu, xen_timer_interrupt,
++ */
+ static irqreturn_t xen_timer_interrupt(int irq, void *dev_id)
+ {
+ 	struct clock_event_device *evt = this_cpu_ptr(&xen_clock_events.evt);
+@@ -318,8 +421,18 @@ void xen_teardown_timer(int cpu)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/xen/time.c|508| <<xen_time_init>> xen_setup_timer(cpu);
++ *   - arch/x86/xen/enlighten_hvm.c|156| <<xen_cpu_up_prepare_hvm>> xen_setup_timer(cpu);
++ *   - arch/x86/xen/enlighten_pv.c|1421| <<xen_cpu_up_prepare_pv>> xen_setup_timer(cpu);
++ */
+ void xen_setup_timer(int cpu)
+ {
++	/*
++	 * 在上面定义的:
++	 *   - static DEFINE_PER_CPU(struct xen_clock_event_device, xen_clock_events) = { .evt.irq = -1 };
++	 */
+ 	struct xen_clock_event_device *xevt = &per_cpu(xen_clock_events, cpu);
+ 	struct clock_event_device *evt = &xevt->evt;
+ 	int irq;
+@@ -345,6 +458,12 @@ void xen_setup_timer(int cpu)
+ }
+ 
+ 
++/*
++ * called by:
++ *   - arch/x86/xen/smp_pv.c|76| <<cpu_bringup>> xen_setup_cpu_clockevents();
++ *   - arch/x86/xen/time.c|509| <<xen_time_init>> xen_setup_cpu_clockevents();
++ *   - arch/x86/xen/time.c|542| <<xen_hvm_setup_cpu_clockevents>> xen_setup_cpu_clockevents();
++ */
+ void xen_setup_cpu_clockevents(void)
+ {
+ 	clockevents_register_device(this_cpu_ptr(&xen_clock_events.evt));
+@@ -366,6 +485,11 @@ void xen_timer_resume(void)
+ 	}
+ }
+ 
++/*
++ * used by:
++ *   - arch/x86/xen/time.c|519| <<xen_init_time_ops>> pv_time_ops = xen_time_ops;
++ *   - arch/x86/xen/time.c|561| <<xen_hvm_init_time_ops>> pv_time_ops = xen_time_ops;
++ */
+ static const struct pv_time_ops xen_time_ops __initconst = {
+ 	.sched_clock = xen_clocksource_read,
+ 	.steal_clock = xen_steal_clock,
+@@ -416,6 +540,10 @@ void xen_restore_time_memory_area(void)
+ 			  ret);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/xen/time.c|504| <<xen_time_init>> xen_setup_vsyscall_time_info();
++ */
+ static void xen_setup_vsyscall_time_info(void)
+ {
+ 	struct vcpu_register_time_memory_area t;
+@@ -457,6 +585,11 @@ static void xen_setup_vsyscall_time_info(void)
+ 	xen_clocksource.archdata.vclock_mode = VCLOCK_PVCLOCK;
+ }
+ 
++/*
++ * 在以下被使用:
++ *   - arch/x86/xen/time.c|510| <<xen_init_time_ops>> x86_init.timers.timer_init = xen_time_init;
++ *   - arch/x86/xen/time.c|551| <<xen_hvm_init_time_ops>> x86_init.timers.setup_percpu_clockev = xen_time_init;
++ */
+ static void __init xen_time_init(void)
+ {
+ 	struct pvclock_vcpu_time_info *pvti;
+@@ -467,6 +600,12 @@ static void __init xen_time_init(void)
+ 	if (xen_initial_domain())
+ 		xen_clocksource.rating = 275;
+ 
++	/*
++	 * xen_clocksource在以下被使用:
++	 *   - arch/x86/xen/time.c|470| <<xen_time_init>> clocksource_register_hz(&xen_clocksource, NSEC_PER_SEC);
++	 *   - arch/x86/xen/time.c|468| <<xen_time_init>> xen_clocksource.rating = 275;
++	 *   - arch/x86/xen/time.c|457| <<xen_setup_vsyscall_time_info>> xen_clocksource.archdata.vclock_mode = VCLOCK_PVCLOCK;
++	 */
+ 	clocksource_register_hz(&xen_clocksource, NSEC_PER_SEC);
+ 
+ 	if (HYPERVISOR_vcpu_op(VCPUOP_stop_periodic_timer, xen_vcpu_nr(cpu),
+@@ -474,6 +613,16 @@ static void __init xen_time_init(void)
+ 		/* Successfully turned off 100Hz tick, so we have the
+ 		   vcpuop-based timer interface */
+ 		printk(KERN_DEBUG "Xen: using vcpuop timer interface\n");
++		/*
++		 * used by:
++		 *   - arch/x86/xen/time.c|347| <<xen_setup_timer>> memcpy(evt, xen_clockevent, sizeof(*evt));
++		 *   - arch/x86/xen/time.c|365| <<xen_timer_resume>> if (xen_clockevent != &xen_vcpuop_clockevent)
++		 *   - arch/x86/xen/time.c|488| <<xen_time_init>> xen_clockevent = &xen_vcpuop_clockevent;
++		 *
++		 * 一共两种clock event:
++		 *   -> struct clock_event_device xen_timerop_clockevent (name是"xen")
++		 *   -> struct clock_event_device xen_vcpuop_clockevent (name也是xen)
++		 */
+ 		xen_clockevent = &xen_vcpuop_clockevent;
+ 	}
+ 
+@@ -503,6 +652,10 @@ static void __init xen_time_init(void)
+ 		pvclock_gtod_register_notifier(&xen_pvclock_gtod_notifier);
+ }
+ 
++/*
++ * 只在一处被调用:
++ *   - arch/x86/xen/enlighten_pv.c|972| <<xen_setup_shared_info>> xen_init_time_ops();
++ */
+ void __ref xen_init_time_ops(void)
+ {
+ 	pv_time_ops = xen_time_ops;
+@@ -519,6 +672,10 @@ void __ref xen_init_time_ops(void)
+ }
+ 
+ #ifdef CONFIG_XEN_PVHVM
++/*
++ * used only by:
++ *   - arch/x86/xen/time.c|563| <<xen_hvm_init_time_ops>> x86_cpuinit.setup_percpu_clockev = xen_hvm_setup_cpu_clockevents;
++ */
+ static void xen_hvm_setup_cpu_clockevents(void)
+ {
+ 	int cpu = smp_processor_id();
+@@ -531,6 +688,10 @@ static void xen_hvm_setup_cpu_clockevents(void)
+ 	xen_setup_cpu_clockevents();
+ }
+ 
++/*
++ * 只在一处被调用:
++ *   - arch/x86/xen/enlighten_hvm.c|202| <<xen_hvm_guest_init>> xen_hvm_init_time_ops();
++ */
+ void __init xen_hvm_init_time_ops(void)
+ {
+ 	/*
 diff --git a/include/linux/clockchips.h b/include/linux/clockchips.h
-index 8ae9a95..1a5f1f3 100644
+index 8ae9a95..38a6335 100644
 --- a/include/linux/clockchips.h
 +++ b/include/linux/clockchips.h
-@@ -98,6 +98,33 @@ enum clock_event_state {
+@@ -98,7 +98,41 @@ enum clock_event_state {
   * @owner:		module reference
   */
  struct clock_event_device {
@@ -66,8 +483,74 @@ index 8ae9a95..1a5f1f3 100644
 +	 *   - kernel/time/tick-oneshot.c|104| <<tick_switch_to_oneshot>> dev->event_handler = handler;
 +	 */
  	void			(*event_handler)(struct clock_event_device *);
++	/*
++	 * called by:
++	 *   - called by:
++	 *   - kernel/time/clockevents.c|256| <<clockevents_program_min_delta>> if (dev->set_next_event((unsigned long ) clc, dev) == 0)
++	 *   - kernel/time/clockevents.c|295| <<clockevents_program_min_delta>> if (dev->set_next_event((unsigned long ) clc, dev) == 0)
++	 *   - kernel/time/clockevents.c|344| <<clockevents_program_event>> rc = dev->set_next_event((unsigned long ) clc, dev);
++	 */
  	int			(*set_next_event)(unsigned long evt, struct clock_event_device *);
  	int			(*set_next_ktime)(ktime_t expires, struct clock_event_device *);
+ 	ktime_t			next_event;
+diff --git a/kernel/sched/loadavg.c b/kernel/sched/loadavg.c
+index a171c12..8754ab6 100644
+--- a/kernel/sched/loadavg.c
++++ b/kernel/sched/loadavg.c
+@@ -349,6 +349,10 @@ static inline void calc_global_nohz(void) { }
+  *
+  * Called from the global timer code.
+  */
++/*
++ * 只被do_timer()调用:
++ *   - kernel/time/timekeeping.c|2196| <<do_timer>> calc_global_load(ticks);
++ */
+ void calc_global_load(unsigned long ticks)
+ {
+ 	unsigned long sample_window;
+diff --git a/kernel/time/clockevents.c b/kernel/time/clockevents.c
+index 16c027e..e3aa7d6 100644
+--- a/kernel/time/clockevents.c
++++ b/kernel/time/clockevents.c
+@@ -253,6 +253,12 @@ static int clockevents_program_min_delta(struct clock_event_device *dev)
+ 
+ 		dev->retries++;
+ 		clc = ((unsigned long long) delta * dev->mult) >> dev->shift;
++		/*
++		 * called by:
++		 *   - kernel/time/clockevents.c|256| <<clockevents_program_min_delta>> if (dev->set_next_event((unsigned long ) clc, dev) == 0)
++		 *   - kernel/time/clockevents.c|295| <<clockevents_program_min_delta>> if (dev->set_next_event((unsigned long ) clc, dev) == 0)
++		 *   - kernel/time/clockevents.c|344| <<clockevents_program_event>> rc = dev->set_next_event((unsigned long ) clc, dev);
++		 */
+ 		if (dev->set_next_event((unsigned long) clc, dev) == 0)
+ 			return 0;
+ 
+@@ -292,6 +298,12 @@ static int clockevents_program_min_delta(struct clock_event_device *dev)
+ 
+ 		dev->retries++;
+ 		clc = ((unsigned long long) delta * dev->mult) >> dev->shift;
++		/*
++		 * called by:
++		 *   - kernel/time/clockevents.c|256| <<clockevents_program_min_delta>> if (dev->set_next_event((unsigned long ) clc, dev) == 0)
++		 *   - kernel/time/clockevents.c|295| <<clockevents_program_min_delta>> if (dev->set_next_event((unsigned long ) clc, dev) == 0)
++		 *   - kernel/time/clockevents.c|344| <<clockevents_program_event>> rc = dev->set_next_event((unsigned long ) clc, dev);
++		 */
+ 		if (dev->set_next_event((unsigned long) clc, dev) == 0)
+ 			return 0;
+ 	}
+@@ -341,6 +353,12 @@ int clockevents_program_event(struct clock_event_device *dev, ktime_t expires,
+ 	delta = max(delta, (int64_t) dev->min_delta_ns);
+ 
+ 	clc = ((unsigned long long) delta * dev->mult) >> dev->shift;
++	/*
++	 * called by:
++	 *   - kernel/time/clockevents.c|256| <<clockevents_program_min_delta>> if (dev->set_next_event((unsigned long ) clc, dev) == 0)
++	 *   - kernel/time/clockevents.c|295| <<clockevents_program_min_delta>> if (dev->set_next_event((unsigned long ) clc, dev) == 0)
++	 *   - kernel/time/clockevents.c|344| <<clockevents_program_event>> rc = dev->set_next_event((unsigned long ) clc, dev);
++	 */
+ 	rc = dev->set_next_event((unsigned long) clc, dev);
+ 
+ 	return (rc && force) ? clockevents_program_min_delta(dev) : rc;
 diff --git a/kernel/time/hrtimer.c b/kernel/time/hrtimer.c
 index 3e93c54..e4bb5a8 100644
 --- a/kernel/time/hrtimer.c
@@ -84,11 +567,26 @@ index 3e93c54..e4bb5a8 100644
  void hrtimer_interrupt(struct clock_event_device *dev)
  {
  	struct hrtimer_cpu_base *cpu_base = this_cpu_ptr(&hrtimer_bases);
+diff --git a/kernel/time/tick-broadcast.c b/kernel/time/tick-broadcast.c
+index aa2094d..fb8cfd7 100644
+--- a/kernel/time/tick-broadcast.c
++++ b/kernel/time/tick-broadcast.c
+@@ -304,6 +304,10 @@ static bool tick_do_broadcast(struct cpumask *mask)
+  * Periodic broadcast:
+  * - invoke the broadcast handlers
+  */
++/*
++ * called only by:
++ *   - kernel/time/tick-broadcast.c|329| <<tick_handle_periodic_broadcast>> bc_local = tick_do_periodic_broadcast();
++ */
+ static bool tick_do_periodic_broadcast(void)
+ {
+ 	cpumask_and(tmpmask, cpu_online_mask, tick_broadcast_mask);
 diff --git a/kernel/time/tick-common.c b/kernel/time/tick-common.c
-index 14de372..3705cfe 100644
+index 14de372..1f1cfdd 100644
 --- a/kernel/time/tick-common.c
 +++ b/kernel/time/tick-common.c
-@@ -49,6 +49,16 @@ ktime_t tick_period;
+@@ -49,6 +49,15 @@ ktime_t tick_period;
   *    at it will take over and keep the time keeping alive.  The handover
   *    procedure also covers cpu hotplug.
   */
@@ -97,7 +595,6 @@ index 14de372..3705cfe 100644
 + *   - kernel/time/tick-common.c|194| <<tick_setup_device>> tick_do_timer_cpu = cpu;
 + *   - kernel/time/tick-common.c|377| <<tick_handover_do_timer>> tick_do_timer_cpu = (cpu < nr_cpu_ids) ? cpu :
 + *   - kernel/time/tick-sched.c|130| <<tick_sched_do_timer>> tick_do_timer_cpu = cpu; 
-+ *   - kernel/time/tick-common.c|52| <<global>> int tick_do_timer_cpu __read_mostly = TICK_DO_TIMER_BOOT;
 + *   - kernel/time/tick-common.c|196| <<tick_setup_device>> tick_do_timer_cpu = TICK_DO_TIMER_NONE;
 + *   - kernel/time/tick-sched.c|751| <<tick_nohz_stop_tick>> tick_do_timer_cpu = TICK_DO_TIMER_NONE;
 + *   - kernel/time/tick-sched.c|873| <<can_stop_idle_tick>> tick_do_timer_cpu = TICK_DO_TIMER_NONE;
@@ -105,7 +602,7 @@ index 14de372..3705cfe 100644
  int tick_do_timer_cpu __read_mostly = TICK_DO_TIMER_BOOT;
  
  /*
-@@ -76,6 +86,11 @@ int tick_is_oneshot_available(void)
+@@ -76,6 +85,11 @@ int tick_is_oneshot_available(void)
  /*
   * Periodic tick
   */
@@ -117,7 +614,7 @@ index 14de372..3705cfe 100644
  static void tick_periodic(int cpu)
  {
  	if (tick_do_timer_cpu == cpu) {
-@@ -96,6 +111,23 @@ static void tick_periodic(int cpu)
+@@ -96,6 +110,23 @@ static void tick_periodic(int cpu)
  /*
   * Event handler for periodic ticks
   */
@@ -141,6 +638,28 @@ index 14de372..3705cfe 100644
  void tick_handle_periodic(struct clock_event_device *dev)
  {
  	int cpu = smp_processor_id();
+@@ -174,6 +205,11 @@ void tick_setup_periodic(struct clock_event_device *dev, int broadcast)
+ /*
+  * Setup the tick device
+  */
++/*
++ * called by:
++ *   - kernel/time/tick-common.c|273| <<tick_install_replacement>> tick_setup_device(td, newdev, cpu, cpumask_of(cpu));
++ *   - kernel/time/tick-common.c|362| <<tick_check_new_device>> tick_setup_device(td, newdev, cpu, cpumask_of(cpu));
++ */
+ static void tick_setup_device(struct tick_device *td,
+ 			      struct clock_event_device *newdev, int cpu,
+ 			      const struct cpumask *cpumask)
+@@ -190,6 +226,9 @@ static void tick_setup_device(struct tick_device *td,
+ 		 * this cpu:
+ 		 */
+ 		if (tick_do_timer_cpu == TICK_DO_TIMER_BOOT) {
++			/*
++			 * tick_nohz_full_cpu()依赖CONFIG_NO_HZ_FULL
++			 */
+ 			if (!tick_nohz_full_cpu(cpu))
+ 				tick_do_timer_cpu = cpu;
+ 			else
 diff --git a/kernel/time/tick-oneshot.c b/kernel/time/tick-oneshot.c
 index 6fe615d..eacbe29 100644
 --- a/kernel/time/tick-oneshot.c
@@ -169,7 +688,7 @@ index 6fe615d..eacbe29 100644
  {
  	return tick_switch_to_oneshot(hrtimer_interrupt);
 diff --git a/kernel/time/tick-sched.c b/kernel/time/tick-sched.c
-index 5b33e2f..5f5c7c2 100644
+index 5b33e2f..6437820 100644
 --- a/kernel/time/tick-sched.c
 +++ b/kernel/time/tick-sched.c
 @@ -54,6 +54,12 @@ static ktime_t last_jiffies_update;
@@ -185,6 +704,65 @@ index 5b33e2f..5f5c7c2 100644
  static void tick_do_update_jiffies64(ktime_t now)
  {
  	unsigned long ticks = 0;
+@@ -113,6 +119,11 @@ static ktime_t tick_init_jiffy_update(void)
+ 	return period;
+ }
+ 
++/*
++ * called by:
++ *   - kernel/time/tick-sched.c|1188| <<tick_nohz_handler>> tick_sched_do_timer(ts, now);
++ *   - kernel/time/tick-sched.c|1283| <<tick_sched_timer>> tick_sched_do_timer(ts, now);
++ */
+ static void tick_sched_do_timer(struct tick_sched *ts, ktime_t now)
+ {
+ 	int cpu = smp_processor_id();
+@@ -168,6 +179,11 @@ static void tick_sched_handle(struct tick_sched *ts, struct pt_regs *regs)
+ 
+ #ifdef CONFIG_NO_HZ_FULL
+ cpumask_var_t tick_nohz_full_mask;
++/*
++ * 默认是false, 在以下修改:
++ *   - kernel/time/tick-sched.c|401| <<tick_nohz_full_setup>> tick_nohz_full_running = true;
++ *   - kernel/time/tick-sched.c|431| <<tick_nohz_init>> tick_nohz_full_running = false;
++ */
+ bool tick_nohz_full_running;
+ static atomic_t tick_dep_mask;
+ 
+@@ -729,6 +745,11 @@ static ktime_t tick_nohz_next_event(struct tick_sched *ts, int cpu)
+ 	return ts->timer_expires;
+ }
+ 
++/*
++ * called by:
++ *   - kernel/time/tick-sched.c|821| <<tick_nohz_stop_sched_tick>> tick_nohz_stop_tick(ts, cpu);
++ *   - kernel/time/tick-sched.c|945| <<__tick_nohz_idle_stop_tick>> tick_nohz_stop_tick(ts, cpu);
++ */
+ static void tick_nohz_stop_tick(struct tick_sched *ts, int cpu)
+ {
+ 	struct clock_event_device *dev = __this_cpu_read(tick_cpu_device.evtdev);
+@@ -809,6 +830,10 @@ static void tick_nohz_retain_tick(struct tick_sched *ts)
+ }
+ 
+ #ifdef CONFIG_NO_HZ_FULL
++/*
++ * called only by:
++ *   - kernel/time/tick-sched.c|872| <<tick_nohz_full_update_tick>> tick_nohz_stop_sched_tick(ts, cpu);
++ */
+ static void tick_nohz_stop_sched_tick(struct tick_sched *ts, int cpu)
+ {
+ 	if (tick_nohz_next_event(ts, cpu))
+@@ -859,6 +884,11 @@ static void tick_nohz_full_update_tick(struct tick_sched *ts)
+ #endif
+ }
+ 
++/*
++ * called by:
++ *   - kernel/time/tick-sched.c|945| <<__tick_nohz_idle_stop_tick>> else if (can_stop_idle_tick(cpu, ts))
++ *   - kernel/time/tick-sched.c|1066| <<tick_nohz_get_sleep_length>> if (!can_stop_idle_tick(cpu, ts))
++ */
+ static bool can_stop_idle_tick(int cpu, struct tick_sched *ts)
+ {
+ 	/*
 diff --git a/kernel/time/tick-sched.h b/kernel/time/tick-sched.h
 index 6de959a..e031a7b 100644
 --- a/kernel/time/tick-sched.h
@@ -209,10 +787,10 @@ index 6de959a..e031a7b 100644
  };
  
 diff --git a/kernel/time/timekeeping.c b/kernel/time/timekeeping.c
-index 4786df9..0a721c0 100644
+index 4786df9..086838a 100644
 --- a/kernel/time/timekeeping.c
 +++ b/kernel/time/timekeeping.c
-@@ -2167,6 +2167,29 @@ EXPORT_SYMBOL(ktime_get_coarse_ts64);
+@@ -2167,8 +2167,35 @@ EXPORT_SYMBOL(ktime_get_coarse_ts64);
  /*
   * Must hold jiffies_lock
   */
@@ -241,7 +819,13 @@ index 4786df9..0a721c0 100644
 + */
  void do_timer(unsigned long ticks)
  {
++	/*
++	 * 在kvm -smp 2的环境下,
++	 * tick_do_timer_cpu一会是0, 一会是1, 一会是TICK_DO_TIMER_NONE(-1)
++	 */
  	jiffies_64 += ticks;
+ 	calc_global_load(ticks);
+ }
 -- 
 2.7.4
 
