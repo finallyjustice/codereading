@@ -1,0 +1,311 @@
+From 01f15501b8a1e3a6eb5329170533ac52614694d4 Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang@oracle.com>
+Date: Sat, 19 Jan 2019 21:02:31 +0800
+Subject: [PATCH 1/1] freezer for linux-5.0-rc1
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ include/linux/freezer.h | 61 ++++++++++++++++++++++++++++++++
+ include/linux/sched.h   | 16 +++++++++
+ kernel/freezer.c        | 94 +++++++++++++++++++++++++++++++++++++++++++++++++
+ kernel/power/process.c  |  9 +++++
+ 4 files changed, 180 insertions(+)
+
+diff --git a/include/linux/freezer.h b/include/linux/freezer.h
+index 21f5aa0..06f0176 100644
+--- a/include/linux/freezer.h
++++ b/include/linux/freezer.h
+@@ -32,10 +32,33 @@ extern bool freezing_slow_path(struct task_struct *p);
+ /*
+  * Check if there is a request to freeze a process
+  */
++/*
++ * 很多地方在调用
++ *
++ * 如果当前没有suspend (比如没有调用xen的do_suspend() )就返回false
++ * 否则调用freezing_slow_path()来slow path for testing whether a task needs to be frozen
++ * 比如如果设置了PF_NOFREEZE就返回false
++ *
++ * 就是检查系统是否处于freezing状态
++ */
+ static inline bool freezing(struct task_struct *p)
+ {
++	/*
++	 * 除了cgroup,主要在freeze_processes()增加, 在thaw_processes()减少
++	 *
++	 * 就是说在以下增加:
++	 *   - drivers/xen/manage.c|103| <<do_suspend>> err = freeze_processes();
++	 *   - kernel/kexec_core.c|1134| <<kernel_kexec>> error = freeze_processes();
++	 *   - kernel/power/hibernate.c|716| <<hibernate>> error = freeze_processes();
++	 *   - kernel/power/hibernate.c|892| <<software_resume>> error = freeze_processes();
++	 *   - kernel/power/power.h|256| <<suspend_freeze_processes>> error = freeze_processes();
++	 *   - kernel/power/user.c|235| <<snapshot_ioctl>> error = freeze_processes();
++	 */
+ 	if (likely(!atomic_read(&system_freezing_cnt)))
+ 		return false;
++	/*
++	 * slow path for testing whether a task needs to be frozen
++	 */
+ 	return freezing_slow_path(p);
+ }
+ 
+@@ -52,18 +75,56 @@ extern void thaw_kernel_threads(void);
+  * DO NOT ADD ANY NEW CALLERS OF THIS FUNCTION
+  * If try_to_freeze causes a lockdep warning it means the caller may deadlock
+  */
++/*
++ * called by:
++ *   - include/linux/freezer.h|67| <<try_to_freeze>> return try_to_freeze_unsafe();
++ *   - include/linux/freezer.h|136| <<freezer_count_unsafe>> try_to_freeze_unsafe();
++ *
++ * 调用freezing():
++ *    如果当前没有suspend (比如没有调用xen的do_suspend() )就返回false
++ *    否则调用freezing_slow_path()来slow path for testing whether a task needs to be frozen
++ *    比如如果设置了PF_NOFREEZE就返回false
++ * 如果freezing()返回true, 则调用__refrigerator()尝试冻结这个线程
++ */
+ static inline bool try_to_freeze_unsafe(void)
+ {
+ 	might_sleep();
++	/*
++	 * freezing():
++	 *    如果当前没有suspend (比如没有调用xen的do_suspend() )就返回false
++	 *    否则调用freezing_slow_path()来slow path for testing whether a task needs to be frozen
++	 *    比如如果设置了PF_NOFREEZE就返回false
++	 *
++	 * 就是检查系统是否处于freezing状态
++	 */
+ 	if (likely(!freezing(current)))
+ 		return false;
++	/*
++	 * 主动进入冻结
++	 */
+ 	return __refrigerator(false);
+ }
+ 
++/*
++ * 调用freezing():
++ *    如果当前没有suspend (比如没有调用xen的do_suspend() )就返回false
++ *    否则调用freezing_slow_path()来slow path for testing whether a task needs to be frozen
++ *    比如如果设置了PF_NOFREEZE就返回false
++ * 如果freezing()返回true, 则调用__refrigerator()尝试冻结这个线程
++ *
++ * 很多内核线程在用,比如jbd2
++ */
+ static inline bool try_to_freeze(void)
+ {
+ 	if (!(current->flags & PF_NOFREEZE))
+ 		debug_check_no_locks_held();
++	/*
++	 * 调用freezing():
++	 *    如果当前没有suspend (比如没有调用xen的do_suspend() )就返回false
++	 *    否则调用freezing_slow_path()来slow path for testing whether a task needs to be frozen
++	 *    比如如果设置了PF_NOFREEZE就返回false
++	 * 如果freezing()返回true, 则调用__refrigerator()尝试冻结这个线程
++	 */
+ 	return try_to_freeze_unsafe();
+ }
+ 
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 89541d2..9110660 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1396,7 +1396,23 @@ extern struct pid *cad_pid;
+ #define PF_NPROC_EXCEEDED	0x00001000	/* set_user() noticed that RLIMIT_NPROC was exceeded */
+ #define PF_USED_MATH		0x00002000	/* If unset the fpu must be initialized before use */
+ #define PF_USED_ASYNC		0x00004000	/* Used async_schedule*(), used by module init */
++/*
++ * 在以下被使用:
++ *   - drivers/block/aoe/aoecmd.c|1234| <<kthread>> current->flags |= PF_NOFREEZE;
++ *   - drivers/scsi/lpfc/lpfc_hbadisc.c|745| <<lpfc_do_work>> current->flags |= PF_NOFREEZE;
++ *   - fs/exec.c|1293| <<flush_old_exec>> PF_NOFREEZE | PF_NO_SETAFFINITY);
++ *   - include/linux/freezer.h|65| <<try_to_freeze>> if (!(current->flags & PF_NOFREEZE))
++ *   - kernel/freezer.c|48| <<freezing_slow_path>> if (p->flags & (PF_NOFREEZE | PF_SUSPEND_TASK))
++ *   - kernel/freezer.c|180| <<set_freezable>> current->flags &= ~PF_NOFREEZE;
++ *   - kernel/kthread.c|569| <<kthreadd>> current->flags |= PF_NOFREEZE;
++ *   - kernel/sched/core.c|3487| <<do_task_dead>> current->flags |= PF_NOFREEZE;
++ */
+ #define PF_NOFREEZE		0x00008000	/* This thread should not be frozen */
++/*
++ * 在以下被设置:
++ *   - kernel/freezer.c|78| <<__refrigerator>> current->flags |= PF_FROZEN;
++ *   - kernel/freezer.c|81| <<__refrigerator>> current->flags &= ~PF_FROZEN;
++ */
+ #define PF_FROZEN		0x00010000	/* Frozen for system suspend */
+ #define PF_KSWAPD		0x00020000	/* I am kswapd */
+ #define PF_MEMALLOC_NOFS	0x00040000	/* All allocation requests will inherit GFP_NOFS */
+diff --git a/kernel/freezer.c b/kernel/freezer.c
+index b162b74..83349fb 100644
+--- a/kernel/freezer.c
++++ b/kernel/freezer.c
+@@ -11,6 +11,50 @@
+ #include <linux/freezer.h>
+ #include <linux/kthread.h>
+ 
++/*
++ * 假设没有冻结技术,进程可以在任意可调度的点暂停,而且直到
++ * cpu_down才会暂停并迁移.这会给系统带来很多问题.
++ *
++ * (1) 有可能破坏文件系统.在系统创建hibernate image到cpu down之间,如果有进程
++ *     还在修改文件系统的内容,这将会导致系统恢复之后无法完全恢复文件系统.
++ *
++ * (2) 有可能导致创建hibernation image失败.创建hibernation image需要足够的内存
++ *     空间,但是在这期间如果还有进程在申请内存,就可能导致创建失败.
++ *
++ * (3) 有可能干扰设备的suspend和resume.在cpu down之前,device suspend期间,如果
++ *     进程还在访问设备,尤其是访问竞争资源,就有可能引起设备suspend异常.
++ *
++ * (4) 有可能导致进程感知系统休眠.系统休眠的理想状态是所有任务对休眠过程无感知,睡
++ *     醒之后全部自动恢复工作,但是有些进程,比如某个进程需要所有cpu online才能正常
++ *     工作,如果进程不冻结,那么在休眠过程中将会工作异常.
++ */
++
++/*
++ * 标记系统freeze状态的有三个重要的全局变量:
++ *   - pm_freezing
++ *   - system_freezing_cnt
++ *   - pm_nosig_freezing
++ *
++ * 如果全为0,表示系统未进入冻结;
++ * system_freezing_cnt>0表示系统进入冻结,pm_freezing=true表示冻结用户进程,pm_nosig_freezing=true表示冻结内核线程和workqueue.
++ * 它们会在freeze_processes和freeze_kernel_threads中置位,在thaw_processes和thaw_kernel_threads中清零.
++ *
++ * fake_signal_wake_up函数巧妙的利用了信号处理机制,只设置任务的
++ * TIF_SIGPENDING位,但不传递任何信号,然后唤醒任务;这样任务在返
++ * 回用户态时会进入信号处理流程,检查系统的freeze状态,并做相应处理.
++ */
++
++/*
++ * 在以下被使用:
++ *   - kernel/freezer.c|15| <<global>> atomic_t system_freezing_cnt = ATOMIC_INIT(0);
++ *   - include/linux/freezer.h|37| <<freezing>> if (likely(!atomic_read(&system_freezing_cnt)))
++ *   - kernel/cgroup/freezer.c|116| <<freezer_css_online>> atomic_inc(&system_freezing_cnt);
++ *   - kernel/cgroup/freezer.c|137| <<freezer_css_offline>> atomic_dec(&system_freezing_cnt);
++ *   - kernel/cgroup/freezer.c|360| <<freezer_apply_state>> atomic_inc(&system_freezing_cnt);
++ *   - kernel/cgroup/freezer.c|370| <<freezer_apply_state>> atomic_dec(&system_freezing_cnt);
++ *   - kernel/power/process.c|135| <<freeze_processes>> atomic_inc(&system_freezing_cnt);
++ *   - kernel/power/process.c|196| <<thaw_processes>> atomic_dec(&system_freezing_cnt);
++ */
+ /* total number of freezing conditions in effect */
+ atomic_t system_freezing_cnt = ATOMIC_INIT(0);
+ EXPORT_SYMBOL(system_freezing_cnt);
+@@ -18,7 +62,25 @@ EXPORT_SYMBOL(system_freezing_cnt);
+ /* indicate whether PM freezing is in effect, protected by
+  * system_transition_mutex
+  */
++/*
++ * 被以下使用:
++ *   - drivers/ata/libata-scsi.c|4807| <<ata_scsi_hotplug>> while (pm_freezing)
++ *   - kernel/freezer.c|86| <<freezing_slow_path>> if (pm_freezing && !(p->flags & PF_KTHREAD))
++ *   - kernel/power/process.c|143| <<freeze_processes>> if (!pm_freezing)
++ *   - kernel/power/process.c|148| <<freeze_processes>> pm_freezing = true;
++ *   - kernel/power/process.c|204| <<thaw_processes>> if (pm_freezing)
++ *   - kernel/power/process.c|206| <<thaw_processes>> pm_freezing = false;
++ *
++ * 只在freeze_processes()和thaw_processes()被修改
++ */
+ bool pm_freezing;
++/*
++ * 在以下被使用:
++ *   - kernel/freezer.c|94| <<freezing_slow_path>> if (pm_nosig_freezing || cgroup_freezing(p))
++ *   - kernel/power/process.c|185| <<freeze_kernel_threads>> pm_nosig_freezing = true;
++ *   - kernel/power/process.c|207| <<thaw_processes>> pm_nosig_freezing = false;
++ *   - kernel/power/process.c|240| <<thaw_kernel_threads>> pm_nosig_freezing = false;
++ */
+ bool pm_nosig_freezing;
+ 
+ /*
+@@ -39,17 +101,30 @@ static DEFINE_SPINLOCK(freezer_lock);
+  * called under any context.  The freezers are responsible for ensuring the
+  * target tasks see the updated state.
+  */
++/*
++ * called only by:
++ *   - include/linux/freezer.h|39| <<freezing>> return freezing_slow_path(p);
++ */
+ bool freezing_slow_path(struct task_struct *p)
+ {
++	/*
++	 * 当前进程是否允许冻结
++	 */
+ 	if (p->flags & (PF_NOFREEZE | PF_SUSPEND_TASK))
+ 		return false;
+ 
+ 	if (test_tsk_thread_flag(p, TIF_MEMDIE))
+ 		return false;
+ 
++	/*
++	 * 系统冻结kernel threads
++	 */
+ 	if (pm_nosig_freezing || cgroup_freezing(p))
+ 		return true;
+ 
++	/*
++	 * 系统冻结用户进程
++	 */
+ 	if (pm_freezing && !(p->flags & PF_KTHREAD))
+ 		return true;
+ 
+@@ -58,6 +133,11 @@ bool freezing_slow_path(struct task_struct *p)
+ EXPORT_SYMBOL(freezing_slow_path);
+ 
+ /* Refrigerator is place where frozen processes are stored :-). */
++/*
++ * called by:
++ *   - include/linux/freezer.h|86| <<try_to_freeze_unsafe>> return __refrigerator(false);
++ *   - kernel/kthread.c|137| <<kthread_freezable_should_stop>> frozen = __refrigerator(true);
++ */
+ bool __refrigerator(bool check_kthr_stop)
+ {
+ 	/* Hmm, should we be allowed to suspend when there are realtime
+@@ -72,6 +152,17 @@ bool __refrigerator(bool check_kthr_stop)
+ 
+ 		spin_lock_irq(&freezer_lock);
+ 		current->flags |= PF_FROZEN;
++		/*
++		 * freezing():
++		 *     如果当前没有suspend (比如没有调用xen的do_suspend() )就返回false
++		 *     否则调用freezing_slow_path()来slow path for testing whether a task needs to be frozen
++		 *     比如如果设置了PF_NOFREEZE就返回false
++		 *
++		 * if语句只要返回true就不设置PF_FROZEN
++		 * 这个kthread就不会被放入refrigerator
++		 *
++		 * 判断系统是否还处于冻结, 如果系统已解冻，则取消冻结状态
++		 */
+ 		if (!freezing(current) ||
+ 		    (check_kthr_stop && kthread_should_stop()))
+ 			current->flags &= ~PF_FROZEN;
+@@ -80,6 +171,9 @@ bool __refrigerator(bool check_kthr_stop)
+ 		if (!(current->flags & PF_FROZEN))
+ 			break;
+ 		was_frozen = true;
++		/*
++		 * 这里就hang了 直到resume!!!
++		 */
+ 		schedule();
+ 	}
+ 
+diff --git a/kernel/power/process.c b/kernel/power/process.c
+index 4b6a54d..6464f97 100644
+--- a/kernel/power/process.c
++++ b/kernel/power/process.c
+@@ -120,6 +120,15 @@ static int try_to_freeze_tasks(bool user_only)
+  *
+  * On success, returns 0.  On failure, -errno and system is fully thawed.
+  */
++/*
++ * called by:
++ *   - drivers/xen/manage.c|103| <<do_suspend>> err = freeze_processes();
++ *   - kernel/kexec_core.c|1134| <<kernel_kexec>> error = freeze_processes();
++ *   - kernel/power/hibernate.c|716| <<hibernate>> error = freeze_processes();
++ *   - kernel/power/hibernate.c|892| <<software_resume>> error = freeze_processes();
++ *   - kernel/power/power.h|256| <<suspend_freeze_processes>> error = freeze_processes();
++ *   - kernel/power/user.c|235| <<snapshot_ioctl>> error = freeze_processes();
++ */
+ int freeze_processes(void)
+ {
+ 	int error;
+-- 
+2.7.4
+
