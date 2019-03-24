@@ -1,0 +1,261 @@
+From 4a1a95596edc76380d211572fc56a3889002b43b Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Mon, 25 Mar 2019 00:23:55 +0800
+Subject: [PATCH 1/1] linux for xen misx for linux-4.9.164
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ arch/x86/pci/xen.c                   | 64 ++++++++++++++++++++++++++++++++++++
+ drivers/nvme/host/pci.c              |  6 ++++
+ drivers/xen/events/events_base.c     | 41 +++++++++++++++++++++++
+ drivers/xen/events/events_internal.h |  3 ++
+ 4 files changed, 114 insertions(+)
+
+diff --git a/arch/x86/pci/xen.c b/arch/x86/pci/xen.c
+index 4ea9f29..4ef4282 100644
+--- a/arch/x86/pci/xen.c
++++ b/arch/x86/pci/xen.c
+@@ -261,17 +261,61 @@ static int xen_hvm_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
+ }
+ 
+ #ifdef CONFIG_XEN_DOM0
++/*
++ * 在以下修改:
++ *   - arch/x86/pci/xen.c|332| <<xen_initdom_setup_msi_irqs>> pci_seg_supported = false;
++ *   - arch/x86/pci/xen.c|365| <<xen_initdom_restore_msi_irqs>> pci_seg_supported = false;
++ */
+ static bool __read_mostly pci_seg_supported = true;
+ 
++/*
++ * nvme调用了两次:
++ *
++ * nvme_reset_work()
++ * nvme_pci_enable()
++ * pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_ALL_TYPES);
++ *
++ * nvme_reset_work()
++ * nvme_setup_io_queues()  
++ * pci_alloc_irq_vectors(pdev, 1, nr_io_queues, PCI_IRQ_ALL_TYPES | PCI_IRQ_AFFINITY);
++ *
++ * [0] xen_initdom_setup_msi_irqs
++ * [0] arch_setup_msi_irqs
++ * [0] pci_msi_setup_msi_irqs
++ * [0] __pci_enable_msix
++ * [0] __pci_enable_msix_range
++ * [0] pci_alloc_irq_vectors
++ * [0] nvme_reset_work
++ * [0] process_one_work
++ * [0] worker_thread
++ * [0] kthread
++ * [0] ret_from_fork
++ *
++ * used by:
++ *   - arch/x86/pci/xen.c|491| <<pci_xen_initial_domain>> x86_msi.setup_msi_irqs = xen_initdom_setup_msi_irqs;
++ */
+ static int xen_initdom_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
+ {
+ 	int ret = 0;
+ 	struct msi_desc *msidesc;
+ 
++	/*
++	 * nvme两次调用进来的时候type都是PCI_CAP_ID_MSIX
++	 */
++
+ 	for_each_pci_msi_entry(msidesc, dev) {
+ 		struct physdev_map_pirq map_irq;
+ 		domid_t domid;
+ 
++		/*
++		 * 对于nvme (8个vector), 共调用了8次, 有8个struct msi_desc
++		 * msidesc->msi_attrib.entry_nr先后是0, 1, 2, 3, 4, 5, 6, 7
++		 *
++		 * 在desktop上测试此时pci_domain_nr(dev->bus) == 0
++		 *
++		 * 此时pci_seg_supported也都是true
++		 */
++
+ 		domid = ret = xen_find_device_domain_owner(dev);
+ 		/* N.B. Casting int's -ENODEV to uint16_t results in 0xFFED,
+ 		 * hence check ret value for < 0. */
+@@ -311,6 +355,12 @@ static int xen_initdom_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
+ 		if (pci_seg_supported)
+ 			ret = HYPERVISOR_physdev_op(PHYSDEVOP_map_pirq,
+ 						    &map_irq);
++
++		/*
++		 * 成功的话ret是0, 在desktop上的nvme测试的map_irq.pirq分别是:
++		 * 856, 857, 858, 859, 860, 861, 862, 872
++		 */
++
+ 		if (type == PCI_CAP_ID_MSI && nvec > 1 && ret) {
+ 			/*
+ 			 * If MAP_PIRQ_TYPE_MULTI_MSI is not available
+@@ -328,6 +378,11 @@ static int xen_initdom_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
+ 			map_irq.bus = dev->bus->number;
+ 			ret = HYPERVISOR_physdev_op(PHYSDEVOP_map_pirq,
+ 						    &map_irq);
++			/*
++			 * 在以下修改:
++			 *   - arch/x86/pci/xen.c|332| <<xen_initdom_setup_msi_irqs>> pci_seg_supported = false;
++			 *   - arch/x86/pci/xen.c|365| <<xen_initdom_restore_msi_irqs>> pci_seg_supported = false;
++			 */
+ 			if (ret != -EINVAL)
+ 				pci_seg_supported = false;
+ 		}
+@@ -337,6 +392,15 @@ static int xen_initdom_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
+ 			goto out;
+ 		}
+ 
++		/*
++		 * 假设是nvme的msix, 上面的PHYSDEVOP_map_pirq应该返回了pirq在map_irq.pirq
++		 *
++		 * 下面再通过xen_bind_pirq_msi_to_irq()把pirq和irq(event channel)绑定在一起
++		 */
++
++		/*
++		 * Bind an PSI pirq to an irq
++		 */
+ 		ret = xen_bind_pirq_msi_to_irq(dev, msidesc, map_irq.pirq,
+ 		                               (type == PCI_CAP_ID_MSI) ? nvec : 1,
+ 		                               (type == PCI_CAP_ID_MSIX) ? "msi-x" : "msi",
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 1ac4cec..e1f3f7c 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -1582,6 +1582,12 @@ static int nvme_dev_add(struct nvme_dev *dev)
+ 	return 0;
+ }
+ 
++/*
++ * called only by:
++ *   - drivers/nvme/host/pci.c|1773| <<nvme_reset_work>> result = nvme_pci_enable(dev);
++ *
++ * 有一个result = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_ALL_TYPES);
++ */
+ static int nvme_pci_enable(struct nvme_dev *dev)
+ {
+ 	u64 cap;
+diff --git a/drivers/xen/events/events_base.c b/drivers/xen/events/events_base.c
+index 4b0cc9d..8d7e2f7 100644
+--- a/drivers/xen/events/events_base.c
++++ b/drivers/xen/events/events_base.c
+@@ -116,6 +116,10 @@ static void clear_evtchn_to_irq_all(void)
+ 	}
+ }
+ 
++/*
++ * 核心思想是: evtchn_to_irq[row][col] = irq;
++ * row和col通过evtchn计算
++ */
+ static int set_evtchn_to_irq(unsigned evtchn, unsigned irq)
+ {
+ 	unsigned row;
+@@ -159,6 +163,11 @@ struct irq_info *info_for_irq(unsigned irq)
+ }
+ 
+ /* Constructors for packed IRQ information. */
++/*
++ * 核心思想:
++ * evtchn_to_irq[row][col] = irq; row和col通过evtchn计算
++ * 调用evtchn_ops->setup(info), 只有fifo支持
++ */
+ static int xen_irq_info_common_setup(struct irq_info *info,
+ 				     unsigned irq,
+ 				     enum xen_irq_type type,
+@@ -174,12 +183,20 @@ static int xen_irq_info_common_setup(struct irq_info *info,
+ 	info->evtchn = evtchn;
+ 	info->cpu = cpu;
+ 
++	/*
++	 * 核心思想是: evtchn_to_irq[row][col] = irq;
++	 * row和col通过evtchn计算
++	 */
+ 	ret = set_evtchn_to_irq(evtchn, irq);
+ 	if (ret < 0)
+ 		return ret;
+ 
++	/* linux的函数, 不是xen的 */
+ 	irq_clear_status_flags(irq, IRQ_NOREQUEST|IRQ_NOAUTOEN);
+ 
++	/*
++	 * 调用evtchn_ops->setup(info), 只有fifo支持
++	 */
+ 	return xen_evtchn_port_setup(info);
+ }
+ 
+@@ -219,6 +236,11 @@ static int xen_irq_info_virq_setup(unsigned cpu,
+ 	return xen_irq_info_common_setup(info, irq, IRQT_VIRQ, evtchn, 0);
+ }
+ 
++/*
++ * 核心思想: 先为irq设置struct irq_info
++ * evtchn_to_irq[row][col] = irq; row和col通过evtchn计算
++ * 调用evtchn_ops->setup(info), 只有fifo支持
++ */
+ static int xen_irq_info_pirq_setup(unsigned irq,
+ 				   unsigned evtchn,
+ 				   unsigned pirq,
+@@ -233,6 +255,11 @@ static int xen_irq_info_pirq_setup(unsigned irq,
+ 	info->u.pirq.domid = domid;
+ 	info->u.pirq.flags = flags;
+ 
++	/*
++	 * 核心思想:
++	 * evtchn_to_irq[row][col] = irq; row和col通过evtchn计算
++	 * 调用evtchn_ops->setup(info), 只有fifo支持
++	 */
+ 	return xen_irq_info_common_setup(info, irq, IRQT_PIRQ, evtchn, 0);
+ }
+ 
+@@ -735,6 +762,14 @@ int xen_allocate_pirq_msi(struct pci_dev *dev, struct msi_desc *msidesc)
+ 	return rc ? -1 : op_get_free_pirq.pirq;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/pci/xen.c|183| <<xen_setup_msi_irqs>> irq = xen_bind_pirq_msi_to_irq(dev, msidesc, v[i],
++ *   - arch/x86/pci/xen.c|245| <<xen_hvm_setup_msi_irqs>> irq = xen_bind_pirq_msi_to_irq(dev, msidesc, pirq,
++ *   - arch/x86/pci/xen.c|340| <<xen_initdom_setup_msi_irqs>> ret = xen_bind_pirq_msi_to_irq(dev, msidesc, map_irq.pirq,
++ *
++ * Bind an PSI pirq to an irq
++ */
+ int xen_bind_pirq_msi_to_irq(struct pci_dev *dev, struct msi_desc *msidesc,
+ 			     int pirq, int nvec, const char *name, domid_t domid)
+ {
+@@ -742,6 +777,7 @@ int xen_bind_pirq_msi_to_irq(struct pci_dev *dev, struct msi_desc *msidesc,
+ 
+ 	mutex_lock(&irq_mapping_update_lock);
+ 
++	/* 分配一个irq??? */
+ 	irq = xen_allocate_irqs_dynamic(nvec);
+ 	if (irq < 0)
+ 		goto out;
+@@ -749,6 +785,11 @@ int xen_bind_pirq_msi_to_irq(struct pci_dev *dev, struct msi_desc *msidesc,
+ 	for (i = 0; i < nvec; i++) {
+ 		irq_set_chip_and_handler_name(irq + i, &xen_pirq_chip, handle_edge_irq, name);
+ 
++		/*
++		 * 核心思想: 先为irq设置struct irq_info
++		 * evtchn_to_irq[row][col] = irq; row和col通过evtchn计算
++		 * 调用evtchn_ops->setup(info), 只有fifo支持
++		 */
+ 		ret = xen_irq_info_pirq_setup(irq + i, 0, pirq + i, 0, domid,
+ 					      i == 0 ? 0 : PIRQ_MSI_GROUP);
+ 		if (ret < 0)
+diff --git a/drivers/xen/events/events_internal.h b/drivers/xen/events/events_internal.h
+index 50c2050..9ec3146 100644
+--- a/drivers/xen/events/events_internal.h
++++ b/drivers/xen/events/events_internal.h
+@@ -91,6 +91,9 @@ static inline unsigned xen_evtchn_max_channels(void)
+  * Do any ABI specific setup for a bound event channel before it can
+  * be unmasked and used.
+  */
++/*
++ * 调用evtchn_ops->setup(info), 只有fifo支持
++ */
+ static inline int xen_evtchn_port_setup(struct irq_info *info)
+ {
+ 	if (evtchn_ops->setup)
+-- 
+2.7.4
+
