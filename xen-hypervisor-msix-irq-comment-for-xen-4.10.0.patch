@@ -1,16 +1,17 @@
-From 393544807e18ef2ed3e3a161e73907d5152c3cb3 Mon Sep 17 00:00:00 2001
+From 00800906a994c90058103aea815d0c13741dd9df Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Mon, 25 Mar 2019 00:22:36 +0800
+Date: Mon, 25 Mar 2019 15:20:14 +0800
 Subject: [PATCH 1/1] xen hypervisor msix irq comment for xen-4.10.0
 
 xen-4.10.0
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
- xen/arch/x86/io_apic.c | 20 ++++++++++++++++++++
- xen/arch/x86/irq.c     | 23 +++++++++++++++++++++++
- xen/arch/x86/physdev.c | 17 +++++++++++++++++
- 3 files changed, 60 insertions(+)
+ xen/arch/x86/io_apic.c |  20 ++++++++
+ xen/arch/x86/irq.c     | 125 +++++++++++++++++++++++++++++++++++++++++++++++++
+ xen/arch/x86/physdev.c |  17 +++++++
+ xen/common/irq.c       |   1 +
+ 4 files changed, 163 insertions(+)
 
 diff --git a/xen/arch/x86/io_apic.c b/xen/arch/x86/io_apic.c
 index f959090..71864a8 100644
@@ -67,10 +68,92 @@ index f959090..71864a8 100644
          nr_irqs = cpu_has_apic ?
                    max(16U + num_present_cpus() * NR_DYNAMIC_VECTORS,
 diff --git a/xen/arch/x86/irq.c b/xen/arch/x86/irq.c
-index c0ab299..b785cba 100644
+index c0ab299..5b7e4d6 100644
 --- a/xen/arch/x86/irq.c
 +++ b/xen/arch/x86/irq.c
-@@ -157,11 +157,28 @@ int __init bind_irq_vector(int irq, int vector, const cpumask_t *cpu_mask)
+@@ -26,6 +26,53 @@
+ #include <asm/mach-generic/mach_apic.h>
+ #include <public/physdev.h>
+ 
++/*
++ * 在arch/x86/x86_64/entry.S,
++ * autogen_entrypoints生成vector table, 每一个vector指向一个处理函数
++ * 函数都差不多 (每个cpu支持256个vector):
++ *
++ * 先"movb  $vec,4(%rsp)", 再"jmp   common_interrupt"
++ *
++ * 在arch/x86/x86_64/entry.S:
++ * 392 ENTRY(common_interrupt)
++ * 393         SAVE_ALL CLAC
++ * 394         CR4_PV32_RESTORE
++ * 395         movq %rsp,%rdi
++ * 396         callq do_IRQ
++ * 397         jmp ret_from_intr
++ *
++ * do_IRQ()如何把vector发送到guest?
++ *
++ * 1. 先通过vector查找percpu的vector_irq[vector]找到irq:
++ * int irq = __get_cpu_var(vector_irq[vector]);
++ *
++ * 2. 再通过irq找到对应的struct irq_desc, x86下就是&irq_desc[irq]:
++ * desc = irq_to_desc(irq);
++ *
++ * 3. 很可能desc->status & IRQ_GUEST是true, 就要调用__do_IRQ_guest(irq)了
++ *
++ * 4. 如果是dom0, 调用send_guest_pirq()往dom0插入event
++ *
++ *
++ * 重要的函数或者数据结构:
++ *
++ * - vector_irq[vector]: 把cpu的vector转换成irq, 索引&irq_desc[irq]
++ * - domain_irq_to_pirq(d, irq)负责将xen的irq转换成某个domain d的pirq
++ * - pirq_info(d, pirq)负责将某个domain d的pirq转换成'struct pirq'
++ *
++ * struct pirq {
++ *   int pirq;
++ *   u16 evtchn;
++ *   bool_t masked;
++ *   struct rcu_head rcu_head;
++ *   struct arch_pirq arch;
++ * };
++ *
++ * dom0 linux的核心函数感觉是__startup_pirq()
++ *
++ * xen有自己的irq, linux有自己的irq, pirq是domain相关的, linux和xen都认识
++ */
++
+ static int parse_irq_vector_map_param(const char *s);
+ 
+ /* opt_noirqbalance: If true, software IRQ balancing/affinity is disabled. */
+@@ -48,6 +95,27 @@ static DECLARE_BITMAP(used_vectors, NR_VECTORS);
+ 
+ static DEFINE_SPINLOCK(vector_lock);
+ 
++/*
++ * 使用的地方:
++ *   - xen/arch/x86/i8259.c|106| <<_disable_8259A_irq>> per_cpu(vector_irq, 0)[LEGACY_VECTOR(irq)] = ~irq;
++ *   - xen/arch/x86/i8259.c|122| <<enable_8259A_irq>> per_cpu(vector_irq, 0)[LEGACY_VECTOR(desc->irq)] = desc->irq;
++ *   - xen/arch/x86/i8259.c|352| <<init_IRQ>> per_cpu(vector_irq, cpu)[FIRST_LEGACY_VECTOR + irq] = irq;
++ *   - xen/arch/x86/i8259.c|357| <<init_IRQ>> per_cpu(vector_irq, cpu)[IRQ0_VECTOR] = 0;
++ *   - xen/arch/x86/irq.c|134| <<__bind_irq_vector>> per_cpu(vector_irq, cpu)[vector] = irq;
++ *   - xen/arch/x86/irq.c|284| <<__clear_irq_vector>> ASSERT( per_cpu(vector_irq, cpu)[vector] == irq );
++ *   - xen/arch/x86/irq.c|285| <<__clear_irq_vector>> per_cpu(vector_irq, cpu)[vector] = ~irq;
++ *   - xen/arch/x86/irq.c|309| <<__clear_irq_vector>> ASSERT( per_cpu(vector_irq, cpu)[old_vector] == irq );
++ *   - xen/arch/x86/irq.c|311| <<__clear_irq_vector>> per_cpu(vector_irq, cpu)[old_vector] = ~irq;
++ *   - xen/arch/x86/irq.c|385| <<init_irq_data>> this_cpu(vector_irq)[vector] = INT_MIN;
++ *   - xen/arch/x86/irq.c|548| <<__assign_irq_vector>> if (per_cpu(vector_irq, new_cpu)[vector] >= 0)
++ *   - xen/arch/x86/irq.c|560| <<__assign_irq_vector>> per_cpu(vector_irq, new_cpu)[vector] = irq;
++ *   - xen/arch/x86/irq.c|617| <<setup_vector_irq>> per_cpu(vector_irq, cpu)[vector] = INT_MIN;
++ *   - xen/arch/x86/irq.c|631| <<setup_vector_irq>> per_cpu(vector_irq, cpu)[vector] = irq;
++ *   - xen/arch/x86/irq.c|691| <<irq_move_cleanup_interrupt>> irq = __get_cpu_var(vector_irq)[vector];
++ *   - xen/arch/x86/irq.c|729| <<irq_move_cleanup_interrupt>> __get_cpu_var(vector_irq)[vector] = ~irq;
++ *   - xen/arch/x86/irq.c|861| <<do_IRQ>> int irq = __get_cpu_var(vector_irq[vector]);
++ *   - xen/arch/x86/smpboot.c|1060| <<smp_intr_init>> per_cpu(vector_irq, cpu)[vector] = irq;
++ */
+ DEFINE_PER_CPU(vector_irq_t, vector_irq);
+ 
+ DEFINE_PER_CPU(struct cpu_user_regs *, __irq_regs);
+@@ -157,18 +225,43 @@ int __init bind_irq_vector(int irq, int vector, const cpumask_t *cpu_mask)
  /*
   * Dynamic irq allocate and deallocation for MSI
   */
@@ -98,8 +181,15 @@ index c0ab299..b785cba 100644
 +
      for (irq = nr_irqs_gsi; irq < nr_irqs; irq++)
      {
++        /* 返回&irq_desc[irq] */
          desc = irq_to_desc(irq);
-@@ -169,6 +186,7 @@ int create_irq(nodeid_t node)
++        /*
++	 * For use with irq_desc.arch.used
++	 *   #define IRQ_UNUSED      (0)
++	 *   #define IRQ_USED        (1)
++	 *   #define IRQ_RESERVED    (-1)
++	 */
+         if (cmpxchg(&desc->arch.used, IRQ_UNUSED, IRQ_RESERVED) == IRQ_UNUSED)
             break;
      }
  
@@ -107,7 +197,7 @@ index c0ab299..b785cba 100644
      if (irq >= nr_irqs)
           return -ENOSPC;
  
-@@ -188,6 +206,7 @@ int create_irq(nodeid_t node)
+@@ -188,6 +281,7 @@ int create_irq(nodeid_t node)
      if (ret < 0)
      {
          desc->arch.used = IRQ_UNUSED;
@@ -115,7 +205,86 @@ index c0ab299..b785cba 100644
          irq = ret;
      }
      else if ( hardware_domain )
-@@ -2656,6 +2675,10 @@ int allocate_and_map_gsi_pirq(struct domain *d, int index, int *pirq_p)
+@@ -438,6 +532,13 @@ static vmask_t *irq_get_used_vector_mask(int irq)
+     return ret;
+ }
+ 
++/*
++ * called by:
++ *   - xen/arch/x86/irq.c|591| <<assign_irq_vector>> ret = __assign_irq_vector(irq, desc, mask ?: TARGET_CPUS);
++ *   - xen/arch/x86/irq.c|780| <<set_desc_affinity>> ret = __assign_irq_vector(irq, desc, mask);
++ *
++ * 如果是assign_irq_vector()进来的, 如果之前mask是NULL, 则参数mask是genapic->target_cpus()
++ */
+ static int __assign_irq_vector(
+     int irq, struct irq_desc *desc, const cpumask_t *mask)
+ {
+@@ -546,6 +647,13 @@ next:
+     return err;
+ }
+ 
++/*
++ * called by:
++ *   - xen/arch/x86/io_apic.c|1032| <<setup_IO_APIC_irqs>> vector = assign_irq_vector(irq, NULL);
++ *   - xen/arch/x86/io_apic.c|2232| <<io_apic_set_pci_routing>> vector = assign_irq_vector(irq, NULL);
++ *   - xen/arch/x86/io_apic.c|2396| <<ioapic_guest_write>> ret = assign_irq_vector(irq, NULL);
++ *   - xen/arch/x86/irq.c|204| <<create_irq>> ret = assign_irq_vector(irq, mask);
++ */
+ int assign_irq_vector(int irq, const cpumask_t *mask)
+ {
+     int ret;
+@@ -859,6 +967,7 @@ void do_IRQ(struct cpu_user_regs *regs)
+         goto out_no_unlock;
+     }
+ 
++    /* 就是&irq_desc[irq] */
+     desc = irq_to_desc(irq);
+ 
+     spin_lock(&desc->lock);
+@@ -1863,12 +1972,16 @@ static inline bool is_free_pirq(const struct domain *d,
+         pirq->arch.hvm.emuirq == IRQ_UNBOUND));
+ }
+ 
++/*
++ * 搜索返回一个没人用的pirq
++ */
+ int get_free_pirq(struct domain *d, int type)
+ {
+     int i;
+ 
+     ASSERT(spin_is_locked(&d->event_lock));
+ 
++    /* gsi用的是nr_irqs_gsi之前的 */
+     if ( type == MAP_PIRQ_TYPE_GSI )
+     {
+         for ( i = 16; i < nr_irqs_gsi; i++ )
+@@ -1878,6 +1991,7 @@ int get_free_pirq(struct domain *d, int type)
+                 return i;
+             }
+     }
++    /* msi用的是nr_irqs_gsi之后的?? */
+     for ( i = d->nr_pirqs - 1; i >= nr_irqs_gsi; i-- )
+         if ( is_free_pirq(d, pirq_info(d, i)) )
+         {
+@@ -2561,6 +2675,9 @@ bool hvm_domain_use_pirq(const struct domain *d, const struct pirq *pirq)
+     return is_hvm_domain(d) && pirq && pirq->arch.hvm.emuirq != IRQ_UNBOUND;
+ }
+ 
++/*
++ * 核心思想是搜索返回一个没人用的pirq
++ */
+ static int allocate_pirq(struct domain *d, int index, int pirq, int irq,
+                          int type, int *nr)
+ {
+@@ -2598,6 +2715,7 @@ static int allocate_pirq(struct domain *d, int index, int pirq, int irq,
+         }
+         else
+         {
++            /* 搜索返回一个没人用的pirq */
+             pirq = get_free_pirq(d, type);
+             if ( pirq < 0 )
+                 dprintk(XENLOG_G_ERR, "dom%d: no free pirq\n", d->domain_id);
+@@ -2656,6 +2774,10 @@ int allocate_and_map_gsi_pirq(struct domain *d, int index, int *pirq_p)
      return ret;
  }
  
@@ -126,6 +295,16 @@ index c0ab299..b785cba 100644
  int allocate_and_map_msi_pirq(struct domain *d, int index, int *pirq_p,
                                int type, struct msi_info *msi)
  {
+@@ -2695,6 +2817,9 @@ int allocate_and_map_msi_pirq(struct domain *d, int index, int *pirq_p,
+     pcidevs_lock();
+     /* Verify or get pirq. */
+     spin_lock(&d->event_lock);
++    /*
++     * 核心思想是搜索返回一个没人用的pirq
++     */
+     pirq = allocate_pirq(d, index, *pirq_p, irq, type, &msi->entry_nr);
+     if ( pirq < 0 )
+     {
 diff --git a/xen/arch/x86/physdev.c b/xen/arch/x86/physdev.c
 index a5fedca..3ab6973 100644
 --- a/xen/arch/x86/physdev.c
@@ -174,6 +353,18 @@ index a5fedca..3ab6973 100644
 +         */
          ret = physdev_map_pirq(map.domid, map.type, &map.index, &map.pirq,
                                 &msi);
+ 
+diff --git a/xen/common/irq.c b/xen/common/irq.c
+index f42512d..1eadfc7 100644
+--- a/xen/common/irq.c
++++ b/xen/common/irq.c
+@@ -5,6 +5,7 @@ int init_one_irq_desc(struct irq_desc *desc)
+ {
+     int err;
+ 
++    /* 如果(desc)->handler != NULL */
+     if (irq_desc_initialized(desc))
+         return 0;
  
 -- 
 2.7.4
