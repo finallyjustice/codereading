@@ -1,6 +1,6 @@
-From 1d6a8b394f7605b60e92bf65ee2e54c78c9bac6e Mon Sep 17 00:00:00 2001
+From 883076b647b6fb186258ec5b2de197b6f2f8ea54 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Wed, 27 Mar 2019 16:11:15 +0800
+Date: Thu, 28 Mar 2019 16:20:29 +0800
 Subject: [PATCH 1/1] block comment for block and drivers for
  linux-block:for-5.1/block-20190302
 
@@ -10,7 +10,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
  block/bio.c                     |   3 +
  block/blk-core.c                |  41 ++
- block/blk-flush.c               | 124 ++++++
+ block/blk-flush.c               | 255 +++++++++++
  block/blk-merge.c               |   4 +
  block/blk-mq-cpumap.c           |  15 +
  block/blk-mq-debugfs.c          |  12 +
@@ -21,14 +21,14 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  block/blk-mq-tag.c              | 332 +++++++++++++++
  block/blk-mq-tag.h              |  95 +++++
  block/blk-mq-virtio.c           |  11 +
- block/blk-mq.c                  | 909 ++++++++++++++++++++++++++++++++++++++++
+ block/blk-mq.c                  | 913 ++++++++++++++++++++++++++++++++++++++++
  block/blk-mq.h                  | 104 ++++-
  block/blk-settings.c            |  39 ++
  block/blk-softirq.c             |  10 +
  block/blk-stat.c                |  49 +++
  block/blk-sysfs.c               |  32 ++
  block/blk-timeout.c             |  14 +
- block/blk.h                     |   7 +
+ block/blk.h                     |  32 ++
  block/genhd.c                   |   5 +
  drivers/nvme/host/core.c        |  69 +++
  drivers/nvme/host/nvme.h        |   5 +
@@ -40,7 +40,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  include/linux/sbitmap.h         |  45 ++
  lib/percpu-refcount.c           |  13 +
  lib/sbitmap.c                   |  89 ++++
- 32 files changed, 3263 insertions(+), 1 deletion(-)
+ 32 files changed, 3423 insertions(+), 1 deletion(-)
 
 diff --git a/block/bio.c b/block/bio.c
 index 83a2dfa..2175b00 100644
@@ -151,24 +151,95 @@ index 6b78ec5..6b59b1f 100644
  	if (!q->stats)
  		goto fail_stats;
 diff --git a/block/blk-flush.c b/block/blk-flush.c
-index 6e0f2d9..28e482ec 100644
+index 6e0f2d9..692addd 100644
 --- a/block/blk-flush.c
 +++ b/block/blk-flush.c
-@@ -76,6 +76,13 @@
+@@ -76,6 +76,37 @@
  #include "blk-mq-tag.h"
  #include "blk-mq-sched.h"
  
 +/*
++ * 硬盘在控制器上的一块内存芯片,其类型一般以SDRAM为主,具有极快的存取速度,
++ * 它是硬盘内部存储和外界接口之间的缓冲器.由于硬盘的内部数据传输速度和外界
++ * 介面传输速度不同,缓存在其中起到一个缓冲的作用.缓存的大小与速度是直接关
++ * 系到硬盘的传输速度的重要因素,能够大幅度地提高硬盘整体性能.
++ *
++ * 如果硬盘的cache启用了,那么很有可能写入的数据是写到了硬盘的cache中,而没
++ * 有真正写到磁盘介质上.
++ *
++ * 在linux下,查看磁盘cache是否开启可通过hdparm命令:
++ *
++ * #hdparm -W /dev/sdx    //是否开启cache，1为enable
++ * #hdparm -W 0 /dev/sdx  //关闭cache
++ * #hdparm -W 1 /dev/sdx  //enable cache
++ *
 + * REQ_FUA     : forced unit access,绕过磁盘cache,直接把数据写到磁盘介质中.
 + * REQ_PREFLUSH: request for cache flush, 表示把磁盘cache中的data刷新到磁盘介质中,防止掉电丢失
 + *
 + * blk_insert_flush()是非常重要的入口!
 + */
 +
++/*
++ * 冲刷的过程中request_queue为什么要使用双缓冲队列来存放fs_request?
++ *
++ * 双缓冲队列可以做到只执行一次冲刷请求就可以完成多个fs_request的冲刷要求.队列自
++ * 带的冲刷request在执行的过程中,blk_insert_flush()可以被调用多次,来自上层的
++ * fs_request被添加到pending1队列,等待冲刷request的下一次执行,当冲刷requst可以再
++ * 次被执行时,pending1队列不再接收新的fs_request(fs_request被加入到pending2队列),
++ * 冲刷request执行完毕后,pending1队列所有的fs_request的PREFLUSH/POSTFLUSH执行完毕.
++ */
++
  /* PREFLUSH/FUA sequences */
  enum {
  	REQ_FSEQ_PREFLUSH	= (1 << 0), /* pre-flushing in progress */
-@@ -113,6 +120,26 @@ static unsigned int blk_flush_policy(unsigned long fflags, struct request *rq)
+@@ -96,16 +127,46 @@ enum {
+ static void blk_kick_flush(struct request_queue *q,
+ 			   struct blk_flush_queue *fq, unsigned int flags);
+ 
++/*
++ * called only by:
++ *   - block/blk-flush.c|422| <<blk_insert_flush>> unsigned int policy = blk_flush_policy(fflags, rq);
++ */
+ static unsigned int blk_flush_policy(unsigned long fflags, struct request *rq)
+ {
++	/*
++	 * If a request doesn't have data, only REQ_PREFLUSH makes sense, which
++	 * indicates a simple flush request.  If there is data, REQ_PREFLUSH indicates
++	 * that the device cache should be flushed before the data is executed, and
++	 * REQ_FUA means that the data must be on non-volatile media on request
++	 * completion.
++	 *
++	 * If the device doesn't have writeback cache, PREFLUSH and FUA don't make any
++	 * difference.  The requests are either completed immediately if there's no data
++	 * or executed as normal requests otherwise.
++	 *
++	 * If the device has writeback cache and supports FUA, REQ_PREFLUSH is
++	 * translated to PREFLUSH but REQ_FUA is passed down directly with DATA.
++	 *
++	 * If the device has writeback cache and doesn't support FUA, REQ_PREFLUSH
++	 * is translated to PREFLUSH and REQ_FUA to POSTFLUSH.
++	 */
+ 	unsigned int policy = 0;
+ 
++	/* 如果有数据policy要有REQ_FSEQ_DATA */
+ 	if (blk_rq_sectors(rq))
+ 		policy |= REQ_FSEQ_DATA;
+ 
++	/*
++	 * Write back is a storage method in which data is written into the
++	 * cache every time a change occurs, but is written into the
++	 * corresponding location in main memory only at specified
++	 * intervals or under certain conditions.
++	 */
++
+ 	if (fflags & (1UL << QUEUE_FLAG_WC)) {
+ 		if (rq->cmd_flags & REQ_PREFLUSH)
+ 			policy |= REQ_FSEQ_PREFLUSH;
++		/* 如果磁盘不支持FUA,那么可以使用REQ_FSEQ_POSTFLUSH代替 */
+ 		if (!(fflags & (1UL << QUEUE_FLAG_FUA)) &&
+ 		    (rq->cmd_flags & REQ_FUA))
+ 			policy |= REQ_FSEQ_POSTFLUSH;
+@@ -113,6 +174,26 @@ static unsigned int blk_flush_policy(unsigned long fflags, struct request *rq)
  	return policy;
  }
  
@@ -195,7 +266,7 @@ index 6e0f2d9..28e482ec 100644
  static unsigned int blk_flush_cur_seq(struct request *rq)
  {
  	return 1 << ffz(rq->flush.seq);
-@@ -132,6 +159,13 @@ static void blk_flush_restore_request(struct request *rq)
+@@ -132,6 +213,13 @@ static void blk_flush_restore_request(struct request *rq)
  	rq->end_io = rq->flush.saved_end_io;
  }
  
@@ -209,7 +280,7 @@ index 6e0f2d9..28e482ec 100644
  static void blk_flush_queue_rq(struct request *rq, bool add_front)
  {
  	blk_mq_add_to_requeue_list(rq, add_front, true);
-@@ -153,6 +187,12 @@ static void blk_flush_queue_rq(struct request *rq, bool add_front)
+@@ -153,18 +241,38 @@ static void blk_flush_queue_rq(struct request *rq, bool add_front)
   * RETURNS:
   * %true if requests were added to the dispatch queue, %false otherwise.
   */
@@ -218,22 +289,76 @@ index 6e0f2d9..28e482ec 100644
 + *   - block/blk-flush.c|270| <<flush_end_io>> blk_flush_complete_seq(rq, fq, seq, error);
 + *   - block/blk-flush.c|374| <<mq_flush_data_end_io>> blk_flush_complete_seq(rq, fq, REQ_FSEQ_DATA, error);
 + *   - block/blk-flush.c|464| <<blk_insert_flush>> blk_flush_complete_seq(rq, fq, REQ_FSEQ_ACTIONS & ~policy, 0);
++ *
++ * 参数的seq是可以跳过的步骤, 如果结果是0则说明没有可以跳过的步骤
 + */
  static void blk_flush_complete_seq(struct request *rq,
  				   struct blk_flush_queue *fq,
  				   unsigned int seq, blk_status_t error)
-@@ -204,6 +244,10 @@ static void blk_flush_complete_seq(struct request *rq,
+ {
+ 	struct request_queue *q = rq->q;
++	/*
++	 * fq->flush_pending_idx只在以下修改:
++	 *   - block/blk-flush.c|327| <<blk_kick_flush>> fq->flush_pending_idx ^= 1;
++	 */
+ 	struct list_head *pending = &fq->flush_queue[fq->flush_pending_idx];
+ 	unsigned int cmd_flags;
+ 
+ 	BUG_ON(rq->flush.seq & seq);
++	/*
++	 * 将已完成步骤更新到rq->flush.seq中,后面调用blk_flush_cur_seq()看下一步是哪步
++	 */
+ 	rq->flush.seq |= seq;
+ 	cmd_flags = rq->cmd_flags;
+ 
++	/*
++	 * 调用blk_flush_cur_seq()看下一步是哪步
++	 *
++	 * 只有这里一处会设置REQ_FSEQ_DONE
++	 */
+ 	if (likely(!error))
+ 		seq = blk_flush_cur_seq(rq);
+ 	else
+@@ -176,11 +284,14 @@ static void blk_flush_complete_seq(struct request *rq,
+ 		/* queue for flush */
+ 		if (list_empty(pending))
+ 			fq->flush_pending_since = jiffies;
++		/* 把前者从自己本身的队列删除掉, 加入后面的队列 */
+ 		list_move_tail(&rq->flush.list, pending);
+ 		break;
+ 
+ 	case REQ_FSEQ_DATA:
++		/* 把前者从自己本身的队列删除掉, 加入后面的队列 */
+ 		list_move_tail(&rq->flush.list, &fq->flush_data_in_flight);
++		/* 把request插入q->requeue_list, 调用blk_mq_kick_requeue_list(q) */
+ 		blk_flush_queue_rq(rq, true);
+ 		break;
+ 
+@@ -204,6 +315,13 @@ static void blk_flush_complete_seq(struct request *rq,
  	blk_kick_flush(q, fq, cmd_flags);
  }
  
 +/*
 + * used by:
 + *   - block/blk-flush.c|354| <<blk_kick_flush>> flush_rq->end_io = flush_end_io;
++ *
++ * .end_io()就一个地方调用:
++ *   - block/blk-mq.c|884| <<__blk_mq_end_request>> rq->end_io(rq, error);
 + */
  static void flush_end_io(struct request *flush_rq, blk_status_t error)
  {
  	struct request_queue *q = flush_rq->q;
-@@ -255,6 +299,10 @@ static void flush_end_io(struct request *flush_rq, blk_status_t error)
+@@ -235,6 +353,9 @@ static void flush_end_io(struct request *flush_rq, blk_status_t error)
+ 		unsigned int seq = blk_flush_cur_seq(rq);
+ 
+ 		BUG_ON(seq != REQ_FSEQ_PREFLUSH && seq != REQ_FSEQ_POSTFLUSH);
++		/*
++		 * 参数的seq是可以跳过的步骤, 如果结果是0则说明没有可以跳过的步骤
++		 */
+ 		blk_flush_complete_seq(rq, fq, seq, error);
+ 	}
+ 
+@@ -255,15 +376,27 @@ static void flush_end_io(struct request *flush_rq, blk_status_t error)
   * spin_lock_irq(fq->mq_flush_lock)
   *
   */
@@ -244,8 +369,48 @@ index 6e0f2d9..28e482ec 100644
  static void blk_kick_flush(struct request_queue *q, struct blk_flush_queue *fq,
  			   unsigned int flags)
  {
-@@ -311,6 +359,9 @@ static void blk_kick_flush(struct request_queue *q, struct blk_flush_queue *fq,
++	/*
++	 * flush_pending_idx只在以下修改:
++	 *   - block/blk-flush.c|327| <<blk_kick_flush>> fq->flush_pending_idx ^= 1;
++	 */
+ 	struct list_head *pending = &fq->flush_queue[fq->flush_pending_idx];
+ 	struct request *first_rq =
+ 		list_first_entry(pending, struct request, flush.list);
+ 	struct request *flush_rq = fq->flush_rq;
+ 
+ 	/* C1 described at the top of this file */
++	/*
++	 * C1. At any given time, only one flush shall be in progress.  This makes
++	 *     double buffering sufficient.
++	 */
+ 	if (fq->flush_pending_idx != fq->flush_running_idx || list_empty(pending))
+ 		return;
+ 
+@@ -273,6 +406,16 @@ static void blk_kick_flush(struct request_queue *q, struct blk_flush_queue *fq,
+ 	 * assigned to empty flushes, and we deadlock if we are expecting
+ 	 * other requests to make progress. Don't defer for that case.
+ 	 */
++	/*
++	 * C2. Flush is deferred if any request is executing DATA of its sequence.
++	 *     This avoids issuing separate POSTFLUSHes for requests which shared
++	 *     PREFLUSH.
++	 *
++	 * C3. The second condition is ignored if there is a request which has
++	 *     waited longer than FLUSH_PENDING_TIMEOUT.  This is to avoid
++	 *     starvation in the unlikely case where there are continuous stream of
++	 *     FUA (without PREFLUSH) requests.
++	 */
+ 	if (!list_empty(&fq->flush_data_in_flight) && q->elevator &&
+ 	    time_before(jiffies,
+ 			fq->flush_pending_since + FLUSH_PENDING_TIMEOUT))
+@@ -309,8 +452,15 @@ static void blk_kick_flush(struct request_queue *q, struct blk_flush_queue *fq,
+ 	flush_rq->cmd_flags |= (flags & REQ_DRV) | (flags & REQ_FAILFAST_MASK);
+ 	flush_rq->rq_flags |= RQF_FLUSH_SEQ;
  	flush_rq->rq_disk = first_rq->rq_disk;
++	/*
++	 * end_io调用就一个地方:
++	 *   - block/blk-mq.c|884| <<__blk_mq_end_request>> rq->end_io(rq, error);
++	 */
  	flush_rq->end_io = flush_end_io;
  
 +	/*
@@ -254,7 +419,18 @@ index 6e0f2d9..28e482ec 100644
  	blk_flush_queue_rq(flush_rq, false);
  }
  
-@@ -347,6 +398,23 @@ static void mq_flush_data_end_io(struct request *rq, blk_status_t error)
+@@ -335,6 +485,10 @@ static void mq_flush_data_end_io(struct request *rq, blk_status_t error)
+ 	blk_flush_complete_seq(rq, fq, REQ_FSEQ_DATA, error);
+ 	spin_unlock_irqrestore(&fq->mq_flush_lock, flags);
+ 
++	/*
++	 * 如果之前设置了BLK_MQ_S_SCHED_RESTART到hctx->state
++	 * 取消这个bit, 触发blk_mq_run_hw_queue(hctx, true);
++	 */
+ 	blk_mq_sched_restart(hctx);
+ }
+ 
+@@ -347,10 +501,41 @@ static void mq_flush_data_end_io(struct request *rq, blk_status_t error)
   * @rq is being submitted.  Analyze what needs to be done and put it on the
   * right queue.
   */
@@ -278,7 +454,66 @@ index 6e0f2d9..28e482ec 100644
  void blk_insert_flush(struct request *rq)
  {
  	struct request_queue *q = rq->q;
-@@ -420,6 +488,32 @@ void blk_insert_flush(struct request *rq)
++	/*
++	 * queue_flags的两个例子:
++	 *   - QUEUE_FLAG_WC      Write back caching
++	 *   - QUEUE_FLAG_FUA     device supports FUA writes
++	 */
+ 	unsigned long fflags = q->queue_flags;	/* may change, cache */
++	/*
++	 * 调用blk_flush_policy()判断需要做哪些冲刷的步骤,可能有3步:
++	 * REQ_FSEQ_PREFLUSH(在数据请求以前冲刷磁盘缓存),
++	 * REQ_FSEQ_DATA(写入数据请求),
++	 * REQ_FSEQ_POSTFLUSH(在数据请求之后冲刷磁盘缓存).
++	 *
++	 * 如果磁盘不支持FUA,那么可以使用REQ_FSEQ_POSTFLUSH代替.
++	 * 假定我们分析的场景中,磁盘不支持FUA,则最终我们的冲刷策略为3步都做(policy=111). 
++	 */
+ 	unsigned int policy = blk_flush_policy(fflags, rq);
+ 	struct blk_flush_queue *fq = blk_get_flush_queue(q, rq->mq_ctx);
+ 
+@@ -359,6 +544,9 @@ void blk_insert_flush(struct request *rq)
+ 	 * REQ_PREFLUSH and FUA for the driver.
+ 	 */
+ 	rq->cmd_flags &= ~REQ_PREFLUSH;
++	/*
++	 * 假定我们分析的场景中,磁盘不支持FUA,则最终我们的冲刷策略为3步都做(policy=111).
++	 */
+ 	if (!(fflags & (1UL << QUEUE_FLAG_FUA)))
+ 		rq->cmd_flags &= ~REQ_FUA;
+ 
+@@ -389,6 +577,10 @@ void blk_insert_flush(struct request *rq)
+ 	 */
+ 	if ((policy & REQ_FSEQ_DATA) &&
+ 	    !(policy & (REQ_FSEQ_PREFLUSH | REQ_FSEQ_POSTFLUSH))) {
++		/*
++		 * 直接把request插入hctx->dispatch,
++		 * 如果参数run_queue是true就调用blk_mq_run_hw_queue()
++		 */
+ 		blk_mq_request_bypass_insert(rq, false);
+ 		return;
+ 	}
+@@ -399,12 +591,19 @@ void blk_insert_flush(struct request *rq)
+ 	 */
+ 	memset(&rq->flush, 0, sizeof(rq->flush));
+ 	INIT_LIST_HEAD(&rq->flush.list);
++	/* request for flush sequence */
+ 	rq->rq_flags |= RQF_FLUSH_SEQ;
+ 	rq->flush.saved_end_io = rq->end_io; /* Usually NULL */
+ 
+ 	rq->end_io = mq_flush_data_end_io;
+ 
+ 	spin_lock_irq(&fq->mq_flush_lock);
++	/*
++	 * REQ_FSEQ_ACTIONS & ~policy把可以跳过的步骤对应的位置填1
++	 * 如果结果是0则说明没有可以跳过的步骤
++	 *
++	 * 但是原始的policy没传进去??
++	 */
+ 	blk_flush_complete_seq(rq, fq, REQ_FSEQ_ACTIONS & ~policy, 0);
+ 	spin_unlock_irq(&fq->mq_flush_lock);
+ }
+@@ -420,6 +619,32 @@ void blk_insert_flush(struct request *rq)
   *    room for storing the error offset in case of a flush error, if they
   *    wish to.
   */
@@ -311,7 +546,7 @@ index 6e0f2d9..28e482ec 100644
  int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
  		sector_t *error_sector)
  {
-@@ -430,6 +524,7 @@ int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
+@@ -430,6 +655,7 @@ int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
  	if (bdev->bd_disk == NULL)
  		return -ENXIO;
  
@@ -319,7 +554,7 @@ index 6e0f2d9..28e482ec 100644
  	q = bdev_get_queue(bdev);
  	if (!q)
  		return -ENXIO;
-@@ -447,6 +542,7 @@ int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
+@@ -447,6 +673,7 @@ int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
  	bio_set_dev(bio, bdev);
  	bio->bi_opf = REQ_OP_WRITE | REQ_PREFLUSH;
  
@@ -327,7 +562,7 @@ index 6e0f2d9..28e482ec 100644
  	ret = submit_bio_wait(bio);
  
  	/*
-@@ -462,6 +558,14 @@ int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
+@@ -462,6 +689,14 @@ int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
  }
  EXPORT_SYMBOL(blkdev_issue_flush);
  
@@ -342,7 +577,7 @@ index 6e0f2d9..28e482ec 100644
  struct blk_flush_queue *blk_alloc_flush_queue(struct request_queue *q,
  		int node, int cmd_size, gfp_t flags)
  {
-@@ -474,13 +578,33 @@ struct blk_flush_queue *blk_alloc_flush_queue(struct request_queue *q,
+@@ -474,13 +709,33 @@ struct blk_flush_queue *blk_alloc_flush_queue(struct request_queue *q,
  
  	spin_lock_init(&fq->mq_flush_lock);
  
@@ -1950,7 +2185,7 @@ index 3708271..76190b8 100644
  		goto fallback;
  
 diff --git a/block/blk-mq.c b/block/blk-mq.c
-index fa024bc..7468eb9 100644
+index fa024bc..946fba5 100644
 --- a/block/blk-mq.c
 +++ b/block/blk-mq.c
 @@ -38,9 +38,137 @@
@@ -3101,7 +3336,18 @@ index fa024bc..7468eb9 100644
  void __blk_mq_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
  			     bool at_head)
  {
-@@ -1649,6 +2291,13 @@ void blk_mq_request_bypass_insert(struct request *rq, bool run_queue)
+@@ -1637,6 +2279,10 @@ void __blk_mq_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
+  * Should only be used carefully, when the caller knows we want to
+  * bypass a potential IO scheduler on the target device.
+  */
++/*
++ * 直接把request插入hctx->dispatch,
++ * 如果参数run_queue是true就调用blk_mq_run_hw_queue()
++ */
+ void blk_mq_request_bypass_insert(struct request *rq, bool run_queue)
+ {
+ 	struct blk_mq_hw_ctx *hctx = rq->mq_hctx;
+@@ -1649,6 +2295,13 @@ void blk_mq_request_bypass_insert(struct request *rq, bool run_queue)
  		blk_mq_run_hw_queue(hctx, false);
  }
  
@@ -3115,7 +3361,7 @@ index fa024bc..7468eb9 100644
  void blk_mq_insert_requests(struct blk_mq_hw_ctx *hctx, struct blk_mq_ctx *ctx,
  			    struct list_head *list)
  
-@@ -1667,6 +2316,7 @@ void blk_mq_insert_requests(struct blk_mq_hw_ctx *hctx, struct blk_mq_ctx *ctx,
+@@ -1667,6 +2320,7 @@ void blk_mq_insert_requests(struct blk_mq_hw_ctx *hctx, struct blk_mq_ctx *ctx,
  
  	spin_lock(&ctx->lock);
  	list_splice_tail_init(list, &ctx->rq_lists[type]);
@@ -3123,7 +3369,7 @@ index fa024bc..7468eb9 100644
  	blk_mq_hctx_mark_pending(hctx, ctx);
  	spin_unlock(&ctx->lock);
  }
-@@ -1749,6 +2399,12 @@ static void blk_mq_bio_to_request(struct request *rq, struct bio *bio)
+@@ -1749,6 +2403,12 @@ static void blk_mq_bio_to_request(struct request *rq, struct bio *bio)
  	blk_account_io_start(rq, true);
  }
  
@@ -3136,7 +3382,7 @@ index fa024bc..7468eb9 100644
  static blk_status_t __blk_mq_issue_directly(struct blk_mq_hw_ctx *hctx,
  					    struct request *rq,
  					    blk_qc_t *cookie, bool last)
-@@ -1788,6 +2444,15 @@ static blk_status_t __blk_mq_issue_directly(struct blk_mq_hw_ctx *hctx,
+@@ -1788,6 +2448,15 @@ static blk_status_t __blk_mq_issue_directly(struct blk_mq_hw_ctx *hctx,
  	return ret;
  }
  
@@ -3152,7 +3398,7 @@ index fa024bc..7468eb9 100644
  blk_status_t blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
  						struct request *rq,
  						blk_qc_t *cookie,
-@@ -1829,6 +2494,9 @@ blk_status_t blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
+@@ -1829,6 +2498,9 @@ blk_status_t blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
  	 *.queue_rq() to the hardware dispatch list.
  	 */
  	force = true;
@@ -3162,7 +3408,7 @@ index fa024bc..7468eb9 100644
  	ret = __blk_mq_issue_directly(hctx, rq, cookie, last);
  out_unlock:
  	hctx_unlock(hctx, srcu_idx);
-@@ -1860,6 +2528,10 @@ blk_status_t blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
+@@ -1860,6 +2532,10 @@ blk_status_t blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
  	return ret;
  }
  
@@ -3173,7 +3419,7 @@ index fa024bc..7468eb9 100644
  void blk_mq_try_issue_list_directly(struct blk_mq_hw_ctx *hctx,
  		struct list_head *list)
  {
-@@ -1904,7 +2576,16 @@ static void blk_add_rq_to_plug(struct blk_plug *plug, struct request *rq)
+@@ -1904,7 +2580,16 @@ static void blk_add_rq_to_plug(struct blk_plug *plug, struct request *rq)
  
  static blk_qc_t blk_mq_make_request(struct request_queue *q, struct bio *bio)
  {
@@ -3190,7 +3436,7 @@ index fa024bc..7468eb9 100644
  	const int is_flush_fua = op_is_flush(bio->bi_opf);
  	struct blk_mq_alloc_data data = { .flags = 0};
  	struct request *rq;
-@@ -1914,6 +2595,10 @@ static blk_qc_t blk_mq_make_request(struct request_queue *q, struct bio *bio)
+@@ -1914,6 +2599,10 @@ static blk_qc_t blk_mq_make_request(struct request_queue *q, struct bio *bio)
  
  	blk_queue_bounce(q, &bio);
  
@@ -3201,7 +3447,7 @@ index fa024bc..7468eb9 100644
  	blk_queue_split(q, &bio);
  
  	if (!bio_integrity_prep(bio))
-@@ -2053,6 +2738,12 @@ void blk_mq_free_rq_map(struct blk_mq_tags *tags)
+@@ -2053,6 +2742,12 @@ void blk_mq_free_rq_map(struct blk_mq_tags *tags)
  	blk_mq_free_tags(tags);
  }
  
@@ -3214,7 +3460,7 @@ index fa024bc..7468eb9 100644
  struct blk_mq_tags *blk_mq_alloc_rq_map(struct blk_mq_tag_set *set,
  					unsigned int hctx_idx,
  					unsigned int nr_tags,
-@@ -2110,6 +2801,12 @@ static int blk_mq_init_request(struct blk_mq_tag_set *set, struct request *rq,
+@@ -2110,6 +2805,12 @@ static int blk_mq_init_request(struct blk_mq_tag_set *set, struct request *rq,
  	return 0;
  }
  
@@ -3227,7 +3473,7 @@ index fa024bc..7468eb9 100644
  int blk_mq_alloc_rqs(struct blk_mq_tag_set *set, struct blk_mq_tags *tags,
  		     unsigned int hctx_idx, unsigned int depth)
  {
-@@ -2192,6 +2889,10 @@ int blk_mq_alloc_rqs(struct blk_mq_tag_set *set, struct blk_mq_tags *tags,
+@@ -2192,6 +2893,10 @@ int blk_mq_alloc_rqs(struct blk_mq_tag_set *set, struct blk_mq_tags *tags,
   * software queue to the hw queue dispatch list, and ensure that it
   * gets run.
   */
@@ -3238,7 +3484,7 @@ index fa024bc..7468eb9 100644
  static int blk_mq_hctx_notify_dead(unsigned int cpu, struct hlist_node *node)
  {
  	struct blk_mq_hw_ctx *hctx;
-@@ -2228,6 +2929,12 @@ static void blk_mq_remove_cpuhp(struct blk_mq_hw_ctx *hctx)
+@@ -2228,6 +2933,12 @@ static void blk_mq_remove_cpuhp(struct blk_mq_hw_ctx *hctx)
  }
  
  /* hctx->ctxs will be freed in queue's release handler */
@@ -3251,7 +3497,7 @@ index fa024bc..7468eb9 100644
  static void blk_mq_exit_hctx(struct request_queue *q,
  		struct blk_mq_tag_set *set,
  		struct blk_mq_hw_ctx *hctx, unsigned int hctx_idx)
-@@ -2263,6 +2970,10 @@ static void blk_mq_exit_hw_queues(struct request_queue *q,
+@@ -2263,6 +2974,10 @@ static void blk_mq_exit_hw_queues(struct request_queue *q,
  	}
  }
  
@@ -3262,7 +3508,7 @@ index fa024bc..7468eb9 100644
  static int blk_mq_init_hctx(struct request_queue *q,
  		struct blk_mq_tag_set *set,
  		struct blk_mq_hw_ctx *hctx, unsigned hctx_idx)
-@@ -2314,6 +3025,7 @@ static int blk_mq_init_hctx(struct request_queue *q,
+@@ -2314,6 +3029,7 @@ static int blk_mq_init_hctx(struct request_queue *q,
  	if (blk_mq_init_request(set, hctx->fq->flush_rq, hctx_idx, node))
  		goto free_fq;
  
@@ -3270,7 +3516,7 @@ index fa024bc..7468eb9 100644
  	if (hctx->flags & BLK_MQ_F_BLOCKING)
  		init_srcu_struct(hctx->srcu);
  
-@@ -2333,6 +3045,10 @@ static int blk_mq_init_hctx(struct request_queue *q,
+@@ -2333,6 +3049,10 @@ static int blk_mq_init_hctx(struct request_queue *q,
  	return -1;
  }
  
@@ -3281,7 +3527,7 @@ index fa024bc..7468eb9 100644
  static void blk_mq_init_cpu_queues(struct request_queue *q,
  				   unsigned int nr_hw_queues)
  {
-@@ -2392,6 +3108,11 @@ static void blk_mq_free_map_and_requests(struct blk_mq_tag_set *set,
+@@ -2392,6 +3112,11 @@ static void blk_mq_free_map_and_requests(struct blk_mq_tag_set *set,
  	}
  }
  
@@ -3293,7 +3539,7 @@ index fa024bc..7468eb9 100644
  static void blk_mq_map_swqueue(struct request_queue *q)
  {
  	unsigned int i, j, hctx_idx;
-@@ -2404,6 +3125,7 @@ static void blk_mq_map_swqueue(struct request_queue *q)
+@@ -2404,6 +3129,7 @@ static void blk_mq_map_swqueue(struct request_queue *q)
  	 */
  	mutex_lock(&q->sysfs_lock);
  
@@ -3301,7 +3547,7 @@ index fa024bc..7468eb9 100644
  	queue_for_each_hw_ctx(q, hctx, i) {
  		cpumask_clear(hctx->cpumask);
  		hctx->nr_ctx = 0;
-@@ -2430,6 +3152,14 @@ static void blk_mq_map_swqueue(struct request_queue *q)
+@@ -2430,6 +3156,14 @@ static void blk_mq_map_swqueue(struct request_queue *q)
  		}
  
  		ctx = per_cpu_ptr(q->queue_ctx, i);
@@ -3316,7 +3562,7 @@ index fa024bc..7468eb9 100644
  		for (j = 0; j < set->nr_maps; j++) {
  			if (!set->map[j].nr_queues) {
  				ctx->hctxs[j] = blk_mq_map_queue_type(q,
-@@ -2459,6 +3189,9 @@ static void blk_mq_map_swqueue(struct request_queue *q)
+@@ -2459,6 +3193,9 @@ static void blk_mq_map_swqueue(struct request_queue *q)
  			BUG_ON(!hctx->nr_ctx);
  		}
  
@@ -3326,7 +3572,7 @@ index fa024bc..7468eb9 100644
  		for (; j < HCTX_MAX_TYPES; j++)
  			ctx->hctxs[j] = blk_mq_map_queue_type(q,
  					HCTX_TYPE_DEFAULT, i);
-@@ -2548,6 +3281,13 @@ static void blk_mq_del_queue_tag_set(struct request_queue *q)
+@@ -2548,6 +3285,13 @@ static void blk_mq_del_queue_tag_set(struct request_queue *q)
  	INIT_LIST_HEAD(&q->tag_set_list);
  }
  
@@ -3340,7 +3586,7 @@ index fa024bc..7468eb9 100644
  static void blk_mq_add_queue_tag_set(struct blk_mq_tag_set *set,
  				     struct request_queue *q)
  {
-@@ -2570,6 +3310,12 @@ static void blk_mq_add_queue_tag_set(struct blk_mq_tag_set *set,
+@@ -2570,6 +3314,12 @@ static void blk_mq_add_queue_tag_set(struct blk_mq_tag_set *set,
  }
  
  /* All allocations will be freed in release handler of q->mq_kobj */
@@ -3353,7 +3599,7 @@ index fa024bc..7468eb9 100644
  static int blk_mq_alloc_ctxs(struct request_queue *q)
  {
  	struct blk_mq_ctxs *ctxs;
-@@ -2603,6 +3349,10 @@ static int blk_mq_alloc_ctxs(struct request_queue *q)
+@@ -2603,6 +3353,10 @@ static int blk_mq_alloc_ctxs(struct request_queue *q)
   * and headache because q->mq_kobj shouldn't have been introduced,
   * but we can't group ctx/kctx kobj without it.
   */
@@ -3364,7 +3610,7 @@ index fa024bc..7468eb9 100644
  void blk_mq_release(struct request_queue *q)
  {
  	struct blk_mq_hw_ctx *hctx;
-@@ -2688,6 +3438,10 @@ static int blk_mq_hw_ctx_size(struct blk_mq_tag_set *tag_set)
+@@ -2688,6 +3442,10 @@ static int blk_mq_hw_ctx_size(struct blk_mq_tag_set *tag_set)
  	return hw_ctx_size;
  }
  
@@ -3375,7 +3621,7 @@ index fa024bc..7468eb9 100644
  static struct blk_mq_hw_ctx *blk_mq_alloc_and_init_hctx(
  		struct blk_mq_tag_set *set, struct request_queue *q,
  		int hctx_idx, int node)
-@@ -2707,6 +3461,16 @@ static struct blk_mq_hw_ctx *blk_mq_alloc_and_init_hctx(
+@@ -2707,6 +3465,16 @@ static struct blk_mq_hw_ctx *blk_mq_alloc_and_init_hctx(
  		return NULL;
  	}
  
@@ -3392,7 +3638,7 @@ index fa024bc..7468eb9 100644
  	atomic_set(&hctx->nr_active, 0);
  	hctx->numa_node = node;
  	hctx->queue_num = hctx_idx;
-@@ -2721,10 +3485,22 @@ static struct blk_mq_hw_ctx *blk_mq_alloc_and_init_hctx(
+@@ -2721,10 +3489,22 @@ static struct blk_mq_hw_ctx *blk_mq_alloc_and_init_hctx(
  	return hctx;
  }
  
@@ -3415,7 +3661,7 @@ index fa024bc..7468eb9 100644
  	struct blk_mq_hw_ctx **hctxs = q->queue_hw_ctx;
  
  	/* protect against switching io scheduler  */
-@@ -2739,6 +3515,9 @@ static void blk_mq_realloc_hw_ctxs(struct blk_mq_tag_set *set,
+@@ -2739,6 +3519,9 @@ static void blk_mq_realloc_hw_ctxs(struct blk_mq_tag_set *set,
  		 * we need to realloc the hctx. If allocation fails, fallback
  		 * to use the previous one.
  		 */
@@ -3425,7 +3671,7 @@ index fa024bc..7468eb9 100644
  		if (hctxs[i] && (hctxs[i]->numa_node == node))
  			continue;
  
-@@ -2791,20 +3570,47 @@ static void blk_mq_realloc_hw_ctxs(struct blk_mq_tag_set *set,
+@@ -2791,20 +3574,47 @@ static void blk_mq_realloc_hw_ctxs(struct blk_mq_tag_set *set,
   * have more than the CPUs (software queues). For multiple sets, the tag_set
   * user may have set ->nr_hw_queues larger.
   */
@@ -3473,7 +3719,7 @@ index fa024bc..7468eb9 100644
  	q->poll_cb = blk_stat_alloc_callback(blk_mq_poll_stats_fn,
  					     blk_mq_poll_stats_bkt,
  					     BLK_MQ_POLL_STATS_BKTS, q);
-@@ -2817,7 +3623,21 @@ struct request_queue *blk_mq_init_allocated_queue(struct blk_mq_tag_set *set,
+@@ -2817,7 +3627,21 @@ struct request_queue *blk_mq_init_allocated_queue(struct blk_mq_tag_set *set,
  	/* init q->mq_kobj and sw queues' kobjects */
  	blk_mq_sysfs_init(q);
  
@@ -3495,7 +3741,7 @@ index fa024bc..7468eb9 100644
  	q->queue_hw_ctx = kcalloc_node(q->nr_queues, sizeof(*(q->queue_hw_ctx)),
  						GFP_KERNEL, set->numa_node);
  	if (!q->queue_hw_ctx)
-@@ -2856,6 +3676,10 @@ struct request_queue *blk_mq_init_allocated_queue(struct blk_mq_tag_set *set,
+@@ -2856,6 +3680,10 @@ struct request_queue *blk_mq_init_allocated_queue(struct blk_mq_tag_set *set,
  	q->poll_nsec = -1;
  
  	blk_mq_init_cpu_queues(q, set->nr_hw_queues);
@@ -3506,7 +3752,7 @@ index fa024bc..7468eb9 100644
  	blk_mq_add_queue_tag_set(set, q);
  	blk_mq_map_swqueue(q);
  
-@@ -2939,6 +3763,13 @@ static int blk_mq_alloc_rq_maps(struct blk_mq_tag_set *set)
+@@ -2939,6 +3767,13 @@ static int blk_mq_alloc_rq_maps(struct blk_mq_tag_set *set)
  	return 0;
  }
  
@@ -3520,7 +3766,7 @@ index fa024bc..7468eb9 100644
  static int blk_mq_update_queue_map(struct blk_mq_tag_set *set)
  {
  	if (set->ops->map_queues && !is_kdump_kernel()) {
-@@ -2964,6 +3795,7 @@ static int blk_mq_update_queue_map(struct blk_mq_tag_set *set)
+@@ -2964,6 +3799,7 @@ static int blk_mq_update_queue_map(struct blk_mq_tag_set *set)
  		return set->ops->map_queues(set);
  	} else {
  		BUG_ON(set->nr_maps > 1);
@@ -3528,7 +3774,7 @@ index fa024bc..7468eb9 100644
  		return blk_mq_map_queues(&set->map[HCTX_TYPE_DEFAULT]);
  	}
  }
-@@ -2974,6 +3806,23 @@ static int blk_mq_update_queue_map(struct blk_mq_tag_set *set)
+@@ -2974,6 +3810,23 @@ static int blk_mq_update_queue_map(struct blk_mq_tag_set *set)
   * requested depth down, if it's too large. In that case, the set
   * value will be stored in set->queue_depth.
   */
@@ -3552,7 +3798,7 @@ index fa024bc..7468eb9 100644
  int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
  {
  	int i, ret;
-@@ -2990,6 +3839,7 @@ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
+@@ -2990,6 +3843,7 @@ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
  	if (!set->ops->queue_rq)
  		return -EINVAL;
  
@@ -3560,7 +3806,7 @@ index fa024bc..7468eb9 100644
  	if (!set->ops->get_budget ^ !set->ops->put_budget)
  		return -EINVAL;
  
-@@ -3021,6 +3871,11 @@ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
+@@ -3021,6 +3875,11 @@ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
  	if (set->nr_maps == 1 && set->nr_hw_queues > nr_cpu_ids)
  		set->nr_hw_queues = nr_cpu_ids;
  
@@ -3572,7 +3818,7 @@ index fa024bc..7468eb9 100644
  	set->tags = kcalloc_node(nr_hw_queues(set), sizeof(struct blk_mq_tags *),
  				 GFP_KERNEL, set->numa_node);
  	if (!set->tags)
-@@ -3028,6 +3883,10 @@ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
+@@ -3028,6 +3887,10 @@ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
  
  	ret = -ENOMEM;
  	for (i = 0; i < set->nr_maps; i++) {
@@ -3583,7 +3829,7 @@ index fa024bc..7468eb9 100644
  		set->map[i].mq_map = kcalloc_node(nr_cpu_ids,
  						  sizeof(set->map[i].mq_map[0]),
  						  GFP_KERNEL, set->numa_node);
-@@ -3036,10 +3895,16 @@ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
+@@ -3036,10 +3899,16 @@ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
  		set->map[i].nr_queues = is_kdump_kernel() ? 1 : set->nr_hw_queues;
  	}
  
@@ -3600,7 +3846,7 @@ index fa024bc..7468eb9 100644
  	ret = blk_mq_alloc_rq_maps(set);
  	if (ret)
  		goto out_free_mq_map;
-@@ -3077,6 +3942,10 @@ void blk_mq_free_tag_set(struct blk_mq_tag_set *set)
+@@ -3077,6 +3946,10 @@ void blk_mq_free_tag_set(struct blk_mq_tag_set *set)
  }
  EXPORT_SYMBOL(blk_mq_free_tag_set);
  
@@ -3611,7 +3857,7 @@ index fa024bc..7468eb9 100644
  int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr)
  {
  	struct blk_mq_tag_set *set = q->tag_set;
-@@ -3086,13 +3955,26 @@ int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr)
+@@ -3086,13 +3959,26 @@ int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr)
  	if (!set)
  		return -EINVAL;
  
@@ -3638,7 +3884,7 @@ index fa024bc..7468eb9 100644
  	queue_for_each_hw_ctx(q, hctx, i) {
  		if (!hctx->tags)
  			continue;
-@@ -3114,6 +3996,10 @@ int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr)
+@@ -3114,6 +4000,10 @@ int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr)
  	if (!ret)
  		q->nr_requests = nr;
  
@@ -3649,7 +3895,7 @@ index fa024bc..7468eb9 100644
  	blk_mq_unquiesce_queue(q);
  	blk_mq_unfreeze_queue(q);
  
-@@ -3190,6 +4076,19 @@ static void blk_mq_elv_switch_back(struct list_head *head,
+@@ -3190,6 +4080,19 @@ static void blk_mq_elv_switch_back(struct list_head *head,
  	mutex_unlock(&q->sysfs_lock);
  }
  
@@ -3669,7 +3915,7 @@ index fa024bc..7468eb9 100644
  static void __blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set,
  							int nr_hw_queues)
  {
-@@ -3253,6 +4152,16 @@ static void __blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set,
+@@ -3253,6 +4156,16 @@ static void __blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set,
  		blk_mq_unfreeze_queue(q);
  }
  
@@ -4232,21 +4478,57 @@ index 124c261..bf1cef2 100644
  			mod_timer(&q->timeout, expiry);
  	}
 diff --git a/block/blk.h b/block/blk.h
-index 5d636ee..867d90a 100644
+index 5d636ee..f575f59 100644
 --- a/block/blk.h
 +++ b/block/blk.h
-@@ -16,6 +16,10 @@ extern struct dentry *blk_debugfs_root;
+@@ -16,10 +16,34 @@ extern struct dentry *blk_debugfs_root;
  
  struct blk_flush_queue {
  	unsigned int		flush_queue_delayed:1;
 +	/*
 +	 * 在以下修改:
 +	 *   - block/blk-flush.c|327| <<blk_kick_flush>> fq->flush_pending_idx ^= 1;
++	 *
++	 *   Issue flush and toggle pending_idx.  This makes pending_idx
++	 *   different from running_idx, which means flush is in flight.
 +	 */
  	unsigned int		flush_pending_idx:1;
++	/*
++	 * 在以下修改:
++	 *   - block/blk-flush.c|294| <<flush_end_io>> fq->flush_running_idx ^= 1;
++	 *
++	 * 在以下被使用:
++	 *   - block/blk-flush.c|290| <<flush_end_io>> running = &fq->flush_queue[fq->flush_running_idx];
++	 *   - block/blk-flush.c|291| <<flush_end_io>> BUG_ON(fq->flush_pending_idx == fq->flush_running_idx);
++	 *   - block/blk-flush.c|338| <<blk_kick_flush>> if (fq->flush_pending_idx != fq->flush_running_idx || list_empty(pending))
++	 */
  	unsigned int		flush_running_idx:1;
++	/*
++	 * 只在以下修改:
++	 *   - block/blk-flush.c|234| <<blk_flush_complete_seq>> fq->flush_pending_since = jiffies;
++	 */
  	unsigned long		flush_pending_since;
-@@ -55,6 +59,9 @@ void blk_rq_bio_prep(struct request_queue *q, struct request *rq,
+ 	struct list_head	flush_queue[2];
++	/*
++	 * 在以下添加元素, 删除的还不知道:
++	 *   - block/blk-flush.c|239| <<blk_flush_complete_seq>> list_move_tail(&rq->flush.list, &fq->flush_data_in_flight);
++	 */
+ 	struct list_head	flush_data_in_flight;
+ 	struct request		*flush_rq;
+ 
+@@ -27,6 +51,11 @@ struct blk_flush_queue {
+ 	 * flush_rq shares tag with this rq, both can't be active
+ 	 * at the same time
+ 	 */
++	/*
++	 * used by:
++	 *   - block/blk-flush.c|283| <<flush_end_io>> blk_mq_tag_set_rq(hctx, flush_rq->tag, fq->orig_rq);
++	 *   - block/blk-flush.c|372| <<blk_kick_flush>> fq->orig_rq = first_rq;
++	 */
+ 	struct request		*orig_rq;
+ 	spinlock_t		mq_flush_lock;
+ };
+@@ -55,6 +84,9 @@ void blk_rq_bio_prep(struct request_queue *q, struct request *rq,
  			struct bio *bio);
  void blk_freeze_queue(struct request_queue *q);
  
