@@ -1,6 +1,6 @@
-From 7a4c060e6266db1522718cbb3c8ffa7ed757e666 Mon Sep 17 00:00:00 2001
+From 3ee6e6cbeb5d37a000d58018cf47272f05d01b77 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Fri, 29 Mar 2019 00:48:38 +0800
+Date: Fri, 29 Mar 2019 16:01:49 +0800
 Subject: [PATCH 1/1] block comment for block and drivers for
  linux-block:for-5.1/block-20190302
 
@@ -10,7 +10,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
  block/bio.c                     |   3 +
  block/blk-core.c                |  41 ++
- block/blk-flush.c               | 328 ++++++++++++++
+ block/blk-flush.c               | 426 +++++++++++++++++++
  block/blk-merge.c               |   4 +
  block/blk-mq-cpumap.c           |  15 +
  block/blk-mq-debugfs.c          |  12 +
@@ -26,21 +26,21 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  block/blk-settings.c            |  39 ++
  block/blk-softirq.c             |  10 +
  block/blk-stat.c                |  49 +++
- block/blk-sysfs.c               |  32 ++
+ block/blk-sysfs.c               |  41 ++
  block/blk-timeout.c             |  14 +
- block/blk.h                     |  35 ++
+ block/blk.h                     |  44 ++
  block/genhd.c                   |   5 +
- drivers/nvme/host/core.c        |  69 +++
- drivers/nvme/host/nvme.h        |   5 +
- drivers/nvme/host/pci.c         | 313 ++++++++++++++
+ drivers/nvme/host/core.c        | 106 +++++
+ drivers/nvme/host/nvme.h        |  11 +
+ drivers/nvme/host/pci.c         | 339 +++++++++++++++
  include/linux/blk-mq.h          | 334 +++++++++++++++
  include/linux/blk_types.h       |   7 +
- include/linux/blkdev.h          | 204 +++++++++
+ include/linux/blkdev.h          | 241 +++++++++++
  include/linux/percpu-refcount.h |  38 ++
  include/linux/sbitmap.h         |  45 ++
  lib/percpu-refcount.c           |  13 +
  lib/sbitmap.c                   |  89 ++++
- 32 files changed, 3503 insertions(+), 1 deletion(-)
+ 32 files changed, 3725 insertions(+), 1 deletion(-)
 
 diff --git a/block/bio.c b/block/bio.c
 index 83a2dfa..2175b00 100644
@@ -151,10 +151,10 @@ index 6b78ec5..6b59b1f 100644
  	if (!q->stats)
  		goto fail_stats;
 diff --git a/block/blk-flush.c b/block/blk-flush.c
-index 6e0f2d9..a357f6b 100644
+index 6e0f2d9..8934474 100644
 --- a/block/blk-flush.c
 +++ b/block/blk-flush.c
-@@ -76,6 +76,37 @@
+@@ -76,6 +76,120 @@
  #include "blk-mq-tag.h"
  #include "blk-mq-sched.h"
  
@@ -189,10 +189,93 @@ index 6e0f2d9..a357f6b 100644
 + * 冲刷request执行完毕后,pending1队列所有的fs_request的PREFLUSH/POSTFLUSH执行完毕.
 + */
 +
++/*
++ * 设置write back的一些地方:
++ *   - block/blk-settings.c|865| <<blk_queue_write_cache>> blk_queue_flag_set(QUEUE_FLAG_WC, q);
++ *   - block/blk-settings.c|867| <<blk_queue_write_cache>> blk_queue_flag_clear(QUEUE_FLAG_WC, q);
++ *   - block/blk-sysfs.c|514| <<queue_wc_store>> blk_queue_flag_set(QUEUE_FLAG_WC, q);
++ *   - block/blk-sysfs.c|516| <<queue_wc_store>> blk_queue_flag_clear(QUEUE_FLAG_WC, q);
++ *
++ *   - drivers/block/loop.c|964| <<loop_set_fd>> blk_queue_write_cache(lo->lo_queue, true, false);
++ *   - drivers/block/null_blk_main.c|1680| <<null_add_dev>> blk_queue_write_cache(nullb->q, true, true);
++ *   - drivers/block/virtio_blk.c|606| <<virtblk_update_cache_mode>> blk_queue_write_cache(vblk->disk->queue, writeback, false);
++ *   - drivers/block/xen-blkfront.c|1014| <<xlvbd_flush>> blk_queue_write_cache(info->rq, info->feature_flush ? true : false,
++ *   - drivers/nvme/host/core.c|2031| <<nvme_set_queue_limits>> blk_queue_write_cache(q, vwc, vwc);
++ *   - drivers/nvme/host/multipath.c|315| <<nvme_mpath_alloc_disk>> blk_queue_write_cache(q, vwc, vwc);
++ *   - drivers/ide/ide-disk.c|554| <<update_flush>> blk_queue_write_cache(drive->queue, wc, false);
++ *   - drivers/scsi/sd.c|153| <<sd_set_flush_flag>> blk_queue_write_cache(sdkp->disk->queue, wc, fua);
++ */
++
++/*
++ * 假设三个都要做:
++ *
++ * blk_insert_flush()
++ *
++ * rq->flush.saved_end_io保存原来的rq->end_io
++ * 把rq->end_io设置为mq_flush_data_end_io()
++ *
++ * spin_lock_irq(&fq->mq_flush_lock);
++ * 调用blk_flush_complete_seq()
++ * 一开始是REQ_FSEQ_PREFLUSH, 把request放入fq->flush_queue[fq->flush_pending_idx]
++ * 此时flush_pending_idx == flush_running_idx
++ * 调用blk_kick_flush(q, fq, cmd_flags)把request从fq->flush_queue[fq->flush_pending_idx]获得(不取出)
++ * 反转fq->flush_pending_idx ^= 1, 然后flush_pending_idx就不等于flush_running_idx了
++ * 设置对应的预留的flush_rq, cmd_flags设置上REQ_OP_FLUSH | REQ_PREFLUSH;
++ * flush_rq->end_io设置成flush_end_io
++ * 下发!!!
++ * spin_unlock_irq(&fq->mq_flush_lock);
++ *
++ *
++ * ---> possible race :)
++ *
++ *
++ * 下发成功后flush_end_io()被调用
++ * spin_lock_irqsave(&fq->mq_flush_lock, flags);
++ * 此时flush_pending_idx不等于flush_running_idx了
++ * 反转fq->flush_running_idx, 这样flush_pending_idx == flush_running_idx了
++ *
++ * 把fq->flush_queue[反转前的fq->flush_running_idx]的每一个获得(不取出), 先讨论一个的情况吧
++ * 调用blk_flush_complete_seq()
++ * 这次是REQ_FSEQ_DATA, 把request从刚才的fq->flush_queue[反转前的fq->flush_running_idx]放入fq->flush_data_in_flight
++ * 调用blk_flush_queue_rq()下发request 
++ * 再次进入blk_kick_flush(), 此时fq->flush_queue[fq->flush_pending_idx]是空的(第二个list了), 所以直接return
++ * spin_unlock_irqrestore(&fq->mq_flush_lock, flags);
++ *
++ *
++ * ---> possible race :)
++ *
++ *
++ * 下发成功后mq_flush_data_end_io()被调用
++ * spin_lock_irqsave(&fq->mq_flush_lock, flags);
++ * 调用blk_flush_complete_seq(rq, fq, REQ_FSEQ_DATA, error);
++ * 这时是REQ_FSEQ_POSTFLUSH, 把request放入fq->flush_queue[fq->flush_pending_idx]
++ * 此时flush_pending_idx == flush_running_idx
++ * 调用blk_kick_flush(q, fq, cmd_flags)把request从fq->flush_queue[fq->flush_pending_idx]获得(不取出)
++ * 反转fq->flush_pending_idx ^= 1, 然后flush_pending_idx就不等于flush_running_idx了
++ * 设置对应的预留的flush_rq, cmd_flags设置上REQ_OP_FLUSH | REQ_PREFLUSH;
++ * flush_rq->end_io设置成flush_end_io
++ * 下发!!!
++ * spin_unlock_irqrestore(&fq->mq_flush_lock, flags);
++ *
++ *
++ * ---> possible race :)
++ *
++ *
++ * 下发成功后flush_end_io()被调用
++ * spin_lock_irqsave(&fq->mq_flush_lock, flags); 
++ * 此时flush_pending_idx不等于flush_running_idx了
++ * 反转fq->flush_running_idx, 这样flush_pending_idx == flush_running_idx了
++ *
++ * 把fq->flush_queue[反转前的fq->flush_running_idx]的每一个获得(不取出), 先讨论一个的情况吧
++ * 调用blk_flush_complete_seq() 
++ * 这次是REQ_FSEQ_DONE, 直接从所有list删掉, 然后blk_mq_end_request()!!
++ * spin_unlock_irqrestore(&fq->mq_flush_lock, flags);
++ */
++
  /* PREFLUSH/FUA sequences */
  enum {
  	REQ_FSEQ_PREFLUSH	= (1 << 0), /* pre-flushing in progress */
-@@ -96,16 +127,56 @@ enum {
+@@ -96,16 +210,61 @@ enum {
  static void blk_kick_flush(struct request_queue *q,
  			   struct blk_flush_queue *fq, unsigned int flags);
  
@@ -236,6 +319,11 @@ index 6e0f2d9..a357f6b 100644
 +	 * intervals or under certain conditions.
 +	 */
 +
++	/*
++	 * 如果硬盘本身不支持WC (write back cache)
++	 * 就没有设置任何的意义
++	 */
++
  	if (fflags & (1UL << QUEUE_FLAG_WC)) {
  		if (rq->cmd_flags & REQ_PREFLUSH)
  			policy |= REQ_FSEQ_PREFLUSH;
@@ -249,7 +337,7 @@ index 6e0f2d9..a357f6b 100644
  		if (!(fflags & (1UL << QUEUE_FLAG_FUA)) &&
  		    (rq->cmd_flags & REQ_FUA))
  			policy |= REQ_FSEQ_POSTFLUSH;
-@@ -113,11 +184,40 @@ static unsigned int blk_flush_policy(unsigned long fflags, struct request *rq)
+@@ -113,11 +272,40 @@ static unsigned int blk_flush_policy(unsigned long fflags, struct request *rq)
  	return policy;
  }
  
@@ -290,7 +378,7 @@ index 6e0f2d9..a357f6b 100644
  static void blk_flush_restore_request(struct request *rq)
  {
  	/*
-@@ -132,6 +232,13 @@ static void blk_flush_restore_request(struct request *rq)
+@@ -132,6 +320,13 @@ static void blk_flush_restore_request(struct request *rq)
  	rq->end_io = rq->flush.saved_end_io;
  }
  
@@ -304,7 +392,7 @@ index 6e0f2d9..a357f6b 100644
  static void blk_flush_queue_rq(struct request *rq, bool add_front)
  {
  	blk_mq_add_to_requeue_list(rq, add_front, true);
-@@ -153,18 +260,44 @@ static void blk_flush_queue_rq(struct request *rq, bool add_front)
+@@ -153,18 +348,44 @@ static void blk_flush_queue_rq(struct request *rq, bool add_front)
   * RETURNS:
   * %true if requests were added to the dispatch queue, %false otherwise.
   */
@@ -349,7 +437,7 @@ index 6e0f2d9..a357f6b 100644
  	if (likely(!error))
  		seq = blk_flush_cur_seq(rq);
  	else
-@@ -176,23 +309,53 @@ static void blk_flush_complete_seq(struct request *rq,
+@@ -176,23 +397,53 @@ static void blk_flush_complete_seq(struct request *rq,
  		/* queue for flush */
  		if (list_empty(pending))
  			fq->flush_pending_since = jiffies;
@@ -403,7 +491,7 @@ index 6e0f2d9..a357f6b 100644
  		blk_flush_restore_request(rq);
  		blk_mq_end_request(rq, error);
  		break;
-@@ -204,6 +367,13 @@ static void blk_flush_complete_seq(struct request *rq,
+@@ -204,6 +455,13 @@ static void blk_flush_complete_seq(struct request *rq,
  	blk_kick_flush(q, fq, cmd_flags);
  }
  
@@ -417,7 +505,7 @@ index 6e0f2d9..a357f6b 100644
  static void flush_end_io(struct request *flush_rq, blk_status_t error)
  {
  	struct request_queue *q = flush_rq->q;
-@@ -224,6 +394,10 @@ static void flush_end_io(struct request *flush_rq, blk_status_t error)
+@@ -224,6 +482,10 @@ static void flush_end_io(struct request *flush_rq, blk_status_t error)
  		flush_rq->internal_tag = -1;
  	}
  
@@ -428,7 +516,7 @@ index 6e0f2d9..a357f6b 100644
  	running = &fq->flush_queue[fq->flush_running_idx];
  	BUG_ON(fq->flush_pending_idx == fq->flush_running_idx);
  
-@@ -232,9 +406,16 @@ static void flush_end_io(struct request *flush_rq, blk_status_t error)
+@@ -232,9 +494,16 @@ static void flush_end_io(struct request *flush_rq, blk_status_t error)
  
  	/* and push the waiting requests to the next stage */
  	list_for_each_entry_safe(rq, n, running, flush.list) {
@@ -445,7 +533,7 @@ index 6e0f2d9..a357f6b 100644
  		blk_flush_complete_seq(rq, fq, seq, error);
  	}
  
-@@ -255,15 +436,27 @@ static void flush_end_io(struct request *flush_rq, blk_status_t error)
+@@ -255,15 +524,27 @@ static void flush_end_io(struct request *flush_rq, blk_status_t error)
   * spin_lock_irq(fq->mq_flush_lock)
   *
   */
@@ -473,7 +561,7 @@ index 6e0f2d9..a357f6b 100644
  	if (fq->flush_pending_idx != fq->flush_running_idx || list_empty(pending))
  		return;
  
-@@ -273,6 +466,20 @@ static void blk_kick_flush(struct request_queue *q, struct blk_flush_queue *fq,
+@@ -273,6 +554,20 @@ static void blk_kick_flush(struct request_queue *q, struct blk_flush_queue *fq,
  	 * assigned to empty flushes, and we deadlock if we are expecting
  	 * other requests to make progress. Don't defer for that case.
  	 */
@@ -494,7 +582,15 @@ index 6e0f2d9..a357f6b 100644
  	if (!list_empty(&fq->flush_data_in_flight) && q->elevator &&
  	    time_before(jiffies,
  			fq->flush_pending_since + FLUSH_PENDING_TIMEOUT))
-@@ -309,11 +516,23 @@ static void blk_kick_flush(struct request_queue *q, struct blk_flush_queue *fq,
+@@ -305,15 +600,31 @@ static void blk_kick_flush(struct request_queue *q, struct blk_flush_queue *fq,
+ 		flush_rq->internal_tag = first_rq->internal_tag;
+ 	}
+ 
++	/*
++	 * 设置REQ_OP_FLUSH目的很明确
++	 * 不知道为什么设置REQ_PREFLUSH
++	 */
+ 	flush_rq->cmd_flags = REQ_OP_FLUSH | REQ_PREFLUSH;
  	flush_rq->cmd_flags |= (flags & REQ_DRV) | (flags & REQ_FAILFAST_MASK);
  	flush_rq->rq_flags |= RQF_FLUSH_SEQ;
  	flush_rq->rq_disk = first_rq->rq_disk;
@@ -518,7 +614,7 @@ index 6e0f2d9..a357f6b 100644
  static void mq_flush_data_end_io(struct request *rq, blk_status_t error)
  {
  	struct request_queue *q = rq->q;
-@@ -335,6 +554,10 @@ static void mq_flush_data_end_io(struct request *rq, blk_status_t error)
+@@ -335,6 +646,10 @@ static void mq_flush_data_end_io(struct request *rq, blk_status_t error)
  	blk_flush_complete_seq(rq, fq, REQ_FSEQ_DATA, error);
  	spin_unlock_irqrestore(&fq->mq_flush_lock, flags);
  
@@ -529,7 +625,7 @@ index 6e0f2d9..a357f6b 100644
  	blk_mq_sched_restart(hctx);
  }
  
-@@ -347,10 +570,45 @@ static void mq_flush_data_end_io(struct request *rq, blk_status_t error)
+@@ -347,10 +662,45 @@ static void mq_flush_data_end_io(struct request *rq, blk_status_t error)
   * @rq is being submitted.  Analyze what needs to be done and put it on the
   * right queue.
   */
@@ -575,17 +671,24 @@ index 6e0f2d9..a357f6b 100644
  	unsigned int policy = blk_flush_policy(fflags, rq);
  	struct blk_flush_queue *fq = blk_get_flush_queue(q, rq->mq_ctx);
  
-@@ -359,6 +617,9 @@ void blk_insert_flush(struct request *rq)
+@@ -358,7 +708,16 @@ void blk_insert_flush(struct request *rq)
+ 	 * @policy now records what operations need to be done.  Adjust
  	 * REQ_PREFLUSH and FUA for the driver.
  	 */
++	/*
++	 * 猜测这里因为REQ_PREFLUSH需要用预留的flush_rq, 所以可以在data rq里删掉这个flag
++	 */
  	rq->cmd_flags &= ~REQ_PREFLUSH;
 +	/*
 +	 * 假定我们分析的场景中,磁盘不支持FUA,则最终我们的冲刷策略为3步都做(policy=111).
++	 *
++	 * 磁盘不支持FUA就按正常数据下发, 就不用REQ_FUA这个flag了
++	 * 反正最后还是要FLUSH一下!
 +	 */
  	if (!(fflags & (1UL << QUEUE_FLAG_FUA)))
  		rq->cmd_flags &= ~REQ_FUA;
  
-@@ -389,6 +650,10 @@ void blk_insert_flush(struct request *rq)
+@@ -389,6 +748,10 @@ void blk_insert_flush(struct request *rq)
  	 */
  	if ((policy & REQ_FSEQ_DATA) &&
  	    !(policy & (REQ_FSEQ_PREFLUSH | REQ_FSEQ_POSTFLUSH))) {
@@ -596,7 +699,7 @@ index 6e0f2d9..a357f6b 100644
  		blk_mq_request_bypass_insert(rq, false);
  		return;
  	}
-@@ -399,12 +664,19 @@ void blk_insert_flush(struct request *rq)
+@@ -399,12 +762,19 @@ void blk_insert_flush(struct request *rq)
  	 */
  	memset(&rq->flush, 0, sizeof(rq->flush));
  	INIT_LIST_HEAD(&rq->flush.list);
@@ -616,7 +719,7 @@ index 6e0f2d9..a357f6b 100644
  	blk_flush_complete_seq(rq, fq, REQ_FSEQ_ACTIONS & ~policy, 0);
  	spin_unlock_irq(&fq->mq_flush_lock);
  }
-@@ -420,6 +692,32 @@ void blk_insert_flush(struct request *rq)
+@@ -420,6 +790,32 @@ void blk_insert_flush(struct request *rq)
   *    room for storing the error offset in case of a flush error, if they
   *    wish to.
   */
@@ -649,7 +752,7 @@ index 6e0f2d9..a357f6b 100644
  int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
  		sector_t *error_sector)
  {
-@@ -430,6 +728,7 @@ int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
+@@ -430,6 +826,7 @@ int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
  	if (bdev->bd_disk == NULL)
  		return -ENXIO;
  
@@ -657,7 +760,7 @@ index 6e0f2d9..a357f6b 100644
  	q = bdev_get_queue(bdev);
  	if (!q)
  		return -ENXIO;
-@@ -447,6 +746,7 @@ int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
+@@ -447,6 +844,7 @@ int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
  	bio_set_dev(bio, bdev);
  	bio->bi_opf = REQ_OP_WRITE | REQ_PREFLUSH;
  
@@ -665,7 +768,7 @@ index 6e0f2d9..a357f6b 100644
  	ret = submit_bio_wait(bio);
  
  	/*
-@@ -462,6 +762,14 @@ int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
+@@ -462,6 +860,14 @@ int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
  }
  EXPORT_SYMBOL(blkdev_issue_flush);
  
@@ -680,7 +783,7 @@ index 6e0f2d9..a357f6b 100644
  struct blk_flush_queue *blk_alloc_flush_queue(struct request_queue *q,
  		int node, int cmd_size, gfp_t flags)
  {
-@@ -474,13 +782,33 @@ struct blk_flush_queue *blk_alloc_flush_queue(struct request_queue *q,
+@@ -474,13 +880,33 @@ struct blk_flush_queue *blk_alloc_flush_queue(struct request_queue *q,
  
  	spin_lock_init(&fq->mq_flush_lock);
  
@@ -4510,10 +4613,26 @@ index 696a041..8ca76e2 100644
  {
  	if (!stats)
 diff --git a/block/blk-sysfs.c b/block/blk-sysfs.c
-index 5968591..8d65a92 100644
+index 5968591..e3ec8f3 100644
 --- a/block/blk-sysfs.c
 +++ b/block/blk-sysfs.c
-@@ -872,6 +872,33 @@ static void __blk_release_queue(struct work_struct *work)
+@@ -510,6 +510,15 @@ static ssize_t queue_wc_store(struct request_queue *q, const char *page,
+ 	if (set == -1)
+ 		return -EINVAL;
+ 
++	/*
++	 * When read, this file will display whether the device has write back
++	 * caching enabled or not. It will return "write back" for the former
++	 * case, and "write through" for the latter. Writing to this file can
++	 * change the kernels view of the device, but it doesn't alter the
++	 * device state. This means that it might not be safe to toggle the
++	 * setting from "write back" to "write through", since that will also
++	 * eliminate cache flushes issued by the kernel.
++	 */
+ 	if (set)
+ 		blk_queue_flag_set(QUEUE_FLAG_WC, q);
+ 	else
+@@ -872,6 +881,33 @@ static void __blk_release_queue(struct work_struct *work)
  	call_rcu(&q->rcu_head, blk_free_queue_rcu);
  }
  
@@ -4547,7 +4666,7 @@ index 5968591..8d65a92 100644
  static void blk_release_queue(struct kobject *kobj)
  {
  	struct request_queue *q =
-@@ -896,6 +923,11 @@ struct kobj_type blk_queue_ktype = {
+@@ -896,6 +932,11 @@ struct kobj_type blk_queue_ktype = {
   * blk_register_queue - register a block layer queue with sysfs
   * @disk: Disk of which the request queue should be registered with sysfs.
   */
@@ -4592,7 +4711,7 @@ index 124c261..bf1cef2 100644
  			mod_timer(&q->timeout, expiry);
  	}
 diff --git a/block/blk.h b/block/blk.h
-index 5d636ee..97706b3 100644
+index 5d636ee..15f6f7e 100644
 --- a/block/blk.h
 +++ b/block/blk.h
 @@ -16,10 +16,37 @@ extern struct dentry *blk_debugfs_root;
@@ -4633,7 +4752,7 @@ index 5d636ee..97706b3 100644
  	struct list_head	flush_data_in_flight;
  	struct request		*flush_rq;
  
-@@ -27,6 +54,11 @@ struct blk_flush_queue {
+@@ -27,7 +54,21 @@ struct blk_flush_queue {
  	 * flush_rq shares tag with this rq, both can't be active
  	 * at the same time
  	 */
@@ -4643,9 +4762,19 @@ index 5d636ee..97706b3 100644
 +	 *   - block/blk-flush.c|372| <<blk_kick_flush>> fq->orig_rq = first_rq;
 +	 */
  	struct request		*orig_rq;
++	/*
++	 * used by:
++	 *   - block/blk-flush.c|409| <<flush_end_io>> spin_lock_irqsave(&fq->mq_flush_lock, flags);
++	 *   - block/blk-flush.c|445| <<flush_end_io>> spin_unlock_irqrestore(&fq->mq_flush_lock, flags);
++	 *   - block/blk-flush.c|575| <<mq_flush_data_end_io>> spin_lock_irqsave(&fq->mq_flush_lock, flags);
++	 *   - block/blk-flush.c|577| <<mq_flush_data_end_io>> spin_unlock_irqrestore(&fq->mq_flush_lock, flags);
++	 *   - block/blk-flush.c|695| <<blk_insert_flush>> spin_lock_irq(&fq->mq_flush_lock);
++	 *   - block/blk-flush.c|703| <<blk_insert_flush>> spin_unlock_irq(&fq->mq_flush_lock);
++	 */
  	spinlock_t		mq_flush_lock;
  };
-@@ -55,6 +87,9 @@ void blk_rq_bio_prep(struct request_queue *q, struct request *rq,
+ 
+@@ -55,6 +96,9 @@ void blk_rq_bio_prep(struct request_queue *q, struct request *rq,
  			struct bio *bio);
  void blk_freeze_queue(struct request_queue *q);
  
@@ -4672,7 +4801,7 @@ index 7032678..3e01ba0 100644
  {
  	struct class_dev_iter iter;
 diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
-index 07bf2bf..4fd31ab 100644
+index 07bf2bf..e16139d 100644
 --- a/drivers/nvme/host/core.c
 +++ b/drivers/nvme/host/core.c
 @@ -71,6 +71,10 @@ MODULE_PARM_DESC(streams, "turn on support for Streams write directives");
@@ -4752,7 +4881,96 @@ index 07bf2bf..4fd31ab 100644
  bool nvme_cancel_request(struct request *req, void *data, bool reserved)
  {
  	dev_dbg_ratelimited(((struct nvme_ctrl *) data)->device,
-@@ -701,6 +743,14 @@ void nvme_cleanup_cmd(struct request *req)
+@@ -416,9 +458,23 @@ static void nvme_put_ns(struct nvme_ns *ns)
+ 	kref_put(&ns->kref, nvme_free_ns);
+ }
+ 
++/*
++ * 如果req->rq_flags没设置RQF_DONTPREP, 要设置RQF_DONTPREP
++ */
+ static inline void nvme_clear_nvme_request(struct request *req)
+ {
++	/*
++	 * don't call prep for this one
++	 * 设置的地方:
++	 *   - drivers/block/skd_main.c|501| <<skd_mq_queue_rq>> req->rq_flags |= RQF_DONTPREP;
++	 *   - drivers/ide/ide-io.c|464| <<ide_issue_rq>> rq->rq_flags |= RQF_DONTPREP;
++	 *   - drivers/mmc/core/queue.c|301| <<mmc_mq_queue_rq>> req->rq_flags |= RQF_DONTPREP;
++	 *   - drivers/nvme/host/core.c|466| <<nvme_clear_nvme_request>> req->rq_flags |= RQF_DONTPREP;
++	 *   - drivers/scsi/scsi_lib.c|147| <<scsi_mq_requeue_cmd>> cmd->request->rq_flags &= ~RQF_DONTPREP;
++	 *   - drivers/scsi/scsi_lib.c|1720| <<scsi_queue_rq>> req->rq_flags |= RQF_DONTPREP;
++	 */
+ 	if (!(req->rq_flags & RQF_DONTPREP)) {
++		/* 获取request后面driver specific的部分 */
+ 		nvme_req(req)->retries = 0;
+ 		nvme_req(req)->flags = 0;
+ 		req->rq_flags |= RQF_DONTPREP;
+@@ -547,6 +603,10 @@ static void nvme_assign_write_stream(struct nvme_ctrl *ctrl,
+ 		req->q->write_hints[streamid] += blk_rq_bytes(req) >> 9;
+ }
+ 
++/*
++ * 处理REQ_OP_FLUSH:
++ *   - drivers/nvme/host/core.c|785| <<nvme_setup_cmd>> nvme_setup_flush(ns, cmd);
++ */
+ static inline void nvme_setup_flush(struct nvme_ns *ns,
+ 		struct nvme_command *cmnd)
+ {
+@@ -554,9 +614,18 @@ static inline void nvme_setup_flush(struct nvme_ns *ns,
+ 	cmnd->common.nsid = cpu_to_le32(ns->head->ns_id);
+ }
+ 
++/*
++ * 处理REQ_OP_DISCARD或者作为REQ_OP_WRITE_ZEROES的quirk:
++ *   - drivers/nvme/host/core.c|671| <<nvme_setup_write_zeroes>> return nvme_setup_discard(ns, req, cmnd);
++ *   - drivers/nvme/host/core.c|791| <<nvme_setup_cmd>> ret = nvme_setup_discard(ns, req, cmd);
++ */
+ static blk_status_t nvme_setup_discard(struct nvme_ns *ns, struct request *req,
+ 		struct nvme_command *cmnd)
+ {
++	/*
++	 * Number of discard segments (or ranges) the driver needs to fill in.
++	 * Each discard bio merged into a request is counted as one segment.
++	 */
+ 	unsigned short segments = blk_rq_nr_discard_segments(req), n = 0;
+ 	struct nvme_dsm_range *range;
+ 	struct bio *bio;
+@@ -576,6 +645,7 @@ static blk_status_t nvme_setup_discard(struct nvme_ns *ns, struct request *req,
+ 	}
+ 
+ 	__rq_for_each_bio(bio, req) {
++		/* 把一个namespace的vector转换成在namespace的block number */
+ 		u64 slba = nvme_block_nr(ns, bio->bi_iter.bi_sector);
+ 		u32 nlb = bio->bi_iter.bi_size >> ns->lba_shift;
+ 
+@@ -608,6 +678,10 @@ static blk_status_t nvme_setup_discard(struct nvme_ns *ns, struct request *req,
+ 	return BLK_STS_OK;
+ }
+ 
++/*
++ * 处理REQ_OP_WRITE_ZEROES:
++ *   - drivers/nvme/host/core.c|788| <<nvme_setup_cmd>> ret = nvme_setup_write_zeroes(ns, req, cmd);
++ */
+ static inline blk_status_t nvme_setup_write_zeroes(struct nvme_ns *ns,
+ 		struct request *req, struct nvme_command *cmnd)
+ {
+@@ -616,6 +690,7 @@ static inline blk_status_t nvme_setup_write_zeroes(struct nvme_ns *ns,
+ 
+ 	cmnd->write_zeroes.opcode = nvme_cmd_write_zeroes;
+ 	cmnd->write_zeroes.nsid = cpu_to_le32(ns->head->ns_id);
++	/* 把一个namespace的vector转换成在namespace的block numbe */
+ 	cmnd->write_zeroes.slba =
+ 		cpu_to_le64(nvme_block_nr(ns, blk_rq_pos(req)));
+ 	cmnd->write_zeroes.length =
+@@ -641,6 +716,7 @@ static inline blk_status_t nvme_setup_rw(struct nvme_ns *ns,
+ 
+ 	cmnd->rw.opcode = (rq_data_dir(req) ? nvme_cmd_write : nvme_cmd_read);
+ 	cmnd->rw.nsid = cpu_to_le32(ns->head->ns_id);
++	/* 把一个namespace的vector转换成在namespace的block number */
+ 	cmnd->rw.slba = cpu_to_le64(nvme_block_nr(ns, blk_rq_pos(req)));
+ 	cmnd->rw.length = cpu_to_le16((blk_rq_bytes(req) >> ns->lba_shift) - 1);
+ 
+@@ -701,11 +777,22 @@ void nvme_cleanup_cmd(struct request *req)
  }
  EXPORT_SYMBOL_GPL(nvme_cleanup_cmd);
  
@@ -4763,11 +4981,19 @@ index 07bf2bf..4fd31ab 100644
 + *   - drivers/nvme/host/rdma.c|1737| <<nvme_rdma_queue_rq>> ret = nvme_setup_cmd(ns, rq, c);
 + *   - drivers/nvme/host/tcp.c|1997| <<nvme_tcp_setup_cmd_pdu>> ret = nvme_setup_cmd(ns, rq, &pdu->cmd);
 + *   - drivers/nvme/target/loop.c|159| <<nvme_loop_queue_rq>> ret = nvme_setup_cmd(ns, req, &iod->cmd);
++ *
++ * 把req->tag存入cmd->common.command_id
 + */
  blk_status_t nvme_setup_cmd(struct nvme_ns *ns, struct request *req,
  		struct nvme_command *cmd)
  {
-@@ -3710,6 +3760,14 @@ static void nvme_free_ctrl(struct device *dev)
+ 	blk_status_t ret = BLK_STS_OK;
+ 
++	/* 如果req->rq_flags没设置RQF_DONTPREP, 要设置RQF_DONTPREP */
+ 	nvme_clear_nvme_request(req);
+ 
+ 	memset(cmd, 0, sizeof(*cmd));
+@@ -3710,6 +3797,14 @@ static void nvme_free_ctrl(struct device *dev)
   * earliest initialization so that we have the initialized structured around
   * during probing.
   */
@@ -4782,7 +5008,7 @@ index 07bf2bf..4fd31ab 100644
  int nvme_init_ctrl(struct nvme_ctrl *ctrl, struct device *dev,
  		const struct nvme_ctrl_ops *ops, unsigned long quirks)
  {
-@@ -3790,6 +3848,12 @@ EXPORT_SYMBOL_GPL(nvme_init_ctrl);
+@@ -3790,6 +3885,12 @@ EXPORT_SYMBOL_GPL(nvme_init_ctrl);
   * Call this function when the driver determines it is unable to get the
   * controller in a state capable of servicing IO.
   */
@@ -4795,7 +5021,7 @@ index 07bf2bf..4fd31ab 100644
  void nvme_kill_queues(struct nvme_ctrl *ctrl)
  {
  	struct nvme_ns *ns;
-@@ -3843,6 +3907,11 @@ void nvme_wait_freeze(struct nvme_ctrl *ctrl)
+@@ -3843,6 +3944,11 @@ void nvme_wait_freeze(struct nvme_ctrl *ctrl)
  }
  EXPORT_SYMBOL_GPL(nvme_wait_freeze);
  
@@ -4808,10 +5034,20 @@ index 07bf2bf..4fd31ab 100644
  {
  	struct nvme_ns *ns;
 diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
-index b91f183..7dd1342 100644
+index b91f183..a6e1306 100644
 --- a/drivers/nvme/host/nvme.h
 +++ b/drivers/nvme/host/nvme.h
-@@ -173,6 +173,11 @@ struct nvme_ctrl {
+@@ -112,6 +112,9 @@ enum {
+ 	NVME_REQ_USERCMD		= (1 << 1),
+ };
+ 
++/*
++ * 获取request后面driver specific的部分
++ */
+ static inline struct nvme_request *nvme_req(struct request *req)
+ {
+ 	return blk_mq_rq_to_pdu(req);
+@@ -173,6 +176,11 @@ struct nvme_ctrl {
  
  	u32 ctrl_config;
  	u16 mtfa;
@@ -4823,8 +5059,18 @@ index b91f183..7dd1342 100644
  	u32 queue_count;
  
  	u64 cap;
+@@ -383,6 +391,9 @@ static inline int nvme_reset_subsystem(struct nvme_ctrl *ctrl)
+ 	return ctrl->ops->reg_write32(ctrl, NVME_REG_NSSR, 0x4E564D65);
+ }
+ 
++/*
++ * 把一个namespace的vector转换成在namespace的block number
++ */
+ static inline u64 nvme_block_nr(struct nvme_ns *ns, sector_t sector)
+ {
+ 	return (sector >> (ns->lba_shift - 9));
 diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
-index f54718b..bb8a156 100644
+index f54718b..55361fd 100644
 --- a/drivers/nvme/host/pci.c
 +++ b/drivers/nvme/host/pci.c
 @@ -39,6 +39,12 @@
@@ -5049,7 +5295,19 @@ index f54718b..bb8a156 100644
  static unsigned int nvme_pci_iod_alloc_size(struct nvme_dev *dev,
  		unsigned int size, unsigned int nseg, bool use_sgl)
  {
-@@ -537,6 +667,11 @@ static inline void nvme_write_sq_db(struct nvme_queue *nvmeq, bool write_sq)
+@@ -514,6 +644,11 @@ static int nvme_pci_map_queues(struct blk_mq_tag_set *set)
+ /*
+  * Write sq tail if we are asked to, or if the next command would wrap.
+  */
++/*
++ * called by:
++ *   - drivers/nvme/host/pci.c|682| <<nvme_submit_cmd>> nvme_write_sq_db(nvmeq, write_sq);
++ *   - drivers/nvme/host/pci.c|692| <<nvme_commit_rqs>> nvme_write_sq_db(nvmeq, true);
++ */
+ static inline void nvme_write_sq_db(struct nvme_queue *nvmeq, bool write_sq)
+ {
+ 	if (!write_sq) {
+@@ -537,10 +672,23 @@ static inline void nvme_write_sq_db(struct nvme_queue *nvmeq, bool write_sq)
   * @cmd: The command to send
   * @write_sq: whether to write to the SQ doorbell
   */
@@ -5061,7 +5319,30 @@ index f54718b..bb8a156 100644
  static void nvme_submit_cmd(struct nvme_queue *nvmeq, struct nvme_command *cmd,
  			    bool write_sq)
  {
-@@ -922,6 +1057,15 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 	spin_lock(&nvmeq->sq_lock);
++	/*
++	 * sq_cmds根据是否使用cmb在两处分配在两处分配, sq的ring buffer:
++	 *   - drivers/nvme/host/pci.c|1544| <<nvme_alloc_sq_cmds>> nvmeq->sq_cmds = pci_alloc_p2pmem(pdev, SQ_SIZE(depth));
++	 *   - drivers/nvme/host/pci.c|1553| <<nvme_alloc_sq_cmds>> nvmeq->sq_cmds = dma_alloc_coherent(dev->dev, SQ_SIZE(depth),
++	 *
++	 * 下发到sq写入tail
++	 * 从cq接收写入head
++	 */
+ 	memcpy(&nvmeq->sq_cmds[nvmeq->sq_tail], cmd, sizeof(*cmd));
+ 	if (++nvmeq->sq_tail == nvmeq->q_depth)
+ 		nvmeq->sq_tail = 0;
+@@ -829,6 +977,10 @@ static blk_status_t nvme_pci_setup_sgls(struct nvme_dev *dev,
+ 	return BLK_STS_OK;
+ }
+ 
++/*
++ * called by only:
++ *   - drivers/nvme/host/pci.c|1081| <<nvme_queue_rq>> ret = nvme_map_data(dev, req, &cmnd);
++ */
+ static blk_status_t nvme_map_data(struct nvme_dev *dev, struct request *req,
+ 		struct nvme_command *cmnd)
+ {
+@@ -922,6 +1074,15 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
  	 * We should not need to do this, but we're still using this to
  	 * ensure we can drain requests on a dying queue.
  	 */
@@ -5077,7 +5358,22 @@ index f54718b..bb8a156 100644
  	if (unlikely(!test_bit(NVMEQ_ENABLED, &nvmeq->flags)))
  		return BLK_STS_IOERR;
  
-@@ -939,6 +1083,23 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
+@@ -933,12 +1094,38 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 	if (ret)
+ 		goto out_free_cmd;
+ 
++	/*
++	 * Number of physical segments as sent to the device.
++	 *
++	 * Normally this is the number of discontiguous data segments sent by the
++	 * submitter.  But for data-less command like discard we might have no
++	 * actual data segments submitted, but the driver might have to add it's
++	 * own special payload.  In that case we still return 1 here so that this
++	 * special payload will be mapped.
++	 */
+ 	if (blk_rq_nr_phys_segments(req)) {
+ 		ret = nvme_map_data(dev, req, &cmnd);
+ 		if (ret)
  			goto out_cleanup_iod;
  	}
  
@@ -5101,7 +5397,7 @@ index f54718b..bb8a156 100644
  	blk_mq_start_request(req);
  	nvme_submit_cmd(nvmeq, &cmnd, bd->last);
  	return BLK_STS_OK;
-@@ -1461,6 +1622,10 @@ static int nvme_cmb_qdepth(struct nvme_dev *dev, int nr_io_queues,
+@@ -1461,6 +1648,10 @@ static int nvme_cmb_qdepth(struct nvme_dev *dev, int nr_io_queues,
  	return q_depth;
  }
  
@@ -5112,7 +5408,7 @@ index f54718b..bb8a156 100644
  static int nvme_alloc_sq_cmds(struct nvme_dev *dev, struct nvme_queue *nvmeq,
  				int qid, int depth)
  {
-@@ -1483,6 +1648,13 @@ static int nvme_alloc_sq_cmds(struct nvme_dev *dev, struct nvme_queue *nvmeq,
+@@ -1483,6 +1674,13 @@ static int nvme_alloc_sq_cmds(struct nvme_dev *dev, struct nvme_queue *nvmeq,
  	return 0;
  }
  
@@ -5126,7 +5422,7 @@ index f54718b..bb8a156 100644
  static int nvme_alloc_queue(struct nvme_dev *dev, int qid, int depth)
  {
  	struct nvme_queue *nvmeq = &dev->queues[qid];
-@@ -1533,6 +1705,11 @@ static int queue_request_irq(struct nvme_queue *nvmeq)
+@@ -1533,6 +1731,11 @@ static int queue_request_irq(struct nvme_queue *nvmeq)
  	}
  }
  
@@ -5138,7 +5434,7 @@ index f54718b..bb8a156 100644
  static void nvme_init_queue(struct nvme_queue *nvmeq, u16 qid)
  {
  	struct nvme_dev *dev = nvmeq->dev;
-@@ -1548,6 +1725,10 @@ static void nvme_init_queue(struct nvme_queue *nvmeq, u16 qid)
+@@ -1548,6 +1751,10 @@ static void nvme_init_queue(struct nvme_queue *nvmeq, u16 qid)
  	wmb(); /* ensure the first interrupt sees the initialization */
  }
  
@@ -5149,7 +5445,7 @@ index f54718b..bb8a156 100644
  static int nvme_create_queue(struct nvme_queue *nvmeq, int qid, bool polled)
  {
  	struct nvme_dev *dev = nvmeq->dev;
-@@ -1668,6 +1849,12 @@ static unsigned long db_bar_size(struct nvme_dev *dev, unsigned nr_io_queues)
+@@ -1668,6 +1875,12 @@ static unsigned long db_bar_size(struct nvme_dev *dev, unsigned nr_io_queues)
  	return NVME_REG_DBS + ((nr_io_queues + 1) * 8 * dev->db_stride);
  }
  
@@ -5162,7 +5458,7 @@ index f54718b..bb8a156 100644
  static int nvme_remap_bar(struct nvme_dev *dev, unsigned long size)
  {
  	struct pci_dev *pdev = to_pci_dev(dev->dev);
-@@ -1738,12 +1925,29 @@ static int nvme_pci_configure_admin_queue(struct nvme_dev *dev)
+@@ -1738,12 +1951,29 @@ static int nvme_pci_configure_admin_queue(struct nvme_dev *dev)
  	return result;
  }
  
@@ -5192,7 +5488,7 @@ index f54718b..bb8a156 100644
  		if (nvme_alloc_queue(dev, i, dev->q_depth)) {
  			ret = -ENOMEM;
  			break;
-@@ -2072,6 +2276,10 @@ static void nvme_calc_io_queues(struct nvme_dev *dev, unsigned int irq_queues)
+@@ -2072,6 +2302,10 @@ static void nvme_calc_io_queues(struct nvme_dev *dev, unsigned int irq_queues)
  	}
  }
  
@@ -5203,7 +5499,7 @@ index f54718b..bb8a156 100644
  static int nvme_setup_irqs(struct nvme_dev *dev, unsigned int nr_io_queues)
  {
  	struct pci_dev *pdev = to_pci_dev(dev->dev);
-@@ -2150,13 +2358,22 @@ static void nvme_disable_io_queues(struct nvme_dev *dev)
+@@ -2150,13 +2384,22 @@ static void nvme_disable_io_queues(struct nvme_dev *dev)
  		__nvme_disable_io_queues(dev, nvme_admin_delete_cq);
  }
  
@@ -5226,7 +5522,7 @@ index f54718b..bb8a156 100644
  	nr_io_queues = max_io_queues();
  	result = nvme_set_queue_count(&dev->ctrl, &nr_io_queues);
  	if (result < 0)
-@@ -2312,6 +2529,10 @@ static bool __nvme_disable_io_queues(struct nvme_dev *dev, u8 opcode)
+@@ -2312,6 +2555,10 @@ static bool __nvme_disable_io_queues(struct nvme_dev *dev, u8 opcode)
  /*
   * return error value only when tagset allocation failed
   */
@@ -5237,7 +5533,7 @@ index f54718b..bb8a156 100644
  static int nvme_dev_add(struct nvme_dev *dev)
  {
  	int ret;
-@@ -2319,6 +2540,13 @@ static int nvme_dev_add(struct nvme_dev *dev)
+@@ -2319,6 +2566,13 @@ static int nvme_dev_add(struct nvme_dev *dev)
  	if (!dev->ctrl.tagset) {
  		dev->tagset.ops = &nvme_mq_ops;
  		dev->tagset.nr_hw_queues = dev->online_queues - 1;
@@ -5251,7 +5547,7 @@ index f54718b..bb8a156 100644
  		dev->tagset.nr_maps = 2; /* default + read */
  		if (dev->io_queues[HCTX_TYPE_POLL])
  			dev->tagset.nr_maps++;
-@@ -2435,6 +2663,20 @@ static void nvme_pci_disable(struct nvme_dev *dev)
+@@ -2435,6 +2689,20 @@ static void nvme_pci_disable(struct nvme_dev *dev)
  	}
  }
  
@@ -5272,7 +5568,7 @@ index f54718b..bb8a156 100644
  static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
  {
  	bool dead = true;
-@@ -2470,6 +2712,9 @@ static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
+@@ -2470,6 +2738,9 @@ static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
  	nvme_suspend_queue(&dev->queues[0]);
  	nvme_pci_disable(dev);
  
@@ -5282,7 +5578,7 @@ index f54718b..bb8a156 100644
  	blk_mq_tagset_busy_iter(&dev->tagset, nvme_cancel_request, &dev->ctrl);
  	blk_mq_tagset_busy_iter(&dev->admin_tagset, nvme_cancel_request, &dev->ctrl);
  
-@@ -2533,6 +2778,17 @@ static void nvme_remove_dead_ctrl(struct nvme_dev *dev, int status)
+@@ -2533,6 +2804,17 @@ static void nvme_remove_dead_ctrl(struct nvme_dev *dev, int status)
  		nvme_put_ctrl(&dev->ctrl);
  }
  
@@ -5300,7 +5596,7 @@ index f54718b..bb8a156 100644
  static void nvme_reset_work(struct work_struct *work)
  {
  	struct nvme_dev *dev =
-@@ -2697,6 +2953,10 @@ static const struct nvme_ctrl_ops nvme_pci_ctrl_ops = {
+@@ -2697,6 +2979,10 @@ static const struct nvme_ctrl_ops nvme_pci_ctrl_ops = {
  	.get_address		= nvme_pci_get_address,
  };
  
@@ -5311,7 +5607,7 @@ index f54718b..bb8a156 100644
  static int nvme_dev_map(struct nvme_dev *dev)
  {
  	struct pci_dev *pdev = to_pci_dev(dev->dev);
-@@ -2744,6 +3004,10 @@ static unsigned long check_vendor_combination_bug(struct pci_dev *pdev)
+@@ -2744,6 +3030,10 @@ static unsigned long check_vendor_combination_bug(struct pci_dev *pdev)
  	return 0;
  }
  
@@ -5322,7 +5618,7 @@ index f54718b..bb8a156 100644
  static void nvme_async_probe(void *data, async_cookie_t cookie)
  {
  	struct nvme_dev *dev = data;
-@@ -2768,6 +3032,9 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+@@ -2768,6 +3058,9 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
  	if (!dev)
  		return -ENOMEM;
  
@@ -5332,7 +5628,7 @@ index f54718b..bb8a156 100644
  	dev->queues = kcalloc_node(max_queue_count(), sizeof(struct nvme_queue),
  					GFP_KERNEL, node);
  	if (!dev->queues)
-@@ -2776,6 +3043,7 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+@@ -2776,6 +3069,7 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
  	dev->dev = get_device(&pdev->dev);
  	pci_set_drvdata(pdev, dev);
  
@@ -5340,7 +5636,7 @@ index f54718b..bb8a156 100644
  	result = nvme_dev_map(dev);
  	if (result)
  		goto put_pci;
-@@ -2784,6 +3052,7 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+@@ -2784,6 +3078,7 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
  	INIT_WORK(&dev->remove_work, nvme_remove_dead_ctrl_work);
  	mutex_init(&dev->shutdown_lock);
  
@@ -5348,7 +5644,7 @@ index f54718b..bb8a156 100644
  	result = nvme_setup_prp_pools(dev);
  	if (result)
  		goto unmap;
-@@ -2798,6 +3067,9 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+@@ -2798,6 +3093,9 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
  						NVME_MAX_SEGS, true);
  	WARN_ON_ONCE(alloc_size > PAGE_SIZE);
  
@@ -5358,7 +5654,7 @@ index f54718b..bb8a156 100644
  	dev->iod_mempool = mempool_create_node(1, mempool_kmalloc,
  						mempool_kfree,
  						(void *) alloc_size,
-@@ -2807,6 +3079,7 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+@@ -2807,6 +3105,7 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
  		goto release_pools;
  	}
  
@@ -5366,7 +5662,7 @@ index f54718b..bb8a156 100644
  	result = nvme_init_ctrl(&dev->ctrl, &pdev->dev, &nvme_pci_ctrl_ops,
  			quirks);
  	if (result)
-@@ -2815,6 +3088,11 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+@@ -2815,6 +3114,11 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
  	dev_info(dev->ctrl.device, "pci function %s\n", dev_name(&pdev->dev));
  
  	nvme_get_ctrl(&dev->ctrl);
@@ -5378,7 +5674,7 @@ index f54718b..bb8a156 100644
  	async_schedule(nvme_async_probe, dev);
  
  	return 0;
-@@ -2833,12 +3111,18 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+@@ -2833,12 +3137,18 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
  	return result;
  }
  
@@ -5397,7 +5693,7 @@ index f54718b..bb8a156 100644
  static void nvme_reset_done(struct pci_dev *pdev)
  {
  	struct nvme_dev *dev = pci_get_drvdata(pdev);
-@@ -2856,6 +3140,17 @@ static void nvme_shutdown(struct pci_dev *pdev)
+@@ -2856,6 +3166,17 @@ static void nvme_shutdown(struct pci_dev *pdev)
   * state. This function must not have any dependencies on the device state in
   * order to proceed.
   */
@@ -5415,7 +5711,7 @@ index f54718b..bb8a156 100644
  static void nvme_remove(struct pci_dev *pdev)
  {
  	struct nvme_dev *dev = pci_get_drvdata(pdev);
-@@ -2905,6 +3200,9 @@ static int nvme_resume(struct device *dev)
+@@ -2905,6 +3226,9 @@ static int nvme_resume(struct device *dev)
  
  static SIMPLE_DEV_PM_OPS(nvme_dev_pm_ops, nvme_suspend, nvme_resume);
  
@@ -5425,7 +5721,7 @@ index f54718b..bb8a156 100644
  static pci_ers_result_t nvme_error_detected(struct pci_dev *pdev,
  						pci_channel_state_t state)
  {
-@@ -2931,6 +3229,9 @@ static pci_ers_result_t nvme_error_detected(struct pci_dev *pdev,
+@@ -2931,6 +3255,9 @@ static pci_ers_result_t nvme_error_detected(struct pci_dev *pdev,
  	return PCI_ERS_RESULT_NEED_RESET;
  }
  
@@ -5435,7 +5731,7 @@ index f54718b..bb8a156 100644
  static pci_ers_result_t nvme_slot_reset(struct pci_dev *pdev)
  {
  	struct nvme_dev *dev = pci_get_drvdata(pdev);
-@@ -2941,6 +3242,9 @@ static pci_ers_result_t nvme_slot_reset(struct pci_dev *pdev)
+@@ -2941,6 +3268,9 @@ static pci_ers_result_t nvme_slot_reset(struct pci_dev *pdev)
  	return PCI_ERS_RESULT_RECOVERED;
  }
  
@@ -5445,7 +5741,7 @@ index f54718b..bb8a156 100644
  static void nvme_error_resume(struct pci_dev *pdev)
  {
  	struct nvme_dev *dev = pci_get_drvdata(pdev);
-@@ -2956,6 +3260,10 @@ static const struct pci_error_handlers nvme_err_handler = {
+@@ -2956,6 +3286,10 @@ static const struct pci_error_handlers nvme_err_handler = {
  	.reset_done	= nvme_reset_done,
  };
  
@@ -5456,7 +5752,7 @@ index f54718b..bb8a156 100644
  static const struct pci_device_id nvme_id_table[] = {
  	{ PCI_VDEVICE(INTEL, 0x0953),
  		.driver_data = NVME_QUIRK_STRIPE_SIZE |
-@@ -3010,6 +3318,11 @@ static struct pci_driver nvme_driver = {
+@@ -3010,6 +3344,11 @@ static struct pci_driver nvme_driver = {
  	.driver		= {
  		.pm	= &nvme_dev_pm_ops,
  	},
@@ -5963,7 +6259,7 @@ index d66bf5f..3e92106 100644
  
  #define REQ_DRV			(1ULL << __REQ_DRV)
 diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
-index faed9d9..e83220e 100644
+index faed9d9..8c3f745 100644
 --- a/include/linux/blkdev.h
 +++ b/include/linux/blkdev.h
 @@ -62,6 +62,9 @@ typedef void (rq_end_io_fn)(struct request *, blk_status_t);
@@ -5976,7 +6272,22 @@ index faed9d9..e83220e 100644
  /* elevator knows about this request */
  #define RQF_SORTED		((__force req_flags_t)(1 << 0))
  /* drive already may have started this one */
-@@ -73,6 +76,15 @@ typedef __u32 __bitwise req_flags_t;
+@@ -69,12 +72,41 @@ typedef __u32 __bitwise req_flags_t;
+ /* may not be passed by ioscheduler */
+ #define RQF_SOFTBARRIER		((__force req_flags_t)(1 << 3))
+ /* request for flush sequence */
++/*
++ * used by:
++ *   - block/blk-core.c|207| <<req_bio_endio>> if (bio->bi_iter.bi_size == 0 && !(rq->rq_flags & RQF_FLUSH_SEQ))
++ *   - block/blk-core.c|1372| <<blk_account_io_done>> if (blk_do_io_stat(req) && !(req->rq_flags & RQF_FLUSH_SEQ)) {
++ *   - block/blk-flush.c|253| <<blk_flush_restore_request>> rq->rq_flags &= ~RQF_FLUSH_SEQ;
++ *   - block/blk-flush.c|543| <<blk_kick_flush>> flush_rq->rq_flags |= RQF_FLUSH_SEQ;
++ *   - block/blk-flush.c|694| <<blk_insert_flush>> rq->rq_flags |= RQF_FLUSH_SEQ;
++ *   - block/blk-mq-sched.c|530| <<blk_mq_sched_bypass_insert>> if (rq->rq_flags & RQF_FLUSH_SEQ) {
++ *   - block/blk-mq-sched.c|569| <<blk_mq_sched_insert_request>> if (!(rq->rq_flags & RQF_FLUSH_SEQ) && op_is_flush(rq->cmd_flags)) {
++ *   - include/linux/blkdev.h|124| <<RQF_NOMERGE_FLAGS>> (RQF_STARTED | RQF_SOFTBARRIER | RQF_FLUSH_SEQ | RQF_SPECIAL_PAYLOAD)
++ */
+ #define RQF_FLUSH_SEQ		((__force req_flags_t)(1 << 4))
  /* merge of different types, fail separately */
  #define RQF_MIXED_MERGE		((__force req_flags_t)(1 << 5))
  /* track inflight for MQ */
@@ -5991,8 +6302,19 @@ index faed9d9..e83220e 100644
 + */
  #define RQF_MQ_INFLIGHT		((__force req_flags_t)(1 << 6))
  /* don't call prep for this one */
++/*
++ * 设置的地方:
++ *   - drivers/block/skd_main.c|501| <<skd_mq_queue_rq>> req->rq_flags |= RQF_DONTPREP;
++ *   - drivers/ide/ide-io.c|464| <<ide_issue_rq>> rq->rq_flags |= RQF_DONTPREP;
++ *   - drivers/mmc/core/queue.c|301| <<mmc_mq_queue_rq>> req->rq_flags |= RQF_DONTPREP;
++ *   - drivers/nvme/host/core.c|466| <<nvme_clear_nvme_request>> req->rq_flags |= RQF_DONTPREP;
++ *   - drivers/scsi/scsi_lib.c|147| <<scsi_mq_requeue_cmd>> cmd->request->rq_flags &= ~RQF_DONTPREP;
++ *   - drivers/scsi/scsi_lib.c|1720| <<scsi_queue_rq>> req->rq_flags |= RQF_DONTPREP;
++ */
  #define RQF_DONTPREP		((__force req_flags_t)(1 << 7))
-@@ -114,9 +126,37 @@ typedef __u32 __bitwise req_flags_t;
+ /* set for "ide_preempt" requests and also for requests for which the SCSI
+    "quiesce" state must be ignored. */
+@@ -114,9 +146,37 @@ typedef __u32 __bitwise req_flags_t;
  /*
   * Request state for blk-mq.
   */
@@ -6030,7 +6352,7 @@ index faed9d9..e83220e 100644
  	MQ_RQ_COMPLETE		= 2,
  };
  
-@@ -128,12 +168,31 @@ enum mq_rq_state {
+@@ -128,12 +188,31 @@ enum mq_rq_state {
   */
  struct request {
  	struct request_queue *q;
@@ -6062,7 +6384,15 @@ index faed9d9..e83220e 100644
  	int internal_tag;
  
  	/* the following two fields are internal, NEVER access directly */
-@@ -317,9 +376,34 @@ struct queue_limits {
+@@ -142,6 +221,7 @@ struct request {
+ 	sector_t __sector;		/* sector cursor */
+ 
+ 	struct bio *bio;
++	/* 指向请求的尾部 */
+ 	struct bio *biotail;
+ 
+ 	struct list_head queuelist;
+@@ -317,9 +397,34 @@ struct queue_limits {
  	unsigned long		seg_boundary_mask;
  	unsigned long		virt_boundary_mask;
  
@@ -6097,7 +6427,7 @@ index faed9d9..e83220e 100644
  	unsigned int		max_sectors;
  	unsigned int		max_segment_size;
  	unsigned int		physical_block_size;
-@@ -404,13 +488,38 @@ struct request_queue {
+@@ -404,13 +509,38 @@ struct request_queue {
  	const struct blk_mq_ops	*mq_ops;
  
  	/* sw queues */
@@ -6136,7 +6466,7 @@ index faed9d9..e83220e 100644
  	unsigned int		nr_hw_queues;
  
  	struct backing_dev_info	*backing_dev_info;
-@@ -468,8 +577,23 @@ struct request_queue {
+@@ -468,8 +598,23 @@ struct request_queue {
  	/*
  	 * queue settings
  	 */
@@ -6160,7 +6490,7 @@ index faed9d9..e83220e 100644
  	unsigned int		dma_drain_size;
  	void			*dma_drain_buffer;
  	unsigned int		dma_pad_mask;
-@@ -481,7 +605,25 @@ struct request_queue {
+@@ -481,7 +626,25 @@ struct request_queue {
  	struct blk_stat_callback	*poll_cb;
  	struct blk_rq_stat	poll_stat[BLK_MQ_POLL_STATS_BKTS];
  
@@ -6186,7 +6516,7 @@ index faed9d9..e83220e 100644
  	struct work_struct	timeout_work;
  
  	struct list_head	icq_list;
-@@ -537,6 +679,11 @@ struct request_queue {
+@@ -537,6 +700,11 @@ struct request_queue {
  
  	struct mutex		sysfs_lock;
  
@@ -6198,7 +6528,7 @@ index faed9d9..e83220e 100644
  	atomic_t		mq_freeze_depth;
  
  #if defined(CONFIG_BLK_DEV_BSG)
-@@ -548,7 +695,40 @@ struct request_queue {
+@@ -548,7 +716,40 @@ struct request_queue {
  	struct throtl_data *td;
  #endif
  	struct rcu_head		rcu_head;
@@ -6239,7 +6569,7 @@ index faed9d9..e83220e 100644
  	struct percpu_ref	q_usage_counter;
  	struct list_head	all_q_node;
  
-@@ -572,7 +752,19 @@ struct request_queue {
+@@ -572,7 +773,19 @@ struct request_queue {
  	u64			write_hints[BLK_MAX_WRITE_HINTS];
  };
  
@@ -6259,7 +6589,26 @@ index faed9d9..e83220e 100644
  #define QUEUE_FLAG_DYING	1	/* queue being torn down */
  #define QUEUE_FLAG_BIDI		2	/* queue supports bidi requests */
  #define QUEUE_FLAG_NOMERGES     3	/* disable merge attempts */
-@@ -592,10 +784,22 @@ struct request_queue {
+@@ -589,13 +802,41 @@ struct request_queue {
+ #define QUEUE_FLAG_DEAD		13	/* queue tear-down finished */
+ #define QUEUE_FLAG_INIT_DONE	14	/* queue is initialized */
+ #define QUEUE_FLAG_POLL		16	/* IO polling enabled if set */
++/*
++ * 一些设置的地方:
++ *   - block/blk-settings.c|865| <<blk_queue_write_cache>> blk_queue_flag_set(QUEUE_FLAG_WC, q);
++ *   - block/blk-settings.c|867| <<blk_queue_write_cache>> blk_queue_flag_clear(QUEUE_FLAG_WC, q);
++ *   - block/blk-sysfs.c|514| <<queue_wc_store>> blk_queue_flag_set(QUEUE_FLAG_WC, q);
++ *   - block/blk-sysfs.c|516| <<queue_wc_store>> blk_queue_flag_clear(QUEUE_FLAG_WC, q);
++ *
++ *   - drivers/block/loop.c|964| <<loop_set_fd>> blk_queue_write_cache(lo->lo_queue, true, false);
++ *   - drivers/block/null_blk_main.c|1680| <<null_add_dev>> blk_queue_write_cache(nullb->q, true, true);
++ *   - drivers/block/virtio_blk.c|606| <<virtblk_update_cache_mode>> blk_queue_write_cache(vblk->disk->queue, writeback, false);
++ *   - drivers/block/xen-blkfront.c|1014| <<xlvbd_flush>> blk_queue_write_cache(info->rq, info->feature_flush ? true : false,
++ *   - drivers/nvme/host/core.c|2031| <<nvme_set_queue_limits>> blk_queue_write_cache(q, vwc, vwc);
++ *   - drivers/nvme/host/multipath.c|315| <<nvme_mpath_alloc_disk>> blk_queue_write_cache(q, vwc, vwc);
++ *   - drivers/ide/ide-disk.c|554| <<update_flush>> blk_queue_write_cache(drive->queue, wc, false);
++ *   - drivers/scsi/sd.c|153| <<sd_set_flush_flag>> blk_queue_write_cache(sdkp->disk->queue, wc, fua);
++ */
  #define QUEUE_FLAG_WC		17	/* Write back caching */
  #define QUEUE_FLAG_FUA		18	/* device supports FUA writes */
  #define QUEUE_FLAG_DAX		19	/* device supports DAX */
