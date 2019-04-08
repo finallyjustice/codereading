@@ -1,21 +1,75 @@
-From 8be6970dc8ce6d9167bc3a6ce9d55cf4f787c17d Mon Sep 17 00:00:00 2001
+From 792e4e0ee9764e779189b681676f4cf22b0c30c9 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Wed, 3 Apr 2019 15:43:40 +0800
+Date: Mon, 8 Apr 2019 16:18:07 +0800
 Subject: [PATCH 1/1] io_uring comment for linux-block:io_uring-20190323
 
 This is for linux-block: io_uring-20190323
 
-Signed-off-by: Dongli Zhang <dongli.zhang@oracle.com>
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
- fs/io_uring.c                 | 230 ++++++++++++++++++++++++++++++++++++++++++
- include/uapi/linux/io_uring.h | 116 +++++++++++++++++++++
- 2 files changed, 346 insertions(+)
+ fs/io_uring.c                 | 577 ++++++++++++++++++++++++++++++++++++++++++
+ include/uapi/linux/io_uring.h | 132 ++++++++++
+ 2 files changed, 709 insertions(+)
 
 diff --git a/fs/io_uring.c b/fs/io_uring.c
-index c592a09..69b13d7 100644
+index c592a09..09d3c89 100644
 --- a/fs/io_uring.c
 +++ b/fs/io_uring.c
-@@ -112,22 +112,73 @@ struct io_ring_ctx {
+@@ -62,9 +62,39 @@
+ 
+ #include "internal.h"
+ 
++/*
++ * 对于sq
++ * user修改tail, kernel修改head
++ * The head and tail values are used to manage entries in the ring; if the
++ * two values are equal, the ring is empty. User-space code adds an entry
++ * by putting its index into array[r.tail] and incrementing the tail
++ * pointer; only the kernel side should change r.head. Once one or more
++ * entries have been placed in the ring, they can be submitted with a call
++ * to:
++ *
++ *     int io_uring_enter(unsigned int fd, u32 to_submit, u32 min_complete, u32 flags);
++ *
++ *
++ * 对于cq
++ * kernel修改tail, user修改head
++ * In this ring, the r.head index points to the first available completion
++ * event, while r.tail points to the last; user space should only change
++ * r.head. 
++ */
++
+ #define IORING_MAX_ENTRIES	4096
+ #define IORING_MAX_FIXED_FILES	1024
+ 
++/*
++ * The head and tail values are used to manage entries in the ring; if the 
++ * two values are equal, the ring is empty. User-space code adds an entry
++ * by putting its index into array[r.tail] and incrementing the tail
++ * pointer; only the kernel side should change r.head. Once one or more
++ * entries have been placed in the ring, they can be submitted with a call
++ * to:
++ *
++ * int io_uring_enter(unsigned int fd, u32 to_submit, u32 min_complete, u32 flags);
++ */
+ struct io_uring {
+ 	u32 head ____cacheline_aligned_in_smp;
+ 	u32 tail ____cacheline_aligned_in_smp;
+@@ -104,6 +134,13 @@ struct async_list {
+ 	size_t			io_pages;
+ };
+ 
++/*
++ * io_allocate_scq_urings()执行后:
++ * struct io_ring_ctx
++ *   struct io_sq_ring    *sq_ring; --> 指向struct io_sq_ring + 一组u32 array[]
++ *   struct io_uring_sqe  *sq_sqes; --> 指向一组struct io_uring_sqe[]
++ *   struct io_cq_ring    *cq_ring; --> 指向struct io_cq_ring + 一组struct io_uring_cqe[]
++ */
+ struct io_ring_ctx {
+ 	struct {
+ 		struct percpu_ref	refs;
+@@ -112,31 +149,106 @@ struct io_ring_ctx {
  	struct {
  		unsigned int		flags;
  		bool			compat;
@@ -89,8 +143,16 @@ index c592a09..69b13d7 100644
  	unsigned		sqo_stop;
  
  	struct {
-@@ -135,6 +186,10 @@ struct io_ring_ctx {
+ 		/* CQ ring */
  		struct io_cq_ring	*cq_ring;
++		/*
++		 * 在以下使用cached_cq_tail:
++		 *   - fs/io_uring.c|471| <<io_commit_cqring>> if (ctx->cached_cq_tail != READ_ONCE(ring->r.tail)) {
++		 *   - fs/io_uring.c|473| <<io_commit_cqring>> smp_store_release(&ring->r.tail, ctx->cached_cq_tail);
++		 *   - fs/io_uring.c|493| <<io_get_cqring>> tail = ctx->cached_cq_tail;
++		 *   - fs/io_uring.c|499| <<io_get_cqring>> ctx->cached_cq_tail++;
++		 *   - fs/io_uring.c|2826| <<io_uring_poll>> if (READ_ONCE(ctx->cq_ring->r.head) != ctx->cached_cq_tail)
++		 */
  		unsigned		cached_cq_tail;
  		unsigned		cq_entries;
 +		/*
@@ -98,9 +160,104 @@ index c592a09..69b13d7 100644
 +		 *   - fs/io_uring.c|2815| <<io_allocate_scq_urings>> ctx->cq_mask = cq_ring->ring_mask;
 +		 */
  		unsigned		cq_mask;
++		/*
++		 * cq_wait在以下被使用:
++		 *   - fs/io_uring.c|385| <<io_ring_ctx_alloc>> init_waitqueue_head(&ctx->cq_wait);
++		 *   - fs/io_uring.c|414| <<io_commit_cqring>> if (wq_has_sleeper(&ctx->cq_wait)) {
++		 *   - fs/io_uring.c|415| <<io_commit_cqring>> wake_up_interruptible(&ctx->cq_wait);
++		 *   - fs/io_uring.c|2730| <<io_uring_poll>> poll_wait(file, &ctx->cq_wait, wait);
++		 */
  		struct wait_queue_head	cq_wait;
++		/*
++		 * cq_fasync在以下使用:
++		 *   - fs/io_uring.c|483| <<io_commit_cqring>> kill_fasync(&ctx->cq_fasync, SIGIO, POLL_IN);
++		 *   - fs/io_uring.c|2839| <<io_uring_fasync>> return fasync_helper(fd, file, on, &ctx->cq_fasync);
++		 */
  		struct fasync_struct	*cq_fasync;
-@@ -255,6 +310,16 @@ struct io_submit_state {
+ 	} ____cacheline_aligned_in_smp;
+ 
+@@ -154,10 +266,28 @@ struct io_ring_ctx {
+ 
+ 	struct user_struct	*user;
+ 
++	/*
++	 * 使用ctx_done的地方:
++	 *   - fs/io_uring.c|361| <<io_ring_ctx_ref_free>> complete(&ctx->ctx_done);
++	 *   - fs/io_uring.c|386| <<io_ring_ctx_alloc>> init_completion(&ctx->ctx_done);
++	 *   - fs/io_uring.c|2764| <<io_ring_ctx_wait_and_kill>> wait_for_completion(&ctx->ctx_done);
++	 *   - fs/io_uring.c|3246| <<__io_uring_register>> wait_for_completion(&ctx->ctx_done);
++	 *   - fs/io_uring.c|3273| <<__io_uring_register>> reinit_completion(&ctx->ctx_done);
++	 */
+ 	struct completion	ctx_done;
+ 
+ 	struct {
+ 		struct mutex		uring_lock;
++		/*
++		 * used by:
++		 *   - fs/io_uring.c|490| <<io_ring_ctx_alloc>> init_waitqueue_head(&ctx->wait);
++		 *   - fs/io_uring.c|589| <<io_cqring_ev_posted>> if (waitqueue_active(&ctx->wait))
++		 *   - fs/io_uring.c|590| <<io_cqring_ev_posted>> wake_up(&ctx->wait);
++		 *   - fs/io_uring.c|621| <<io_ring_drop_ctx_refs>> if (waitqueue_active(&ctx->wait))
++		 *   - fs/io_uring.c|622| <<io_ring_drop_ctx_refs>> wake_up(&ctx->wait);
++		 *   - fs/io_uring.c|2274| <<io_cqring_wait>> prepare_to_wait(&ctx->wait, &wait, TASK_INTERRUPTIBLE);
++		 *   - fs/io_uring.c|2289| <<io_cqring_wait>> finish_wait(&ctx->wait, &wait);
++		 */
+ 		wait_queue_head_t	wait;
+ 	} ____cacheline_aligned_in_smp;
+ 
+@@ -170,10 +300,39 @@ struct io_ring_ctx {
+ 		 * For SQPOLL, only the single threaded io_sq_thread() will
+ 		 * manipulate the list, hence no extra locking is needed there.
+ 		 */
++		/*
++		 * poll_list在以下被使用:
++		 *   - fs/io_uring.c|395| <<io_ring_ctx_alloc>> INIT_LIST_HEAD(&ctx->poll_list);
++		 *   - fs/io_uring.c|631| <<io_do_iopoll>> list_for_each_entry_safe(req, tmp, &ctx->poll_list, list) {
++		 *   - fs/io_uring.c|669| <<io_iopoll_getevents>> while (!list_empty(&ctx->poll_list)) {
++		 *   - fs/io_uring.c|692| <<io_iopoll_reap_events>> while (!list_empty(&ctx->poll_list)) {
++		 *   - fs/io_uring.c|776| <<io_iopoll_req_issued>> if (list_empty(&ctx->poll_list)) {
++		 *   - fs/io_uring.c|781| <<io_iopoll_req_issued>> list_req = list_first_entry(&ctx->poll_list, struct io_kiocb,
++		 *   - fs/io_uring.c|792| <<io_iopoll_req_issued>> list_add(&req->list, &ctx->poll_list);
++		 *   - fs/io_uring.c|794| <<io_iopoll_req_issued>> list_add_tail(&req->list, &ctx->poll_list);
++		 */
+ 		struct list_head	poll_list;
++		/*
++		 * cancel_list在以下被使用:
++		 *   - fs/io_uring.c|396| <<io_ring_ctx_alloc>> INIT_LIST_HEAD(&ctx->cancel_list);
++		 *   - fs/io_uring.c|1243| <<io_poll_remove_all>> while (!list_empty(&ctx->cancel_list)) {
++		 *   - fs/io_uring.c|1244| <<io_poll_remove_all>> req = list_first_entry(&ctx->cancel_list, struct io_kiocb,list);
++		 *   - fs/io_uring.c|1267| <<io_poll_remove>> list_for_each_entry_safe(poll_req, next, &ctx->cancel_list, list) {
++		 *   - fs/io_uring.c|1421| <<io_poll_add>> list_add_tail(&req->list, &ctx->cancel_list);
++		 */
+ 		struct list_head	cancel_list;
+ 	} ____cacheline_aligned_in_smp;
+ 
++	/*
++	 * pending_async在以下被使用:
++	 *   - fs/io_uring.c|389| <<io_ring_ctx_alloc>> for (i = 0; i < ARRAY_SIZE(ctx->pending_async); i++) {
++	 *   - fs/io_uring.c|390| <<io_ring_ctx_alloc>> spin_lock_init(&ctx->pending_async[i].lock);
++	 *   - fs/io_uring.c|391| <<io_ring_ctx_alloc>> INIT_LIST_HEAD(&ctx->pending_async[i].list);
++	 *   - fs/io_uring.c|392| <<io_ring_ctx_alloc>> atomic_set(&ctx->pending_async[i].cnt, 0);
++	 *   - fs/io_uring.c|1021| <<io_async_list_note>> struct async_list *async_list = &req->ctx->pending_async[rw];
++	 *   - fs/io_uring.c|1507| <<io_async_list_from_sqe>> return &ctx->pending_async[READ];
++	 *   - fs/io_uring.c|1510| <<io_async_list_from_sqe>> return &ctx->pending_async[WRITE];
++	 */
+ 	struct async_list	pending_async[2];
+ 
+ #if defined(CONFIG_UNIX)
+@@ -211,6 +370,11 @@ struct io_poll_iocb {
+ struct io_kiocb {
+ 	union {
+ 		struct file		*file;
++		/*
++		 * 有两处设置ki_complete:
++		 *  - fs/io_uring.c|964| <<io_prep_rw>> kiocb->ki_complete = io_complete_rw_iopoll;
++		 *  - fs/io_uring.c|968| <<io_prep_rw>> kiocb->ki_complete = io_complete_rw;
++		 */
+ 		struct kiocb		rw;
+ 		struct io_poll_iocb	poll;
+ 	};
+@@ -255,10 +419,24 @@ struct io_submit_state {
  	unsigned int		ios_left;
  };
  
@@ -117,7 +274,36 @@ index c592a09..69b13d7 100644
  static struct kmem_cache *req_cachep;
  
  static const struct file_operations io_uring_fops;
-@@ -279,6 +344,12 @@ static void io_ring_ctx_ref_free(struct percpu_ref *ref)
+ 
++/*
++ * called by only:
++ *   - net/unix/scm.c|38| <<unix_get_socket>> u_sock = io_uring_get_socket(filp);
++ */
+ struct sock *io_uring_get_socket(struct file *file)
+ {
+ #if defined(CONFIG_UNIX)
+@@ -272,13 +450,35 @@ struct sock *io_uring_get_socket(struct file *file)
+ }
+ EXPORT_SYMBOL(io_uring_get_socket);
+ 
++/*
++ * used by:
++ *   - fs/io_uring.c|379| <<io_ring_ctx_alloc>> if (percpu_ref_init(&ctx->refs, io_ring_ctx_ref_free, 0, GFP_KERNEL)) {
++ *
++ * 被用做io_ring_ctx->refs这个percpu_ref的release函数
++ */
+ static void io_ring_ctx_ref_free(struct percpu_ref *ref)
+ {
+ 	struct io_ring_ctx *ctx = container_of(ref, struct io_ring_ctx, refs);
+ 
++	/*
++	 * 使用ctx_done的地方:  
++	 *   - fs/io_uring.c|361| <<io_ring_ctx_ref_free>> complete(&ctx->ctx_done);
++	 *   - fs/io_uring.c|386| <<io_ring_ctx_alloc>> init_completion(&ctx->ctx_done);
++	 *   - fs/io_uring.c|2764| <<io_ring_ctx_wait_and_kill>> wait_for_completion(&ctx->ctx_done);
++	 *   - fs/io_uring.c|3246| <<__io_uring_register>> wait_for_completion(&ctx->ctx_done);
++	 *   - fs/io_uring.c|3273| <<__io_uring_register>> reinit_completion(&ctx->ctx_done);
++	 */
  	complete(&ctx->ctx_done);
  }
  
@@ -126,11 +312,75 @@ index c592a09..69b13d7 100644
 + *
 + * called by only:
 + *   - fs/io_uring.c|2875| <<io_uring_create>> ctx = io_ring_ctx_alloc(p);
++ *
++ * SYSCALL_DEFINE2(io_uring_setup)-->io_uring_setup()-->io_uring_create()-->io_ring_ctx_alloc()
 + */
  static struct io_ring_ctx *io_ring_ctx_alloc(struct io_uring_params *p)
  {
  	struct io_ring_ctx *ctx;
-@@ -345,6 +416,12 @@ static struct io_uring_cqe *io_get_cqring(struct io_ring_ctx *ctx)
+@@ -309,12 +509,21 @@ static struct io_ring_ctx *io_ring_ctx_alloc(struct io_uring_params *p)
+ 	return ctx;
+ }
+ 
++/*
++ * called by:
++ *   - fs/io_uring.c|555| <<io_cqring_add_event>> io_commit_cqring(ctx);
++ *   - fs/io_uring.c|679| <<io_iopoll_complete>> io_commit_cqring(ctx);
++ *   - fs/io_uring.c|1372| <<io_poll_complete>> io_commit_cqring(ctx);
++ */
+ static void io_commit_cqring(struct io_ring_ctx *ctx)
+ {
+ 	struct io_cq_ring *ring = ctx->cq_ring;
+ 
+ 	if (ctx->cached_cq_tail != READ_ONCE(ring->r.tail)) {
+ 		/* order cqe stores with ring update */
++		/*
++		 * barrier之后调用WRITE_ONCE(*p, v)
++		 */
+ 		smp_store_release(&ring->r.tail, ctx->cached_cq_tail);
+ 
+ 		/*
+@@ -323,13 +532,29 @@ static void io_commit_cqring(struct io_ring_ctx *ctx)
+ 		 */
+ 		smp_wmb();
+ 
++		/*
++		 * check if there are any waiting processes
++		 */
+ 		if (wq_has_sleeper(&ctx->cq_wait)) {
++			/*
++			 * cq_wait在以下使用:
++			 *   - fs/io_uring.c|414| <<io_commit_cqring>> if (wq_has_sleeper(&ctx->cq_wait)) {
++			 *   - fs/io_uring.c|415| <<io_commit_cqring>> wake_up_interruptible(&ctx->cq_wait);
++			 *   - fs/io_uring.c|2730| <<io_uring_poll>> poll_wait(file, &ctx->cq_wait, wait);
++			 */
+ 			wake_up_interruptible(&ctx->cq_wait);
++			/*
++			 * 通知用户进程???
++			 */
+ 			kill_fasync(&ctx->cq_fasync, SIGIO, POLL_IN);
+ 		}
+ 	}
+ }
+ 
++/*
++ * called by only:
++ *   - fs/io_uring.c|575| <<io_cqring_fill_event>> cqe = io_get_cqring(ctx);
++ */
+ static struct io_uring_cqe *io_get_cqring(struct io_ring_ctx *ctx)
+ {
+ 	struct io_cq_ring *ring = ctx->cq_ring;
+@@ -338,6 +563,9 @@ static struct io_uring_cqe *io_get_cqring(struct io_ring_ctx *ctx)
+ 	tail = ctx->cached_cq_tail;
+ 	/* See comment at the top of the file */
+ 	smp_rmb();
++	/*
++	 * 为什么还有一个不可以??
++	 */
+ 	if (tail + 1 == READ_ONCE(ring->r.head))
+ 		return NULL;
+ 
+@@ -345,6 +573,14 @@ static struct io_uring_cqe *io_get_cqring(struct io_ring_ctx *ctx)
  	return &ring->cqes[tail & ctx->cq_mask];
  }
  
@@ -139,11 +389,59 @@ index c592a09..69b13d7 100644
 + *   - fs/io_uring.c|434| <<io_cqring_add_event>> io_cqring_fill_event(ctx, user_data, res, ev_flags);
 + *   - fs/io_uring.c|536| <<io_iopoll_complete>> io_cqring_fill_event(ctx, req->user_data, req->error, 0);
 + *   - fs/io_uring.c|1223| <<io_poll_complete>> io_cqring_fill_event(ctx, req->user_data, mangle_poll(mask), 0);
++ *
++ * 这个函数是把返回的数据结果写入cq的某一个entry
 + */
  static void io_cqring_fill_event(struct io_ring_ctx *ctx, u64 ki_user_data,
  				 long res, unsigned ev_flags)
  {
-@@ -375,6 +452,15 @@ static void io_cqring_ev_posted(struct io_ring_ctx *ctx)
+@@ -355,6 +591,7 @@ static void io_cqring_fill_event(struct io_ring_ctx *ctx, u64 ki_user_data,
+ 	 * submission (by quite a lot). Increment the overflow count in
+ 	 * the ring.
+ 	 */
++	/* 只在这里被调用 */
+ 	cqe = io_get_cqring(ctx);
+ 	if (cqe) {
+ 		WRITE_ONCE(cqe->user_data, ki_user_data);
+@@ -367,14 +604,53 @@ static void io_cqring_fill_event(struct io_ring_ctx *ctx, u64 ki_user_data,
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - fs/io_uring.c|614| <<io_cqring_add_event>> io_cqring_ev_posted(ctx);
++ *   - fs/io_uring.c|1459| <<io_poll_complete_work>> io_cqring_ev_posted(ctx);
++ *   - fs/io_uring.c|1484| <<io_poll_wake>> io_cqring_ev_posted(ctx);
++ *   - fs/io_uring.c|1574| <<io_poll_add>> io_cqring_ev_posted(ctx);
++ *
++ * 唤醒ctx->wait和ctx->sqo_wait
++ */
+ static void io_cqring_ev_posted(struct io_ring_ctx *ctx)
+ {
++	/*
++	 * used by:
++	 *   - fs/io_uring.c|490| <<io_ring_ctx_alloc>> init_waitqueue_head(&ctx->wait);
++	 *   - fs/io_uring.c|589| <<io_cqring_ev_posted>> if (waitqueue_active(&ctx->wait))
++	 *   - fs/io_uring.c|590| <<io_cqring_ev_posted>> wake_up(&ctx->wait);
++	 *   - fs/io_uring.c|621| <<io_ring_drop_ctx_refs>> if (waitqueue_active(&ctx->wait))
++	 *   - fs/io_uring.c|622| <<io_ring_drop_ctx_refs>> wake_up(&ctx->wait);
++	 *   - fs/io_uring.c|2274| <<io_cqring_wait>> prepare_to_wait(&ctx->wait, &wait, TASK_INTERRUPTIBLE);
++	 *   - fs/io_uring.c|2289| <<io_cqring_wait>> finish_wait(&ctx->wait, &wait);
++	 */
+ 	if (waitqueue_active(&ctx->wait))
+ 		wake_up(&ctx->wait);
++	/*
++	 * used by:
++	 *   - fs/io_uring.c|390| <<io_cqring_ev_posted>> if (waitqueue_active(&ctx->sqo_wait))
++	 *   - fs/io_uring.c|391| <<io_cqring_ev_posted>> wake_up(&ctx->sqo_wait);
++	 *   - fs/io_uring.c|1866| <<io_sq_thread>> prepare_to_wait(&ctx->sqo_wait, &wait,
++	 *   - fs/io_uring.c|1875| <<io_sq_thread>> finish_wait(&ctx->sqo_wait, &wait);
++	 *   - fs/io_uring.c|1881| <<io_sq_thread>> finish_wait(&ctx->sqo_wait, &wait);
++	 *   - fs/io_uring.c|1887| <<io_sq_thread>> finish_wait(&ctx->sqo_wait, &wait);
++	 *   - fs/io_uring.c|2228| <<io_sq_offload_start>> init_waitqueue_head(&ctx->sqo_wait);
++	 *   - fs/io_uring.c|2693| <<SYSCALL_DEFINE6(io_uring_enter)>> wake_up(&ctx->sqo_wait);
++	 */
+ 	if (waitqueue_active(&ctx->sqo_wait))
  		wake_up(&ctx->sqo_wait);
  }
  
@@ -159,7 +457,21 @@ index c592a09..69b13d7 100644
  static void io_cqring_add_event(struct io_ring_ctx *ctx, u64 user_data,
  				long res, unsigned ev_flags)
  {
-@@ -396,6 +482,10 @@ static void io_ring_drop_ctx_refs(struct io_ring_ctx *ctx, unsigned refs)
+@@ -388,6 +664,13 @@ static void io_cqring_add_event(struct io_ring_ctx *ctx, u64 user_data,
+ 	io_cqring_ev_posted(ctx);
+ }
+ 
++/*
++ * called by:
++ *   - fs/io_uring.c|724| <<io_get_req>> io_ring_drop_ctx_refs(ctx, 1);
++ *   - fs/io_uring.c|732| <<io_free_req_many>> io_ring_drop_ctx_refs(ctx, *nr);
++ *   - fs/io_uring.c|741| <<io_free_req>> io_ring_drop_ctx_refs(req->ctx, 1);
++ *   - fs/io_uring.c|3114| <<SYSCALL_DEFINE6(io_uring_enter)>> io_ring_drop_ctx_refs(ctx, 1);
++ */
+ static void io_ring_drop_ctx_refs(struct io_ring_ctx *ctx, unsigned refs)
+ {
+ 	percpu_ref_put_many(&ctx->refs, refs);
+@@ -396,6 +679,10 @@ static void io_ring_drop_ctx_refs(struct io_ring_ctx *ctx, unsigned refs)
  		wake_up(&ctx->wait);
  }
  
@@ -170,7 +482,78 @@ index c592a09..69b13d7 100644
  static struct io_kiocb *io_get_req(struct io_ring_ctx *ctx,
  				   struct io_submit_state *state)
  {
-@@ -1593,6 +1683,11 @@ static int io_req_set_file(struct io_ring_ctx *ctx, const struct sqe_submit *s,
+@@ -590,6 +877,11 @@ static void io_iopoll_reap_events(struct io_ring_ctx *ctx)
+ 	mutex_unlock(&ctx->uring_lock);
+ }
+ 
++/*
++ * called by:
++ *   - fs/io_uring.c|1946| <<io_sq_thread>> io_iopoll_check(ctx, &nr_events, 0);
++ *   - fs/io_uring.c|2890| <<SYSCALL_DEFINE6(io_uring_enter)>> ret = io_iopoll_check(ctx, &nr_events, min_complete);
++ */
+ static int io_iopoll_check(struct io_ring_ctx *ctx, unsigned *nr_events,
+ 			   long min)
+ {
+@@ -741,6 +1033,11 @@ static bool io_file_supports_async(struct file *file)
+ 	return false;
+ }
+ 
++/*
++ * called by:
++ *   - fs/io_uring.c|1126| <<io_read>> ret = io_prep_rw(req, s, force_nonblock, state);
++ *   - fs/io_uring.c|1173| <<io_write>> ret = io_prep_rw(req, s, force_nonblock, state);
++ */
+ static int io_prep_rw(struct io_kiocb *req, const struct sqe_submit *s,
+ 		      bool force_nonblock, struct io_submit_state *state)
+ {
+@@ -939,6 +1236,11 @@ static void io_async_list_note(int rw, struct io_kiocb *req, size_t len)
+ 	async_list->io_end = io_end;
+ }
+ 
++/*
++ * called by:
++ *   - fs/io_uring.c|1518| <<__io_submit_sqe>> ret = io_read(req, s, force_nonblock, state);
++ *   - fs/io_uring.c|1526| <<__io_submit_sqe>> ret = io_read(req, s, force_nonblock, state);
++ */
+ static int io_read(struct io_kiocb *req, const struct sqe_submit *s,
+ 		   bool force_nonblock, struct io_submit_state *state)
+ {
+@@ -986,6 +1288,11 @@ static int io_read(struct io_kiocb *req, const struct sqe_submit *s,
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - fs/io_uring.c|1523| <<__io_submit_sqe>> ret = io_write(req, s, force_nonblock, state);
++ *   - fs/io_uring.c|1529| <<__io_submit_sqe>> ret = io_write(req, s, force_nonblock, state);
++ */
+ static int io_write(struct io_kiocb *req, const struct sqe_submit *s,
+ 		    bool force_nonblock, struct io_submit_state *state)
+ {
+@@ -1059,6 +1366,10 @@ static int io_nop(struct io_kiocb *req, u64 user_data)
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - fs/io_uring.c|1532| <<__io_submit_sqe>> ret = io_fsync(req, s->sqe, force_nonblock);
++ */
+ static int io_prep_fsync(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+ {
+ 	struct io_ring_ctx *ctx = req->ctx;
+@@ -1323,6 +1634,11 @@ static int io_poll_add(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+ 	return ipt.error;
+ }
+ 
++/*
++ * called by:
++ *   - fs/io_uring.c|1622| <<io_sq_wq_submit_work>> ret = __io_submit_sqe(ctx, req, s, false, NULL);
++ *   - fs/io_uring.c|1793| <<io_submit_sqe>> ret = __io_submit_sqe(ctx, req, s, true, state);
++ */
+ static int __io_submit_sqe(struct io_ring_ctx *ctx, struct io_kiocb *req,
+ 			   const struct sqe_submit *s, bool force_nonblock,
+ 			   struct io_submit_state *state)
+@@ -1593,6 +1909,11 @@ static int io_req_set_file(struct io_ring_ctx *ctx, const struct sqe_submit *s,
  	return 0;
  }
  
@@ -182,7 +565,7 @@ index c592a09..69b13d7 100644
  static int io_submit_sqe(struct io_ring_ctx *ctx, struct sqe_submit *s,
  			 struct io_submit_state *state)
  {
-@@ -1711,6 +1806,13 @@ static void io_drop_sqring(struct io_ring_ctx *ctx)
+@@ -1711,6 +2032,13 @@ static void io_drop_sqring(struct io_ring_ctx *ctx)
   * used, it's important that those reads are done through READ_ONCE() to
   * prevent a re-load down the line.
   */
@@ -196,7 +579,7 @@ index c592a09..69b13d7 100644
  static bool io_get_sqring(struct io_ring_ctx *ctx, struct sqe_submit *s)
  {
  	struct io_sq_ring *ring = ctx->sq_ring;
-@@ -1727,9 +1829,15 @@ static bool io_get_sqring(struct io_ring_ctx *ctx, struct sqe_submit *s)
+@@ -1727,9 +2055,15 @@ static bool io_get_sqring(struct io_ring_ctx *ctx, struct sqe_submit *s)
  	head = ctx->cached_sq_head;
  	/* See comment at the top of this file */
  	smp_rmb();
@@ -212,7 +595,7 @@ index c592a09..69b13d7 100644
  	head = READ_ONCE(ring->array[head & ctx->sq_mask]);
  	if (head < ctx->sq_entries) {
  		s->index = head;
-@@ -1746,6 +1854,10 @@ static bool io_get_sqring(struct io_ring_ctx *ctx, struct sqe_submit *s)
+@@ -1746,6 +2080,10 @@ static bool io_get_sqring(struct io_ring_ctx *ctx, struct sqe_submit *s)
  	return false;
  }
  
@@ -223,7 +606,7 @@ index c592a09..69b13d7 100644
  static int io_submit_sqes(struct io_ring_ctx *ctx, struct sqe_submit *sqes,
  			  unsigned int nr, bool has_user, bool mm_fault)
  {
-@@ -1780,6 +1892,11 @@ static int io_submit_sqes(struct io_ring_ctx *ctx, struct sqe_submit *sqes,
+@@ -1780,6 +2118,11 @@ static int io_submit_sqes(struct io_ring_ctx *ctx, struct sqe_submit *sqes,
  	return submitted;
  }
  
@@ -235,7 +618,39 @@ index c592a09..69b13d7 100644
  static int io_sq_thread(void *data)
  {
  	struct sqe_submit sqes[IO_IOPOLL_BATCH];
-@@ -2027,6 +2144,11 @@ static int io_sqe_files_unregister(struct io_ring_ctx *ctx)
+@@ -1909,6 +2252,10 @@ static int io_sq_thread(void *data)
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - fs/io_uring.c|2872| <<SYSCALL_DEFINE6(io_uring_enter)>> submitted = io_ring_submit(ctx, to_submit);
++ */
+ static int io_ring_submit(struct io_ring_ctx *ctx, unsigned int to_submit)
+ {
+ 	struct io_submit_state state, *statep = NULL;
+@@ -1929,6 +2276,9 @@ static int io_ring_submit(struct io_ring_ctx *ctx, unsigned int to_submit)
+ 		s.needs_lock = false;
+ 		s.needs_fixed_file = false;
+ 
++		/*
++		 * 猜测这里是下发下去
++		 */
+ 		ret = io_submit_sqe(ctx, &s, statep);
+ 		if (ret) {
+ 			io_drop_sqring(ctx);
+@@ -1954,6 +2304,10 @@ static unsigned io_cqring_events(struct io_cq_ring *ring)
+  * Wait until events become available, if we don't already have some. The
+  * application must reap them itself, as they reside on the shared cq ring.
+  */
++/*
++ * called by:
++ *   - fs/io_uring.c|2893| <<SYSCALL_DEFINE6(io_uring_enter)>> ret = io_cqring_wait(ctx, min_complete, sig, sigsz);
++ */
+ static int io_cqring_wait(struct io_ring_ctx *ctx, int min_events,
+ 			  const sigset_t __user *sig, size_t sigsz)
+ {
+@@ -2027,6 +2381,11 @@ static int io_sqe_files_unregister(struct io_ring_ctx *ctx)
  	return 0;
  }
  
@@ -247,7 +662,7 @@ index c592a09..69b13d7 100644
  static void io_sq_thread_stop(struct io_ring_ctx *ctx)
  {
  	if (ctx->sqo_thread) {
-@@ -2204,6 +2326,10 @@ static int io_sqe_files_register(struct io_ring_ctx *ctx, void __user *arg,
+@@ -2204,6 +2563,10 @@ static int io_sqe_files_register(struct io_ring_ctx *ctx, void __user *arg,
  	return ret;
  }
  
@@ -258,7 +673,7 @@ index c592a09..69b13d7 100644
  static int io_sq_offload_start(struct io_ring_ctx *ctx,
  			       struct io_uring_params *p)
  {
-@@ -2300,12 +2426,22 @@ static void *io_mem_alloc(size_t size)
+@@ -2300,12 +2663,22 @@ static void *io_mem_alloc(size_t size)
  	return (void *) __get_free_pages(gfp_flags, get_order(size));
  }
  
@@ -281,7 +696,7 @@ index c592a09..69b13d7 100644
  	bytes = struct_size(sq_ring, array, sq_entries);
  	bytes += array_size(sizeof(struct io_uring_sqe), sq_entries);
  	bytes += struct_size(cq_ring, cqes, cq_entries);
-@@ -2313,6 +2449,12 @@ static unsigned long ring_pages(unsigned sq_entries, unsigned cq_entries)
+@@ -2313,6 +2686,12 @@ static unsigned long ring_pages(unsigned sq_entries, unsigned cq_entries)
  	return (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
  }
  
@@ -294,7 +709,7 @@ index c592a09..69b13d7 100644
  static int io_sqe_buffer_unregister(struct io_ring_ctx *ctx)
  {
  	int i, j;
-@@ -2338,6 +2480,10 @@ static int io_sqe_buffer_unregister(struct io_ring_ctx *ctx)
+@@ -2338,6 +2717,10 @@ static int io_sqe_buffer_unregister(struct io_ring_ctx *ctx)
  	return 0;
  }
  
@@ -305,7 +720,7 @@ index c592a09..69b13d7 100644
  static int io_copy_iov(struct io_ring_ctx *ctx, struct iovec *dst,
  		       void __user *arg, unsigned index)
  {
-@@ -2363,6 +2509,10 @@ static int io_copy_iov(struct io_ring_ctx *ctx, struct iovec *dst,
+@@ -2363,6 +2746,10 @@ static int io_copy_iov(struct io_ring_ctx *ctx, struct iovec *dst,
  	return 0;
  }
  
@@ -316,7 +731,7 @@ index c592a09..69b13d7 100644
  static int io_sqe_buffer_register(struct io_ring_ctx *ctx, void __user *arg,
  				  unsigned nr_args)
  {
-@@ -2505,6 +2655,10 @@ static int io_sqe_buffer_register(struct io_ring_ctx *ctx, void __user *arg,
+@@ -2505,6 +2892,10 @@ static int io_sqe_buffer_register(struct io_ring_ctx *ctx, void __user *arg,
  	return ret;
  }
  
@@ -327,7 +742,7 @@ index c592a09..69b13d7 100644
  static void io_ring_ctx_free(struct io_ring_ctx *ctx)
  {
  	io_finish_async(ctx);
-@@ -2532,6 +2686,9 @@ static void io_ring_ctx_free(struct io_ring_ctx *ctx)
+@@ -2532,6 +2923,9 @@ static void io_ring_ctx_free(struct io_ring_ctx *ctx)
  	kfree(ctx);
  }
  
@@ -337,7 +752,7 @@ index c592a09..69b13d7 100644
  static __poll_t io_uring_poll(struct file *file, poll_table *wait)
  {
  	struct io_ring_ctx *ctx = file->private_data;
-@@ -2548,6 +2705,9 @@ static __poll_t io_uring_poll(struct file *file, poll_table *wait)
+@@ -2548,6 +2942,9 @@ static __poll_t io_uring_poll(struct file *file, poll_table *wait)
  	return mask;
  }
  
@@ -347,7 +762,7 @@ index c592a09..69b13d7 100644
  static int io_uring_fasync(int fd, struct file *file, int on)
  {
  	struct io_ring_ctx *ctx = file->private_data;
-@@ -2555,6 +2715,11 @@ static int io_uring_fasync(int fd, struct file *file, int on)
+@@ -2555,6 +2952,11 @@ static int io_uring_fasync(int fd, struct file *file, int on)
  	return fasync_helper(fd, file, on, &ctx->cq_fasync);
  }
  
@@ -359,7 +774,7 @@ index c592a09..69b13d7 100644
  static void io_ring_ctx_wait_and_kill(struct io_ring_ctx *ctx)
  {
  	mutex_lock(&ctx->uring_lock);
-@@ -2567,6 +2732,9 @@ static void io_ring_ctx_wait_and_kill(struct io_ring_ctx *ctx)
+@@ -2567,6 +2969,9 @@ static void io_ring_ctx_wait_and_kill(struct io_ring_ctx *ctx)
  	io_ring_ctx_free(ctx);
  }
  
@@ -369,7 +784,7 @@ index c592a09..69b13d7 100644
  static int io_uring_release(struct inode *inode, struct file *file)
  {
  	struct io_ring_ctx *ctx = file->private_data;
-@@ -2576,6 +2744,9 @@ static int io_uring_release(struct inode *inode, struct file *file)
+@@ -2576,6 +2981,9 @@ static int io_uring_release(struct inode *inode, struct file *file)
  	return 0;
  }
  
@@ -379,7 +794,73 @@ index c592a09..69b13d7 100644
  static int io_uring_mmap(struct file *file, struct vm_area_struct *vma)
  {
  	loff_t offset = (loff_t) vma->vm_pgoff << PAGE_SHIFT;
-@@ -2692,6 +2863,12 @@ static const struct file_operations io_uring_fops = {
+@@ -2607,6 +3015,11 @@ static int io_uring_mmap(struct file *file, struct vm_area_struct *vma)
+ 	return remap_pfn_range(vma, vma->vm_start, pfn, sz, vma->vm_page_prot);
+ }
+ 
++/*
++ * If flags contains IORING_ENTER_GETEVENTS and min_complete is nonzero,
++ * io_uring_enter() will block until at least that many operations have
++ * completed.
++ */
+ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
+ 		u32, min_complete, u32, flags, const sigset_t __user *, sig,
+ 		size_t, sigsz)
+@@ -2628,6 +3041,13 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
+ 		goto out_fput;
+ 
+ 	ret = -ENXIO;
++	/*
++	 * io_allocate_scq_urings()执行后:
++	 * struct io_ring_ctx
++	 *   struct io_sq_ring    *sq_ring; --> 指向struct io_sq_ring + 一组u32 array[]
++	 *   struct io_uring_sqe  *sq_sqes; --> 指向一组struct io_uring_sqe[]
++	 *   struct io_cq_ring    *cq_ring; --> 指向struct io_cq_ring + 一组struct io_uring_cqe[]
++	 */
+ 	ctx = f.file->private_data;
+ 	if (!percpu_ref_tryget(&ctx->refs))
+ 		goto out_fput;
+@@ -2638,6 +3058,17 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
+ 	 * we were asked to.
+ 	 */
+ 	if (ctx->flags & IORING_SETUP_SQPOLL) {
++		/*
++		 * used by:
++		 *   - fs/io_uring.c|390| <<io_cqring_ev_posted>> if (waitqueue_active(&ctx->sqo_wait))
++		 *   - fs/io_uring.c|391| <<io_cqring_ev_posted>> wake_up(&ctx->sqo_wait);
++		 *   - fs/io_uring.c|1866| <<io_sq_thread>> prepare_to_wait(&ctx->sqo_wait, &wait,
++		 *   - fs/io_uring.c|1875| <<io_sq_thread>> finish_wait(&ctx->sqo_wait, &wait);
++		 *   - fs/io_uring.c|1881| <<io_sq_thread>> finish_wait(&ctx->sqo_wait, &wait);
++		 *   - fs/io_uring.c|1887| <<io_sq_thread>> finish_wait(&ctx->sqo_wait, &wait);
++		 *   - fs/io_uring.c|2228| <<io_sq_offload_start>> init_waitqueue_head(&ctx->sqo_wait);
++		 *   - fs/io_uring.c|2693| <<SYSCALL_DEFINE6(io_uring_enter)>> wake_up(&ctx->sqo_wait);
++		 */
+ 		if (flags & IORING_ENTER_SQ_WAKEUP)
+ 			wake_up(&ctx->sqo_wait);
+ 		submitted = to_submit;
+@@ -2655,6 +3086,11 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
+ 		if (submitted < 0)
+ 			goto out_ctx;
+ 	}
++	/*
++	 * If flags contains IORING_ENTER_GETEVENTS and min_complete is
++	 * nonzero, io_uring_enter() will block until at least that many
++	 * operations have completed.
++	 */
+ 	if (flags & IORING_ENTER_GETEVENTS) {
+ 		unsigned nr_events = 0;
+ 
+@@ -2674,6 +3110,9 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
+ 			ret = io_iopoll_check(ctx, &nr_events, min_complete);
+ 			mutex_unlock(&ctx->uring_lock);
+ 		} else {
++			/*
++			 * sig和sigsz都是用户空间通过系统调用传下来的
++			 */
+ 			ret = io_cqring_wait(ctx, min_complete, sig, sigsz);
+ 		}
+ 	}
+@@ -2692,6 +3131,18 @@ static const struct file_operations io_uring_fops = {
  	.fasync		= io_uring_fasync,
  };
  
@@ -387,12 +868,18 @@ index c592a09..69b13d7 100644
 + * called by only:
 + *   - fs/io_uring.c|2834| <<io_uring_create>> ret = io_allocate_scq_urings(ctx, p);
 + *
++ * io_allocate_scq_urings()执行后:
++ * struct io_ring_ctx
++ *   struct io_sq_ring    *sq_ring; --> 指向struct io_sq_ring + 一组u32 array[]
++ *   struct io_uring_sqe  *sq_sqes; --> 指向一组struct io_uring_sqe[]
++ *   struct io_cq_ring    *cq_ring; --> 指向struct io_cq_ring + 一组struct io_uring_cqe[]
++ *
 + * SYSCALL_DEFINE2(io_uring_setup)-->io_uring_setup()-->io_uring_create()-->io_allocate_scq_urings()
 + */
  static int io_allocate_scq_urings(struct io_ring_ctx *ctx,
  				  struct io_uring_params *p)
  {
-@@ -2699,6 +2876,10 @@ static int io_allocate_scq_urings(struct io_ring_ctx *ctx,
+@@ -2699,6 +3150,10 @@ static int io_allocate_scq_urings(struct io_ring_ctx *ctx,
  	struct io_cq_ring *cq_ring;
  	size_t size;
  
@@ -403,7 +890,28 @@ index c592a09..69b13d7 100644
  	sq_ring = io_mem_alloc(struct_size(sq_ring, array, p->sq_entries));
  	if (!sq_ring)
  		return -ENOMEM;
-@@ -2740,6 +2921,12 @@ static int io_allocate_scq_urings(struct io_ring_ctx *ctx,
+@@ -2713,12 +3168,20 @@ static int io_allocate_scq_urings(struct io_ring_ctx *ctx,
+ 	if (size == SIZE_MAX)
+ 		return -EOVERFLOW;
+ 
++	/*
++	 * 类型是struct io_uring_sqe *sq_sqes
++	 * 指向的是p->sq_entries=sq_ring->ring_entries=ctx->sq_entries个'struct io_uring_sqe'
++	 */
+ 	ctx->sq_sqes = io_mem_alloc(size);
+ 	if (!ctx->sq_sqes) {
+ 		io_mem_free(ctx->sq_ring);
+ 		return -ENOMEM;
+ 	}
+ 
++	/*
++	 * cqes在struct io_cq_ring类型的cq_ring中的定义是: struct io_uring_cqe cqes[];
++	 * 这里在分配cq_ring的时候一起分配了struct io_cq_ring + 一组struct io_uring_cqe[]
++	 */
+ 	cq_ring = io_mem_alloc(struct_size(cq_ring, cqes, p->cq_entries));
+ 	if (!cq_ring) {
+ 		io_mem_free(ctx->sq_ring);
+@@ -2740,6 +3203,12 @@ static int io_allocate_scq_urings(struct io_ring_ctx *ctx,
   * fd to gain access to the SQ/CQ ring details. If UNIX sockets are enabled,
   * we have to tie this fd to a socket for file garbage collection purposes.
   */
@@ -416,7 +924,7 @@ index c592a09..69b13d7 100644
  static int io_uring_get_fd(struct io_ring_ctx *ctx)
  {
  	struct file *file;
-@@ -2778,6 +2965,12 @@ static int io_uring_get_fd(struct io_ring_ctx *ctx)
+@@ -2778,6 +3247,12 @@ static int io_uring_get_fd(struct io_ring_ctx *ctx)
  	return ret;
  }
  
@@ -429,7 +937,7 @@ index c592a09..69b13d7 100644
  static int io_uring_create(unsigned entries, struct io_uring_params *p)
  {
  	struct user_struct *user = NULL;
-@@ -2794,6 +2987,7 @@ static int io_uring_create(unsigned entries, struct io_uring_params *p)
+@@ -2794,6 +3269,7 @@ static int io_uring_create(unsigned entries, struct io_uring_params *p)
  	 * since the sqes are only used at submission time. This allows for
  	 * some flexibility in overcommitting a bit.
  	 */
@@ -437,7 +945,7 @@ index c592a09..69b13d7 100644
  	p->sq_entries = roundup_pow_of_two(entries);
  	p->cq_entries = 2 * p->sq_entries;
  
-@@ -2809,6 +3003,9 @@ static int io_uring_create(unsigned entries, struct io_uring_params *p)
+@@ -2809,6 +3285,9 @@ static int io_uring_create(unsigned entries, struct io_uring_params *p)
  		}
  	}
  
@@ -447,12 +955,18 @@ index c592a09..69b13d7 100644
  	ctx = io_ring_ctx_alloc(p);
  	if (!ctx) {
  		if (account_mem)
-@@ -2821,18 +3018,30 @@ static int io_uring_create(unsigned entries, struct io_uring_params *p)
+@@ -2821,18 +3300,36 @@ static int io_uring_create(unsigned entries, struct io_uring_params *p)
  	ctx->account_mem = account_mem;
  	ctx->user = user;
  
 +	/*
 +	 * 分配sq和cq的ring buffer
++	 *
++	 * 该函数执行后:
++	 * struct io_ring_ctx
++	 *   struct io_sq_ring    *sq_ring; --> 指向struct io_sq_ring + 一组u32 array[]
++	 *   struct io_uring_sqe  *sq_sqes; --> 指向一组struct io_uring_sqe[]
++	 *   struct io_cq_ring    *cq_ring; --> 指向struct io_cq_ring + 一组struct io_uring_cqe[]
 +	 */
  	ret = io_allocate_scq_urings(ctx, p);
  	if (ret)
@@ -478,8 +992,13 @@ index c592a09..69b13d7 100644
  	memset(&p->sq_off, 0, sizeof(p->sq_off));
  	p->sq_off.head = offsetof(struct io_sq_ring, r.head);
  	p->sq_off.tail = offsetof(struct io_sq_ring, r.tail);
-@@ -2842,6 +3051,9 @@ static int io_uring_create(unsigned entries, struct io_uring_params *p)
+@@ -2840,14 +3337,23 @@ static int io_uring_create(unsigned entries, struct io_uring_params *p)
+ 	p->sq_off.ring_entries = offsetof(struct io_sq_ring, ring_entries);
+ 	p->sq_off.flags = offsetof(struct io_sq_ring, flags);
  	p->sq_off.dropped = offsetof(struct io_sq_ring, dropped);
++	/*
++	 * 在io_allocate_scq_urings()中分配的array在struct io_sq_ring的最后面
++	 */
  	p->sq_off.array = offsetof(struct io_sq_ring, array);
  
 +	/*
@@ -488,18 +1007,58 @@ index c592a09..69b13d7 100644
  	memset(&p->cq_off, 0, sizeof(p->cq_off));
  	p->cq_off.head = offsetof(struct io_cq_ring, r.head);
  	p->cq_off.tail = offsetof(struct io_cq_ring, r.tail);
-@@ -2860,6 +3072,10 @@ static int io_uring_create(unsigned entries, struct io_uring_params *p)
+ 	p->cq_off.ring_mask = offsetof(struct io_cq_ring, ring_mask);
+ 	p->cq_off.ring_entries = offsetof(struct io_cq_ring, ring_entries);
+ 	p->cq_off.overflow = offsetof(struct io_cq_ring, overflow);
++	/*
++	 * 在io_allocate_scq_urings()中分配的cqes在struct io_cq_ring的最后面
++	 */
+ 	p->cq_off.cqes = offsetof(struct io_cq_ring, cqes);
+ 	return ret;
+ err:
+@@ -2860,6 +3366,41 @@ static int io_uring_create(unsigned entries, struct io_uring_params *p)
   * ring size, we return the actual sq/cq ring sizes (among other things) in the
   * params structure passed in.
   */
 +/*
 + * called by:
 + *   - fs/io_uring.c|2903| <<SYSCALL_DEFINE2(io_uring_setup)>> return io_uring_setup(entries, params);
++ *
++ * The return value from io_uring_setup() is a file descriptor that can
++ * then be passed to mmap() to map the buffer into the process's address
++ * space.
++ *
++ * More specifically, three calls are needed to map:
++ * 1. the two ring buffers and
++ * 2. an array of submission-queue entries;
++ *
++ * io_uring_create()执行后:
++ * struct io_ring_ctx
++ *   struct io_sq_ring    *sq_ring; --> 指向struct io_sq_ring + 一组u32 array[]
++ *   struct io_uring_sqe  *sq_sqes; --> 指向一组struct io_uring_sqe[]
++ *   struct io_cq_ring    *cq_ring; --> 指向struct io_cq_ring + 一组struct io_uring_cqe[]
++ *
++ * the information needed to do this mapping will be found in the sq_off
++ * and cq_off fields of the io_uring_params structure.
++ *
++ * 用户空间需要调用:
++ *
++ * subqueue = mmap(0, params.sq_off.array + params.sq_entries*sizeof(__u32),
++ *                 PROT_READ|PROT_WRITE|MAP_SHARED|MAP_POPULATE,
++ *                 ring_fd, IORING_OFF_SQ_RING);
++ *
++ * sqentries = mmap(0, params.sq_entries*sizeof(struct io_uring_sqe),
++ *                  PROT_READ|PROT_WRITE|MAP_SHARED|MAP_POPULATE,
++ *                  ring_fd, IORING_OFF_SQES);
++ *
++ * cqentries = mmap(0, params.cq_off.cqes + params.cq_entries*sizeof(struct io_uring_cqe),
++ *                  PROT_READ|PROT_WRITE|MAP_SHARED|MAP_POPULATE,
++ *                  ring_fd, IORING_OFF_CQ_RING);
 + */
  static long io_uring_setup(u32 entries, struct io_uring_params __user *params)
  {
  	struct io_uring_params p;
-@@ -2877,6 +3093,9 @@ static long io_uring_setup(u32 entries, struct io_uring_params __user *params)
+@@ -2877,6 +3418,9 @@ static long io_uring_setup(u32 entries, struct io_uring_params __user *params)
  			IORING_SETUP_SQ_AFF))
  		return -EINVAL;
  
@@ -509,7 +1068,7 @@ index c592a09..69b13d7 100644
  	ret = io_uring_create(entries, &p);
  	if (ret < 0)
  		return ret;
-@@ -2893,6 +3112,10 @@ SYSCALL_DEFINE2(io_uring_setup, u32, entries,
+@@ -2893,6 +3437,10 @@ SYSCALL_DEFINE2(io_uring_setup, u32, entries,
  	return io_uring_setup(entries, params);
  }
  
@@ -520,7 +1079,36 @@ index c592a09..69b13d7 100644
  static int __io_uring_register(struct io_ring_ctx *ctx, unsigned opcode,
  			       void __user *arg, unsigned nr_args)
  {
-@@ -2962,3 +3185,10 @@ static int __init io_uring_init(void)
+@@ -2931,6 +3479,28 @@ static int __io_uring_register(struct io_ring_ctx *ctx, unsigned opcode,
+ 	return ret;
+ }
+ 
++/*
++ * There is ability to map a program's I/O buffers into the kernel. This
++ * mapping normally happens with each I/O operation so that data can be
++ * copied into or out of the buffers; the buffers are unmapped when the
++ * operation completes. If the buffers will be used many times over the
++ * course of the program's execution, it is far more efficient to map them
++ * once and leave them in place. This mapping is done by filling in yet
++ * another structure describing the buffers to be mapped: 
++ *
++ * In this case, the opcode should be IORING_REGISTER_BUFFERS. The buffers
++ * will remain mapped for as long as the initial file descriptor remains
++ * open, unless the program explicitly unmaps them with
++ * IORING_UNREGISTER_BUFFERS. Mapping buffers in this way is essentially
++ * locking memory into RAM, so the usual resource limit that applies to
++ * mlock() applies here as well. When performing I/O to premapped buffers,
++ * the IORING_OP_READ_FIXED and IORING_OP_WRITE_FIXED operations should be
++ * used.
++ *
++ * There is also an IORING_REGISTER_FILES operation that can be used to
++ * optimize situations where many operations will be performed on the same
++ * file(s). 
++ */
+ SYSCALL_DEFINE4(io_uring_register, unsigned int, fd, unsigned int, opcode,
+ 		void __user *, arg, unsigned int, nr_args)
+ {
+@@ -2962,3 +3532,10 @@ static int __init io_uring_init(void)
  	return 0;
  };
  __initcall(io_uring_init);
@@ -532,10 +1120,10 @@ index c592a09..69b13d7 100644
 + *   - io_uring_register
 + */
 diff --git a/include/uapi/linux/io_uring.h b/include/uapi/linux/io_uring.h
-index e234086..0cdb3da 100644
+index e234086..e79aaae 100644
 --- a/include/uapi/linux/io_uring.h
 +++ b/include/uapi/linux/io_uring.h
-@@ -37,16 +37,51 @@ struct io_uring_sqe {
+@@ -37,16 +37,67 @@ struct io_uring_sqe {
  /*
   * sqe->flags
   */
@@ -568,6 +1156,22 @@ index e234086..0cdb3da 100644
 + *   - fs/io_uring.c|2251| <<io_sq_offload_start>> if (ctx->flags & IORING_SETUP_SQPOLL) {
 + *   - fs/io_uring.c|2702| <<SYSCALL_DEFINE6(io_uring_enter)>> if (ctx->flags & IORING_SETUP_SQPOLL) {
 + *   - fs/io_uring.c|2973| <<io_uring_setup>> if (p.flags & ~(IORING_SETUP_IOPOLL | IORING_SETUP_SQPOLL |
++ *
++ * There is also a fully polled mode that (almost) eliminates the need to
++ * make any system calls at all. This mode is enabled by setting the
++ * IORING_SETUP_SQPOLL flag at ring setup time. A call to io_uring_enter()
++ * will kick off a kernel thread that will occasionally poll the submission
++ * queue and automatically submit any requests found there; receive-queue
++ * polling is also performed if it has been requested. As long as the
++ * application continues to submit I/O and consume the results, I/O will
++ * happen with no further system calls.
++ *
++ * Eventually, though (after one second currently), the kernel will get
++ * bored if no new requests are submitted and the polling will stop. When
++ * that happens, the flags field in the submission queue structure will
++ * have the IORING_SQ_NEED_WAKEUP bit set. The application should check
++ * for this bit and, if it is set, make a new call to io_uring_enter() to
++ * start the mechanism up again. 
 + */
  #define IORING_SETUP_SQPOLL	(1U << 1)	/* SQ poll thread */
 +/*
@@ -587,7 +1191,7 @@ index e234086..0cdb3da 100644
  #define IORING_OP_READV		1
  #define IORING_OP_WRITEV	2
  #define IORING_OP_FSYNC		3
-@@ -72,13 +107,39 @@ struct io_uring_cqe {
+@@ -72,13 +123,39 @@ struct io_uring_cqe {
  /*
   * Magic offsets for the application to mmap the data it needs
   */
@@ -627,7 +1231,7 @@ index e234086..0cdb3da 100644
  struct io_sqring_offsets {
  	__u32 head;
  	__u32 tail;
-@@ -94,8 +155,24 @@ struct io_sqring_offsets {
+@@ -94,8 +171,24 @@ struct io_sqring_offsets {
  /*
   * sq_ring->flags
   */
@@ -652,7 +1256,7 @@ index e234086..0cdb3da 100644
  struct io_cqring_offsets {
  	__u32 head;
  	__u32 tail;
-@@ -109,20 +186,59 @@ struct io_cqring_offsets {
+@@ -109,20 +202,59 @@ struct io_cqring_offsets {
  /*
   * io_uring_enter(2) flags
   */
