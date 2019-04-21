@@ -1,21 +1,535 @@
-From 926c551edebf307f270fa5ecd52d35df5ff1815d Mon Sep 17 00:00:00 2001
+From e75742fd156edf00844fae56d1797c35d6552770 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Wed, 17 Apr 2019 11:03:42 +0800
+Date: Mon, 22 Apr 2019 06:05:22 +0800
 Subject: [PATCH 1/1] linux-xen-interface-for-linux-4.9.168
 
 xen specific interface linux-4.9.168
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
- arch/x86/xen/irq.c                  | 53 ++++++++++++++++++++
- arch/x86/xen/platform-pci-unplug.c  |  5 ++
- arch/x86/xen/xen-asm_64.S           |  4 ++
- drivers/block/xen-blkback/blkback.c | 99 +++++++++++++++++++++++++++++++++++++
- drivers/block/xen-blkback/common.h  | 25 ++++++++++
- drivers/block/xen-blkfront.c        | 60 ++++++++++++++++++++++
- drivers/xen/xenbus/xenbus_probe.c   | 17 +++++++
- 7 files changed, 263 insertions(+)
+ arch/x86/pci/xen.c                   | 288 +++++++++++++++++++++++
+ arch/x86/xen/enlighten.c             |   8 +
+ arch/x86/xen/irq.c                   |  53 +++++
+ arch/x86/xen/platform-pci-unplug.c   |   5 +
+ arch/x86/xen/smp.c                   |   4 +
+ arch/x86/xen/xen-asm_64.S            |   4 +
+ drivers/block/xen-blkback/blkback.c  |  99 ++++++++
+ drivers/block/xen-blkback/common.h   |  25 ++
+ drivers/block/xen-blkfront.c         |  60 +++++
+ drivers/nvme/host/pci.c              |   3 +
+ drivers/xen/events/events_base.c     | 429 +++++++++++++++++++++++++++++++++++
+ drivers/xen/events/events_internal.h |   9 +
+ drivers/xen/pci.c                    |  29 +++
+ drivers/xen/xenbus/xenbus_probe.c    |  17 ++
+ kernel/irq/chip.c                    |   3 +
+ 15 files changed, 1036 insertions(+)
 
+diff --git a/arch/x86/pci/xen.c b/arch/x86/pci/xen.c
+index 4ea9f29..092ffbb 100644
+--- a/arch/x86/pci/xen.c
++++ b/arch/x86/pci/xen.c
+@@ -27,6 +27,63 @@
+ #include <asm/apic.h>
+ #include <asm/i8259.h>
+ 
++/*
++ * 下面主要是xen hypervisor的部分,
++ * 核心思想: xen有自己的irq, linux有自己的irq, pirq是domain相关的, linux和xen都认识
++ *
++ * 在arch/x86/x86_64/entry.S,
++ * autogen_entrypoints生成vector table, 每一个vector指向一个处理函数
++ * 函数都差不多 (每个cpu支持256个vector):
++ *
++ * 先"movb  $vec,4(%rsp)", 再"jmp   common_interrupt"
++ *
++ * 在arch/x86/x86_64/entry.S:
++ * 392 ENTRY(common_interrupt)
++ * 393         SAVE_ALL CLAC
++ * 394         CR4_PV32_RESTORE
++ * 395         movq %rsp,%rdi
++ * 396         callq do_IRQ
++ * 397         jmp ret_from_intr
++ *
++ * do_IRQ()如何把vector发送到guest?
++ *
++ * 1. 先通过vector查找percpu的vector_irq[vector]找到irq:
++ * int irq = __get_cpu_var(vector_irq[vector]);
++ *
++ * 2. 再通过irq找到对应的struct irq_desc, x86下就是&irq_desc[irq]:
++ * desc = irq_to_desc(irq);
++ *
++ * 3. 很可能desc->status & IRQ_GUEST是true, 就要调用__do_IRQ_guest(irq)了
++ *
++ * 4. 如果是dom0, 调用send_guest_pirq()往dom0插入event
++ *
++ *
++ * 重要的函数或者数据结构:
++ *
++ * - vector_irq[vector]: 把cpu的vector转换成irq, 索引&irq_desc[irq]
++ * - domain_irq_to_pirq(d, irq)负责将xen的irq转换成某个domain d的pirq
++ * - pirq_info(d, pirq)负责将某个domain d的pirq转换成'struct pirq'
++ *
++ * struct pirq {
++ *   int pirq;
++ *   u16 evtchn;
++ *   bool_t masked;
++ *   struct rcu_head rcu_head;
++ *   struct arch_pirq arch;
++ * };
++ *
++ * dom0 linux的核心函数感觉是__startup_pirq()
++ *
++ * xen有自己的irq, linux有自己的irq, pirq是domain相关的, linux和xen都认识
++ */
++
++/*
++ * used by:
++ *   - arch/x86/pci/xen.c|437| <<pci_xen_init>> pcibios_enable_irq = xen_pcifront_enable_irq;
++ *
++ * pcibios_enable_irq只在以下调用:
++ *   - arch/x86/pci/common.c|728| <<pcibios_enable_device>> return pcibios_enable_irq(dev);
++ */
+ static int xen_pcifront_enable_irq(struct pci_dev *dev)
+ {
+ 	int rc;
+@@ -59,6 +116,56 @@ static int xen_pcifront_enable_irq(struct pci_dev *dev)
+ }
+ 
+ #ifdef CONFIG_ACPI
++/*
++ * xen: --> pirq=13 -> irq=13 (gsi=13)
++ * [0] xen_register_pirq.constprop.8
++ * [0] pci_xen_initial_domain
++ * [0] xen_init_IRQ
++ * [0] init_IRQ
++ * [0] start_kernel
++ * [0] x86_64_start_reservations
++ * [0] xen_start_kernel
++ *
++ * xen: registering gsi 9 triggering 0 polarity 0
++ * orabug: xen_register_pirq(), gsi=9, gsi_override=-1, triggering=0, set_pirq=1
++ * [0] xen_register_pirq.constprop.8
++ * [0] acpi_register_gsi_xen
++ * [0] acpi_gsi_to_irq
++ * [0] acpi_os_install_interrupt_handler
++ * [0] acpi_ev_install_sci_handler
++ * [0] acpi_ev_install_xrupt_handlers
++ * [0] acpi_enable_subsystem
++ * [0] acpi_init
++ * [0] do_one_initcall
++ * [0] kernel_init_freeable
++ * [0] kernel_init
++ * [0] ret_from_fork
++ *
++ * [    3.726277]  [<ffffffff8135118e>] dump_stack+0x63/0x85
++ * [    3.726354]  [<ffffffff8175de63>] xen_register_pirq.constprop.8+0x33/0x100
++ * [    3.726512]  [<ffffffff8175df81>] acpi_register_gsi_xen+0x51/0xc0
++ * [    3.726590]  [<ffffffff8104be80>] acpi_register_gsi+0x10/0x20
++ * [    3.726666]  [<ffffffff813bb25d>] acpi_dev_get_irqresource.part.2+0x5d/0x150
++ * [    3.726901]  [<ffffffff813bb3cc>] acpi_dev_resource_interrupt+0x7c/0xc0
++ * [    3.726979]  [<ffffffff813f26a0>] pnpacpi_allocated_resource+0x70/0x260
++ * [    3.727133]  [<ffffffff813dc002>] acpi_walk_resource_buffer+0x4a/0x82
++ * [    3.727288]  [<ffffffff813dc2a2>] acpi_walk_resources+0x77/0x92
++ * [    3.727364]  [<ffffffff813f28d4>] pnpacpi_parse_allocated_resource+0x44/0x90
++ * [    3.727444]  [<ffffffff81fa8709>] pnpacpi_add_device_handler+0x195/0x220
++ * [    3.727522]  [<ffffffff813d817c>] acpi_ns_get_device_callback+0x141/0x150
++ *                     769 [    3.727755]  [<ffffffff813d7b2e>] acpi_ns_walk_namespace+0xdf/0x191
++ *                        772 [    3.727988]  [<ffffffff813d7f5a>] acpi_get_devices+0x56/0x6c
++ *                          774 [    3.728140]  [<ffffffff81fa87e2>] pnpacpi_init+0x4e/0x6e
++ *                           775 [    3.728216]  [<ffffffff8100214a>] do_one_initcall+0x3a/0x160
++ *                             777 [    3.728372]  [<ffffffff81f65090>] kernel_init_freeable+0x15e/0x1e4
++ *                               779 [    3.728526]  [<ffffffff819631b9>] kernel_init+0x9/0x100
++ *                                780 [    3.728602]  [<ffffffff8196e7e7>] ret_from_fork+0x57/0x70
++ *
++ * called by:
++ *   - arch/x86/pci/xen.c|114| <<acpi_register_gsi_xen_hvm>> return xen_register_pirq(gsi, -1 , trigger,
++ *   - arch/x86/pci/xen.c|130| <<xen_register_gsi>> irq = xen_register_pirq(gsi, gsi_override, triggering, true);
++ *   - arch/x86/pci/xen.c|495| <<pci_xen_initial_domain>> xen_register_pirq(irq, -1 ,
++ */
+ static int xen_register_pirq(u32 gsi, int gsi_override, int triggering,
+ 			     bool set_pirq)
+ {
+@@ -105,6 +212,10 @@ static int xen_register_pirq(u32 gsi, int gsi_override, int triggering,
+ 	return irq;
+ }
+ 
++/*
++ * used by:
++ *   - arch/x86/pci/xen.c|494| <<pci_xen_hvm_init>> __acpi_register_gsi = acpi_register_gsi_xen_hvm;
++ */
+ static int acpi_register_gsi_xen_hvm(struct device *dev, u32 gsi,
+ 				     int trigger, int polarity)
+ {
+@@ -116,6 +227,10 @@ static int acpi_register_gsi_xen_hvm(struct device *dev, u32 gsi,
+ }
+ 
+ #ifdef CONFIG_XEN_DOM0
++/*
++ * used by:
++ *   - arch/x86/pci/xen.c|156| <<acpi_register_gsi_xen>> return xen_register_gsi(gsi, -1 , trigger, polarity);
++ */
+ static int xen_register_gsi(u32 gsi, int gsi_override, int triggering, int polarity)
+ {
+ 	int rc, irq;
+@@ -144,6 +259,13 @@ static int xen_register_gsi(u32 gsi, int gsi_override, int triggering, int polar
+ 	return irq;
+ }
+ 
++/*
++ * used by:
++ *   - arch/x86/pci/xen.c|523| <<pci_xen_initial_domain>> __acpi_register_gsi = acpi_register_gsi_xen;
++ *
++ * called by:
++ *   - arch/x86/kernel/acpi/boot.c|711| <<acpi_register_gsi>> return __acpi_register_gsi(dev, gsi, trigger, polarity);
++ */
+ static int acpi_register_gsi_xen(struct device *dev, u32 gsi,
+ 				 int trigger, int polarity)
+ {
+@@ -159,6 +281,13 @@ static int acpi_register_gsi_xen(struct device *dev, u32 gsi,
+ struct xen_pci_frontend_ops *xen_pci_frontend;
+ EXPORT_SYMBOL_GPL(xen_pci_frontend);
+ 
++/*
++ * used by:
++ *   - arch/x86/pci/xen.c|446| <<pci_xen_init>> x86_msi.setup_msi_irqs = xen_setup_msi_irqs;
++ *
++ * called by:
++ *   - arch/x86/kernel/x86_init.c|121| <<arch_setup_msi_irqs>> return x86_msi.setup_msi_irqs(dev, nvec, type);
++ */
+ static int xen_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
+ {
+ 	int irq, ret, i;
+@@ -208,6 +337,10 @@ static int xen_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
+ #define XEN_PIRQ_MSI_DATA  (MSI_DATA_TRIGGER_EDGE | \
+ 		MSI_DATA_LEVEL_ASSERT | (3 << 8) | MSI_DATA_VECTOR(0))
+ 
++/*
++ * called by:
++ *   - arch/x86/pci/xen.c|248| <<xen_hvm_setup_msi_irqs>> xen_msi_compose_msg(dev, pirq, &msg);
++ */
+ static void xen_msi_compose_msg(struct pci_dev *pdev, unsigned int pirq,
+ 		struct msi_msg *msg)
+ {
+@@ -224,6 +357,10 @@ static void xen_msi_compose_msg(struct pci_dev *pdev, unsigned int pirq,
+ 	msg->data = XEN_PIRQ_MSI_DATA;
+ }
+ 
++/*
++ * used by:
++ *   - arch/x86/pci/xen.c|449| <<xen_msi_init>> x86_msi.setup_msi_irqs = xen_hvm_setup_msi_irqs;
++ */
+ static int xen_hvm_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
+ {
+ 	int irq, pirq;
+@@ -261,17 +398,63 @@ static int xen_hvm_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
+ }
+ 
+ #ifdef CONFIG_XEN_DOM0
++/*
++ * 在以下修改:
++ *   - arch/x86/pci/xen.c|370| <<xen_initdom_setup_msi_irqs>> pci_seg_supported = false;
++ *   - arch/x86/pci/xen.c|407| <<xen_initdom_restore_msi_irqs>> pci_seg_supported = false;
++ */
+ static bool __read_mostly pci_seg_supported = true;
+ 
++/*
++ * nvme调用了两次:
++ *
++ * nvme_reset_work()
++ * nvme_pci_enable()
++ * pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_ALL_TYPES);
++ *
++ * nvme_reset_work()
++ * nvme_setup_io_queues()  
++ * pci_alloc_irq_vectors(pdev, 1, nr_io_queues, PCI_IRQ_ALL_TYPES | PCI_IRQ_AFFINITY);
++ *
++ * [0] xen_initdom_setup_msi_irqs
++ * [0] arch_setup_msi_irqs
++ * [0] pci_msi_setup_msi_irqs
++ * [0] __pci_enable_msix
++ * [0] __pci_enable_msix_range
++ * [0] pci_alloc_irq_vectors
++ * [0] nvme_reset_work
++ * [0] process_one_work
++ * [0] worker_thread
++ * [0] kthread
++ * [0] ret_from_fork
++ *
++ * used by:
++ *   - arch/x86/pci/xen.c|488| <<pci_xen_initial_domain>> x86_msi.setup_msi_irqs = xen_initdom_setup_msi_irqs;
++ *
++ * called by:
++ *   - arch/x86/kernel/x86_init.c|121| <<arch_setup_msi_irqs>> return x86_msi.setup_msi_irqs(dev, nvec, type);
++ */
+ static int xen_initdom_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
+ {
+ 	int ret = 0;
+ 	struct msi_desc *msidesc;
+ 
++	/*
++	 * nvme两次调用进来的时候type都是PCI_CAP_ID_MSIX
++	 */
+ 	for_each_pci_msi_entry(msidesc, dev) {
+ 		struct physdev_map_pirq map_irq;
+ 		domid_t domid;
+ 
++		/*
++		 * 对于nvme (8个vector), 共调用了8次, 有8个struct msi_desc
++		 * msidesc->msi_attrib.entry_nr先后是0, 1, 2, 3, 4, 5, 6, 7
++		 *
++		 * 在desktop上测试此时pci_domain_nr(dev->bus) == 0
++		 *
++		 * 此时pci_seg_supported也都是true
++		 */
++
+ 		domid = ret = xen_find_device_domain_owner(dev);
+ 		/* N.B. Casting int's -ENODEV to uint16_t results in 0xFFED,
+ 		 * hence check ret value for < 0. */
+@@ -311,6 +494,12 @@ static int xen_initdom_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
+ 		if (pci_seg_supported)
+ 			ret = HYPERVISOR_physdev_op(PHYSDEVOP_map_pirq,
+ 						    &map_irq);
++
++		/*
++		 * 成功的话ret是0, 在desktop上的nvme测试的map_irq.pirq分别是:
++		 * 856, 857, 858, 859, 860, 861, 862, 872
++		 */
++
+ 		if (type == PCI_CAP_ID_MSI && nvec > 1 && ret) {
+ 			/*
+ 			 * If MAP_PIRQ_TYPE_MULTI_MSI is not available
+@@ -328,6 +517,11 @@ static int xen_initdom_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
+ 			map_irq.bus = dev->bus->number;
+ 			ret = HYPERVISOR_physdev_op(PHYSDEVOP_map_pirq,
+ 						    &map_irq);
++			/*
++			 * 在以下修改:
++			 *   - arch/x86/pci/xen.c|370| <<xen_initdom_setup_msi_irqs>> pci_seg_supported = false;
++			 *   - arch/x86/pci/xen.c|407| <<xen_initdom_restore_msi_irqs>> pci_seg_supported = false;
++			 */
+ 			if (ret != -EINVAL)
+ 				pci_seg_supported = false;
+ 		}
+@@ -337,6 +531,9 @@ static int xen_initdom_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
+ 			goto out;
+ 		}
+ 
++		/*
++		 * Bind an PSI pirq to an irq
++		 */
+ 		ret = xen_bind_pirq_msi_to_irq(dev, msidesc, map_irq.pirq,
+ 		                               (type == PCI_CAP_ID_MSI) ? nvec : 1,
+ 		                               (type == PCI_CAP_ID_MSIX) ? "msi-x" : "msi",
+@@ -349,6 +546,13 @@ static int xen_initdom_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
+ 	return ret;
+ }
+ 
++/*
++ * used by:
++ *   - arch/x86/pci/xen.c|520| <<pci_xen_initial_domain>> x86_msi.restore_msi_irqs = xen_initdom_restore_msi_irqs;
++ *
++ * called by:
++ *   - arch/x86/kernel/x86_init.c|136| <<arch_restore_msi_irqs>> x86_msi.restore_msi_irqs(dev);
++ */
+ static void xen_initdom_restore_msi_irqs(struct pci_dev *dev)
+ {
+ 	int ret = 0;
+@@ -376,6 +580,10 @@ static void xen_initdom_restore_msi_irqs(struct pci_dev *dev)
+ }
+ #endif
+ 
++/*
++ * used by:
++ *   - arch/x86/pci/xen.c|448| <<pci_xen_init>> x86_msi.teardown_msi_irqs = xen_teardown_msi_irqs;
++ */
+ static void xen_teardown_msi_irqs(struct pci_dev *dev)
+ {
+ 	struct msi_desc *msidesc;
+@@ -390,6 +598,12 @@ static void xen_teardown_msi_irqs(struct pci_dev *dev)
+ 	default_teardown_msi_irqs(dev);
+ }
+ 
++/*
++ * used by:
++ *   - arch/x86/pci/xen.c|437| <<pci_xen_init>> x86_msi.teardown_msi_irq = xen_teardown_msi_irq;
++ *   - arch/x86/pci/xen.c|466| <<xen_msi_init>> x86_msi.teardown_msi_irq = xen_teardown_msi_irq;
++ *   - arch/x86/pci/xen.c|505| <<pci_xen_initial_domain>> x86_msi.teardown_msi_irq = xen_teardown_msi_irq;
++ */
+ static void xen_teardown_msi_irq(unsigned int irq)
+ {
+ 	xen_destroy_irq(irq);
+@@ -397,6 +611,17 @@ static void xen_teardown_msi_irq(unsigned int irq)
+ 
+ #endif
+ 
++/*
++ * used by:
++ *   - arch/x86/xen/enlighten.c|1743| <<xen_start_kernel>> x86_init.pci.arch_init = pci_xen_init;
++ *
++ * called by:
++ *   - arch/x86/pci/init.c|19| <<pci_arch_init>> if (x86_init.pci.arch_init && !x86_init.pci.arch_init())
++ *
++ * 如果不是pv或者是dom0返回-ENODEV
++ * 只用在hvm的guest???
++ * 成功了返回0
++ */
+ int __init pci_xen_init(void)
+ {
+ 	if (!xen_pv_domain() || xen_initial_domain())
+@@ -424,6 +649,10 @@ int __init pci_xen_init(void)
+ }
+ 
+ #ifdef CONFIG_PCI_MSI
++/*
++ * used by:
++ *   - arch/x86/pci/xen.c|473| <<pci_xen_hvm_init>> x86_platform.apic_post_init = xen_msi_init;
++ */
+ void __init xen_msi_init(void)
+ {
+ 	if (!disable_apic) {
+@@ -445,6 +674,10 @@ void __init xen_msi_init(void)
+ }
+ #endif
+ 
++/*
++ * called by:
++ *   - drivers/xen/events/events_base.c|1713| <<xen_init_IRQ>> pci_xen_hvm_init();
++ */
+ int __init pci_xen_hvm_init(void)
+ {
+ 	if (!xen_have_vector_callback || !xen_feature(XENFEAT_hvm_pirqs))
+@@ -470,6 +703,19 @@ int __init pci_xen_hvm_init(void)
+ }
+ 
+ #ifdef CONFIG_XEN_DOM0
++/*
++ * [0] pci_xen_initial_domain
++ * [0] xen_init_IRQ
++ * [0] init_IRQ
++ * [0] start_kernel
++ * [0] x86_64_start_reservations
++ * [0] xen_start_kernel
++ *
++ * called by:
++ *   - drivers/xen/events/events_base.c|1698| <<xen_init_IRQ>> pci_xen_initial_domain();
++ *
++ * 只在在init_IRQ()-->xen_init_IRQ()为dom0调用
++ */
+ int __init pci_xen_initial_domain(void)
+ {
+ 	int irq;
+@@ -480,6 +726,10 @@ int __init pci_xen_initial_domain(void)
+ 	x86_msi.restore_msi_irqs = xen_initdom_restore_msi_irqs;
+ 	pci_msi_ignore_mask = 1;
+ #endif
++	/*
++	 * called by:
++	 *   - arch/x86/kernel/acpi/boot.c|711| <<acpi_register_gsi>> return __acpi_register_gsi(dev, gsi, trigger, polarity);
++	 */
+ 	__acpi_register_gsi = acpi_register_gsi_xen;
+ 	__acpi_unregister_gsi = NULL;
+ 	/*
+@@ -496,6 +746,9 @@ int __init pci_xen_initial_domain(void)
+ 			trigger ? ACPI_LEVEL_SENSITIVE : ACPI_EDGE_SENSITIVE,
+ 			true /* Map GSI to PIRQ */);
+ 	}
++	/*
++	 * 在dell测试机上nr_ioapics是1
++	 */
+ 	if (0 == nr_ioapics) {
+ 		for (irq = 0; irq < nr_legacy_irqs(); irq++)
+ 			xen_bind_pirq_gsi_to_irq(irq, irq, 0, "xt-pic");
+@@ -503,6 +756,10 @@ int __init pci_xen_initial_domain(void)
+ 	return 0;
+ }
+ 
++/*
++ * 就是一个domain和struct pci_dev的pair,
++ * 通过list加入到dev_domain_list
++ */
+ struct xen_device_domain_owner {
+ 	domid_t domain;
+ 	struct pci_dev *dev;
+@@ -510,8 +767,19 @@ struct xen_device_domain_owner {
+ };
+ 
+ static DEFINE_SPINLOCK(dev_domain_list_spinlock);
++/*
++ * used by:
++ *   - arch/x86/pci/xen.c|519| <<find_device>> list_for_each_entry(owner, &dev_domain_list, list) {
++ *   - arch/x86/pci/xen.c|556| <<xen_register_device_domain_owner>> list_add_tail(&owner->list, &dev_domain_list);
++ */
+ static struct list_head dev_domain_list = LIST_HEAD_INIT(dev_domain_list);
+ 
++/*
++ * called by:
++ *   - arch/x86/pci/xen.c|532| <<xen_find_device_domain_owner>> owner = find_device(dev);
++ *   - arch/x86/pci/xen.c|549| <<xen_register_device_domain_owner>> if (find_device(dev)) {
++ *   - arch/x86/pci/xen.c|567| <<xen_unregister_device_domain_owner>> owner = find_device(dev);
++ */
+ static struct xen_device_domain_owner *find_device(struct pci_dev *dev)
+ {
+ 	struct xen_device_domain_owner *owner;
+@@ -523,6 +791,12 @@ static struct xen_device_domain_owner *find_device(struct pci_dev *dev)
+ 	return NULL;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/pci/xen.c|275| <<xen_initdom_setup_msi_irqs>> domid = ret = xen_find_device_domain_owner(dev);
++ *   - drivers/xen/xen-pciback/pci_stub.c|624| <<pcistub_remove>> int domid = xen_find_device_domain_owner(dev);
++ *   - drivers/xen/xen-pciback/xenbus.c|254| <<xen_pcibk_export_device>> xen_find_device_domain_owner(dev));
++ */
+ int xen_find_device_domain_owner(struct pci_dev *dev)
+ {
+ 	struct xen_device_domain_owner *owner;
+@@ -537,6 +811,13 @@ int xen_find_device_domain_owner(struct pci_dev *dev)
+ }
+ EXPORT_SYMBOL_GPL(xen_find_device_domain_owner);
+ 
++/*
++ * called by:
++ *   - drivers/xen/xen-pciback/xenbus.c|251| <<xen_pcibk_export_device>> if (xen_register_device_domain_owner(dev,
++ *   - drivers/xen/xen-pciback/xenbus.c|256| <<xen_pcibk_export_device>> xen_register_device_domain_owner(dev, pdev->xdev->otherend_id);
++ *
++ * 一个struct xen_device_domain_owner相当于是一个pci_dev和domain的pair
++ */
+ int xen_register_device_domain_owner(struct pci_dev *dev, uint16_t domain)
+ {
+ 	struct xen_device_domain_owner *owner;
+@@ -559,6 +840,13 @@ int xen_register_device_domain_owner(struct pci_dev *dev, uint16_t domain)
+ }
+ EXPORT_SYMBOL_GPL(xen_register_device_domain_owner);
+ 
++/*
++ * called by:
++ *   - drivers/xen/xen-pciback/pci_stub.c|103| <<pcistub_device_release>> xen_unregister_device_domain_owner(dev);
++ *   - drivers/xen/xen-pciback/pci_stub.c|306| <<pcistub_put_pci_dev>> xen_unregister_device_domain_owner(dev);
++ *   - drivers/xen/xen-pciback/xenbus.c|255| <<xen_pcibk_export_device>> xen_unregister_device_domain_owner(dev);
++ *   - drivers/xen/xen-pciback/xenbus.c|290| <<xen_pcibk_remove_device>> xen_unregister_device_domain_owner(dev);
++ */
+ int xen_unregister_device_domain_owner(struct pci_dev *dev)
+ {
+ 	struct xen_device_domain_owner *owner;
+diff --git a/arch/x86/xen/enlighten.c b/arch/x86/xen/enlighten.c
+index db7cf87..a800ad0 100644
+--- a/arch/x86/xen/enlighten.c
++++ b/arch/x86/xen/enlighten.c
+@@ -1773,6 +1773,14 @@ asmlinkage __visible void __init xen_start_kernel(void)
+ 	}
+ #ifdef CONFIG_PCI
+ 	/* PCI BIOS service won't work from a PV guest. */
++	/*
++	 * 用到PCI_PROBE_BIOS的地方:
++	 *   - arch/x86/pci/common.c|22| <<global>> unsigned int pci_probe = PCI_PROBE_BIOS | PCI_PROBE_CONF1 | PCI_PROBE_CONF2 |
++	 *   - arch/x86/pci/common.c|546| <<pcibios_setup>> pci_probe = PCI_PROBE_BIOS;
++	 *   - arch/x86/pci/common.c|549| <<pcibios_setup>> pci_probe &= ~PCI_PROBE_BIOS;
++	 *   - arch/x86/pci/pcbios.c|421| <<pci_pcbios_init>> if ((pci_probe & PCI_PROBE_BIOS)
++	 *   - arch/x86/xen/enlighten.c|1776| <<xen_start_kernel>> pci_probe &= ~PCI_PROBE_BIOS;
++	 */
+ 	pci_probe &= ~PCI_PROBE_BIOS;
+ #endif
+ 	xen_raw_console_write("about to get started...\n");
 diff --git a/arch/x86/xen/irq.c b/arch/x86/xen/irq.c
 index 33e9295..16a041f 100644
 --- a/arch/x86/xen/irq.c
@@ -156,6 +670,21 @@ index 90d1b83..290eb7f 100644
  void xen_unplug_emulated_devices(void)
  {
  	int r;
+diff --git a/arch/x86/xen/smp.c b/arch/x86/xen/smp.c
+index 8eca26e..f427061 100644
+--- a/arch/x86/xen/smp.c
++++ b/arch/x86/xen/smp.c
+@@ -765,6 +765,10 @@ static const struct smp_ops xen_smp_ops __initconst = {
+ 	.send_call_func_single_ipi = xen_smp_send_call_function_single_ipi,
+ };
+ 
++/*
++ * called only by:
++ *   - arch/x86/xen/enlighten.c|1667| <<xen_start_kernel>> xen_smp_init();
++ */
+ void __init xen_smp_init(void)
+ {
+ 	smp_ops = xen_smp_ops;
 diff --git a/arch/x86/xen/xen-asm_64.S b/arch/x86/xen/xen-asm_64.S
 index c3df431..769269c 100644
 --- a/arch/x86/xen/xen-asm_64.S
@@ -529,6 +1058,987 @@ index c08ee8c..a462c8c 100644
  static void blkif_release(struct gendisk *disk, fmode_t mode)
  {
  	struct blkfront_info *info = disk->private_data;
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 1ac4cec..688e558 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -1582,6 +1582,9 @@ static int nvme_dev_add(struct nvme_dev *dev)
+ 	return 0;
+ }
+ 
++/*
++ * 有一个result = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_ALL_TYPES);
++ */
+ static int nvme_pci_enable(struct nvme_dev *dev)
+ {
+ 	u64 cap;
+diff --git a/drivers/xen/events/events_base.c b/drivers/xen/events/events_base.c
+index 4b0cc9d..89b3e8f 100644
+--- a/drivers/xen/events/events_base.c
++++ b/drivers/xen/events/events_base.c
+@@ -70,18 +70,70 @@ const struct evtchn_ops *evtchn_ops;
+  */
+ static DEFINE_MUTEX(irq_mapping_update_lock);
+ 
++/*
++ * 在以下使用xen_irq_list_head:
++ *   - drivers/xen/events/events_base.c|406| <<xen_irq_init>> list_add_tail(&info->list, &xen_irq_list_head);
++ *   - drivers/xen/events/events_base.c|615| <<xen_irq_from_gsi>> list_for_each_entry(info, &xen_irq_list_head, list) {
++ *   - drivers/xen/events/events_base.c|854| <<xen_irq_from_pirq>> list_for_each_entry(info, &xen_irq_list_head, list) {
++ *   - drivers/xen/events/events_base.c|1452| <<restore_pirqs>> list_for_each_entry(info, &xen_irq_list_head, list) {
++ *   - drivers/xen/events/events_base.c|1613| <<xen_irq_resume>> list_for_each_entry(info, &xen_irq_list_head, list)
++ */
+ static LIST_HEAD(xen_irq_list_head);
+ 
+ /* IRQ <-> VIRQ mapping. */
++/*
++ * used by:
++ *   - drivers/xen/events/events_base.c|242| <<xen_irq_info_virq_setup>> per_cpu(virq_to_irq, cpu)[virq] = irq;
++ *   - drivers/xen/events/events_base.c|289| <<irq_from_virq>> return per_cpu(virq_to_irq, cpu)[virq];
++ *   - drivers/xen/events/events_base.c|708| <<__unbind_from_irq>> per_cpu(virq_to_irq, cpu)[virq_from_irq(irq)] = -1;
++ *   - drivers/xen/events/events_base.c|1085| <<bind_virq_to_irq>> irq = per_cpu(virq_to_irq, cpu)[virq];
++ *   - drivers/xen/events/events_base.c|1561| <<restore_cpu_virqs>> if ((irq = per_cpu(virq_to_irq, cpu)[virq]) == -1)
++ */
+ static DEFINE_PER_CPU(int [NR_VIRQS], virq_to_irq) = {[0 ... NR_VIRQS-1] = -1};
+ 
+ /* IRQ <-> IPI mapping */
++/*
++ * used by:
++ *   - drivers/xen/events/events_base.c|228| <<xen_irq_info_ipi_setup>> per_cpu(ipi_to_irq, cpu)[ipi] = irq;
++ *   - drivers/xen/events/events_base.c|711| <<__unbind_from_irq>> per_cpu(ipi_to_irq, cpu)[ipi_from_irq(irq)] = -1;
++ *   - drivers/xen/events/events_base.c|994| <<bind_ipi_to_irq>> irq = per_cpu(ipi_to_irq, cpu)[ipi];
++ *   - drivers/xen/events/events_base.c|1327| <<xen_send_IPI_one>> irq = per_cpu(ipi_to_irq, cpu)[vector];
++ *   - drivers/xen/events/events_base.c|1586| <<restore_cpu_ipis>> if ((irq = per_cpu(ipi_to_irq, cpu)[ipi]) == -1)
++ */
+ static DEFINE_PER_CPU(int [XEN_NR_IPIS], ipi_to_irq) = {[0 ... XEN_NR_IPIS-1] = -1};
+ 
++/*
++ * used by:
++ *   - drivers/xen/events/events_base.c|95| <<EVTCHN_ROW>> #define EVTCHN_ROW(e) (e / (PAGE_SIZE/sizeof(**evtchn_to_irq)))
++ *   - drivers/xen/events/events_base.c|96| <<EVTCHN_COL>> #define EVTCHN_COL(e) (e % (PAGE_SIZE/sizeof(**evtchn_to_irq)))
++ *   - drivers/xen/events/events_base.c|97| <<EVTCHN_PER_ROW>> #define EVTCHN_PER_ROW (PAGE_SIZE / sizeof(**evtchn_to_irq))
++ *   - drivers/xen/events/events_base.c|113| <<clear_evtchn_to_irq_row>> evtchn_to_irq[row][col] = -1;
++ *   - drivers/xen/events/events_base.c|121| <<clear_evtchn_to_irq_all>> if (evtchn_to_irq[row] == NULL)
++ *   - drivers/xen/events/events_base.c|142| <<set_evtchn_to_irq>> if (evtchn_to_irq[row] == NULL) {
++ *   - drivers/xen/events/events_base.c|147| <<set_evtchn_to_irq>> evtchn_to_irq[row] = (int *)get_zeroed_page(GFP_KERNEL);
++ *   - drivers/xen/events/events_base.c|148| <<set_evtchn_to_irq>> if (evtchn_to_irq[row] == NULL)
++ *   - drivers/xen/events/events_base.c|154| <<set_evtchn_to_irq>> evtchn_to_irq[row][col] = irq;
++ *   - drivers/xen/events/events_base.c|162| <<get_evtchn_to_irq>> if (evtchn_to_irq[EVTCHN_ROW(evtchn)] == NULL)
++ *   - drivers/xen/events/events_base.c|164| <<get_evtchn_to_irq>> return evtchn_to_irq[EVTCHN_ROW(evtchn)][EVTCHN_COL(evtchn)];
++ */
+ int **evtchn_to_irq;
+ #ifdef CONFIG_X86
++/*
++ * used by:
++ *   - drivers/xen/events/events_base.c|376| <<pirq_check_eoi_map>> return test_bit(pirq_from_irq(irq), pirq_eoi_map);
++ *   - drivers/xen/events/events_base.c|1858| <<xen_init_IRQ>> pirq_eoi_map = (void *)__get_free_page(GFP_KERNEL|__GFP_ZERO);
++ *   - drivers/xen/events/events_base.c|1859| <<xen_init_IRQ>> eoi_gmfn.gmfn = virt_to_gfn(pirq_eoi_map);
++ *   - drivers/xen/events/events_base.c|1863| <<xen_init_IRQ>> free_page((unsigned long ) pirq_eoi_map);
++ *   - drivers/xen/events/events_base.c|1864| <<xen_init_IRQ>> pirq_eoi_map = NULL;
++ */
+ static unsigned long *pirq_eoi_map;
+ #endif
++/*
++ * used by:
++ *   - drivers/xen/events/events_base.c|608| <<eoi_pirq>> if (pirq_needs_eoi(data->irq)) {
++ *   - drivers/xen/events/events_base.c|1838| <<xen_init_IRQ>> pirq_needs_eoi = pirq_needs_eoi_flag;
++ *   - drivers/xen/events/events_base.c|1866| <<xen_init_IRQ>> pirq_needs_eoi = pirq_check_eoi_map;
++ */
+ static bool (*pirq_needs_eoi)(unsigned irq);
+ 
+ #define EVTCHN_ROW(e)  (e / (PAGE_SIZE/sizeof(**evtchn_to_irq)))
+@@ -116,6 +168,10 @@ static void clear_evtchn_to_irq_all(void)
+ 	}
+ }
+ 
++/*
++ * 核心思想是: evtchn_to_irq[row][col] = irq;
++ * row和col通过evtchn计算
++ */
+ static int set_evtchn_to_irq(unsigned evtchn, unsigned irq)
+ {
+ 	unsigned row;
+@@ -132,6 +188,7 @@ static int set_evtchn_to_irq(unsigned evtchn, unsigned irq)
+ 		if (irq == -1)
+ 			return 0;
+ 
++		/* 如果某一个row还没分配, 现场分配内存 -- on demand */
+ 		evtchn_to_irq[row] = (int *)get_zeroed_page(GFP_KERNEL);
+ 		if (evtchn_to_irq[row] == NULL)
+ 			return -ENOMEM;
+@@ -149,6 +206,20 @@ int get_evtchn_to_irq(unsigned evtchn)
+ 		return -1;
+ 	if (evtchn_to_irq[EVTCHN_ROW(evtchn)] == NULL)
+ 		return -1;
++	/*
++	 * used by:
++	 *   - drivers/xen/events/events_base.c|95| <<EVTCHN_ROW>> #define EVTCHN_ROW(e) (e / (PAGE_SIZE/sizeof(**evtchn_to_irq)))
++	 *   - drivers/xen/events/events_base.c|96| <<EVTCHN_COL>> #define EVTCHN_COL(e) (e % (PAGE_SIZE/sizeof(**evtchn_to_irq)))
++	 *   - drivers/xen/events/events_base.c|97| <<EVTCHN_PER_ROW>> #define EVTCHN_PER_ROW (PAGE_SIZE / sizeof(**evtchn_to_irq))
++	 *   - drivers/xen/events/events_base.c|113| <<clear_evtchn_to_irq_row>> evtchn_to_irq[row][col] = -1;
++	 *   - drivers/xen/events/events_base.c|121| <<clear_evtchn_to_irq_all>> if (evtchn_to_irq[row] == NULL)
++	 *   - drivers/xen/events/events_base.c|142| <<set_evtchn_to_irq>> if (evtchn_to_irq[row] == NULL) {
++	 *   - drivers/xen/events/events_base.c|147| <<set_evtchn_to_irq>> evtchn_to_irq[row] = (int *)get_zeroed_page(GFP_KERNEL);
++	 *   - drivers/xen/events/events_base.c|148| <<set_evtchn_to_irq>> if (evtchn_to_irq[row] == NULL)
++	 *   - drivers/xen/events/events_base.c|154| <<set_evtchn_to_irq>> evtchn_to_irq[row][col] = irq;
++	 *   - drivers/xen/events/events_base.c|162| <<get_evtchn_to_irq>> if (evtchn_to_irq[EVTCHN_ROW(evtchn)] == NULL)
++	 *   - drivers/xen/events/events_base.c|164| <<get_evtchn_to_irq>> return evtchn_to_irq[EVTCHN_ROW(evtchn)][EVTCHN_COL(evtchn)];
++	 */
+ 	return evtchn_to_irq[EVTCHN_ROW(evtchn)][EVTCHN_COL(evtchn)];
+ }
+ 
+@@ -159,6 +230,18 @@ struct irq_info *info_for_irq(unsigned irq)
+ }
+ 
+ /* Constructors for packed IRQ information. */
++/*
++ * called by:
++ *   - drivers/xen/events/events_base.c|262| <<xen_irq_info_evtchn_setup>> return xen_irq_info_common_setup(info, irq, IRQT_EVTCHN, evtchn, 0);
++ *   - drivers/xen/events/events_base.c|276| <<xen_irq_info_ipi_setup>> return xen_irq_info_common_setup(info, irq, IRQT_IPI, evtchn, 0);
++ *   - drivers/xen/events/events_base.c|290| <<xen_irq_info_virq_setup>> return xen_irq_info_common_setup(info, irq, IRQT_VIRQ, evtchn, 0);
++ *   - drivers/xen/events/events_base.c|307| <<xen_irq_info_pirq_setup>> return xen_irq_info_common_setup(info, irq, IRQT_PIRQ, evtchn, 0);
++ *
++ * 核心思想:
++ * 填充struct irq_info (第一个参数)
++ * evtchn_to_irq[row][col] = irq; row和col通过evtchn计算
++ * 调用evtchn_ops->setup(info), 只有fifo支持
++ */
+ static int xen_irq_info_common_setup(struct irq_info *info,
+ 				     unsigned irq,
+ 				     enum xen_irq_type type,
+@@ -174,20 +257,40 @@ static int xen_irq_info_common_setup(struct irq_info *info,
+ 	info->evtchn = evtchn;
+ 	info->cpu = cpu;
+ 
++	/*
++	 * 核心思想是: evtchn_to_irq[row][col] = irq;
++	 * row和col通过evtchn计算
++	 */
+ 	ret = set_evtchn_to_irq(evtchn, irq);
+ 	if (ret < 0)
+ 		return ret;
+ 
++	/* linux的函数, 不是xen的 */
+ 	irq_clear_status_flags(irq, IRQ_NOREQUEST|IRQ_NOAUTOEN);
+ 
++	/*
++	 * 调用evtchn_ops->setup(info), 只有fifo支持
++	 */
+ 	return xen_evtchn_port_setup(info);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/xen/events/events_base.c|1012| <<bind_evtchn_to_irq>> ret = xen_irq_info_evtchn_setup(irq, evtchn);
++ *   - drivers/xen/events/events_base.c|1447| <<rebind_evtchn_irq>> (void )xen_irq_info_evtchn_setup(irq, evtchn);
++ */
+ static int xen_irq_info_evtchn_setup(unsigned irq,
+ 				     unsigned evtchn)
+ {
++	/* Get info for IRQ */
+ 	struct irq_info *info = info_for_irq(irq);
+ 
++	/*
++	 * 核心思想:
++	 * 填充struct irq_info (第一个参数)
++	 * evtchn_to_irq[row][col] = irq; row和col通过evtchn计算
++	 * 调用evtchn_ops->setup(info), 只有fifo支持
++	 */
+ 	return xen_irq_info_common_setup(info, irq, IRQT_EVTCHN, evtchn, 0);
+ }
+ 
+@@ -202,9 +305,20 @@ static int xen_irq_info_ipi_setup(unsigned cpu,
+ 
+ 	per_cpu(ipi_to_irq, cpu)[ipi] = irq;
+ 
++	/*
++	 * 核心思想:
++	 * 填充struct irq_info (第一个参数)
++	 * evtchn_to_irq[row][col] = irq; row和col通过evtchn计算
++	 * 调用evtchn_ops->setup(info), 只有fifo支持
++	 */
+ 	return xen_irq_info_common_setup(info, irq, IRQT_IPI, evtchn, 0);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/xen/events/events_base.c|1194| <<bind_virq_to_irq>> ret = xen_irq_info_virq_setup(cpu, irq, evtchn, virq);
++ *   - drivers/xen/events/events_base.c|1657| <<restore_cpu_virqs>> (void )xen_irq_info_virq_setup(cpu, irq, evtchn, virq);
++ */
+ static int xen_irq_info_virq_setup(unsigned cpu,
+ 				   unsigned irq,
+ 				   unsigned evtchn,
+@@ -216,9 +330,26 @@ static int xen_irq_info_virq_setup(unsigned cpu,
+ 
+ 	per_cpu(virq_to_irq, cpu)[virq] = irq;
+ 
++	/*
++	 * 核心思想:
++	 * 填充struct irq_info (第一个参数)
++	 * evtchn_to_irq[row][col] = irq; row和col通过evtchn计算
++	 * 调用evtchn_ops->setup(info), 只有fifo支持
++	 */
+ 	return xen_irq_info_common_setup(info, irq, IRQT_VIRQ, evtchn, 0);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/xen/events/events_base.c|854| <<xen_bind_pirq_gsi_to_irq>> ret = xen_irq_info_pirq_setup(irq, 0, pirq, gsi, DOMID_SELF,
++ *   - drivers/xen/events/events_base.c|934| <<xen_bind_pirq_msi_to_irq>> ret = xen_irq_info_pirq_setup(irq + i, 0, pirq + i, 0, domid,
++ *
++ * 核心思想:
++ * 根据irq找到对应的struct irq_info
++ * 设置nfo->u.pirq, 填充struct irq_info
++ * evtchn_to_irq[row][col] = irq; row和col通过evtchn计算
++ * 调用evtchn_ops->setup(info), 只有fifo支持
++ */
+ static int xen_irq_info_pirq_setup(unsigned irq,
+ 				   unsigned evtchn,
+ 				   unsigned pirq,
+@@ -226,6 +357,7 @@ static int xen_irq_info_pirq_setup(unsigned irq,
+ 				   uint16_t domid,
+ 				   unsigned char flags)
+ {
++	/* Get info for IRQ */
+ 	struct irq_info *info = info_for_irq(irq);
+ 
+ 	info->u.pirq.pirq = pirq;
+@@ -233,6 +365,12 @@ static int xen_irq_info_pirq_setup(unsigned irq,
+ 	info->u.pirq.domid = domid;
+ 	info->u.pirq.flags = flags;
+ 
++	/*
++	 * 核心思想:
++	 * 填充struct irq_info (第一个参数)
++	 * evtchn_to_irq[row][col] = irq; row和col通过evtchn计算
++	 * 调用evtchn_ops->setup(info), 只有fifo支持
++	 */
+ 	return xen_irq_info_common_setup(info, irq, IRQT_PIRQ, evtchn, 0);
+ }
+ 
+@@ -294,6 +432,15 @@ static unsigned pirq_from_irq(unsigned irq)
+ 	return info->u.pirq.pirq;
+ }
+ 
++/*
++ * enum xen_irq_type {
++ *     IRQT_UNBOUND = 0,
++ *     IRQT_PIRQ,
++ *     IRQT_VIRQ,
++ *     IRQT_IPI,
++ *     IRQT_EVTCHN
++ * };
++ */
+ static enum xen_irq_type type_from_irq(unsigned irq)
+ {
+ 	return info_for_irq(irq)->type;
+@@ -316,12 +463,26 @@ unsigned int cpu_from_evtchn(unsigned int evtchn)
+ }
+ 
+ #ifdef CONFIG_X86
++/*
++ * used by:
++ *   - drivers/xen/events/events_base.c|1918| <<xen_init_IRQ>> pirq_needs_eoi = pirq_check_eoi_map;
++ *
++ * called by:
++ *   - drivers/xen/events/events_base.c|660| <<eoi_pirq>> if (pirq_needs_eoi(data->irq)) {
++ */
+ static bool pirq_check_eoi_map(unsigned irq)
+ {
+ 	return test_bit(pirq_from_irq(irq), pirq_eoi_map);
+ }
+ #endif
+ 
++/*
++ * used by:
++ *   - drivers/xen/events/events_base.c|1916| <<xen_init_IRQ>> pirq_needs_eoi = pirq_needs_eoi_flag;
++ *
++ * called by:
++ *   - drivers/xen/events/events_base.c|686| <<eoi_pirq>> if (pirq_needs_eoi(data->irq)) {
++ */
+ static bool pirq_needs_eoi_flag(unsigned irq)
+ {
+ 	struct irq_info *info = info_for_irq(irq);
+@@ -339,6 +500,7 @@ static void bind_evtchn_to_cpu(unsigned int chn, unsigned int cpu)
+ #ifdef CONFIG_SMP
+ 	cpumask_copy(irq_get_affinity_mask(irq), cpumask_of(cpu));
+ #endif
++	/* 调用evtchn_ops->bind_to_cpu(info, cpu) */
+ 	xen_evtchn_port_bind_to_cpu(info, cpu);
+ 
+ 	info->cpu = cpu;
+@@ -348,6 +510,7 @@ static void xen_evtchn_mask_all(void)
+ {
+ 	unsigned int evtchn;
+ 
++	/* 调用evtchn_ops->mask(port) */
+ 	for (evtchn = 0; evtchn < xen_evtchn_nr_channels(); evtchn++)
+ 		mask_evtchn(evtchn);
+ }
+@@ -369,11 +532,22 @@ void notify_remote_via_irq(int irq)
+ }
+ EXPORT_SYMBOL_GPL(notify_remote_via_irq);
+ 
++/*
++ * called by:
++ *   - drivers/xen/events/events_base.c|442| <<xen_allocate_irqs_dynamic>> xen_irq_init(irq + i);
++ *   - drivers/xen/events/events_base.c|480| <<xen_allocate_irq_gsi>> xen_irq_init(irq);
++ *
++ * 分配一个struct irq_info *info
++ * 把info(struct irq_info)设置为irq对应的desc->irq_common_data.handler_data
++ * 最后把info插入xen_irq_list_head
++ */
+ static void xen_irq_init(unsigned irq)
+ {
++	/* 是xen特有的一个结构 */
+ 	struct irq_info *info;
+ #ifdef CONFIG_SMP
+ 	/* By default all event channels notify CPU#0. */
++	/* 默认在cpu 0 */
+ 	cpumask_copy(irq_get_affinity_mask(irq), cpumask_of(0));
+ #endif
+ 
+@@ -384,16 +558,44 @@ static void xen_irq_init(unsigned irq)
+ 	info->type = IRQT_UNBOUND;
+ 	info->refcnt = -1;
+ 
++	/* 把info(struct irq_info)设置为irq对应的desc->irq_common_data.handler_data */
+ 	irq_set_handler_data(irq, info);
+ 
++	/*
++	 * 在以下使用xen_irq_list_head:
++	 *   - drivers/xen/events/events_base.c|406| <<xen_irq_init>> list_add_tail(&info->list, &xen_irq_list_head);
++	 *   - drivers/xen/events/events_base.c|615| <<xen_irq_from_gsi>> list_for_each_entry(info, &xen_irq_list_head, list) {
++	 *   - drivers/xen/events/events_base.c|854| <<xen_irq_from_pirq>> list_for_each_entry(info, &xen_irq_list_head, list) {
++	 *   - drivers/xen/events/events_base.c|1452| <<restore_pirqs>> list_for_each_entry(info, &xen_irq_list_head, list) {
++	 *   - drivers/xen/events/events_base.c|1613| <<xen_irq_resume>> list_for_each_entry(info, &xen_irq_list_head, list)
++	 */
+ 	list_add_tail(&info->list, &xen_irq_list_head);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/xen/events/events_base.c|440| <<xen_allocate_irq_dynamic>> return xen_allocate_irqs_dynamic(1);
++ *   - drivers/xen/events/events_base.c|798| <<xen_bind_pirq_msi_to_irq>> irq = xen_allocate_irqs_dynamic(nvec);
++ *
++ * 分配nvec个irq, 也就是nvec个desc, 对于每一个分配的irq
++ * 分配一个struct irq_info *info
++ * 把info(struct irq_info)设置为irq对应的desc->irq_common_data.handler_data
++ * 最后把info插入xen_irq_list_head
++ */
+ static int __must_check xen_allocate_irqs_dynamic(int nvec)
+ {
++	/*
++	 * allocate and initialize a range of irq descriptors
++	 * return the first irq number or error code
++	 */
+ 	int i, irq = irq_alloc_descs(-1, 0, nvec, -1);
+ 
+ 	if (irq >= 0) {
++		/*
++		 * 分配一个struct irq_info *info
++		 * 把info(struct irq_info)设置为irq对应的desc->irq_common_data.handler_data
++		 * 最后把info插入xen_irq_list_head
++		 */
+ 		for (i = 0; i < nvec; i++)
+ 			xen_irq_init(irq + i);
+ 	}
+@@ -401,12 +603,33 @@ static int __must_check xen_allocate_irqs_dynamic(int nvec)
+ 	return irq;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/xen/events/events_base.c|454| <<xen_allocate_irq_gsi>> return xen_allocate_irq_dynamic();
++ *   - drivers/xen/events/events_base.c|917| <<bind_evtchn_to_irq>> irq = xen_allocate_irq_dynamic();
++ *   - drivers/xen/events/events_base.c|955| <<bind_ipi_to_irq>> irq = xen_allocate_irq_dynamic();
++ *   - drivers/xen/events/events_base.c|1046| <<bind_virq_to_irq>> irq = xen_allocate_irq_dynamic();
++ *
++ * 分配1个irq, 也就是1个desc, 对于分配的irq
++ * 分配一个struct irq_info *info
++ * 把info(struct irq_info)设置为irq对应的desc->irq_common_data.handler_data
++ * 最后把info插入xen_irq_list_head
++ */
+ static inline int __must_check xen_allocate_irq_dynamic(void)
+ {
+ 
+ 	return xen_allocate_irqs_dynamic(1);
+ }
+ 
++/*
++ * called by only:
++ *   - drivers/xen/events/events_base.c|741| <<xen_bind_pirq_gsi_to_irq>> irq = xen_allocate_irq_gsi(gsi);
++ *
++ * 对于dom0, 核心思想是:
++ * 分配一个struct irq_info *info
++ * 把info(struct irq_info)设置为irq对应的desc->irq_common_data.handler_data
++ * 最后把info插入xen_irq_list_head
++ */
+ static int __must_check xen_allocate_irq_gsi(unsigned gsi)
+ {
+ 	int irq;
+@@ -417,6 +640,12 @@ static int __must_check xen_allocate_irq_gsi(unsigned gsi)
+ 	 * all IRQs are dynamically allocated from the entire IRQ
+ 	 * space.
+ 	 */
++	/*
++	 * 分配1个irq, 也就是1个desc, 对于分配的irq
++	 * 分配一个struct irq_info *info
++	 * 把info(struct irq_info)设置为irq对应的desc->irq_common_data.handler_data
++	 * 最后把info插入xen_irq_list_head
++	 */
+ 	if (xen_pv_domain() && !xen_initial_domain())
+ 		return xen_allocate_irq_dynamic();
+ 
+@@ -426,11 +655,23 @@ static int __must_check xen_allocate_irq_gsi(unsigned gsi)
+ 	else
+ 		irq = irq_alloc_desc_at(gsi, -1);
+ 
++	/*
++	 * 分配一个struct irq_info *info
++	 * 把info(struct irq_info)设置为irq对应的desc->irq_common_data.handler_data
++	 * 最后把info插入xen_irq_list_head
++	 */
+ 	xen_irq_init(irq);
+ 
+ 	return irq;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/xen/events/events_base.c|828| <<__unbind_from_irq>> xen_free_irq(irq);
++ *   - drivers/xen/events/events_base.c|875| <<xen_bind_pirq_gsi_to_irq>> xen_free_irq(irq);
++ *   - drivers/xen/events/events_base.c|1010| <<xen_destroy_irq>> xen_free_irq(irq);
++ *   - drivers/xen/events/events_base.c|1653| <<restore_pirqs>> xen_free_irq(irq);
++ */
+ static void xen_free_irq(unsigned irq)
+ {
+ 	struct irq_info *info = irq_get_handler_data(irq);
+@@ -462,6 +703,11 @@ static void xen_evtchn_close(unsigned int port)
+ 		BUG();
+ }
+ 
++/*
++ * called by:
++ *   - drivers/xen/events/events_base.c|747| <<__startup_pirq>> pirq_query_unmask(irq);
++ *   - drivers/xen/events/events_base.c|914| <<xen_bind_pirq_gsi_to_irq>> pirq_query_unmask(irq);
++ */
+ static void pirq_query_unmask(int irq)
+ {
+ 	struct physdev_irq_status_query irq_status;
+@@ -512,6 +758,11 @@ static void mask_ack_pirq(struct irq_data *data)
+ 	eoi_pirq(data);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/xen/events/events_base.c|774| <<startup_pirq>> return __startup_pirq(data->irq);
++ *   - drivers/xen/events/events_base.c|1685| <<restore_pirqs>> __startup_pirq(irq);
++ */
+ static unsigned int __startup_pirq(unsigned int irq)
+ {
+ 	struct evtchn_bind_pirq bind_pirq;
+@@ -544,6 +795,7 @@ static unsigned int __startup_pirq(unsigned int irq)
+ 	info->evtchn = evtchn;
+ 	bind_evtchn_to_cpu(evtchn, 0);
+ 
++	/* 调用evtchn_ops->setup(info), 只有fifo支持 */
+ 	rc = xen_evtchn_port_setup(info);
+ 	if (rc)
+ 		goto err;
+@@ -591,6 +843,14 @@ static void disable_pirq(struct irq_data *data)
+ 	disable_dynirq(data);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/pci/xen.c|133| <<xen_register_pirq>> irq = xen_irq_from_gsi(gsi);
++ *   - drivers/xen/events/events_base.c|685| <<xen_bind_pirq_gsi_to_irq>> irq = xen_irq_from_gsi(gsi);
++ *
++ * 遍历xen_irq_list_head上的所有struct irq_info,
++ * 返回info->irq (谁的info->u.pirq.gsi是参数的gsi)
++ */
+ int xen_irq_from_gsi(unsigned gsi)
+ {
+ 	struct irq_info *info;
+@@ -650,6 +910,12 @@ static void __unbind_from_irq(unsigned int irq)
+  * Shareable implies level triggered, not shareable implies edge
+  * triggered here.
+  */
++/*
++ * called by:
++ *   - arch/x86/pci/xen.c|49| <<xen_pcifront_enable_irq>> rc = xen_bind_pirq_gsi_to_irq(gsi, pirq, share, "pcifront");
++ *   - arch/x86/pci/xen.c|99| <<xen_register_pirq>> irq = xen_bind_pirq_gsi_to_irq(gsi, map_irq.pirq, shareable, name);
++ *   - arch/x86/pci/xen.c|501| <<pci_xen_initial_domain>> xen_bind_pirq_gsi_to_irq(irq, irq, 0, "xt-pic");
++ */
+ int xen_bind_pirq_gsi_to_irq(unsigned gsi,
+ 			     unsigned pirq, int shareable, char *name)
+ {
+@@ -659,13 +925,24 @@ int xen_bind_pirq_gsi_to_irq(unsigned gsi,
+ 
+ 	mutex_lock(&irq_mapping_update_lock);
+ 
++	/*
++	 * 遍历xen_irq_list_head上的所有struct irq_info,
++	 * 返回info->irq (谁的info->u.pirq.gsi是参数的gsi)
++	 */
+ 	irq = xen_irq_from_gsi(gsi);
++	/* 如果找到了 */
+ 	if (irq != -1) {
+ 		pr_info("%s: returning irq %d for gsi %u\n",
+ 			__func__, irq, gsi);
+ 		goto out;
+ 	}
+ 
++	/*
++	 * 对于dom0, 核心思想是:
++	 * 分配一个struct irq_info *info
++	 * 把info(struct irq_info)设置为irq对应的desc->irq_common_data.handler_data
++	 * 最后把info插入xen_irq_list_head
++	 */
+ 	irq = xen_allocate_irq_gsi(gsi);
+ 	if (irq < 0)
+ 		goto out;
+@@ -683,6 +960,13 @@ int xen_bind_pirq_gsi_to_irq(unsigned gsi,
+ 		goto out;
+ 	}
+ 
++	/*
++	 * 核心思想:
++	 * 根据irq找到对应的struct irq_info
++	 * 设置nfo->u.pirq, 填充struct irq_info
++	 * evtchn_to_irq[row][col] = irq; row和col通过evtchn计算
++	 * 调用evtchn_ops->setup(info), 只有fifo支持
++	 */
+ 	ret = xen_irq_info_pirq_setup(irq, 0, pirq, gsi, DOMID_SELF,
+ 			       shareable ? PIRQ_SHAREABLE : 0);
+ 	if (ret < 0) {
+@@ -721,6 +1005,12 @@ int xen_bind_pirq_gsi_to_irq(unsigned gsi,
+ }
+ 
+ #ifdef CONFIG_PCI_MSI
++/*
++ * Allocate a pirq for a MSI style physical interrupt
++ *
++ * called by:
++ *   - arch/x86/pci/xen.c|327| <<xen_hvm_setup_msi_irqs>> pirq = xen_allocate_pirq_msi(dev, msidesc);
++ */
+ int xen_allocate_pirq_msi(struct pci_dev *dev, struct msi_desc *msidesc)
+ {
+ 	int rc;
+@@ -735,6 +1025,14 @@ int xen_allocate_pirq_msi(struct pci_dev *dev, struct msi_desc *msidesc)
+ 	return rc ? -1 : op_get_free_pirq.pirq;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/pci/xen.c|212| <<xen_setup_msi_irqs>> irq = xen_bind_pirq_msi_to_irq(dev, msidesc, v[i],
++ *   - arch/x86/pci/xen.c|282| <<xen_hvm_setup_msi_irqs>> irq = xen_bind_pirq_msi_to_irq(dev, msidesc, pirq,
++ *   - arch/x86/pci/xen.c|434| <<xen_initdom_setup_msi_irqs>> ret = xen_bind_pirq_msi_to_irq(dev, msidesc, map_irq.pirq,
++ *
++ * Bind an PSI pirq to an irq
++ */
+ int xen_bind_pirq_msi_to_irq(struct pci_dev *dev, struct msi_desc *msidesc,
+ 			     int pirq, int nvec, const char *name, domid_t domid)
+ {
+@@ -742,6 +1040,7 @@ int xen_bind_pirq_msi_to_irq(struct pci_dev *dev, struct msi_desc *msidesc,
+ 
+ 	mutex_lock(&irq_mapping_update_lock);
+ 
++	/* 分配一个irq??? */
+ 	irq = xen_allocate_irqs_dynamic(nvec);
+ 	if (irq < 0)
+ 		goto out;
+@@ -749,6 +1048,11 @@ int xen_bind_pirq_msi_to_irq(struct pci_dev *dev, struct msi_desc *msidesc,
+ 	for (i = 0; i < nvec; i++) {
+ 		irq_set_chip_and_handler_name(irq + i, &xen_pirq_chip, handle_edge_irq, name);
+ 
++		/*
++		 * 核心思想: 填充struct irq_info (第一个参数), 先为irq设置struct irq_info
++		 * evtchn_to_irq[row][col] = irq; row和col通过evtchn计算
++		 * 调用evtchn_ops->setup(info), 只有fifo支持
++		 */
+ 		ret = xen_irq_info_pirq_setup(irq + i, 0, pirq + i, 0, domid,
+ 					      i == 0 ? 0 : PIRQ_MSI_GROUP);
+ 		if (ret < 0)
+@@ -814,6 +1118,14 @@ int xen_irq_from_pirq(unsigned pirq)
+ 
+ 	mutex_lock(&irq_mapping_update_lock);
+ 
++	/*
++	 * 在以下使用xen_irq_list_head:
++	 *   - drivers/xen/events/events_base.c|406| <<xen_irq_init>> list_add_tail(&info->list, &xen_irq_list_head);
++	 *   - drivers/xen/events/events_base.c|615| <<xen_irq_from_gsi>> list_for_each_entry(info, &xen_irq_list_head, list) {
++	 *   - drivers/xen/events/events_base.c|854| <<xen_irq_from_pirq>> list_for_each_entry(info, &xen_irq_list_head, list) {
++	 *   - drivers/xen/events/events_base.c|1452| <<restore_pirqs>> list_for_each_entry(info, &xen_irq_list_head, list) {
++	 *   - drivers/xen/events/events_base.c|1613| <<xen_irq_resume>> list_for_each_entry(info, &xen_irq_list_head, list)
++	 */
+ 	list_for_each_entry(info, &xen_irq_list_head, list) {
+ 		if (info->type != IRQT_PIRQ)
+ 			continue;
+@@ -835,6 +1147,14 @@ int xen_pirq_from_irq(unsigned irq)
+ }
+ EXPORT_SYMBOL_GPL(xen_pirq_from_irq);
+ 
++/*
++ * called by:
++ *   - drivers/scsi/xen-scsifront.c|757| <<scsifront_alloc_ring>> err = bind_evtchn_to_irq(info->evtchn);
++ *   - drivers/tty/hvc/hvc_xen.c|391| <<xencons_connect_backend>> irq = bind_evtchn_to_irq(evtchn);
++ *   - drivers/tty/hvc/hvc_xen.c|555| <<xen_hvc_init>> info->irq = bind_evtchn_to_irq(info->evtchn);
++ *   - drivers/xen/events/events_base.c|1184| <<bind_interdomain_evtchn_to_irq>> return err ? : bind_evtchn_to_irq(bind_interdomain.local_port);
++ *   - drivers/xen/events/events_base.c|1290| <<bind_evtchn_to_irqhandler>> irq = bind_evtchn_to_irq(evtchn);
++ */
+ int bind_evtchn_to_irq(unsigned int evtchn)
+ {
+ 	int irq;
+@@ -848,6 +1168,12 @@ int bind_evtchn_to_irq(unsigned int evtchn)
+ 	irq = get_evtchn_to_irq(evtchn);
+ 
+ 	if (irq == -1) {
++		/*
++		 * 分配1个irq, 也就是1个desc, 对于分配的irq
++		 * 分配一个struct irq_info *info
++		 * 把info(struct irq_info)设置为irq对应的desc->irq_common_data.handler_data
++		 * 最后把info插入xen_irq_list_head
++		 */
+ 		irq = xen_allocate_irq_dynamic();
+ 		if (irq < 0)
+ 			goto out;
+@@ -1161,6 +1487,11 @@ int evtchn_make_refcounted(unsigned int evtchn)
+ }
+ EXPORT_SYMBOL_GPL(evtchn_make_refcounted);
+ 
++/*
++ * called by:
++ *   - drivers/xen/gntalloc.c|418| <<gntalloc_ioctl_unmap_notify>> if (evtchn_get(op.event_channel_port)) {
++ *   - drivers/xen/gntdev.c|705| <<gntdev_ioctl_notify>> if (evtchn_get(op.event_channel_port))
++ */
+ int evtchn_get(unsigned int evtchn)
+ {
+ 	int irq;
+@@ -1194,6 +1525,13 @@ int evtchn_get(unsigned int evtchn)
+ }
+ EXPORT_SYMBOL_GPL(evtchn_get);
+ 
++/*
++ * called by:
++ *   - drivers/xen/gntalloc.c|190| <<__del_gref>> evtchn_put(gref->notify.event);
++ *   - drivers/xen/gntalloc.c|425| <<gntalloc_ioctl_unmap_notify>> evtchn_put(gref->notify.event);
++ *   - drivers/xen/gntdev.c|221| <<gntdev_put_map>> evtchn_put(map->notify.event);
++ *   - drivers/xen/gntdev.c|744| <<gntdev_ioctl_notify>> evtchn_put(out_event);
++ */
+ void evtchn_put(unsigned int evtchn)
+ {
+ 	int irq = get_evtchn_to_irq(evtchn);
+@@ -1221,8 +1559,19 @@ void xen_send_IPI_one(unsigned int cpu, enum ipi_vector vector)
+ 	notify_remote_via_irq(irq);
+ }
+ 
++/*
++ * used by:
++ *   - drivers/xen/events/events_base.c|1539| <<__xen_evtchn_do_upcall>> if (__this_cpu_inc_return(xed_nesting_count) - 1)
++ *   - drivers/xen/events/events_base.c|1546| <<__xen_evtchn_do_upcall>> count = __this_cpu_read(xed_nesting_count);
++ *   - drivers/xen/events/events_base.c|1547| <<__xen_evtchn_do_upcall>> __this_cpu_write(xed_nesting_count, 0);
++ */
+ static DEFINE_PER_CPU(unsigned, xed_nesting_count);
+ 
++/*
++ * called by:
++ *   - drivers/xen/events/events_base.c|1548| <<xen_evtchn_do_upcall>> __xen_evtchn_do_upcall();
++ *   - drivers/xen/events/events_base.c|1556| <<xen_hvm_evtchn_do_upcall>> __xen_evtchn_do_upcall();
++ */
+ static void __xen_evtchn_do_upcall(void)
+ {
+ 	struct vcpu_info *vcpu_info = __this_cpu_read(xen_vcpu);
+@@ -1271,6 +1620,11 @@ void xen_hvm_evtchn_do_upcall(void)
+ EXPORT_SYMBOL_GPL(xen_hvm_evtchn_do_upcall);
+ 
+ /* Rebind a new event channel to an existing irq. */
++/*
++ * called by:
++ *   - drivers/tty/hvc/hvc_xen.c|330| <<xen_console_resume>> rebind_evtchn_irq(info->evtchn, info->irq);
++ *   - drivers/xen/xenbus/xenbus_comms.c|223| <<xb_init_comms>> rebind_evtchn_irq(xen_store_evtchn, xenbus_irq);
++ */
+ void rebind_evtchn_irq(int evtchn, int irq)
+ {
+ 	struct irq_info *info = info_for_irq(irq);
+@@ -1303,6 +1657,10 @@ void rebind_evtchn_irq(int evtchn, int irq)
+ }
+ 
+ /* Rebind an evtchn so that it gets delivered to a specific cpu */
++/*
++ * called by:
++ *   - drivers/xen/events/events_base.c|1651| <<set_affinity_irq>> return rebind_irq_to_cpu(data->irq, tcpu);
++ */
+ static int rebind_irq_to_cpu(unsigned irq, unsigned tcpu)
+ {
+ 	struct evtchn_bind_vcpu bind_vcpu;
+@@ -1523,6 +1881,11 @@ bool xen_test_irq_pending(int irq)
+ 
+ /* Poll waiting for an irq to become pending with timeout.  In the usual case,
+  * the irq will be disabled so it won't deliver an interrupt. */
++/*
++ * called by:
++ *   - drivers/pci/xen-pcifront.c|143| <<do_pci_op>> xen_poll_irq_timeout(irq, jiffies + 3*HZ);
++ *   - drivers/xen/events/events_base.c|1850| <<xen_poll_irq>> xen_poll_irq_timeout(irq, 0 );
++ */
+ void xen_poll_irq_timeout(int irq, u64 timeout)
+ {
+ 	evtchn_port_t evtchn = evtchn_from_irq(irq);
+@@ -1541,6 +1904,10 @@ void xen_poll_irq_timeout(int irq, u64 timeout)
+ EXPORT_SYMBOL(xen_poll_irq_timeout);
+ /* Poll waiting for an irq to become pending.  In the usual case, the
+  * irq will be disabled so it won't deliver an interrupt. */
++/*
++ * called only by:
++ *   - arch/x86/xen/spinlock.c|59| <<xen_qlock_wait>> xen_poll_irq(irq);
++ */
+ void xen_poll_irq(int irq)
+ {
+ 	xen_poll_irq_timeout(irq, 0 /* no timeout */);
+@@ -1586,6 +1953,12 @@ void xen_irq_resume(void)
+ 	restore_pirqs();
+ }
+ 
++/*
++ * used by:
++ *   - drivers/xen/events/events_base.c|146| <<bool>> static struct irq_chip xen_dynamic_chip;
++ *   - drivers/xen/events/events_base.c|1142| <<bind_evtchn_to_irq>> irq_set_chip_and_handler_name(irq, &xen_dynamic_chip,
++ *   - drivers/xen/events/events_base.c|1275| <<bind_virq_to_irq>> irq_set_chip_and_handler_name(irq, &xen_dynamic_chip,
++ */
+ static struct irq_chip xen_dynamic_chip __read_mostly = {
+ 	.name			= "xen-dyn",
+ 
+@@ -1600,6 +1973,12 @@ static struct irq_chip xen_dynamic_chip __read_mostly = {
+ 	.irq_retrigger		= retrigger_dynirq,
+ };
+ 
++/*
++ * used by:
++ *   - drivers/xen/events/events_base.c|956| <<xen_bind_pirq_gsi_to_irq>> irq_set_chip_and_handler_name(irq, &xen_pirq_chip,
++ *   - drivers/xen/events/events_base.c|959| <<xen_bind_pirq_gsi_to_irq>> irq_set_chip_and_handler_name(irq, &xen_pirq_chip,
++ *   - drivers/xen/events/events_base.c|1010| <<xen_bind_pirq_msi_to_irq>> irq_set_chip_and_handler_name(irq + i, &xen_pirq_chip, handle_edge_irq, name);
++ */
+ static struct irq_chip xen_pirq_chip __read_mostly = {
+ 	.name			= "xen-pirq",
+ 
+@@ -1620,6 +1999,11 @@ static struct irq_chip xen_pirq_chip __read_mostly = {
+ 	.irq_retrigger		= retrigger_dynirq,
+ };
+ 
++/*
++ * used by:
++ *   - drivers/xen/events/events_base.c|1180| <<bind_ipi_to_irq>> irq_set_chip_and_handler_name(irq, &xen_percpu_chip,
++ *   - drivers/xen/events/events_base.c|1272| <<bind_virq_to_irq>> irq_set_chip_and_handler_name(irq, &xen_percpu_chip,
++ */
+ static struct irq_chip xen_percpu_chip __read_mostly = {
+ 	.name			= "xen-percpu",
+ 
+@@ -1630,6 +2014,12 @@ static struct irq_chip xen_percpu_chip __read_mostly = {
+ 	.irq_ack		= ack_dynirq,
+ };
+ 
++/*
++ * called by:
++ *   - drivers/xen/events/events_base.c|1981| <<xen_callback_vector>> rc = xen_set_callback_via(callback_via);
++ *   - drivers/xen/platform-pci.c|95| <<platform_pci_resume>> err = xen_set_callback_via(callback_via);
++ *   - drivers/xen/platform-pci.c|148| <<platform_pci_probe>> ret = xen_set_callback_via(callback_via);
++ */
+ int xen_set_callback_via(uint64_t via)
+ {
+ 	struct xen_hvm_param a;
+@@ -1644,6 +2034,11 @@ EXPORT_SYMBOL_GPL(xen_set_callback_via);
+ /* Vector callbacks are better than PCI interrupts to receive event
+  * channel notifications because we can receive vector callbacks on any
+  * vcpu and we don't need PCI support or APIC interactions. */
++/*
++ * called by:
++ *   - arch/x86/xen/suspend.c|42| <<xen_hvm_post_suspend>> xen_callback_vector();
++ *   - drivers/xen/events/events_base.c|2043| <<xen_init_IRQ>> xen_callback_vector();
++ */
+ void xen_callback_vector(void)
+ {
+ 	int rc;
+@@ -1673,6 +2068,21 @@ void xen_callback_vector(void) {}
+ static bool fifo_events = true;
+ module_param(fifo_events, bool, 0);
+ 
++/*
++ * [0] pci_xen_initial_domain
++ * [0] xen_init_IRQ
++ * [0] init_IRQ
++ * [0] start_kernel
++ * [0] x86_64_start_reservations
++ * [0] xen_start_kernel
++ *
++ * used by:
++ *   - arch/x86/xen/enlighten.c|1949| <<xen_hvm_guest_init>> x86_init.irqs.intr_init = xen_init_IRQ;
++ *   - arch/x86/xen/irq.c|189| <<xen_init_irq_ops>> x86_init.irqs.intr_init = xen_init_IRQ;
++ *
++ * called by:
++ *   - arch/x86/kernel/irqinit.c|100| <<init_IRQ>> x86_init.irqs.intr_init();
++ */
+ void __init xen_init_IRQ(void)
+ {
+ 	int ret = -EINVAL;
+@@ -1689,11 +2099,19 @@ void __init xen_init_IRQ(void)
+ 	/* No event channels are 'live' right now. */
+ 	xen_evtchn_mask_all();
+ 
++	/*
++	 * called by:
++	 *   - drivers/xen/events/events_base.c|686| <<eoi_pirq>> if (pirq_needs_eoi(data->irq)) {
++	 */
+ 	pirq_needs_eoi = pirq_needs_eoi_flag;
+ 
+ #ifdef CONFIG_X86
+ 	if (xen_pv_domain()) {
++		/* 64-bit下好像什么也不做 */
+ 		irq_ctx_init(smp_processor_id());
++		/*
++		 * pci_xen_initial_domain()只在这里针对dom0被调用
++		 */
+ 		if (xen_initial_domain())
+ 			pci_xen_initial_domain();
+ 	}
+@@ -1711,8 +2129,19 @@ void __init xen_init_IRQ(void)
+ 
+ 		pirq_eoi_map = (void *)__get_free_page(GFP_KERNEL|__GFP_ZERO);
+ 		eoi_gmfn.gmfn = virt_to_gfn(pirq_eoi_map);
++		/*
++		 * Register a shared page for the hypervisor to indicate whether the
++		 * guest must issue PHYSDEVOP_eoi. This hypercall is very similar to
++		 * PHYSDEVOP_pirq_eoi_gmfn_v1 but it doesn't change the semantics of
++		 * PHYSDEVOP_eoi. The page registered is used as a bit array indexed by
++		 * Xen's PIRQ value
++		 */
+ 		rc = HYPERVISOR_physdev_op(PHYSDEVOP_pirq_eoi_gmfn_v2, &eoi_gmfn);
+ 		/* TODO: No PVH support for PIRQ EOI */
++		/*
++		 * pirq_needs_eoi = pirq_check_eoi_map在以下被调用:
++		 *   - drivers/xen/events/events_base.c|660| <<eoi_pirq>> if (pirq_needs_eoi(data->irq)) {
++		 */
+ 		if (rc != 0) {
+ 			free_page((unsigned long) pirq_eoi_map);
+ 			pirq_eoi_map = NULL;
+diff --git a/drivers/xen/events/events_internal.h b/drivers/xen/events/events_internal.h
+index 50c2050..93cf9df 100644
+--- a/drivers/xen/events/events_internal.h
++++ b/drivers/xen/events/events_internal.h
+@@ -91,6 +91,9 @@ static inline unsigned xen_evtchn_max_channels(void)
+  * Do any ABI specific setup for a bound event channel before it can
+  * be unmasked and used.
+  */
++/*
++ * 调用evtchn_ops->setup(info), 只有fifo支持
++ */
+ static inline int xen_evtchn_port_setup(struct irq_info *info)
+ {
+ 	if (evtchn_ops->setup)
+@@ -98,6 +101,9 @@ static inline int xen_evtchn_port_setup(struct irq_info *info)
+ 	return 0;
+ }
+ 
++/*
++ * 调用evtchn_ops->bind_to_cpu(info, cpu)
++ */
+ static inline void xen_evtchn_port_bind_to_cpu(struct irq_info *info,
+ 					       unsigned cpu)
+ {
+@@ -124,6 +130,9 @@ static inline bool test_and_set_mask(unsigned port)
+ 	return evtchn_ops->test_and_set_mask(port);
+ }
+ 
++/*
++ * 调用evtchn_ops->mask(port)
++ */
+ static inline void mask_evtchn(unsigned port)
+ {
+ 	return evtchn_ops->mask(port);
+diff --git a/drivers/xen/pci.c b/drivers/xen/pci.c
+index 7494dbe..d6f2b11 100644
+--- a/drivers/xen/pci.c
++++ b/drivers/xen/pci.c
+@@ -31,8 +31,16 @@
+ #include <asm/pci_x86.h>
+ #endif
+ 
++/*
++ * 只在以下修改:
++ *   - drivers/xen/pci.c|112| <<xen_add_device>> pci_seg_supported = false;
++ */
+ static bool __read_mostly pci_seg_supported = true;
+ 
++/*
++ * called by (处理BUS_NOTIFY_ADD_DEVICE):
++ *   - drivers/xen/pci.c|186| <<xen_pci_notifier>> r = xen_add_device(dev);
++ */
+ static int xen_add_device(struct device *dev)
+ {
+ 	int r;
+@@ -146,6 +154,10 @@ static int xen_add_device(struct device *dev)
+ 	return r;
+ }
+ 
++/*
++ * calle by only (处理BUS_NOTIFY_DEL_DEVICE):
++ *   - drivers/xen/pci.c|200| <<xen_pci_notifier>> r = xen_remove_device(dev);
++ */
+ static int xen_remove_device(struct device *dev)
+ {
+ 	int r;
+@@ -175,6 +187,9 @@ static int xen_remove_device(struct device *dev)
+ 	return r;
+ }
+ 
++/*
++ * struct notifier_block device_nb.notifier_call = xen_pci_notifier()
++ */
+ static int xen_pci_notifier(struct notifier_block *nb,
+ 			    unsigned long action, void *data)
+ {
+@@ -202,8 +217,12 @@ static struct notifier_block device_nb = {
+ 	.notifier_call = xen_pci_notifier,
+ };
+ 
++/*
++ * 必须是dom0才能进行下去
++ */
+ static int __init register_xen_pci_notifier(void)
+ {
++	/* 必须是dom0才能进行下去 */
+ 	if (!xen_initial_domain())
+ 		return 0;
+ 
+@@ -213,11 +232,17 @@ static int __init register_xen_pci_notifier(void)
+ arch_initcall(register_xen_pci_notifier);
+ 
+ #ifdef CONFIG_PCI_MMCONFIG
++/*
++ * 必须是dom0才能进行下去
++ */
+ static int __init xen_mcfg_late(void)
+ {
+ 	struct pci_mmcfg_region *cfg;
+ 	int rc;
+ 
++	/*
++	 * 必须是dom0才能进行下去
++	 */
+ 	if (!xen_initial_domain())
+ 		return 0;
+ 
+@@ -228,6 +253,10 @@ static int __init xen_mcfg_late(void)
+ 		return 0;
+ 
+ 	/* Check whether they are in the right area. */
++	/*
++	 * 只在以下添加新元素到pci_mmcfg_list:
++	 *   - arch/x86/pci/mmconfig-shared.c|64| <<list_add_sorted>> list_add_tail_rcu(&new->list, &pci_mmcfg_list);
++	 */
+ 	list_for_each_entry(cfg, &pci_mmcfg_list, list) {
+ 		struct physdev_pci_mmcfg_reserved r;
+ 
 diff --git a/drivers/xen/xenbus/xenbus_probe.c b/drivers/xen/xenbus/xenbus_probe.c
 index c2d4476..e210a92 100644
 --- a/drivers/xen/xenbus/xenbus_probe.c
@@ -571,6 +2081,20 @@ index c2d4476..e210a92 100644
  void xenbus_dev_shutdown(struct device *_dev)
  {
  	struct xenbus_device *dev = to_xenbus_device(_dev);
+diff --git a/kernel/irq/chip.c b/kernel/irq/chip.c
+index 9e745cc..38c0c73 100644
+--- a/kernel/irq/chip.c
++++ b/kernel/irq/chip.c
+@@ -89,6 +89,9 @@ EXPORT_SYMBOL(irq_set_irq_type);
+  *
+  *	Set the hardware irq controller data for an irq
+  */
++/*
++ * 把data设置为irq对应的desc->irq_common_data.handler_data
++ */
+ int irq_set_handler_data(unsigned int irq, void *data)
+ {
+ 	unsigned long flags;
 -- 
 2.7.4
 
