@@ -1,0 +1,103 @@
+nvme申请threaded irq的例子:
+
+
+1118 static int queue_request_irq(struct nvme_queue *nvmeq)
+1119 {
+1120         if (use_threaded_interrupts)
+1121                 return request_threaded_irq(nvmeq_irq(nvmeq), nvme_irq_check,
+1122                                 nvme_irq, IRQF_SHARED, nvmeq->irqname, nvmeq);
+1123         else
+1124                 return request_irq(nvmeq_irq(nvmeq), nvme_irq, IRQF_SHARED,
+1125                                 nvmeq->irqname, nvmeq);
+1126 }
+
+
+1678 int request_threaded_irq(unsigned int irq, irq_handler_t handler,
+1679                          irq_handler_t thread_fn, unsigned long irqflags,
+1680                          const char *devname, void *dev_id)
+1681 {
+
+
+handler = nvme_irq_check()在中断处理执行,
+
+[0] nvme_irq_check
+[0] __handle_irq_event_percpu
+[0] handle_irq_event_percpu
+[0] handle_irq_event
+[0] handle_edge_irq
+[0] handle_irq
+[0] do_IRQ
+[0] common_interrupt
+[0] irq_exit
+[0] smp_reschedule_interrupt
+[0] reschedule_interrupt
+
+[0] nvme_irq_check
+[0] __handle_irq_event_percpu
+[0] handle_irq_event_percpu
+[0] handle_irq_event 
+[0] handle_edge_irq 
+[0] handle_irq
+[0] do_IRQ
+[0] common_interrupt
+
+
+thread_fn = nvme_irq()在中断线程执行
+
+[0] nvme_irq
+[0] irq_thread_fn
+[0] irq_thread
+[0] kthread
+[0] ret_from_fork
+
+
+request_threaded_irq()
+  -> __setup_irq()
+      -> setup_irq_thread()
+会为每一个中断创建内核线程, 内核线程记录在irqaction->thread
+
+root       900  0.2  0.0      0     0 ?        S    11:03   0:00 [irq/24-nvme0q0]
+root       902  0.0  0.0      0     0 ?        S    11:03   0:00 [irq/24-nvme0q1]
+root      1012  0.0  0.0      0     0 ?        S    11:03   0:00 [irq/25-nvme0q2]
+root      1015  0.0  0.0      0     0 ?        S    11:03   0:00 [irq/26-nvme0q3]
+root      1016  0.0  0.0      0     0 ?        S    11:03   0:00 [irq/27-nvme0q4]
+
+
+中断发生时, line 145的action->handler = nvme_irq_check()会检查cq的
+ring buffer是否有数据. 如果有数据就返回IRQ_WAKE_THREAD.
+__handle_irq_event_percpu()就会使用
+__irq_wake_thread()-->wake_up_process()唤醒中断内核线程.
+
+135 irqreturn_t __handle_irq_event_percpu(struct irq_desc *desc, unsigned int *flags)
+136 {
+137         irqreturn_t retval = IRQ_NONE;
+138         unsigned int irq = desc->irq_data.irq;
+139         struct irqaction *action;
+140 
+141         for_each_action_of_desc(desc, action) {
+142                 irqreturn_t res;
+143 
+144                 trace_irq_handler_entry(irq, action);
+145                 res = action->handler(irq, action->dev_id);
+146                 trace_irq_handler_exit(irq, action, res);
+147 
+148                 if (WARN_ONCE(!irqs_disabled(),"irq %u handler %pF enabled interrupts\n",
+149                               irq, action->handler))
+150                         local_irq_disable();
+151 
+152                 switch (res) {
+153                 case IRQ_WAKE_THREAD:
+154                         /*
+155                          * Catch drivers which return WAKE_THREAD but
+156                          * did not set up a thread function
+157                          */
+158                         if (unlikely(!action->thread_fn)) {
+159                                 warn_no_thread(irq, action);
+160                                 break;
+161                         }
+162 
+163                         __irq_wake_thread(desc, action);
+164 
+165                         /* Fall through to add to randomness */
+166                 case IRQ_HANDLED:
+167                         *flags |= action->flags;
