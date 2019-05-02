@@ -1,6 +1,6 @@
-From 2d616d76020106432f4f1d57eb102a3bbc81860b Mon Sep 17 00:00:00 2001
+From 18371c9a29a3704228ab17948938a0c342174816 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Sat, 27 Apr 2019 05:36:10 +0800
+Date: Thu, 2 May 2019 21:56:14 +0800
 Subject: [PATCH 1/1] linux-xen-interface-for-linux-4.9.168
 
 xen specific interface linux-4.9.168
@@ -12,17 +12,19 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  arch/x86/xen/irq.c                   |  53 +++
  arch/x86/xen/platform-pci-unplug.c   |   5 +
  arch/x86/xen/smp.c                   |   4 +
+ arch/x86/xen/spinlock.c              |  17 +
  arch/x86/xen/xen-asm_64.S            |   4 +
  drivers/block/xen-blkback/blkback.c  |  99 +++++
  drivers/block/xen-blkback/common.h   |  25 ++
  drivers/block/xen-blkfront.c         |  60 +++
- drivers/nvme/host/pci.c              |   3 +
+ drivers/nvme/host/pci.c              |  32 ++
  drivers/xen/events/events_base.c     | 684 +++++++++++++++++++++++++++++++++++
  drivers/xen/events/events_internal.h |  13 +
  drivers/xen/pci.c                    |  29 ++
  drivers/xen/xenbus/xenbus_probe.c    |  17 +
  kernel/irq/chip.c                    |  10 +
- 15 files changed, 1604 insertions(+)
+ kernel/irq/manage.c                  |  90 +++++
+ 17 files changed, 1740 insertions(+)
 
 diff --git a/arch/x86/pci/xen.c b/arch/x86/pci/xen.c
 index 4ea9f29..d3ed1f7 100644
@@ -987,6 +989,41 @@ index 8eca26e..f427061 100644
  void __init xen_smp_init(void)
  {
  	smp_ops = xen_smp_ops;
+diff --git a/arch/x86/xen/spinlock.c b/arch/x86/xen/spinlock.c
+index 8d2c6f0..aac7a1b 100644
+--- a/arch/x86/xen/spinlock.c
++++ b/arch/x86/xen/spinlock.c
+@@ -18,13 +18,30 @@
+ #include "xen-ops.h"
+ #include "debugfs.h"
+ 
++/*
++ * used by:
++ *   - arch/x86/xen/spinlock.c|30| <<xen_qlock_kick>> int irq = per_cpu(lock_kicker_irq, cpu);
++ *   - arch/x86/xen/spinlock.c|44| <<xen_qlock_wait>> int irq = __this_cpu_read(lock_kicker_irq);
++ *   - arch/x86/xen/spinlock.c|79| <<xen_init_lock_cpu>> WARN(per_cpu(lock_kicker_irq, cpu) >= 0, "spinlock on CPU%d exists on IRQ%d!\n",
++ *   - arch/x86/xen/spinlock.c|80| <<xen_init_lock_cpu>> cpu, per_cpu(lock_kicker_irq, cpu));
++ *   - arch/x86/xen/spinlock.c|92| <<xen_init_lock_cpu>> per_cpu(lock_kicker_irq, cpu) = irq;
++ *   - arch/x86/xen/spinlock.c|104| <<xen_uninit_lock_cpu>> unbind_from_irqhandler(per_cpu(lock_kicker_irq, cpu), NULL);
++ *   - arch/x86/xen/spinlock.c|105| <<xen_uninit_lock_cpu>> per_cpu(lock_kicker_irq, cpu) = -1;
++ */
+ static DEFINE_PER_CPU(int, lock_kicker_irq) = -1;
+ static DEFINE_PER_CPU(char *, irq_name);
++/*
++ * used by:
++ *   - arch/x86/xen/spinlock.c|45| <<xen_qlock_wait>> atomic_t *nest_cnt = this_cpu_ptr(&xen_qlock_wait_nest);
++ */
+ static DEFINE_PER_CPU(atomic_t, xen_qlock_wait_nest);
+ static bool xen_pvspin = true;
+ 
+ #include <asm/qspinlock.h>
+ 
++/*
++ * 向要唤醒的cpu发送XEN_SPIN_UNLOCK_VECTOR
++ */
+ static void xen_qlock_kick(int cpu)
+ {
+ 	int irq = per_cpu(lock_kicker_irq, cpu);
 diff --git a/arch/x86/xen/xen-asm_64.S b/arch/x86/xen/xen-asm_64.S
 index c3df431..769269c 100644
 --- a/arch/x86/xen/xen-asm_64.S
@@ -1361,10 +1398,53 @@ index c08ee8c..a462c8c 100644
  {
  	struct blkfront_info *info = disk->private_data;
 diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
-index 1ac4cec..688e558 100644
+index 1ac4cec..1698885 100644
 --- a/drivers/nvme/host/pci.c
 +++ b/drivers/nvme/host/pci.c
-@@ -1582,6 +1582,9 @@ static int nvme_dev_add(struct nvme_dev *dev)
+@@ -736,6 +736,13 @@ static void nvme_process_cq(struct nvme_queue *nvmeq)
+ 	__nvme_process_cq(nvmeq, NULL);
+ }
+ 
++/*
++ * [0] nvme_irq
++ * [0] irq_thread_fn
++ * [0] irq_thread
++ * [0] kthread
++ * [0] ret_from_fork
++ */
+ static irqreturn_t nvme_irq(int irq, void *data)
+ {
+ 	irqreturn_t result;
+@@ -748,6 +755,28 @@ static irqreturn_t nvme_irq(int irq, void *data)
+ 	return result;
+ }
+ 
++/*
++ * [0] nvme_irq_check
++ * [0] __handle_irq_event_percpu
++ * [0] handle_irq_event_percpu
++ * [0] handle_irq_event
++ * [0] handle_edge_irq
++ * [0] handle_irq
++ * [0] do_IRQ
++ * [0] common_interrupt
++ * [0] irq_exit
++ * [0] smp_reschedule_interrupt
++ * [0] reschedule_interrupt
++ *
++ * [0] nvme_irq_check
++ * [0] __handle_irq_event_percpu
++ * [0] handle_irq_event_percpu
++ * [0] handle_irq_event
++ * [0] handle_edge_irq
++ * [0] handle_irq
++ * [0] do_IRQ
++ * [0] common_interrupt
++ */
+ static irqreturn_t nvme_irq_check(int irq, void *data)
+ {
+ 	struct nvme_queue *nvmeq = data;
+@@ -1582,6 +1611,9 @@ static int nvme_dev_add(struct nvme_dev *dev)
  	return 0;
  }
  
@@ -2907,6 +2987,135 @@ index 9e745cc..2078bb5 100644
  void handle_edge_irq(struct irq_desc *desc)
  {
  	raw_spin_lock(&desc->lock);
+diff --git a/kernel/irq/manage.c b/kernel/irq/manage.c
+index cf94460..f44a64e 100644
+--- a/kernel/irq/manage.c
++++ b/kernel/irq/manage.c
+@@ -1079,6 +1079,11 @@ static void irq_release_resources(struct irq_desc *desc)
+ 		c->irq_release_resources(d);
+ }
+ 
++/*
++ * called by:
++ *   - kernel/irq/manage.c|1183| <<__setup_irq>> ret = setup_irq_thread(new, irq, false);
++ *   - kernel/irq/manage.c|1187| <<__setup_irq>> ret = setup_irq_thread(new->secondary, irq, true);
++ */
+ static int
+ setup_irq_thread(struct irqaction *new, unsigned int irq, bool secondary)
+ {
+@@ -1088,6 +1093,13 @@ setup_irq_thread(struct irqaction *new, unsigned int irq, bool secondary)
+ 	};
+ 
+ 	if (!secondary) {
++		/*
++		 * root       900  0.2  0.0      0     0 ?        S    11:03   0:00 [irq/24-nvme0q0]
++		 * root       902  0.0  0.0      0     0 ?        S    11:03   0:00 [irq/24-nvme0q1]
++		 * root      1012  0.0  0.0      0     0 ?        S    11:03   0:00 [irq/25-nvme0q2]
++		 * root      1015  0.0  0.0      0     0 ?        S    11:03   0:00 [irq/26-nvme0q3]
++		 * root      1016  0.0  0.0      0     0 ?        S    11:03   0:00 [irq/27-nvme0q4]
++		 */
+ 		t = kthread_create(irq_thread, new, "irq/%d-%s", irq,
+ 				   new->name);
+ 	} else {
+@@ -1125,6 +1137,13 @@ setup_irq_thread(struct irqaction *new, unsigned int irq, bool secondary)
+  * Internal function to register an irqaction - typically used to
+  * allocate special interrupts that are part of the architecture.
+  */
++/*
++ * called by:
++ *   - kernel/irq/manage.c|1459| <<setup_irq>> retval = __setup_irq(irq, desc, act);
++ *   - kernel/irq/manage.c|1720| <<request_threaded_irq>> retval = __setup_irq(irq, desc, action);
++ *   - kernel/irq/manage.c|1970| <<setup_percpu_irq>> retval = __setup_irq(irq, desc, act);
++ *   - kernel/irq/manage.c|2026| <<request_percpu_irq>> retval = __setup_irq(irq, desc, action);
++ */
+ static int
+ __setup_irq(unsigned int irq, struct irq_desc *desc, struct irqaction *new)
+ {
+@@ -1644,6 +1663,76 @@ EXPORT_SYMBOL(free_irq);
+  *	IRQF_TRIGGER_*		Specify active edge(s) or level
+  *
+  */
++/*
++ * nvme申请threaded irq的例子:
++ *
++ *
++ * 1118 static int queue_request_irq(struct nvme_queue *nvmeq)
++ * 1119 {
++ * 1120         if (use_threaded_interrupts)
++ * 1121                 return request_threaded_irq(nvmeq_irq(nvmeq), nvme_irq_check,
++ * 1122                                 nvme_irq, IRQF_SHARED, nvmeq->irqname, nvmeq);
++ * 1123         else
++ * 1124                 return request_irq(nvmeq_irq(nvmeq), nvme_irq, IRQF_SHARED,
++ * 1125                                 nvmeq->irqname, nvmeq);
++ * 1126 }
++ *
++ *
++ * 1678 int request_threaded_irq(unsigned int irq, irq_handler_t handler,
++ * 1679                          irq_handler_t thread_fn, unsigned long irqflags,
++ * 1680                          const char *devname, void *dev_id)
++ * 1681 {
++ *
++ *
++ * handler = nvme_irq_check()在中断处理执行,
++ *
++ * [0] nvme_irq_check
++ * [0] __handle_irq_event_percpu
++ * [0] handle_irq_event_percpu
++ * [0] handle_irq_event
++ * [0] handle_edge_irq
++ * [0] handle_irq
++ * [0] do_IRQ
++ * [0] common_interrupt
++ * [0] irq_exit
++ * [0] smp_reschedule_interrupt
++ * [0] reschedule_interrupt
++ *
++ * [0] nvme_irq_check
++ * [0] __handle_irq_event_percpu
++ * [0] handle_irq_event_percpu
++ * [0] handle_irq_event 
++ * [0] handle_edge_irq 
++ * [0] handle_irq
++ * [0] do_IRQ
++ * [0] common_interrupt
++ *
++ *
++ * thread_fn = nvme_irq()在中断线程执行
++ *
++ * [0] nvme_irq
++ * [0] irq_thread_fn
++ * [0] irq_thread
++ * [0] kthread
++ * [0] ret_from_fork
++ *
++ *
++ * request_threaded_irq()
++ *   -> __setup_irq()
++ *        -> setup_irq_thread()
++ * 会为每一个中断创建内核线程, 内核线程记录在irqaction->thread
++ *
++ * root       900  0.2  0.0      0     0 ?        S    11:03   0:00 [irq/24-nvme0q0]
++ * root       902  0.0  0.0      0     0 ?        S    11:03   0:00 [irq/24-nvme0q1]
++ * root      1012  0.0  0.0      0     0 ?        S    11:03   0:00 [irq/25-nvme0q2]
++ * root      1015  0.0  0.0      0     0 ?        S    11:03   0:00 [irq/26-nvme0q3]
++ * root      1016  0.0  0.0      0     0 ?        S    11:03   0:00 [irq/27-nvme0q4]
++ *
++ * 中断发生时, action->handler = nvme_irq_check()会检查cq的
++ * ring buffer是否有数据. 如果有数据就返回IRQ_WAKE_THREAD.
++ * __handle_irq_event_percpu()就会使用
++ * __irq_wake_thread()-->wake_up_process()唤醒中断内核线程.
++ */
+ int request_threaded_irq(unsigned int irq, irq_handler_t handler,
+ 			 irq_handler_t thread_fn, unsigned long irqflags,
+ 			 const char *devname, void *dev_id)
+@@ -1680,6 +1769,7 @@ int request_threaded_irq(unsigned int irq, irq_handler_t handler,
+ 	if (!handler) {
+ 		if (!thread_fn)
+ 			return -EINVAL;
++		/* 默认返回 IRQ_WAKE_THREAD */
+ 		handler = irq_default_primary_handler;
+ 	}
+ 
 -- 
 2.7.4
 
