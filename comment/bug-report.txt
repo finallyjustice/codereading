@@ -1,0 +1,69 @@
+- hung_task, soft-lockup, hard-lockup
+- rcu stall
+- lockdep
+- kmemleak, kasan
+
+---------------------------------------------------------------------------
+
+hung_task   : kernel/hung_task.c
+检测函数是check_hung_task()
+soft-lockup : kernel/watchdog.c
+检测函数是watchdog_timer_fn()
+hard-lockup : kernel/watchdog_hld.c
+检测函数是watchdog_overflow_callback()
+
+1. 抢占被长时间关闭而导致进程无法调度 (soft lockup)
+2. 中断被长时间关闭而导致更严重的问题 (hard lockup)
+
+Softlockup是用来检测内核长时间不发生调度的情况,它的工作原理是在内核中启动一个优先级
+为MAX_RT_PRIO-1的FIFO进程,在此进程里面会刷新时间戳.如果此时间戳超过设定的时间阈值
+没有更新,则会报softlockup错误.
+
+>>>>>>>> hung_task:
+
+进程长时间(系统默认配置120秒)处于TASK_UNINTERRUPTIBLE睡眠状态,这种状态下进程不响应异步信号.如:进
+程与外设硬件的交互(如read),通常使用这种状态来保证进程与设备的交互过程不被打断,否则设备可能处于不
+可控的状态.
+
+Linux的进程存在多种状态,如TASK_RUNNING的运行态,EXIT_DEAD的停止态和TASK_INTERRUPTIBLE的接收信号的
+等待状态等等(可在include/linux/sched.h中查看).其中有一种状态等待为TASK_UNINTERRUPTIBLE,称为D状态,
+该种状态下进程不接收信号,只能通过wake_up唤醒.处于这种状态的情况有很多.例如mutex锁就可能会设置进
+程于该状态,有时候进程在等待某种IO资源就绪时(wait_event机制)会设置进程进入该状态.一般情况下,进程处
+于该状态的时间不会太久,但若IO设备出现故障或者出现进程死锁等情况,进程就可能长期处于该状态而无法再
+返回到TASK_RUNNING态.因此,内核为了便于发现这类情况设计出了hung task机制专门用于检测长期处于D状态
+的进程并发出告警.
+
+核心思想为创建一个内核监测进程循环监测处于D状态的每一个进程(任务),统计它们在两次检测之间的调度次数,
+如果发现有任务在两次监测之间没有发生任何的调度则可判断该进程一直处于D状态,很有可能已经死锁,因此触
+发报警日志打印,输出进程的基本信息,栈回溯以及寄存器保存信息以供内核开发人员定位.
+
+核心函数是kernel/hung_task.c的watchdog(), 会创建一个内核线程khungtaskd.
+
+
+>>>>>>>> soft-lockup:
+
+进程长时间(系统默认配置60秒)处于TASK_RUNNING状态垄断cpu而不发生切换,一般情况下是进程关抢占后长时
+候干活,有时候可能进程关抢占后处于死循环或者睡眠后,这样就造成系统异常.
+
+内核会为每一个cpu创建一个内核线程"watchdog/%u",主要工作就是调用__touch_watchdog()函数来刷新时间戳
+watchdog_touch_ts.此线程函数是在watchdog_timer_fn中唤醒的. 此内核线程为实时的FIFO线程,优先级为
+MAX_RT_PRIO-1,优先级第二高了,这样就能够在进程被唤醒的时候能够强制其它优先级低的线程/进程了.
+
+hrtimer的处理函数watchdog_timer_fn()用来进行所有的检测.首先读取per CPU变量watchdog_touch_ts赋值给
+touch_ts,表示上一次刷新的时间戳.然后调用wake_up_process函数唤醒此cpu上的watchdog线程,如果watchdog
+线程被唤醒就会去刷新时间戳,如果系统关了抢占,此watchdog线程不会被唤醒,这样时间戳就不会更新.
+is_softlockup()函数会判断当前时间与上次刷新时间touch_ts的差值,如果差值大于设定的阈值,就返回差值即
+变量duration,否则返回0.如果duration不为0,则表示内核有超过设定的阈值时间没有发生调度。
+
+
+>>>>>>>> hard-lockup:
+
+hard-lockup利用了硬件的nmi.perf_event_create_kernel_counter()函数主要是注册了一个硬件的事件.这个硬
+件在x86里叫performance monitoring,这个硬件有一个功能就是在cpu clock经过了多少个周期后发出一个NMI中
+断出来.hw_nmi_get_sample_period()根据当前cpu的频率,算出一个值,也就是20秒cpu clock经过的周期数.这样
+一来,当cpu全负荷跑完20秒后,就会有一个NMI中断发出,而这个中断的出路函数就是watchdog_overflow_callback().
+watchdog_overflow_callback()通过is_hardlockup()查看hrtimer_interrupts(是per cpu的)变量在时钟中断处
+理函数里有没有被更新.假如没有更新,就意味着中断出了问题,可能被错误代码长时间的关中断了.
+
+per-cpu变量watchdog_overflow_callback()是在watchdog_timer_fn()-->watchdog_interrupt_count()更新的.
+watchdog_timer_fn()是一个hrtimer的处理函数.
