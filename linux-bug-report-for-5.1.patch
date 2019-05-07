@@ -1,0 +1,380 @@
+From 4efff752c0c0c29c47d5c970fb9f9be43af157bd Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Tue, 7 May 2019 08:34:57 +0800
+Subject: [PATCH 1/1] linux bug report for 5.1
+
+- hung_task, soft-lockup, hard-lockup
+- rcu stall
+- lockdep
+- kmemleak, kasan
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ kernel/rcu/tree.c     | 98 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ kernel/rcu/tree.h     | 14 ++++++++
+ kernel/rcu/tree_exp.h | 17 +++++++++
+ kernel/rcu/update.c   | 12 +++++++
+ kernel/time/timer.c   |  8 +++++
+ 5 files changed, 149 insertions(+)
+
+diff --git a/kernel/rcu/tree.c b/kernel/rcu/tree.c
+index acd6ccf..7e8dd79 100644
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@ -82,6 +82,13 @@ struct rcu_state rcu_state = {
+ 	.gp_state = RCU_GP_IDLE,
+ 	.gp_seq = (0UL - 300UL) << RCU_SEQ_CTR_SHIFT,
+ 	.barrier_mutex = __MUTEX_INITIALIZER(rcu_state.barrier_mutex),
++	/*
++	 * CONFIG_TRACING在desktop/server一般都开启
++	 *
++	 * 但是不管结果如何, RCU_NAME都直接或者间接指向RCU_NAME_RAW
++	 *   - CONFIG_PREEMPT_RCU的情况下是  rcu_preempt(p)
++	 *   - !CONFIG_PREEMPT_RCU的情况下是 rcu_sched (s)
++	 */
+ 	.name = RCU_NAME,
+ 	.abbr = RCU_ABBR,
+ 	.exp_mutex = __MUTEX_INITIALIZER(rcu_state.exp_mutex),
+@@ -1253,6 +1260,12 @@ static void panic_on_rcu_stall(void)
+ 		panic("RCU Stall\n");
+ }
+ 
++/*
++ * called by only:
++ *   - kernel/rcu/tree.c|1441| <<check_cpu_stall>> print_other_cpu_stall(gs2);
++ *
++ * 进入这个函数一定会打印"INFO: %s detected stalls on CPUs/tasks:"
++ */
+ static void print_other_cpu_stall(unsigned long gp_seq)
+ {
+ 	int cpu;
+@@ -1325,6 +1338,12 @@ static void print_other_cpu_stall(unsigned long gp_seq)
+ 	rcu_force_quiescent_state();  /* Kick them all. */
+ }
+ 
++/*
++ * called by only:
++ *   - kernel/rcu/tree.c|1434| <<check_cpu_stall>> print_cpu_stall();
++ *
++ * 这个函数一定会打印"INFO: %s self-detected stall on CPU"
++ */
+ static void print_cpu_stall(void)
+ {
+ 	int cpu;
+@@ -1379,6 +1398,10 @@ static void print_cpu_stall(void)
+ 	set_preempt_need_resched();
+ }
+ 
++/*
++ * called by only:
++ *   - kernel/rcu/tree.c|3103| <<rcu_pending>> check_cpu_stall(rdp);
++ */
+ static void check_cpu_stall(struct rcu_data *rdp)
+ {
+ 	unsigned long gs1;
+@@ -1480,6 +1503,11 @@ static void trace_rcu_this_gp(struct rcu_node *rnp, struct rcu_data *rdp,
+  *
+  * Returns true if the GP thread needs to be awakened else false.
+  */
++/*
++ * called by:
++ *   - kernel/rcu/tree.c|1648| <<rcu_accelerate_cbs>> ret = rcu_start_this_gp(rnp, rdp, gp_seq_req);
++ *   - kernel/rcu/tree_plugin.h|2051| <<rcu_nocb_wait_gp>> needwake = rcu_start_this_gp(rnp, rdp, c);
++ */
+ static bool rcu_start_this_gp(struct rcu_node *rnp_start, struct rcu_data *rdp,
+ 			      unsigned long gp_seq_req)
+ {
+@@ -1532,6 +1560,13 @@ static bool rcu_start_this_gp(struct rcu_node *rnp_start, struct rcu_data *rdp,
+ 		goto unlock_out;
+ 	}
+ 	trace_rcu_this_gp(rnp, rdp, gp_seq_req, TPS("Startedroot"));
++	/*
++	 * 使用RCU_GP_FLAG_INIT的地方:
++	 *   - kernel/rcu/tree.c|1551| <<rcu_start_this_gp>> WRITE_ONCE(rcu_state.gp_flags, rcu_state.gp_flags | RCU_GP_FLAG_INIT);
++	 *   - kernel/rcu/tree.c|2102| <<rcu_gp_cleanup>> WRITE_ONCE(rcu_state.gp_flags, RCU_GP_FLAG_INIT);
++	 *   - kernel/rcu/tree.c|2109| <<rcu_gp_cleanup>> rcu_state.gp_flags & RCU_GP_FLAG_INIT);
++	 *   - kernel/rcu/tree.c|2140| <<rcu_gp_kthread>> RCU_GP_FLAG_INIT);
++	 */
+ 	WRITE_ONCE(rcu_state.gp_flags, rcu_state.gp_flags | RCU_GP_FLAG_INIT);
+ 	rcu_state.gp_req_activity = jiffies;
+ 	if (!rcu_state.gp_kthread) {
+@@ -2098,6 +2133,10 @@ static void rcu_gp_cleanup(void)
+ /*
+  * Body of kthread that handles grace periods.
+  */
++/*
++ * used by only:
++ *   - kernel/rcu/tree.c|3650| <<rcu_spawn_gp_kthread>> t = kthread_create(rcu_gp_kthread, NULL, "%s", rcu_state.name);
++ */
+ static int __noreturn rcu_gp_kthread(void *unused)
+ {
+ 	rcu_bind_gp_kthread();
+@@ -2109,6 +2148,13 @@ static int __noreturn rcu_gp_kthread(void *unused)
+ 					       READ_ONCE(rcu_state.gp_seq),
+ 					       TPS("reqwait"));
+ 			rcu_state.gp_state = RCU_GP_WAIT_GPS;
++			/*
++			 * 使用RCU_GP_FLAG_INIT的地方:
++			 *   - kernel/rcu/tree.c|1551| <<rcu_start_this_gp>> WRITE_ONCE(rcu_state.gp_flags, rcu_state.gp_flags | RCU_GP_FLAG_INIT);
++			 *   - kernel/rcu/tree.c|2102| <<rcu_gp_cleanup>> WRITE_ONCE(rcu_state.gp_flags, RCU_GP_FLAG_INIT);
++			 *   - kernel/rcu/tree.c|2109| <<rcu_gp_cleanup>> rcu_state.gp_flags & RCU_GP_FLAG_INIT);
++			 *   - kernel/rcu/tree.c|2140| <<rcu_gp_kthread>> RCU_GP_FLAG_INIT);
++			 */
+ 			swait_event_idle_exclusive(rcu_state.gp_wq,
+ 					 READ_ONCE(rcu_state.gp_flags) &
+ 					 RCU_GP_FLAG_INIT);
+@@ -2168,6 +2214,15 @@ static void rcu_report_qs_rsp(unsigned long flags)
+  * disabled.  This allows propagating quiescent state due to resumed tasks
+  * during grace-period initialization.
+  */
++/*
++ * called by:
++ *   - kernel/rcu/tree.c|1908| <<rcu_gp_init>> rcu_report_qs_rnp(mask, rnp, rnp->gp_seq, flags);
++ *   - kernel/rcu/tree.c|2283| <<rcu_report_unblock_qs_rnp>> rcu_report_qs_rnp(mask, rnp_p, gps, flags);
++ *   - kernel/rcu/tree.c|2325| <<rcu_report_qs_rdp>> rcu_report_qs_rnp(mask, rnp, rnp->gp_seq, flags);
++ *   - kernel/rcu/tree.c|2614| <<force_qs_rnp>> rcu_report_qs_rnp(mask, rnp, rnp->gp_seq, flags);
++ *   - kernel/rcu/tree.c|3512| <<rcu_cpu_starting>> rcu_report_qs_rnp(mask, rnp, rnp->gp_seq, flags);
++ *   - kernel/rcu/tree.c|3549| <<rcu_report_dead>> rcu_report_qs_rnp(mask, rnp, rnp->gp_seq, flags);
++ */
+ static void rcu_report_qs_rnp(unsigned long mask, struct rcu_node *rnp,
+ 			      unsigned long gps, unsigned long flags)
+ 	__releases(rnp->lock)
+@@ -2271,6 +2326,10 @@ rcu_report_unblock_qs_rnp(struct rcu_node *rnp, unsigned long flags)
+  * Record a quiescent state for the specified CPU to that CPU's rcu_data
+  * structure.  This must be called from the specified CPU.
+  */
++/*
++ * called by:
++ *   - kernel/rcu/tree.c|2362| <<rcu_check_quiescent_state>> rcu_report_qs_rdp(rdp->cpu, rdp);
++ */
+ static void
+ rcu_report_qs_rdp(int cpu, struct rcu_data *rdp)
+ {
+@@ -2319,6 +2378,10 @@ rcu_report_qs_rdp(int cpu, struct rcu_data *rdp)
+  * Otherwise, see if this CPU has just passed through its first
+  * quiescent state for this grace period, and record that fact if so.
+  */
++/*
++ * called by only:
++ *   - kernel/rcu/tree.c|2776| <<rcu_core>> rcu_check_quiescent_state(rdp);
++ */
+ static void
+ rcu_check_quiescent_state(struct rcu_data *rdp)
+ {
+@@ -2527,6 +2590,12 @@ static void rcu_do_batch(struct rcu_data *rdp)
+  * it will ask the scheduler to manufacture a context switch for the sole
+  * purpose of providing a providing the needed quiescent state.
+  */
++/*
++ * called only by:
++ *   - kernel/time/timer.c|1635| <<update_process_times>> rcu_sched_clock_irq(user_tick);
++ *
++ * 这个函数以前叫做rcu_check_callbacks()
++ */
+ void rcu_sched_clock_irq(int user)
+ {
+ 	trace_rcu_utilization(TPS("Start scheduler-tick"));
+@@ -2791,6 +2860,17 @@ static void invoke_rcu_callbacks(struct rcu_data *rdp)
+ 	invoke_rcu_callbacks_kthread();
+ }
+ 
++/*
++ * called by:
++ *   - kernel/rcu/tree.c|2535| <<rcu_do_batch>> invoke_rcu_core();
++ *   - kernel/rcu/tree.c|2565| <<rcu_sched_clock_irq>> invoke_rcu_core();
++ *   - kernel/rcu/tree.c|2831| <<__call_rcu_core>> invoke_rcu_core();
++ *   - kernel/rcu/tree_plugin.h|1559| <<rcu_needs_cpu>> invoke_rcu_core();
++ *   - kernel/rcu/tree_plugin.h|1601| <<rcu_prepare_for_idle>> invoke_rcu_core();
++ *   - kernel/rcu/tree_plugin.h|1615| <<rcu_prepare_for_idle>> invoke_rcu_core();
++ *   - kernel/rcu/tree_plugin.h|1647| <<rcu_cleanup_after_idle>> invoke_rcu_core();
++ *   - kernel/rcu/tree_plugin.h|2008| <<__call_rcu_nocb>> invoke_rcu_core();
++ */
+ static void invoke_rcu_core(void)
+ {
+ 	if (cpu_online(smp_processor_id()))
+@@ -2800,6 +2880,10 @@ static void invoke_rcu_core(void)
+ /*
+  * Handle any core-RCU processing required by a call_rcu() invocation.
+  */
++/*
++ * called only by:
++ *   - kernel/rcu/tree.c|2938| <<__call_rcu>> __call_rcu_core(rdp, head, flags);
++ */
+ static void __call_rcu_core(struct rcu_data *rdp, struct rcu_head *head,
+ 			    unsigned long flags)
+ {
+@@ -2855,6 +2939,12 @@ static void rcu_leak_callback(struct rcu_head *rhp)
+  * a CPU only if that CPU is a no-CBs CPU.  Currently, only rcu_barrier()
+  * is expected to specify a CPU.
+  */
++/*
++ * called by:
++ *   - kernel/rcu/tree.c|2994| <<call_rcu>> __call_rcu(head, func, -1, 0);
++ *   - kernel/rcu/tree.c|3007| <<kfree_call_rcu>> __call_rcu(head, func, -1, 1);
++ *   - kernel/rcu/tree.c|3279| <<rcu_barrier>> __call_rcu(&rdp->barrier_head,
++ */
+ static void
+ __call_rcu(struct rcu_head *head, rcu_callback_t func, int cpu, bool lazy)
+ {
+@@ -3094,6 +3184,10 @@ EXPORT_SYMBOL_GPL(cond_synchronize_rcu);
+  * CPU-local state are performed first.  However, we must check for CPU
+  * stalls first, else we might not get a chance.
+  */
++/*
++ * called only by:
++ *   - kernel/rcu/tree.c|2544| <<rcu_sched_clock_irq>> if (rcu_pending())
++ */
+ static int rcu_pending(void)
+ {
+ 	struct rcu_data *rdp = this_cpu_ptr(&rcu_data);
+@@ -3576,6 +3670,10 @@ static int rcu_pm_notify(struct notifier_block *self,
+ /*
+  * Spawn the kthreads that handle RCU's grace periods.
+  */
++/*
++ * 在下面被调用:
++ *   - kernel/rcu/tree.c|3687| <<global>> early_initcall(rcu_spawn_gp_kthread);
++ */
+ static int __init rcu_spawn_gp_kthread(void)
+ {
+ 	unsigned long flags;
+diff --git a/kernel/rcu/tree.h b/kernel/rcu/tree.h
+index bb4f995..28db997 100644
+--- a/kernel/rcu/tree.h
++++ b/kernel/rcu/tree.h
+@@ -342,6 +342,13 @@ struct rcu_state {
+ };
+ 
+ /* Values for rcu_state structure's gp_flags field. */
++/*
++ * 使用RCU_GP_FLAG_INIT的地方:
++ *   - kernel/rcu/tree.c|1551| <<rcu_start_this_gp>> WRITE_ONCE(rcu_state.gp_flags, rcu_state.gp_flags | RCU_GP_FLAG_INIT);
++ *   - kernel/rcu/tree.c|2102| <<rcu_gp_cleanup>> WRITE_ONCE(rcu_state.gp_flags, RCU_GP_FLAG_INIT);
++ *   - kernel/rcu/tree.c|2109| <<rcu_gp_cleanup>> rcu_state.gp_flags & RCU_GP_FLAG_INIT);
++ *   - kernel/rcu/tree.c|2140| <<rcu_gp_kthread>> RCU_GP_FLAG_INIT);
++ */
+ #define RCU_GP_FLAG_INIT 0x1	/* Need grace-period initialization. */
+ #define RCU_GP_FLAG_FQS  0x2	/* Need grace-period quiescent-state forcing. */
+ 
+@@ -383,6 +390,13 @@ static const char * const gp_state_names[] = {
+ #define RCU_ABBR 's'
+ #define RCU_NAME_RAW "rcu_sched"
+ #endif /* #else #ifdef CONFIG_PREEMPT_RCU */
++/*
++ * CONFIG_TRACING在desktop/server一般都开启
++ *
++ * 但是不管结果如何, RCU_NAME都直接或者间接指向RCU_NAME_RAW
++ *   - CONFIG_PREEMPT_RCU的情况下是  rcu_preempt(p)
++ *   - !CONFIG_PREEMPT_RCU的情况下是 rcu_sched (s)
++ */
+ #ifndef CONFIG_TRACING
+ #define RCU_NAME RCU_NAME_RAW
+ #else /* #ifdef CONFIG_TRACING */
+diff --git a/kernel/rcu/tree_exp.h b/kernel/rcu/tree_exp.h
+index 4c2a018..75ca993 100644
+--- a/kernel/rcu/tree_exp.h
++++ b/kernel/rcu/tree_exp.h
+@@ -451,6 +451,10 @@ static void sync_rcu_exp_select_cpus(void)
+ 			flush_work(&rnp->rew.rew_work);
+ }
+ 
++/*
++ * called by only:
++ *   - kernel/rcu/tree_exp.h|538| <<rcu_exp_wait_wake>> synchronize_sched_expedited_wait();
++ */
+ static void synchronize_sched_expedited_wait(void)
+ {
+ 	int cpu;
+@@ -531,6 +535,10 @@ static void synchronize_sched_expedited_wait(void)
+  * grace period.  Also update all the ->exp_seq_rq counters as needed
+  * in order to avoid counter-wrap problems.
+  */
++/*
++ * called by only:
++ *   - kernel/rcu/tree_exp.h|573| <<rcu_exp_sel_wait_wake>> rcu_exp_wait_wake(s);
++ */
+ static void rcu_exp_wait_wake(unsigned long s)
+ {
+ 	struct rcu_node *rnp;
+@@ -564,6 +572,11 @@ static void rcu_exp_wait_wake(unsigned long s)
+  * Common code to drive an expedited grace period forward, used by
+  * workqueues and mid-boot-time tasks.
+  */
++/*
++ * called by:
++ *   - kernel/rcu/tree_exp.h|584| <<wait_rcu_exp_gp>> rcu_exp_sel_wait_wake(rewp->rew_s);
++ *   - kernel/rcu/tree_exp.h|764| <<synchronize_rcu_expedited>> rcu_exp_sel_wait_wake(s);
++ */
+ static void rcu_exp_sel_wait_wake(unsigned long s)
+ {
+ 	/* Initialize the rcu_node tree in preparation for the wait. */
+@@ -576,6 +589,10 @@ static void rcu_exp_sel_wait_wake(unsigned long s)
+ /*
+  * Work-queue handler to drive an expedited grace period forward.
+  */
++/*
++ * used by only:
++ *   - kernel/rcu/tree_exp.h|781| <<synchronize_rcu_expedited>> INIT_WORK_ONSTACK(&rew.rew_work, wait_rcu_exp_gp);
++ */
+ static void wait_rcu_exp_gp(struct work_struct *wp)
+ {
+ 	struct rcu_exp_work *rewp;
+diff --git a/kernel/rcu/update.c b/kernel/rcu/update.c
+index cbaa976..04f73ba 100644
+--- a/kernel/rcu/update.c
++++ b/kernel/rcu/update.c
+@@ -431,6 +431,14 @@ EXPORT_SYMBOL_GPL(do_trace_rcu_torture_read);
+ #define RCU_STALL_DELAY_DELTA	       0
+ #endif
+ 
++/*
++ * 在以下被修改:
++ *   - kernel/rcu/rcu.h|241| <<rcu_ftrace_dump_stall_suppress>> rcu_cpu_stall_suppress = 3; \
++ *   - kernel/rcu/rcu.h|247| <<rcu_ftrace_dump_stall_unsuppress>> rcu_cpu_stall_suppress = 0; \
++ *   - kernel/rcu/update.c|463| <<rcu_sysrq_start>> rcu_cpu_stall_suppress = 2;
++ *   - kernel/rcu/update.c|469| <<rcu_sysrq_end>> rcu_cpu_stall_suppress = 0;
++ *   - kernel/rcu/update.c|474| <<rcu_panic>> rcu_cpu_stall_suppress = 1;
++ */
+ int rcu_cpu_stall_suppress __read_mostly; /* 1 = suppress stall warnings. */
+ EXPORT_SYMBOL_GPL(rcu_cpu_stall_suppress);
+ static int rcu_cpu_stall_timeout __read_mostly = CONFIG_RCU_CPU_STALL_TIMEOUT;
+@@ -612,6 +620,10 @@ void rcu_barrier_tasks(void)
+ EXPORT_SYMBOL_GPL(rcu_barrier_tasks);
+ 
+ /* See if tasks are still holding out, complain if so. */
++/*
++ * called by only:
++ *   - kernel/rcu/update.c|765| <<rcu_tasks_kthread>> check_holdout_task(t, needreport, &firstreport);
++ */
+ static void check_holdout_task(struct task_struct *t,
+ 			       bool needreport, bool *firstreport)
+ {
+diff --git a/kernel/time/timer.c b/kernel/time/timer.c
+index 2fce056..274a5d2 100644
+--- a/kernel/time/timer.c
++++ b/kernel/time/timer.c
+@@ -1625,6 +1625,11 @@ static inline int collect_expired_timers(struct timer_base *base,
+  * Called from the timer interrupt handler to charge one tick to the current
+  * process.  user_tick is 1 if the tick is user time, 0 for system.
+  */
++/*
++ * 在x86下:
++ *   - kernel/time/tick-common.c|88| <<tick_periodic>> update_process_times(user_mode(get_irq_regs()));
++ *   - kernel/time/tick-sched.c|161| <<tick_sched_handle>> update_process_times(user_mode(regs));
++ */
+ void update_process_times(int user_tick)
+ {
+ 	struct task_struct *p = current;
+@@ -1632,6 +1637,9 @@ void update_process_times(int user_tick)
+ 	/* Note: this timer irq context must be accounted for as well. */
+ 	account_process_tick(p, user_tick);
+ 	run_local_timers();
++	/*
++	 * 这个函数以前叫rcu_check_callbacks()
++	 */
+ 	rcu_sched_clock_irq(user_tick);
+ #ifdef CONFIG_IRQ_WORK
+ 	if (in_irq())
+-- 
+2.7.4
+
