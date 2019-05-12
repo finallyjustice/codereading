@@ -1,28 +1,299 @@
-From 900079c17e2793cf5d93b685b4fd02e3677d3fdc Mon Sep 17 00:00:00 2001
+From edf255470214dca325c1c740798a58d63e801491 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Thu, 9 May 2019 01:39:32 +0800
+Date: Mon, 13 May 2019 06:14:49 +0800
 Subject: [PATCH 1/1] linux-apic-for-4.14.113
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
- arch/x86/kernel/apic/io_apic.c  | 32 ++++++++++++++++++++++++++++++++
- arch/x86/kernel/apic/probe_64.c | 13 +++++++++++++
- arch/x86/kernel/dumpstack.c     |  6 ++++++
- arch/x86/kernel/i8259.c         |  7 +++++++
- arch/x86/kernel/time.c          | 19 +++++++++++++++++++
- kernel/irq/chip.c               |  3 +++
- kernel/kexec_core.c             | 21 +++++++++++++++++++++
- kernel/panic.c                  |  7 +++++++
- kernel/time/tick-common.c       |  5 +++++
- kernel/time/tick-oneshot.c      |  9 +++++++++
- 10 files changed, 122 insertions(+)
+ arch/x86/include/asm/i8259.h    |  15 +++
+ arch/x86/include/asm/io_apic.h  |  10 ++
+ arch/x86/kernel/apic/io_apic.c  | 262 ++++++++++++++++++++++++++++++++++++++++
+ arch/x86/kernel/apic/probe_64.c |  13 ++
+ arch/x86/kernel/apic/vector.c   |   4 +
+ arch/x86/kernel/dumpstack.c     |   6 +
+ arch/x86/kernel/i8259.c         | 149 +++++++++++++++++++++++
+ arch/x86/kernel/time.c          |  21 ++++
+ arch/x86/kernel/x86_init.c      |   7 ++
+ kernel/irq/chip.c               |   3 +
+ kernel/irq/irqdomain.c          |   5 +
+ kernel/kexec_core.c             |  21 ++++
+ kernel/panic.c                  |   7 ++
+ kernel/time/tick-common.c       |   5 +
+ kernel/time/tick-oneshot.c      |   9 ++
+ 15 files changed, 537 insertions(+)
 
+diff --git a/arch/x86/include/asm/i8259.h b/arch/x86/include/asm/i8259.h
+index 89789e8..b447b42 100644
+--- a/arch/x86/include/asm/i8259.h
++++ b/arch/x86/include/asm/i8259.h
+@@ -61,9 +61,20 @@ struct legacy_pic {
+ 	void (*unmask)(unsigned int irq);
+ 	void (*mask_all)(void);
+ 	void (*restore_mask)(void);
++	/*
++	 * called by:
++	 *   - arch/x86/kernel/apic/io_apic.c|2166| <<check_timer>> legacy_pic->init(1);
++	 *   - arch/x86/kernel/apic/io_apic.c|2315| <<check_timer>> legacy_pic->init(0);
++	 *   - arch/x86/kernel/irqinit.c|68| <<init_ISA_irqs>> legacy_pic->init(0);
++	 */
+ 	void (*init)(int auto_eoi);
+ 	int (*probe)(void);
+ 	int (*irq_pending)(unsigned int irq);
++	/*
++	 * calld by:
++	 *   - arch/x86/kernel/apic/io_apic.c|1977| <<init_IO_APIC_traps>> legacy_pic->make_irq(irq);
++	 *   - arch/x86/kernel/apic/io_apic.c|2316| <<check_timer>> legacy_pic->make_irq(0);
++	 */
+ 	void (*make_irq)(unsigned int irq);
+ };
+ 
+@@ -75,6 +86,10 @@ static inline bool has_legacy_pic(void)
+ 	return legacy_pic != &null_legacy_pic;
+ }
+ 
++/*
++ * 在default_legacy_pic返回NR_IRQS_LEGACY(16)
++ * 在null_legacy_pic返回0
++ */
+ static inline int nr_legacy_irqs(void)
+ {
+ 	return legacy_pic->nr_legacy_irqs;
+diff --git a/arch/x86/include/asm/io_apic.h b/arch/x86/include/asm/io_apic.h
+index 5c27e14..ad0a20d 100644
+--- a/arch/x86/include/asm/io_apic.h
++++ b/arch/x86/include/asm/io_apic.h
+@@ -150,6 +150,16 @@ extern unsigned long io_apic_irqs;
+  * If we use the IO-APIC for IRQ routing, disable automatic
+  * assignment of PCI IRQ's.
+  */
++/*
++ * used by:
++ *   - arch/x86/pci/irq.c|898| <<pcibios_lookup_irq>> if (io_apic_assign_pci_irqs)
++ *   - arch/x86/pci/irq.c|1051| <<pcibios_fixup_irqs>> if (io_apic_assign_pci_irqs)
++ *   - arch/x86/pci/irq.c|1147| <<pcibios_irq_init>> if (io_apic_assign_pci_irqs)
++ *   - arch/x86/pci/irq.c|1153| <<pcibios_irq_init>> if (io_apic_assign_pci_irqs && pci_routeirq) {
++ *   - arch/x86/pci/irq.c|1198| <<pirq_enable_irq>> if (!io_apic_assign_pci_irqs && dev->irq)
++ *   - arch/x86/pci/irq.c|1201| <<pirq_enable_irq>> if (io_apic_assign_pci_irqs) {
++ *   - arch/x86/pci/irq.c|1275| <<pirq_disable_irq>> if (io_apic_assign_pci_irqs && !mp_should_keep_irq(&dev->dev) &&
++ */
+ #define io_apic_assign_pci_irqs \
+ 	(mp_irq_entries && !skip_ioapic_setup && io_apic_irqs)
+ 
 diff --git a/arch/x86/kernel/apic/io_apic.c b/arch/x86/kernel/apic/io_apic.c
-index 96a8a68..67e3937 100644
+index 96a8a68..7805f24 100644
 --- a/arch/x86/kernel/apic/io_apic.c
 +++ b/arch/x86/kernel/apic/io_apic.c
-@@ -1597,6 +1597,10 @@ __setup("no_timer_check", notimercheck);
+@@ -88,6 +88,22 @@ struct irq_pin_list {
+ };
+ 
+ struct mp_chip_data {
++	/*
++	 * 使用的地方:
++	 *   - arch/x86/kernel/apic/io_apic.c|414| <<__add_pin_to_irq_node>> for_each_irq_pin(entry, data->irq_2_pin)
++	 *   - arch/x86/kernel/apic/io_apic.c|426| <<__add_pin_to_irq_node>> list_add_tail(&entry->list, &data->irq_2_pin);
++	 *   - arch/x86/kernel/apic/io_apic.c|435| <<__remove_pin_from_irq>> list_for_each_entry_safe(entry, tmp, &data->irq_2_pin, list)
++	 *   - arch/x86/kernel/apic/io_apic.c|463| <<replace_pin_at_irq_node>> for_each_irq_pin(entry, data->irq_2_pin) {
++	 *   - arch/x86/kernel/apic/io_apic.c|488| <<io_apic_modify_irq>> for_each_irq_pin(entry, data->irq_2_pin) {
++	 *   - arch/x86/kernel/apic/io_apic.c|578| <<eoi_ioapic_pin>> for_each_irq_pin(entry, data->irq_2_pin)
++	 *   - arch/x86/kernel/apic/io_apic.c|1410| <<print_IO_APICs>> if (list_empty(&data->irq_2_pin))
++	 *   - arch/x86/kernel/apic/io_apic.c|1414| <<print_IO_APICs>> for_each_irq_pin(entry, data->irq_2_pin)
++	 *   - arch/x86/kernel/apic/io_apic.c|1763| <<io_apic_level_ack_pending>> for_each_irq_pin(entry, data->irq_2_pin) {
++	 *   - arch/x86/kernel/apic/io_apic.c|1930| <<ioapic_set_affinity>> for_each_irq_pin(entry, data->irq_2_pin)
++	 *   - arch/x86/kernel/apic/io_apic.c|3113| <<mp_irqdomain_alloc>> INIT_LIST_HEAD(&data->irq_2_pin);
++	 *   - arch/x86/kernel/apic/io_apic.c|3151| <<mp_irqdomain_free>> WARN_ON(!list_empty(&data->irq_2_pin));
++	 *   - arch/x86/kernel/apic/io_apic.c|3165| <<mp_irqdomain_activate>> for_each_irq_pin(entry, data->irq_2_pin)
++	 */
+ 	struct list_head irq_2_pin;
+ 	struct IO_APIC_route_entry entry;
+ 	int trigger;
+@@ -105,6 +121,15 @@ static struct ioapic {
+ 	/*
+ 	 * # of IRQ routing registers
+ 	 */
++	/*
++	 * used by:
++	 *   - arch/x86/kernel/apic/io_apic.c|73| <<for_each_pin>> for ((pin) = 0; (pin) < ioapics[(idx)].nr_registers; (pin)++)
++	 *   - arch/x86/kernel/apic/io_apic.c|240| <<alloc_ioapic_saved_registers>> size = sizeof(struct IO_APIC_route_entry) * ioapics[idx].nr_registers;
++	 *   - arch/x86/kernel/apic/io_apic.c|1324| <<print_IO_APICs>> ioapics[ioapic_idx].nr_registers);
++	 *   - arch/x86/kernel/apic/io_apic.c|2752| <<find_free_ioapic_entry>> if (ioapics[idx].nr_registers == 0)
++	 *   - arch/x86/kernel/apic/io_apic.c|2849| <<mp_register_ioapic>> ioapics[idx].nr_registers = entries;
++	 *   - arch/x86/kernel/apic/io_apic.c|2890| <<mp_unregister_ioapic>> ioapics[ioapic].nr_registers = 0;
++	 */
+ 	int nr_registers;
+ 	/*
+ 	 * Saved state during suspend/resume, or while enabling intr-remap.
+@@ -176,6 +201,24 @@ int nr_ioapics;
+ /* The one past the highest gsi number used */
+ u32 gsi_top;
+ 
++/*
++ * 在以下被使用:
++ *   - mp_config_acpi_legacy_irqs()
++ *   - mp_save_irq()
++ *   - find_irq_entry()
++ *   - find_isa_irq_pin()
++ *   - find_isa_irq_apic()
++ *   - default_EISA_trigger()
++ *   - irq_polarity()
++ *   - irq_trigger()
++ *   - mp_map_pin_to_irq()
++ *   - pin_2_irq()
++ *   - IO_APIC_get_PCI_irq_vector()
++ *   - setup_ioapic_ids_from_mpc_nocheck()
++ *   - get_MP_intsrc_index()
++ *   - check_irq_src()
++ *   - replace_intsrc_all()
++ */
+ /* MP IRQ source entries */
+ struct mpc_intsrc mp_irqs[MAX_IRQ_SOURCES];
+ 
+@@ -303,10 +346,18 @@ union entry_union {
+ 	struct IO_APIC_route_entry entry;
+ };
+ 
++/*
++ * called by:
++ *   - arch/x86/kernel/apic/io_apic.c|322| <<ioapic_read_entry>> eu.entry = __ioapic_read_entry(apic, pin);
++ *   - arch/x86/kernel/apic/io_apic.c|516| <<__eoi_ioapic_pin>> entry = entry1 = __ioapic_read_entry(apic, pin);
++ */
+ static struct IO_APIC_route_entry __ioapic_read_entry(int apic, int pin)
+ {
+ 	union entry_union eu;
+ 
++	/*
++	 * 乘以2是因为一个entry是64 bits
++	 */
+ 	eu.w1 = io_apic_read(apic, 0x10 + 2 * pin);
+ 	eu.w2 = io_apic_read(apic, 0x11 + 2 * pin);
+ 
+@@ -415,12 +466,32 @@ static void add_pin_to_irq_node(struct mp_chip_data *data,
+ /*
+  * Reroute an IRQ to a different pin.
   */
++/*
++ * called by only:
++ *   - arch/x86/kernel/apic/io_apic.c|2226| <<check_timer>> replace_pin_at_irq_node(data, node, apic1, pin1, apic2, pin2);
++ */
+ static void __init replace_pin_at_irq_node(struct mp_chip_data *data, int node,
+ 					   int oldapic, int oldpin,
+ 					   int newapic, int newpin)
+ {
+ 	struct irq_pin_list *entry;
+ 
++	/*
++	 * 使用的地方:
++	 *   - arch/x86/kernel/apic/io_apic.c|414| <<__add_pin_to_irq_node>> for_each_irq_pin(entry, data->irq_2_pin)
++	 *   - arch/x86/kernel/apic/io_apic.c|426| <<__add_pin_to_irq_node>> list_add_tail(&entry->list, &data->irq_2_pin);
++	 *   - arch/x86/kernel/apic/io_apic.c|435| <<__remove_pin_from_irq>> list_for_each_entry_safe(entry, tmp, &data->irq_2_pin, list)
++	 *   - arch/x86/kernel/apic/io_apic.c|463| <<replace_pin_at_irq_node>> for_each_irq_pin(entry, data->irq_2_pin) {
++	 *   - arch/x86/kernel/apic/io_apic.c|488| <<io_apic_modify_irq>> for_each_irq_pin(entry, data->irq_2_pin) {
++	 *   - arch/x86/kernel/apic/io_apic.c|578| <<eoi_ioapic_pin>> for_each_irq_pin(entry, data->irq_2_pin)
++	 *   - arch/x86/kernel/apic/io_apic.c|1410| <<print_IO_APICs>> if (list_empty(&data->irq_2_pin))
++	 *   - arch/x86/kernel/apic/io_apic.c|1414| <<print_IO_APICs>> for_each_irq_pin(entry, data->irq_2_pin)
++	 *   - arch/x86/kernel/apic/io_apic.c|1763| <<io_apic_level_ack_pending>> for_each_irq_pin(entry, data->irq_2_pin) {
++	 *   - arch/x86/kernel/apic/io_apic.c|1930| <<ioapic_set_affinity>> for_each_irq_pin(entry, data->irq_2_pin)
++	 *   - arch/x86/kernel/apic/io_apic.c|3113| <<mp_irqdomain_alloc>> INIT_LIST_HEAD(&data->irq_2_pin);
++	 *   - arch/x86/kernel/apic/io_apic.c|3151| <<mp_irqdomain_free>> WARN_ON(!list_empty(&data->irq_2_pin));
++	 *   - arch/x86/kernel/apic/io_apic.c|3165| <<mp_irqdomain_activate>> for_each_irq_pin(entry, data->irq_2_pin)
++	 */
+ 	for_each_irq_pin(entry, data->irq_2_pin) {
+ 		if (entry->apic == oldapic && entry->pin == oldpin) {
+ 			entry->apic = newapic;
+@@ -541,6 +612,15 @@ static void eoi_ioapic_pin(int vector, struct mp_chip_data *data)
+ 	raw_spin_unlock_irqrestore(&ioapic_lock, flags);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kernel/apic/io_apic.c|636| <<clear_IO_APIC>> clear_IO_APIC_pin(apic, pin);
++ *   - arch/x86/kernel/apic/io_apic.c|2033| <<unlock_ExtINT_logic>> clear_IO_APIC_pin(apic, pin);
++ *   - arch/x86/kernel/apic/io_apic.c|2062| <<unlock_ExtINT_logic>> clear_IO_APIC_pin(apic, pin);
++ *   - arch/x86/kernel/apic/io_apic.c|2209| <<check_timer>> clear_IO_APIC_pin(0, pin1);
++ *   - arch/x86/kernel/apic/io_apic.c|2214| <<check_timer>> clear_IO_APIC_pin(apic1, pin1);
++ *   - arch/x86/kernel/apic/io_apic.c|2239| <<check_timer>> clear_IO_APIC_pin(apic2, pin2);
++ */
+ static void clear_IO_APIC_pin(unsigned int apic, unsigned int pin)
+ {
+ 	struct IO_APIC_route_entry entry;
+@@ -588,6 +668,11 @@ static void clear_IO_APIC_pin(unsigned int apic, unsigned int pin)
+ 		       mpc_ioapic_id(apic), pin);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kernel/apic/io_apic.c|1410| <<enable_IO_APIC>> clear_IO_APIC();
++ *   - arch/x86/kernel/apic/io_apic.c|1449| <<disable_IO_APIC>> clear_IO_APIC();
++ */
+ static void clear_IO_APIC (void)
+ {
+ 	int apic, pin;
+@@ -717,6 +802,9 @@ static int find_irq_entry(int ioapic_idx, int pin, int type)
+ /*
+  * Find the pin to which IRQ[irq] (ISA) is connected
+  */
++/*
++ * 通过mptable读取
++ */
+ static int __init find_isa_irq_pin(int irq, int type)
+ {
+ 	int i;
+@@ -733,6 +821,9 @@ static int __init find_isa_irq_pin(int irq, int type)
+ 	return -1;
+ }
+ 
++/*
++ * 通过mptable读取
++ */
+ static int __init find_isa_irq_apic(int irq, int type)
+ {
+ 	int i;
+@@ -1312,6 +1403,10 @@ static void __init print_IO_APIC(int ioapic_idx)
+ 	io_apic_print_entries(ioapic_idx, reg_01.bits.entries);
+ }
+ 
++/*
++ * called by only:
++ *   - arch/x86/kernel/apic/vector.c|993| <<print_ICs>> print_IO_APICs();
++ */
+ void __init print_IO_APICs(void)
+ {
+ 	int ioapic_idx;
+@@ -1356,9 +1451,28 @@ void __init print_IO_APICs(void)
+ 	printk(KERN_INFO ".................................... done.\n");
+ }
+ 
++/*
++ * used by:
++ *   - arch/x86/kernel/apic/io_apic.c|1381| <<enable_IO_APIC>> ioapic_i8259.apic = apic;
++ *   - arch/x86/kernel/apic/io_apic.c|1382| <<enable_IO_APIC>> ioapic_i8259.pin = pin;
++ *   - arch/x86/kernel/apic/io_apic.c|1395| <<enable_IO_APIC>> if ((ioapic_i8259.pin == -1) && (i8259_pin >= 0)) {
++ *   - arch/x86/kernel/apic/io_apic.c|1397| <<enable_IO_APIC>> ioapic_i8259.pin = i8259_pin;
++ *   - arch/x86/kernel/apic/io_apic.c|1398| <<enable_IO_APIC>> ioapic_i8259.apic = i8259_apic;
++ *   - arch/x86/kernel/apic/io_apic.c|1401| <<enable_IO_APIC>> if (((ioapic_i8259.apic != i8259_apic) || (ioapic_i8259.pin != i8259_pin)) &&
++ *   - arch/x86/kernel/apic/io_apic.c|1402| <<enable_IO_APIC>> (i8259_pin >= 0) && (ioapic_i8259.pin >= 0))
++ *   - arch/x86/kernel/apic/io_apic.c|1420| <<native_disable_io_apic>> if (ioapic_i8259.pin != -1) {
++ *   - arch/x86/kernel/apic/io_apic.c|1434| <<native_disable_io_apic>> ioapic_write_entry(ioapic_i8259.apic, ioapic_i8259.pin, entry);
++ *   - arch/x86/kernel/apic/io_apic.c|1438| <<native_disable_io_apic>> disconnect_bsp_APIC(ioapic_i8259.pin != -1);
++ *   - arch/x86/kernel/apic/io_apic.c|2079| <<check_timer>> pin2 = ioapic_i8259.pin;
++ *   - arch/x86/kernel/apic/io_apic.c|2080| <<check_timer>> apic2 = ioapic_i8259.apic;
++ */
+ /* Where if anywhere is the i8259 connect in external int mode */
+ static struct { int pin, apic; } ioapic_i8259 = { -1, -1 };
+ 
++/*
++ * called by only:
++ *   - arch/x86/kernel/apic/apic.c|2361| <<apic_bsp_setup>> enable_IO_APIC();
++ */
+ void __init enable_IO_APIC(void)
+ {
+ 	int i8259_apic, i8259_pin;
+@@ -1595,8 +1709,15 @@ __setup("no_timer_check", notimercheck);
+  *	- if this function detects that timer IRQs are defunct, then we fall
+  *	  back to ISA timer IRQs
+  */
++/*
++ * 在timer_irq_works()中测试的时候会激活中断
++ */
  static int __init timer_irq_works(void)
  {
 +	/*
@@ -32,8 +303,55 @@ index 96a8a68..67e3937 100644
  	unsigned long t1 = jiffies;
  	unsigned long flags;
  
-@@ -2029,6 +2033,9 @@ static int mp_alloc_timer_irq(int ioapic, int pin)
+@@ -1925,9 +2046,26 @@ static struct irq_chip lapic_chip __read_mostly = {
+ 	.irq_ack	= ack_lapic_irq,
+ };
+ 
++/*
++ * called by:
++ *   - arch/x86/kernel/apic/io_apic.c|2278| <<check_timer>> lapic_register_intr(0);
++ */
+ static void lapic_register_intr(int irq)
+ {
+ 	irq_clear_status_flags(irq, IRQ_LEVEL);
++	/*
++	 * 在部分以下调用:
++	 *   - arch/x86/kernel/apic/io_apic.c|2056| <<lapic_register_intr>> irq_set_chip_and_handler_name(irq, &lapic_chip, handle_edge_irq,
++	 *   - kernel/irq/irqdomain.c|1797| <<irq_domain_set_info>> irq_set_chip_and_handler_name(virq, chip, handler, handler_name);
++	 *   - include/linux/irq.h|620| <<irq_set_chip_and_handler>> irq_set_chip_and_handler_name(irq, chip, handle, NULL);
++	 *   - drivers/xen/events/events_base.c|702| <<xen_bind_pirq_gsi_to_irq>> irq_set_chip_and_handler_name(irq, &xen_pirq_chip,
++	 *   - drivers/xen/events/events_base.c|705| <<xen_bind_pirq_gsi_to_irq>> irq_set_chip_and_handler_name(irq, &xen_pirq_chip,
++	 *   - drivers/xen/events/events_base.c|741| <<xen_bind_pirq_msi_to_irq>> irq_set_chip_and_handler_name(irq + i, &xen_pirq_chip, handle_edge_irq, name);
++	 *   - drivers/xen/events/events_base.c|846| <<bind_evtchn_to_irq>> irq_set_chip_and_handler_name(irq, &xen_dynamic_chip,
++	 *   - drivers/xen/events/events_base.c|884| <<bind_ipi_to_irq>> irq_set_chip_and_handler_name(irq, &xen_percpu_chip,
++	 *   - drivers/xen/events/events_base.c|976| <<bind_virq_to_irq>> irq_set_chip_and_handler_name(irq, &xen_percpu_chip,
++	 *   - drivers/xen/events/events_base.c|979| <<bind_virq_to_irq>> irq_set_chip_and_handler_name(irq, &xen_dynamic_chip,
++	 */
+ 	irq_set_chip_and_handler_name(irq, &lapic_chip, handle_edge_irq,
+ 				      "edge");
+ }
+@@ -1945,11 +2083,13 @@ static inline void __init unlock_ExtINT_logic(void)
+ 	struct IO_APIC_route_entry entry0, entry1;
+ 	unsigned char save_control, save_freq_select;
+ 
++	/* 通过mptable读取 */
+ 	pin  = find_isa_irq_pin(8, mp_INT);
+ 	if (pin == -1) {
+ 		WARN_ON_ONCE(1);
+ 		return;
+ 	}
++	/* 通过mptable读取 */
+ 	apic = find_isa_irq_apic(8, mp_INT);
+ 	if (apic == -1) {
+ 		WARN_ON_ONCE(1);
+@@ -2027,8 +2167,15 @@ static int mp_alloc_timer_irq(int ioapic, int pin)
+  *
+  * FIXME: really need to revamp this for all platforms.
   */
++/*
++ * called by only:
++ *   - arch/x86/kernel/apic/io_apic.c|2312| <<setup_IO_APIC>> check_timer();
++ */
  static inline void __init check_timer(void)
  {
 +	/*
@@ -42,7 +360,7 @@ index 96a8a68..67e3937 100644
  	struct irq_data *irq_data = irq_get_irq_data(0);
  	struct mp_chip_data *data = irq_data->chip_data;
  	struct irq_cfg *cfg = irqd_cfg(irq_data);
-@@ -2042,6 +2049,13 @@ static inline void __init check_timer(void)
+@@ -2042,6 +2189,15 @@ static inline void __init check_timer(void)
  	/*
  	 * get/set the timer IRQ vector:
  	 */
@@ -52,12 +370,28 @@ index 96a8a68..67e3937 100644
 +	 *   - null_legacy_pic
 +	 *
 +	 * 这里的参数0是irq
++	 *
++	 * 对于mask_8259A_irq(): 通过IMR寄存器在8259禁用某个irq line
 +	 */
  	legacy_pic->mask(0);
  
  	/*
-@@ -2061,6 +2075,13 @@ static inline void __init check_timer(void)
+@@ -2054,13 +2210,27 @@ static inline void __init check_timer(void)
+ 	 * automatically.
+ 	 */
+ 	apic_write(APIC_LVT0, APIC_LVT_MASKED | APIC_DM_EXTINT);
++	/*
++	 * init_8259A()
++	 */
+ 	legacy_pic->init(1);
+ 
++	/* 通过mptable读取 */
+ 	pin1  = find_isa_irq_pin(0, mp_INT);
++	/* 通过mptable读取 */
+ 	apic1 = find_isa_irq_apic(0, mp_INT);
++	/* 从ioapic获取的 */
  	pin2  = ioapic_i8259.pin;
++	/* 从ioapic获取的 */
  	apic2 = ioapic_i8259.apic;
  
 +	/*
@@ -70,7 +404,7 @@ index 96a8a68..67e3937 100644
  	apic_printk(APIC_QUIET, KERN_INFO "..TIMER: vector=0x%02X "
  		    "apic1=%d pin1=%d apic2=%d pin2=%d\n",
  		    cfg->vector, apic1, pin1, apic2, pin2);
-@@ -2072,6 +2093,14 @@ static inline void __init check_timer(void)
+@@ -2072,6 +2242,14 @@ static inline void __init check_timer(void)
  	 * was found above, try it both directly and through the
  	 * 8259A.
  	 */
@@ -85,16 +419,152 @@ index 96a8a68..67e3937 100644
  	if (pin1 == -1) {
  		panic_if_irq_remap("BIOS bug: timer not connected to IO-APIC");
  		pin1 = pin2;
-@@ -2088,6 +2117,9 @@ static inline void __init check_timer(void)
+@@ -2088,17 +2266,41 @@ static inline void __init check_timer(void)
  			mp_alloc_timer_irq(apic1, pin1);
  		} else {
  			/*
 +			 * 目前测试的kvm和xen都是执行这里
++			 *
++			 * 在测试xen domU中boot和kdump的例子都是:
++			 * ..TIMER: vector=0x30 apic1=0 pin1=2 apic2=0 pin2=0
 +			 */
 +			/*
  			 * for edge trigger, it's already unmasked,
  			 * so only need to unmask if it is level-trigger
  			 * do we really have level trigger timer?
+ 			 */
+ 			int idx;
++			/*
++			 * 在测试xen domU中boot和kdump的例子都是:
++			 * ..TIMER: vector=0x30 apic1=0 pin1=2 apic2=0 pin2=0
++			 *
++			 * 这里先尝试8254???
++			 */
+ 			idx = find_irq_entry(apic1, pin1, mp_INT);
+ 			if (idx != -1 && irq_trigger(idx))
+ 				unmask_ioapic_irq(irq_get_irq_data(0));
+ 		}
++		/*
++		 * irq_data来自一开始的:
++		 * struct irq_data *irq_data = irq_get_irq_data(0);
++		 */
+ 		irq_domain_deactivate_irq(irq_data);
+ 		irq_domain_activate_irq(irq_data);
++		/*
++		 * 先测试用ioapic处理的8254?? (pin 2接口)
++		 *
++		 * 在这里测试中:
++		 *   - 在8259上mask了irq 0
++		 *   - 在lapic上的lvt0禁用了8259
++		 *   - 在ioapic的pin 2 (irq line 2)上接收中断到irq 0 --> 当然是用 ioapic发的!!
++		 */
+ 		if (timer_irq_works()) {
+ 			if (disable_timer_pin_1 > 0)
+ 				clear_IO_APIC_pin(0, pin1);
+@@ -2116,12 +2318,30 @@ static inline void __init check_timer(void)
+ 		apic_printk(APIC_QUIET, KERN_INFO
+ 			    "..... (found apic %d pin %d) ...\n", apic2, pin2);
+ 		/*
++		 * 在测试xen domU中boot和kdump的例子都是:
++		 * ..TIMER: vector=0x30 apic1=0 pin1=2 apic2=0 pin2=0
++		 *
++		 * 下面用8259, 也就是pin 0接口, 定向到irq0
++		 */
++		/*
+ 		 * legacy devices should be connected to IO APIC #0
+ 		 */
+ 		replace_pin_at_irq_node(data, node, apic1, pin1, apic2, pin2);
+ 		irq_domain_deactivate_irq(irq_data);
+ 		irq_domain_activate_irq(irq_data);
++		/*
++		 * 对于unmask_8259A_irq(): 通过IMR寄存器在8259开通某个irq line
++		 */
+ 		legacy_pic->unmask(0);
++		/*
++		 * 这里测试的8259? pin 0接口
++		 *
++		 * 在这里的测试中:
++		 *   - 在8259上开通了irq 0
++		 *   - 在lapic上的lvt0依然禁用了8259???
++		 *   - 这里用io_apic发的???
++		 * 那中断是怎么发到cpu的????????
++		 */
+ 		if (timer_irq_works()) {
+ 			apic_printk(APIC_QUIET, KERN_INFO "....... works.\n");
+ 			goto out;
+@@ -2138,10 +2358,23 @@ static inline void __init check_timer(void)
+ 	apic_printk(APIC_QUIET, KERN_INFO
+ 		    "...trying to set up timer as Virtual Wire IRQ...\n");
+ 
++	/*
++	 * 下面又要开启lapic的LVT0
++	 */
+ 	lapic_register_intr(0);
++	/*
++	 * 用APIC_DM_FIXED需要制定vector
++	 *
++	 * cfg来自函数一开始的
++	 * struct irq_data *irq_data = irq_get_irq_data(0);
++	 * struct irq_cfg *cfg = irqd_cfg(irq_data);
++	 */
+ 	apic_write(APIC_LVT0, APIC_DM_FIXED | cfg->vector);	/* Fixed mode */
+ 	legacy_pic->unmask(0);
+ 
++	/*
++	 *
++	 */
+ 	if (timer_irq_works()) {
+ 		apic_printk(APIC_QUIET, KERN_INFO "..... works.\n");
+ 		goto out;
+@@ -2154,12 +2387,37 @@ static inline void __init check_timer(void)
+ 	apic_printk(APIC_QUIET, KERN_INFO
+ 		    "...trying to set up timer as ExtINT IRQ...\n");
+ 
++	/*
++	 * 下面用另外一种方式开启lapic的LVT0
++	 *
++	 * default_legacy_pic:
++	 *   init_8259A()
++	 *   make_8259A_irq()
++	 */
+ 	legacy_pic->init(0);
++	/*
++	 * make_8259A_irq()
++	 * 配置8259使某个irq line通过8259, 而不通过ioapic了
++	 * 这里在io_apic_irqs把某个irq line的bit清0, 说明不通过ioapic了
++	 * 通过下面设置中断的chip:
++	 *   - irq_set_chip_and_handler(irq, &i8259A_chip, handle_level_irq);
++	 *
++	 * io_apic_irqs是一个bitmap, 说明那个irq line是用的io_apic
++	 * used by:
++	 *   - arch/x86/include/asm/io_apic.h|147| <<IO_APIC_IRQ>> #define IO_APIC_IRQ(x) (((x) >= NR_IRQS_LEGACY) || ((1 << (x)) & io_apic_irqs))
++	 *   - arch/x86/include/asm/io_apic.h|154| <<io_apic_assign_pci_irqs>> (mp_irq_entries && !skip_ioapic_setup && io_apic_irqs)
++	 *   - arch/x86/kernel/apic/io_apic.c|284| <<arch_early_ioapic_init>> io_apic_irqs = ~0UL;
++	 *   - arch/x86/kernel/apic/io_apic.c|2427| <<setup_IO_APIC>> io_apic_irqs = nr_legacy_irqs() ? ~PIC_IRQS : ~0UL;
++	 *   - arch/x86/kernel/i8259.c|115| <<make_8259A_irq>> io_apic_irqs &= ~(1<<irq);
++	 */
+ 	legacy_pic->make_irq(0);
+ 	apic_write(APIC_LVT0, APIC_DM_EXTINT);
+ 
+ 	unlock_ExtINT_logic();
+ 
++	/*
++	 *
++	 */
+ 	if (timer_irq_works()) {
+ 		apic_printk(APIC_QUIET, KERN_INFO "..... works.\n");
+ 		goto out;
+@@ -2255,6 +2513,10 @@ static void ioapic_destroy_irqdomain(int idx)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kernel/apic/apic.c|2364| <<apic_bsp_setup>> setup_IO_APIC();
++ */
+ void __init setup_IO_APIC(void)
+ {
+ 	int ioapic;
 diff --git a/arch/x86/kernel/apic/probe_64.c b/arch/x86/kernel/apic/probe_64.c
 index c303054..e714f47 100644
 --- a/arch/x86/kernel/apic/probe_64.c
@@ -126,6 +596,21 @@ index c303054..e714f47 100644
  		if ((*drv)->probe && (*drv)->probe()) {
  			if (apic != *drv) {
  				apic = *drv;
+diff --git a/arch/x86/kernel/apic/vector.c b/arch/x86/kernel/apic/vector.c
+index b958082..a379ce1 100644
+--- a/arch/x86/kernel/apic/vector.c
++++ b/arch/x86/kernel/apic/vector.c
+@@ -396,6 +396,10 @@ static const struct irq_domain_ops x86_vector_domain_ops = {
+ 	.free	= x86_vector_free_irqs,
+ };
+ 
++/*
++ * called by only:
++ *   - kernel/irq/irqdesc.c|490| <<early_irq_init>> initcnt = arch_probe_nr_irqs();
++ */
+ int __init arch_probe_nr_irqs(void)
+ {
+ 	int nr;
 diff --git a/arch/x86/kernel/dumpstack.c b/arch/x86/kernel/dumpstack.c
 index 224de37..aa6fef2 100644
 --- a/arch/x86/kernel/dumpstack.c
@@ -144,10 +629,288 @@ index 224de37..aa6fef2 100644
  {
  	if (regs && kexec_should_crash(current))
 diff --git a/arch/x86/kernel/i8259.c b/arch/x86/kernel/i8259.c
-index 02abc13..03589ff 100644
+index 02abc13..69d8f13 100644
 --- a/arch/x86/kernel/i8259.c
 +++ b/arch/x86/kernel/i8259.c
-@@ -419,6 +419,13 @@ struct legacy_pic default_legacy_pic = {
+@@ -32,6 +32,11 @@
+  */
+ static void init_8259A(int auto_eoi);
+ 
++/*
++ * used by:
++ *   - arch/x86/kernel/i8259.c|346| <<i8259A_resume>> init_8259A(i8259A_auto_eoi);
++ *   - arch/x86/kernel/i8259.c|452| <<init_8259A>> i8259A_auto_eoi = auto_eoi;
++ */
+ static int i8259A_auto_eoi;
+ DEFINE_RAW_SPINLOCK(i8259A_lock);
+ 
+@@ -42,6 +47,15 @@ DEFINE_RAW_SPINLOCK(i8259A_lock);
+ /*
+  * This contains the irq mask for both 8259A irq controllers,
+  */
++/*
++ * used by:
++ *   - arch/x86/include/asm/i8259.h|11| <<cached_master_mask>> #define cached_master_mask (__byte(0, cached_irq_mask))
++ *   - arch/x86/include/asm/i8259.h|12| <<cached_slave_mask>> #define cached_slave_mask (__byte(1, cached_irq_mask))
++ *   - arch/x86/kernel/i8259.c|64| <<mask_8259A_irq>> cached_irq_mask |= mask;
++ *   - arch/x86/kernel/i8259.c|83| <<unmask_8259A_irq>> cached_irq_mask &= mask;
++ *   - arch/x86/kernel/i8259.c|171| <<mask_and_ack_8259A>> if (cached_irq_mask & irqmask)
++ *   - arch/x86/kernel/i8259.c|173| <<mask_and_ack_8259A>> cached_irq_mask |= irqmask;
++ */
+ unsigned int cached_irq_mask = 0xffff;
+ 
+ /*
+@@ -53,13 +67,44 @@ unsigned int cached_irq_mask = 0xffff;
+  * this 'mixed mode' IRQ handling costs nothing because it's only used
+  * at IRQ setup time.
+  */
++/*
++ * used by:
++ *   - arch/x86/include/asm/io_apic.h|147| <<IO_APIC_IRQ>> #define IO_APIC_IRQ(x) (((x) >= NR_IRQS_LEGACY) || ((1 << (x)) & io_apic_irqs))
++ *   - arch/x86/include/asm/io_apic.h|154| <<io_apic_assign_pci_irqs>> (mp_irq_entries && !skip_ioapic_setup && io_apic_irqs)
++ *   - arch/x86/kernel/apic/io_apic.c|284| <<arch_early_ioapic_init>> io_apic_irqs = ~0UL;
++ *   - arch/x86/kernel/apic/io_apic.c|2427| <<setup_IO_APIC>> io_apic_irqs = nr_legacy_irqs() ? ~PIC_IRQS : ~0UL;
++ *   - arch/x86/kernel/i8259.c|115| <<make_8259A_irq>> io_apic_irqs &= ~(1<<irq);
++ *
++ * 在I/O APIC的IRQ0线上链接着8259中断
++ *
++ * 下面是一个bitmap, 说明那个irq line是用的io_apic
++ */
+ unsigned long io_apic_irqs;
+ 
++/*
++ * called by:
++ *   - arch/x86/kernel/apic/io_apic.c|1744| <<startup_ioapic_irq>> legacy_pic->mask(irq);
++ *   - arch/x86/kernel/apic/io_apic.c|2154| <<check_timer>> legacy_pic->mask(0);
++ *   - arch/x86/kernel/apic/io_apic.c|2285| <<check_timer>> legacy_pic->mask(0);
++ *   - arch/x86/kernel/apic/io_apic.c|2305| <<check_timer>> legacy_pic->mask(0);
++ *   - arch/x86/kernel/apic/io_apic.c|3115| <<mp_irqdomain_alloc>> legacy_pic->mask(virq);
++ *
++ * struct legacy_pic default_legacy_pic.mask = mask_8259A_irq()
++ *
++ * 通过IMR寄存器在8259禁用某个irq line
++ */
+ static void mask_8259A_irq(unsigned int irq)
+ {
+ 	unsigned int mask = 1 << irq;
+ 	unsigned long flags;
+ 
++	/*
++	 * unsigned int cached_irq_mask;
++	 * #define __byte(x, y)            (((unsigned char *)&(y))[x])
++	 * #define cached_master_mask      (__byte(0, cached_irq_mask))
++	 * #define cached_slave_mask       (__byte(1, cached_irq_mask))
++	 */
++
+ 	raw_spin_lock_irqsave(&i8259A_lock, flags);
+ 	cached_irq_mask |= mask;
+ 	if (irq & 8)
+@@ -69,11 +114,26 @@ static void mask_8259A_irq(unsigned int irq)
+ 	raw_spin_unlock_irqrestore(&i8259A_lock, flags);
+ }
+ 
++/*
++ * struct irq_chip i8259A_chip.irq_mask = disable_8259A_irq()
++ * struct irq_chip i8259A_chip.irq_disable = disable_8259A_irq()
++ *
++ * 通过IMR寄存器在8259禁用某个通过irq_data定义的irq line
++ */
+ static void disable_8259A_irq(struct irq_data *data)
+ {
+ 	mask_8259A_irq(data->irq);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kernel/apic/io_apic.c|2273| <<check_timer>> legacy_pic->unmask(0);
++ *   - arch/x86/kernel/apic/io_apic.c|2298| <<check_timer>> legacy_pic->unmask(0);
++ *
++ * struct legacy_pic default_legacy_pic.unmask = unmask_8259A_irq()
++ *
++ * 通过IMR寄存器在8259开通某个irq line
++ */
+ static void unmask_8259A_irq(unsigned int irq)
+ {
+ 	unsigned int mask = ~(1 << irq);
+@@ -88,11 +148,24 @@ static void unmask_8259A_irq(unsigned int irq)
+ 	raw_spin_unlock_irqrestore(&i8259A_lock, flags);
+ }
+ 
++/*
++ * struct irq_chip i8259A_chip.irq_unmask = enable_8259A_irq()
++ *
++ * 通过IMR寄存器在8259开通某个irq line
++ */
+ static void enable_8259A_irq(struct irq_data *data)
+ {
+ 	unmask_8259A_irq(data->irq);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kernel/apic/io_apic.c|1745| <<startup_ioapic_irq>> if (legacy_pic->irq_pending(irq))
++ *
++ * struct legacy_pic default_legacy_pic.irq_pending = i8259A_irq_pending()
++ *
++ * 通过cmd port获取某个irq line是否在pending
++ */
+ static int i8259A_irq_pending(unsigned int irq)
+ {
+ 	unsigned int mask = 1<<irq;
+@@ -109,9 +182,32 @@ static int i8259A_irq_pending(unsigned int irq)
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kernel/apic/io_apic.c|1977| <<init_IO_APIC_traps>> legacy_pic->make_irq(irq);
++ *   - arch/x86/kernel/apic/io_apic.c|2316| <<check_timer>> legacy_pic->make_irq(0);
++ *
++ * struct legacy_pic default_legacy_pic.make_irq = make_8259A_irq()
++ *
++ * 配置8259使某个irq line通过8259, 而不通过ioapic了
++ * 这里在io_apic_irqs把某个irq line的bit清0, 说明不通过ioapic了
++ * 通过下面设置中断的chip:
++ *   - irq_set_chip_and_handler(irq, &i8259A_chip, handle_level_irq);
++ */
+ static void make_8259A_irq(unsigned int irq)
+ {
+ 	disable_irq_nosync(irq);
++	/*
++	 * io_apic_irqs是一个bitmap, 说明那个irq line是用的io_apic
++	 * used by:
++	 *   - arch/x86/include/asm/io_apic.h|147| <<IO_APIC_IRQ>> #define IO_APIC_IRQ(x) (((x) >= NR_IRQS_LEGACY) || ((1 << (x)) & io_apic_irqs))
++	 *   - arch/x86/include/asm/io_apic.h|154| <<io_apic_assign_pci_irqs>> (mp_irq_entries && !skip_ioapic_setup && io_apic_irqs)
++	 *   - arch/x86/kernel/apic/io_apic.c|284| <<arch_early_ioapic_init>> io_apic_irqs = ~0UL;
++	 *   - arch/x86/kernel/apic/io_apic.c|2427| <<setup_IO_APIC>> io_apic_irqs = nr_legacy_irqs() ? ~PIC_IRQS : ~0UL;
++	 *   - arch/x86/kernel/i8259.c|115| <<make_8259A_irq>> io_apic_irqs &= ~(1<<irq);
++	 *
++	 * 这里把某个irq line的bit清0, 说明不通过ioapic了
++	 */
+ 	io_apic_irqs &= ~(1<<irq);
+ 	irq_set_chip_and_handler(irq, &i8259A_chip, handle_level_irq);
+ 	enable_irq(irq);
+@@ -123,6 +219,10 @@ static void make_8259A_irq(unsigned int irq)
+  * This has to be protected by the irq controller spinlock
+  * before being called.
+  */
++/*
++ * called by only:
++ *   - arch/x86/kernel/i8259.c|273| <<mask_and_ack_8259A>> if (i8259A_irq_real(irq))
++ */
+ static inline int i8259A_irq_real(unsigned int irq)
+ {
+ 	int value;
+@@ -146,6 +246,9 @@ static inline int i8259A_irq_real(unsigned int irq)
+  * first, _then_ send the EOI, and the order of EOI
+  * to the two 8259s is important!
+  */
++/*
++ * struct irq_chip i8259A_chip.irq_mask_ack = mask_and_ack_8259A()
++ */
+ static void mask_and_ack_8259A(struct irq_data *data)
+ {
+ 	unsigned int irq = data->irq;
+@@ -220,6 +323,7 @@ static void mask_and_ack_8259A(struct irq_data *data)
+ 	}
+ }
+ 
++/* struct legacy_pic default_legacy_pic.chip = i8259A_chip */
+ struct irq_chip i8259A_chip = {
+ 	.name		= "XT-PIC",
+ 	.irq_mask	= disable_8259A_irq,
+@@ -245,18 +349,27 @@ static void save_ELCR(char *trigger)
+ 	trigger[1] = inb(0x4d1) & 0xDE;
+ }
+ 
++/*
++ * struct syscore_ops i8259_syscore_ops.resume = i8259A_resume()
++ */
+ static void i8259A_resume(void)
+ {
+ 	init_8259A(i8259A_auto_eoi);
+ 	restore_ELCR(irq_trigger);
+ }
+ 
++/*
++ * struct syscore_ops i8259_syscore_ops.suspend = i8259A_suspend()
++ */
+ static int i8259A_suspend(void)
+ {
+ 	save_ELCR(irq_trigger);
+ 	return 0;
+ }
+ 
++/*
++ * struct syscore_ops i8259_syscore_ops.shutdown = i8259A_shutdown()
++ */
+ static void i8259A_shutdown(void)
+ {
+ 	/* Put the i8259A into a quiescent state that
+@@ -273,6 +386,9 @@ static struct syscore_ops i8259_syscore_ops = {
+ 	.shutdown = i8259A_shutdown,
+ };
+ 
++/*
++ * struct legacy_pic default_legacy_pic.mask_all = mask_8259A()
++ */
+ static void mask_8259A(void)
+ {
+ 	unsigned long flags;
+@@ -285,6 +401,9 @@ static void mask_8259A(void)
+ 	raw_spin_unlock_irqrestore(&i8259A_lock, flags);
+ }
+ 
++/*
++ * struct legacy_pic default_legacy_pic.restore_mask = unmask_8259A()
++ */
+ static void unmask_8259A(void)
+ {
+ 	unsigned long flags;
+@@ -297,9 +416,20 @@ static void unmask_8259A(void)
+ 	raw_spin_unlock_irqrestore(&i8259A_lock, flags);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kernel/apic/vector.c|423| <<arch_probe_nr_irqs>> return legacy_pic->probe();
++ *
++ * struct legacy_pic default_legacy_pic.probe = probe_8259A()
++ *
++ * 把slave的imr设置为全是1 (全部master)
++ * 把master除了irq 2全部mask (irq 2连接slave)
++ * 对于default_legacy_pic返回NR_IRQS_LEGACY(16)
++ */
+ static int probe_8259A(void)
+ {
+ 	unsigned long flags;
++	/* 除了第2个bit是0, 剩下全是1: 11111011*/
+ 	unsigned char probe_val = ~(1 << PIC_CASCADE_IR);
+ 	unsigned char new_val;
+ 	/*
+@@ -320,9 +450,21 @@ static int probe_8259A(void)
+ 	}
+ 
+ 	raw_spin_unlock_irqrestore(&i8259A_lock, flags);
++	/*
++	 * 在default_legacy_pic返回NR_IRQS_LEGACY(16)
++	 * 在null_legacy_pic返回0
++	 */
+ 	return nr_legacy_irqs();
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kernel/apic/io_apic.c|2166| <<check_timer>> legacy_pic->init(1);
++ *   - arch/x86/kernel/apic/io_apic.c|2315| <<check_timer>> legacy_pic->init(0);
++ *   - arch/x86/kernel/irqinit.c|68| <<init_ISA_irqs>> legacy_pic->init(0);
++ *
++ * struct legacy_pic default_legacy_pic.init = init_8259A()
++ */
+ static void init_8259A(int auto_eoi)
+ {
+ 	unsigned long flags;
+@@ -419,6 +561,13 @@ struct legacy_pic default_legacy_pic = {
  	.make_irq = make_8259A_irq,
  };
  
@@ -162,14 +925,16 @@ index 02abc13..03589ff 100644
  EXPORT_SYMBOL(legacy_pic);
  
 diff --git a/arch/x86/kernel/time.c b/arch/x86/kernel/time.c
-index ab0176a..84f3660 100644
+index ab0176a..1960e1f 100644
 --- a/arch/x86/kernel/time.c
 +++ b/arch/x86/kernel/time.c
-@@ -56,8 +56,27 @@ EXPORT_SYMBOL(profile_pc);
+@@ -56,8 +56,29 @@ EXPORT_SYMBOL(profile_pc);
  /*
   * Default timer interrupt handler for PIT/HPET
   */
 +/*
++ * struct irqaction irq0.handler = timer_interrupt()
++ *
 + * tick_do_timer_cpu更新timer
 + */
  static irqreturn_t timer_interrupt(int irq, void *dev_id)
@@ -193,6 +958,24 @@ index ab0176a..84f3660 100644
  	global_clock_event->event_handler(global_clock_event);
  	return IRQ_HANDLED;
  }
+diff --git a/arch/x86/kernel/x86_init.c b/arch/x86/kernel/x86_init.c
+index 5b2d10c..fdab936 100644
+--- a/arch/x86/kernel/x86_init.c
++++ b/arch/x86/kernel/x86_init.c
+@@ -144,6 +144,13 @@ void arch_restore_msi_irqs(struct pci_dev *dev)
+ }
+ #endif
+ 
++/*
++ * used by:
++ *   - arch/x86/include/asm/io_apic.h|190| <<io_apic_read>> return x86_io_apic_ops.read(apic, reg);
++ *   - arch/x86/kernel/apic/io_apic.c|1454| <<disable_IO_APIC>> x86_io_apic_ops.disable();
++ *   - arch/x86/xen/apic.c|220| <<xen_init_apic>> x86_io_apic_ops.read = xen_io_apic_read;
++ *   - drivers/iommu/irq_remapping.c|45| <<irq_remapping_modify_x86_ops>> x86_io_apic_ops.disable = irq_remapping_disable_io_apic;
++ */
+ struct x86_io_apic_ops x86_io_apic_ops __ro_after_init = {
+ 	.read			= native_io_apic_read,
+ 	.disable		= native_disable_io_apic,
 diff --git a/kernel/irq/chip.c b/kernel/irq/chip.c
 index 317fc75..76f1650 100644
 --- a/kernel/irq/chip.c
@@ -207,6 +990,22 @@ index 317fc75..76f1650 100644
  struct irq_data *irq_get_irq_data(unsigned int irq)
  {
  	struct irq_desc *desc = irq_to_desc(irq);
+diff --git a/kernel/irq/irqdomain.c b/kernel/irq/irqdomain.c
+index ac4644e..500efdd 100644
+--- a/kernel/irq/irqdomain.c
++++ b/kernel/irq/irqdomain.c
+@@ -1689,6 +1689,11 @@ static void __irq_domain_activate_irq(struct irq_data *irq_data)
+ 
+ 		if (irq_data->parent_data)
+ 			__irq_domain_activate_irq(irq_data->parent_data);
++		/*
++		 * 设置的部分地方:
++		 *   - arch/x86/kernel/apic/io_apic.c|3227| <<global>> .activate = mp_irqdomain_activate,
++		 *   - drivers/iommu/intel_irq_remapping.c|1414| <<global>> .activate = intel_irq_remapping_activate,
++		 */
+ 		if (domain->ops->activate)
+ 			domain->ops->activate(domain, irq_data);
+ 	}
 diff --git a/kernel/kexec_core.c b/kernel/kexec_core.c
 index 20fef1a..82bf1f1 100644
 --- a/kernel/kexec_core.c
