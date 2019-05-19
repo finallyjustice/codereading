@@ -1,6 +1,6 @@
-From d215a799165fd28889dcbcd82d9d45a5b4f89b8e Mon Sep 17 00:00:00 2001
+From 76a92cbedfa6eb95dc6d94774c2d4b3ffc2878df Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Sun, 19 May 2019 03:09:12 +0800
+Date: Sun, 19 May 2019 20:30:50 +0800
 Subject: [PATCH 1/1] linux-swiotlb-for-linux-4.14.113
 
 swiotlb linux-4.4.113
@@ -8,14 +8,17 @@ swiotlb linux-4.4.113
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
  arch/x86/include/asm/dma-mapping.h |   4 +
- arch/x86/kernel/pci-swiotlb.c      |  81 ++++++
- arch/x86/xen/pci-swiotlb-xen.c     |  29 ++
- drivers/xen/swiotlb-xen.c          | 356 +++++++++++++++++++++++
+ arch/x86/include/asm/iommu_table.h |  10 +
+ arch/x86/kernel/pci-dma.c          |   6 +
+ arch/x86/kernel/pci-swiotlb.c      | 114 +++++++
+ arch/x86/xen/pci-swiotlb-xen.c     |  62 ++++
+ drivers/xen/swiotlb-xen.c          | 363 ++++++++++++++++++++++
  include/linux/device.h             |   2 +
  include/linux/dma-direction.h      |   8 +
- include/linux/dma-mapping.h        |  64 +++++
- lib/swiotlb.c                      | 574 ++++++++++++++++++++++++++++++++++++-
- 8 files changed, 1117 insertions(+), 1 deletion(-)
+ include/linux/dma-mapping.h        |  64 ++++
+ include/linux/swiotlb.h            |  20 ++
+ lib/swiotlb.c                      | 618 ++++++++++++++++++++++++++++++++++++-
+ 11 files changed, 1268 insertions(+), 3 deletions(-)
 
 diff --git a/arch/x86/include/asm/dma-mapping.h b/arch/x86/include/asm/dma-mapping.h
 index 69f16f0..3fe4878 100644
@@ -32,8 +35,49 @@ index 69f16f0..3fe4878 100644
  static inline unsigned long dma_alloc_coherent_mask(struct device *dev,
  						    gfp_t gfp)
  {
+diff --git a/arch/x86/include/asm/iommu_table.h b/arch/x86/include/asm/iommu_table.h
+index 1fb3fd1..1a5c46c 100644
+--- a/arch/x86/include/asm/iommu_table.h
++++ b/arch/x86/include/asm/iommu_table.h
+@@ -87,9 +87,19 @@ struct iommu_table_entry {
+  * Both variants will still call the 'init' and 'late_init' functions if
+  * they are set.
+  */
++/*
++ * used by:
++ *   - arch/x86/kernel/pci-swiotlb.c|128| <<global>> IOMMU_INIT_FINISH(pci_swiotlb_detect_override,
++ *   - arch/x86/xen/pci-swiotlb-xen.c|130| <<global>> IOMMU_INIT_FINISH(pci_xen_swiotlb_detect,
++ *   - drivers/iommu/amd_iommu_init.c|2932| <<global>> IOMMU_INIT_FINISH(amd_iommu_detect,
++ */
+ #define IOMMU_INIT_FINISH(_detect, _depend, _init, _late_init)		\
+ 	__IOMMU_INIT(_detect, _depend, _init, _late_init, 1)
+ 
++/*
++ * used by only:
++ *   - arch/x86/kernel/pci-swiotlb.c|172| <<global>> IOMMU_INIT(pci_swiotlb_detect_4gb,
++ */
+ #define IOMMU_INIT(_detect, _depend, _init, _late_init)			\
+ 	__IOMMU_INIT(_detect, _depend, _init, _late_init, 0)
+ 
+diff --git a/arch/x86/kernel/pci-dma.c b/arch/x86/kernel/pci-dma.c
+index 599d746..c43814c 100644
+--- a/arch/x86/kernel/pci-dma.c
++++ b/arch/x86/kernel/pci-dma.c
+@@ -76,6 +76,12 @@ void __init pci_iommu_alloc(void)
+ 		}
+ 	}
+ }
++/*
++ * used by:
++ *   - arch/x86/kernel/pci-nommu.c|100| <<global>> .alloc = dma_generic_alloc_coherent,
++ *   - arch/x86/kernel/amd_gart_64.c|503| <<gart_alloc_coherent>> return dma_generic_alloc_coherent(dev, size, dma_addr, flag,
++ *   - arch/x86/kernel/pci-swiotlb.c|51| <<x86_swiotlb_alloc_coherent>> vaddr = dma_generic_alloc_coherent(hwdev, size, dma_handle, flags,
++ */
+ void *dma_generic_alloc_coherent(struct device *dev, size_t size,
+ 				 dma_addr_t *dma_addr, gfp_t flag,
+ 				 unsigned long attrs)
 diff --git a/arch/x86/kernel/pci-swiotlb.c b/arch/x86/kernel/pci-swiotlb.c
-index 53bd05e..842d959 100644
+index 53bd05e..da64057 100644
 --- a/arch/x86/kernel/pci-swiotlb.c
 +++ b/arch/x86/kernel/pci-swiotlb.c
 @@ -15,8 +15,26 @@
@@ -63,7 +107,20 @@ index 53bd05e..842d959 100644
  void *x86_swiotlb_alloc_coherent(struct device *hwdev, size_t size,
  					dma_addr_t *dma_handle, gfp_t flags,
  					unsigned long attrs)
-@@ -38,6 +56,12 @@ void *x86_swiotlb_alloc_coherent(struct device *hwdev, size_t size,
+@@ -30,6 +48,12 @@ void *x86_swiotlb_alloc_coherent(struct device *hwdev, size_t size,
+ 	 */
+ 	flags |= __GFP_NOWARN;
+ 
++	/*
++	 * 在以下使用dma_generic_alloc_coherent():
++	 *   - arch/x86/kernel/pci-nommu.c|100| <<global>> .alloc = dma_generic_alloc_coherent,
++	 *   - arch/x86/kernel/amd_gart_64.c|503| <<gart_alloc_coherent>> return dma_generic_alloc_coherent(dev, size, dma_addr, flag,
++	 *   - arch/x86/kernel/pci-swiotlb.c|51| <<x86_swiotlb_alloc_coherent>> vaddr = dma_generic_alloc_coherent(hwdev, size, dma_handle, flags,
++	 */
+ 	vaddr = dma_generic_alloc_coherent(hwdev, size, dma_handle, flags,
+ 					   attrs);
+ 	if (vaddr)
+@@ -38,6 +62,12 @@ void *x86_swiotlb_alloc_coherent(struct device *hwdev, size_t size,
  	return swiotlb_alloc_coherent(hwdev, size, dma_handle, flags);
  }
  
@@ -76,7 +133,7 @@ index 53bd05e..842d959 100644
  void x86_swiotlb_free_coherent(struct device *dev, size_t size,
  				      void *vaddr, dma_addr_t dma_addr,
  				      unsigned long attrs)
-@@ -48,6 +72,10 @@ void x86_swiotlb_free_coherent(struct device *dev, size_t size,
+@@ -48,6 +78,10 @@ void x86_swiotlb_free_coherent(struct device *dev, size_t size,
  		dma_generic_free_coherent(dev, size, vaddr, dma_addr, attrs);
  }
  
@@ -87,7 +144,7 @@ index 53bd05e..842d959 100644
  static const struct dma_map_ops swiotlb_dma_ops = {
  	.mapping_error = swiotlb_dma_mapping_error,
  	.alloc = x86_swiotlb_alloc_coherent,
-@@ -69,8 +97,29 @@ static const struct dma_map_ops swiotlb_dma_ops = {
+@@ -69,13 +103,57 @@ static const struct dma_map_ops swiotlb_dma_ops = {
   * This returns non-zero if we are forced to use swiotlb (by the boot
   * option).
   */
@@ -117,7 +174,35 @@ index 53bd05e..842d959 100644
  	if (swiotlb_force == SWIOTLB_FORCE)
  		swiotlb = 1;
  
-@@ -85,10 +134,27 @@ IOMMU_INIT_FINISH(pci_swiotlb_detect_override,
+ 	return swiotlb;
+ }
++/*
++ * A more sophisticated version of IOMMU_INIT. This variant requires:
++ *  a). A detection routine function.
++ *  b). The name of the detection routine we depend on to get called
++ *      before us.
++ *  c). The init routine which gets called if the detection routine
++ *      returns a positive value from the pci_iommu_alloc. This means
++ *      no presence of a memory allocator.
++ *  d). Similar to the 'init', except that this gets called from pci_iommu_init
++ *      where we do have a memory allocator.
++ *
++ * The standard IOMMU_INIT differs from the IOMMU_INIT_FINISH variant
++ * in that the former will continue detecting other IOMMUs in the call
++ * list after the detection routine returns a positive number, while the
++ * latter will stop the execution chain upon first successful detection.
++ * Both variants will still call the 'init' and 'late_init' functions if
++ * they are set.
++ *
++ * used by:
++ *   - arch/x86/kernel/pci-swiotlb.c|128| <<global>> IOMMU_INIT_FINISH(pci_swiotlb_detect_override,
++ *   - arch/x86/xen/pci-swiotlb-xen.c|130| <<global>> IOMMU_INIT_FINISH(pci_xen_swiotlb_detect,
++ *   - drivers/iommu/amd_iommu_init.c|2932| <<global>> IOMMU_INIT_FINISH(amd_iommu_detect,
++ */
+ IOMMU_INIT_FINISH(pci_swiotlb_detect_override,
+ 		  pci_xen_swiotlb_detect,
+ 		  pci_swiotlb_init,
+@@ -85,10 +163,27 @@ IOMMU_INIT_FINISH(pci_swiotlb_detect_override,
   * If 4GB or more detected (and iommu=off not set) or if SME is active
   * then set swiotlb to 1 and return 1.
   */
@@ -145,7 +230,16 @@ index 53bd05e..842d959 100644
  	if (!no_iommu && max_possible_pfn > MAX_DMA32_PFN)
  		swiotlb = 1;
  #endif
-@@ -108,6 +174,13 @@ IOMMU_INIT(pci_swiotlb_detect_4gb,
+@@ -103,11 +198,22 @@ int __init pci_swiotlb_detect_4gb(void)
+ 
+ 	return swiotlb;
+ }
++/*
++ * used by only:
++ *   - arch/x86/kernel/pci-swiotlb.c|172| <<global>> IOMMU_INIT(pci_swiotlb_detect_4gb,
++ */
+ IOMMU_INIT(pci_swiotlb_detect_4gb,
+ 	   pci_swiotlb_detect_override,
  	   pci_swiotlb_init,
  	   pci_swiotlb_late_init);
  
@@ -159,7 +253,7 @@ index 53bd05e..842d959 100644
  void __init pci_swiotlb_init(void)
  {
  	if (swiotlb) {
-@@ -116,6 +189,14 @@ void __init pci_swiotlb_init(void)
+@@ -116,6 +222,14 @@ void __init pci_swiotlb_init(void)
  	}
  }
  
@@ -175,7 +269,7 @@ index 53bd05e..842d959 100644
  {
  	/* An IOMMU turned us off. */
 diff --git a/arch/x86/xen/pci-swiotlb-xen.c b/arch/x86/xen/pci-swiotlb-xen.c
-index 37c6056..14d3a32 100644
+index 37c6056..0b339e1 100644
 --- a/arch/x86/xen/pci-swiotlb-xen.c
 +++ b/arch/x86/xen/pci-swiotlb-xen.c
 @@ -16,6 +16,12 @@
@@ -220,7 +314,7 @@ index 37c6056..14d3a32 100644
  	swiotlb = 0;
  
  #ifdef CONFIG_X86_64
-@@ -54,6 +76,9 @@ int __init pci_xen_swiotlb_detect(void)
+@@ -54,9 +76,17 @@ int __init pci_xen_swiotlb_detect(void)
  	return xen_swiotlb;
  }
  
@@ -230,7 +324,15 @@ index 37c6056..14d3a32 100644
  void __init pci_xen_swiotlb_init(void)
  {
  	if (xen_swiotlb) {
-@@ -67,6 +92,10 @@ void __init pci_xen_swiotlb_init(void)
++		/*
++		 * xen_swiotlb_init()在以下调用:
++		 *   - arch/x86/xen/pci-swiotlb-xen.c|60| <<pci_xen_swiotlb_init>> xen_swiotlb_init(1, true );
++		 *   - arch/x86/xen/pci-swiotlb-xen.c|77| <<pci_xen_swiotlb_init_late>> rc = xen_swiotlb_init(1, false );
++		 */
+ 		xen_swiotlb_init(1, true /* early */);
+ 		dma_ops = &xen_swiotlb_dma_ops;
+ 
+@@ -67,6 +97,10 @@ void __init pci_xen_swiotlb_init(void)
  	}
  }
  
@@ -241,8 +343,50 @@ index 37c6056..14d3a32 100644
  int pci_xen_swiotlb_init_late(void)
  {
  	int rc;
+@@ -78,6 +112,11 @@ int pci_xen_swiotlb_init_late(void)
+ 	if (rc)
+ 		return rc;
+ 
++	/*
++	 * xen_swiotlb_dma_ops在以下使用:
++	 *   - arch/x86/xen/pci-swiotlb-xen.c|61| <<pci_xen_swiotlb_init>> dma_ops = &xen_swiotlb_dma_ops;
++	 *   - arch/x86/xen/pci-swiotlb-xen.c|81| <<pci_xen_swiotlb_init_late>> dma_ops = &xen_swiotlb_dma_ops;
++	 */
+ 	dma_ops = &xen_swiotlb_dma_ops;
+ #ifdef CONFIG_PCI
+ 	/* Make sure ACS will be enabled */
+@@ -88,6 +127,29 @@ int pci_xen_swiotlb_init_late(void)
+ }
+ EXPORT_SYMBOL_GPL(pci_xen_swiotlb_init_late);
+ 
++/*
++ * A more sophisticated version of IOMMU_INIT. This variant requires:
++ *  a). A detection routine function.
++ *  b). The name of the detection routine we depend on to get called
++ *      before us.
++ *  c). The init routine which gets called if the detection routine
++ *      returns a positive value from the pci_iommu_alloc. This means
++ *      no presence of a memory allocator.
++ *  d). Similar to the 'init', except that this gets called from pci_iommu_init
++ *      where we do have a memory allocator.
++ *
++ * The standard IOMMU_INIT differs from the IOMMU_INIT_FINISH variant
++ * in that the former will continue detecting other IOMMUs in the call
++ * list after the detection routine returns a positive number, while the
++ * latter will stop the execution chain upon first successful detection.
++ * Both variants will still call the 'init' and 'late_init' functions if
++ * they are set.
++ *
++ * used by:
++ *   - arch/x86/kernel/pci-swiotlb.c|128| <<global>> IOMMU_INIT_FINISH(pci_swiotlb_detect_override,
++ *   - arch/x86/xen/pci-swiotlb-xen.c|130| <<global>> IOMMU_INIT_FINISH(pci_xen_swiotlb_detect,
++ *   - drivers/iommu/amd_iommu_init.c|2932| <<global>> IOMMU_INIT_FINISH(amd_iommu_detect,
++ */
+ IOMMU_INIT_FINISH(pci_xen_swiotlb_detect,
+ 		  NULL,
+ 		  pci_xen_swiotlb_init,
 diff --git a/drivers/xen/swiotlb-xen.c b/drivers/xen/swiotlb-xen.c
-index 95dbee8..acccb79 100644
+index 95dbee8..13f07ad 100644
 --- a/drivers/xen/swiotlb-xen.c
 +++ b/drivers/xen/swiotlb-xen.c
 @@ -33,6 +33,14 @@
@@ -390,10 +534,10 @@ index 95dbee8..acccb79 100644
 +	 *
 +	 * 第二个循环的原因是每次分配可能会失败, 比如第一次在测试机器上分配128个slot的时候第四次才成功:
 +	 *
-+	 * [    0.000000] xen:swiotlb_xen: orabug: xen_swiotlb_fixup() 2c400000, 6, 12
-+	 * [    0.000000] xen:swiotlb_xen: orabug: xen_swiotlb_fixup() 2c400000, 6, 13
-+	 * [    0.000000] xen:swiotlb_xen: orabug: xen_swiotlb_fixup() 2c400000, 6, 14
-+	 * [    0.000000] xen:swiotlb_xen: orabug: xen_swiotlb_fixup() 2c400000, 6, 15
++	 * [    0.000000] xen:swiotlb_xen: orabug: xen_swiotlb_fixup() 2c400000, 6, 0x12
++	 * [    0.000000] xen:swiotlb_xen: orabug: xen_swiotlb_fixup() 2c400000, 6, 0x13
++	 * [    0.000000] xen:swiotlb_xen: orabug: xen_swiotlb_fixup() 2c400000, 6, 0x14
++	 * [    0.000000] xen:swiotlb_xen: orabug: xen_swiotlb_fixup() 2c400000, 6, 0x15
 +	 *
 +	 * 2c400000 : p + (i << IO_TLB_SHIFT)
 +	 * 6        : get_order(slabs << IO_TLB_SHIFT),  --> 2^6 = 64 page = 128 slots
@@ -402,7 +546,7 @@ index 95dbee8..acccb79 100644
 +	 * 一开始12个bit的mask分不到, 要0x15个才行
 +	 *
 +	 * 最后一次分配到了0x1b个bit的mask
-+	 * [    0.000000] xen:swiotlb_xen: orabug: xen_swiotlb_fixup() 303c0000, 6, 1b
++	 * [    0.000000] xen:swiotlb_xen: orabug: xen_swiotlb_fixup() 303c0000, 6, 0x1b
 +	 */
 +
  	i = 0;
@@ -441,7 +585,7 @@ index 95dbee8..acccb79 100644
  static const char *xen_swiotlb_error(enum xen_swiotlb_err err)
  {
  	switch (err) {
-@@ -216,6 +321,20 @@ static const char *xen_swiotlb_error(enum xen_swiotlb_err err)
+@@ -216,6 +321,22 @@ static const char *xen_swiotlb_error(enum xen_swiotlb_err err)
  	}
  	return "";
  }
@@ -458,11 +602,13 @@ index 95dbee8..acccb79 100644
 + * [    0.275543]  mem_init+0xb/0x98
 + * [    0.275546]  start_kernel+0x23b/0x4da
 + * [    0.275548]  xen_start_kernel+0x561/0x56b
++ *
++ * verbose总是1
 + */
  int __ref xen_swiotlb_init(int verbose, bool early)
  {
  	unsigned long bytes, order;
-@@ -223,13 +342,36 @@ int __ref xen_swiotlb_init(int verbose, bool early)
+@@ -223,13 +344,36 @@ int __ref xen_swiotlb_init(int verbose, bool early)
  	enum xen_swiotlb_err m_ret = XEN_SWIOTLB_UNKNOWN;
  	unsigned int repeat = 3;
  
@@ -499,7 +645,7 @@ index 95dbee8..acccb79 100644
  	if (early)
  		xen_io_tlb_start = alloc_bootmem_pages(PAGE_ALIGN(bytes));
  	else {
-@@ -252,14 +394,24 @@ int __ref xen_swiotlb_init(int verbose, bool early)
+@@ -252,14 +396,24 @@ int __ref xen_swiotlb_init(int verbose, bool early)
  		m_ret = XEN_SWIOTLB_ENOMEM;
  		goto error;
  	}
@@ -524,7 +670,7 @@ index 95dbee8..acccb79 100644
  		if (early)
  			free_bootmem(__pa(xen_io_tlb_start), PAGE_ALIGN(bytes));
  		else {
-@@ -269,6 +421,7 @@ int __ref xen_swiotlb_init(int verbose, bool early)
+@@ -269,6 +423,7 @@ int __ref xen_swiotlb_init(int verbose, bool early)
  		m_ret = XEN_SWIOTLB_EFIXUP;
  		goto error;
  	}
@@ -532,7 +678,7 @@ index 95dbee8..acccb79 100644
  	start_dma_addr = xen_virt_to_bus(xen_io_tlb_start);
  	if (early) {
  		if (swiotlb_init_with_tbl(xen_io_tlb_start, xen_io_tlb_nslabs,
-@@ -281,6 +434,12 @@ int __ref xen_swiotlb_init(int verbose, bool early)
+@@ -281,6 +436,12 @@ int __ref xen_swiotlb_init(int verbose, bool early)
  	if (!rc)
  		swiotlb_set_max_segment(PAGE_SIZE);
  
@@ -545,7 +691,7 @@ index 95dbee8..acccb79 100644
  	return rc;
  error:
  	if (repeat--) {
-@@ -298,6 +457,12 @@ int __ref xen_swiotlb_init(int verbose, bool early)
+@@ -298,6 +459,12 @@ int __ref xen_swiotlb_init(int verbose, bool early)
  	return rc;
  }
  
@@ -558,7 +704,7 @@ index 95dbee8..acccb79 100644
  static void *
  xen_swiotlb_alloc_coherent(struct device *hwdev, size_t size,
  			   dma_addr_t *dma_handle, gfp_t flags,
-@@ -325,11 +490,24 @@ xen_swiotlb_alloc_coherent(struct device *hwdev, size_t size,
+@@ -325,11 +492,24 @@ xen_swiotlb_alloc_coherent(struct device *hwdev, size_t size,
  	 * address. In fact on ARM virt_to_phys only works for kernel direct
  	 * mapped RAM memory. Also see comment below.
  	 */
@@ -583,7 +729,7 @@ index 95dbee8..acccb79 100644
  	if (hwdev && hwdev->coherent_dma_mask)
  		dma_mask = dma_alloc_coherent_mask(hwdev, flags);
  
-@@ -339,6 +517,10 @@ xen_swiotlb_alloc_coherent(struct device *hwdev, size_t size,
+@@ -339,6 +519,10 @@ xen_swiotlb_alloc_coherent(struct device *hwdev, size_t size,
  	 * to *dma_handle. */
  	phys = *dma_handle;
  	dev_addr = xen_phys_to_bus(phys);
@@ -594,7 +740,7 @@ index 95dbee8..acccb79 100644
  	if (((dev_addr + size - 1 <= dma_mask)) &&
  	    !range_straddles_page_boundary(phys, size))
  		*dma_handle = dev_addr;
-@@ -353,6 +535,12 @@ xen_swiotlb_alloc_coherent(struct device *hwdev, size_t size,
+@@ -353,6 +537,12 @@ xen_swiotlb_alloc_coherent(struct device *hwdev, size_t size,
  	return ret;
  }
  
@@ -607,7 +753,7 @@ index 95dbee8..acccb79 100644
  static void
  xen_swiotlb_free_coherent(struct device *hwdev, size_t size, void *vaddr,
  			  dma_addr_t dev_addr, unsigned long attrs)
-@@ -375,6 +563,7 @@ xen_swiotlb_free_coherent(struct device *hwdev, size_t size, void *vaddr,
+@@ -375,6 +565,7 @@ xen_swiotlb_free_coherent(struct device *hwdev, size_t size, void *vaddr,
  	    range_straddles_page_boundary(phys, size))
  		xen_destroy_contiguous_region(phys, order);
  
@@ -615,7 +761,7 @@ index 95dbee8..acccb79 100644
  	xen_free_coherent_pages(hwdev, size, vaddr, (dma_addr_t)phys, attrs);
  }
  
-@@ -385,12 +574,40 @@ xen_swiotlb_free_coherent(struct device *hwdev, size_t size, void *vaddr,
+@@ -385,12 +576,40 @@ xen_swiotlb_free_coherent(struct device *hwdev, size_t size, void *vaddr,
   * Once the device is given the dma address, the device owns this memory until
   * either xen_swiotlb_unmap_page or xen_swiotlb_dma_sync_single is performed.
   */
@@ -628,7 +774,7 @@ index 95dbee8..acccb79 100644
 + * access the contents of the buffer.
 + *
 + * Occasionally a driver needs to access the contents of a streaming DMA buffer
-+ * without numapping it.
++ * without unmapping it.
 + *
 + * dma_sync_single_for_cpu() should be called before the processor accesses a streaming
 + * DMA buffer. Once the call has been made, the CPU "owns" the DMA buffer and can work
@@ -656,7 +802,7 @@ index 95dbee8..acccb79 100644
  	dma_addr_t dev_addr = xen_phys_to_bus(phys);
  
  	BUG_ON(dir == DMA_NONE);
-@@ -399,6 +616,13 @@ static dma_addr_t xen_swiotlb_map_page(struct device *dev, struct page *page,
+@@ -399,6 +618,13 @@ static dma_addr_t xen_swiotlb_map_page(struct device *dev, struct page *page,
  	 * we can safely return the device addr and not worry about bounce
  	 * buffering it.
  	 */
@@ -670,7 +816,7 @@ index 95dbee8..acccb79 100644
  	if (dma_capable(dev, dev_addr, size) &&
  	    !range_straddles_page_boundary(phys, size) &&
  		!xen_arch_need_swiotlb(dev, phys, dev_addr) &&
-@@ -406,6 +630,7 @@ static dma_addr_t xen_swiotlb_map_page(struct device *dev, struct page *page,
+@@ -406,6 +632,7 @@ static dma_addr_t xen_swiotlb_map_page(struct device *dev, struct page *page,
  		/* we are not interested in the dma_addr returned by
  		 * xen_dma_map_page, only in the potential cache flushes executed
  		 * by the function. */
@@ -678,7 +824,7 @@ index 95dbee8..acccb79 100644
  		xen_dma_map_page(dev, page, dev_addr, offset, size, dir, attrs);
  		return dev_addr;
  	}
-@@ -415,12 +640,19 @@ static dma_addr_t xen_swiotlb_map_page(struct device *dev, struct page *page,
+@@ -415,12 +642,19 @@ static dma_addr_t xen_swiotlb_map_page(struct device *dev, struct page *page,
  	 */
  	trace_swiotlb_bounced(dev, dev_addr, size, swiotlb_force);
  
@@ -698,7 +844,7 @@ index 95dbee8..acccb79 100644
  	xen_dma_map_page(dev, pfn_to_page(map >> PAGE_SHIFT),
  					dev_addr, map & ~PAGE_MASK, size, dir, attrs);
  
-@@ -444,6 +676,11 @@ static dma_addr_t xen_swiotlb_map_page(struct device *dev, struct page *page,
+@@ -444,6 +678,11 @@ static dma_addr_t xen_swiotlb_map_page(struct device *dev, struct page *page,
   * After this call, reads by the cpu to the buffer are guaranteed to see
   * whatever the device wrote there.
   */
@@ -710,7 +856,7 @@ index 95dbee8..acccb79 100644
  static void xen_unmap_single(struct device *hwdev, dma_addr_t dev_addr,
  			     size_t size, enum dma_data_direction dir,
  			     unsigned long attrs)
-@@ -452,9 +689,11 @@ static void xen_unmap_single(struct device *hwdev, dma_addr_t dev_addr,
+@@ -452,9 +691,11 @@ static void xen_unmap_single(struct device *hwdev, dma_addr_t dev_addr,
  
  	BUG_ON(dir == DMA_NONE);
  
@@ -722,7 +868,7 @@ index 95dbee8..acccb79 100644
  	if (is_xen_swiotlb_buffer(dev_addr)) {
  		swiotlb_tbl_unmap_single(hwdev, paddr, size, dir, attrs);
  		return;
-@@ -469,9 +708,17 @@ static void xen_unmap_single(struct device *hwdev, dma_addr_t dev_addr,
+@@ -469,9 +710,17 @@ static void xen_unmap_single(struct device *hwdev, dma_addr_t dev_addr,
  	 * are fine since dma_mark_clean() is null on POWERPC. We can
  	 * make dma_mark_clean() take a physical address if necessary.
  	 */
@@ -740,7 +886,7 @@ index 95dbee8..acccb79 100644
  static void xen_swiotlb_unmap_page(struct device *hwdev, dma_addr_t dev_addr,
  			    size_t size, enum dma_data_direction dir,
  			    unsigned long attrs)
-@@ -489,6 +736,31 @@ static void xen_swiotlb_unmap_page(struct device *hwdev, dma_addr_t dev_addr,
+@@ -489,6 +738,33 @@ static void xen_swiotlb_unmap_page(struct device *hwdev, dma_addr_t dev_addr,
   * address back to the card, you must first perform a
   * xen_swiotlb_dma_sync_for_device, and then the device again owns the buffer
   */
@@ -768,11 +914,13 @@ index 95dbee8..acccb79 100644
 + *   - drivers/xen/swiotlb-xen.c|794| <<xen_swiotlb_sync_single_for_cpu>> xen_swiotlb_sync_single(hwdev, dev_addr, size, dir, SYNC_FOR_CPU);
 + *   - drivers/xen/swiotlb-xen.c|808| <<xen_swiotlb_sync_single_for_device>> xen_swiotlb_sync_single(hwdev, dev_addr, size, dir, SYNC_FOR_DEVICE);
 + *   - drivers/xen/swiotlb-xen.c|932| <<xen_swiotlb_sync_sg>> xen_swiotlb_sync_single(hwdev, sg->dma_address,
++ *
++ * 参数dev_addr在pvm是machine address
 + */
  static void
  xen_swiotlb_sync_single(struct device *hwdev, dma_addr_t dev_addr,
  			size_t size, enum dma_data_direction dir,
-@@ -498,22 +770,37 @@ xen_swiotlb_sync_single(struct device *hwdev, dma_addr_t dev_addr,
+@@ -498,22 +774,40 @@ xen_swiotlb_sync_single(struct device *hwdev, dma_addr_t dev_addr,
  
  	BUG_ON(dir == DMA_NONE);
  
@@ -783,6 +931,9 @@ index 95dbee8..acccb79 100644
  	/* NOTE: We use dev_addr here, not paddr! */
 +	/*
 +	 * 判断地址是否在swiotlb预留范围内
++	 *
++	 * 这里的判断很重要, 如果不在swiotlb的内存范围, 比如alloc分配的
++	 * 就不用map和unmap了
 +	 *
 +	 * dev_addr是machine address
 +	 */
@@ -810,7 +961,7 @@ index 95dbee8..acccb79 100644
  void
  xen_swiotlb_sync_single_for_cpu(struct device *hwdev, dma_addr_t dev_addr,
  				size_t size, enum dma_data_direction dir)
-@@ -521,6 +808,13 @@ xen_swiotlb_sync_single_for_cpu(struct device *hwdev, dma_addr_t dev_addr,
+@@ -521,6 +815,13 @@ xen_swiotlb_sync_single_for_cpu(struct device *hwdev, dma_addr_t dev_addr,
  	xen_swiotlb_sync_single(hwdev, dev_addr, size, dir, SYNC_FOR_CPU);
  }
  
@@ -824,7 +975,7 @@ index 95dbee8..acccb79 100644
  void
  xen_swiotlb_sync_single_for_device(struct device *hwdev, dma_addr_t dev_addr,
  				   size_t size, enum dma_data_direction dir)
-@@ -532,6 +826,12 @@ xen_swiotlb_sync_single_for_device(struct device *hwdev, dma_addr_t dev_addr,
+@@ -532,6 +833,12 @@ xen_swiotlb_sync_single_for_device(struct device *hwdev, dma_addr_t dev_addr,
   * Unmap a set of streaming mode DMA translations.  Again, cpu read rules
   * concerning calls here are the same as for swiotlb_unmap_page() above.
   */
@@ -837,7 +988,7 @@ index 95dbee8..acccb79 100644
  static void
  xen_swiotlb_unmap_sg_attrs(struct device *hwdev, struct scatterlist *sgl,
  			   int nelems, enum dma_data_direction dir,
-@@ -563,6 +863,12 @@ xen_swiotlb_unmap_sg_attrs(struct device *hwdev, struct scatterlist *sgl,
+@@ -563,6 +870,12 @@ xen_swiotlb_unmap_sg_attrs(struct device *hwdev, struct scatterlist *sgl,
   * Device ownership issues as mentioned above for xen_swiotlb_map_page are the
   * same here.
   */
@@ -850,7 +1001,7 @@ index 95dbee8..acccb79 100644
  static int
  xen_swiotlb_map_sg_attrs(struct device *hwdev, struct scatterlist *sgl,
  			 int nelems, enum dma_data_direction dir,
-@@ -628,6 +934,11 @@ xen_swiotlb_map_sg_attrs(struct device *hwdev, struct scatterlist *sgl,
+@@ -628,6 +941,11 @@ xen_swiotlb_map_sg_attrs(struct device *hwdev, struct scatterlist *sgl,
   * The same as swiotlb_sync_single_* but for a scatter-gather list, same rules
   * and usage.
   */
@@ -862,7 +1013,7 @@ index 95dbee8..acccb79 100644
  static void
  xen_swiotlb_sync_sg(struct device *hwdev, struct scatterlist *sgl,
  		    int nelems, enum dma_data_direction dir,
-@@ -641,6 +952,12 @@ xen_swiotlb_sync_sg(struct device *hwdev, struct scatterlist *sgl,
+@@ -641,6 +959,12 @@ xen_swiotlb_sync_sg(struct device *hwdev, struct scatterlist *sgl,
  					sg_dma_len(sg), dir, target);
  }
  
@@ -875,7 +1026,7 @@ index 95dbee8..acccb79 100644
  static void
  xen_swiotlb_sync_sg_for_cpu(struct device *hwdev, struct scatterlist *sg,
  			    int nelems, enum dma_data_direction dir)
-@@ -648,6 +965,12 @@ xen_swiotlb_sync_sg_for_cpu(struct device *hwdev, struct scatterlist *sg,
+@@ -648,6 +972,12 @@ xen_swiotlb_sync_sg_for_cpu(struct device *hwdev, struct scatterlist *sg,
  	xen_swiotlb_sync_sg(hwdev, sg, nelems, dir, SYNC_FOR_CPU);
  }
  
@@ -888,7 +1039,7 @@ index 95dbee8..acccb79 100644
  static void
  xen_swiotlb_sync_sg_for_device(struct device *hwdev, struct scatterlist *sg,
  			       int nelems, enum dma_data_direction dir)
-@@ -661,6 +984,14 @@ xen_swiotlb_sync_sg_for_device(struct device *hwdev, struct scatterlist *sg,
+@@ -661,6 +991,14 @@ xen_swiotlb_sync_sg_for_device(struct device *hwdev, struct scatterlist *sg,
   * during bus mastering, then you would pass 0x00ffffff as the mask to
   * this function.
   */
@@ -903,7 +1054,7 @@ index 95dbee8..acccb79 100644
  static int
  xen_swiotlb_dma_supported(struct device *hwdev, u64 mask)
  {
-@@ -672,6 +1003,13 @@ xen_swiotlb_dma_supported(struct device *hwdev, u64 mask)
+@@ -672,6 +1010,13 @@ xen_swiotlb_dma_supported(struct device *hwdev, u64 mask)
   * This function should be called with the pages from the current domain only,
   * passing pages mapped from other domains would lead to memory corruption.
   */
@@ -917,7 +1068,7 @@ index 95dbee8..acccb79 100644
  static int
  xen_swiotlb_dma_mmap(struct device *dev, struct vm_area_struct *vma,
  		     void *cpu_addr, dma_addr_t dma_addr, size_t size,
-@@ -689,6 +1027,13 @@ xen_swiotlb_dma_mmap(struct device *dev, struct vm_area_struct *vma,
+@@ -689,6 +1034,13 @@ xen_swiotlb_dma_mmap(struct device *dev, struct vm_area_struct *vma,
   * This function should be called with the pages from the current domain only,
   * passing pages mapped from other domains would lead to memory corruption.
   */
@@ -931,7 +1082,7 @@ index 95dbee8..acccb79 100644
  static int
  xen_swiotlb_get_sgtable(struct device *dev, struct sg_table *sgt,
  			void *cpu_addr, dma_addr_t handle, size_t size,
-@@ -712,11 +1057,22 @@ xen_swiotlb_get_sgtable(struct device *dev, struct sg_table *sgt,
+@@ -712,11 +1064,22 @@ xen_swiotlb_get_sgtable(struct device *dev, struct sg_table *sgt,
  	return dma_common_get_sgtable(dev, sgt, cpu_addr, handle, size);
  }
  
@@ -1109,8 +1260,39 @@ index 7bf3b99..6329e89 100644
  	int (*dma_supported)(struct device *dev, u64 mask);
  #ifdef ARCH_HAS_DMA_GET_REQUIRED_MASK
  	u64 (*get_required_mask)(struct device *dev);
+diff --git a/include/linux/swiotlb.h b/include/linux/swiotlb.h
+index 24ed817..da2bf51 100644
+--- a/include/linux/swiotlb.h
++++ b/include/linux/swiotlb.h
+@@ -39,6 +39,26 @@ extern int swiotlb_late_init_with_tbl(char *tlb, unsigned long nslabs);
+ extern void __init swiotlb_update_mem_attributes(void);
+ 
+ /*
++ * 来自LDD
++ *
++ * Once a buffer has been mapped, it belongs to the device, not the processor. Until
++ * the buffer has been unmapped, the driver should not touch its contents in any
++ * way. Only after dma_unmap_single has been called is it safe for the driver to
++ * access the contents of the buffer.
++ *
++ * Occasionally a driver needs to access the contents of a streaming DMA buffer
++ * without numapping it.
++ *
++ * dma_sync_single_for_cpu() should be called before the processor accesses a streaming
++ * DMA buffer. Once the call has been made, the CPU "owns" the DMA buffer and can work
++ * with it as needed.
++ *
++ * Before the device accesses the buffer, however, ownership should be transferred to 
++ * the device with dma_sync_single_for_device(). The processor, once again, should not
++ * access the DMA buffer after this call has been made.
++ */
++
++/*
+  * Enumeration for sync targets
+  */
+ enum dma_sync_target {
 diff --git a/lib/swiotlb.c b/lib/swiotlb.c
-index b4c768d..80164e2 100644
+index b4c768d..6724d0b 100644
 --- a/lib/swiotlb.c
 +++ b/lib/swiotlb.c
 @@ -44,9 +44,36 @@
@@ -1271,7 +1453,7 @@ index b4c768d..80164e2 100644
  static int late_alloc;
  
  static int __init
-@@ -127,6 +230,13 @@ setup_io_tlb_npages(char *str)
+@@ -127,18 +230,38 @@ setup_io_tlb_npages(char *str)
  early_param("swiotlb", setup_io_tlb_npages);
  /* make io_tlb_overflow tunable too? */
  
@@ -1285,7 +1467,32 @@ index b4c768d..80164e2 100644
  unsigned long swiotlb_nr_tbl(void)
  {
  	return io_tlb_nslabs;
-@@ -171,11 +281,19 @@ static dma_addr_t swiotlb_phys_to_dma(struct device *hwdev,
+ }
+ EXPORT_SYMBOL_GPL(swiotlb_nr_tbl);
+ 
++/*
++ * called by:
++ *   - drivers/gpu/drm/i915/i915_gem.c|2312| <<i915_gem_object_get_pages_gtt>> max_segment = swiotlb_max_segment();
++ *   - drivers/gpu/drm/i915/i915_gem_internal.c|62| <<i915_gem_object_get_pages_internal>> max_segment = swiotlb_max_segment();
++ *   - drivers/mmc/host/sdhci.c|3832| <<sdhci_setup_host>> if (swiotlb_max_segment()) {
++ *   - drivers/mmc/host/tmio_mmc_core.c|1235| <<tmio_mmc_host_probe>> if (swiotlb_max_segment()) {
++ */
+ unsigned int swiotlb_max_segment(void)
+ {
+ 	return max_segment;
+ }
+ EXPORT_SYMBOL_GPL(swiotlb_max_segment);
+ 
++/*
++ * called by:
++ *   - drivers/xen/swiotlb-xen.c|435| <<xen_swiotlb_init>> swiotlb_set_max_segment(PAGE_SIZE);
++ *   - lib/swiotlb.c|401| <<swiotlb_init_with_tbl>> swiotlb_set_max_segment(io_tlb_nslabs << IO_TLB_SHIFT);
++ *   - lib/swiotlb.c|576| <<swiotlb_late_init_with_tbl>> swiotlb_set_max_segment(io_tlb_nslabs << IO_TLB_SHIFT);
++ */
+ void swiotlb_set_max_segment(unsigned int val)
+ {
+ 	if (swiotlb_force == SWIOTLB_FORCE)
+@@ -171,11 +294,19 @@ static dma_addr_t swiotlb_phys_to_dma(struct device *hwdev,
  static dma_addr_t swiotlb_virt_to_bus(struct device *hwdev,
  				      volatile void *address)
  {
@@ -1305,7 +1512,7 @@ index b4c768d..80164e2 100644
  void swiotlb_print_info(void)
  {
  	unsigned long bytes = io_tlb_nslabs << IO_TLB_SHIFT;
-@@ -197,6 +315,10 @@ void swiotlb_print_info(void)
+@@ -197,6 +328,10 @@ void swiotlb_print_info(void)
   * call SWIOTLB when the operations are possible.  It needs to be called
   * before the SWIOTLB memory is used.
   */
@@ -1316,7 +1523,7 @@ index b4c768d..80164e2 100644
  void __init swiotlb_update_mem_attributes(void)
  {
  	void *vaddr;
-@@ -216,6 +338,20 @@ void __init swiotlb_update_mem_attributes(void)
+@@ -216,6 +351,20 @@ void __init swiotlb_update_mem_attributes(void)
  	memset(vaddr, 0, bytes);
  }
  
@@ -1337,7 +1544,7 @@ index b4c768d..80164e2 100644
  int __init swiotlb_init_with_tbl(char *tlb, unsigned long nslabs, int verbose)
  {
  	void *v_overflow_buffer;
-@@ -250,6 +386,10 @@ int __init swiotlb_init_with_tbl(char *tlb, unsigned long nslabs, int verbose)
+@@ -250,6 +399,10 @@ int __init swiotlb_init_with_tbl(char *tlb, unsigned long nslabs, int verbose)
  				PAGE_ALIGN(io_tlb_nslabs * sizeof(phys_addr_t)),
  				PAGE_SIZE);
  	for (i = 0; i < io_tlb_nslabs; i++) {
@@ -1348,7 +1555,7 @@ index b4c768d..80164e2 100644
  		io_tlb_list[i] = IO_TLB_SEGSIZE - OFFSET(i, IO_TLB_SEGSIZE);
  		io_tlb_orig_addr[i] = INVALID_PHYS_ADDR;
  	}
-@@ -266,6 +406,12 @@ int __init swiotlb_init_with_tbl(char *tlb, unsigned long nslabs, int verbose)
+@@ -266,6 +419,12 @@ int __init swiotlb_init_with_tbl(char *tlb, unsigned long nslabs, int verbose)
   * Statically reserve bounce buffer space and initialize bounce buffer data
   * structures for the software IO TLB used to implement the DMA API.
   */
@@ -1361,7 +1568,7 @@ index b4c768d..80164e2 100644
  void  __init
  swiotlb_init(int verbose)
  {
-@@ -297,6 +443,9 @@ swiotlb_init(int verbose)
+@@ -297,6 +456,9 @@ swiotlb_init(int verbose)
   * initialize the swiotlb later using the slab allocator if needed.
   * This should be just like above, but with some error catching.
   */
@@ -1371,7 +1578,7 @@ index b4c768d..80164e2 100644
  int
  swiotlb_late_init_with_default_size(size_t default_size)
  {
-@@ -341,6 +490,18 @@ swiotlb_late_init_with_default_size(size_t default_size)
+@@ -341,6 +503,18 @@ swiotlb_late_init_with_default_size(size_t default_size)
  	return rc;
  }
  
@@ -1390,7 +1597,7 @@ index b4c768d..80164e2 100644
  int
  swiotlb_late_init_with_tbl(char *tlb, unsigned long nslabs)
  {
-@@ -349,6 +510,11 @@ swiotlb_late_init_with_tbl(char *tlb, unsigned long nslabs)
+@@ -349,6 +523,11 @@ swiotlb_late_init_with_tbl(char *tlb, unsigned long nslabs)
  
  	bytes = nslabs << IO_TLB_SHIFT;
  
@@ -1402,7 +1609,7 @@ index b4c768d..80164e2 100644
  	io_tlb_nslabs = nslabs;
  	io_tlb_start = virt_to_phys(tlb);
  	io_tlb_end = io_tlb_start + bytes;
-@@ -373,11 +539,21 @@ swiotlb_late_init_with_tbl(char *tlb, unsigned long nslabs)
+@@ -373,11 +552,21 @@ swiotlb_late_init_with_tbl(char *tlb, unsigned long nslabs)
  	 * to find contiguous free memory regions of size up to IO_TLB_SEGSIZE
  	 * between io_tlb_start and io_tlb_end.
  	 */
@@ -1424,7 +1631,7 @@ index b4c768d..80164e2 100644
  	io_tlb_orig_addr = (phys_addr_t *)
  		__get_free_pages(GFP_KERNEL,
  				 get_order(io_tlb_nslabs *
-@@ -385,7 +561,9 @@ swiotlb_late_init_with_tbl(char *tlb, unsigned long nslabs)
+@@ -385,7 +574,9 @@ swiotlb_late_init_with_tbl(char *tlb, unsigned long nslabs)
  	if (!io_tlb_orig_addr)
  		goto cleanup4;
  
@@ -1434,7 +1641,7 @@ index b4c768d..80164e2 100644
  		io_tlb_list[i] = IO_TLB_SEGSIZE - OFFSET(i, IO_TLB_SEGSIZE);
  		io_tlb_orig_addr[i] = INVALID_PHYS_ADDR;
  	}
-@@ -415,6 +593,10 @@ swiotlb_late_init_with_tbl(char *tlb, unsigned long nslabs)
+@@ -415,6 +606,10 @@ swiotlb_late_init_with_tbl(char *tlb, unsigned long nslabs)
  	return -ENOMEM;
  }
  
@@ -1445,7 +1652,7 @@ index b4c768d..80164e2 100644
  void __init swiotlb_free(void)
  {
  	if (!io_tlb_orig_addr)
-@@ -443,6 +625,13 @@ void __init swiotlb_free(void)
+@@ -443,6 +638,13 @@ void __init swiotlb_free(void)
  	max_segment = 0;
  }
  
@@ -1459,7 +1666,7 @@ index b4c768d..80164e2 100644
  int is_swiotlb_buffer(phys_addr_t paddr)
  {
  	return paddr >= io_tlb_start && paddr < io_tlb_end;
-@@ -451,12 +640,29 @@ int is_swiotlb_buffer(phys_addr_t paddr)
+@@ -451,12 +653,29 @@ int is_swiotlb_buffer(phys_addr_t paddr)
  /*
   * Bounce: copy the swiotlb buffer back to the original dma location
   */
@@ -1489,7 +1696,7 @@ index b4c768d..80164e2 100644
  	if (PageHighMem(pfn_to_page(pfn))) {
  		/* The buffer does not have a mapping.  Map it in and copy */
  		unsigned int offset = orig_addr & ~PAGE_MASK;
-@@ -482,12 +688,104 @@ static void swiotlb_bounce(phys_addr_t orig_addr, phys_addr_t tlb_addr,
+@@ -482,12 +701,104 @@ static void swiotlb_bounce(phys_addr_t orig_addr, phys_addr_t tlb_addr,
  			offset = 0;
  		}
  	} else if (dir == DMA_TO_DEVICE) {
@@ -1594,7 +1801,7 @@ index b4c768d..80164e2 100644
  phys_addr_t swiotlb_tbl_map_single(struct device *hwdev,
  				   dma_addr_t tbl_dma_addr,
  				   phys_addr_t orig_addr, size_t size,
-@@ -512,11 +810,27 @@ phys_addr_t swiotlb_tbl_map_single(struct device *hwdev,
+@@ -512,11 +823,27 @@ phys_addr_t swiotlb_tbl_map_single(struct device *hwdev,
  
  	tbl_dma_addr &= mask;
  
@@ -1622,7 +1829,7 @@ index b4c768d..80164e2 100644
  	max_slots = mask + 1
  		    ? ALIGN(mask + 1, 1 << IO_TLB_SHIFT) >> IO_TLB_SHIFT
  		    : 1UL << (BITS_PER_LONG - IO_TLB_SHIFT);
-@@ -525,7 +839,16 @@ phys_addr_t swiotlb_tbl_map_single(struct device *hwdev,
+@@ -525,7 +852,16 @@ phys_addr_t swiotlb_tbl_map_single(struct device *hwdev,
  	 * For mappings greater than or equal to a page, we limit the stride
  	 * (and hence alignment) to a page size.
  	 */
@@ -1639,7 +1846,7 @@ index b4c768d..80164e2 100644
  	if (size >= PAGE_SIZE)
  		stride = (1 << (PAGE_SHIFT - IO_TLB_SHIFT));
  	else
-@@ -538,12 +861,34 @@ phys_addr_t swiotlb_tbl_map_single(struct device *hwdev,
+@@ -538,12 +874,34 @@ phys_addr_t swiotlb_tbl_map_single(struct device *hwdev,
  	 * request and allocate a buffer from that IO TLB pool.
  	 */
  	spin_lock_irqsave(&io_tlb_lock, flags);
@@ -1674,7 +1881,7 @@ index b4c768d..80164e2 100644
  		while (iommu_is_span_boundary(index, nslots, offset_slots,
  					      max_slots)) {
  			index += stride;
-@@ -554,32 +899,81 @@ phys_addr_t swiotlb_tbl_map_single(struct device *hwdev,
+@@ -554,32 +912,81 @@ phys_addr_t swiotlb_tbl_map_single(struct device *hwdev,
  		}
  
  		/*
@@ -1757,7 +1964,7 @@ index b4c768d..80164e2 100644
  
  not_found:
  	spin_unlock_irqrestore(&io_tlb_lock, flags);
-@@ -594,8 +988,14 @@ phys_addr_t swiotlb_tbl_map_single(struct device *hwdev,
+@@ -594,8 +1001,14 @@ phys_addr_t swiotlb_tbl_map_single(struct device *hwdev,
  	 * This is needed when we sync the memory.  Then we sync the buffer if
  	 * needed.
  	 */
@@ -1772,7 +1979,7 @@ index b4c768d..80164e2 100644
  	if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC) &&
  	    (dir == DMA_TO_DEVICE || dir == DMA_BIDIRECTIONAL))
  		swiotlb_bounce(orig_addr, tlb_addr, size, DMA_TO_DEVICE);
-@@ -608,6 +1008,12 @@ EXPORT_SYMBOL_GPL(swiotlb_tbl_map_single);
+@@ -608,6 +1021,12 @@ EXPORT_SYMBOL_GPL(swiotlb_tbl_map_single);
   * Allocates bounce buffer and returns its kernel virtual address.
   */
  
@@ -1785,7 +1992,7 @@ index b4c768d..80164e2 100644
  static phys_addr_t
  map_single(struct device *hwdev, phys_addr_t phys, size_t size,
  	   enum dma_data_direction dir, unsigned long attrs)
-@@ -620,6 +1026,13 @@ map_single(struct device *hwdev, phys_addr_t phys, size_t size,
+@@ -620,6 +1039,13 @@ map_single(struct device *hwdev, phys_addr_t phys, size_t size,
  		return SWIOTLB_MAP_ERROR;
  	}
  
@@ -1799,7 +2006,7 @@ index b4c768d..80164e2 100644
  	start_dma_addr = swiotlb_phys_to_dma(hwdev, io_tlb_start);
  	return swiotlb_tbl_map_single(hwdev, start_dma_addr, phys, size,
  				      dir, attrs);
-@@ -628,18 +1041,45 @@ map_single(struct device *hwdev, phys_addr_t phys, size_t size,
+@@ -628,18 +1054,45 @@ map_single(struct device *hwdev, phys_addr_t phys, size_t size,
  /*
   * dma_addr is the kernel virtual address of the bounce buffer to unmap.
   */
@@ -1845,7 +2052,7 @@ index b4c768d..80164e2 100644
  	if (orig_addr != INVALID_PHYS_ADDR &&
  	    !(attrs & DMA_ATTR_SKIP_CPU_SYNC) &&
  	    ((dir == DMA_FROM_DEVICE) || (dir == DMA_BIDIRECTIONAL)))
-@@ -653,12 +1093,31 @@ void swiotlb_tbl_unmap_single(struct device *hwdev, phys_addr_t tlb_addr,
+@@ -653,12 +1106,31 @@ void swiotlb_tbl_unmap_single(struct device *hwdev, phys_addr_t tlb_addr,
  	 */
  	spin_lock_irqsave(&io_tlb_lock, flags);
  	{
@@ -1877,7 +2084,7 @@ index b4c768d..80164e2 100644
  		for (i = index + nslots - 1; i >= index; i--) {
  			io_tlb_list[i] = ++count;
  			io_tlb_orig_addr[i] = INVALID_PHYS_ADDR;
-@@ -667,6 +1126,25 @@ void swiotlb_tbl_unmap_single(struct device *hwdev, phys_addr_t tlb_addr,
+@@ -667,6 +1139,25 @@ void swiotlb_tbl_unmap_single(struct device *hwdev, phys_addr_t tlb_addr,
  		 * Step 2: merge the returned slots with the preceding slots,
  		 * if available (non zero)
  		 */
@@ -1903,10 +2110,28 @@ index b4c768d..80164e2 100644
  		for (i = index - 1; (OFFSET(i, IO_TLB_SEGSIZE) != IO_TLB_SEGSIZE -1) && io_tlb_list[i]; i--)
  			io_tlb_list[i] = ++count;
  	}
-@@ -674,6 +1152,15 @@ void swiotlb_tbl_unmap_single(struct device *hwdev, phys_addr_t tlb_addr,
+@@ -674,26 +1165,70 @@ void swiotlb_tbl_unmap_single(struct device *hwdev, phys_addr_t tlb_addr,
  }
  EXPORT_SYMBOL_GPL(swiotlb_tbl_unmap_single);
  
++/*
++ * Once a buffer has been mapped, it belongs to the device, not the processor. Until
++ * the buffer has been unmapped, the driver should not touch its contents in any
++ * way. Only after dma_unmap_single has been called is it safe for the driver to
++ * access the contents of the buffer.
++ *
++ * Occasionally a driver needs to access the contents of a streaming DMA buffer
++ * without unmapping it.
++ *
++ * dma_sync_single_for_cpu() should be called before the processor accesses a streaming
++ * DMA buffer. Once the call has been made, the CPU "owns" the DMA buffer and can work
++ * with it as needed.
++ *
++ * Before the device accesses the buffer, however, ownership should be transferred to 
++ * the device with dma_sync_single_for_device(). The processor, once again, should not
++ * access the DMA buffer after this call has been made.
++ */
++
 +/*
 + * called by:
 + *   - drivers/xen/swiotlb-xen.c|532| <<xen_swiotlb_sync_single>> swiotlb_tbl_sync_single(hwdev, paddr, size, dir, target);
@@ -1919,10 +2144,26 @@ index b4c768d..80164e2 100644
  void swiotlb_tbl_sync_single(struct device *hwdev, phys_addr_t tlb_addr,
  			     size_t size, enum dma_data_direction dir,
  			     enum dma_sync_target target)
-@@ -687,6 +1174,10 @@ void swiotlb_tbl_sync_single(struct device *hwdev, phys_addr_t tlb_addr,
+ {
++	/*
++	 * 计算swiotlb slot的index
++	 */
+ 	int index = (tlb_addr - io_tlb_start) >> IO_TLB_SHIFT;
++	/*
++	 * 根据slot的index找到swap之前的地址
++	 */
+ 	phys_addr_t orig_addr = io_tlb_orig_addr[index];
+ 
++	/*
++	 * 如果没有swap过直接返回就可以了
++	 */
+ 	if (orig_addr == INVALID_PHYS_ADDR)
+ 		return;
+ 	orig_addr += (unsigned long)tlb_addr & ((1 << IO_TLB_SHIFT) - 1);
  
  	switch (target) {
- 	case SYNC_FOR_CPU:
+-	case SYNC_FOR_CPU:
++	case SYNC_FOR_CPU:      // --> 把控制权交还给CPU
 +		/*
 +		 * 如果是DMA_TO_DEVICE就要从原始内存拷贝到bounce buffer
 +		 * 如果是其他 (比如DMA_FROM_DEVICE) 就要从bounce buffer拷贝到原始内存
@@ -1930,10 +2171,11 @@ index b4c768d..80164e2 100644
  		if (likely(dir == DMA_FROM_DEVICE || dir == DMA_BIDIRECTIONAL))
  			swiotlb_bounce(orig_addr, tlb_addr,
  				       size, DMA_FROM_DEVICE);
-@@ -694,6 +1185,10 @@ void swiotlb_tbl_sync_single(struct device *hwdev, phys_addr_t tlb_addr,
+ 		else
  			BUG_ON(dir != DMA_TO_DEVICE);
  		break;
- 	case SYNC_FOR_DEVICE:
+-	case SYNC_FOR_DEVICE:
++	case SYNC_FOR_DEVICE:   //  --> 把控制权交还给Device
 +		/*
 +		 * 如果是DMA_TO_DEVICE就要从原始内存拷贝到bounce buffer
 +		 * 如果是其他 (比如DMA_FROM_DEVICE) 就要从bounce buffer拷贝到原始内存
@@ -1941,7 +2183,7 @@ index b4c768d..80164e2 100644
  		if (likely(dir == DMA_TO_DEVICE || dir == DMA_BIDIRECTIONAL))
  			swiotlb_bounce(orig_addr, tlb_addr,
  				       size, DMA_TO_DEVICE);
-@@ -706,6 +1201,11 @@ void swiotlb_tbl_sync_single(struct device *hwdev, phys_addr_t tlb_addr,
+@@ -706,6 +1241,11 @@ void swiotlb_tbl_sync_single(struct device *hwdev, phys_addr_t tlb_addr,
  }
  EXPORT_SYMBOL_GPL(swiotlb_tbl_sync_single);
  
@@ -1953,7 +2195,7 @@ index b4c768d..80164e2 100644
  void *
  swiotlb_alloc_coherent(struct device *hwdev, size_t size,
  		       dma_addr_t *dma_handle, gfp_t flags)
-@@ -777,6 +1277,10 @@ swiotlb_alloc_coherent(struct device *hwdev, size_t size,
+@@ -777,6 +1317,10 @@ swiotlb_alloc_coherent(struct device *hwdev, size_t size,
  }
  EXPORT_SYMBOL(swiotlb_alloc_coherent);
  
@@ -1964,7 +2206,7 @@ index b4c768d..80164e2 100644
  void
  swiotlb_free_coherent(struct device *hwdev, size_t size, void *vaddr,
  		      dma_addr_t dev_addr)
-@@ -796,6 +1300,11 @@ swiotlb_free_coherent(struct device *hwdev, size_t size, void *vaddr,
+@@ -796,6 +1340,11 @@ swiotlb_free_coherent(struct device *hwdev, size_t size, void *vaddr,
  }
  EXPORT_SYMBOL(swiotlb_free_coherent);
  
@@ -1976,7 +2218,7 @@ index b4c768d..80164e2 100644
  static void
  swiotlb_full(struct device *dev, size_t size, enum dma_data_direction dir,
  	     int do_panic)
-@@ -831,6 +1340,13 @@ swiotlb_full(struct device *dev, size_t size, enum dma_data_direction dir,
+@@ -831,6 +1380,13 @@ swiotlb_full(struct device *dev, size_t size, enum dma_data_direction dir,
   * Once the device is given the dma address, the device owns this memory until
   * either swiotlb_unmap_page or swiotlb_dma_sync_single is performed.
   */
@@ -1990,7 +2232,7 @@ index b4c768d..80164e2 100644
  dma_addr_t swiotlb_map_page(struct device *dev, struct page *page,
  			    unsigned long offset, size_t size,
  			    enum dma_data_direction dir,
-@@ -903,6 +1419,13 @@ static void unmap_single(struct device *hwdev, dma_addr_t dev_addr,
+@@ -903,6 +1459,13 @@ static void unmap_single(struct device *hwdev, dma_addr_t dev_addr,
  	dma_mark_clean(phys_to_virt(paddr), size);
  }
  
@@ -2004,7 +2246,7 @@ index b4c768d..80164e2 100644
  void swiotlb_unmap_page(struct device *hwdev, dma_addr_t dev_addr,
  			size_t size, enum dma_data_direction dir,
  			unsigned long attrs)
-@@ -941,6 +1464,13 @@ swiotlb_sync_single(struct device *hwdev, dma_addr_t dev_addr,
+@@ -941,6 +1504,13 @@ swiotlb_sync_single(struct device *hwdev, dma_addr_t dev_addr,
  	dma_mark_clean(phys_to_virt(paddr), size);
  }
  
@@ -2018,7 +2260,7 @@ index b4c768d..80164e2 100644
  void
  swiotlb_sync_single_for_cpu(struct device *hwdev, dma_addr_t dev_addr,
  			    size_t size, enum dma_data_direction dir)
-@@ -949,6 +1479,13 @@ swiotlb_sync_single_for_cpu(struct device *hwdev, dma_addr_t dev_addr,
+@@ -949,6 +1519,13 @@ swiotlb_sync_single_for_cpu(struct device *hwdev, dma_addr_t dev_addr,
  }
  EXPORT_SYMBOL(swiotlb_sync_single_for_cpu);
  
@@ -2032,7 +2274,7 @@ index b4c768d..80164e2 100644
  void
  swiotlb_sync_single_for_device(struct device *hwdev, dma_addr_t dev_addr,
  			       size_t size, enum dma_data_direction dir)
-@@ -973,6 +1510,12 @@ EXPORT_SYMBOL(swiotlb_sync_single_for_device);
+@@ -973,6 +1550,12 @@ EXPORT_SYMBOL(swiotlb_sync_single_for_device);
   * Device ownership issues as mentioned above for swiotlb_map_page are the
   * same here.
   */
@@ -2045,7 +2287,7 @@ index b4c768d..80164e2 100644
  int
  swiotlb_map_sg_attrs(struct device *hwdev, struct scatterlist *sgl, int nelems,
  		     enum dma_data_direction dir, unsigned long attrs)
-@@ -1013,6 +1556,12 @@ EXPORT_SYMBOL(swiotlb_map_sg_attrs);
+@@ -1013,6 +1596,12 @@ EXPORT_SYMBOL(swiotlb_map_sg_attrs);
   * Unmap a set of streaming mode DMA translations.  Again, cpu read rules
   * concerning calls here are the same as for swiotlb_unmap_page() above.
   */
@@ -2058,7 +2300,7 @@ index b4c768d..80164e2 100644
  void
  swiotlb_unmap_sg_attrs(struct device *hwdev, struct scatterlist *sgl,
  		       int nelems, enum dma_data_direction dir,
-@@ -1049,6 +1598,12 @@ swiotlb_sync_sg(struct device *hwdev, struct scatterlist *sgl,
+@@ -1049,6 +1638,12 @@ swiotlb_sync_sg(struct device *hwdev, struct scatterlist *sgl,
  				    sg_dma_len(sg), dir, target);
  }
  
@@ -2071,7 +2313,7 @@ index b4c768d..80164e2 100644
  void
  swiotlb_sync_sg_for_cpu(struct device *hwdev, struct scatterlist *sg,
  			int nelems, enum dma_data_direction dir)
-@@ -1057,6 +1612,12 @@ swiotlb_sync_sg_for_cpu(struct device *hwdev, struct scatterlist *sg,
+@@ -1057,6 +1652,12 @@ swiotlb_sync_sg_for_cpu(struct device *hwdev, struct scatterlist *sg,
  }
  EXPORT_SYMBOL(swiotlb_sync_sg_for_cpu);
  
@@ -2084,7 +2326,7 @@ index b4c768d..80164e2 100644
  void
  swiotlb_sync_sg_for_device(struct device *hwdev, struct scatterlist *sg,
  			   int nelems, enum dma_data_direction dir)
-@@ -1065,6 +1626,12 @@ swiotlb_sync_sg_for_device(struct device *hwdev, struct scatterlist *sg,
+@@ -1065,6 +1666,12 @@ swiotlb_sync_sg_for_device(struct device *hwdev, struct scatterlist *sg,
  }
  EXPORT_SYMBOL(swiotlb_sync_sg_for_device);
  
@@ -2097,7 +2339,7 @@ index b4c768d..80164e2 100644
  int
  swiotlb_dma_mapping_error(struct device *hwdev, dma_addr_t dma_addr)
  {
-@@ -1078,6 +1645,11 @@ EXPORT_SYMBOL(swiotlb_dma_mapping_error);
+@@ -1078,6 +1685,11 @@ EXPORT_SYMBOL(swiotlb_dma_mapping_error);
   * during bus mastering, then you would pass 0x00ffffff as the mask to
   * this function.
   */
