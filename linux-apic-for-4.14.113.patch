@@ -1,30 +1,37 @@
-From 24981e51332920445e747758faad242a4d1fd1f9 Mon Sep 17 00:00:00 2001
+From 98824fc4d27af548f3f4b7e389d72525256320aa Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Thu, 30 May 2019 06:33:58 +0800
+Date: Thu, 30 May 2019 16:00:17 +0800
 Subject: [PATCH 1/1] linux-apic-for-4.14.113
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
- arch/x86/include/asm/i8259.h       |  31 ++++
- arch/x86/include/asm/io_apic.h     |  10 ++
+ arch/x86/include/asm/i8259.h       |  31 +++
+ arch/x86/include/asm/io_apic.h     |  10 +
  arch/x86/include/asm/irq_vectors.h |   7 +
- arch/x86/kernel/apic/io_apic.c     | 308 +++++++++++++++++++++++++++++++++++++
+ arch/x86/kernel/apic/io_apic.c     | 438 +++++++++++++++++++++++++++++++++++++
+ arch/x86/kernel/apic/msi.c         |  34 +++
  arch/x86/kernel/apic/probe_64.c    |  13 ++
- arch/x86/kernel/apic/vector.c      |  26 ++++
+ arch/x86/kernel/apic/vector.c      | 105 +++++++++
  arch/x86/kernel/dumpstack.c        |   6 +
- arch/x86/kernel/hpet.c             |   9 ++
- arch/x86/kernel/i8259.c            | 221 ++++++++++++++++++++++++++
+ arch/x86/kernel/hpet.c             |   9 +
+ arch/x86/kernel/i8259.c            | 221 +++++++++++++++++++
  arch/x86/kernel/irq.c              |  25 +++
  arch/x86/kernel/irqinit.c          |  25 +++
- arch/x86/kernel/time.c             |  28 ++++
+ arch/x86/kernel/time.c             |  28 +++
  arch/x86/kernel/x86_init.c         |   7 +
- kernel/irq/chip.c                  |   3 +
- kernel/irq/irqdomain.c             |   5 +
- kernel/kexec_core.c                |  21 +++
+ drivers/pci/msi.c                  |   1 +
+ include/linux/device.h             |   6 +
+ include/linux/irqdomain.h          |  30 +++
+ kernel/irq/chip.c                  |  11 +
+ kernel/irq/irqdomain.c             | 132 +++++++++++
+ kernel/irq/manage.c                |   7 +
+ kernel/irq/msi.c                   |  42 ++++
+ kernel/irq_work.c                  |   6 +
+ kernel/kexec_core.c                |  21 ++
  kernel/panic.c                     |   7 +
  kernel/time/tick-common.c          |   5 +
- kernel/time/tick-oneshot.c         |   9 ++
- 19 files changed, 766 insertions(+)
+ kernel/time/tick-oneshot.c         |   9 +
+ 26 files changed, 1236 insertions(+)
 
 diff --git a/arch/x86/include/asm/i8259.h b/arch/x86/include/asm/i8259.h
 index 89789e8..909be79 100644
@@ -126,10 +133,22 @@ index c20ffca..df116f4 100644
  
  /*
 diff --git a/arch/x86/kernel/apic/io_apic.c b/arch/x86/kernel/apic/io_apic.c
-index 96a8a68..b77859d 100644
+index 96a8a68..f5e2e85 100644
 --- a/arch/x86/kernel/apic/io_apic.c
 +++ b/arch/x86/kernel/apic/io_apic.c
-@@ -88,6 +88,22 @@ struct irq_pin_list {
+@@ -79,6 +79,11 @@
+ 
+ static DEFINE_RAW_SPINLOCK(ioapic_lock);
+ static DEFINE_MUTEX(ioapic_mutex);
++/*
++ * used by:
++ *   - arch/x86/kernel/apic/io_apic.c|2554| <<mp_irqdomain_create>> ioapic_dynirq_base = max(ioapic_dynirq_base,
++ *   - arch/x86/kernel/apic/io_apic.c|2659| <<arch_dynirq_lower_bound>> return ioapic_initialized ? ioapic_dynirq_base : gsi_top;
++ */
+ static unsigned int ioapic_dynirq_base;
+ static int ioapic_initialized;
+ 
+@@ -88,6 +93,22 @@ struct irq_pin_list {
  };
  
  struct mp_chip_data {
@@ -152,7 +171,7 @@ index 96a8a68..b77859d 100644
  	struct list_head irq_2_pin;
  	struct IO_APIC_route_entry entry;
  	int trigger;
-@@ -105,6 +121,15 @@ static struct ioapic {
+@@ -105,6 +126,15 @@ static struct ioapic {
  	/*
  	 * # of IRQ routing registers
  	 */
@@ -168,7 +187,7 @@ index 96a8a68..b77859d 100644
  	int nr_registers;
  	/*
  	 * Saved state during suspend/resume, or while enabling intr-remap.
-@@ -176,6 +201,24 @@ int nr_ioapics;
+@@ -176,6 +206,24 @@ int nr_ioapics;
  /* The one past the highest gsi number used */
  u32 gsi_top;
  
@@ -193,7 +212,7 @@ index 96a8a68..b77859d 100644
  /* MP IRQ source entries */
  struct mpc_intsrc mp_irqs[MAX_IRQ_SOURCES];
  
-@@ -303,10 +346,18 @@ union entry_union {
+@@ -303,10 +351,18 @@ union entry_union {
  	struct IO_APIC_route_entry entry;
  };
  
@@ -212,7 +231,7 @@ index 96a8a68..b77859d 100644
  	eu.w1 = io_apic_read(apic, 0x10 + 2 * pin);
  	eu.w2 = io_apic_read(apic, 0x11 + 2 * pin);
  
-@@ -415,12 +466,32 @@ static void add_pin_to_irq_node(struct mp_chip_data *data,
+@@ -415,12 +471,32 @@ static void add_pin_to_irq_node(struct mp_chip_data *data,
  /*
   * Reroute an IRQ to a different pin.
   */
@@ -245,7 +264,29 @@ index 96a8a68..b77859d 100644
  	for_each_irq_pin(entry, data->irq_2_pin) {
  		if (entry->apic == oldapic && entry->pin == oldpin) {
  			entry->apic = newapic;
-@@ -541,6 +612,15 @@ static void eoi_ioapic_pin(int vector, struct mp_chip_data *data)
+@@ -465,6 +541,10 @@ static void io_apic_sync(struct irq_pin_list *entry)
+ 	readl(&io_apic->data);
+ }
+ 
++/*
++ * struct irq_chip ioapic_chip.irq_mask = mask_ioapic_irq()
++ * struct irq_chip ioapic_ir_chip.irq_mask = mask_ioapic_irq()
++ */
+ static void mask_ioapic_irq(struct irq_data *irq_data)
+ {
+ 	struct mp_chip_data *data = irq_data->chip_data;
+@@ -480,6 +560,10 @@ static void __unmask_ioapic(struct mp_chip_data *data)
+ 	io_apic_modify_irq(data, ~IO_APIC_REDIR_MASKED, 0, NULL);
+ }
+ 
++/*
++ * struct irq_chip ioapic_chip.irq_unmask = unmask_ioapic_irq()
++ * struct irq_chip ioapic_ir_chip.irq_unmask = unmask_ioapic_irq()
++ */
+ static void unmask_ioapic_irq(struct irq_data *irq_data)
+ {
+ 	struct mp_chip_data *data = irq_data->chip_data;
+@@ -541,6 +625,15 @@ static void eoi_ioapic_pin(int vector, struct mp_chip_data *data)
  	raw_spin_unlock_irqrestore(&ioapic_lock, flags);
  }
  
@@ -261,7 +302,7 @@ index 96a8a68..b77859d 100644
  static void clear_IO_APIC_pin(unsigned int apic, unsigned int pin)
  {
  	struct IO_APIC_route_entry entry;
-@@ -588,6 +668,11 @@ static void clear_IO_APIC_pin(unsigned int apic, unsigned int pin)
+@@ -588,6 +681,11 @@ static void clear_IO_APIC_pin(unsigned int apic, unsigned int pin)
  		       mpc_ioapic_id(apic), pin);
  }
  
@@ -273,7 +314,7 @@ index 96a8a68..b77859d 100644
  static void clear_IO_APIC (void)
  {
  	int apic, pin;
-@@ -717,6 +802,9 @@ static int find_irq_entry(int ioapic_idx, int pin, int type)
+@@ -717,6 +815,9 @@ static int find_irq_entry(int ioapic_idx, int pin, int type)
  /*
   * Find the pin to which IRQ[irq] (ISA) is connected
   */
@@ -283,7 +324,7 @@ index 96a8a68..b77859d 100644
  static int __init find_isa_irq_pin(int irq, int type)
  {
  	int i;
-@@ -733,6 +821,9 @@ static int __init find_isa_irq_pin(int irq, int type)
+@@ -733,6 +834,9 @@ static int __init find_isa_irq_pin(int irq, int type)
  	return -1;
  }
  
@@ -293,7 +334,18 @@ index 96a8a68..b77859d 100644
  static int __init find_isa_irq_apic(int irq, int type)
  {
  	int i;
-@@ -1312,6 +1403,10 @@ static void __init print_IO_APIC(int ioapic_idx)
+@@ -1226,6 +1330,10 @@ void ioapic_zap_locks(void)
+ 	raw_spin_lock_init(&ioapic_lock);
+ }
+ 
++/*
++ * called by only:
++ *   - arch/x86/kernel/apic/io_apic.c|1408| <<print_IO_APIC>> io_apic_print_entries(ioapic_idx, reg_01.bits.entries);
++ */
+ static void io_apic_print_entries(unsigned int apic, unsigned int nr_entries)
+ {
+ 	int i;
+@@ -1312,6 +1420,10 @@ static void __init print_IO_APIC(int ioapic_idx)
  	io_apic_print_entries(ioapic_idx, reg_01.bits.entries);
  }
  
@@ -304,7 +356,7 @@ index 96a8a68..b77859d 100644
  void __init print_IO_APICs(void)
  {
  	int ioapic_idx;
-@@ -1356,9 +1451,28 @@ void __init print_IO_APICs(void)
+@@ -1356,9 +1468,28 @@ void __init print_IO_APICs(void)
  	printk(KERN_INFO ".................................... done.\n");
  }
  
@@ -333,7 +385,7 @@ index 96a8a68..b77859d 100644
  void __init enable_IO_APIC(void)
  {
  	int i8259_apic, i8259_pin;
-@@ -1578,6 +1692,15 @@ void __init setup_ioapic_ids_from_mpc(void)
+@@ -1578,6 +1709,15 @@ void __init setup_ioapic_ids_from_mpc(void)
  }
  #endif
  
@@ -349,7 +401,7 @@ index 96a8a68..b77859d 100644
  int no_timer_check __initdata;
  
  static int __init notimercheck(char *s)
-@@ -1595,11 +1718,27 @@ __setup("no_timer_check", notimercheck);
+@@ -1595,11 +1735,27 @@ __setup("no_timer_check", notimercheck);
   *	- if this function detects that timer IRQs are defunct, then we fall
   *	  back to ISA timer IRQs
   */
@@ -377,7 +429,112 @@ index 96a8a68..b77859d 100644
  	if (no_timer_check)
  		return 1;
  
-@@ -1925,9 +2064,26 @@ static struct irq_chip lapic_chip __read_mostly = {
+@@ -1645,6 +1801,10 @@ static int __init timer_irq_works(void)
+  * This is not complete - we should be able to fake
+  * an edge even if it isn't on the 8259A...
+  */
++/*
++ * struct irq_chip ioapic_chip.irq_startup = startup_ioapic_irq()
++ * struct irq_chip ioapic_ir_chip.irq_startup = startup_ioapic_irq()
++ */
+ static unsigned int startup_ioapic_irq(struct irq_data *data)
+ {
+ 	int was_pending = 0, irq = data->irq;
+@@ -1742,6 +1902,9 @@ static inline void ioapic_irqd_unmask(struct irq_data *data, bool masked)
+ }
+ #endif
+ 
++/*
++ * struct irq_chip ioapic_chip.irq_eoi = ioapic_ack_level()
++ */
+ static void ioapic_ack_level(struct irq_data *irq_data)
+ {
+ 	struct irq_cfg *cfg = irqd_cfg(irq_data);
+@@ -1808,6 +1971,9 @@ static void ioapic_ack_level(struct irq_data *irq_data)
+ 	ioapic_irqd_unmask(irq_data, masked);
+ }
+ 
++/*
++ * struct irq_chip ioapic_ir_chip.irq_eoi = ioapic_ir_ack_level()
++ */
+ static void ioapic_ir_ack_level(struct irq_data *irq_data)
+ {
+ 	struct mp_chip_data *data = irq_data->chip_data;
+@@ -1822,6 +1988,10 @@ static void ioapic_ir_ack_level(struct irq_data *irq_data)
+ 	eoi_ioapic_pin(data->entry.vector, data);
+ }
+ 
++/*
++ * struct irq_chip ioapic_chip.irq_set_affinity = ioapic_set_affinity()
++ * struct irq_chip ioapic_ir_chip.irq_set_affinity = ioapic_set_affinity()
++ */
+ static int ioapic_set_affinity(struct irq_data *irq_data,
+ 			       const struct cpumask *mask, bool force)
+ {
+@@ -1847,6 +2017,11 @@ static int ioapic_set_affinity(struct irq_data *irq_data,
+ 	return ret;
+ }
+ 
++/*
++ * used by:
++ *   - arch/x86/kernel/apic/io_apic.c|1446| <<print_IO_APICs>> if (chip != &ioapic_chip && chip != &ioapic_ir_chip)
++ *   - arch/x86/kernel/apic/io_apic.c|3296| <<mp_irqdomain_alloc>> &ioapic_chip : &ioapic_ir_chip;
++ */
+ static struct irq_chip ioapic_chip __read_mostly = {
+ 	.name			= "IO-APIC",
+ 	.irq_startup		= startup_ioapic_irq,
+@@ -1859,6 +2034,11 @@ static struct irq_chip ioapic_chip __read_mostly = {
+ 	.flags			= IRQCHIP_SKIP_SET_WAKE,
+ };
+ 
++/*
++ * used by:
++ *   - arch/x86/kernel/apic/io_apic.c|1446| <<print_IO_APICs>> if (chip != &ioapic_chip && chip != &ioapic_ir_chip)
++ *   - arch/x86/kernel/apic/io_apic.c|3296| <<mp_irqdomain_alloc>> &ioapic_chip : &ioapic_ir_chip;
++ */
+ static struct irq_chip ioapic_ir_chip __read_mostly = {
+ 	.name			= "IR-IO-APIC",
+ 	.irq_startup		= startup_ioapic_irq,
+@@ -1897,6 +2077,9 @@ static inline void init_IO_APIC_traps(void)
+  * The local APIC irq-chip implementation:
+  */
+ 
++/*
++ * struct irq_chip lapic_chip.irq_mask = mask_lapic_irq()
++ */
+ static void mask_lapic_irq(struct irq_data *data)
+ {
+ 	unsigned long v;
+@@ -1905,6 +2088,9 @@ static void mask_lapic_irq(struct irq_data *data)
+ 	apic_write(APIC_LVT0, v | APIC_LVT_MASKED);
+ }
+ 
++/*
++ * struct irq_chip lapic_chip.irq_unmask = unmask_lapic_irq()
++ */
+ static void unmask_lapic_irq(struct irq_data *data)
+ {
+ 	unsigned long v;
+@@ -1913,11 +2099,18 @@ static void unmask_lapic_irq(struct irq_data *data)
+ 	apic_write(APIC_LVT0, v & ~APIC_LVT_MASKED);
+ }
+ 
++/*
++ * struct irq_chip lapic_chip.irq_ack = ack_lapic_irq()
++ */
+ static void ack_lapic_irq(struct irq_data *data)
+ {
+ 	ack_APIC_irq();
+ }
+ 
++/*
++ * used by:
++ *   - arch/x86/kernel/apic/io_apic.c|2121| <<lapic_register_intr>> irq_set_chip_and_handler_name(irq, &lapic_chip, handle_edge_irq,
++ */
+ static struct irq_chip lapic_chip __read_mostly = {
+ 	.name		= "local-APIC",
+ 	.irq_mask	= mask_lapic_irq,
+@@ -1925,9 +2118,26 @@ static struct irq_chip lapic_chip __read_mostly = {
  	.irq_ack	= ack_lapic_irq,
  };
  
@@ -404,7 +561,7 @@ index 96a8a68..b77859d 100644
  	irq_set_chip_and_handler_name(irq, &lapic_chip, handle_edge_irq,
  				      "edge");
  }
-@@ -1945,11 +2101,13 @@ static inline void __init unlock_ExtINT_logic(void)
+@@ -1945,11 +2155,13 @@ static inline void __init unlock_ExtINT_logic(void)
  	struct IO_APIC_route_entry entry0, entry1;
  	unsigned char save_control, save_freq_select;
  
@@ -418,7 +575,7 @@ index 96a8a68..b77859d 100644
  	apic = find_isa_irq_apic(8, mp_INT);
  	if (apic == -1) {
  		WARN_ON_ONCE(1);
-@@ -2027,8 +2185,28 @@ static int mp_alloc_timer_irq(int ioapic, int pin)
+@@ -2027,8 +2239,28 @@ static int mp_alloc_timer_irq(int ioapic, int pin)
   *
   * FIXME: really need to revamp this for all platforms.
   */
@@ -447,7 +604,7 @@ index 96a8a68..b77859d 100644
  	struct irq_data *irq_data = irq_get_irq_data(0);
  	struct mp_chip_data *data = irq_data->chip_data;
  	struct irq_cfg *cfg = irqd_cfg(irq_data);
-@@ -2042,6 +2220,18 @@ static inline void __init check_timer(void)
+@@ -2042,6 +2274,18 @@ static inline void __init check_timer(void)
  	/*
  	 * get/set the timer IRQ vector:
  	 */
@@ -466,7 +623,7 @@ index 96a8a68..b77859d 100644
  	legacy_pic->mask(0);
  
  	/*
-@@ -2054,13 +2244,31 @@ static inline void __init check_timer(void)
+@@ -2054,13 +2298,31 @@ static inline void __init check_timer(void)
  	 * automatically.
  	 */
  	apic_write(APIC_LVT0, APIC_LVT_MASKED | APIC_DM_EXTINT);
@@ -498,7 +655,7 @@ index 96a8a68..b77859d 100644
  	apic_printk(APIC_QUIET, KERN_INFO "..TIMER: vector=0x%02X "
  		    "apic1=%d pin1=%d apic2=%d pin2=%d\n",
  		    cfg->vector, apic1, pin1, apic2, pin2);
-@@ -2072,6 +2280,14 @@ static inline void __init check_timer(void)
+@@ -2072,6 +2334,14 @@ static inline void __init check_timer(void)
  	 * was found above, try it both directly and through the
  	 * 8259A.
  	 */
@@ -513,7 +670,7 @@ index 96a8a68..b77859d 100644
  	if (pin1 == -1) {
  		panic_if_irq_remap("BIOS bug: timer not connected to IO-APIC");
  		pin1 = pin2;
-@@ -2088,17 +2304,43 @@ static inline void __init check_timer(void)
+@@ -2088,17 +2358,43 @@ static inline void __init check_timer(void)
  			mp_alloc_timer_irq(apic1, pin1);
  		} else {
  			/*
@@ -557,7 +714,7 @@ index 96a8a68..b77859d 100644
  		if (timer_irq_works()) {
  			if (disable_timer_pin_1 > 0)
  				clear_IO_APIC_pin(0, pin1);
-@@ -2116,12 +2358,30 @@ static inline void __init check_timer(void)
+@@ -2116,12 +2412,30 @@ static inline void __init check_timer(void)
  		apic_printk(APIC_QUIET, KERN_INFO
  			    "..... (found apic %d pin %d) ...\n", apic2, pin2);
  		/*
@@ -588,7 +745,7 @@ index 96a8a68..b77859d 100644
  		if (timer_irq_works()) {
  			apic_printk(APIC_QUIET, KERN_INFO "....... works.\n");
  			goto out;
-@@ -2138,10 +2398,23 @@ static inline void __init check_timer(void)
+@@ -2138,10 +2452,23 @@ static inline void __init check_timer(void)
  	apic_printk(APIC_QUIET, KERN_INFO
  		    "...trying to set up timer as Virtual Wire IRQ...\n");
  
@@ -612,7 +769,7 @@ index 96a8a68..b77859d 100644
  	if (timer_irq_works()) {
  		apic_printk(APIC_QUIET, KERN_INFO "..... works.\n");
  		goto out;
-@@ -2154,12 +2427,43 @@ static inline void __init check_timer(void)
+@@ -2154,12 +2481,43 @@ static inline void __init check_timer(void)
  	apic_printk(APIC_QUIET, KERN_INFO
  		    "...trying to set up timer as ExtINT IRQ...\n");
  
@@ -656,7 +813,51 @@ index 96a8a68..b77859d 100644
  	if (timer_irq_works()) {
  		apic_printk(APIC_QUIET, KERN_INFO "..... works.\n");
  		goto out;
-@@ -2255,6 +2559,10 @@ static void ioapic_destroy_irqdomain(int idx)
+@@ -2195,6 +2553,11 @@ static inline void __init check_timer(void)
+  */
+ #define PIC_IRQS	(1UL << PIC_CASCADE_IR)
+ 
++/*
++ * called by:
++ *   - arch/x86/kernel/apic/io_apic.c|2583| <<setup_IO_APIC>> BUG_ON(mp_irqdomain_create(ioapic));
++ *   - arch/x86/kernel/apic/io_apic.c|3110| <<mp_register_ioapic>> if (mp_irqdomain_create(idx)) {
++ */
+ static int mp_irqdomain_create(int ioapic)
+ {
+ 	struct irq_alloc_info info;
+@@ -2209,6 +2572,7 @@ static int mp_irqdomain_create(int ioapic)
+ 	if (cfg->type == IOAPIC_DOMAIN_INVALID)
+ 		return 0;
+ 
++	/* 就是清0 */
+ 	init_irq_alloc_info(&info, NULL);
+ 	info.type = X86_IRQ_ALLOC_TYPE_IOAPIC;
+ 	info.ioapic_id = mpc_ioapic_id(ioapic);
+@@ -2222,11 +2586,23 @@ static int mp_irqdomain_create(int ioapic)
+ 	if (cfg->dev) {
+ 		fn = of_node_to_fwnode(cfg->dev);
+ 	} else {
++		/*
++		 * 在kvm上执行到这里
++		 *
++		 * 分配和初始化一个 struct fwnode_handle
++		 */
+ 		fn = irq_domain_alloc_named_id_fwnode(name, ioapic);
+ 		if (!fn)
+ 			return -ENOMEM;
+ 	}
+ 
++	/*
++	 * 这里cfg->ops可以是struct irq_domain_ops mp_ioapic_irqdomain_ops
++	 * hwirqs是ioapic的pin的数量
++	 * ioapic是ioapic的id
++	 *
++	 * 核心思想就是初始化一个struct irq_domain, 加入irq_domain_list
++	 */
+ 	ip->irqdomain = irq_domain_create_linear(fn, hwirqs, cfg->ops,
+ 						 (void *)(long)ioapic);
+ 
+@@ -2255,6 +2631,10 @@ static void ioapic_destroy_irqdomain(int idx)
  	}
  }
  
@@ -667,6 +868,185 @@ index 96a8a68..b77859d 100644
  void __init setup_IO_APIC(void)
  {
  	int ioapic;
+@@ -2903,6 +3283,23 @@ static void mp_setup_entry(struct irq_cfg *cfg, struct mp_chip_data *data,
+ 		entry->mask = IOAPIC_UNMASKED;
+ }
+ 
++/*
++ * [0] mp_irqdomain_alloc
++ * [0] __irq_domain_alloc_irqs
++ * [0] alloc_isa_irq_from_domain.isra.11
++ * [0] mp_map_pin_to_irq
++ * [0] setup_IO_APIC
++ * [0] apic_bsp_setup
++ * [0] native_smp_prepare_cpus
++ * [0] kernel_init_freeable
++ * [0] kernel_init
++ * [0] ret_from_fork
++ *
++ * called by:
++ *   - kernel/irq/irqdomain.c|1456| <<irq_domain_alloc_irqs_hierarchy>> return domain->ops->alloc(domain, irq_base, nr_irqs, arg);
++ *
++ * struct irq_domain_ops mp_ioapic_irqdomain_ops.alloc = mp_irqdomain_alloc()
++ */
+ int mp_irqdomain_alloc(struct irq_domain *domain, unsigned int virq,
+ 		       unsigned int nr_irqs, void *arg)
+ {
+@@ -2928,6 +3325,9 @@ int mp_irqdomain_alloc(struct irq_domain *domain, unsigned int virq,
+ 	if (!data)
+ 		return -ENOMEM;
+ 
++	/*
++	 * info->ioapic_entry是struct IO_APIC_route_entry *ioapic_entry;
++	 */
+ 	info->ioapic_entry = &data->entry;
+ 	ret = irq_domain_alloc_irqs_parent(domain, virq, nr_irqs, info);
+ 	if (ret < 0) {
+@@ -2961,6 +3361,12 @@ int mp_irqdomain_alloc(struct irq_domain *domain, unsigned int virq,
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - kernel/irq/irqdomain.c|1442| <<irq_domain_free_irqs_hierarchy>> domain->ops->free(domain, irq_base, nr_irqs);
++ *
++ * struct irq_domain_ops mp_ioapic_irqdomain_ops.free = mp_irqdomain_free()
++ */
+ void mp_irqdomain_free(struct irq_domain *domain, unsigned int virq,
+ 		       unsigned int nr_irqs)
+ {
+@@ -2979,6 +3385,12 @@ void mp_irqdomain_free(struct irq_domain *domain, unsigned int virq,
+ 	irq_domain_free_irqs_top(domain, virq, nr_irqs);
+ }
+ 
++/*
++ * called by:
++ *   - kernel/irq/irqdomain.c|1780| <<__irq_domain_activate_irq>> domain->ops->activate(domain, irq_data);
++ *
++ * struct irq_domain_ops mp_ioapic_irqdomain_ops.activate = mp_irqdomain_activate()
++ */
+ void mp_irqdomain_activate(struct irq_domain *domain,
+ 			   struct irq_data *irq_data)
+ {
+@@ -2987,11 +3399,23 @@ void mp_irqdomain_activate(struct irq_domain *domain,
+ 	struct mp_chip_data *data = irq_data->chip_data;
+ 
+ 	raw_spin_lock_irqsave(&ioapic_lock, flags);
++	/*
++	 * struct irq_pin_list {
++	 *         struct list_head list;
++	 *         int apic, pin;
++	 * };
++	 */
+ 	for_each_irq_pin(entry, data->irq_2_pin)
+ 		__ioapic_write_entry(entry->apic, entry->pin, data->entry);
+ 	raw_spin_unlock_irqrestore(&ioapic_lock, flags);
+ }
+ 
++/*
++ * called by:
++ *   - kernel/irq/irqdomain.c|1790| <<__irq_domain_deactivate_irq>> domain->ops->deactivate(domain, irq_data);
++ *
++ * struct irq_domain_ops mp_ioapic_irqdomain_ops.deactivate = mp_irqdomain_deactivate()
++ */
+ void mp_irqdomain_deactivate(struct irq_domain *domain,
+ 			     struct irq_data *irq_data)
+ {
+@@ -3000,11 +3424,25 @@ void mp_irqdomain_deactivate(struct irq_domain *domain,
+ 			  (int)irq_data->hwirq);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kernel/apic/io_apic.c|3230| <<mp_irqdomain_alloc>> ioapic = mp_irqdomain_ioapic_idx(domain);
++ *   - arch/x86/kernel/apic/io_apic.c|3282| <<mp_irqdomain_free>> __remove_pin_from_irq(data, mp_irqdomain_ioapic_idx(domain),
++ *   - arch/x86/kernel/apic/io_apic.c|3307| <<mp_irqdomain_deactivate>> ioapic_mask_entry(mp_irqdomain_ioapic_idx(domain),
++ *   - arch/x86/kernel/devicetree.c|218| <<dt_irqdomain_alloc>> tmp.ioapic_id = mpc_ioapic_id(mp_irqdomain_ioapic_idx(domain));
++ */
+ int mp_irqdomain_ioapic_idx(struct irq_domain *domain)
+ {
+ 	return (int)(long)domain->host_data;
+ }
+ 
++/*
++ * used by:
++ *   - arch/x86/kernel/acpi/boot.c|453| <<acpi_parse_ioapic>> .ops = &mp_ioapic_irqdomain_ops,
++ *   - arch/x86/kernel/acpi/boot.c|805| <<acpi_register_ioapic>> .ops = &mp_ioapic_irqdomain_ops,
++ *   - arch/x86/kernel/mpparse.c|120| <<MP_ioapic_info>> .ops = &mp_ioapic_irqdomain_ops,
++ *   - arch/x86/platform/sfi/sfi.c|82| <<sfi_parse_ioapic>> .ops = &mp_ioapic_irqdomain_ops,
++ */
+ const struct irq_domain_ops mp_ioapic_irqdomain_ops = {
+ 	.alloc		= mp_irqdomain_alloc,
+ 	.free		= mp_irqdomain_free,
+diff --git a/arch/x86/kernel/apic/msi.c b/arch/x86/kernel/apic/msi.c
+index f10e7f9..a99e6f7 100644
+--- a/arch/x86/kernel/apic/msi.c
++++ b/arch/x86/kernel/apic/msi.c
+@@ -24,6 +24,12 @@
+ #include <asm/apic.h>
+ #include <asm/irq_remapping.h>
+ 
++/*
++ * used by:
++ *   - arch/x86/kernel/apic/msi.c|85| <<native_setup_msi_irqs>> domain = msi_default_domain;
++ *   - arch/x86/kernel/apic/msi.c|152| <<arch_init_msi_domain>> msi_default_domain =
++ *   - arch/x86/kernel/apic/msi.c|157| <<arch_init_msi_domain>> if (!msi_default_domain)
++ */
+ static struct irq_domain *msi_default_domain;
+ 
+ static void irq_msi_compose_msg(struct irq_data *data, struct msi_msg *msg)
+@@ -58,6 +64,9 @@ static void irq_msi_compose_msg(struct irq_data *data, struct msi_msg *msg)
+  * IRQ Chip for MSI PCI/PCI-X/PCI-Express Devices,
+  * which implement the MSI or MSI-X Capability Structure.
+  */
++/*
++ * struct msi_domain_info pci_msi_domain_info.chip = pci_msi_controller
++ */
+ static struct irq_chip pci_msi_controller = {
+ 	.name			= "PCI-MSI",
+ 	.irq_unmask		= pci_msi_unmask_irq,
+@@ -122,12 +131,20 @@ void pci_msi_set_desc(msi_alloc_info_t *arg, struct msi_desc *desc)
+ }
+ EXPORT_SYMBOL_GPL(pci_msi_set_desc);
+ 
++/*
++ * struct msi_domain_info pci_msi_domain_info.ops = pci_msi_domain_ops
++ * struct msi_domain_info pci_msi_ir_domain_info.ops = pci_msi_domain_ops
++ */
+ static struct msi_domain_ops pci_msi_domain_ops = {
+ 	.get_hwirq	= pci_msi_get_hwirq,
+ 	.msi_prepare	= pci_msi_prepare,
+ 	.set_desc	= pci_msi_set_desc,
+ };
+ 
++/*
++ * used by:
++ *   - arch/x86/kernel/apic/msi.c|159| <<arch_init_msi_domain>> pci_msi_create_irq_domain(fn, &pci_msi_domain_info,
++ */
+ static struct msi_domain_info pci_msi_domain_info = {
+ 	.flags		= MSI_FLAG_USE_DEF_DOM_OPS | MSI_FLAG_USE_DEF_CHIP_OPS |
+ 			  MSI_FLAG_PCI_MSIX,
+@@ -391,3 +408,20 @@ int hpet_assign_irq(struct irq_domain *domain, struct hpet_dev *dev,
+ 	return irq_domain_alloc_irqs(domain, 1, NUMA_NO_NODE, &info);
+ }
+ #endif
++
++/*
++ * msi的struct irq_domain_ops的例子
++ *
++ * kernel/irq/msi.c
++ *
++ * 166 static const struct irq_domain_ops msi_domain_ops = {
++ * 167         .alloc          = msi_domain_alloc,
++ * 168         .free           = msi_domain_free,
++ * 169         .activate       = msi_domain_activate,
++ * 170         .deactivate     = msi_domain_deactivate,
++ * 171 };
++ *
++ *
++ * info的例子:
++ * struct msi_domain_info pci_msi_domain_info
++ */
 diff --git a/arch/x86/kernel/apic/probe_64.c b/arch/x86/kernel/apic/probe_64.c
 index c303054..e714f47 100644
 --- a/arch/x86/kernel/apic/probe_64.c
@@ -699,21 +1079,86 @@ index c303054..e714f47 100644
  			if (apic != *drv) {
  				apic = *drv;
 diff --git a/arch/x86/kernel/apic/vector.c b/arch/x86/kernel/apic/vector.c
-index b958082..6e2d7f9 100644
+index b958082..6788846 100644
 --- a/arch/x86/kernel/apic/vector.c
 +++ b/arch/x86/kernel/apic/vector.c
-@@ -103,6 +103,10 @@ static void free_apic_chip_data(struct apic_chip_data *data)
+@@ -59,6 +59,7 @@ static struct apic_chip_data *apic_chip_data(struct irq_data *irq_data)
+ 	while (irq_data->parent_data)
+ 		irq_data = irq_data->parent_data;
+ 
++	/* void *chip_data */
+ 	return irq_data->chip_data;
+ }
+ 
+@@ -103,6 +104,67 @@ static void free_apic_chip_data(struct apic_chip_data *data)
  	}
  }
  
 +/*
++ * assign_irq_vector+0x48/0x320
++ * [    0.277036]  x86_vector_alloc_irqs+0x107/0x1e0
++ * [    0.277036]  msi_domain_alloc+0x65/0x140
++ * [    0.277036]  __irq_domain_alloc_irqs+0x12c/0x280
++ * [    0.277036]  msi_domain_alloc_irqs+0x83/0x170
++ * [    0.277036]  native_setup_msi_irqs+0x3b/0x50
++ * [    0.277036]  __pci_enable_msix_range+0x2ef/0x4e0
++ * [    0.277036]  pci_alloc_irq_vectors_affinity+0x77/0xc0
++ * [    0.277036]  vp_find_vqs_msix+0xed/0x4a0
++ * [    0.277036]  ? try_to_wake_up+0x40/0x420
++ * [    0.277036]  vp_find_vqs+0x35/0x190
++ * [    0.277036]  vp_modern_find_vqs+0x10/0x60
++ * [    0.277036]  virtscsi_init+0xfb/0x250
++ * [    0.277036]  virtscsi_probe+0xf7/0x300
++ * [    0.277036]  virtio_dev_probe+0x1b0/0x230
++ * [    0.277036]  driver_probe_device+0x203/0x2e0
++ * [    0.277036]  __driver_attach+0x92/0xa0
++ * [    0.277036]  ? driver_probe_device+0x2e0/0x2e0
++ * [    0.277036]  bus_for_each_dev+0x57/0x90
++ * [    0.277036]  bus_add_driver+0x196/0x210
++ * [    0.277036]  ? spi_transport_init+0x71/0x71
++ * [    0.277036]  driver_register+0x52/0xc0
++ * [    0.277036]  ? spi_transport_init+0x71/0x71
++ * [    0.277036]  init+0x81/0xc7
++ * [    0.277036]  do_one_initcall+0x3c/0x15e
++ * [    0.277036]  kernel_init_freeable+0x152/0x1d1
++ * [    0.277036]  ? rest_init+0xa0/0xa0
++ * [    0.277036]  kernel_init+0x5/0xf2
++ * [    0.277036]  ret_from_fork+0x35/0x40
++ *
++ * assign_irq_vector+0x48/0x320
++ * [    0.337552]  msi_domain_set_affinity+0x1d/0x60
++ * [    0.337552]  irq_do_set_affinity+0x28/0xa0
++ * [    0.337552]  irq_startup+0xbe/0xe0
++ * [    0.337552]  __setup_irq+0x686/0x720
++ * [    0.337552]  request_threaded_irq+0xf2/0x190
++ * [    0.337552]  vp_find_vqs_msix+0x30e/0x4a0
++ * [    0.337552]  vp_find_vqs+0x35/0x190
++ * [    0.337552]  vp_modern_find_vqs+0x10/0x60
++ * [    0.337552]  virtscsi_init+0xfb/0x250
++ * [    0.337552]  virtscsi_probe+0xf7/0x300
++ * [    0.337552]  virtio_dev_probe+0x1b0/0x230
++ * [    0.337552]  driver_probe_device+0x203/0x2e0
++ * [    0.337552]  __driver_attach+0x92/0xa0
++ * [    0.337552]  ? driver_probe_device+0x2e0/0x2e0
++ * [    0.337552]  bus_for_each_dev+0x57/0x90
++ * [    0.337552]  bus_add_driver+0x196/0x210
++ * [    0.337552]  ? spi_transport_init+0x71/0x71
++ * [    0.337552]  driver_register+0x52/0xc0
++ * [    0.337552]  ? spi_transport_init+0x71/0x71
++ * [    0.337552]  init+0x81/0xc7
++ * [    0.337552]  do_one_initcall+0x3c/0x15e
++ * [    0.337552]  kernel_init_freeable+0x152/0x1d1
++ * [    0.337552]  ? rest_init+0xa0/0xa0
++ * [    0.337552]  kernel_init+0x5/0xf2
++ * [    0.337552]  ret_from_fork+0x35/0x40
++ *
 + * called by:
 + *   - arch/x86/kernel/apic/vector.c|244| <<assign_irq_vector>> err = __assign_irq_vector(irq, data, mask, irqdata);
 + */
  static int __assign_irq_vector(int irq, struct apic_chip_data *d,
  			       const struct cpumask *mask,
  			       struct irq_data *irqdata)
-@@ -189,6 +193,9 @@ static int __assign_irq_vector(int irq, struct apic_chip_data *d,
+@@ -189,6 +251,9 @@ static int __assign_irq_vector(int irq, struct apic_chip_data *d,
  		/* Schedule the old vector for cleanup on all cpus */
  		if (d->cfg.vector)
  			cpumask_copy(d->old_domain, d->domain);
@@ -723,7 +1168,7 @@ index b958082..6e2d7f9 100644
  		for_each_cpu(new_cpu, vector_searchmask)
  			per_cpu(vector_irq, new_cpu)[vector] = irq_to_desc(irq);
  		goto update;
-@@ -233,6 +240,13 @@ static int __assign_irq_vector(int irq, struct apic_chip_data *d,
+@@ -233,6 +298,13 @@ static int __assign_irq_vector(int irq, struct apic_chip_data *d,
  	return 0;
  }
  
@@ -737,7 +1182,7 @@ index b958082..6e2d7f9 100644
  static int assign_irq_vector(int irq, struct apic_chip_data *data,
  			     const struct cpumask *mask,
  			     struct irq_data *irqdata)
-@@ -396,6 +410,10 @@ static const struct irq_domain_ops x86_vector_domain_ops = {
+@@ -396,6 +468,10 @@ static const struct irq_domain_ops x86_vector_domain_ops = {
  	.free	= x86_vector_free_irqs,
  };
  
@@ -748,7 +1193,61 @@ index b958082..6e2d7f9 100644
  int __init arch_probe_nr_irqs(void)
  {
  	int nr;
-@@ -806,6 +824,10 @@ static void __init print_APIC_field(int base)
+@@ -471,6 +547,10 @@ int __init arch_early_irq_init(void)
+ }
+ 
+ /* Initialize vector_irq on a new cpu */
++/*
++ * called by:
++ *   - arch/x86/kernel/apic/vector.c|538| <<setup_vector_irq>> __setup_vector_irq(cpu);
++ */
+ static void __setup_vector_irq(int cpu)
+ {
+ 	struct apic_chip_data *data;
+@@ -479,11 +559,23 @@ static void __setup_vector_irq(int cpu)
+ 
+ 	/* Mark the inuse vectors */
+ 	for_each_irq_desc(irq, desc) {
++		/*
++		 * struct irq_data来自irq_desc->irq_data
++		 * 是嵌入进去的, 不是指针
++		 */
+ 		struct irq_data *idata = irq_desc_get_irq_data(desc);
+ 
++		/* struct irq_data的void *chip_data */
+ 		data = apic_chip_data(idata);
+ 		if (!data || !cpumask_test_cpu(cpu, data->domain))
+ 			continue;
++		/*
++		 * struct irq_cfg {
++		 *         unsigned int dest_apicid;
++		 *         u8           vector;
++		 *         u8           old_vector;
++		 * };
++		 */
+ 		vector = data->cfg.vector;
+ 		per_cpu(vector_irq, cpu)[vector] = desc;
+ 	}
+@@ -493,6 +585,7 @@ static void __setup_vector_irq(int cpu)
+ 		if (IS_ERR_OR_NULL(desc))
+ 			continue;
+ 
++		/* struct irq_data的void *chip_data */
+ 		data = apic_chip_data(irq_desc_get_irq_data(desc));
+ 		if (!cpumask_test_cpu(cpu, data->domain))
+ 			per_cpu(vector_irq, cpu)[vector] = VECTOR_UNUSED;
+@@ -502,6 +595,10 @@ static void __setup_vector_irq(int cpu)
+ /*
+  * Setup the vector to irq mappings. Must be called with vector_lock held.
+  */
++/*
++ * called by:
++ *   - arch/x86/kernel/smpboot.c|257| <<start_secondary>> setup_vector_irq(smp_processor_id());
++ */
+ void setup_vector_irq(int cpu)
+ {
+ 	int irq;
+@@ -806,6 +903,10 @@ static void __init print_APIC_field(int base)
  	pr_cont("\n");
  }
  
@@ -759,7 +1258,7 @@ index b958082..6e2d7f9 100644
  static void __init print_local_APIC(void *dummy)
  {
  	unsigned int i, v, ver, maxlvt;
-@@ -913,6 +935,10 @@ static void __init print_local_APIC(void *dummy)
+@@ -913,6 +1014,10 @@ static void __init print_local_APIC(void *dummy)
  	pr_cont("\n");
  }
  
@@ -1363,8 +1862,97 @@ index 5b2d10c..fdab936 100644
  struct x86_io_apic_ops x86_io_apic_ops __ro_after_init = {
  	.read			= native_io_apic_read,
  	.disable		= native_disable_io_apic,
+diff --git a/drivers/pci/msi.c b/drivers/pci/msi.c
+index 536e9a5..7701e24 100644
+--- a/drivers/pci/msi.c
++++ b/drivers/pci/msi.c
+@@ -34,6 +34,7 @@ int pci_msi_ignore_mask;
+ #ifdef CONFIG_PCI_MSI_IRQ_DOMAIN
+ static int pci_msi_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
+ {
++	/* include/linux/irqdomain.h */
+ 	struct irq_domain *domain;
+ 
+ 	domain = dev_get_msi_domain(&dev->dev);
+diff --git a/include/linux/device.h b/include/linux/device.h
+index 66fe271..ad2564a 100644
+--- a/include/linux/device.h
++++ b/include/linux/device.h
+@@ -1014,6 +1014,12 @@ static inline struct irq_domain *dev_get_msi_domain(const struct device *dev)
+ #endif
+ }
+ 
++/*
++ * called by:
++ *   - drivers/pci/host/vmd.c|658| <<vmd_enable_domain>> dev_set_msi_domain(&vmd->bus->dev, vmd->irq_domain);
++ *   - drivers/pci/probe.c|748| <<pci_set_bus_msi_domain>> dev_set_msi_domain(&bus->dev, d);
++ *   - drivers/pci/probe.c|2081| <<pci_set_msi_domain>> dev_set_msi_domain(&dev->dev, d);
++ */
+ static inline void dev_set_msi_domain(struct device *dev, struct irq_domain *d)
+ {
+ #ifdef CONFIG_GENERIC_MSI_IRQ_DOMAIN
+diff --git a/include/linux/irqdomain.h b/include/linux/irqdomain.h
+index b1037df..89a9d32 100644
+--- a/include/linux/irqdomain.h
++++ b/include/linux/irqdomain.h
+@@ -108,11 +108,27 @@ struct irq_domain_ops {
+ 
+ #ifdef	CONFIG_IRQ_DOMAIN_HIERARCHY
+ 	/* extended V2 interfaces to support hierarchy irq_domains */
++	/*
++	 * called by:
++	 *   - kernel/irq/irqdomain.c|1780| <<__irq_domain_activate_irq>> domain->ops->activate(domain, irq_data);
++	 */
+ 	int (*alloc)(struct irq_domain *d, unsigned int virq,
+ 		     unsigned int nr_irqs, void *arg);
++	/*
++	 * called by:
++	 *   - kernel/irq/irqdomain.c|1790| <<__irq_domain_deactivate_irq>> domain->ops->deactivate(domain, irq_data);
++	 */
+ 	void (*free)(struct irq_domain *d, unsigned int virq,
+ 		     unsigned int nr_irqs);
++	/*
++	 * called by:
++	 *   - kernel/irq/irqdomain.c|1780| <<__irq_domain_activate_irq>> domain->ops->activate(domain, irq_data);
++	 */
+ 	void (*activate)(struct irq_domain *d, struct irq_data *irq_data);
++	/*
++	 * called by:             
++	 *   - kernel/irq/irqdomain.c|1790| <<__irq_domain_deactivate_irq>> domain->ops->deactivate(domain, irq_data);
++	 */
+ 	void (*deactivate)(struct irq_domain *d, struct irq_data *irq_data);
+ 	int (*translate)(struct irq_domain *d, struct irq_fwspec *fwspec,
+ 			 unsigned long *out_hwirq, unsigned int *out_type);
+@@ -339,6 +355,12 @@ static inline struct irq_domain *irq_domain_create_linear(struct fwnode_handle *
+ 					 const struct irq_domain_ops *ops,
+ 					 void *host_data)
+ {
++	/*
++	 * 如果是从ioapic进来的:
++	 *   ops可以是struct irq_domain_ops mp_ioapic_irqdomain_ops
++	 *   size是ioapic的pin的数量
++	 *   host_data是ioapic的id
++	 */
+ 	return __irq_domain_add(fwnode, size, size, 0, ops, host_data);
+ }
+ 
+@@ -441,6 +463,14 @@ extern void irq_domain_free_irqs(unsigned int virq, unsigned int nr_irqs);
+ extern void irq_domain_activate_irq(struct irq_data *irq_data);
+ extern void irq_domain_deactivate_irq(struct irq_data *irq_data);
+ 
++/*
++ * called by:
++ *   - arch/x86/kernel/apic/htirq.c|192| <<arch_setup_ht_irq>> return irq_domain_alloc_irqs(htirq_domain, 1, dev_to_node(&dev->dev),
++ *   - arch/x86/kernel/apic/msi.c|280| <<dmar_alloc_hwirq>> return irq_domain_alloc_irqs(domain, 1, node, &info);
++ *   - arch/x86/kernel/apic/msi.c|400| <<hpet_assign_irq>> return irq_domain_alloc_irqs(domain, 1, NUMA_NO_NODE, &info);
++ *   - arch/x86/platform/uv/uv_irq.c|204| <<uv_setup_irq>> return irq_domain_alloc_irqs(domain, 1,
++ *   - kernel/irq/irqdomain.c|907| <<irq_create_fwspec_mapping>> virq = irq_domain_alloc_irqs(domain, 1, NUMA_NO_NODE, fwspec);
++ */
+ static inline int irq_domain_alloc_irqs(struct irq_domain *domain,
+ 			unsigned int nr_irqs, int node, void *arg)
+ {
 diff --git a/kernel/irq/chip.c b/kernel/irq/chip.c
-index 317fc75..76f1650 100644
+index 317fc75..343e0be 100644
 --- a/kernel/irq/chip.c
 +++ b/kernel/irq/chip.c
 @@ -157,6 +157,9 @@ int irq_set_chip_data(unsigned int irq, void *data)
@@ -1377,11 +1965,205 @@ index 317fc75..76f1650 100644
  struct irq_data *irq_get_irq_data(unsigned int irq)
  {
  	struct irq_desc *desc = irq_to_desc(irq);
+@@ -1246,6 +1249,10 @@ EXPORT_SYMBOL_GPL(irq_chip_disable_parent);
+  * irq_chip_ack_parent - Acknowledge the parent interrupt
+  * @data:	Pointer to interrupt specific data
+  */
++/*
++ * struct irq_chip ioapic_chip.irq_ack = irq_chip_ack_parent()
++ * struct irq_chip ioapic_ir_chip.irq_ack = irq_chip_ack_parent()
++ */
+ void irq_chip_ack_parent(struct irq_data *data)
+ {
+ 	data = data->parent_data;
+@@ -1330,6 +1337,10 @@ EXPORT_SYMBOL_GPL(irq_chip_set_type_parent);
+  * Iterate through the domain hierarchy of the interrupt and check
+  * whether a hw retrigger function exists. If yes, invoke it.
+  */
++/*
++ * struct irq_chip ioapic_chip.irq_retrigger = irq_chip_retrigger_hierarchy()
++ * struct irq_chip ioapic_ir_chip.irq_retrigger = irq_chip_retrigger_hierarchy()
++ */
+ int irq_chip_retrigger_hierarchy(struct irq_data *data)
+ {
+ 	for (data = data->parent_data; data; data = data->parent_data)
 diff --git a/kernel/irq/irqdomain.c b/kernel/irq/irqdomain.c
-index ac4644e..500efdd 100644
+index ac4644e..40a170b 100644
 --- a/kernel/irq/irqdomain.c
 +++ b/kernel/irq/irqdomain.c
-@@ -1689,6 +1689,11 @@ static void __irq_domain_activate_irq(struct irq_data *irq_data)
+@@ -18,6 +18,14 @@
+ #include <linux/smp.h>
+ #include <linux/fs.h>
+ 
++/*
++ * used by:
++ *   - kernel/irq/irqdomain.c|298| <<__irq_domain_add>> list_add(&domain->link, &irq_domain_list);
++ *   - kernel/irq/irqdomain.c|472| <<irq_find_matching_fwspec>> list_for_each_entry(h, &irq_domain_list, link) {
++ *   - kernel/irq/irqdomain.c|505| <<irq_domain_check_msi_remap>> list_for_each_entry(h, &irq_domain_list, link) {
++ *   - kernel/irq/irqdomain.c|1029| <<virq_debug_show>> list_for_each_entry(domain, &irq_domain_list, link) {
++ *   - kernel/irq/irqdomain.c|1961| <<irq_domain_debugfs_init>> list_for_each_entry(d, &irq_domain_list, link)
++ */
+ static LIST_HEAD(irq_domain_list);
+ static DEFINE_MUTEX(irq_domain_mutex);
+ 
+@@ -125,6 +133,90 @@ EXPORT_SYMBOL_GPL(irq_domain_free_fwnode);
+  * Allocates and initialize and irq_domain structure.
+  * Returns pointer to IRQ domain, or NULL on failure.
+  */
++/*
++ * irq: Added domain VECTOR
++ * [0] __irq_domain_add
++ * [0] arch_early_irq_init
++ * [0] start_kernel
++ * [0] secondary_startup_64
++ *
++ * irq: Added domain PCI-MSI
++ * [0] __irq_domain_add
++ * [0] irq_domain_create_hierarchy
++ * [0] msi_create_irq_domain
++ * [0] pci_msi_create_irq_domain
++ * [0] arch_init_msi_domain
++ * [0] arch_early_irq_init
++ * [0] start_kernel
++ * [0] secondary_startup_64
++ *
++ * irq: Added domain PCI-HT
++ * [0] __irq_domain_add
++ * [0] arch_init_htirq_domain
++ * [0] arch_early_irq_init
++ * [0] start_kernel
++ * [0] secondary_startup_64
++ *
++ * irq: Added domain IO-APIC-0
++ * [0] __irq_domain_add
++ * [0] mp_irqdomain_create
++ * [0] setup_IO_APIC
++ * [0] apic_bsp_setup
++ * [0] native_smp_prepare_cpus
++ * [0] kernel_init_freeable
++ * [0] kernel_init
++ * [0] ret_from_fork
++ *
++ * irq: Added domain HPET-MSI-0
++ * [0] __irq_domain_add
++ * [0] irq_domain_create_hierarchy
++ * [0] msi_create_irq_domain
++ * [0] hpet_create_irq_domain
++ * [0] hpet_msi_capability_lookup
++ * [0] hpet_late_init
++ * [0] do_one_initcall
++ * [0] kernel_init_freeable
++ * [0] kernel_init
++ * [0] ret_from_fork
++ *
++ *
++ * q35有个额外的
++ * irq: Added domain unknown-1
++ * [0] __irq_domain_add
++ * [0] i2c_register_adapter
++ * [0] i2c_add_adapter
++ * [0] i801_probe
++ * [0] local_pci_probe
++ * [0] pci_device_probe
++ * [0] driver_probe_device
++ * [0] __driver_attach
++ * [0] bus_for_each_dev
++ * [0] bus_add_driver
++ * [0] driver_register
++ * [0] i2c_i801_init
++ * [0] do_one_initcall
++ * [0] kernel_init_freeable
++ * [0] kernel_init
++ * [0] ret_from_fork
++ *
++ * called by:
++ *   - include/linux/irqdomain.h|313| <<irq_domain_add_linear>> return __irq_domain_add(of_node_to_fwnode(of_node), size, size, 0, ops, host_data);
++ *   - include/linux/irqdomain.h|320| <<irq_domain_add_nomap>> return __irq_domain_add(of_node_to_fwnode(of_node), 0, max_irq, max_irq, ops, host_data);
++ *   - include/linux/irqdomain.h|334| <<irq_domain_add_tree>> return __irq_domain_add(of_node_to_fwnode(of_node), 0, ~0, 0, ops, host_data);
++ *   - include/linux/irqdomain.h|342| <<irq_domain_create_linear>> return __irq_domain_add(fwnode, size, size, 0, ops, host_data);
++ *   - include/linux/irqdomain.h|349| <<irq_domain_create_tree>> return __irq_domain_add(fwnode, 0, ~0, 0, ops, host_data);
++ *   - kernel/irq/irqdomain.c|322| <<irq_domain_add_simple>> domain = __irq_domain_add(of_node_to_fwnode(of_node), size, size, 0, ops, host_data);
++ *   - kernel/irq/irqdomain.c|366| <<irq_domain_add_legacy>> domain = __irq_domain_add(of_node_to_fwnode(of_node), first_hwirq + size,
++ *
++ * 如果是从ioapic进来的:
++ *   ops可以是struct irq_domain_ops mp_ioapic_irqdomain_ops
++ *   size是ioapic的pin的数量
++ *   hwirq_max是ioapic的pin的数量
++ *   direct_max是0
++ *   host_data是ioapic的id
++ *
++ * 核心思想就是初始化一个struct irq_domain, 加入irq_domain_list
++ */
+ struct irq_domain *__irq_domain_add(struct fwnode_handle *fwnode, int size,
+ 				    irq_hw_number_t hwirq_max, int direct_max,
+ 				    const struct irq_domain_ops *ops,
+@@ -220,6 +312,14 @@ struct irq_domain *__irq_domain_add(struct fwnode_handle *fwnode, int size,
+ 
+ 	mutex_lock(&irq_domain_mutex);
+ 	debugfs_add_domain_dir(domain);
++	/*
++	 * used by:
++	 *   - kernel/irq/irqdomain.c|298| <<__irq_domain_add>> list_add(&domain->link, &irq_domain_list);
++	 *   - kernel/irq/irqdomain.c|472| <<irq_find_matching_fwspec>> list_for_each_entry(h, &irq_domain_list, link) {
++	 *   - kernel/irq/irqdomain.c|505| <<irq_domain_check_msi_remap>> list_for_each_entry(h, &irq_domain_list, link) {
++	 *   - kernel/irq/irqdomain.c|1029| <<virq_debug_show>> list_for_each_entry(domain, &irq_domain_list, link) {
++	 *   - kernel/irq/irqdomain.c|1961| <<irq_domain_debugfs_init>> list_for_each_entry(d, &irq_domain_list, link)
++	 */
+ 	list_add(&domain->link, &irq_domain_list);
+ 	mutex_unlock(&irq_domain_mutex);
+ 
+@@ -1146,6 +1246,10 @@ struct irq_domain *irq_domain_create_hierarchy(struct irq_domain *parent,
+ }
+ EXPORT_SYMBOL_GPL(irq_domain_create_hierarchy);
+ 
++/*
++ * called by:
++ *   - kernel/irq/irqdomain.c|1523| <<__irq_domain_alloc_irqs>> irq_domain_insert_irq(virq + i);
++ */
+ static void irq_domain_insert_irq(int virq)
+ {
+ 	struct irq_data *data;
+@@ -1252,6 +1356,10 @@ struct irq_data *irq_domain_get_irq_data(struct irq_domain *domain,
+ {
+ 	struct irq_data *irq_data;
+ 
++	/*
++	 * irq_get_irq_data()
++	 * 获得irq的struct irq_desc *desc, 返回desc->irq_data
++	 */
+ 	for (irq_data = irq_get_irq_data(virq); irq_data;
+ 	     irq_data = irq_data->parent_data)
+ 		if (irq_data->domain == domain)
+@@ -1367,6 +1475,13 @@ static void irq_domain_free_irqs_hierarchy(struct irq_domain *domain,
+ 		domain->ops->free(domain, irq_base, nr_irqs);
+ }
+ 
++/*
++ * called by:
++ *   - kernel/irq/irqdomain.c|1445| <<__irq_domain_alloc_irqs>> ret = irq_domain_alloc_irqs_hierarchy(domain, virq, nr_irqs, arg);
++ *   - kernel/irq/irqdomain.c|1546| <<irq_domain_push_irq>> rv = irq_domain_alloc_irqs_hierarchy(domain, virq, 1, arg);
++ *   - kernel/irq/irqdomain.c|1672| <<irq_domain_alloc_irqs_parent>> return irq_domain_alloc_irqs_hierarchy(domain->parent, irq_base,
++ *   - kernel/irq/msi.c|318| <<msi_domain_populate_irqs>> ret = irq_domain_alloc_irqs_hierarchy(domain, desc->irq, 1,
++ */
+ int irq_domain_alloc_irqs_hierarchy(struct irq_domain *domain,
+ 				    unsigned int irq_base,
+ 				    unsigned int nr_irqs, void *arg)
+@@ -1396,6 +1511,14 @@ int irq_domain_alloc_irqs_hierarchy(struct irq_domain *domain,
+  * resources. In this way, it's easier to rollback when failing to
+  * allocate resources.
+  */
++/*
++ * called by:
++ *   - arch/x86/kernel/apic/io_apic.c|1079| <<alloc_irq_from_domain>> return __irq_domain_alloc_irqs(domain, irq, 1,
++ *   - arch/x86/kernel/apic/io_apic.c|1114| <<alloc_isa_irq_from_domain>> irq = __irq_domain_alloc_irqs(domain, irq, 1, node, info, true,
++ *   - include/linux/irqdomain.h|469| <<irq_domain_alloc_irqs>> return __irq_domain_alloc_irqs(domain, -1, nr_irqs, node, arg, false,
++ *   - kernel/irq/ipi.c|85| <<irq_reserve_ipi>> virq = __irq_domain_alloc_irqs(domain, virq, nr_irqs, NUMA_NO_NODE,
++ *   - kernel/irq/msi.c|376| <<msi_domain_alloc_irqs>> virq = __irq_domain_alloc_irqs(domain, -1, desc->nvec_used,
++ */
+ int __irq_domain_alloc_irqs(struct irq_domain *domain, int irq_base,
+ 			    unsigned int nr_irqs, int node, void *arg,
+ 			    bool realloc, const struct cpumask *affinity)
+@@ -1689,6 +1812,11 @@ static void __irq_domain_activate_irq(struct irq_data *irq_data)
  
  		if (irq_data->parent_data)
  			__irq_domain_activate_irq(irq_data->parent_data);
@@ -1393,6 +2175,161 @@ index ac4644e..500efdd 100644
  		if (domain->ops->activate)
  			domain->ops->activate(domain, irq_data);
  	}
+@@ -1767,6 +1895,10 @@ bool irq_domain_hierarchical_is_msi_remap(struct irq_domain *domain)
+ struct irq_data *irq_domain_get_irq_data(struct irq_domain *domain,
+ 					 unsigned int virq)
+ {
++	/*
++	 * irq_get_irq_data()
++	 * 获得irq的struct irq_desc *desc, 返回desc->irq_data
++	 */
+ 	struct irq_data *irq_data = irq_get_irq_data(virq);
+ 
+ 	return (irq_data && irq_data->domain == domain) ? irq_data : NULL;
+diff --git a/kernel/irq/manage.c b/kernel/irq/manage.c
+index 6c877d2..84fdca7 100644
+--- a/kernel/irq/manage.c
++++ b/kernel/irq/manage.c
+@@ -1142,6 +1142,13 @@ setup_irq_thread(struct irqaction *new, unsigned int irq, bool secondary)
+  * interrupt related functions. desc->request_mutex solely serializes
+  * request/free_irq().
+  */
++/*
++ * called by:
++ *   - kernel/irq/manage.c|1508| <<setup_irq>> retval = __setup_irq(irq, desc, act);
++ *   - kernel/irq/manage.c|1795| <<request_threaded_irq>> retval = __setup_irq(irq, desc, action);
++ *   - kernel/irq/manage.c|2043| <<setup_percpu_irq>> retval = __setup_irq(irq, desc, act);
++ *   - kernel/irq/manage.c|2102| <<__request_percpu_irq>> retval = __setup_irq(irq, desc, action);
++ */
+ static int
+ __setup_irq(unsigned int irq, struct irq_desc *desc, struct irqaction *new)
+ {
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 3fa4bd5..a67d899 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -100,6 +100,9 @@ int msi_domain_set_affinity(struct irq_data *irq_data,
+ 	return ret;
+ }
+ 
++/*
++ * struct irq_domain_ops msi_domain_ops.activate = msi_domain_activate()
++ */
+ static void msi_domain_activate(struct irq_domain *domain,
+ 				struct irq_data *irq_data)
+ {
+@@ -109,6 +112,9 @@ static void msi_domain_activate(struct irq_domain *domain,
+ 	irq_chip_write_msi_msg(irq_data, &msg);
+ }
+ 
++/*
++ * struct irq_domain_ops msi_domain_ops.deactivate = msi_domain_deactivate()
++ */
+ static void msi_domain_deactivate(struct irq_domain *domain,
+ 				  struct irq_data *irq_data)
+ {
+@@ -118,6 +124,9 @@ static void msi_domain_deactivate(struct irq_domain *domain,
+ 	irq_chip_write_msi_msg(irq_data, &msg);
+ }
+ 
++/*
++ * struct irq_domain_ops msi_domain_ops.alloc = msi_domain_alloc()
++ */
+ static int msi_domain_alloc(struct irq_domain *domain, unsigned int virq,
+ 			    unsigned int nr_irqs, void *arg)
+ {
+@@ -136,6 +145,14 @@ static int msi_domain_alloc(struct irq_domain *domain, unsigned int virq,
+ 	}
+ 
+ 	for (i = 0; i < nr_irqs; i++) {
++		/*
++		 * info的例子是pci_msi_domain_info
++		 *
++		 * 这里的ops是struct msi_domain_ops
++		 *
++		 * 一个例子就是msi_domain_ops_default?
++		 * msi_domain_ops_init()
++		 */
+ 		ret = ops->msi_init(domain, info, virq + i, hwirq + i, arg);
+ 		if (ret < 0) {
+ 			if (ops->msi_free) {
+@@ -150,6 +167,9 @@ static int msi_domain_alloc(struct irq_domain *domain, unsigned int virq,
+ 	return 0;
+ }
+ 
++/*
++ * struct irq_domain_ops msi_domain_ops.free = msi_domain_free()
++ */
+ static void msi_domain_free(struct irq_domain *domain, unsigned int virq,
+ 			    unsigned int nr_irqs)
+ {
+@@ -200,6 +220,9 @@ static int msi_domain_ops_init(struct irq_domain *domain,
+ 			       unsigned int virq, irq_hw_number_t hwirq,
+ 			       msi_alloc_info_t *arg)
+ {
++	/*
++	 * info的例子是pci_msi_domain_info
++	 */
+ 	irq_domain_set_hwirq_and_chip(domain, virq, hwirq, info->chip,
+ 				      info->chip_data);
+ 	if (info->handler && info->handler_name) {
+@@ -217,6 +240,15 @@ static int msi_domain_ops_check(struct irq_domain *domain,
+ 	return 0;
+ }
+ 
++/*
++ * used by:
++ *   - kernel/irq/msi.c|250| <<msi_domain_update_dom_ops>> info->ops = &msi_domain_ops_default;
++ *   - kernel/irq/msi.c|255| <<msi_domain_update_dom_ops>> ops->get_hwirq = msi_domain_ops_default.get_hwirq;
++ *   - kernel/irq/msi.c|257| <<msi_domain_update_dom_ops>> ops->msi_init = msi_domain_ops_default.msi_init;
++ *   - kernel/irq/msi.c|259| <<msi_domain_update_dom_ops>> ops->msi_check = msi_domain_ops_default.msi_check;
++ *   - kernel/irq/msi.c|261| <<msi_domain_update_dom_ops>> ops->msi_prepare = msi_domain_ops_default.msi_prepare;
++ *   - kernel/irq/msi.c|263| <<msi_domain_update_dom_ops>> ops->set_desc = msi_domain_ops_default.set_desc;
++ */
+ static struct msi_domain_ops msi_domain_ops_default = {
+ 	.get_hwirq	= msi_domain_ops_get_hwirq,
+ 	.msi_init	= msi_domain_ops_init,
+@@ -225,6 +257,10 @@ static struct msi_domain_ops msi_domain_ops_default = {
+ 	.set_desc	= msi_domain_ops_set_desc,
+ };
+ 
++/*
++ * called by:
++ *   - kernel/irq/msi.c|288| <<msi_create_irq_domain>> msi_domain_update_dom_ops(info);
++ */
+ static void msi_domain_update_dom_ops(struct msi_domain_info *info)
+ {
+ 	struct msi_domain_ops *ops = info->ops;
+@@ -345,6 +381,12 @@ int msi_domain_populate_irqs(struct irq_domain *domain, struct device *dev,
+  *
+  * Returns 0 on success or an error code.
+  */
++/*
++ * called by:
++ *   - arch/x86/kernel/apic/msi.c|95| <<native_setup_msi_irqs>> return msi_domain_alloc_irqs(domain, &dev->dev, nvec);
++ *   - drivers/base/platform-msi.c|273| <<platform_msi_domain_alloc_irqs>> err = msi_domain_alloc_irqs(dev->msi_domain, dev, nvec);
++ *   - drivers/pci/msi.c|41| <<pci_msi_setup_msi_irqs>> return msi_domain_alloc_irqs(domain, &dev->dev, nvec);
++ */
+ int msi_domain_alloc_irqs(struct irq_domain *domain, struct device *dev,
+ 			  int nvec)
+ {
+diff --git a/kernel/irq_work.c b/kernel/irq_work.c
+index bcf107c..627f328 100644
+--- a/kernel/irq_work.c
++++ b/kernel/irq_work.c
+@@ -166,6 +166,12 @@ static void irq_work_run_list(struct llist_head *list)
+  * hotplug calls this through:
+  *  hotplug_cfd() -> flush_smp_call_function_queue()
+  */
++/*
++ * called by:
++ *   - arch/x86/kernel/irq_work.c|21| <<smp_irq_work_interrupt>> irq_work_run();
++ *   - arch/x86/xen/smp_pv.c|476| <<xen_irq_work_interrupt>> irq_work_run();
++ *   - kernel/smp.c|257| <<flush_smp_call_function_queue>> irq_work_run();
++ */
+ void irq_work_run(void)
+ {
+ 	irq_work_run_list(this_cpu_ptr(&raised_list));
 diff --git a/kernel/kexec_core.c b/kernel/kexec_core.c
 index 20fef1a..82bf1f1 100644
 --- a/kernel/kexec_core.c
