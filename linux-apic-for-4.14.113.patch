@@ -1,6 +1,6 @@
-From f018cc0a35bb6d91852b778cb92072fd8e725b1c Mon Sep 17 00:00:00 2001
+From 4969794882ce8f40122b6546bb20e2bbde4e4f3c Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Mon, 3 Jun 2019 15:57:41 +0800
+Date: Tue, 4 Jun 2019 00:26:33 +0800
 Subject: [PATCH 1/1] linux-apic-for-4.14.113
 
 Signed-off-by: Dongli Zhang <dongli.zhangi0129@gmail.com>
@@ -36,17 +36,17 @@ Signed-off-by: Dongli Zhang <dongli.zhangi0129@gmail.com>
  include/linux/irqdomain.h             |  40 +++
  include/linux/msi.h                   |  11 +
  include/linux/pci.h                   |   6 +
- kernel/irq/chip.c                     |  11 +
- kernel/irq/irqdesc.c                  |  10 +
- kernel/irq/irqdomain.c                | 177 +++++++++++++
+ kernel/irq/chip.c                     |  24 ++
+ kernel/irq/irqdesc.c                  |  30 +++
+ kernel/irq/irqdomain.c                | 183 +++++++++++++
  kernel/irq/manage.c                   |   7 +
- kernel/irq/msi.c                      |  93 +++++++
+ kernel/irq/msi.c                      |  98 +++++++
  kernel/irq_work.c                     |   6 +
  kernel/kexec_core.c                   |  21 ++
  kernel/panic.c                        |   7 +
  kernel/time/tick-common.c             |   5 +
  kernel/time/tick-oneshot.c            |   9 +
- 41 files changed, 2007 insertions(+)
+ 41 files changed, 2051 insertions(+)
 
 diff --git a/arch/x86/include/asm/i8259.h b/arch/x86/include/asm/i8259.h
 index 89789e8..909be79 100644
@@ -3145,10 +3145,37 @@ index b1abbcc..1cfac35 100644
  pci_alloc_irq_vectors(struct pci_dev *dev, unsigned int min_vecs,
  		      unsigned int max_vecs, unsigned int flags)
 diff --git a/kernel/irq/chip.c b/kernel/irq/chip.c
-index 317fc75..343e0be 100644
+index 317fc75..865dd8a 100644
 --- a/kernel/irq/chip.c
 +++ b/kernel/irq/chip.c
-@@ -157,6 +157,9 @@ int irq_set_chip_data(unsigned int irq, void *data)
+@@ -110,6 +110,16 @@ EXPORT_SYMBOL(irq_set_handler_data);
+  *
+  *	Set the MSI descriptor entry for an irq at offset
+  */
++/*
++ * called by:
++ *   - kernel/irq/chip.c|137| <<irq_set_msi_desc>> return irq_set_msi_desc_off(irq, 0, entry);
++ *   - kernel/irq/msi.c|359| <<msi_domain_populate_irqs>> irq_set_msi_desc_off(desc->irq, 0, desc);
++ *   - kernel/irq/msi.c|470| <<msi_domain_alloc_irqs>> irq_set_msi_desc_off(virq, i, desc);
++ *
++ * 这个函数会修改desc->irq_common_data.msi_desc = entry
++ *
++ * 主要是会修改entry->irq = irq_base!!!!
++ */
+ int irq_set_msi_desc_off(unsigned int irq_base, unsigned int irq_offset,
+ 			 struct msi_desc *entry)
+ {
+@@ -119,6 +129,9 @@ int irq_set_msi_desc_off(unsigned int irq_base, unsigned int irq_offset,
+ 	if (!desc)
+ 		return -EINVAL;
+ 	desc->irq_common_data.msi_desc = entry;
++	/*
++	 * 这里的entry是struct msi_desc
++	 */
+ 	if (entry && !irq_offset)
+ 		entry->irq = irq_base;
+ 	irq_put_desc_unlock(desc, flags);
+@@ -157,6 +170,9 @@ int irq_set_chip_data(unsigned int irq, void *data)
  }
  EXPORT_SYMBOL(irq_set_chip_data);
  
@@ -3158,7 +3185,7 @@ index 317fc75..343e0be 100644
  struct irq_data *irq_get_irq_data(unsigned int irq)
  {
  	struct irq_desc *desc = irq_to_desc(irq);
-@@ -1246,6 +1249,10 @@ EXPORT_SYMBOL_GPL(irq_chip_disable_parent);
+@@ -1246,6 +1262,10 @@ EXPORT_SYMBOL_GPL(irq_chip_disable_parent);
   * irq_chip_ack_parent - Acknowledge the parent interrupt
   * @data:	Pointer to interrupt specific data
   */
@@ -3169,7 +3196,7 @@ index 317fc75..343e0be 100644
  void irq_chip_ack_parent(struct irq_data *data)
  {
  	data = data->parent_data;
-@@ -1330,6 +1337,10 @@ EXPORT_SYMBOL_GPL(irq_chip_set_type_parent);
+@@ -1330,6 +1350,10 @@ EXPORT_SYMBOL_GPL(irq_chip_set_type_parent);
   * Iterate through the domain hierarchy of the interrupt and check
   * whether a hw retrigger function exists. If yes, invoke it.
   */
@@ -3181,7 +3208,7 @@ index 317fc75..343e0be 100644
  {
  	for (data = data->parent_data; data; data = data->parent_data)
 diff --git a/kernel/irq/irqdesc.c b/kernel/irq/irqdesc.c
-index aa08d41..d6a4b51 100644
+index aa08d41..10572a8 100644
 --- a/kernel/irq/irqdesc.c
 +++ b/kernel/irq/irqdesc.c
 @@ -131,6 +131,16 @@ int nr_irqs = NR_IRQS;
@@ -3201,8 +3228,42 @@ index aa08d41..d6a4b51 100644
  static DECLARE_BITMAP(allocated_irqs, IRQ_BITMAP_BITS);
  
  #ifdef CONFIG_SPARSE_IRQ
+@@ -686,6 +696,15 @@ EXPORT_SYMBOL_GPL(irq_free_descs);
+  *
+  * Returns the first irq number or error code
+  */
++/*
++ * called by:
++ *   - include/linux/irq.h|826| <<irq_alloc_descs>> __irq_alloc_descs(irq, from, cnt, node, THIS_MODULE, NULL)
++ *   - kernel/irq/devres.c|190| <<__devm_irq_alloc_descs>> base = __irq_alloc_descs(irq, from, cnt, node, owner, affinity);
++ *   - kernel/irq/irqdesc.c|751| <<irq_alloc_hwirqs>> int i, irq = __irq_alloc_descs(-1, 0, cnt, node, NULL, NULL);
++ *   - kernel/irq/irqdomain.c|1200| <<irq_domain_alloc_descs>> virq = __irq_alloc_descs(virq, virq, cnt, node, THIS_MODULE,
++ *   - kernel/irq/irqdomain.c|1206| <<irq_domain_alloc_descs>> virq = __irq_alloc_descs(-1, hint, cnt, node, THIS_MODULE,
++ *   - kernel/irq/irqdomain.c|1209| <<irq_domain_alloc_descs>> virq = __irq_alloc_descs(-1, 1, cnt, node, THIS_MODULE,
++ */
+ int __ref
+ __irq_alloc_descs(int irq, unsigned int from, unsigned int cnt, int node,
+ 		  struct module *owner, const struct cpumask *affinity)
+@@ -710,6 +729,17 @@ __irq_alloc_descs(int irq, unsigned int from, unsigned int cnt, int node,
+ 
+ 	mutex_lock(&sparse_irq_lock);
+ 
++	/*
++	 * allocated_irqs被以下使用:
++	 *   - kernel/irq/irqdesc.c|144| <<global>> static DECLARE_BITMAP(allocated_irqs, IRQ_BITMAP_BITS);
++	 *   - kernel/irq/irqdesc.c|465| <<alloc_descs>> bitmap_set(allocated_irqs, start, cnt);
++	 *   - kernel/irq/irqdesc.c|505| <<early_irq_init>> set_bit(i, allocated_irqs);
++	 *   - kernel/irq/irqdesc.c|571| <<alloc_descs>> bitmap_set(allocated_irqs, start, cnt);
++	 *   - kernel/irq/irqdesc.c|583| <<irq_mark_irq>> bitmap_set(allocated_irqs, irq, 1);
++	 *   - kernel/irq/irqdesc.c|671| <<irq_free_descs>> bitmap_clear(allocated_irqs, from, cnt);
++	 *   - kernel/irq/irqdesc.c|713| <<__irq_alloc_descs>> start = bitmap_find_next_zero_area(allocated_irqs, IRQ_BITMAP_BITS,
++	 *   - kernel/irq/irqdesc.c|790| <<irq_get_next_irq>> return find_next_bit(allocated_irqs, nr_irqs, offset);
++	 */
+ 	start = bitmap_find_next_zero_area(allocated_irqs, IRQ_BITMAP_BITS,
+ 					   from, cnt, 0);
+ 	ret = -EEXIST;
 diff --git a/kernel/irq/irqdomain.c b/kernel/irq/irqdomain.c
-index ac4644e..2a50e43 100644
+index ac4644e..4a2c234 100644
 --- a/kernel/irq/irqdomain.c
 +++ b/kernel/irq/irqdomain.c
 @@ -18,6 +18,14 @@
@@ -3339,7 +3400,20 @@ index ac4644e..2a50e43 100644
  static void irq_domain_set_mapping(struct irq_domain *domain,
  				   irq_hw_number_t hwirq,
  				   struct irq_data *irq_data)
-@@ -1146,6 +1252,10 @@ struct irq_domain *irq_domain_create_hierarchy(struct irq_domain *parent,
+@@ -1085,6 +1191,12 @@ const struct irq_domain_ops irq_domain_simple_ops = {
+ };
+ EXPORT_SYMBOL_GPL(irq_domain_simple_ops);
+ 
++/*
++ * called by:
++ *   - kernel/irq/ipi.c|79| <<irq_reserve_ipi>> virq = irq_domain_alloc_descs(-1, nr_irqs, 0, NUMA_NO_NODE, NULL);
++ *   - kernel/irq/irqdomain.c|765| <<irq_create_mapping>> virq = irq_domain_alloc_descs(-1, 1, hwirq, of_node_to_nid(of_node), NULL);
++ *   - kernel/irq/irqdomain.c|1567| <<__irq_domain_alloc_irqs>> virq = irq_domain_alloc_descs(irq_base, nr_irqs, 0, node,
++ */
+ int irq_domain_alloc_descs(int virq, unsigned int cnt, irq_hw_number_t hwirq,
+ 			   int node, const struct cpumask *affinity)
+ {
+@@ -1146,6 +1258,10 @@ struct irq_domain *irq_domain_create_hierarchy(struct irq_domain *parent,
  }
  EXPORT_SYMBOL_GPL(irq_domain_create_hierarchy);
  
@@ -3350,7 +3424,7 @@ index ac4644e..2a50e43 100644
  static void irq_domain_insert_irq(int virq)
  {
  	struct irq_data *data;
-@@ -1252,6 +1362,10 @@ struct irq_data *irq_domain_get_irq_data(struct irq_domain *domain,
+@@ -1252,6 +1368,10 @@ struct irq_data *irq_domain_get_irq_data(struct irq_domain *domain,
  {
  	struct irq_data *irq_data;
  
@@ -3361,7 +3435,7 @@ index ac4644e..2a50e43 100644
  	for (irq_data = irq_get_irq_data(virq); irq_data;
  	     irq_data = irq_data->parent_data)
  		if (irq_data->domain == domain)
-@@ -1367,10 +1481,32 @@ static void irq_domain_free_irqs_hierarchy(struct irq_domain *domain,
+@@ -1367,10 +1487,32 @@ static void irq_domain_free_irqs_hierarchy(struct irq_domain *domain,
  		domain->ops->free(domain, irq_base, nr_irqs);
  }
  
@@ -3394,7 +3468,7 @@ index ac4644e..2a50e43 100644
  	return domain->ops->alloc(domain, irq_base, nr_irqs, arg);
  }
  
-@@ -1396,6 +1532,14 @@ int irq_domain_alloc_irqs_hierarchy(struct irq_domain *domain,
+@@ -1396,6 +1538,14 @@ int irq_domain_alloc_irqs_hierarchy(struct irq_domain *domain,
   * resources. In this way, it's easier to rollback when failing to
   * allocate resources.
   */
@@ -3409,7 +3483,7 @@ index ac4644e..2a50e43 100644
  int __irq_domain_alloc_irqs(struct irq_domain *domain, int irq_base,
  			    unsigned int nr_irqs, int node, void *arg,
  			    bool realloc, const struct cpumask *affinity)
-@@ -1416,6 +1560,10 @@ int __irq_domain_alloc_irqs(struct irq_domain *domain, int irq_base,
+@@ -1416,6 +1566,10 @@ int __irq_domain_alloc_irqs(struct irq_domain *domain, int irq_base,
  	if (realloc && irq_base >= 0) {
  		virq = irq_base;
  	} else {
@@ -3420,7 +3494,7 @@ index ac4644e..2a50e43 100644
  		virq = irq_domain_alloc_descs(irq_base, nr_irqs, 0, node,
  					      affinity);
  		if (virq < 0) {
-@@ -1652,6 +1800,20 @@ void irq_domain_free_irqs(unsigned int virq, unsigned int nr_irqs)
+@@ -1652,6 +1806,20 @@ void irq_domain_free_irqs(unsigned int virq, unsigned int nr_irqs)
   * Check whether the domain has been setup recursive. If not allocate
   * through the parent domain.
   */
@@ -3441,7 +3515,7 @@ index ac4644e..2a50e43 100644
  int irq_domain_alloc_irqs_parent(struct irq_domain *domain,
  				 unsigned int irq_base, unsigned int nr_irqs,
  				 void *arg)
-@@ -1659,6 +1821,12 @@ int irq_domain_alloc_irqs_parent(struct irq_domain *domain,
+@@ -1659,6 +1827,12 @@ int irq_domain_alloc_irqs_parent(struct irq_domain *domain,
  	if (!domain->parent)
  		return -ENOSYS;
  
@@ -3454,7 +3528,7 @@ index ac4644e..2a50e43 100644
  	return irq_domain_alloc_irqs_hierarchy(domain->parent, irq_base,
  					       nr_irqs, arg);
  }
-@@ -1689,6 +1857,11 @@ static void __irq_domain_activate_irq(struct irq_data *irq_data)
+@@ -1689,6 +1863,11 @@ static void __irq_domain_activate_irq(struct irq_data *irq_data)
  
  		if (irq_data->parent_data)
  			__irq_domain_activate_irq(irq_data->parent_data);
@@ -3466,7 +3540,7 @@ index ac4644e..2a50e43 100644
  		if (domain->ops->activate)
  			domain->ops->activate(domain, irq_data);
  	}
-@@ -1767,6 +1940,10 @@ bool irq_domain_hierarchical_is_msi_remap(struct irq_domain *domain)
+@@ -1767,6 +1946,10 @@ bool irq_domain_hierarchical_is_msi_remap(struct irq_domain *domain)
  struct irq_data *irq_domain_get_irq_data(struct irq_domain *domain,
  					 unsigned int virq)
  {
@@ -3496,7 +3570,7 @@ index 6c877d2..84fdca7 100644
  __setup_irq(unsigned int irq, struct irq_desc *desc, struct irqaction *new)
  {
 diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
-index 3fa4bd5..e5130cf 100644
+index 3fa4bd5..e8e2ec3 100644
 --- a/kernel/irq/msi.c
 +++ b/kernel/irq/msi.c
 @@ -100,6 +100,9 @@ int msi_domain_set_affinity(struct irq_data *irq_data,
@@ -3668,6 +3742,18 @@ index 3fa4bd5..e5130cf 100644
  		virq = __irq_domain_alloc_irqs(domain, -1, desc->nvec_used,
  					       dev_to_node(dev), &arg, false,
  					       desc->affinity);
+@@ -373,6 +466,11 @@ int msi_domain_alloc_irqs(struct irq_domain *domain, struct device *dev,
+ 			return ret;
+ 		}
+ 
++		/*
++		 * 这个函数会修改desc->irq_common_data.msi_desc = entry
++		 *
++		 * 主要是会修改entry->irq = irq_base!!!!
++		 */
+ 		for (i = 0; i < desc->nvec_used; i++)
+ 			irq_set_msi_desc_off(virq, i, desc);
+ 	}
 diff --git a/kernel/irq_work.c b/kernel/irq_work.c
 index bcf107c..627f328 100644
 --- a/kernel/irq_work.c
