@@ -1,16 +1,33 @@
-From 0f63c46f3bb3115fe384ad09f58bc06e1aa5c081 Mon Sep 17 00:00:00 2001
+From 8b0e3cb51f0c24dbf2f04c8f5659ac495a36af5d Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Tue, 11 Jun 2019 21:48:24 +0800
+Date: Mon, 17 Jun 2019 13:27:09 +0800
 Subject: [PATCH 1/1] linux-net-for-4.14.113
 
 Signed-off-by: Dongli Zhang <dongli.zhangi0129@gmail.com>
 ---
- include/linux/netdevice.h | 10 ++++++++++
- net/sched/sch_generic.c   | 32 ++++++++++++++++++++++++++++++++
- 2 files changed, 42 insertions(+)
+ drivers/net/ethernet/intel/igb/igb_main.c |  5 +++
+ include/linux/netdevice.h                 | 30 +++++++++++++++
+ net/sched/sch_generic.c                   | 64 +++++++++++++++++++++++++++++++
+ 3 files changed, 99 insertions(+)
 
+diff --git a/drivers/net/ethernet/intel/igb/igb_main.c b/drivers/net/ethernet/intel/igb/igb_main.c
+index 8892ea5..c7ea2a7 100644
+--- a/drivers/net/ethernet/intel/igb/igb_main.c
++++ b/drivers/net/ethernet/intel/igb/igb_main.c
+@@ -7096,6 +7096,11 @@ static bool igb_clean_tx_irq(struct igb_q_vector *q_vector, int napi_budget)
+ 		 * sees the new next_to_clean.
+ 		 */
+ 		smp_mb();
++		/*
++		 * igb调用netif_wake_subqueue()的例子:
++		 *   - drivers/net/ethernet/intel/igb/igb_main.c|5187| <<__igb_maybe_stop_tx>> netif_wake_subqueue(netdev, tx_ring->queue_index);
++		 *   - drivers/net/ethernet/intel/igb/igb_main.c|7102| <<igb_clean_tx_irq>> netif_wake_subqueue(tx_ring->netdev,
++		 */
+ 		if (__netif_subqueue_stopped(tx_ring->netdev,
+ 					     tx_ring->queue_index) &&
+ 		    !(test_bit(__IGB_DOWN, &adapter->state))) {
 diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
-index 40b830d..937cfbf 100644
+index 40b830d..efd791c 100644
 --- a/include/linux/netdevice.h
 +++ b/include/linux/netdevice.h
 @@ -532,7 +532,17 @@ enum netdev_queue_state_t {
@@ -31,11 +48,59 @@ index 40b830d..937cfbf 100644
  #define QUEUE_STATE_ANY_XOFF_OR_FROZEN (QUEUE_STATE_ANY_XOFF | \
  					QUEUE_STATE_FROZEN)
  #define QUEUE_STATE_DRV_XOFF_OR_FROZEN (QUEUE_STATE_DRV_XOFF | \
+@@ -575,6 +585,12 @@ struct netdev_queue {
+ 	/*
+ 	 * Time (in jiffies) of last Tx
+ 	 */
++	/*
++	 * 在以下修改netdev_queue->trans_start:
++	 *   - include/linux/netdevice.h|3584| <<txq_trans_update>> txq->trans_start = jiffies;
++	 *   - include/linux/netdevice.h|3593| <<netif_trans_update>> txq->trans_start = jiffies;
++	 *   - net/sched/sch_generic.c|861| <<transition_one_qdisc>> dev_queue->trans_start = 0;
++	 */
+ 	unsigned long		trans_start;
+ 
+ 	unsigned long		state;
+@@ -3154,6 +3170,11 @@ static inline bool netif_subqueue_stopped(const struct net_device *dev,
+  *
+  * Resume individual transmit queue of a device with multiple transmit queues.
+  */
++/*
++ * igb调用的例子:
++ *   - drivers/net/ethernet/intel/igb/igb_main.c|5187| <<__igb_maybe_stop_tx>> netif_wake_subqueue(netdev, tx_ring->queue_index);
++ *   - drivers/net/ethernet/intel/igb/igb_main.c|7102| <<igb_clean_tx_irq>> netif_wake_subqueue(tx_ring->netdev,
++ */
+ static inline void netif_wake_subqueue(struct net_device *dev, u16 queue_index)
+ {
+ 	struct netdev_queue *txq = netdev_get_tx_queue(dev, queue_index);
+@@ -3568,6 +3589,10 @@ static inline void __netif_tx_unlock_bh(struct netdev_queue *txq)
+ 	spin_unlock_bh(&txq->_xmit_lock);
+ }
+ 
++/*
++ * called by:
++ *   - include/linux/netdevice.h|4060| <<netdev_start_xmit>> txq_trans_update(txq);
++ */
+ static inline void txq_trans_update(struct netdev_queue *txq)
+ {
+ 	if (txq->xmit_lock_owner != -1)
+@@ -3575,6 +3600,11 @@ static inline void txq_trans_update(struct netdev_queue *txq)
+ }
+ 
+ /* legacy drivers only, netdev_start_xmit() sets txq->trans_start */
++/*
++ * called by:
++ *   - drivers/net/ethernet/intel/ixgbe/ixgbe_main.c|5610| <<ixgbe_reinit_locked>> netif_trans_update(adapter->netdev);
++ *   - net/sched/sch_generic.c|894| <<dev_activate>> netif_trans_update(dev);
++ */
+ static inline void netif_trans_update(struct net_device *dev)
+ {
+ 	struct netdev_queue *txq = netdev_get_tx_queue(dev, 0);
 diff --git a/net/sched/sch_generic.c b/net/sched/sch_generic.c
-index 79549ba..7242f90 100644
+index 79549ba..cd5481c 100644
 --- a/net/sched/sch_generic.c
 +++ b/net/sched/sch_generic.c
-@@ -288,6 +288,17 @@ unsigned long dev_trans_start(struct net_device *dev)
+@@ -288,12 +288,34 @@ unsigned long dev_trans_start(struct net_device *dev)
  }
  EXPORT_SYMBOL(dev_trans_start);
  
@@ -53,9 +118,35 @@ index 79549ba..7242f90 100644
  static void dev_watchdog(unsigned long arg)
  {
  	struct net_device *dev = (struct net_device *)arg;
-@@ -306,6 +317,13 @@ static void dev_watchdog(unsigned long arg)
  
+ 	netif_tx_lock(dev);
++	/* Is the device using the noop qdisc on all queues? */
+ 	if (!qdisc_tx_is_noop(dev)) {
++		/*
++		 * netif_device_present():
++		 * net_device->state设置了__LINK_STATE_PRESENT
++		 *
++		 * netif_running():
++		 * net_device->state设置了__LINK_STATE_START
++		 *
++		 * netif_carrier_ok():
++		 * net_device->state设置了__LINK_STATE_NOCARRIER
++		 */
+ 		if (netif_device_present(dev) &&
+ 		    netif_running(dev) &&
+ 		    netif_carrier_ok(dev)) {
+@@ -304,8 +326,22 @@ static void dev_watchdog(unsigned long arg)
+ 			for (i = 0; i < dev->num_tx_queues; i++) {
+ 				struct netdev_queue *txq;
+ 
++				/* 返回net_device->_tx[index] */
  				txq = netdev_get_tx_queue(dev, i);
++				/*
++				 * 在以下修改netdev_queue->trans_start:
++				 *   - include/linux/netdevice.h|3584| <<txq_trans_update>> txq->trans_start = jiffies;
++				 *   - include/linux/netdevice.h|3593| <<netif_trans_update>> txq->trans_start = jiffies;
++				 *   - net/sched/sch_generic.c|861| <<transition_one_qdisc>> dev_queue->trans_start = 0;
++				 */
  				trans_start = txq->trans_start;
 +				/*
 +				 * igb设置net_device->watchdog_timeo的例子:
@@ -67,7 +158,7 @@ index 79549ba..7242f90 100644
  				if (netif_xmit_stopped(txq) &&
  				    time_after(jiffies, (trans_start +
  							 dev->watchdog_timeo))) {
-@@ -315,9 +333,19 @@ static void dev_watchdog(unsigned long arg)
+@@ -315,9 +351,19 @@ static void dev_watchdog(unsigned long arg)
  				}
  			}
  
@@ -87,7 +178,35 @@ index 79549ba..7242f90 100644
  				dev->netdev_ops->ndo_tx_timeout(dev);
  			}
  			if (!mod_timer(&dev->watchdog_timer,
-@@ -963,6 +991,10 @@ static void dev_init_scheduler_queue(struct net_device *dev,
+@@ -331,6 +377,12 @@ static void dev_watchdog(unsigned long arg)
+ 	dev_put(dev);
+ }
+ 
++/*
++ * called by:
++ *   - net/core/dev.c|2564| <<netif_device_attach>> __netdev_watchdog_up(dev);
++ *   - net/sched/sch_generic.c|375| <<dev_watchdog_up>> __netdev_watchdog_up(dev);
++ *   - net/sched/sch_generic.c|400| <<netif_carrier_on>> __netdev_watchdog_up(dev);
++ */
+ void __netdev_watchdog_up(struct net_device *dev)
+ {
+ 	if (dev->netdev_ops->ndo_tx_timeout) {
+@@ -817,6 +869,14 @@ static void transition_one_qdisc(struct net_device *dev,
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - net/core/dev.c|1380| <<__dev_open>> dev_activate(dev);
++ *   - net/core/link_watch.c|160| <<linkwatch_do_dev>> dev_activate(dev);
++ *   - net/sched/sch_api.c|953| <<qdisc_graft>> dev_activate(dev);
++ *   - net/sched/sch_mq.c|157| <<mq_graft>> dev_activate(dev);
++ *   - net/sched/sch_mqprio.c|221| <<mqprio_graft>> dev_activate(dev);
++ */
+ void dev_activate(struct net_device *dev)
+ {
+ 	int need_watchdog;
+@@ -963,6 +1023,10 @@ static void dev_init_scheduler_queue(struct net_device *dev,
  	dev_queue->qdisc_sleeping = qdisc;
  }
  
