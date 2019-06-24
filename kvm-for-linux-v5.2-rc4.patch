@@ -1,29 +1,29 @@
-From 1227e9417dd5ebaa1aa8580f810755ad6ce4f1ad Mon Sep 17 00:00:00 2001
+From 2db9f5e0905b191322cccbd399b6d60212a11b2c Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Mon, 24 Jun 2019 01:16:39 +0800
+Date: Mon, 24 Jun 2019 16:11:51 +0800
 Subject: [PATCH 1/1] kvm for linux v5.2-rc4
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
- arch/x86/include/asm/kvm_host.h  |   6 +++
- arch/x86/include/asm/msr-index.h |   7 +++
- arch/x86/kernel/crash.c          |  12 +++++
+ arch/x86/include/asm/kvm_host.h  |   6 ++
+ arch/x86/include/asm/msr-index.h |   7 ++
+ arch/x86/kernel/crash.c          |  12 +++
  arch/x86/kvm/cpuid.c             |   5 ++
- arch/x86/kvm/cpuid.h             |   9 ++++
- arch/x86/kvm/i8254.c             |  86 ++++++++++++++++++++++++++++++++
- arch/x86/kvm/i8254.h             |   6 +++
- arch/x86/kvm/irq.c               |   4 ++
- arch/x86/kvm/irq_comm.c          |   4 ++
- arch/x86/kvm/lapic.c             |  27 ++++++++++
- arch/x86/kvm/mmu.c               |   9 ++++
+ arch/x86/kvm/cpuid.h             |   9 ++
+ arch/x86/kvm/i8254.c             | 174 +++++++++++++++++++++++++++++++++++++++
+ arch/x86/kvm/i8254.h             |  11 +++
+ arch/x86/kvm/irq.c               |   4 +
+ arch/x86/kvm/irq_comm.c          |   4 +
+ arch/x86/kvm/lapic.c             |  27 ++++++
+ arch/x86/kvm/mmu.c               |   9 ++
  arch/x86/kvm/vmx/vmcs12.h        |   1 +
- arch/x86/kvm/vmx/vmx.c           |  75 ++++++++++++++++++++++++++++
- arch/x86/kvm/x86.c               |  74 ++++++++++++++++++++++++++++
- virt/kvm/async_pf.c              |  13 +++++
- virt/kvm/eventfd.c               |   4 ++
- virt/kvm/irqchip.c               |  26 ++++++++++
- virt/kvm/kvm_main.c              | 103 +++++++++++++++++++++++++++++++++++++++
- 18 files changed, 471 insertions(+)
+ arch/x86/kvm/vmx/vmx.c           |  75 +++++++++++++++++
+ arch/x86/kvm/x86.c               |  74 +++++++++++++++++
+ virt/kvm/async_pf.c              |  13 +++
+ virt/kvm/eventfd.c               |   4 +
+ virt/kvm/irqchip.c               |  26 ++++++
+ virt/kvm/kvm_main.c              | 103 +++++++++++++++++++++++
+ 18 files changed, 564 insertions(+)
 
 diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
 index 450d69a..bad74a9 100644
@@ -134,24 +134,53 @@ index 9a327d5..a4a71cd 100644
  {
  	return vcpu->arch.msr_misc_features_enables &
 diff --git a/arch/x86/kvm/i8254.c b/arch/x86/kvm/i8254.c
-index 4a6dc54..1638c64 100644
+index 4a6dc54..b08614b 100644
 --- a/arch/x86/kvm/i8254.c
 +++ b/arch/x86/kvm/i8254.c
-@@ -40,6 +40,10 @@
+@@ -40,6 +40,24 @@
  #include "i8254.h"
  #include "x86.h"
  
 +/*
 + * https://wiki.osdev.org/Programmable_Interval_Timer
++ *
++ * 在driver中设置periodic的例子:
++ * static int pit_set_periodic(struct clock_event_device *evt)
++ * {
++ *         raw_spin_lock(&i8253_lock);
++ * 
++ *         // binary, mode 2, LSB/MSB, ch 0
++ *         outb_p(0x34, PIT_MODE);
++ *         outb_p(PIT_LATCH & 0xff, PIT_CH0);      // LSB
++ *         outb_p(PIT_LATCH >> 8, PIT_CH0);        // MSB
++ *
++ *         raw_spin_unlock(&i8253_lock);
++ *         return 0;
++ * }
 + */
 +
  #ifndef CONFIG_X86_64
  #define mod_64(x, y) ((x) - (y) * div64_u64(x, y))
  #else
-@@ -51,6 +55,10 @@
+@@ -51,6 +69,25 @@
  #define RW_STATE_WORD0 3
  #define RW_STATE_WORD1 4
  
++/*
++ * static int pit_set_periodic(struct clock_event_device *evt)
++ * {
++ *         raw_spin_lock(&i8253_lock);
++ * 
++ *         // binary, mode 2, LSB/MSB, ch 0
++ *         outb_p(0x34, PIT_MODE);
++ *         outb_p(PIT_LATCH & 0xff, PIT_CH0);      // LSB
++ *         outb_p(PIT_LATCH >> 8, PIT_CH0);        // MSB
++ *
++ *         raw_spin_unlock(&i8253_lock);
++ *         return 0;
++ * }
++ */
++
 +/*
 + * called by:
 + *   - arch/x86/kvm/i8254.c|585| <<speaker_ioport_write>> pit_set_gate(pit, 2, val & 1);
@@ -159,18 +188,80 @@ index 4a6dc54..1638c64 100644
  static void pit_set_gate(struct kvm_pit *pit, int channel, u32 val)
  {
  	struct kvm_kpit_channel_state *c = &pit->pit_state.channels[channel];
-@@ -103,6 +111,10 @@ static s64 __kpit_elapsed(struct kvm_pit *pit)
+@@ -79,6 +116,10 @@ static int pit_get_gate(struct kvm_pit *pit, int channel)
+ 	return pit->pit_state.channels[channel].gate;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/i8254.c|123| <<kpit_elapsed>> return __kpit_elapsed(pit);
++ */
+ static s64 __kpit_elapsed(struct kvm_pit *pit)
+ {
+ 	s64 elapsed;
+@@ -103,6 +144,11 @@ static s64 __kpit_elapsed(struct kvm_pit *pit)
  	return elapsed;
  }
  
 +/*
 + * called by:
-+ *   - 
++ *   - arch/x86/kvm/i8254.c|133| <<pit_get_count>> t = kpit_elapsed(pit, c, channel);
++ *   - arch/x86/kvm/i8254.c|160| <<pit_get_out>> t = kpit_elapsed(pit, c, channel);
 + */
  static s64 kpit_elapsed(struct kvm_pit *pit, struct kvm_kpit_channel_state *c,
  			int channel)
  {
-@@ -215,6 +227,10 @@ static void kvm_pit_ack_irq(struct kvm_irq_ack_notifier *kian)
+@@ -112,6 +158,14 @@ static s64 kpit_elapsed(struct kvm_pit *pit, struct kvm_kpit_channel_state *c,
+ 	return ktime_to_ns(ktime_sub(ktime_get(), c->count_load_time));
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/i8254.c|191| <<pit_latch_count>> c->latched_count = pit_get_count(pit, channel);
++ *   - arch/x86/kvm/i8254.c|605| <<pit_ioport_read>> count = pit_get_count(pit, addr);
++ *   - arch/x86/kvm/i8254.c|609| <<pit_ioport_read>> count = pit_get_count(pit, addr);
++ *   - arch/x86/kvm/i8254.c|613| <<pit_ioport_read>> count = pit_get_count(pit, addr);
++ *   - arch/x86/kvm/i8254.c|618| <<pit_ioport_read>> count = pit_get_count(pit, addr);
++ */
+ static int pit_get_count(struct kvm_pit *pit, int channel)
+ {
+ 	struct kvm_kpit_channel_state *c = &pit->pit_state.channels[channel];
+@@ -139,6 +193,11 @@ static int pit_get_count(struct kvm_pit *pit, int channel)
+ 	return counter;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/i8254.c|202| <<pit_latch_status>> c->status = ((pit_get_out(pit, channel) << 7) |
++ *   - arch/x86/kvm/i8254.c|666| <<speaker_ioport_read>> (pit_get_out(pit, 2) << 5) | (refresh_clock << 4));
++ */
+ static int pit_get_out(struct kvm_pit *pit, int channel)
+ {
+ 	struct kvm_kpit_channel_state *c = &pit->pit_state.channels[channel];
+@@ -171,6 +230,11 @@ static int pit_get_out(struct kvm_pit *pit, int channel)
+ 	return out;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/i8254.c|530| <<pit_ioport_write>> pit_latch_count(pit, channel);
++ *   - arch/x86/kvm/i8254.c|540| <<pit_ioport_write>> pit_latch_count(pit, channel);
++ */
+ static void pit_latch_count(struct kvm_pit *pit, int channel)
+ {
+ 	struct kvm_kpit_channel_state *c = &pit->pit_state.channels[channel];
+@@ -181,6 +245,10 @@ static void pit_latch_count(struct kvm_pit *pit, int channel)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/i8254.c|532| <<pit_ioport_write>> pit_latch_status(pit, channel);
++ */
+ static void pit_latch_status(struct kvm_pit *pit, int channel)
+ {
+ 	struct kvm_kpit_channel_state *c = &pit->pit_state.channels[channel];
+@@ -215,6 +283,10 @@ static void kvm_pit_ack_irq(struct kvm_irq_ack_notifier *kian)
  		kthread_queue_work(pit->worker, &pit->expired);
  }
  
@@ -181,7 +272,7 @@ index 4a6dc54..1638c64 100644
  void __kvm_migrate_pit_timer(struct kvm_vcpu *vcpu)
  {
  	struct kvm_pit *pit = vcpu->kvm->arch.vpit;
-@@ -236,6 +252,17 @@ static void destroy_pit_timer(struct kvm_pit *pit)
+@@ -236,6 +308,17 @@ static void destroy_pit_timer(struct kvm_pit *pit)
  	kthread_flush_work(&pit->expired);
  }
  
@@ -199,7 +290,29 @@ index 4a6dc54..1638c64 100644
  static void pit_do_work(struct kthread_work *work)
  {
  	struct kvm_pit *pit = container_of(work, struct kvm_pit, expired);
-@@ -281,12 +308,26 @@ static enum hrtimer_restart pit_timer_fn(struct hrtimer *data)
+@@ -264,6 +347,10 @@ static void pit_do_work(struct kthread_work *work)
+ 			kvm_apic_nmi_wd_deliver(vcpu);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/i8254.c|781| <<kvm_create_pit>> pit_state->timer.function = pit_timer_fn;
++ */
+ static enum hrtimer_restart pit_timer_fn(struct hrtimer *data)
+ {
+ 	struct kvm_kpit_state *ps = container_of(data, struct kvm_kpit_state, timer);
+@@ -275,18 +362,37 @@ static enum hrtimer_restart pit_timer_fn(struct hrtimer *data)
+ 	kthread_queue_work(pt->worker, &pt->expired);
+ 
+ 	if (ps->is_periodic) {
++		/*
++		 * ps->period在以下设置:
++		 *   - arch/x86/kvm/i8254.c|397| <<create_pit_timer>> ps->period = interval;
++		 *   - arch/x86/kvm/i8254.c|415| <<create_pit_timer>> ps->period = min_period;
++		 */
+ 		hrtimer_add_expires_ns(&ps->timer, ps->period);
+ 		return HRTIMER_RESTART;
+ 	} else
  		return HRTIMER_NORESTART;
  }
  
@@ -226,7 +339,7 @@ index 4a6dc54..1638c64 100644
  void kvm_pit_set_reinject(struct kvm_pit *pit, bool reinject)
  {
  	struct kvm_kpit_state *ps = &pit->pit_state;
-@@ -308,6 +349,11 @@ void kvm_pit_set_reinject(struct kvm_pit *pit, bool reinject)
+@@ -308,6 +414,11 @@ void kvm_pit_set_reinject(struct kvm_pit *pit, bool reinject)
  	atomic_set(&ps->reinject, reinject);
  }
  
@@ -238,7 +351,7 @@ index 4a6dc54..1638c64 100644
  static void create_pit_timer(struct kvm_pit *pit, u32 val, int is_period)
  {
  	struct kvm_kpit_state *ps = &pit->pit_state;
-@@ -351,6 +397,15 @@ static void create_pit_timer(struct kvm_pit *pit, u32 val, int is_period)
+@@ -351,6 +462,15 @@ static void create_pit_timer(struct kvm_pit *pit, u32 val, int is_period)
  		      HRTIMER_MODE_ABS);
  }
  
@@ -254,7 +367,7 @@ index 4a6dc54..1638c64 100644
  static void pit_load_count(struct kvm_pit *pit, int channel, u32 val)
  {
  	struct kvm_kpit_state *ps = &pit->pit_state;
-@@ -389,6 +444,11 @@ static void pit_load_count(struct kvm_pit *pit, int channel, u32 val)
+@@ -389,6 +509,11 @@ static void pit_load_count(struct kvm_pit *pit, int channel, u32 val)
  	}
  }
  
@@ -266,7 +379,38 @@ index 4a6dc54..1638c64 100644
  void kvm_pit_load_count(struct kvm_pit *pit, int channel, u32 val,
  		int hpet_legacy_start)
  {
-@@ -611,6 +671,10 @@ static int speaker_ioport_read(struct kvm_vcpu *vcpu,
+@@ -418,12 +543,20 @@ static inline struct kvm_pit *speaker_to_pit(struct kvm_io_device *dev)
+ 	return container_of(dev, struct kvm_pit, speaker_dev);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/i8254.c|528| <<pit_ioport_write>> if (!pit_in_range(addr))
++ *   - arch/x86/kvm/i8254.c|603| <<pit_ioport_read>> if (!pit_in_range(addr))
++ */
+ static inline int pit_in_range(gpa_t addr)
+ {
+ 	return ((addr >= KVM_PIT_BASE_ADDRESS) &&
+ 		(addr < KVM_PIT_BASE_ADDRESS + KVM_PIT_MEM_LENGTH));
+ }
+ 
++/*
++ * struct kvm_io_device_ops pit_dev_ops.write = pit_ioport_write()
++ */
+ static int pit_ioport_write(struct kvm_vcpu *vcpu,
+ 				struct kvm_io_device *this,
+ 			    gpa_t addr, int len, const void *data)
+@@ -500,6 +633,9 @@ static int pit_ioport_write(struct kvm_vcpu *vcpu,
+ 	return 0;
+ }
+ 
++/*
++ * struct kvm_io_device_ops pit_dev_ops.read = pit_ioport_read()
++ */
+ static int pit_ioport_read(struct kvm_vcpu *vcpu,
+ 			   struct kvm_io_device *this,
+ 			   gpa_t addr, int len, void *data)
+@@ -611,6 +747,10 @@ static int speaker_ioport_read(struct kvm_vcpu *vcpu,
  	return 0;
  }
  
@@ -277,7 +421,29 @@ index 4a6dc54..1638c64 100644
  static void kvm_pit_reset(struct kvm_pit *pit)
  {
  	int i;
-@@ -645,6 +709,12 @@ static const struct kvm_io_device_ops speaker_dev_ops = {
+@@ -627,6 +767,10 @@ static void kvm_pit_reset(struct kvm_pit *pit)
+ 	kvm_pit_reset_reinject(pit);
+ }
+ 
++/*
++ * used by:
++ *   - arch/x86/kvm/i8254.c|794| <<kvm_create_pit>> pit->mask_notifier.func = pit_mask_notifer;
++ */
+ static void pit_mask_notifer(struct kvm_irq_mask_notifier *kimn, bool mask)
+ {
+ 	struct kvm_pit *pit = container_of(kimn, struct kvm_pit, mask_notifier);
+@@ -635,6 +779,10 @@ static void pit_mask_notifer(struct kvm_irq_mask_notifier *kimn, bool mask)
+ 		kvm_pit_reset_reinject(pit);
+ }
+ 
++/*
++ * used by:
++ *   - arch/x86/kvm/i8254.c|801| <<kvm_create_pit>> kvm_iodevice_init(&pit->dev, &pit_dev_ops);
++ */
+ static const struct kvm_io_device_ops pit_dev_ops = {
+ 	.read     = pit_ioport_read,
+ 	.write    = pit_ioport_write,
+@@ -645,6 +793,12 @@ static const struct kvm_io_device_ops speaker_dev_ops = {
  	.write    = speaker_ioport_write,
  };
  
@@ -290,7 +456,7 @@ index 4a6dc54..1638c64 100644
  struct kvm_pit *kvm_create_pit(struct kvm *kvm, u32 flags)
  {
  	struct kvm_pit *pit;
-@@ -671,6 +741,14 @@ struct kvm_pit *kvm_create_pit(struct kvm *kvm, u32 flags)
+@@ -671,6 +825,14 @@ struct kvm_pit *kvm_create_pit(struct kvm *kvm, u32 flags)
  	if (IS_ERR(pit->worker))
  		goto fail_kthread;
  
@@ -305,7 +471,7 @@ index 4a6dc54..1638c64 100644
  	kthread_init_work(&pit->expired, pit_do_work);
  
  	pit->kvm = kvm;
-@@ -689,6 +767,14 @@ struct kvm_pit *kvm_create_pit(struct kvm *kvm, u32 flags)
+@@ -689,6 +851,14 @@ struct kvm_pit *kvm_create_pit(struct kvm *kvm, u32 flags)
  
  	mutex_lock(&kvm->slots_lock);
  	kvm_iodevice_init(&pit->dev, &pit_dev_ops);
@@ -320,8 +486,19 @@ index 4a6dc54..1638c64 100644
  	ret = kvm_io_bus_register_dev(kvm, KVM_PIO_BUS, KVM_PIT_BASE_ADDRESS,
  				      KVM_PIT_MEM_LENGTH, &pit->dev);
  	if (ret < 0)
+@@ -719,6 +889,10 @@ struct kvm_pit *kvm_create_pit(struct kvm *kvm, u32 flags)
+ 	return NULL;
+ }
+ 
++/*
++ * called by only:
++ *   - arch/x86/kvm/x86.c|9375| <<kvm_arch_sync_events>> kvm_free_pit(kvm);
++ */
+ void kvm_free_pit(struct kvm *kvm)
+ {
+ 	struct kvm_pit *pit = kvm->arch.vpit;
 diff --git a/arch/x86/kvm/i8254.h b/arch/x86/kvm/i8254.h
-index 394d952..4f40872 100644
+index 394d952..f14af896 100644
 --- a/arch/x86/kvm/i8254.h
 +++ b/arch/x86/kvm/i8254.h
 @@ -19,6 +19,12 @@ struct kvm_kpit_channel_state {
@@ -337,6 +514,18 @@ index 394d952..4f40872 100644
  	ktime_t count_load_time;
  };
  
+@@ -27,6 +33,11 @@ struct kvm_kpit_state {
+ 	struct kvm_kpit_channel_state channels[3];
+ 	u32 flags;
+ 	bool is_periodic;
++	/*
++	 * 在以下设置:
++	 *   - arch/x86/kvm/i8254.c|397| <<create_pit_timer>> ps->period = interval;
++	 *   - arch/x86/kvm/i8254.c|415| <<create_pit_timer>> ps->period = min_period;
++	 */
+ 	s64 period; 				/* unit: ns */
+ 	struct hrtimer timer;
+ 	u32    speaker_data_on;
 diff --git a/arch/x86/kvm/irq.c b/arch/x86/kvm/irq.c
 index e330e7d..14cdce0 100644
 --- a/arch/x86/kvm/irq.c
