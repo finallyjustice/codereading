@@ -1,19 +1,20 @@
-From 34615d231d5cf2c5ae34c9f0e6002d1bf9b2a642 Mon Sep 17 00:00:00 2001
+From e88c39ea26732c66482c74f98b09a86bc106e773 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Thu, 4 Jul 2019 16:03:43 +0800
+Date: Fri, 5 Jul 2019 14:08:16 +0800
 Subject: [PATCH 1/1] kasan for linux v5.2-rc4
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
- arch/x86/include/asm/kasan.h | 46 ++++++++++++++++++++++++++
- mm/kasan/common.c            | 75 ++++++++++++++++++++++++++++++++++++++++++
- mm/kasan/generic.c           | 78 ++++++++++++++++++++++++++++++++++++++++++++
- mm/kasan/generic_report.c    |  4 +++
- mm/kasan/kasan.h             | 12 +++++++
- mm/kasan/report.c            | 14 ++++++++
- tools/objtool/builtin-orc.c  |  4 +++
- tools/objtool/check.c        | 17 ++++++++++
- 8 files changed, 250 insertions(+)
+ arch/x86/include/asm/kasan.h |  46 +++++++++++++
+ mm/kasan/common.c            | 155 +++++++++++++++++++++++++++++++++++++++++++
+ mm/kasan/generic.c           |  78 ++++++++++++++++++++++
+ mm/kasan/generic_report.c    |   4 ++
+ mm/kasan/kasan.h             |  19 ++++++
+ mm/kasan/report.c            |  14 ++++
+ mm/mempool.c                 |  14 ++++
+ tools/objtool/builtin-orc.c  |   4 ++
+ tools/objtool/check.c        |  17 +++++
+ 9 files changed, 351 insertions(+)
 
 diff --git a/arch/x86/include/asm/kasan.h b/arch/x86/include/asm/kasan.h
 index 13e70da..dd9b944 100644
@@ -88,7 +89,7 @@ index 13e70da..dd9b944 100644
  					(1ULL << (__VIRTUAL_MASK_SHIFT - \
  						  KASAN_SHADOW_SCALE_SHIFT)))
 diff --git a/mm/kasan/common.c b/mm/kasan/common.c
-index 242fdc0..4b02ce8 100644
+index 242fdc0..33343b3 100644
 --- a/mm/kasan/common.c
 +++ b/mm/kasan/common.c
 @@ -63,6 +63,10 @@ static inline unsigned int filter_irq_stacks(unsigned long *entries,
@@ -102,7 +103,19 @@ index 242fdc0..4b02ce8 100644
  static inline depot_stack_handle_t save_stack(gfp_t flags)
  {
  	unsigned long entries[KASAN_STACK_DEPTH];
-@@ -131,6 +135,21 @@ void *memcpy(void *dest, const void *src, size_t len)
+@@ -73,6 +77,11 @@ static inline depot_stack_handle_t save_stack(gfp_t flags)
+ 	return stack_depot_save(entries, nr_entries, flags);
+ }
+ 
++/*
++ * called by:
++ *   - mm/kasan/common.c|513| <<__kasan_slab_free>> set_track(&get_alloc_info(cache, object)->free_track, GFP_NOWAIT);
++ *   - mm/kasan/common.c|551| <<__kasan_kmalloc>> set_track(&get_alloc_info(cache, object)->alloc_track, flags);
++ */
+ static inline void set_track(struct kasan_track *track, gfp_t flags)
+ {
+ 	track->pid = current->pid;
+@@ -131,6 +140,21 @@ void *memcpy(void *dest, const void *src, size_t len)
   * Poisons the shadow memory for 'size' bytes starting from 'addr'.
   * Memory addresses should be aligned to KASAN_SHADOW_SCALE_SIZE.
   */
@@ -124,11 +137,37 @@ index 242fdc0..4b02ce8 100644
  void kasan_poison_shadow(const void *address, size_t size, u8 value)
  {
  	void *shadow_start, *shadow_end;
-@@ -148,6 +167,21 @@ void kasan_poison_shadow(const void *address, size_t size, u8 value)
+@@ -148,6 +172,47 @@ void kasan_poison_shadow(const void *address, size_t size, u8 value)
  	__memset(shadow_start, value, shadow_end - shadow_start);
  }
  
 +/*
++ * [0] kasan_unpoison_shadow
++ * [0] prep_new_page
++ * [0] get_page_from_freelist
++ * [0] __alloc_pages_nodemask
++ * [0] new_slab
++ * [0] ___slab_alloc
++ * [0] __slab_alloc
++ * [0] kmem_cache_alloc
++ * [0] create_kmalloc_cache
++ * [0] new_kmalloc_cache
++ * [0] create_kmalloc_caches
++ * [0] kmem_cache_init
++ * [0] start_kernel
++ * [0] secondary_startup_64
++ *
++ * [0] kasan_unpoison_shadow
++ * [0] __kasan_kmalloc
++ * [0] kmem_cache_alloc_node
++ * [0] __kmem_cache_create
++ * [0] create_boot_cache
++ * [0] create_kmalloc_cache
++ * [0] create_kmalloc_caches
++ * [0] kmem_cache_init
++ * [0] start_kernel
++ * [0] secondary_startup_64
++ *
 + * called by:
 + *   - mm/kasan/common.c|179| <<__kasan_unpoison_stack>> kasan_unpoison_shadow(base, size);
 + *   - mm/kasan/common.c|198| <<kasan_unpoison_task_stack_below>> kasan_unpoison_shadow(base, watermark - base);
@@ -146,7 +185,7 @@ index 242fdc0..4b02ce8 100644
  void kasan_unpoison_shadow(const void *address, size_t size)
  {
  	u8 tag = get_tag(address);
-@@ -213,6 +247,11 @@ void kasan_unpoison_stack_above_sp_to(const void *watermark)
+@@ -213,6 +278,11 @@ void kasan_unpoison_stack_above_sp_to(const void *watermark)
  	kasan_unpoison_shadow(sp, size);
  }
  
@@ -158,7 +197,7 @@ index 242fdc0..4b02ce8 100644
  void kasan_alloc_pages(struct page *page, unsigned int order)
  {
  	u8 tag;
-@@ -254,6 +293,11 @@ static inline unsigned int optimal_redzone(unsigned int object_size)
+@@ -254,6 +324,11 @@ static inline unsigned int optimal_redzone(unsigned int object_size)
  		object_size <= (1 << 16) - 1024 ? 1024 : 2048;
  }
  
@@ -170,7 +209,7 @@ index 242fdc0..4b02ce8 100644
  void kasan_cache_create(struct kmem_cache *cache, unsigned int *size,
  			slab_flags_t *flags)
  {
-@@ -303,6 +347,13 @@ size_t kasan_metadata_size(struct kmem_cache *cache)
+@@ -303,6 +378,13 @@ size_t kasan_metadata_size(struct kmem_cache *cache)
  		sizeof(struct kasan_free_meta) : 0);
  }
  
@@ -184,7 +223,20 @@ index 242fdc0..4b02ce8 100644
  struct kasan_alloc_meta *get_alloc_info(struct kmem_cache *cache,
  					const void *object)
  {
-@@ -354,6 +405,11 @@ void kasan_poison_object_data(struct kmem_cache *cache, void *object)
+@@ -333,6 +415,12 @@ void kasan_unpoison_object_data(struct kmem_cache *cache, void *object)
+ 	kasan_unpoison_shadow(object, cache->object_size);
+ }
+ 
++/*
++ * called by:
++ *   - mm/slab.c|2362| <<cache_init_objs_debug>> kasan_poison_object_data(
++ *   - mm/slab.c|2517| <<cache_init_objs>> kasan_poison_object_data(cachep, objp);
++ *   - mm/slub.c|1474| <<setup_object>> kasan_poison_object_data(s, object);
++ */
+ void kasan_poison_object_data(struct kmem_cache *cache, void *object)
+ {
+ 	kasan_poison_shadow(object,
+@@ -354,6 +442,11 @@ void kasan_poison_object_data(struct kmem_cache *cache, void *object)
   *    based on objects indexes, so that objects that are next to each other
   *    get different tags.
   */
@@ -196,7 +248,84 @@ index 242fdc0..4b02ce8 100644
  static u8 assign_tag(struct kmem_cache *cache, const void *object,
  			bool init, bool keep_tag)
  {
-@@ -570,6 +626,12 @@ void kasan_kfree_large(void *ptr, unsigned long ip)
+@@ -413,6 +506,11 @@ static inline bool shadow_invalid(u8 tag, s8 shadow_byte)
+ 		return tag != (u8)shadow_byte;
+ }
+ 
++/*
++ * called by:
++ *   - mm/kasan/common.c|521| <<kasan_slab_free>> return __kasan_slab_free(cache, object, ip, true);
++ *   - mm/kasan/common.c|642| <<kasan_poison_kfree>> __kasan_slab_free(page->slab_cache, ptr, ip, false);
++ */
+ static bool __kasan_slab_free(struct kmem_cache *cache, void *object,
+ 			      unsigned long ip, bool quarantine)
+ {
+@@ -459,6 +557,12 @@ bool kasan_slab_free(struct kmem_cache *cache, void *object, unsigned long ip)
+ 	return __kasan_slab_free(cache, object, ip, true);
+ }
+ 
++/*
++ * called by:
++ *   - mm/kasan/common.c|563| <<kasan_slab_alloc>> return __kasan_kmalloc(cache, object, cache->object_size, flags, false);
++ *   - mm/kasan/common.c|583| <<kasan_kmalloc>> return __kasan_kmalloc(cache, object, size, flags, true);
++ *   - mm/kasan/common.c|624| <<kasan_krealloc>> return __kasan_kmalloc(page->slab_cache, object, size,
++ */
+ static void *__kasan_kmalloc(struct kmem_cache *cache, const void *object,
+ 				size_t size, gfp_t flags, bool keep_tag)
+ {
+@@ -491,12 +595,30 @@ static void *__kasan_kmalloc(struct kmem_cache *cache, const void *object,
+ 	return set_tag(object, tag);
+ }
+ 
++/*
++ * called by:
++ *   - mm/slab.h|437| <<slab_post_alloc_hook>> p[i] = kasan_slab_alloc(s, p[i], flags);
++ */
+ void * __must_check kasan_slab_alloc(struct kmem_cache *cache, void *object,
+ 					gfp_t flags)
+ {
+ 	return __kasan_kmalloc(cache, object, cache->object_size, flags, false);
+ }
+ 
++/*
++ * called by:
++ *   - include/linux/slab.h|449| <<kmem_cache_alloc_trace>> ret = kasan_kmalloc(s, ret, size, flags);
++ *   - include/linux/slab.h|460| <<kmem_cache_alloc_node_trace>> ret = kasan_kmalloc(s, ret, size, gfpflags);
++ *   - mm/slab.c|3555| <<kmem_cache_alloc_trace>> ret = kasan_kmalloc(cachep, ret, size, flags);
++ *   - mm/slab.c|3599| <<kmem_cache_alloc_node_trace>> ret = kasan_kmalloc(cachep, ret, size, flags);
++ *   - mm/slab.c|3620| <<__do_kmalloc_node>> ret = kasan_kmalloc(cachep, ret, size, flags);
++ *   - mm/slab.c|3660| <<__do_kmalloc>> ret = kasan_kmalloc(cachep, ret, size, flags);
++ *   - mm/slub.c|2775| <<kmem_cache_alloc_trace>> ret = kasan_kmalloc(s, ret, size, gfpflags);
++ *   - mm/slub.c|2803| <<kmem_cache_alloc_node_trace>> ret = kasan_kmalloc(s, ret, size, gfpflags);
++ *   - mm/slub.c|3374| <<early_kmem_cache_node_alloc>> n = kasan_kmalloc(kmem_cache_node, n, sizeof(struct kmem_cache_node),
++ *   - mm/slub.c|3793| <<__kmalloc>> ret = kasan_kmalloc(s, ret, size, flags);
++ *   - mm/slub.c|3837| <<__kmalloc_node>> ret = kasan_kmalloc(s, ret, size, flags);
++ */
+ void * __must_check kasan_kmalloc(struct kmem_cache *cache, const void *object,
+ 				size_t size, gfp_t flags)
+ {
+@@ -545,6 +667,20 @@ void * __must_check kasan_krealloc(const void *object, size_t size, gfp_t flags)
+ 						flags, true);
+ }
+ 
++/*
++ * [0] kasan_poison_kfree
++ * [0] mempool_init_node
++ * [0] mempool_create_node
++ * [0] nfs_init_writepagecache
++ * [0] init_nfs_fs
++ * [0] do_one_initcall
++ * [0] kernel_init_freeable
++ * [0] kernel_init
++ * [0] ret_from_fork
++ *
++ * called by:
++ *   - mm/mempool.c|109| <<kasan_poison_element>> kasan_poison_kfree(element, _RET_IP_);
++ */
+ void kasan_poison_kfree(void *ptr, unsigned long ip)
+ {
+ 	struct page *page;
+@@ -570,6 +706,12 @@ void kasan_kfree_large(void *ptr, unsigned long ip)
  	/* The object will be poisoned by page_alloc. */
  }
  
@@ -209,7 +338,7 @@ index 242fdc0..4b02ce8 100644
  int kasan_module_alloc(void *addr, size_t size)
  {
  	void *ret;
-@@ -608,6 +670,19 @@ void kasan_free_shadow(const struct vm_struct *vm)
+@@ -608,6 +750,19 @@ void kasan_free_shadow(const struct vm_struct *vm)
  
  extern void __kasan_report(unsigned long addr, size_t size, bool is_write, unsigned long ip);
  
@@ -409,10 +538,10 @@ index 36c6459..ec94609 100644
  {
  	if (addr_has_shadow(info->access_addr))
 diff --git a/mm/kasan/kasan.h b/mm/kasan/kasan.h
-index 3ce956e..314911c 100644
+index 3ce956e..d461cbd 100644
 --- a/mm/kasan/kasan.h
 +++ b/mm/kasan/kasan.h
-@@ -110,8 +110,20 @@ struct kasan_alloc_meta *get_alloc_info(struct kmem_cache *cache,
+@@ -110,12 +110,31 @@ struct kasan_alloc_meta *get_alloc_info(struct kmem_cache *cache,
  struct kasan_free_meta *get_free_info(struct kmem_cache *cache,
  					const void *object);
  
@@ -433,6 +562,17 @@ index 3ce956e..314911c 100644
  	return (void *)(((unsigned long)shadow_addr - KASAN_SHADOW_OFFSET)
  		<< KASAN_SHADOW_SCALE_SHIFT);
  }
+ 
++/*
++ * called by:
++ *   - mm/kasan/generic_report.c|114| <<get_bug_type>> if (addr_has_shadow(info->access_addr))
++ *   - mm/kasan/report.c|315| <<__kasan_report>> if (addr_has_shadow(untagged_addr))
++ *   - mm/kasan/report.c|326| <<__kasan_report>> if (addr_has_shadow(untagged_addr))
++ *   - mm/kasan/report.c|330| <<__kasan_report>> if (addr_has_shadow(untagged_addr)) {
++ */
+ static inline bool addr_has_shadow(const void *addr)
+ {
+ 	return (addr >= kasan_shadow_to_mem((void *)KASAN_SHADOW_START));
 diff --git a/mm/kasan/report.c b/mm/kasan/report.c
 index 03a4435..05ba571 100644
 --- a/mm/kasan/report.c
@@ -472,6 +612,45 @@ index 03a4435..05ba571 100644
  void __kasan_report(unsigned long addr, size_t size, bool is_write, unsigned long ip)
  {
  	struct kasan_access_info info;
+diff --git a/mm/mempool.c b/mm/mempool.c
+index 85efab3..fa3dcd7a 100644
+--- a/mm/mempool.c
++++ b/mm/mempool.c
+@@ -103,6 +103,10 @@ static inline void poison_element(mempool_t *pool, void *element)
+ }
+ #endif /* CONFIG_DEBUG_SLAB || CONFIG_SLUB_DEBUG_ON */
+ 
++/*
++ * called by:
++ *   - mm/mempool.c|126| <<add_element>> kasan_poison_element(pool, element);
++ */
+ static __always_inline void kasan_poison_element(mempool_t *pool, void *element)
+ {
+ 	if (pool->alloc == mempool_alloc_slab || pool->alloc == mempool_kmalloc)
+@@ -111,6 +115,10 @@ static __always_inline void kasan_poison_element(mempool_t *pool, void *element)
+ 		kasan_free_pages(element, (unsigned long)pool->pool_data);
+ }
+ 
++/*
++ * called by:
++ *   - mm/mempool.c|135| <<remove_element>> kasan_unpoison_element(pool, element);
++ */
+ static void kasan_unpoison_element(mempool_t *pool, void *element)
+ {
+ 	if (pool->alloc == mempool_alloc_slab || pool->alloc == mempool_kmalloc)
+@@ -119,6 +127,12 @@ static void kasan_unpoison_element(mempool_t *pool, void *element)
+ 		kasan_alloc_pages(element, (unsigned long)pool->pool_data);
+ }
+ 
++/*
++ * called by:
++ *   - mm/mempool.c|207| <<mempool_init_node>> add_element(pool, element);
++ *   - mm/mempool.c|347| <<mempool_resize>> add_element(pool, element);
++ *   - mm/mempool.c|495| <<mempool_free>> add_element(pool, element);
++ */
+ static __always_inline void add_element(mempool_t *pool, void *element)
+ {
+ 	BUG_ON(pool->curr_nr >= pool->min_nr);
 diff --git a/tools/objtool/builtin-orc.c b/tools/objtool/builtin-orc.c
 index 5f7cc61..7435efe 100644
 --- a/tools/objtool/builtin-orc.c
