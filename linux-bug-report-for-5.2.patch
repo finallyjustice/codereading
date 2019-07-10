@@ -1,0 +1,700 @@
+From b86039ac48daf063a02f560924e4bcec184916c8 Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Wed, 10 Jul 2019 16:10:50 +0800
+Subject: [PATCH 1/1] linux bug report for 5.2
+
+- hung_task, soft-lockup, hard-lockup
+- rcu stall
+- lockdep
+- kmemleak, kasan
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ arch/x86/include/asm/preempt.h | 21 +++++++++
+ include/linux/bottom_half.h    | 14 ++++++
+ include/linux/hardirq.h        |  8 ++++
+ include/linux/preempt.h        | 86 ++++++++++++++++++++++++++++++++++++
+ kernel/hung_task.c             | 99 ++++++++++++++++++++++++++++++++++++++++++
+ kernel/sched/core.c            | 83 +++++++++++++++++++++++++++++++++++
+ kernel/softirq.c               | 34 +++++++++++++++
+ kernel/watchdog.c              | 14 ++++++
+ 8 files changed, 359 insertions(+)
+
+diff --git a/arch/x86/include/asm/preempt.h b/arch/x86/include/asm/preempt.h
+index 99a7fa9..9110e8d 100644
+--- a/arch/x86/include/asm/preempt.h
++++ b/arch/x86/include/asm/preempt.h
+@@ -6,6 +6,15 @@
+ #include <asm/percpu.h>
+ #include <linux/thread_info.h>
+ 
++/*
++ * DECLARE_PER_CPU(int, __preempt_count);
++ * percpu的__preempt_count:
++ * - 第0-7位表示preempt (PREEMPT_OFFSET)
++ * - 第8-15位表示softirq (SOFTIRQ_OFFSET)
++ * - 第16-19位表示hardirq (HARDIRQ_OFFSET)
++ * - 第20位表示nmi (NMI_OFFSET)
++ * - 第31位用做PREEMPT_NEED_RESCHED
++ */
+ DECLARE_PER_CPU(int, __preempt_count);
+ 
+ /* We use the MSB mostly because its available */
+@@ -21,6 +30,16 @@ DECLARE_PER_CPU(int, __preempt_count);
+  * We mask the PREEMPT_NEED_RESCHED bit so as not to confuse all current users
+  * that think a non-zero value indicates we cannot preempt.
+  */
++/*
++ * 返回percpu的__preempt_count, 第PREEMPT_NEED_RESCHED(31)位被清空为0
++ * DECLARE_PER_CPU(int, __preempt_count);
++ * percpu的__preempt_count:
++ * - 第0-7位表示preempt (PREEMPT_OFFSET)
++ * - 第8-15位表示softirq (SOFTIRQ_OFFSET)
++ * - 第16-19位表示hardirq (HARDIRQ_OFFSET)
++ * - 第20位表示nmi (NMI_OFFSET)
++ * - 第31位用做PREEMPT_NEED_RESCHED
++ */
+ static __always_inline int preempt_count(void)
+ {
+ 	return raw_cpu_read_4(__preempt_count) & ~PREEMPT_NEED_RESCHED;
+@@ -74,11 +93,13 @@ static __always_inline bool test_preempt_need_resched(void)
+  * The various preempt_count add/sub methods
+  */
+ 
++/* 为percpu的__preempt_count增加val */
+ static __always_inline void __preempt_count_add(int val)
+ {
+ 	raw_cpu_add_4(__preempt_count, val);
+ }
+ 
++/* 为percpu的__preempt_count减少val */
+ static __always_inline void __preempt_count_sub(int val)
+ {
+ 	raw_cpu_add_4(__preempt_count, -val);
+diff --git a/include/linux/bottom_half.h b/include/linux/bottom_half.h
+index a19519f..b949a5e 100644
+--- a/include/linux/bottom_half.h
++++ b/include/linux/bottom_half.h
+@@ -7,6 +7,20 @@
+ #ifdef CONFIG_TRACE_IRQFLAGS
+ extern void __local_bh_disable_ip(unsigned long ip, unsigned int cnt);
+ #else
++/*
++ * called by:
++ *   - include/linux/bottom_half.h|19| <<local_bh_disable>> __local_bh_disable_ip(_THIS_IP_, SOFTIRQ_DISABLE_OFFSET);
++ *   - include/linux/rwlock_api_smp.h|175| <<__raw_read_lock_bh>> __local_bh_disable_ip(_RET_IP_, SOFTIRQ_LOCK_OFFSET);
++ *   - include/linux/rwlock_api_smp.h|202| <<__raw_write_lock_bh>> __local_bh_disable_ip(_RET_IP_, SOFTIRQ_LOCK_OFFSET);
++ *   - include/linux/spinlock_api_smp.h|134| <<__raw_spin_lock_bh>> __local_bh_disable_ip(_RET_IP_, SOFTIRQ_LOCK_OFFSET);
++ *   - include/linux/spinlock_api_smp.h|181| <<__raw_spin_trylock_bh>> __local_bh_disable_ip(_RET_IP_, SOFTIRQ_LOCK_OFFSET);
++ *   - include/linux/spinlock_api_up.h|34| <<__LOCK_BH>> do { __local_bh_disable_ip(_THIS_IP_, SOFTIRQ_LOCK_OFFSET); ___LOCK(lock); } while (0)
++ *   - kernel/softirq.c|269| <<__do_softirq>> __local_bh_disable_ip(_RET_IP_, SOFTIRQ_OFFSET);
++ *
++ * 在oracle linux和ubuntu都用这里
++ *
++ * 为percpu的__preempt_count增加cnt
++ */
+ static __always_inline void __local_bh_disable_ip(unsigned long ip, unsigned int cnt)
+ {
+ 	preempt_count_add(cnt);
+diff --git a/include/linux/hardirq.h b/include/linux/hardirq.h
+index da0af63..ddf8668 100644
+--- a/include/linux/hardirq.h
++++ b/include/linux/hardirq.h
+@@ -33,6 +33,10 @@ extern void rcu_nmi_exit(void);
+  * always balanced, so the interrupted value of ->hardirq_context
+  * will always be restored.
+  */
++/*
++ * 为percpu的__preempt_count增加HARDIRQ_OFFSET
++ * HARDIRQ_OFFSET: 1往左移动16位, 16-19位表示hardirq
++ */
+ #define __irq_enter()					\
+ 	do {						\
+ 		account_irq_enter_time(current);	\
+@@ -48,6 +52,10 @@ extern void irq_enter(void);
+ /*
+  * Exit irq context without processing softirqs:
+  */
++/*
++ * 为percpu的__preempt_count减少HARDIRQ_OFFSET
++ * HARDIRQ_OFFSET: 1往左移动16位, 16-19位表示hardirq
++ */
+ #define __irq_exit()					\
+ 	do {						\
+ 		trace_hardirq_exit();			\
+diff --git a/include/linux/preempt.h b/include/linux/preempt.h
+index dd92b1a..888e19e 100644
+--- a/include/linux/preempt.h
++++ b/include/linux/preempt.h
+@@ -11,6 +11,16 @@
+ #include <linux/list.h>
+ 
+ /*
++ * DECLARE_PER_CPU(int, __preempt_count);
++ * percpu的__preempt_count:
++ * - 第0-7位表示preempt (PREEMPT_OFFSET)
++ * - 第8-15位表示softirq (SOFTIRQ_OFFSET)
++ * - 第16-19位表示hardirq (HARDIRQ_OFFSET)
++ * - 第20位表示nmi (NMI_OFFSET)
++ * - 第31位用做PREEMPT_NEED_RESCHED
++ */
++
++/*
+  * We put the hardirq and softirq counter into the preemption
+  * counter. The bitmask has the following meaning:
+  *
+@@ -35,22 +45,71 @@
+ #define NMI_BITS	1
+ 
+ #define PREEMPT_SHIFT	0
++/* 0 + 8 = 8 */
+ #define SOFTIRQ_SHIFT	(PREEMPT_SHIFT + PREEMPT_BITS)
++/* 8 + 8 = 16 */
+ #define HARDIRQ_SHIFT	(SOFTIRQ_SHIFT + SOFTIRQ_BITS)
++/* 16 + 4 = 20 */
+ #define NMI_SHIFT	(HARDIRQ_SHIFT + HARDIRQ_BITS)
+ 
++/* 1"先"往左移x位再减1 */
+ #define __IRQ_MASK(x)	((1UL << (x))-1)
+ 
++/* percpu的__preempt_count中表示preempt的0-7位都是1 */
+ #define PREEMPT_MASK	(__IRQ_MASK(PREEMPT_BITS) << PREEMPT_SHIFT)
++/* percpu的__preempt_count中表示softirq的8-15位都是1 */
+ #define SOFTIRQ_MASK	(__IRQ_MASK(SOFTIRQ_BITS) << SOFTIRQ_SHIFT)
++/* percpu的__preempt_count中表示hardirq的16-19位都是1 */
+ #define HARDIRQ_MASK	(__IRQ_MASK(HARDIRQ_BITS) << HARDIRQ_SHIFT)
++/* percpu的__preempt_count中表示nmi的第20位是1 */
+ #define NMI_MASK	(__IRQ_MASK(NMI_BITS)     << NMI_SHIFT)
+ 
++/*
++ * used by:
++ *   - include/linux/preempt.h|71| <<INIT_PREEMPT_COUNT>> #define INIT_PREEMPT_COUNT PREEMPT_OFFSET
++ *   - include/linux/preempt.h|117| <<PREEMPT_DISABLE_OFFSET>> #define PREEMPT_DISABLE_OFFSET PREEMPT_OFFSET
++ *
++ * 1往左移动0位: 0-7位表示preempt
++ */
+ #define PREEMPT_OFFSET	(1UL << PREEMPT_SHIFT)
++/*
++ * used by:
++ *   - include/linux/preempt.h|61| <<SOFTIRQ_DISABLE_OFFSET>> #define SOFTIRQ_DISABLE_OFFSET (2 * SOFTIRQ_OFFSET)
++ *   - include/linux/preempt.h|108| <<in_serving_softirq>> #define in_serving_softirq() (softirq_count() & SOFTIRQ_OFFSET)
++ *   - include/linux/preempt.h|111| <<in_task>> (NMI_MASK | HARDIRQ_MASK | SOFTIRQ_OFFSET)))
++ *   - kernel/softirq.c|269| <<__do_softirq>> __local_bh_disable_ip(_RET_IP_, SOFTIRQ_OFFSET);
++ *   - kernel/softirq.c|319| <<__do_softirq>> __local_bh_enable(SOFTIRQ_OFFSET);
++ *   - kernel/trace/ring_buffer.c|2706| <<trace_recursive_lock>> if (!(pc & (NMI_MASK | HARDIRQ_MASK | SOFTIRQ_OFFSET)))
++ *   - kernel/trace/trace.c|2330| <<tracing_generic_entry_update>> ((pc & SOFTIRQ_OFFSET) ? TRACE_FLAG_SOFTIRQ : 0) |
++ *
++ * 1往左移动8位: 8-15位表示softirq
++ */
+ #define SOFTIRQ_OFFSET	(1UL << SOFTIRQ_SHIFT)
++/*
++ * used by:
++ *   - include/linux/hardirq.h|43| <<__irq_enter>> preempt_count_add(HARDIRQ_OFFSET); \
++ *   - include/linux/hardirq.h|63| <<__irq_exit>> preempt_count_sub(HARDIRQ_OFFSET); \
++ *   - include/linux/hardirq.h|83| <<nmi_enter>> preempt_count_add(NMI_OFFSET + HARDIRQ_OFFSET); \
++ *   - include/linux/hardirq.h|93| <<nmi_exit>> preempt_count_sub(NMI_OFFSET + HARDIRQ_OFFSET); \
++ *   - kernel/sched/cputime.c|498| <<account_process_tick>> else if ((p != rq->idle) || (irq_count() != HARDIRQ_OFFSET))
++ *   - kernel/sched/cputime.c|499| <<account_process_tick>> account_system_time(p, HARDIRQ_OFFSET, cputime);
++ *   - kernel/softirq.c|415| <<irq_exit>> preempt_count_sub(HARDIRQ_OFFSET);
++ *
++ * 1往左移动16位: 16-19位表示hardirq
++ */
+ #define HARDIRQ_OFFSET	(1UL << HARDIRQ_SHIFT)
++/* 1往左移动20位: 20位表示nmi */
+ #define NMI_OFFSET	(1UL << NMI_SHIFT)
+ 
++/*
++ * used by:
++ *   - include/linux/bottom_half.h|19| <<local_bh_disable>> __local_bh_disable_ip(_THIS_IP_, SOFTIRQ_DISABLE_OFFSET);
++ *   - include/linux/bottom_half.h|27| <<local_bh_enable_ip>> __local_bh_enable_ip(ip, SOFTIRQ_DISABLE_OFFSET);
++ *   - include/linux/bottom_half.h|32| <<local_bh_enable>> __local_bh_enable_ip(_THIS_IP_, SOFTIRQ_DISABLE_OFFSET);
++ *   - include/linux/preempt.h|168| <<SOFTIRQ_LOCK_OFFSET>> #define SOFTIRQ_LOCK_OFFSET (SOFTIRQ_DISABLE_OFFSET + PREEMPT_LOCK_OFFSET)
++ *   - kernel/softirq.c|162| <<_local_bh_enable>> __local_bh_enable(SOFTIRQ_DISABLE_OFFSET);
++ *   - kernel/softirq.c|176| <<__local_bh_enable_ip>> if (softirq_count() == SOFTIRQ_DISABLE_OFFSET)
++ */
+ #define SOFTIRQ_DISABLE_OFFSET	(2 * SOFTIRQ_OFFSET)
+ 
+ #define PREEMPT_DISABLED	(PREEMPT_DISABLE_OFFSET + PREEMPT_ENABLED)
+@@ -77,6 +136,17 @@
+ /* preempt_count() and related functions, depends on PREEMPT_NEED_RESCHED */
+ #include <asm/preempt.h>
+ 
++/*
++ * 返回percpu的__preempt_count, 第PREEMPT_NEED_RESCHED(31)位被清空为0
++ * DECLARE_PER_CPU(int, __preempt_count);
++ * percpu的__preempt_count:
++ * - 第0-7位表示preempt (PREEMPT_OFFSET)
++ * - 第8-15位表示softirq (SOFTIRQ_OFFSET)
++ * - 第16-19位表示hardirq (HARDIRQ_OFFSET)
++ * - 第20位表示nmi (NMI_OFFSET)
++ * - 第31位用做PREEMPT_NEED_RESCHED
++ */
++
+ #define hardirq_count()	(preempt_count() & HARDIRQ_MASK)
+ #define softirq_count()	(preempt_count() & SOFTIRQ_MASK)
+ #define irq_count()	(preempt_count() & (HARDIRQ_MASK | SOFTIRQ_MASK \
+@@ -97,6 +167,7 @@
+  */
+ #define in_irq()		(hardirq_count())
+ #define in_softirq()		(softirq_count())
++/* percpu的__preempt_count中表示softirq (第8-15位), hardirq (第16-19位) 和nmi (第20位) 的部分 */
+ #define in_interrupt()		(irq_count())
+ #define in_serving_softirq()	(softirq_count() & SOFTIRQ_OFFSET)
+ #define in_nmi()		(preempt_count() & NMI_MASK)
+@@ -145,6 +216,21 @@
+  * Check whether we were atomic before we did preempt_disable():
+  * (used by the scheduler)
+  */
++/*
++ * PREEMPT_DISABLE_OFFSET在!CONFIG_PREEMPT_COUNT的情况下是0
++ * 也就是说in_atomic_preempt_off()返回true的前提是preempt_count()不为0
++ *
++ * 返回percpu的__preempt_count, 第PREEMPT_NEED_RESCHED(31)位被清空为0
++ * DECLARE_PER_CPU(int, __preempt_count);
++ * percpu的__preempt_count:
++ * - 第0-7位表示preempt (PREEMPT_OFFSET)
++ * - 第8-15位表示softirq (SOFTIRQ_OFFSET)
++ * - 第16-19位表示hardirq (HARDIRQ_OFFSET)
++ * - 第20位表示nmi (NMI_OFFSET)
++ * - 第31位用做PREEMPT_NEED_RESCHED
++ *
++ * 也就是说!CONFIG_PREEMPT_COUNT情况下只有不在irq, softirq和nmi才返回true!
++ */
+ #define in_atomic_preempt_off() (preempt_count() != PREEMPT_DISABLE_OFFSET)
+ 
+ #if defined(CONFIG_DEBUG_PREEMPT) || defined(CONFIG_TRACE_PREEMPT_TOGGLE)
+diff --git a/kernel/hung_task.c b/kernel/hung_task.c
+index 14a625c..79da315 100644
+--- a/kernel/hung_task.c
++++ b/kernel/hung_task.c
+@@ -25,6 +25,61 @@
+ #include <trace/events/sched.h>
+ 
+ /*
++ * 必须激活CONFIG_DETECT_HUNG_TASK
++ *
++ * hung_task   : kernel/hung_task.c 默认120秒!!!
++ *     检测函数是check_hung_task()
++ *
++ * 进程长时间(系统默认配置120秒)处于TASK_UNINTERRUPTIBLE睡眠状态,这种状态下进程不响应异步信号.如:进
++ * 程与外设硬件的交互(如read),通常使用这种状态来保证进程与设备的交互过程不被打断,否则设备可能处于不
++ * 可控的状态.
++ *
++ * Linux的进程存在多种状态,如TASK_RUNNING的运行态,EXIT_DEAD的停止态和TASK_INTERRUPTIBLE的接收信号的
++ * 等待状态等等(可在include/linux/sched.h中查看).其中有一种状态等待为TASK_UNINTERRUPTIBLE,称为D状态,
++ * 该种状态下进程不接收信号,只能通过wake_up唤醒.处于这种状态的情况有很多.例如mutex锁就可能会设置进
++ * 程于该状态,有时候进程在等待某种IO资源就绪时(wait_event机制)会设置进程进入该状态.一般情况下,进程处
++ * 于该状态的时间不会太久,但若IO设备出现故障或者出现进程死锁等情况,进程就可能长期处于该状态而无法再
++ * 返回到TASK_RUNNING态.因此,内核为了便于发现这类情况设计出了hung task机制专门用于检测长期处于D状态
++ * 的进程并发出告警.
++ *
++ * 核心思想为创建一个内核监测进程循环监测处于D状态的每一个进程(任务),统计它们在两次检测之间的调度次数,
++ * 如果发现有任务在两次监测之间没有发生任何的调度则可判断该进程一直处于D状态,很有可能已经死锁,因此触
++ * 发报警日志打印,输出进程的基本信息,栈回溯以及寄存器保存信息以供内核开发人员定位.
++ *
++ * 核心函数是kernel/hung_task.c的watchdog(), 会创建一个内核线程khungtaskd.
++ *
++ *
++ * 下面是一个hung_task的例子.
++ *
++ * static int task_hang_forever(void *data)
++ * {
++ *     __set_current_state(TASK_UNINTERRUPTIBLE);
++ *     schedule();
++ *
++ *     return 0;
++ * }
++ *
++ * kthread_run(task_hang_forever, NULL, "task_hang_forever");
++ *
++ * 会创建一个task_hang_forever内核线程, 把自己永远设置在D状态
++ *
++ * 在运行120+秒后...
++ * 
++ * [  246.950946] INFO: task task_hang_forev:86 blocked for more than 122 seconds.
++ * [  246.953136]       Not tainted 5.2.0+ #9
++ * [  246.954380] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
++ * [  246.956795] task_hang_forev D15456    86      2 0x80004000
++ * [  246.956802] Call Trace:
++ * [  246.956855]  ? __schedule+0x34a/0x530
++ * [  246.956874]  ? blk_mq_tag_to_rq+0x20/0x20
++ * [  246.956877]  schedule+0x2e/0x90
++ * [  246.956879]  task_hang_forever+0x22/0x40
++ * [  246.956899]  kthread+0xf3/0x130
++ * [  246.956908]  ? kthread_destroy_worker+0x40/0x40
++ * [  246.956913]  ret_from_fork+0x35/0x40
++ */
++
++/*
+  * The number of tasks checked:
+  */
+ int __read_mostly sysctl_hung_task_check_count = PID_MAX_LIMIT;
+@@ -41,6 +96,9 @@ int __read_mostly sysctl_hung_task_check_count = PID_MAX_LIMIT;
+ /*
+  * Zero means infinite timeout - no checking done:
+  */
++/*
++ * 很多操作系统都是120秒后报错
++ */
+ unsigned long __read_mostly sysctl_hung_task_timeout_secs = CONFIG_DEFAULT_HUNG_TASK_TIMEOUT;
+ 
+ /*
+@@ -48,6 +106,9 @@ unsigned long __read_mostly sysctl_hung_task_timeout_secs = CONFIG_DEFAULT_HUNG_
+  */
+ unsigned long __read_mostly sysctl_hung_task_check_interval_secs;
+ 
++/*
++ * 默认最多报告10次
++ */
+ int __read_mostly sysctl_hung_task_warnings = 10;
+ 
+ static int __read_mostly did_panic;
+@@ -85,6 +146,14 @@ static struct notifier_block panic_block = {
+ 	.notifier_call = hung_task_panic,
+ };
+ 
++/*
++ * called by:
++ *   - kernel/hung_task.c|198| <<check_hung_uninterruptible_tasks>> check_hung_task(t, timeout);
++ *
++ * watchdog()
++ *  -> check_hung_uninterruptible_tasks()
++ *      -> check_hung_task()
++ */
+ static void check_hung_task(struct task_struct *t, unsigned long timeout)
+ {
+ 	unsigned long switch_count = t->nvcsw + t->nivcsw;
+@@ -149,6 +218,10 @@ static void check_hung_task(struct task_struct *t, unsigned long timeout)
+  * For preemptible RCU it is sufficient to call rcu_read_unlock in order
+  * to exit the grace period. For classic RCU, a reschedule is required.
+  */
++/*
++ * called by:
++ *   - kernel/hung_task.c|210| <<check_hung_uninterruptible_tasks>> if (!rcu_lock_break(g, t))
++ */
+ static bool rcu_lock_break(struct task_struct *g, struct task_struct *t)
+ {
+ 	bool can_cont;
+@@ -170,6 +243,10 @@ static bool rcu_lock_break(struct task_struct *g, struct task_struct *t)
+  * a really long time (120 seconds). If that happens, print out
+  * a warning.
+  */
++/*
++ * called by:
++ *   - kernel/hung_task.c|309| <<watchdog>> check_hung_uninterruptible_tasks(timeout);
++ */
+ static void check_hung_uninterruptible_tasks(unsigned long timeout)
+ {
+ 	int max_count = sysctl_hung_task_check_count;
+@@ -189,6 +266,13 @@ static void check_hung_uninterruptible_tasks(unsigned long timeout)
+ 		if (!max_count--)
+ 			goto unlock;
+ 		if (time_after(jiffies, last_break + HUNG_TASK_LOCK_BREAK)) {
++			/*
++			 * To avoid extending the RCU grace period for an unbounded amount of time,
++			 * periodically exit the critical section and enter a new one.
++			 *
++			 * For preemptible RCU it is sufficient to call rcu_read_unlock in order
++			 * to exit the grace period. For classic RCU, a reschedule is required.:
++			 */
+ 			if (!rcu_lock_break(g, t))
+ 				goto unlock;
+ 			last_break = jiffies;
+@@ -235,6 +319,11 @@ int proc_dohung_task_timeout_secs(struct ctl_table *table, int write,
+ 	return ret;
+ }
+ 
++/*
++ * used by:
++ *   - kernel/hung_task.c|260| <<reset_hung_task_detector>> atomic_set(&reset_hung_task, 1);
++ *   - kernel/hung_task.c|315| <<watchdog>> if (!atomic_xchg(&reset_hung_task, 0) &&
++ */
+ static atomic_t reset_hung_task = ATOMIC_INIT(0);
+ 
+ void reset_hung_task_detector(void)
+@@ -243,8 +332,18 @@ void reset_hung_task_detector(void)
+ }
+ EXPORT_SYMBOL_GPL(reset_hung_task_detector);
+ 
++/*
++ * 在以下使用hung_detector_suspended:
++ *   - kernel/hung_task.c|255| <<hungtask_pm_notify>> hung_detector_suspended = true;
++ *   - kernel/hung_task.c|260| <<hungtask_pm_notify>> hung_detector_suspended = false;
++ *   - kernel/hung_task.c|288| <<watchdog>> !hung_detector_suspended)
++ */
+ static bool hung_detector_suspended;
+ 
++/*
++ * used by:
++ *   - kernel/hung_task.c|304| <<hung_task_init>> pm_notifier(hungtask_pm_notify, 0);
++ */
+ static int hungtask_pm_notify(struct notifier_block *self,
+ 			      unsigned long action, void *hcpu)
+ {
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 874c427..a1350bf 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -3163,6 +3163,7 @@ static inline void preempt_latency_start(int val)
+ 	}
+ }
+ 
++/* 为percpu的__preempt_count增加val */
+ void preempt_count_add(int val)
+ {
+ #ifdef CONFIG_DEBUG_PREEMPT
+@@ -3172,6 +3173,7 @@ void preempt_count_add(int val)
+ 	if (DEBUG_LOCKS_WARN_ON((preempt_count() < 0)))
+ 		return;
+ #endif
++	/* 为percpu的__preempt_count增加val */
+ 	__preempt_count_add(val);
+ #ifdef CONFIG_DEBUG_PREEMPT
+ 	/*
+@@ -3195,6 +3197,7 @@ static inline void preempt_latency_stop(int val)
+ 		trace_preempt_on(CALLER_ADDR0, get_lock_parent_ip());
+ }
+ 
++/* 为percpu的__preempt_count减少val */
+ void preempt_count_sub(int val)
+ {
+ #ifdef CONFIG_DEBUG_PREEMPT
+@@ -3212,6 +3215,7 @@ void preempt_count_sub(int val)
+ #endif
+ 
+ 	preempt_latency_stop(val);
++	/* 为percpu的__preempt_count减少val */
+ 	__preempt_count_sub(val);
+ }
+ EXPORT_SYMBOL(preempt_count_sub);
+@@ -3232,8 +3236,59 @@ static inline unsigned long get_preempt_disable_ip(struct task_struct *p)
+ }
+ 
+ /*
++ * scheduling while atomic的例子: 通过在net_rx_action()调用schedule():
++ *
++ * [   36.981929] BUG: scheduling while atomic: sshd/707/0x00000101
++ * [   36.986404] Modules linked in:
++ * [   36.986410] CPU: 2 PID: 707 Comm: sshd Not tainted 5.2.0+ #6
++ * [   36.986411] Hardware name: QEMU Standard PC (Q35 + ICH9, 2009), BIOS rel-1.12.1-0-ga5cab58e9a3f-prebuilt.qemu.org 04/01/2014
++ * [   36.986413] Call Trace:
++ * [   36.986429]  <IRQ>
++ * [   36.986455]  dump_stack+0x46/0x5b
++ * [   36.986460]  __schedule_bug+0x47/0x60
++ * [   36.986464]  __schedule+0x474/0x530
++ * [   36.986466]  schedule+0x2e/0x90
++ * [   36.986470]  net_rx_action+0x37b/0x3d0
++ * [   36.986474]  __do_softirq+0xf2/0x2c7
++ * [   36.986477]  do_softirq_own_stack+0x2a/0x40
++ * [   36.986478]  </IRQ>
++ * [   36.986482]  do_softirq.part.19+0x26/0x30
++ * [   36.986485]  __local_bh_enable_ip+0x5b/0x60
++ * [   36.986488]  ip_finish_output2+0x1a3/0x530
++ * [   36.986506]  ? ip_output+0x69/0xe0
++ * [   36.986509]  ip_output+0x69/0xe0
++ * [   36.986511]  ? ip_finish_output2+0x530/0x530
++ * [   36.986513]  __ip_queue_xmit+0x14b/0x380
++ * [   36.986516]  __tcp_transmit_skb+0x574/0xaa0
++ * [   36.986519]  tcp_write_xmit+0x27e/0x11d0
++ * [   36.986522]  __tcp_push_pending_frames+0x29/0xb0
++ * [   36.986525]  tcp_sendmsg_locked+0x2c5/0xd90
++ * [   36.986528]  tcp_sendmsg+0x22/0x40
++ * [   36.986531]  sock_sendmsg+0x39/0x50
++ * [   36.986533]  sock_write_iter+0x82/0xf0
++ * [   36.986537]  new_sync_write+0x107/0x1a0
++ * [   36.986540]  vfs_write+0xae/0x1a0
++ * [   36.986542]  ksys_write+0x57/0xd0
++ * [   36.986545]  do_syscall_64+0x43/0x110
++ * [   36.986549]  entry_SYSCALL_64_after_hwframe+0x44/0xa9
++ * [   36.986552] RIP: 0033:0x7fd167ed8154
++ * ... ...
++ * [   36.986556] RSP: 002b:00007ffe12a19578 EFLAGS: 00000246 ORIG_RAX: 0000000000000001
++ * [   36.986558] RAX: ffffffffffffffda RBX: 0000000000000054 RCX: 00007fd167ed8154
++ * [   36.986559] RDX: 0000000000000054 RSI: 0000564ffeb94770 RDI: 0000000000000003
++ * [   36.986561] RBP: 0000564ffeb79350 R08: 0000000000000000 R09: 0000000000000600
++ * [   36.986562] R10: 0000000000000008 R11: 0000000000000246 R12: 0000000000000000
++ * [   36.986563] R13: 0000564ffe8d3ad0 R14: 0000000000000003 R15: 00007ffe12a195ff
++ * [   36.986585] softirq: huh, entered softirq 3 NET_RX 00000000687a3c6d with preempt_count 00000101, exited with 00000000?
++ */
++
++/*
+  * Print scheduling while atomic bug:
+  */
++/*
++ * called by only:
++ *   - kernel/sched/core.c|3280| <<schedule_debug>> __schedule_bug(prev);
++ */
+ static noinline void __schedule_bug(struct task_struct *prev)
+ {
+ 	/* Save this before calling printk(), since that will clobber it */
+@@ -3265,6 +3320,10 @@ static noinline void __schedule_bug(struct task_struct *prev)
+ /*
+  * Various schedule()-time debugging checks and statistics:
+  */
++/*
++ * called by only:
++ *   - kernel/sched/core.c|3385| <<__schedule>> schedule_debug(prev);
++ */
+ static inline void schedule_debug(struct task_struct *prev)
+ {
+ #ifdef CONFIG_SCHED_STACK_END_CHECK
+@@ -3272,6 +3331,21 @@ static inline void schedule_debug(struct task_struct *prev)
+ 		panic("corrupted stack end detected inside scheduler\n");
+ #endif
+ 
++	/*
++	 * PREEMPT_DISABLE_OFFSET在!CONFIG_PREEMPT_COUNT的情况下是0
++	 * 也就是说in_atomic_preempt_off()返回true的前提是preempt_count()不为0
++	 *
++	 * 返回percpu的__preempt_count, 第PREEMPT_NEED_RESCHED(31)位被清空为0
++	 * DECLARE_PER_CPU(int, __preempt_count);
++	 * percpu的__preempt_count:
++	 * - 第0-7位表示preempt (PREEMPT_OFFSET)
++	 * - 第8-15位表示softirq (SOFTIRQ_OFFSET)
++	 * - 第16-19位表示hardirq (HARDIRQ_OFFSET)
++	 * - 第20位表示nmi (NMI_OFFSET)
++	 * - 第31位用做PREEMPT_NEED_RESCHED
++	 *
++	 * 也就是说!CONFIG_PREEMPT_COUNT情况下只有不在irq, softirq和nmi才返回true!
++	 */
+ 	if (unlikely(in_atomic_preempt_off())) {
+ 		__schedule_bug(prev);
+ 		preempt_count_set(PREEMPT_DISABLED);
+@@ -3366,6 +3440,15 @@ pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+  *
+  * WARNING: must be called with preemption disabled!
+  */
++/*
++ * called by:
++ *   - kernel/sched/core.c|3466| <<do_task_dead>> __schedule(false);
++ *   - kernel/sched/core.c|3513| <<schedule>> __schedule(false);
++ *   - kernel/sched/core.c|3541| <<schedule_idle>> __schedule(false);
++ *   - kernel/sched/core.c|3594| <<preempt_schedule_common>> __schedule(true);
++ *   - kernel/sched/core.c|3668| <<preempt_schedule_notrace>> __schedule(true);
++ *   - kernel/sched/core.c|3697| <<preempt_schedule_irq>> __schedule(true);
++ */
+ static void __sched notrace __schedule(bool preempt)
+ {
+ 	struct task_struct *prev, *next;
+diff --git a/kernel/softirq.c b/kernel/softirq.c
+index a6b81c6..4e656d7 100644
+--- a/kernel/softirq.c
++++ b/kernel/softirq.c
+@@ -107,6 +107,18 @@ static bool ksoftirqd_running(unsigned long pending)
+  * where hardirqs are disabled legitimately:
+  */
+ #ifdef CONFIG_TRACE_IRQFLAGS
++/*
++ * called by:
++ *   - include/linux/bottom_half.h|19| <<local_bh_disable>> __local_bh_disable_ip(_THIS_IP_, SOFTIRQ_DISABLE_OFFSET);
++ *   - include/linux/rwlock_api_smp.h|175| <<__raw_read_lock_bh>> __local_bh_disable_ip(_RET_IP_, SOFTIRQ_LOCK_OFFSET);
++ *   - include/linux/rwlock_api_smp.h|202| <<__raw_write_lock_bh>> __local_bh_disable_ip(_RET_IP_, SOFTIRQ_LOCK_OFFSET);
++ *   - include/linux/spinlock_api_smp.h|134| <<__raw_spin_lock_bh>> __local_bh_disable_ip(_RET_IP_, SOFTIRQ_LOCK_OFFSET);
++ *   - include/linux/spinlock_api_smp.h|181| <<__raw_spin_trylock_bh>> __local_bh_disable_ip(_RET_IP_, SOFTIRQ_LOCK_OFFSET);
++ *   - include/linux/spinlock_api_up.h|34| <<__LOCK_BH>> do { __local_bh_disable_ip(_THIS_IP_, SOFTIRQ_LOCK_OFFSET); ___LOCK(lock); } while (0)
++ *   - kernel/softirq.c|269| <<__do_softirq>> __local_bh_disable_ip(_RET_IP_, SOFTIRQ_OFFSET);
++ *
++ * 在oracle linux和ubuntu都不用这里
++ */
+ void __local_bh_disable_ip(unsigned long ip, unsigned int cnt)
+ {
+ 	unsigned long flags;
+@@ -139,6 +151,11 @@ void __local_bh_disable_ip(unsigned long ip, unsigned int cnt)
+ EXPORT_SYMBOL(__local_bh_disable_ip);
+ #endif /* CONFIG_TRACE_IRQFLAGS */
+ 
++/*
++ * called by:
++ *   - kernel/softirq.c|162| <<_local_bh_enable>> __local_bh_enable(SOFTIRQ_DISABLE_OFFSET);
++ *   - kernel/softirq.c|319| <<__do_softirq>> __local_bh_enable(SOFTIRQ_OFFSET);
++ */
+ static void __local_bh_enable(unsigned int cnt)
+ {
+ 	lockdep_assert_irqs_disabled();
+@@ -149,6 +166,7 @@ static void __local_bh_enable(unsigned int cnt)
+ 	if (softirq_count() == (cnt & SOFTIRQ_MASK))
+ 		trace_softirqs_on(_RET_IP_);
+ 
++	/* 为percpu的__preempt_count减少cnt */
+ 	__preempt_count_sub(cnt);
+ }
+ 
+@@ -266,6 +284,10 @@ asmlinkage __visible void __softirq_entry __do_softirq(void)
+ 	pending = local_softirq_pending();
+ 	account_irq_enter_time(current);
+ 
++	/*
++	 * 为percpu的__preempt_count增加SOFTIRQ_OFFSET,
++	 * 也就是表示softirq的部分
++	 */
+ 	__local_bh_disable_ip(_RET_IP_, SOFTIRQ_OFFSET);
+ 	in_hardirq = lockdep_softirq_start();
+ 
+@@ -355,6 +377,10 @@ void irq_enter(void)
+ 		_local_bh_enable();
+ 	}
+ 
++	/*
++	 * 为percpu的__preempt_count增加HARDIRQ_OFFSET
++	 * HARDIRQ_OFFSET: 1往左移动16位, 16-19位表示hardirq
++	 */
+ 	__irq_enter();
+ }
+ 
+@@ -409,6 +435,14 @@ void irq_exit(void)
+ #endif
+ 	account_irq_exit_time(current);
+ 	preempt_count_sub(HARDIRQ_OFFSET);
++	/*
++	 * in_interrupt():
++	 * percpu的__preempt_count中表示softirq (第8-15位), hardirq (第16-19位) 和nmi (第20位) 的部分
++	 *
++	 * 在__do_softirq()的时候会调用__local_bh_disable_ip(_RET_IP_, SOFTIRQ_OFFSET)
++	 * 为percpu的__preempt_count增加SOFTIRQ_OFFSET,
++	 * 也就是表示softirq的部分
++	 */
+ 	if (!in_interrupt() && local_softirq_pending())
+ 		invoke_softirq();
+ 
+diff --git a/kernel/watchdog.c b/kernel/watchdog.c
+index 7f9e7b9..0ec5f9e 100644
+--- a/kernel/watchdog.c
++++ b/kernel/watchdog.c
+@@ -255,6 +255,13 @@ static void set_sample_period(void)
+ }
+ 
+ /* Commands for resetting the watchdog */
++/*
++ * called by:
++ *   - kernel/watchdog.c|355| <<softlockup_fn>> __touch_watchdog();
++ *   - kernel/watchdog.c|398| <<watchdog_timer_fn>> __touch_watchdog();
++ *   - kernel/watchdog.c|431| <<watchdog_timer_fn>> __touch_watchdog();
++ *   - kernel/watchdog.c|499| <<watchdog_enable>> __touch_watchdog();
++ */
+ static void __touch_watchdog(void)
+ {
+ 	__this_cpu_write(watchdog_touch_ts, get_timestamp());
+@@ -359,6 +366,10 @@ static int softlockup_fn(void *data)
+ }
+ 
+ /* watchdog kicker functions */
++/*
++ * used by:
++ *   - kernel/watchdog.c|494| <<watchdog_enable>> hrtimer->function = watchdog_timer_fn;
++ */
+ static enum hrtimer_restart watchdog_timer_fn(struct hrtimer *hrtimer)
+ {
+ 	unsigned long touch_ts = __this_cpu_read(watchdog_touch_ts);
+@@ -375,6 +386,9 @@ static enum hrtimer_restart watchdog_timer_fn(struct hrtimer *hrtimer)
+ 	/* kick the softlockup detector */
+ 	if (completion_done(this_cpu_ptr(&softlockup_completion))) {
+ 		reinit_completion(this_cpu_ptr(&softlockup_completion));
++		/*
++		 * stop a cpu but don't wait for completion
++		 */
+ 		stop_one_cpu_nowait(smp_processor_id(),
+ 				softlockup_fn, NULL,
+ 				this_cpu_ptr(&softlockup_stop_work));
+-- 
+2.7.4
+
