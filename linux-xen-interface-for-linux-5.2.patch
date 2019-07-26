@@ -1,23 +1,25 @@
-From 9bfba8d2ef60f8b96bbe7499e6ae8b1b68b8f8d2 Mon Sep 17 00:00:00 2001
+From d8b128e3507a0a861f783d08e34d292f6f606066 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Fri, 26 Jul 2019 16:19:43 +0800
+Date: Sat, 27 Jul 2019 02:12:30 +0800
 Subject: [PATCH 1/1] linux-xen-interface-for-linux-5.2
 
 xen specific interface v5.2
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
- arch/x86/include/asm/smp.h       |  4 ++
- arch/x86/kernel/cpu/hypervisor.c |  4 ++
- arch/x86/mm/init.c               |  4 ++
- arch/x86/xen/enlighten.c         | 85 ++++++++++++++++++++++++++++++++++++++++
- arch/x86/xen/enlighten_hvm.c     | 62 +++++++++++++++++++++++++++++
- arch/x86/xen/enlighten_pv.c      |  5 +++
- arch/x86/xen/mmu_hvm.c           |  8 ++++
- arch/x86/xen/smp_hvm.c           |  7 ++++
- arch/x86/xen/time.c              | 41 +++++++++++++++++++
- include/xen/xen-ops.h            | 14 +++++++
- 10 files changed, 234 insertions(+)
+ arch/x86/include/asm/smp.h       |   4 ++
+ arch/x86/kernel/cpu/hypervisor.c |   4 ++
+ arch/x86/mm/init.c               |   4 ++
+ arch/x86/xen/enlighten.c         | 103 +++++++++++++++++++++++++++++++++++++++
+ arch/x86/xen/enlighten_hvm.c     |  76 +++++++++++++++++++++++++++++
+ arch/x86/xen/enlighten_pv.c      |   5 ++
+ arch/x86/xen/mmu_hvm.c           |   8 +++
+ arch/x86/xen/smp_hvm.c           |   7 +++
+ arch/x86/xen/time.c              |  41 ++++++++++++++++
+ include/xen/xen-ops.h            |  14 ++++++
+ init/main.c                      |   4 ++
+ kernel/cpu.c                     |   5 ++
+ 12 files changed, 275 insertions(+)
 
 diff --git a/arch/x86/include/asm/smp.h b/arch/x86/include/asm/smp.h
 index da545df..ed58f72 100644
@@ -65,7 +67,7 @@ index fd10d91..080b2b5 100644
  {
  	unsigned long end;
 diff --git a/arch/x86/xen/enlighten.c b/arch/x86/xen/enlighten.c
-index 750f46a..633bd3d 100644
+index 750f46a..e5b5e0e 100644
 --- a/arch/x86/xen/enlighten.c
 +++ b/arch/x86/xen/enlighten.c
 @@ -38,6 +38,31 @@ EXPORT_SYMBOL_GPL(hypercall_page);
@@ -174,11 +176,29 @@ index 750f46a..633bd3d 100644
  void xen_vcpu_info_reset(int cpu)
  {
  	if (xen_vcpu_nr(cpu) < MAX_VIRT_CPUS) {
-@@ -196,12 +264,26 @@ void xen_vcpu_info_reset(int cpu)
+@@ -196,12 +264,44 @@ void xen_vcpu_info_reset(int cpu)
  	}
  }
  
 +/*
++ * 在optiplex上测试, 4个vcpu的hvm, 开机的时候调用4次
++ *
++ * 第0次 (cpu = 0):
++ * [0] xen_vcpu_setup
++ * [0] start_kernel
++ * [0] secondary_startup_64
++ *
++ * 第1-3次 (cpu = 1-3):
++ * [0] xen_vcpu_setup+
++ * [0] xen_cpu_up_prepare_hvm
++ * [0] cpuhp_invoke_callback
++ * [0] _cpu_up
++ * [0] do_cpu_up
++ * [0] smp_init
++ * [0] kernel_init_freeable
++ * [0] kernel_init
++ * [0] ret_from_fork
++ *
 + * called by:
 + *   - arch/x86/xen/enlighten.c|147| <<xen_vcpu_setup_restore>> rc = xen_vcpu_setup(cpu);
 + *   - arch/x86/xen/enlighten_hvm.c|153| <<xen_cpu_up_prepare_hvm>> rc = xen_vcpu_setup(cpu);
@@ -201,7 +221,7 @@ index 750f46a..633bd3d 100644
  	BUG_ON(HYPERVISOR_shared_info == &xen_dummy_shared_info);
  
  	/*
-@@ -235,6 +317,9 @@ int xen_vcpu_setup(int cpu)
+@@ -235,6 +335,9 @@ int xen_vcpu_setup(int cpu)
  		 * hypercall does not allow to over-write info.mfn and
  		 * info.offset.
  		 */
@@ -212,10 +232,31 @@ index 750f46a..633bd3d 100644
  					 xen_vcpu_nr(cpu), &info);
  
 diff --git a/arch/x86/xen/enlighten_hvm.c b/arch/x86/xen/enlighten_hvm.c
-index 0e75642..285c783 100644
+index 0e75642..c237269 100644
 --- a/arch/x86/xen/enlighten_hvm.c
 +++ b/arch/x86/xen/enlighten_hvm.c
-@@ -63,6 +63,12 @@ static void __init reserve_shared_info(void)
+@@ -25,6 +25,20 @@
+ #include "mmu.h"
+ #include "smp.h"
+ 
++/*
++ * start_kernel()
++ *  -> setup_arch()
++ *      -> init_hypervisor_platform()
++ *          -> x86_init.hyper.init_platform = xen_hvm_guest_init()
++ * 	        -> init_hvm_pv_info()
++ * 	        -> xen_hvm_init_shared_info()
++ * 	        -> xen_vcpu_info_reset(0)
++ * 	        -> xen_hvm_init_time_ops()
++ *  -> smp_prepare_boot_cpu()
++ *      -> smp_ops.smp_prepare_boot_cpu = xen_hvm_smp_prepare_boot_cpu()
++ * 	 -> xen_vcpu_setup(0)
++ */
++
+ static unsigned long shared_info_pfn;
+ 
+ void xen_hvm_init_shared_info(void)
+@@ -63,6 +77,12 @@ static void __init reserve_shared_info(void)
  	HYPERVISOR_shared_info = early_memremap(pa, PAGE_SIZE);
  }
  
@@ -228,7 +269,7 @@ index 0e75642..285c783 100644
  static void __init xen_hvm_init_mem_mapping(void)
  {
  	early_memunmap(HYPERVISOR_shared_info, PAGE_SIZE);
-@@ -82,6 +88,10 @@ static void __init xen_hvm_init_mem_mapping(void)
+@@ -82,6 +102,10 @@ static void __init xen_hvm_init_mem_mapping(void)
  	xen_vcpu_info_reset(0);
  }
  
@@ -239,7 +280,7 @@ index 0e75642..285c783 100644
  static void __init init_hvm_pv_info(void)
  {
  	int major, minor;
-@@ -111,6 +121,17 @@ static void __init init_hvm_pv_info(void)
+@@ -111,6 +135,17 @@ static void __init init_hvm_pv_info(void)
  
  	xen_setup_features();
  
@@ -257,7 +298,7 @@ index 0e75642..285c783 100644
  	cpuid(base + 4, &eax, &ebx, &ecx, &edx);
  	if (eax & XEN_HVM_CPUID_VCPU_ID_PRESENT)
  		this_cpu_write(xen_vcpu_id, ebx);
-@@ -133,6 +154,10 @@ static void xen_hvm_crash_shutdown(struct pt_regs *regs)
+@@ -133,6 +168,10 @@ static void xen_hvm_crash_shutdown(struct pt_regs *regs)
  }
  #endif
  
@@ -268,7 +309,7 @@ index 0e75642..285c783 100644
  static int xen_cpu_up_prepare_hvm(unsigned int cpu)
  {
  	int rc = 0;
-@@ -146,6 +171,17 @@ static int xen_cpu_up_prepare_hvm(unsigned int cpu)
+@@ -146,6 +185,17 @@ static int xen_cpu_up_prepare_hvm(unsigned int cpu)
  		xen_uninit_lock_cpu(cpu);
  	}
  
@@ -286,7 +327,7 @@ index 0e75642..285c783 100644
  	if (cpu_acpi_id(cpu) != U32_MAX)
  		per_cpu(xen_vcpu_id, cpu) = cpu_acpi_id(cpu);
  	else
-@@ -175,6 +211,12 @@ static int xen_cpu_dead_hvm(unsigned int cpu)
+@@ -175,6 +225,12 @@ static int xen_cpu_dead_hvm(unsigned int cpu)
         return 0;
  }
  
@@ -299,7 +340,7 @@ index 0e75642..285c783 100644
  static void __init xen_hvm_guest_init(void)
  {
  	if (xen_pv_domain())
-@@ -201,6 +243,26 @@ static void __init xen_hvm_guest_init(void)
+@@ -201,6 +257,26 @@ static void __init xen_hvm_guest_init(void)
  	WARN_ON(xen_cpuhp_setup(xen_cpu_up_prepare_hvm, xen_cpu_dead_hvm));
  	xen_unplug_emulated_devices();
  	x86_init.irqs.intr_init = xen_init_IRQ;
@@ -500,6 +541,37 @@ index 4969817..b760835 100644
  	return per_cpu(xen_vcpu_id, cpu);
  }
  
+diff --git a/init/main.c b/init/main.c
+index 66a196c..b2a5a14 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -1080,6 +1080,10 @@ void __weak free_initmem(void)
+ 	free_initmem_default(POISON_FREE_INITMEM);
+ }
+ 
++/*
++ * used by:
++ *   - init/main.c|417| <<rest_init>> pid = kernel_thread(kernel_init, NULL, CLONE_FS);
++ */
+ static int __ref kernel_init(void *unused)
+ {
+ 	int ret;
+diff --git a/kernel/cpu.c b/kernel/cpu.c
+index ef1c565..1ab4d45 100644
+--- a/kernel/cpu.c
++++ b/kernel/cpu.c
+@@ -1154,6 +1154,11 @@ static int _cpu_up(unsigned int cpu, int tasks_frozen, enum cpuhp_state target)
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - kernel/cpu.c|1193| <<cpu_up>> return do_cpu_up(cpu, CPUHP_ONLINE);
++ *   - kernel/cpu.c|1937| <<write_cpuhp_target>> ret = do_cpu_up(dev->id, target);
++ */
+ static int do_cpu_up(unsigned int cpu, enum cpuhp_state target)
+ {
+ 	int err = 0;
 -- 
 2.7.4
 
