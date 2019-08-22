@@ -1,11 +1,12 @@
-From f055b43e07f3727c386e39546db02626d0c22cf2 Mon Sep 17 00:00:00 2001
+From 18ab05e735c97e60ae029e011b825eb135cf2a26 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Thu, 22 Aug 2019 16:16:14 +0800
+Date: Fri, 23 Aug 2019 02:10:54 +0800
 Subject: [PATCH 1/1] linux-apic-for-4.14.113
 
 Signed-off-by: Dongli Zhang <dongli.zhangi0129@gmail.com>
 ---
  arch/x86/include/asm/apic.h           |   6 +
+ arch/x86/include/asm/hw_irq.h         |   4 +
  arch/x86/include/asm/i8259.h          |  31 +++
  arch/x86/include/asm/io_apic.h        |  10 +
  arch/x86/include/asm/irq_vectors.h    |   7 +
@@ -16,7 +17,7 @@ Signed-off-by: Dongli Zhang <dongli.zhangi0129@gmail.com>
  arch/x86/kernel/apic/bigsmp_32.c      |   6 +
  arch/x86/kernel/apic/htirq.c          |  33 +++
  arch/x86/kernel/apic/io_apic.c        | 498 ++++++++++++++++++++++++++++++++++
- arch/x86/kernel/apic/msi.c            | 172 ++++++++++++
+ arch/x86/kernel/apic/msi.c            | 198 ++++++++++++++
  arch/x86/kernel/apic/probe_32.c       |   6 +
  arch/x86/kernel/apic/probe_64.c       |  26 ++
  arch/x86/kernel/apic/vector.c         | 464 +++++++++++++++++++++++++++++++
@@ -26,7 +27,7 @@ Signed-off-by: Dongli Zhang <dongli.zhangi0129@gmail.com>
  arch/x86/kernel/dumpstack.c           |   6 +
  arch/x86/kernel/hpet.c                |   9 +
  arch/x86/kernel/i8259.c               | 221 +++++++++++++++
- arch/x86/kernel/irq.c                 |  45 +++
+ arch/x86/kernel/irq.c                 |  67 +++++
  arch/x86/kernel/irqinit.c             |  27 ++
  arch/x86/kernel/time.c                |  28 ++
  arch/x86/kernel/traps.c               |  13 +
@@ -39,18 +40,21 @@ Signed-off-by: Dongli Zhang <dongli.zhangi0129@gmail.com>
  include/linux/irqdomain.h             |  40 +++
  include/linux/msi.h                   |  14 +
  include/linux/pci.h                   |   6 +
+ kernel/cpu.c                          |   4 +
  kernel/irq/chip.c                     |  24 ++
+ kernel/irq/cpuhotplug.c               |  31 +++
  kernel/irq/irqdesc.c                  |  30 ++
  kernel/irq/irqdomain.c                | 183 +++++++++++++
  kernel/irq/manage.c                   |  11 +
- kernel/irq/msi.c                      | 100 +++++++
+ kernel/irq/msi.c                      | 106 ++++++++
  kernel/irq/proc.c                     |  24 ++
  kernel/irq_work.c                     |   6 +
  kernel/kexec_core.c                   |  21 ++
  kernel/panic.c                        |   7 +
+ kernel/smpboot.c                      |   1 +
  kernel/time/tick-common.c             |   5 +
  kernel/time/tick-oneshot.c            |   9 +
- 45 files changed, 2491 insertions(+)
+ 49 files changed, 2585 insertions(+)
 
 diff --git a/arch/x86/include/asm/apic.h b/arch/x86/include/asm/apic.h
 index a1ed92a..19be1b8 100644
@@ -69,6 +73,21 @@ index a1ed92a..19be1b8 100644
  #define x2apic_supported()	(boot_cpu_has(X86_FEATURE_X2APIC))
  #else /* !CONFIG_X86_X2APIC */
  static inline void check_x2apic(void) { }
+diff --git a/arch/x86/include/asm/hw_irq.h b/arch/x86/include/asm/hw_irq.h
+index bf253ad..ef9c894 100644
+--- a/arch/x86/include/asm/hw_irq.h
++++ b/arch/x86/include/asm/hw_irq.h
+@@ -123,6 +123,10 @@ struct irq_alloc_info {
+ };
+ 
+ struct irq_cfg {
++	/*
++	 * 在这里修改dest_apicid:
++	 *   - arch/x86/kernel/apic/vector.c|542| <<__assign_irq_vector>> &d->cfg.dest_apicid));
++	 */
+ 	unsigned int		dest_apicid;
+ 	u8			vector;
+ 	u8			old_vector;
 diff --git a/arch/x86/include/asm/i8259.h b/arch/x86/include/asm/i8259.h
 index 89789e8..909be79 100644
 --- a/arch/x86/include/asm/i8259.h
@@ -1301,10 +1320,10 @@ index 96a8a68..77a24e5 100644
  	.alloc		= mp_irqdomain_alloc,
  	.free		= mp_irqdomain_free,
 diff --git a/arch/x86/kernel/apic/msi.c b/arch/x86/kernel/apic/msi.c
-index f10e7f9..9048b43 100644
+index f10e7f9..9369d3b 100644
 --- a/arch/x86/kernel/apic/msi.c
 +++ b/arch/x86/kernel/apic/msi.c
-@@ -24,6 +24,116 @@
+@@ -24,8 +24,139 @@
  #include <asm/apic.h>
  #include <asm/irq_remapping.h>
  
@@ -1420,8 +1439,43 @@ index f10e7f9..9048b43 100644
 + */
  static struct irq_domain *msi_default_domain;
  
++/*
++ * [  234.140616] orabug: irq_msi_compose_msg() vector=65, apicid=13
++ * [  234.140617] CPU: 1 PID: 13 Comm: migration/1 Not tainted 4.14.113 #2
++ * [  234.140618] Call Trace:
++ * [  234.140623]  dump_stack+0x46/0x62
++ * [  234.140625]  irq_chip_compose_msi_msg+0x42/0x50
++ * [  234.140626]  msi_domain_set_affinity+0x35/0x60
++ * [  234.140628]  irq_do_set_affinity+0x28/0xa0
++ * [  234.140630]  irq_migrate_all_off_this_cpu+0x19c/0x2a0
++ * [  234.140631]  fixup_irqs+0x1e/0xe0
++ * [  234.140633]  native_cpu_disable+0x1b/0x30
++ * [  234.140635]  take_cpu_down+0x34/0x90
++ * [  234.140636]  multi_cpu_stop+0x86/0xb0
++ * [  234.140637]  ? cpu_stop_queue_work+0xa0/0xa0
++ * [  234.140638]  cpu_stopper_thread+0x76/0xe0
++ * [  234.140640]  smpboot_thread_fn+0x109/0x160
++ * [  234.140641]  kthread+0xfa/0x130
++ * [  234.140642]  ? sort_range+0x20/0x20
++ * [  234.140643]  ? kthread_create_on_node+0x40/0x40
++ * [  234.140645]  ret_from_fork+0x35/0x40
++ */
  static void irq_msi_compose_msg(struct irq_data *data, struct msi_msg *msg)
-@@ -58,6 +168,9 @@ static void irq_msi_compose_msg(struct irq_data *data, struct msi_msg *msg)
+ {
+ 	struct irq_cfg *cfg = irqd_cfg(data);
+@@ -35,6 +166,11 @@ static void irq_msi_compose_msg(struct irq_data *data, struct msi_msg *msg)
+ 	if (x2apic_enabled())
+ 		msg->address_hi |= MSI_ADDR_EXT_DEST_ID(cfg->dest_apicid);
+ 
++	/*
++	 * 在以下修改dest_apicid:
++	 *   - arch/x86/kernel/apic/vector.c|542| <<__assign_irq_vector>> &d->cfg.dest_apicid));
++	 */
++
+ 	msg->address_lo =
+ 		MSI_ADDR_BASE_LO |
+ 		((apic->irq_dest_mode == 0) ?
+@@ -58,6 +194,9 @@ static void irq_msi_compose_msg(struct irq_data *data, struct msi_msg *msg)
   * IRQ Chip for MSI PCI/PCI-X/PCI-Express Devices,
   * which implement the MSI or MSI-X Capability Structure.
   */
@@ -1431,7 +1485,7 @@ index f10e7f9..9048b43 100644
  static struct irq_chip pci_msi_controller = {
  	.name			= "PCI-MSI",
  	.irq_unmask		= pci_msi_unmask_irq,
-@@ -68,6 +181,15 @@ static struct irq_chip pci_msi_controller = {
+@@ -68,6 +207,15 @@ static struct irq_chip pci_msi_controller = {
  	.flags			= IRQCHIP_SKIP_SET_WAKE,
  };
  
@@ -1447,7 +1501,7 @@ index f10e7f9..9048b43 100644
  int native_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
  {
  	struct irq_domain *domain;
-@@ -77,7 +199,17 @@ int native_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
+@@ -77,7 +225,17 @@ int native_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
  	info.type = X86_IRQ_ALLOC_TYPE_MSI;
  	info.msi_dev = dev;
  
@@ -1465,7 +1519,7 @@ index f10e7f9..9048b43 100644
  	if (domain == NULL)
  		domain = msi_default_domain;
  	if (domain == NULL)
-@@ -122,12 +254,20 @@ void pci_msi_set_desc(msi_alloc_info_t *arg, struct msi_desc *desc)
+@@ -122,12 +280,20 @@ void pci_msi_set_desc(msi_alloc_info_t *arg, struct msi_desc *desc)
  }
  EXPORT_SYMBOL_GPL(pci_msi_set_desc);
  
@@ -1486,7 +1540,7 @@ index f10e7f9..9048b43 100644
  static struct msi_domain_info pci_msi_domain_info = {
  	.flags		= MSI_FLAG_USE_DEF_DOM_OPS | MSI_FLAG_USE_DEF_CHIP_OPS |
  			  MSI_FLAG_PCI_MSIX,
-@@ -137,6 +277,9 @@ static struct msi_domain_info pci_msi_domain_info = {
+@@ -137,6 +303,9 @@ static struct msi_domain_info pci_msi_domain_info = {
  	.handler_name	= "edge",
  };
  
@@ -1496,7 +1550,7 @@ index f10e7f9..9048b43 100644
  void __init arch_init_msi_domain(struct irq_domain *parent)
  {
  	struct fwnode_handle *fn;
-@@ -164,6 +307,9 @@ static struct irq_chip pci_msi_ir_controller = {
+@@ -164,6 +333,9 @@ static struct irq_chip pci_msi_ir_controller = {
  	.irq_retrigger		= irq_chip_retrigger_hierarchy,
  	.irq_set_vcpu_affinity	= irq_chip_set_vcpu_affinity_parent,
  	.flags			= IRQCHIP_SKIP_SET_WAKE,
@@ -1506,7 +1560,7 @@ index f10e7f9..9048b43 100644
  };
  
  static struct msi_domain_info pci_msi_ir_domain_info = {
-@@ -391,3 +537,29 @@ int hpet_assign_irq(struct irq_domain *domain, struct hpet_dev *dev,
+@@ -391,3 +563,29 @@ int hpet_assign_irq(struct irq_domain *domain, struct hpet_dev *dev,
  	return irq_domain_alloc_irqs(domain, 1, NUMA_NO_NODE, &info);
  }
  #endif
@@ -3009,7 +3063,7 @@ index 02abc13..9b124eb 100644
  EXPORT_SYMBOL(legacy_pic);
  
 diff --git a/arch/x86/kernel/irq.c b/arch/x86/kernel/irq.c
-index 3c2326b..d626449 100644
+index 3c2326b..2c059bf 100644
 --- a/arch/x86/kernel/irq.c
 +++ b/arch/x86/kernel/irq.c
 @@ -207,6 +207,31 @@ u64 arch_irq_stat(void)
@@ -3044,11 +3098,33 @@ index 3c2326b..d626449 100644
  
  /*
   * do_IRQ handles all normal device IRQ's (the special
-@@ -422,6 +447,26 @@ int check_irq_vectors_for_cpu_disable(void)
+@@ -422,6 +447,48 @@ int check_irq_vectors_for_cpu_disable(void)
  }
  
  /* A cpu has been removed from cpu_online_mask.  Reset irq affinities. */
 +/*
++ * nvme往某个entry的destination写0的例子
++ * [   55.963222] orabug: __pci_write_msi_msg() irq=25, lo=0x00000000
++ * [   55.963226] CPU: 3 PID: 23 Comm: migration/3 Not tainted 4.14.113 #8
++ * [   55.963228] Call Trace:
++ * [   55.963237]  dump_stack+0x46/0x62
++ * [   55.963242]  __pci_write_msi_msg+0x129/0x130
++ * [   55.963247]  ? printk+0x3e/0x46
++ * [   55.963252]  msi_domain_deactivate+0x2d/0x40
++ * [   55.963256]  irq_domain_deactivate_irq+0x43/0x60
++ * [   55.963260]  irq_migrate_all_off_this_cpu+0x296/0x2c0
++ * [   55.963263]  fixup_irqs+0x1e/0xe0
++ * [   55.963269]  native_cpu_disable+0x1b/0x30
++ * [   55.963273]  take_cpu_down+0x34/0x90
++ * [   55.963276]  multi_cpu_stop+0x86/0xb0
++ * [   55.963279]  ? cpu_stop_queue_work+0xa0/0xa0
++ * [   55.963282]  cpu_stopper_thread+0x76/0xe0
++ * [   55.963286]  smpboot_thread_fn+0x109/0x160
++ * [   55.963290]  kthread+0xfa/0x130
++ * [   55.963293]  ? sort_range+0x20/0x20
++ * [   55.963297]  ? kthread_create_on_node+0x40/0x40
++ * [   55.963300]  ret_from_fork+0x35/0x40
++ *
 + * 在这个函数dump_stack()的输出:
 + * [   50.420855] IRQ 29: no longer affine to CPU1
 + * [   50.421858] orabug: fixup_irqs()
@@ -3836,6 +3912,21 @@ index b1abbcc..1cfac35 100644
  static inline int
  pci_alloc_irq_vectors(struct pci_dev *dev, unsigned int min_vecs,
  		      unsigned int max_vecs, unsigned int flags)
+diff --git a/kernel/cpu.c b/kernel/cpu.c
+index 8c350dd..ca6a84a 100644
+--- a/kernel/cpu.c
++++ b/kernel/cpu.c
+@@ -814,6 +814,10 @@ void clear_tasks_mm_cpumask(int cpu)
+ }
+ 
+ /* Take this CPU down. */
++/*
++ * called by only:
++ *   - kernel/cpu.c|868| <<takedown_cpu>> err = stop_machine_cpuslocked(take_cpu_down, NULL, cpumask_of(cpu));
++ */
+ static int take_cpu_down(void *_param)
+ {
+ 	struct cpuhp_cpu_state *st = this_cpu_ptr(&cpuhp_state);
 diff --git a/kernel/irq/chip.c b/kernel/irq/chip.c
 index 317fc75..865dd8a 100644
 --- a/kernel/irq/chip.c
@@ -3899,6 +3990,60 @@ index 317fc75..865dd8a 100644
  int irq_chip_retrigger_hierarchy(struct irq_data *data)
  {
  	for (data = data->parent_data; data; data = data->parent_data)
+diff --git a/kernel/irq/cpuhotplug.c b/kernel/irq/cpuhotplug.c
+index 9eb09ae..ec768c6 100644
+--- a/kernel/irq/cpuhotplug.c
++++ b/kernel/irq/cpuhotplug.c
+@@ -48,6 +48,10 @@ static inline bool irq_needs_fixup(struct irq_data *d)
+ 	return cpumask_test_cpu(cpu, m);
+ }
+ 
++/*
++ * called by:
++ *   - kernel/irq/cpuhotplug.c|163| <<irq_migrate_all_off_this_cpu>> affinity_broken = migrate_one_irq(desc);
++ */
+ static bool migrate_one_irq(struct irq_desc *desc)
+ {
+ 	struct irq_data *d = irq_desc_get_irq_data(desc);
+@@ -150,11 +154,38 @@ static bool migrate_one_irq(struct irq_desc *desc)
+  * Note: we must iterate over all IRQs, whether they have an attached
+  * action structure or not, as we need to get chained interrupts too.
+  */
++/*
++ * [  234.140616] orabug: irq_msi_compose_msg() vector=65, apicid=13
++ * [  234.140617] CPU: 1 PID: 13 Comm: migration/1 Not tainted 4.14.113 #2
++ * [  234.140618] Call Trace:
++ * [  234.140623]  dump_stack+0x46/0x62
++ * [  234.140625]  irq_chip_compose_msi_msg+0x42/0x50
++ * [  234.140626]  msi_domain_set_affinity+0x35/0x60
++ * [  234.140628]  irq_do_set_affinity+0x28/0xa0
++ * [  234.140630]  irq_migrate_all_off_this_cpu+0x19c/0x2a0
++ * [  234.140631]  fixup_irqs+0x1e/0xe0
++ * [  234.140633]  native_cpu_disable+0x1b/0x30
++ * [  234.140635]  take_cpu_down+0x34/0x90
++ * [  234.140636]  multi_cpu_stop+0x86/0xb0
++ * [  234.140637]  ? cpu_stop_queue_work+0xa0/0xa0
++ * [  234.140638]  cpu_stopper_thread+0x76/0xe0
++ * [  234.140640]  smpboot_thread_fn+0x109/0x160
++ * [  234.140641]  kthread+0xfa/0x130
++ * [  234.140642]  ? sort_range+0x20/0x20
++ * [  234.140643]  ? kthread_create_on_node+0x40/0x40
++ * [  234.140645]  ret_from_fork+0x35/0x40
++ *
++ * called by:
++ *   - arch/x86/kernel/irq.c|477| <<fixup_irqs>> irq_migrate_all_off_this_cpu();
++ */
+ void irq_migrate_all_off_this_cpu(void)
+ {
+ 	struct irq_desc *desc;
+ 	unsigned int irq;
+ 
++	/*
++	 * 这里是遍历所有的irq, 和cpu无关
++	 */
+ 	for_each_active_irq(irq) {
+ 		bool affinity_broken;
+ 
 diff --git a/kernel/irq/irqdesc.c b/kernel/irq/irqdesc.c
 index aa08d41..10572a8 100644
 --- a/kernel/irq/irqdesc.c
@@ -4273,10 +4418,23 @@ index 6c877d2..f5f41d7 100644
  __setup_irq(unsigned int irq, struct irq_desc *desc, struct irqaction *new)
  {
 diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
-index 3fa4bd5..6e319b8 100644
+index 3fa4bd5..e258261 100644
 --- a/kernel/irq/msi.c
 +++ b/kernel/irq/msi.c
-@@ -100,6 +100,9 @@ int msi_domain_set_affinity(struct irq_data *irq_data,
+@@ -84,6 +84,12 @@ static inline void irq_chip_write_msi_msg(struct irq_data *data,
+  * Intended to be used by MSI interrupt controllers which are
+  * implemented with hierarchical domains.
+  */
++/*
++ * used by:
++ *   - arch/x86/kernel/apic/msi.c|350| <<global>> .irq_set_affinity = msi_domain_set_affinity,
++ *   - arch/x86/kernel/apic/msi.c|447| <<global>> .irq_set_affinity = msi_domain_set_affinity,
++ *   - kernel/irq/msi.c|291| <<msi_domain_update_chip_ops>> chip->irq_set_affinity = msi_domain_set_affinity;
++ */
+ int msi_domain_set_affinity(struct irq_data *irq_data,
+ 			    const struct cpumask *mask, bool force)
+ {
+@@ -100,6 +106,9 @@ int msi_domain_set_affinity(struct irq_data *irq_data,
  	return ret;
  }
  
@@ -4286,7 +4444,7 @@ index 3fa4bd5..6e319b8 100644
  static void msi_domain_activate(struct irq_domain *domain,
  				struct irq_data *irq_data)
  {
-@@ -109,6 +112,9 @@ static void msi_domain_activate(struct irq_domain *domain,
+@@ -109,6 +118,9 @@ static void msi_domain_activate(struct irq_domain *domain,
  	irq_chip_write_msi_msg(irq_data, &msg);
  }
  
@@ -4296,7 +4454,7 @@ index 3fa4bd5..6e319b8 100644
  static void msi_domain_deactivate(struct irq_domain *domain,
  				  struct irq_data *irq_data)
  {
-@@ -118,6 +124,9 @@ static void msi_domain_deactivate(struct irq_domain *domain,
+@@ -118,6 +130,9 @@ static void msi_domain_deactivate(struct irq_domain *domain,
  	irq_chip_write_msi_msg(irq_data, &msg);
  }
  
@@ -4306,7 +4464,7 @@ index 3fa4bd5..6e319b8 100644
  static int msi_domain_alloc(struct irq_domain *domain, unsigned int virq,
  			    unsigned int nr_irqs, void *arg)
  {
-@@ -136,6 +145,14 @@ static int msi_domain_alloc(struct irq_domain *domain, unsigned int virq,
+@@ -136,6 +151,14 @@ static int msi_domain_alloc(struct irq_domain *domain, unsigned int virq,
  	}
  
  	for (i = 0; i < nr_irqs; i++) {
@@ -4321,7 +4479,7 @@ index 3fa4bd5..6e319b8 100644
  		ret = ops->msi_init(domain, info, virq + i, hwirq + i, arg);
  		if (ret < 0) {
  			if (ops->msi_free) {
-@@ -150,6 +167,9 @@ static int msi_domain_alloc(struct irq_domain *domain, unsigned int virq,
+@@ -150,6 +173,9 @@ static int msi_domain_alloc(struct irq_domain *domain, unsigned int virq,
  	return 0;
  }
  
@@ -4331,7 +4489,7 @@ index 3fa4bd5..6e319b8 100644
  static void msi_domain_free(struct irq_domain *domain, unsigned int virq,
  			    unsigned int nr_irqs)
  {
-@@ -200,6 +220,9 @@ static int msi_domain_ops_init(struct irq_domain *domain,
+@@ -200,6 +226,9 @@ static int msi_domain_ops_init(struct irq_domain *domain,
  			       unsigned int virq, irq_hw_number_t hwirq,
  			       msi_alloc_info_t *arg)
  {
@@ -4341,7 +4499,7 @@ index 3fa4bd5..6e319b8 100644
  	irq_domain_set_hwirq_and_chip(domain, virq, hwirq, info->chip,
  				      info->chip_data);
  	if (info->handler && info->handler_name) {
-@@ -217,6 +240,15 @@ static int msi_domain_ops_check(struct irq_domain *domain,
+@@ -217,6 +246,15 @@ static int msi_domain_ops_check(struct irq_domain *domain,
  	return 0;
  }
  
@@ -4357,7 +4515,7 @@ index 3fa4bd5..6e319b8 100644
  static struct msi_domain_ops msi_domain_ops_default = {
  	.get_hwirq	= msi_domain_ops_get_hwirq,
  	.msi_init	= msi_domain_ops_init,
-@@ -225,6 +257,10 @@ static struct msi_domain_ops msi_domain_ops_default = {
+@@ -225,6 +263,10 @@ static struct msi_domain_ops msi_domain_ops_default = {
  	.set_desc	= msi_domain_ops_set_desc,
  };
  
@@ -4368,7 +4526,7 @@ index 3fa4bd5..6e319b8 100644
  static void msi_domain_update_dom_ops(struct msi_domain_info *info)
  {
  	struct msi_domain_ops *ops = info->ops;
-@@ -345,9 +381,57 @@ int msi_domain_populate_irqs(struct irq_domain *domain, struct device *dev,
+@@ -345,9 +387,57 @@ int msi_domain_populate_irqs(struct irq_domain *domain, struct device *dev,
   *
   * Returns 0 on success or an error code.
   */
@@ -4426,7 +4584,7 @@ index 3fa4bd5..6e319b8 100644
  	struct msi_domain_info *info = domain->host_data;
  	struct msi_domain_ops *ops = info->ops;
  	msi_alloc_info_t arg;
-@@ -358,9 +442,20 @@ int msi_domain_alloc_irqs(struct irq_domain *domain, struct device *dev,
+@@ -358,9 +448,20 @@ int msi_domain_alloc_irqs(struct irq_domain *domain, struct device *dev,
  	if (ret)
  		return ret;
  
@@ -4447,7 +4605,7 @@ index 3fa4bd5..6e319b8 100644
  		virq = __irq_domain_alloc_irqs(domain, -1, desc->nvec_used,
  					       dev_to_node(dev), &arg, false,
  					       desc->affinity);
-@@ -373,6 +468,11 @@ int msi_domain_alloc_irqs(struct irq_domain *domain, struct device *dev,
+@@ -373,6 +474,11 @@ int msi_domain_alloc_irqs(struct irq_domain *domain, struct device *dev,
  			return ret;
  		}
  
@@ -4584,6 +4742,18 @@ index 32ff6fd..63b042d 100644
  atomic_t panic_cpu = ATOMIC_INIT(PANIC_CPU_INVALID);
  
  /*
+diff --git a/kernel/smpboot.c b/kernel/smpboot.c
+index 5043e74..db70bf9 100644
+--- a/kernel/smpboot.c
++++ b/kernel/smpboot.c
+@@ -157,6 +157,7 @@ static int smpboot_thread_fn(void *data)
+ 
+ 		if (!ht->thread_should_run(td->cpu)) {
+ 			preempt_enable_no_resched();
++			/* 平时应该hang在这里吧 */
+ 			schedule();
+ 		} else {
+ 			__set_current_state(TASK_RUNNING);
 diff --git a/kernel/time/tick-common.c b/kernel/time/tick-common.c
 index 49edc1c..3ac3df4 100644
 --- a/kernel/time/tick-common.c
