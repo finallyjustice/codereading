@@ -1,0 +1,209 @@
+From 25a17ae1ad1b94595c8cbfec4c787088ea7c7727 Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Thu, 22 Aug 2019 16:17:00 +0800
+Subject: [PATCH 1/1] linux uek4 msi and irq
+
+v4.1.12-124.23.4
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ arch/x86/include/asm/hw_irq.h | 30 ++++++++++++++++++++++++++++++
+ arch/x86/kernel/apic/vector.c | 13 +++++++++++++
+ arch/x86/kernel/irq.c         |  4 ++++
+ arch/x86/kernel/smpboot.c     | 11 +++++++++++
+ arch/x86/xen/smp.c            |  3 +++
+ kernel/smpboot.c              |  5 +++++
+ kernel/stop_machine.c         | 10 ++++++++++
+ 7 files changed, 76 insertions(+)
+
+diff --git a/arch/x86/include/asm/hw_irq.h b/arch/x86/include/asm/hw_irq.h
+index 08017d3..ba6c2ba 100644
+--- a/arch/x86/include/asm/hw_irq.h
++++ b/arch/x86/include/asm/hw_irq.h
+@@ -189,6 +189,36 @@ extern char irq_entries_start[];
+ #define VECTOR_UNDEFINED	(-1)
+ #define VECTOR_RETRIGGERED	(-2)
+ 
++/*
++ * 在以下设置vector_irq:
++ *   - arch/x86/kernel/apic/vector.c|184| <<__assign_irq_vector>> per_cpu(vector_irq, new_cpu)[vector] = irq;
++ *   - arch/x86/kernel/apic/vector.c|219| <<clear_irq_vector>> per_cpu(vector_irq, cpu)[vector] = VECTOR_UNDEFINED;
++ *   - arch/x86/kernel/apic/vector.c|234| <<clear_irq_vector>> per_cpu(vector_irq, cpu)[vector] = VECTOR_UNDEFINED;
++ *   - arch/x86/kernel/apic/vector.c|285| <<__setup_vector_irq>> per_cpu(vector_irq, cpu)[vector] = irq;
++ *   - arch/x86/kernel/apic/vector.c|295| <<__setup_vector_irq>> per_cpu(vector_irq, cpu)[vector] = VECTOR_UNDEFINED;
++ *   - arch/x86/kernel/apic/vector.c|315| <<setup_vector_irq>> per_cpu(vector_irq, cpu)[IRQ0_VECTOR + irq] = irq;
++ *   - arch/x86/kernel/apic/vector.c|460| <<smp_irq_move_cleanup_interrupt>> __this_cpu_write(vector_irq[vector], VECTOR_UNDEFINED);
++ *   - arch/x86/kernel/irq.c|208| <<do_IRQ>> __this_cpu_write(vector_irq[vector], VECTOR_UNDEFINED);
++ *   - arch/x86/kernel/irq.c|479| <<fixup_irqs>> __this_cpu_write(vector_irq[vector], VECTOR_RETRIGGERED);
++ *   - arch/x86/kernel/irq.c|484| <<fixup_irqs>> __this_cpu_write(vector_irq[vector], VECTOR_UNDEFINED);
++ *   - arch/x86/kernel/irqinit.c|98| <<init_IRQ>> per_cpu(vector_irq, 0)[IRQ0_VECTOR + i] = i;
++ *   - arch/x86/lguest/boot.c|868| <<lguest_init_IRQ>> __this_cpu_write(vector_irq[i], i - FIRST_EXTERNAL_VECTOR);
++ *
++ * 在以下使用vector_irq:
++ *   - arch/x86/include/asm/hw_irq.h|193| <<global>> DECLARE_PER_CPU_USER_MAPPED(vector_irq_t, vector_irq);
++ *   - arch/x86/kernel/irqinit.c|55| <<global>> DEFINE_PER_CPU_USER_MAPPED(vector_irq_t, vector_irq) = {
++ *   - arch/x86/kernel/apic/vector.c|171| <<__assign_irq_vector>> if (per_cpu(vector_irq, new_cpu)[vector] >
++ *   - arch/x86/kernel/apic/vector.c|232| <<clear_irq_vector>> if (per_cpu(vector_irq, cpu)[vector] != irq)
++ *   - arch/x86/kernel/apic/vector.c|289| <<__setup_vector_irq>> irq = per_cpu(vector_irq, cpu)[vector];
++ *   - arch/x86/kernel/apic/vector.c|418| <<smp_irq_move_cleanup_interrupt>> irq = __this_cpu_read(vector_irq[vector]);
++ *   - arch/x86/kernel/irq.c|198| <<do_IRQ>> irq = __this_cpu_read(vector_irq[vector]);
++ *   - arch/x86/kernel/irq.c|302| <<check_irq_vectors_for_cpu_disable>> irq = __this_cpu_read(vector_irq[vector]);
++ *   - arch/x86/kernel/irq.c|361| <<check_irq_vectors_for_cpu_disable>> per_cpu(vector_irq, cpu)[vector] < 0)
++ *   - arch/x86/kernel/irq.c|466| <<fixup_irqs>> if (__this_cpu_read(vector_irq[vector]) <= VECTOR_UNDEFINED)
++ *   - arch/x86/kernel/irq.c|471| <<fixup_irqs>> irq = __this_cpu_read(vector_irq[vector]);
++ *   - arch/x86/kernel/irq.c|483| <<fixup_irqs>> if (__this_cpu_read(vector_irq[vector]) != VECTOR_RETRIGGERED)
++ *   - arch/x86/kernel/irqinit.c|64| <<vector_used_by_percpu_irq>> if (per_cpu(vector_irq, cpu)[vector] > VECTOR_UNDEFINED)
++ */
+ typedef int vector_irq_t[NR_VECTORS];
+ DECLARE_PER_CPU_USER_MAPPED(vector_irq_t, vector_irq);
+ 
+diff --git a/arch/x86/kernel/apic/vector.c b/arch/x86/kernel/apic/vector.c
+index 4902161..42a40e2 100644
+--- a/arch/x86/kernel/apic/vector.c
++++ b/arch/x86/kernel/apic/vector.c
+@@ -98,6 +98,11 @@ static void free_irq_cfg(unsigned int at, struct irq_cfg *cfg)
+ 	kfree(cfg);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kernel/apic/vector.c|201| <<assign_irq_vector>> err = __assign_irq_vector(irq, cfg, mask);
++ *   - arch/x86/kernel/apic/vector.c|512| <<arch_setup_hwirq>> ret = __assign_irq_vector(irq, cfg, apic->target_cpus());
++ */
+ static int
+ __assign_irq_vector(int irq, struct irq_cfg *cfg, const struct cpumask *mask)
+ {
+@@ -267,6 +272,10 @@ int __init arch_early_irq_init(void)
+ 	return arch_early_ioapic_init();
+ }
+ 
++/*
++ * called by only:
++ *   - arch/x86/kernel/apic/vector.c|317| <<setup_vector_irq>> __setup_vector_irq(cpu);
++ */
+ static void __setup_vector_irq(int cpu)
+ {
+ 	/* Initialize vector_irq on a new cpu */
+@@ -299,6 +308,10 @@ static void __setup_vector_irq(int cpu)
+ /*
+  * Setup the vector to irq mappings. Must be called with vector_lock held.
+  */
++/*
++ * called by:
++ *   - arch/x86/kernel/smpboot.c|261| <<start_secondary>> setup_vector_irq(smp_processor_id());
++ */
+ void setup_vector_irq(int cpu)
+ {
+ 	int irq;
+diff --git a/arch/x86/kernel/irq.c b/arch/x86/kernel/irq.c
+index 30e8e57..a2d18c3 100644
+--- a/arch/x86/kernel/irq.c
++++ b/arch/x86/kernel/irq.c
+@@ -372,6 +372,10 @@ int check_irq_vectors_for_cpu_disable(void)
+ }
+ 
+ /* A cpu has been removed from cpu_online_mask.  Reset irq affinities. */
++/*
++ * called by:
++ *   - arch/x86/kernel/smpboot.c|1409| <<cpu_disable_common>> fixup_irqs();
++ */
+ void fixup_irqs(void)
+ {
+ 	unsigned int irq, vector;
+diff --git a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
+index 6af203b..361a9c3 100644
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@ -1391,6 +1391,11 @@ static void __ref remove_cpu_from_maps(int cpu)
+ 	numa_remove_cpu(cpu);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kernel/smpboot.c|1416| <<native_cpu_disable>> cpu_disable_common();
++ *   - arch/x86/xen/smp.c|504| <<xen_cpu_disable>> cpu_disable_common();
++ */
+ void cpu_disable_common(void)
+ {
+ 	int cpu = smp_processor_id();
+@@ -1404,6 +1409,12 @@ void cpu_disable_common(void)
+ 	fixup_irqs();
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/include/asm/smp.h|125| <<__cpu_disable>> return smp_ops.cpu_disable();
++ *
++ * struct smp_ops smp_ops.cpu_disable = native_cpu_disable()
++ */
+ int native_cpu_disable(void)
+ {
+ 	int ret;
+diff --git a/arch/x86/xen/smp.c b/arch/x86/xen/smp.c
+index 28b4ad6..af8df77 100644
+--- a/arch/x86/xen/smp.c
++++ b/arch/x86/xen/smp.c
+@@ -495,6 +495,9 @@ static void xen_smp_cpus_done(unsigned int max_cpus)
+ }
+ 
+ #ifdef CONFIG_HOTPLUG_CPU
++/*
++ * struct smp_ops xen_smp_ops.cpu_disable = xen_cpu_disable()
++ */
+ static int xen_cpu_disable(void)
+ {
+ 	unsigned int cpu = smp_processor_id();
+diff --git a/kernel/smpboot.c b/kernel/smpboot.c
+index c697f73..50f086a 100644
+--- a/kernel/smpboot.c
++++ b/kernel/smpboot.c
+@@ -102,6 +102,10 @@ enum {
+  *
+  * Returns 1 when the thread should exit, 0 otherwise.
+  */
++/*
++ * used by:
++ *   - kernel/smpboot.c|182| <<__smpboot_create_thread>> tsk = kthread_create_on_cpu(smpboot_thread_fn, td, cpu,
++ */
+ static int smpboot_thread_fn(void *data)
+ {
+ 	struct smpboot_thread_data *td = data;
+@@ -159,6 +163,7 @@ static int smpboot_thread_fn(void *data)
+ 		} else {
+ 			__set_current_state(TASK_RUNNING);
+ 			preempt_enable();
++			/* cpu_stopper_thread() ??? */
+ 			ht->thread_fn(td->cpu);
+ 		}
+ 	}
+diff --git a/kernel/stop_machine.c b/kernel/stop_machine.c
+index 695f0c6..e04110a 100644
+--- a/kernel/stop_machine.c
++++ b/kernel/stop_machine.c
+@@ -445,6 +445,12 @@ static int cpu_stop_should_run(unsigned int cpu)
+ 	return run;
+ }
+ 
++/*
++ * called by:
++ *   - kernel/smpboot.c|166| <<smpboot_thread_fn>> ht->thread_fn(td->cpu);
++ *
++ * struct smp_hotplug_thread cpu_stop_threads.thread_fn = cpu_stopper_thread()
++ */
+ static void cpu_stopper_thread(unsigned int cpu)
+ {
+ 	struct cpu_stopper *stopper = &per_cpu(cpu_stopper, cpu);
+@@ -516,6 +522,10 @@ static void cpu_stop_unpark(unsigned int cpu)
+ 	spin_unlock_irq(&stopper->lock);
+ }
+ 
++/*
++ * used by:
++ *   - kernel/stop_machine.c|545| <<cpu_stop_init>> BUG_ON(smpboot_register_percpu_thread(&cpu_stop_threads));
++ */
+ static struct smp_hotplug_thread cpu_stop_threads = {
+ 	.store			= &cpu_stopper_task,
+ 	.thread_should_run	= cpu_stop_should_run,
+-- 
+2.7.4
+
