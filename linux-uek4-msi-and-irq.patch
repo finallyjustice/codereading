@@ -1,27 +1,53 @@
-From 25a17ae1ad1b94595c8cbfec4c787088ea7c7727 Mon Sep 17 00:00:00 2001
+From 8341d67c3bcc058230a910aafaff4f9452526e01 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Thu, 22 Aug 2019 16:17:00 +0800
+Date: Fri, 23 Aug 2019 16:19:19 +0800
 Subject: [PATCH 1/1] linux uek4 msi and irq
 
 v4.1.12-124.23.4
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
- arch/x86/include/asm/hw_irq.h | 30 ++++++++++++++++++++++++++++++
- arch/x86/kernel/apic/vector.c | 13 +++++++++++++
- arch/x86/kernel/irq.c         |  4 ++++
- arch/x86/kernel/smpboot.c     | 11 +++++++++++
+ arch/x86/include/asm/hw_irq.h | 51 +++++++++++++++++++++++++++++++++++++++++++
+ arch/x86/kernel/apic/vector.c | 13 +++++++++++
+ arch/x86/kernel/irq.c         | 12 ++++++++++
+ arch/x86/kernel/smpboot.c     | 11 ++++++++++
  arch/x86/xen/smp.c            |  3 +++
+ drivers/pci/msi.c             |  5 +++++
+ include/linux/irq.h           |  8 +++++++
  kernel/smpboot.c              |  5 +++++
- kernel/stop_machine.c         | 10 ++++++++++
- 7 files changed, 76 insertions(+)
+ kernel/stop_machine.c         | 10 +++++++++
+ 9 files changed, 118 insertions(+)
 
 diff --git a/arch/x86/include/asm/hw_irq.h b/arch/x86/include/asm/hw_irq.h
-index 08017d3..ba6c2ba 100644
+index 08017d3..929e0d9 100644
 --- a/arch/x86/include/asm/hw_irq.h
 +++ b/arch/x86/include/asm/hw_irq.h
-@@ -189,6 +189,36 @@ extern char irq_entries_start[];
+@@ -186,9 +186,60 @@ extern char irq_entries_start[];
+ #define trace_irq_entries_start irq_entries_start
+ #endif
+ 
++/*
++ * 在以下使用VECTOR_UNDEFINED:
++ *   - arch/x86/kernel/irqinit.c|56| <<global>> [0 ... NR_VECTORS - 1] = VECTOR_UNDEFINED,
++ *   - arch/x86/kernel/apic/vector.c|177| <<__assign_irq_vector>> VECTOR_UNDEFINED)
++ *   - arch/x86/kernel/apic/vector.c|224| <<clear_irq_vector>> per_cpu(vector_irq, cpu)[vector] = VECTOR_UNDEFINED;
++ *   - arch/x86/kernel/apic/vector.c|239| <<clear_irq_vector>> per_cpu(vector_irq, cpu)[vector] = VECTOR_UNDEFINED;
++ *   - arch/x86/kernel/apic/vector.c|299| <<__setup_vector_irq>> if (irq <= VECTOR_UNDEFINED)
++ *   - arch/x86/kernel/apic/vector.c|304| <<__setup_vector_irq>> per_cpu(vector_irq, cpu)[vector] = VECTOR_UNDEFINED;
++ *   - arch/x86/kernel/apic/vector.c|433| <<smp_irq_move_cleanup_interrupt>> if (irq <= VECTOR_UNDEFINED)
++ *   - arch/x86/kernel/apic/vector.c|473| <<smp_irq_move_cleanup_interrupt>> __this_cpu_write(vector_irq[vector], VECTOR_UNDEFINED);
++ *   - arch/x86/kernel/irq.c|208| <<do_IRQ>> __this_cpu_write(vector_irq[vector], VECTOR_UNDEFINED);
++ *   - arch/x86/kernel/irq.c|470| <<fixup_irqs>> if (__this_cpu_read(vector_irq[vector]) <= VECTOR_UNDEFINED)
++ *   - arch/x86/kernel/irq.c|488| <<fixup_irqs>> __this_cpu_write(vector_irq[vector], VECTOR_UNDEFINED);
++ *   - arch/x86/kernel/irqinit.c|64| <<vector_used_by_percpu_irq>> if (per_cpu(vector_irq, cpu)[vector] > VECTOR_UNDEFINED)
++ */
  #define VECTOR_UNDEFINED	(-1)
++/*
++ * 在以下使用VECTOR_RETRIGGERED:
++ *   - arch/x86/kernel/irq.c|203| <<do_IRQ>> if (irq != VECTOR_RETRIGGERED) {
++ *   - arch/x86/kernel/irq.c|483| <<fixup_irqs>> __this_cpu_write(vector_irq[vector], VECTOR_RETRIGGERED);
++ *   - arch/x86/kernel/irq.c|487| <<fixup_irqs>> if (__this_cpu_read(vector_irq[vector]) != VECTOR_RETRIGGERED)
++ */
  #define VECTOR_RETRIGGERED	(-2)
  
 +/*
@@ -96,7 +122,7 @@ index 4902161..42a40e2 100644
  {
  	int irq;
 diff --git a/arch/x86/kernel/irq.c b/arch/x86/kernel/irq.c
-index 30e8e57..a2d18c3 100644
+index 30e8e57..331dab8 100644
 --- a/arch/x86/kernel/irq.c
 +++ b/arch/x86/kernel/irq.c
 @@ -372,6 +372,10 @@ int check_irq_vectors_for_cpu_disable(void)
@@ -110,6 +136,28 @@ index 30e8e57..a2d18c3 100644
  void fixup_irqs(void)
  {
  	unsigned int irq, vector;
+@@ -396,6 +400,10 @@ void fixup_irqs(void)
+ 
+ 		data = irq_desc_get_irq_data(desc);
+ 		affinity = data->affinity;
++		/*
++		 * 关于cpumask_subset(), 如果affinity是cpu_online_mask的subset, 返回1
++		 * 否则返回0
++		 */
+ 		if (!irq_has_action(irq) || irqd_is_per_cpu(data) ||
+ 		    cpumask_subset(affinity, cpu_online_mask)) {
+ 			raw_spin_unlock(&desc->lock);
+@@ -409,6 +417,10 @@ void fixup_irqs(void)
+ 		 */
+ 		irq_force_complete_move(irq);
+ 
++		/*
++		 * Returns >= nr_cpu_ids if no cpus set.
++		 * 如果affinity里没有online的cpu了...
++		 */
+ 		if (cpumask_any_and(affinity, cpu_online_mask) >= nr_cpu_ids) {
+ 			break_affinity = 1;
+ 			affinity = cpu_online_mask;
 diff --git a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
 index 6af203b..361a9c3 100644
 --- a/arch/x86/kernel/smpboot.c
@@ -153,6 +201,41 @@ index 28b4ad6..af8df77 100644
  static int xen_cpu_disable(void)
  {
  	unsigned int cpu = smp_processor_id();
+diff --git a/drivers/pci/msi.c b/drivers/pci/msi.c
+index c3e7dfc..fcfdefd 100644
+--- a/drivers/pci/msi.c
++++ b/drivers/pci/msi.c
+@@ -246,6 +246,11 @@ static void msi_mask_irq(struct msi_desc *desc, u32 mask, u32 flag)
+  * file.  This saves a few milliseconds when initialising devices with lots
+  * of MSI-X interrupts.
+  */
++/*
++ * called by:
++ *   - drivers/pci/msi.c|268| <<msix_mask_irq>> desc->masked = __pci_msix_desc_mask_irq(desc, flag);
++ *   - drivers/pci/msi.c|1027| <<pci_msix_shutdown>> __pci_msix_desc_mask_irq(entry, 1);     
++ */
+ u32 __pci_msix_desc_mask_irq(struct msi_desc *desc, u32 flag)
+ {
+ 	u32 mask_bits = desc->masked;
+diff --git a/include/linux/irq.h b/include/linux/irq.h
+index 3532dca..a2684fc 100644
+--- a/include/linux/irq.h
++++ b/include/linux/irq.h
+@@ -187,6 +187,14 @@ enum {
+ 	IRQD_TRIGGER_MASK		= 0xf,
+ 	IRQD_SETAFFINITY_PENDING	= (1 <<  8),
+ 	IRQD_NO_BALANCING		= (1 << 10),
++	/*
++	 * 在以下设置和使用IRQD_PER_CPU:
++	 *   - include/linux/irq.h|208| <<irqd_is_per_cpu>> return d->state_use_accessors & IRQD_PER_CPU;
++	 *   - include/linux/irq.h|213| <<irqd_can_balance>> return !(d->state_use_accessors & (IRQD_PER_CPU | IRQD_NO_BALANCING));
++	 *   - kernel/irq/chip.c|800| <<irq_modify_status>> irqd_clear(&desc->irq_data, IRQD_NO_BALANCING | IRQD_PER_CPU |
++	 *   - kernel/irq/chip.c|805| <<irq_modify_status>> irqd_set(&desc->irq_data, IRQD_PER_CPU);
++	 *   - kernel/irq/manage.c|1205| <<__setup_irq>> irqd_set(&desc->irq_data, IRQD_PER_CPU);
++	 */
+ 	IRQD_PER_CPU			= (1 << 11),
+ 	IRQD_AFFINITY_SET		= (1 << 12),
+ 	IRQD_LEVEL			= (1 << 13),
 diff --git a/kernel/smpboot.c b/kernel/smpboot.c
 index c697f73..50f086a 100644
 --- a/kernel/smpboot.c
