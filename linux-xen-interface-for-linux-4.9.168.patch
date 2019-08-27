@@ -1,6 +1,6 @@
-From bfbb1f0b294a663ce1411efaf870de4db9a1554c Mon Sep 17 00:00:00 2001
+From b75b9c83de5127d66f3794ca2ddd2ec5ce76b031 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Thu, 8 Aug 2019 01:09:54 +0800
+Date: Tue, 27 Aug 2019 15:36:07 +0800
 Subject: [PATCH 1/1] linux-xen-interface-for-linux-4.9.168
 
 xen specific interface linux-4.9.168
@@ -25,6 +25,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  drivers/block/xen-blkfront.c         |  60 +++
  drivers/nvme/host/pci.c              |  32 ++
  drivers/pci/msi.c                    |   3 +
+ drivers/xen/balloon.c                | 183 +++++++++
  drivers/xen/events/events_base.c     | 708 +++++++++++++++++++++++++++++++++++
  drivers/xen/events/events_internal.h |  13 +
  drivers/xen/pci.c                    |  29 ++
@@ -33,13 +34,14 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  include/linux/device.h               |   2 +
  include/linux/dma-direction.h        |   8 +
  include/linux/dma-mapping.h          |  60 +++
+ include/xen/balloon.h                |  30 ++
  kernel/irq/chip.c                    |  23 ++
  kernel/irq/irqdomain.c               |  31 ++
  kernel/irq/manage.c                  |  90 +++++
  kernel/sched/core.c                  |   5 +
  lib/iommu-helper.c                   |  12 +
  lib/swiotlb.c                        | 508 ++++++++++++++++++++++++-
- 32 files changed, 2880 insertions(+), 2 deletions(-)
+ 34 files changed, 3093 insertions(+), 2 deletions(-)
 
 diff --git a/arch/x86/include/asm/dma-mapping.h b/arch/x86/include/asm/dma-mapping.h
 index 4446162..55d09e2 100644
@@ -1761,6 +1763,383 @@ index 37f393f..3176ed4 100644
  static int __pci_enable_msix_range(struct pci_dev *dev,
  		struct msix_entry *entries, int minvec, int maxvec,
  		unsigned int flags)
+diff --git a/drivers/xen/balloon.c b/drivers/xen/balloon.c
+index e4db19e..c701d26 100644
+--- a/drivers/xen/balloon.c
++++ b/drivers/xen/balloon.c
+@@ -71,8 +71,14 @@
+ #include <xen/features.h>
+ #include <xen/page.h>
+ 
++/*
++ * 在以下使用:
++ *   - struct ctl_table balloon_table[0].data = &xen_hotplug_unpopulated
++ *   - drivers/xen/balloon.c|623| <<add_ballooned_pages>> if (xen_hotplug_unpopulated) {
++ */
+ static int xen_hotplug_unpopulated;
+ 
++/* oracle linux不支持 CONFIG_XEN_BALLOON_MEMORY_HOTPLUG */
+ #ifdef CONFIG_XEN_BALLOON_MEMORY_HOTPLUG
+ 
+ static int zero;
+@@ -109,6 +115,7 @@ static struct ctl_table xen_root[] = {
+ 	{ }
+ };
+ 
++/* oracle linux不支持 CONFIG_XEN_BALLOON_MEMORY_HOTPLUG */
+ #endif
+ 
+ /*
+@@ -144,11 +151,33 @@ static xen_pfn_t frame_list[PAGE_SIZE / sizeof(xen_pfn_t)];
+ 
+ 
+ /* List of ballooned pages, threaded through the mem_map array. */
++/*
++ * 使用ballooned_pages的地方:
++ *   - drivers/xen/balloon.c|195| <<__balloon_append>> list_add_tail(&page->lru, &ballooned_pages);
++ *   - drivers/xen/balloon.c|198| <<__balloon_append>> list_add(&page->lru, &ballooned_pages);
++ *   - drivers/xen/balloon.c|231| <<balloon_retrieve>> if (list_empty(&ballooned_pages))
++ *   - drivers/xen/balloon.c|234| <<balloon_retrieve>> page = list_entry(ballooned_pages.next, struct page, lru);
++ *   - drivers/xen/balloon.c|252| <<balloon_next_page>> if (next == &ballooned_pages)
++ *   - drivers/xen/balloon.c|472| <<increase_reservation>> page = list_first_entry_or_null(&ballooned_pages, struct page, lru);
++ *   - drivers/xen/balloon.c|668| <<add_ballooned_pages>> !list_empty(&ballooned_pages));
++ */
+ static LIST_HEAD(ballooned_pages);
++/*
++ * 在以下使用balloon_wq:
++ *   - drivers/xen/balloon.c|177| <<__balloon_append>> wake_up(&balloon_wq);
++ *   - drivers/xen/balloon.c|627| <<add_ballooned_pages>> wait_event(balloon_wq,
++ */
+ static DECLARE_WAIT_QUEUE_HEAD(balloon_wq);
+ 
+ /* Main work function, always executed in process context. */
+ static void balloon_process(struct work_struct *work);
++/*
++ * used by:
++ *   - drivers/xen/balloon.c|486| <<xen_memory_notifier>> schedule_delayed_work(&balloon_worker, 0);
++ *   - drivers/xen/balloon.c|704| <<balloon_process>> schedule_delayed_work(&balloon_worker, balloon_stats.schedule_delay * HZ);
++ *   - drivers/xen/balloon.c|712| <<balloon_set_new_target>> schedule_delayed_work(&balloon_worker, 0);
++ *   - drivers/xen/balloon.c|833| <<free_xenballooned_pages>> schedule_delayed_work(&balloon_worker, 0);
++ */
+ static DECLARE_DELAYED_WORK(balloon_worker, balloon_process);
+ 
+ /* When ballooning out (allocating memory to return to Xen) we don't really
+@@ -156,6 +185,10 @@ static DECLARE_DELAYED_WORK(balloon_worker, balloon_process);
+ #define GFP_BALLOON \
+ 	(GFP_HIGHUSER | __GFP_NOWARN | __GFP_NORETRY | __GFP_NOMEMALLOC)
+ 
++/*
++ * called by:
++ *   - drivers/xen/balloon.c|512| <<decrease_reservation>> scrub_page(page);
++ */
+ static void scrub_page(struct page *page)
+ {
+ #ifdef CONFIG_XEN_SCRUB_PAGES
+@@ -164,6 +197,16 @@ static void scrub_page(struct page *page)
+ }
+ 
+ /* balloon_append: add the given page to the balloon. */
++/*
++ * called by:
++ *   - drivers/xen/balloon.c|182| <<balloon_append>> __balloon_append(page);
++ *   - drivers/xen/balloon.c|383| <<xen_online_page>> __balloon_append(page);
++ *   - drivers/xen/balloon.c|731| <<balloon_add_region>> __balloon_append(page);
++ *
++ * 如果page是PageHighMem(), 插入ballooned_pages尾部, 增加balloon_stats.balloon_high
++ * 否则插入ballooned_pages头部, 增加balloon_stats.balloon_low
++ * 最后唤醒balloon_wa
++ */
+ static void __balloon_append(struct page *page)
+ {
+ 	/* Lowmem is re-populated first, so highmem pages go at list tail. */
+@@ -174,20 +217,63 @@ static void __balloon_append(struct page *page)
+ 		list_add(&page->lru, &ballooned_pages);
+ 		balloon_stats.balloon_low++;
+ 	}
++	/*
++	 * 在以下使用balloon_wq:
++	 *   - drivers/xen/balloon.c|177| <<__balloon_append>> wake_up(&balloon_wq);
++	 *   - drivers/xen/balloon.c|627| <<add_ballooned_pages>> wait_event(balloon_wq,
++	 */
+ 	wake_up(&balloon_wq);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/xen/balloon.c|555| <<decrease_reservation>> balloon_append(page);
++ *   - drivers/xen/balloon.c|700| <<free_xenballooned_pages>> balloon_append(pages[i]);
++ *
++ * 如果page是PageHighMem(), 插入ballooned_pages尾部, 增加balloon_stats.balloon_high
++ * 否则插入ballooned_pages头部, 增加balloon_stats.balloon_low
++ * 最后唤醒balloon_wa
++ * !!!totalram_pages减少1
++ */
+ static void balloon_append(struct page *page)
+ {
+ 	__balloon_append(page);
++	/*
++	 * xen balloon调用adjust_managed_page_count()的地方:
++	 *   - drivers/xen/balloon.c|223| <<balloon_append>> adjust_managed_page_count(page, -1);
++	 *   - drivers/xen/balloon.c|244| <<balloon_retrieve>> adjust_managed_page_count(page, 1);
++	 *
++	 * totalram_pages减少1
++	 */
+ 	adjust_managed_page_count(page, -1);
+ }
+ 
+ /* balloon_retrieve: rescue a page from the balloon, if it is not empty. */
++/*
++ * called by:
++ *   - drivers/xen/balloon.c|493| <<increase_reservation>> page = balloon_retrieve(false);
++ *   - drivers/xen/balloon.c|705| <<alloc_xenballooned_pages>> page = balloon_retrieve(true);
++ *
++ * 核心思想是从ballooned_pages的头部取出一个page,
++ * 如果page是PageHighMem(), 减少balloon_stats.balloon_high
++ * 如果page不是PageHighMem(), 减少balloon_stats.balloon_low
++ * !!!totalram_pages增加1
++ * 返回这个page
++ */
+ static struct page *balloon_retrieve(bool require_lowmem)
+ {
+ 	struct page *page;
+ 
++	/*
++	 * 使用ballooned_pages的地方:
++	 *   - drivers/xen/balloon.c|195| <<__balloon_append>> list_add_tail(&page->lru, &ballooned_pages);
++	 *   - drivers/xen/balloon.c|198| <<__balloon_append>> list_add(&page->lru, &ballooned_pages);
++	 *   - drivers/xen/balloon.c|231| <<balloon_retrieve>> if (list_empty(&ballooned_pages))
++	 *   - drivers/xen/balloon.c|234| <<balloon_retrieve>> page = list_entry(ballooned_pages.next, struct page, lru);
++	 *   - drivers/xen/balloon.c|252| <<balloon_next_page>> if (next == &ballooned_pages)
++	 *   - drivers/xen/balloon.c|472| <<increase_reservation>> page = list_first_entry_or_null(&ballooned_pages, struct page, lru);
++	 *   - drivers/xen/balloon.c|668| <<add_ballooned_pages>> !list_empty(&ballooned_pages));
++	 */
+ 	if (list_empty(&ballooned_pages))
+ 		return NULL;
+ 
+@@ -201,11 +287,22 @@ static struct page *balloon_retrieve(bool require_lowmem)
+ 	else
+ 		balloon_stats.balloon_low--;
+ 
++	/*
++	 * xen balloon调用adjust_managed_page_count()的地方:
++	 *   - drivers/xen/balloon.c|223| <<balloon_append>> adjust_managed_page_count(page, -1);
++	 *   - drivers/xen/balloon.c|244| <<balloon_retrieve>> adjust_managed_page_count(page, 1);
++	 *
++	 * totalram_pages增加1
++	 */
+ 	adjust_managed_page_count(page, 1);
+ 
+ 	return page;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/xen/balloon.c|483| <<increase_reservation>> page = balloon_next_page(page);
++ */
+ static struct page *balloon_next_page(struct page *page)
+ {
+ 	struct list_head *next = page->lru.next;
+@@ -214,6 +311,10 @@ static struct page *balloon_next_page(struct page *page)
+ 	return list_entry(next, struct page, lru);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/xen/balloon.c|637| <<balloon_process>> state = update_schedule(state);
++ */
+ static enum bp_state update_schedule(enum bp_state state)
+ {
+ 	if (state == BP_WAIT)
+@@ -245,6 +346,7 @@ static enum bp_state update_schedule(enum bp_state state)
+ 	return BP_EAGAIN;
+ }
+ 
++/* oracle linux不支持 CONFIG_XEN_BALLOON_MEMORY_HOTPLUG */
+ #ifdef CONFIG_XEN_BALLOON_MEMORY_HOTPLUG
+ static void release_memory_resource(struct resource *resource)
+ {
+@@ -397,12 +499,14 @@ static struct notifier_block xen_memory_nb = {
+ 	.notifier_call = xen_memory_notifier,
+ 	.priority = 0
+ };
++/* oracle linux不支持 CONFIG_XEN_BALLOON_MEMORY_HOTPLUG */
+ #else
+ static enum bp_state reserve_additional_memory(void)
+ {
+ 	balloon_stats.target_pages = balloon_stats.current_pages;
+ 	return BP_ECANCELED;
+ }
++/* oracle linux不支持 CONFIG_XEN_BALLOON_MEMORY_HOTPLUG */
+ #endif /* CONFIG_XEN_BALLOON_MEMORY_HOTPLUG */
+ 
+ static long current_credit(void)
+@@ -415,6 +519,12 @@ static bool balloon_is_inflated(void)
+ 	return balloon_stats.balloon_low || balloon_stats.balloon_high;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/xen/balloon.c|686| <<balloon_process>> state = increase_reservation(credit);
++ *
++ * 这个会把totalram_pages增加nr_pages
++ */
+ static enum bp_state increase_reservation(unsigned long nr_pages)
+ {
+ 	int rc;
+@@ -450,6 +560,13 @@ static enum bp_state increase_reservation(unsigned long nr_pages)
+ 		return BP_EAGAIN;
+ 
+ 	for (i = 0; i < rc; i++) {
++		/*
++		 * 核心思想是从ballooned_pages的头部取出一个page,
++		 * 如果page是PageHighMem(), 减少balloon_stats.balloon_high
++		 * 如果page不是PageHighMem(), 减少balloon_stats.balloon_low
++		 * !!!totalram_pages增加1
++		 * 返回这个page
++		 */
+ 		page = balloon_retrieve(false);
+ 		BUG_ON(page == NULL);
+ 
+@@ -486,6 +603,13 @@ static enum bp_state increase_reservation(unsigned long nr_pages)
+ 	return BP_DONE;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/xen/balloon.c|692| <<balloon_process>> state = decrease_reservation(-credit, GFP_BALLOON);
++ *   - drivers/xen/balloon.c|731| <<add_ballooned_pages>> st = decrease_reservation(nr_pages, GFP_USER);
++ *
++ * 这个会把totalram_pages减少nr_pages
++ */
+ static enum bp_state decrease_reservation(unsigned long nr_pages, gfp_t gfp)
+ {
+ 	enum bp_state state = BP_DONE;
+@@ -552,6 +676,12 @@ static enum bp_state decrease_reservation(unsigned long nr_pages, gfp_t gfp)
+ #endif
+ 		list_del(&page->lru);
+ 
++		/*
++		 * 如果page是PageHighMem(), 插入ballooned_pages尾部, 增加balloon_stats.balloon_high
++		 * 否则插入ballooned_pages头部, 增加balloon_stats.balloon_low
++		 * 最后唤醒balloon_wa
++		 * !!!totalram_pages减少1
++		 */
+ 		balloon_append(page);
+ 	}
+ 
+@@ -573,6 +703,16 @@ static enum bp_state decrease_reservation(unsigned long nr_pages, gfp_t gfp)
+  * by the balloon lock), or with changes to the Xen hard limit, but we will
+  * recover from these in time.
+  */
++/*
++ * called by:
++ *   - drivers/xen/balloon.c|486| <<xen_memory_notifier>> schedule_delayed_work(&balloon_worker, 0);
++ *   - drivers/xen/balloon.c|704| <<balloon_process>> schedule_delayed_work(&balloon_worker, balloon_stats.schedule_delay * HZ);
++ *   - drivers/xen/balloon.c|712| <<balloon_set_new_target>> schedule_delayed_work(&balloon_worker, 0);
++ *   - drivers/xen/balloon.c|833| <<free_xenballooned_pages>> schedule_delayed_work(&balloon_worker, 0);
++ *
++ * used by:
++ *   - drivers/xen/balloon.c|174| <<global>> static DECLARE_DELAYED_WORK(balloon_worker, balloon_process);
++ */
+ static void balloon_process(struct work_struct *work)
+ {
+ 	enum bp_state state = BP_DONE;
+@@ -616,10 +756,19 @@ void balloon_set_new_target(unsigned long target)
+ }
+ EXPORT_SYMBOL_GPL(balloon_set_new_target);
+ 
++/*
++ * called by:
++ *   - drivers/xen/balloon.c|784| <<alloc_xenballooned_pages>> ret = add_ballooned_pages(nr_pages - pgno);
++ */
+ static int add_ballooned_pages(int nr_pages)
+ {
+ 	enum bp_state st;
+ 
++	/*
++	 * 在以下使用:
++	 *   - struct ctl_table balloon_table[0].data = &xen_hotplug_unpopulated
++	 *   - drivers/xen/balloon.c|623| <<add_ballooned_pages>> if (xen_hotplug_unpopulated) 
++	 */
+ 	if (xen_hotplug_unpopulated) {
+ 		st = reserve_additional_memory();
+ 		if (st != BP_ECANCELED) {
+@@ -644,6 +793,13 @@ static int add_ballooned_pages(int nr_pages)
+  * @pages: pages returned
+  * @return 0 on success, error otherwise
+  */
++/*
++ * called by:
++ *   - drivers/xen/grant-table.c|689| <<gnttab_alloc_pages>> ret = alloc_xenballooned_pages(nr_pages, pages);
++ *   - drivers/xen/privcmd.c|404| <<alloc_empty_pages>> rc = alloc_xenballooned_pages(numpgs, pages);
++ *   - drivers/xen/xenbus/xenbus_client.c|645| <<xenbus_map_ring_valloc_hvm>> err = alloc_xenballooned_pages(nr_pages, node->hvm.pages);
++ *   - drivers/xen/xlate_mmu.c|236| <<xen_xlate_map_ballooned_pages>> rc = alloc_xenballooned_pages(nr_pages, pages);
++ */
+ int alloc_xenballooned_pages(int nr_pages, struct page **pages)
+ {
+ 	int pgno = 0;
+@@ -655,6 +811,13 @@ int alloc_xenballooned_pages(int nr_pages, struct page **pages)
+ 	balloon_stats.target_unpopulated += nr_pages;
+ 
+ 	while (pgno < nr_pages) {
++		/*
++		 * 核心思想是从ballooned_pages的头部取出一个page,
++		 * 如果page是PageHighMem(), 减少balloon_stats.balloon_high
++		 * 如果page不是PageHighMem(), 减少balloon_stats.balloon_low
++		 * !!!totalram_pages增加1
++		 * 返回这个page
++		 */
+ 		page = balloon_retrieve(true);
+ 		if (page) {
+ 			pages[pgno++] = page;
+@@ -689,6 +852,15 @@ EXPORT_SYMBOL(alloc_xenballooned_pages);
+  * @nr_pages: Number of pages
+  * @pages: pages to return
+  */
++/*
++ * called by:
++ *   - drivers/xen/balloon.c|783| <<alloc_xenballooned_pages>> free_xenballooned_pages(pgno, pages);
++ *   - drivers/xen/grant-table.c|728| <<gnttab_free_pages>> free_xenballooned_pages(nr_pages, pages);
++ *   - drivers/xen/privcmd.c|594| <<privcmd_close>> free_xenballooned_pages(numpgs, pages);
++ *   - drivers/xen/xenbus/xenbus_client.c|684| <<xenbus_map_ring_valloc_hvm>> free_xenballooned_pages(nr_pages, node->hvm.pages);
++ *   - drivers/xen/xenbus/xenbus_client.c|866| <<xenbus_unmap_ring_vfree_hvm>> free_xenballooned_pages(nr_pages, node->hvm.pages);
++ *   - drivers/xen/xlate_mmu.c|253| <<xen_xlate_map_ballooned_pages>> free_xenballooned_pages(nr_pages, pages);
++ */
+ void free_xenballooned_pages(int nr_pages, struct page **pages)
+ {
+ 	int i;
+@@ -696,6 +868,12 @@ void free_xenballooned_pages(int nr_pages, struct page **pages)
+ 	mutex_lock(&balloon_mutex);
+ 
+ 	for (i = 0; i < nr_pages; i++) {
++		/*
++		 * 如果page是PageHighMem(), 插入ballooned_pages尾部, 增加balloon_stats.balloon_high
++		 * 否则插入ballooned_pages头部, 增加balloon_stats.balloon_low
++		 * 最后唤醒balloon_wa
++		 * !!!totalram_pages减少1
++		 */
+ 		if (pages[i])
+ 			balloon_append(pages[i]);
+ 	}
+@@ -710,6 +888,10 @@ void free_xenballooned_pages(int nr_pages, struct page **pages)
+ }
+ EXPORT_SYMBOL(free_xenballooned_pages);
+ 
++/*
++ * called by:
++ *   - drivers/xen/balloon.c|819| <<balloon_init>> balloon_add_region(xen_extra_mem[i].start_pfn,
++ */
+ static void __init balloon_add_region(unsigned long start_pfn,
+ 				      unsigned long pages)
+ {
+@@ -756,6 +938,7 @@ static int __init balloon_init(void)
+ 	balloon_stats.retry_count = 1;
+ 	balloon_stats.max_retry_count = RETRY_UNLIMITED;
+ 
++/* oracle linux不支持 CONFIG_XEN_BALLOON_MEMORY_HOTPLUG */
+ #ifdef CONFIG_XEN_BALLOON_MEMORY_HOTPLUG
+ 	set_online_page_callback(&xen_online_page);
+ 	register_memory_notifier(&xen_memory_nb);
 diff --git a/drivers/xen/events/events_base.c b/drivers/xen/events/events_base.c
 index 4b0cc9d..27ba32b 100644
 --- a/drivers/xen/events/events_base.c
@@ -4139,6 +4518,49 @@ index 704caae..8aed9cb 100644
  	int (*dma_supported)(struct device *dev, u64 mask);
  	int (*set_dma_mask)(struct device *dev, u64 mask);
  #ifdef ARCH_HAS_DMA_GET_REQUIRED_MASK
+diff --git a/include/xen/balloon.h b/include/xen/balloon.h
+index d1767df..04024d5 100644
+--- a/include/xen/balloon.h
++++ b/include/xen/balloon.h
+@@ -6,8 +6,38 @@
+ 
+ struct balloon_stats {
+ 	/* We aim for 'current allocation' == 'target allocation'. */
++	/*
++	 * 修改current_pages的地方:
++	 *   - drivers/xen/balloon.c|506| <<reserve_additional_memory>> balloon_stats.target_pages = balloon_stats.current_pages;
++	 *   - drivers/xen/balloon.c|601| <<increase_reservation>> balloon_stats.current_pages += rc;
++	 *   - drivers/xen/balloon.c|695| <<decrease_reservation>> balloon_stats.current_pages -= nr_pages;
++	 *   - drivers/xen/balloon.c|928| <<balloon_init>> balloon_stats.current_pages = xen_pv_domain()
++	 * 使用current_pages的地方:
++	 *   - drivers/xen/balloon.c|514| <<current_credit>> return balloon_stats.target_pages - balloon_stats.current_pages;
++	 *   - drivers/xen/balloon.c|931| <<balloon_init>> balloon_stats.target_pages = balloon_stats.current_pages;
++	 *   - drivers/xen/balloon.c|934| <<balloon_init>> balloon_stats.total_pages = balloon_stats.current_pages;
++	 *   - drivers/xen/xen-selfballoon.c|229| <<selfballoon_process>> balloon_stats.current_pages - totalram_pages);
++	 *   - drivers/xen/xen-balloon.c|123| <<global>> BALLOON_SHOW(current_kb, "%lu\n", PAGES2KB(balloon_stats.current_pages));
++	 */
+ 	unsigned long current_pages;
++	/*
++	 * 修改target_pages的地方:
++	 *   - drivers/xen/balloon.c|506| <<reserve_additional_memory>> balloon_stats.target_pages = balloon_stats.current_pages;
++	 *   - drivers/xen/balloon.c|754| <<balloon_set_new_target>> balloon_stats.target_pages = target;
++	 *   - drivers/xen/balloon.c|931| <<balloon_init>> balloon_stats.target_pages = balloon_stats.current_pages;
++	 * 使用target_pages的地方
++	 *   - drivers/xen/balloon.c|409| <<reserve_additional_memory>> credit = balloon_stats.target_pages + balloon_stats.target_unpopulated
++	 *   - drivers/xen/balloon.c|514| <<current_credit>> return balloon_stats.target_pages - balloon_stats.current_pages;
++	 *   - drivers/xen/xen-balloon.c|135| <<show_target_kb>> return sprintf(buf, "%lu\n", PAGES2KB(balloon_stats.target_pages));
++	 *   - drivers/xen/xen-balloon.c|164| <<show_target>> (unsigned long long )balloon_stats.target_pages
++	 */
+ 	unsigned long target_pages;
++	/*
++	 * 修改和使用target_unpopulated的地方:
++	 *   - drivers/xen/balloon.c|811| <<alloc_xenballooned_pages>> balloon_stats.target_unpopulated += nr_pages;
++	 *   - drivers/xen/balloon.c|881| <<free_xenballooned_pages>> balloon_stats.target_unpopulated -= nr_pages;
++	 *   - drivers/xen/balloon.c|409| <<reserve_additional_memory>> credit = balloon_stats.target_pages + balloon_stats.target_unpopulated
++	 */
+ 	unsigned long target_unpopulated;
+ 	/* Number of pages in high- and low-memory balloons. */
+ 	unsigned long balloon_low;
 diff --git a/kernel/irq/chip.c b/kernel/irq/chip.c
 index 9e745cc..6b8bdb8 100644
 --- a/kernel/irq/chip.c
