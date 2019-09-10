@@ -1,0 +1,123 @@
+缺少下面的patch而造成的xen-blkfront hang或者kvm nvme panic的bug.
+
+
+blk-mq: simplify queue mapping & schedule with each possisble CPU
+https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=20e4d813931961fe26d26a1e98b3aba6ec00b130
+
+blk-mq: make sure hctx->next_cpu is set correctly
+https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=7bed45954b95601230ebf387d3e4e20e4a3cc025
+
+blk-mq: make sure that correct hctx->next_cpu is set
+https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=a1c735fb790745f94a359df45c11df4a69760389
+
+
+
+对于2-vcpu (maxvcpus=32) 的VM, q->nr_hw_queues在xen上是2, 在kvm (nvme) 上是32.
+
+map mq_map[]的函数
+xen : blk_mq_map_queues()
+nvme: blk_mq_pci_map_queues()
+
+核心是在blk_mq_map_swqueue().
+
+不管是xen还是nvme, 因为present的cpu只有2个, 所以其他的cpu的ctx->index_hw都是0吧 (line 2171)
+
+但是xen和nvme不同的一点是, xen的nr_hw_queues数量比cpu少,
+所以不会出现hctx->nr_ctx是0的情况. 而nvme的nr_hw_queues等于cpu数量,
+所以有的hctx->nr_ctx是0 (line 2173).
+
+2149         /*
+2150          * Map software to hardware queues.
+2151          *                     
+2152          * If the cpu isn't present, the cpu is mapped to first hctx.
+2153          */
+2154         for_each_present_cpu(i) {
+2155                 hctx_idx = q->mq_map[i];
+2156                 /* unmapped hw queue can be remapped after CPU topo changed */
+2157                 if (!set->tags[hctx_idx] &&
+2158                     !__blk_mq_alloc_rq_map(set, hctx_idx)) {
+2159                         /*
+2160                          * If tags initialization fail for some hctx,
+2161                          * that hctx won't be brought online.  In this
+2162                          * case, remap the current ctx to hctx[0] which
+2163                          * is guaranteed to always have tags allocated
+2164                          */
+2165                         q->mq_map[i] = 0;
+2166                 }
+2167 
+2168                 ctx = per_cpu_ptr(q->queue_ctx, i);
+2169                 hctx = blk_mq_map_queue(q, i);
+2170 
+2171                 cpumask_set_cpu(i, hctx->cpumask);
+2172                 ctx->index_hw = hctx->nr_ctx;
+2173                 hctx->ctxs[hctx->nr_ctx++] = ctx;
+2174         }
+
+下面就能用到上面说的xen和nvme的不同了.
+
+xen : xen的nr_hw_queues数量比cpu少, 所以不会出现hctx->nr_ctx是0的情况, line 2183跳过
+nvme: nvme的nr_hw_queues等于cpu数量, 所以有的hctx->nr_ctx是0, line 2183执行, 结果就是有些hctx的tags被释放了
+
+2178         queue_for_each_hw_ctx(q, hctx, i) {
+2179                 /*
+2180                  * If no software queues are mapped to this hardware queue,
+2181                  * disable it and free the request entries.
+2182                  */
+2183                 if (!hctx->nr_ctx) {
+2184                         /* Never unmap queue 0.  We need it as a
+2185                          * fallback in case of a new remap fails
+2186                          * allocation
+2187                          */
+2188                         if (i && set->tags[i])
+2189                                 blk_mq_free_map_and_requests(set, i);
+2190 
+2191                         hctx->tags = NULL;
+2192                         continue;
+2193                 }
+2194 
+2195                 hctx->tags = set->tags[i];
+2196                 WARN_ON(!hctx->tags);
+2197 
+2198                 /*
+2199                  * Set the map size to the number of mapped software queues.
+2200                  * This is more accurate and more efficient than looping
+2201                  * over all possibly mapped software queues.
+2202                  */
+2203                 sbitmap_resize(&hctx->ctx_map, hctx->nr_ctx);
+2204 
+2205                 /*
+2206                  * Initialize batch roundrobin counts
+2207                  */
+2208                 hctx->next_cpu = cpumask_first(hctx->cpumask);
+2209                 hctx->next_cpu_batch = BLK_MQ_CPU_WORK_BATCH;
+2210         }
+
+
+以下是xen hang的情况
+
+blk_mq_make_request()
+ -> 在获取hctx和ctx, 因为用的q->mq_map[cpu], 所以结果是正确的
+ -> blk_mq_queue_io(data.hctx, data.ctx, rq);
+     -> __blk_mq_insert_request()
+         -> __blk_mq_insert_req_list(hctx, rq, at_head); --> 把request插入ctx->rq_list
+         -> blk_mq_hctx_mark_pending(hctx, ctx);
+             -> 尽管hctx和ctx的mapping是正确的, 但是因为ctx->index_hw (没有设置为ctx->index_hw, line 2172-2173)
+                所以sbitmap_test_bit(&hctx->ctx_map, ctx->index_hw)设置的是错误的
+
+稍后下面想把request从ctx->rq_list下发的时候, 因为hctx->ctx_map没设置正确, request就不会下发.
+所以I/O hang了.
+
+blk_mq_sched_dispatch_requests()
+ -> blk_mq_flush_busy_ctxs()
+     -> sbitmap_for_each_set(&hctx->ctx_map, flush_busy_ctx, &data);
+
+
+
+以下是nvme panic的情况
+
+blk_mq_make_request()
+ -> blk_mq_get_request()
+     -> blk_mq_map_queue(q, data->ctx->cpu) --> map到的hctx->tags是NULL
+     -> blk_mq_get_tag()
+         -> blk_mq_tags_from_data() --> 返回data->hctx->tags
+         -> 访问tags->nr_reserved_tags的时候panic, 因为hctx->tags是NULL!!!!!!!
