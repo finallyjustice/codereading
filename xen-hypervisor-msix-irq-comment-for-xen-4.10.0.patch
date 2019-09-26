@@ -1,6 +1,6 @@
-From 3e8c2faba305f32d6ad7dac66ad9b026ddbece69 Mon Sep 17 00:00:00 2001
+From 52d963234d0870df6a690812abd90826d0ee4818 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Wed, 25 Sep 2019 16:24:43 +0800
+Date: Fri, 27 Sep 2019 05:34:31 +0800
 Subject: [PATCH 1/1] xen hypervisor msix irq comment for xen-4.10.0
 
 xen-4.10.0
@@ -15,6 +15,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  tools/qemu-xen-traditional/xenstore.c        |   9 ++
  tools/qemu-xen/hw/i386/xen/xen-hvm.c         |  49 +++++++
  tools/qemu-xen/hw/xen/xen_pt_msi.c           |  29 ++++
+ xen/arch/x86/domain_page.c                   |  88 ++++++++++++
  xen/arch/x86/hvm/emulate.c                   |  45 +++++++
  xen/arch/x86/hvm/hvm.c                       |   6 +
  xen/arch/x86/hvm/intercept.c                 |  34 +++++
@@ -45,11 +46,12 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  xen/include/asm-x86/hvm/vmx/vmcs.h           |  23 ++++
  xen/include/asm-x86/hvm/vmx/vmx.h            |   6 +
  xen/include/asm-x86/mach-generic/mach_apic.h |   5 +
+ xen/include/asm-x86/page.h                   |   8 ++
  xen/include/public/arch-x86/hvm/save.h       |  14 ++
  xen/include/public/arch-x86/xen.h            |   8 ++
  xen/include/xen/event.h                      |   8 ++
  xen/include/xen/pci.h                        |   5 +
- 42 files changed, 1196 insertions(+)
+ 44 files changed, 1292 insertions(+)
 
 diff --git a/tools/libxl/libxl_pci.c b/tools/libxl/libxl_pci.c
 index 88a55ce..c259730 100644
@@ -341,6 +343,166 @@ index 6d1e3bd..ed7ab12 100644
  static void pci_msix_write(void *opaque, hwaddr addr,
                             uint64_t val, unsigned size)
  {
+diff --git a/xen/arch/x86/domain_page.c b/xen/arch/x86/domain_page.c
+index 3432a85..e4a4710 100644
+--- a/xen/arch/x86/domain_page.c
++++ b/xen/arch/x86/domain_page.c
+@@ -57,11 +57,21 @@ static inline struct vcpu *mapcache_current_vcpu(void)
+     return v;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/pv/dom0_build.c|704| <<dom0_construct_pv>> mapcache_override_current(v);
++ *   - arch/x86/pv/dom0_build.c|723| <<dom0_construct_pv>> mapcache_override_current(NULL);
++ *   - arch/x86/pv/dom0_build.c|844| <<dom0_construct_pv>> mapcache_override_current(NULL);
++ */
+ void __init mapcache_override_current(struct vcpu *v)
+ {
+     this_cpu(override) = v;
+ }
+ 
++/*
++ * 只在下面的MAPCACHE_L2_ENTRIES()使用
++ *   - arch/x86/domain_page.c|66| <<MAPCACHE_L2_ENTRIES>> #define MAPCACHE_L2_ENTRIES (mapcache_l2_entry(MAPCACHE_ENTRIES - 1) + 1)
++ */
+ #define mapcache_l2_entry(e) ((e) >> PAGETABLE_ORDER)
+ #define MAPCACHE_L2_ENTRIES (mapcache_l2_entry(MAPCACHE_ENTRIES - 1) + 1)
+ #define MAPCACHE_L1ENT(idx) \
+@@ -85,7 +95,30 @@ void *map_domain_page(mfn_t mfn)
+     if ( !v || !is_pv_vcpu(v) )
+         return mfn_to_virt(mfn_x(mfn));
+ 
++    /*
++     * struct vcpu
++     *  -> struct domain *domain;
++     *      -> struct arch_domain arch;
++     *          -> union
++     *              -> struct pv_domain pv_domain;
++     *                  -> struct mapcache_domain mapcache;
++     *              -> struct hvm_domain hvm_domain;
++     */
+     dcache = &v->domain->arch.pv_domain.mapcache;
++    /*
++     * struct vcpu
++     *  -> struct arch_vcpu arch;
++     *      -> union
++     *          -> struct pv_vcpu pv_vcpu;
++     *              -> struct mapcache_vcpu mapcache;
++     *                      48     //Lock-free per-VCPU hash of recently-used mappings.
++     *                      49     struct vcpu_maphash_entry {
++     *                      50         unsigned long mfn;
++     *                      51         uint32_t      idx;
++     *                      52         uint32_t      refcnt;
++     *                      53     } hash[MAPHASH_ENTRIES];
++     *          -> struct hvm_vcpu hvm_vcpu;
++     */
+     vcache = &v->arch.pv_vcpu.mapcache;
+     if ( !dcache->inuse )
+         return mfn_to_virt(mfn_x(mfn));
+@@ -186,18 +219,43 @@ void unmap_domain_page(const void *ptr)
+ 
+     ASSERT(va >= MAPCACHE_VIRT_START && va < MAPCACHE_VIRT_END);
+ 
++    /* 返回的v是struct vcpu */
+     v = mapcache_current_vcpu();
+     ASSERT(v && is_pv_vcpu(v));
+ 
++    /*
++     * struct vcpu
++     *  -> struct domain *domain;
++     *      -> struct arch_domain arch;
++     *          -> union
++     *              -> struct pv_domain pv_domain;
++     *                  -> struct mapcache_domain mapcache;
++     *              -> struct hvm_domain hvm_domain;
++     */
+     dcache = &v->domain->arch.pv_domain.mapcache;
+     ASSERT(dcache->inuse);
+ 
+     idx = PFN_DOWN(va - MAPCACHE_VIRT_START);
+     mfn = l1e_get_pfn(MAPCACHE_L1ENT(idx));
++    /*
++     * struct vcpu
++     *  -> struct arch_vcpu arch;
++     *      -> union
++     *          -> struct pv_vcpu pv_vcpu;
++     *              -> struct mapcache_vcpu mapcache;
++     *                      48     //Lock-free per-VCPU hash of recently-used mappings.
++     *                      49     struct vcpu_maphash_entry {
++     *                      50         unsigned long mfn;
++     *                      51         uint32_t      idx;
++     *                      52         uint32_t      refcnt;
++     *                      53     } hash[MAPHASH_ENTRIES];
++     *          -> struct hvm_vcpu hvm_vcpu;
++     */
+     hashent = &v->arch.pv_vcpu.mapcache.hash[MAPHASH_HASHFN(mfn)];
+ 
+     local_irq_save(flags);
+ 
++    /* 如果在cpu的hash里找到了 */
+     if ( hashent->idx == idx )
+     {
+         ASSERT(hashent->mfn == mfn);
+@@ -231,8 +289,20 @@ void unmap_domain_page(const void *ptr)
+     local_irq_restore(flags);
+ }
+ 
++/*
++ * called by only:
++ *   - arch/x86/domain.c|476| <<arch_domain_create>> mapcache_domain_init(d);
++ */
+ int mapcache_domain_init(struct domain *d)
+ {
++    /*
++     * struct domain *domain;
++     *  -> struct arch_domain arch;
++     *      -> union
++     *          -> struct pv_domain pv_domain;
++     *              -> struct mapcache_domain mapcache;
++     *          -> struct hvm_domain hvm_domain;
++     */
+     struct mapcache_domain *dcache = &d->arch.pv_domain.mapcache;
+     unsigned int bitmap_pages;
+ 
+@@ -259,6 +329,10 @@ int mapcache_domain_init(struct domain *d)
+                                     NIL(l1_pgentry_t *), NULL);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/domain.c|327| <<vcpu_initialise>> rc = mapcache_vcpu_init(v);
++ */
+ int mapcache_vcpu_init(struct vcpu *v)
+ {
+     struct domain *d = v->domain;
+@@ -331,6 +405,17 @@ void unmap_domain_page_global(const void *ptr)
+ }
+ 
+ /* Translate a map-domain-page'd address to the underlying MFN */
++/*
++ * called by:
++ *   - arch/x86/cpu/vpmu.c|677| <<pvpmu_finish>> mfn = domain_page_map_to_mfn(xenpmu_data);
++ *   - arch/x86/hvm/hvm.c|2642| <<hvm_unmap_guest_frame>> mfn = domain_page_map_to_mfn(p);
++ *   - arch/x86/hvm/viridian.c|430| <<teardown_vp_assist>> page = mfn_to_page(domain_page_map_to_mfn(va));
++ *   - arch/x86/hvm/vmx/vvmx.c|1732| <<nvmx_handle_vmptrld>> pfn_to_paddr(domain_page_map_to_mfn(vvmcx));
++ *   - arch/x86/hvm/vmx/vvmx.c|1818| <<nvmx_handle_vmclear>> domain_page_map_to_mfn(vvmcs));
++ *   - common/event_fifo.c|392| <<unmap_guest_page>> page = mfn_to_page(domain_page_map_to_mfn(virt))
++ * 
++ * Given a VA from map_domain_page(), return its underlying MFN.
++ */
+ unsigned long domain_page_map_to_mfn(const void *ptr)
+ {
+     unsigned long va = (unsigned long)ptr;
+@@ -350,5 +435,8 @@ unsigned long domain_page_map_to_mfn(const void *ptr)
+         pl1e = &__linear_l1_table[l1_linear_offset(va)];
+     }
+ 
++    /*
++     * Get pfn mapped by pte (unsigned long).
++     */
+     return l1e_get_pfn(*pl1e);
+ }
 diff --git a/xen/arch/x86/hvm/emulate.c b/xen/arch/x86/hvm/emulate.c
 index f88a011..873858a 100644
 --- a/xen/arch/x86/hvm/emulate.c
@@ -2585,6 +2747,25 @@ index 03e9e8a..c7ba8f5 100644
  #define vector_allocation_cpumask(cpu) (genapic->vector_allocation_cpumask(cpu))
  
  static inline void enable_apic_mode(void)
+diff --git a/xen/include/asm-x86/page.h b/xen/include/asm-x86/page.h
+index 45ca742..bc07ac8 100644
+--- a/xen/include/asm-x86/page.h
++++ b/xen/include/asm-x86/page.h
+@@ -279,6 +279,14 @@ void copy_page_sse2(void *, const void *);
+ #endif /* !defined(__ASSEMBLY__) */
+ 
+ /* Where to find each level of the linear mapping */
++/*
++ * 使用__linear_l1_table的地方:
++ *   - arch/x86/domain_page.c|68| <<MAPCACHE_L1ENT>> __linear_l1_table[l1_linear_offset(MAPCACHE_VIRT_START + pfn_to_paddr(idx))]
++ *   - arch/x86/domain_page.c|394| <<domain_page_map_to_mfn>> pl1e = &__linear_l1_table[l1_linear_offset(va)];
++ *   - arch/x86/mm/shadow/types.h|174| <<sh_linear_l2_table>> (is_hvm_vcpu(v) ? __linear_l1_table : __sh_linear_l1_table) + \
++ *   - arch/x86/pv/mm.h|18| <<guest_get_eff_l1e>> &__linear_l1_table[l1_linear_offset(linear)],
++ *   - include/asm-x86/page.h|284| <<__linear_l2_table>> ((l2_pgentry_t *)(__linear_l1_table + l1_linear_offset(LINEAR_PT_VIRT_START)))
++ */
+ #define __linear_l1_table ((l1_pgentry_t *)(LINEAR_PT_VIRT_START))
+ #define __linear_l2_table \
+  ((l2_pgentry_t *)(__linear_l1_table + l1_linear_offset(LINEAR_PT_VIRT_START)))
 diff --git a/xen/include/public/arch-x86/hvm/save.h b/xen/include/public/arch-x86/hvm/save.h
 index fd7bf3f..44b0739 100644
 --- a/xen/include/public/arch-x86/hvm/save.h
