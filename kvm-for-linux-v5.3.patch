@@ -1,0 +1,4202 @@
+From 9d57bbb1246801f5062f307ce01bef592fec9872 Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Sun, 6 Oct 2019 03:30:49 +0800
+Subject: [PATCH 1/1] kvm for linux v5.3
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ arch/x86/include/asm/kvm_host.h |  179 ++++
+ arch/x86/kernel/apic/apic.c     |    3 +
+ arch/x86/kernel/kvmclock.c      |   70 ++
+ arch/x86/kvm/lapic.c            |   14 +
+ arch/x86/kvm/mmu.c              | 1747 +++++++++++++++++++++++++++++++++++++++
+ arch/x86/kvm/vmx/ops.h          |    4 +
+ arch/x86/kvm/vmx/vmenter.S      |   11 +
+ arch/x86/kvm/vmx/vmx.c          |   45 +
+ arch/x86/kvm/x86.c              |   40 +
+ drivers/vhost/vhost.c           |   13 +
+ drivers/vhost/vsock.c           |   36 +
+ include/linux/kvm_host.h        |  102 +++
+ virt/kvm/kvm_main.c             |   85 ++
+ 13 files changed, 2349 insertions(+)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index bdc16b0..28c5acea5 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -109,14 +109,55 @@ enum {
+ 	/* set max level to the biggest one */
+ 	PT_MAX_HUGEPAGE_LEVEL = PT_PDPE_LEVEL,
+ };
++/* 3 - 1 + 1 = 3 */
+ #define KVM_NR_PAGE_SIZES	(PT_MAX_HUGEPAGE_LEVEL - \
+ 				 PT_PAGE_TABLE_LEVEL + 1)
++/*
++ * x = 1: KVM_HPAGE_GFN_SHIFT(1) = 0   none
++ * x = 2: KVM_HPAGE_GFN_SHIFT(2) = 9   2M
++ * x = 3: KVM_HPAGE_GFN_SHIFT(3) = 18  1G
++ */
+ #define KVM_HPAGE_GFN_SHIFT(x)	(((x) - 1) * 9)
++/*
++ * KVM_HPAGE_SHIFT(1) = 12 +  0 = 12
++ * KVM_HPAGE_SHIFT(2) = 12 +  9 = 21
++ * KVM_HPAGE_SHIFT(3) = 12 + 18 = 30
++ */
+ #define KVM_HPAGE_SHIFT(x)	(PAGE_SHIFT + KVM_HPAGE_GFN_SHIFT(x))
++/*
++ * KVM_HPAGE_SIZE(1) = 1 << 12 = 4K
++ * KVM_HPAGE_SIZE(2) = 1 << 21 = 2M
++ * KVM_HPAGE_SIZE(3) = 1 << 30 = 1G
++ */
+ #define KVM_HPAGE_SIZE(x)	(1UL << KVM_HPAGE_SHIFT(x))
++/*
++ * KVM_HPAGE_MASK(1) : mask了4K
++ * KVM_HPAGE_MASK(2) : mask了2M
++ * KVM_HPAGE_MASK(3) : mask了1G
++ */
+ #define KVM_HPAGE_MASK(x)	(~(KVM_HPAGE_SIZE(x) - 1))
++/*
++ * KVM_PAGES_PER_HPAGE(1) : 4K有多少4K的page
++ * KVM_PAGES_PER_HPAGE(2) : 2M有多少4K的page
++ * KVM_PAGES_PER_HPAGE(3) : 1G有多少4K的page
++ */
+ #define KVM_PAGES_PER_HPAGE(x)	(KVM_HPAGE_SIZE(x) / PAGE_SIZE)
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|1142| <<lpage_info_slot>> idx = gfn_to_index(gfn, slot->base_gfn, level);
++ *   - arch/x86/kvm/mmu.c|1411| <<__gfn_to_rmap>> idx = gfn_to_index(gfn, slot->base_gfn, level);
++ *   - arch/x86/kvm/page_track.c|68| <<update_gfn_track>> index = gfn_to_index(gfn, slot->base_gfn, PT_PAGE_TABLE_LEVEL);
++ *   - arch/x86/kvm/page_track.c|158| <<kvm_page_track_is_active>> index = gfn_to_index(gfn, slot->base_gfn, PT_PAGE_TABLE_LEVEL);
++ *   - arch/x86/kvm/x86.c|9510| <<kvm_arch_create_memslot>> lpages = gfn_to_index(slot->base_gfn + npages - 1,
++ *
++ * base_gfn是基于4k开始的gfn
++ * gfn是基于4k结束的gfn
++ * 计算从开始到结束需要用到几个hugepage (或者普通page)
++ *   level是1的时候hugepage大小是4K
++ *   level是2的时候hugepage大小是2M
++ *   level是3的时候hugepage大小是1G
++ */
+ static inline gfn_t gfn_to_index(gfn_t gfn, gfn_t base_gfn, int level)
+ {
+ 	/* KVM_HPAGE_GFN_SHIFT(PT_PAGE_TABLE_LEVEL) must be 0. */
+@@ -258,9 +299,23 @@ struct kvm_mmu_memory_cache {
+ union kvm_mmu_page_role {
+ 	u32 word;
+ 	struct {
++		/*
++		 * The level in the shadow paging hierarchy that this shadow page belongs to.
++		 * 1=4k sptes, 2=2M sptes, 3=1G sptes, etc.
++		 */
+ 		unsigned level:4;
+ 		unsigned gpte_is_8_bytes:1;
+ 		unsigned quadrant:2;
++		/*
++		 * If set, leaf sptes reachable from this page are for a linear range.
++		 * Examples include real mode translation, large guest pages backed by small
++		 * host pages, and gpa->hpa translations when NPT or EPT is active.
++		 * The linear range starts at (gfn << PAGE_SHIFT) and its size is determined
++		 * by role.level (2MB for first level, 1GB for second level, 0.5TB for third
++		 * level, 256TB for fourth level)
++		 * If clear, this page corresponds to a guest page table denoted by the gfn
++		 * field.
++		 */
+ 		unsigned direct:1;
+ 		unsigned access:3;
+ 		unsigned invalid:1;
+@@ -268,6 +323,11 @@ union kvm_mmu_page_role {
+ 		unsigned cr0_wp:1;
+ 		unsigned smep_andnot_wp:1;
+ 		unsigned smap_andnot_wp:1;
++		/*
++		 * Is 1 if the MMU instance cannot use A/D bits.  EPT did not have A/D
++		 * bits before Haswell; shadow EPT page tables also cannot use A/D bits
++		 * if the L1 hypervisor does not enable them.
++		 */
+ 		unsigned ad_disabled:1;
+ 		unsigned guest_mode:1;
+ 		unsigned :6;
+@@ -313,13 +373,28 @@ union kvm_mmu_role {
+ };
+ 
+ struct kvm_rmap_head {
++	/*
++	 * 注释:
++	 *
++	 * If the bit zero of rmap_head->val is clear, then it points to the only spte
++	 * in this rmap chain. Otherwise, (rmap_head->val & ~1) points to a struct
++	 * pte_list_desc containing more mappings.
++	 */
+ 	unsigned long val;
+ };
+ 
++/*
++ * 每个页表页(MMU page)对应一个数据结构kvm_mmu_page
++ */
+ struct kvm_mmu_page {
+ 	struct list_head link;
+ 	struct hlist_node hash_link;
+ 	bool unsync;
++	/*
++	 * 在以下使用mmio_cached:
++	 *   - arch/x86/kvm/mmu.c|952| <<mark_mmio_spte>> page_header(__pa(sptep))->mmio_cached = true;
++	 *   - arch/x86/kvm/mmu.c|6916| <<__kvm_mmu_zap_all>> if (mmio_only && !sp->mmio_cached)
++	 */
+ 	bool mmio_cached;
+ 
+ 	/*
+@@ -329,12 +404,39 @@ struct kvm_mmu_page {
+ 	union kvm_mmu_page_role role;
+ 	gfn_t gfn;
+ 
++	/*
++	 * 在kvm_mmu_alloc_page()分配的真正的页表的4K page
++	 */
+ 	u64 *spt;
+ 	/* hold the gfn of each spte inside spt */
++	/*
++	 * 似乎tdp不用, shadow才用
++	 */
+ 	gfn_t *gfns;
+ 	int root_count;          /* Currently serving as active root */
+ 	unsigned int unsync_children;
+ 	struct kvm_rmap_head parent_ptes; /* rmap pointers to parent sptes */
++	/*
++	 * Zapping all pages (page generation count)
++	 *
++	 * For the large memory guests, walking and zapping all pages is really slow
++	 * (because there are a lot of pages), and also blocks memory accesses of
++	 * all VCPUs because it needs to hold the MMU lock.
++	 *
++	 * To make it be more scalable, kvm maintains a global generation number
++	 * which is stored in kvm->arch.mmu_valid_gen.  Every shadow page stores
++	 * the current global generation-number into sp->mmu_valid_gen when it
++	 * is created.  Pages with a mismatching generation number are "obsolete".
++	 *
++	 * When KVM need zap all shadow pages sptes, it just simply increases the global
++	 * generation-number then reload root shadow pages on all vcpus.  As the VCPUs
++	 * create new shadow page tables, the old pages are not used because of the
++	 * mismatching generation number.
++	 *
++	 * KVM then walks through all pages and zaps obsolete pages.  While the zap
++	 * operation needs to take the MMU lock, the lock can be released periodically
++	 * so that the VCPUs can make progress.
++	 */
+ 	unsigned long mmu_valid_gen;
+ 	DECLARE_BITMAP(unsync_child_bitmap, 512);
+ 
+@@ -347,6 +449,12 @@ struct kvm_mmu_page {
+ #endif
+ 
+ 	/* Number of writes since the last time traversal visited this page.  */
++	/*
++	 * 修改和使用write_flooding_count的地方:
++	 *   - arch/x86/kvm/mmu.c|3559| <<__clear_sp_write_flooding_count>> atomic_set(&sp->write_flooding_count, 0);
++	 *   - arch/x86/kvm/mmu.c|6392| <<detect_write_flooding>> atomic_inc(&sp->write_flooding_count);
++	 *   - arch/x86/kvm/mmu.c|6393| <<detect_write_flooding>> return atomic_read(&sp->write_flooding_count) >= 3;
++	 */
+ 	atomic_t write_flooding_count;
+ };
+ 
+@@ -792,12 +900,39 @@ struct kvm_vcpu_arch {
+ };
+ 
+ struct kvm_lpage_info {
++	/*
++	 * 在以下修改disallow_lpage:
++	 *   - arch/x86/kvm/mmu.c|1154| <<update_gfn_disallow_lpage_count>> linfo->disallow_lpage += count;
++	 *   - arch/x86/kvm/x86.c|9528| <<kvm_arch_create_memslot>> linfo[0].disallow_lpage = 1;
++	 *   - arch/x86/kvm/x86.c|9530| <<kvm_arch_create_memslot>> linfo[lpages - 1].disallow_lpage = 1;
++	 *   - arch/x86/kvm/x86.c|9542| <<kvm_arch_create_memslot>> linfo[j].disallow_lpage = 1;
++	 *
++	 * 在以下使用disallow_lpage:
++	 *   - arch/x86/kvm/mmu.c|2112| <<update_gfn_disallow_lpage_count>> WARN_ON(linfo->disallow_lpage < 0);
++	 *   - arch/x86/kvm/mmu.c|2177| <<__mmu_gfn_lpage_is_disallowed>> return !!linfo->disallow_lpage;
++	 */
+ 	int disallow_lpage;
+ };
+ 
+ struct kvm_arch_memory_slot {
++	/*
++	 * About rmap_head encoding:
++	 *
++	 * If the bit zero of rmap_head->val is clear, then it points to the only spte
++	 * in this rmap chain. Otherwise, (rmap_head->val & ~1) points to a struct
++	 * pte_list_desc containing more mappings.
++	 *
++	 * rmap和lpage_info的第二维都是在kvm_arch_create_memslot()分配
++	 * 数量是对应level的page的数量
++	 * level越大(大页)数量越少
++	 *
++	 * KVM_NR_PAGE_SIZES = 3 !!!!!
++	 */
+ 	struct kvm_rmap_head *rmap[KVM_NR_PAGE_SIZES];
+ 	struct kvm_lpage_info *lpage_info[KVM_NR_PAGE_SIZES - 1];
++	/*
++	 * 应该是每个slot中page的数量吧
++	 */
+ 	unsigned short *gfn_track[KVM_PAGE_TRACK_MAX];
+ };
+ 
+@@ -857,7 +992,31 @@ struct kvm_arch {
+ 	unsigned long n_requested_mmu_pages;
+ 	unsigned long n_max_mmu_pages;
+ 	unsigned int indirect_shadow_pages;
++	/*
++	 * Zapping all pages (page generation count)
++	 *
++	 * For the large memory guests, walking and zapping all pages is really slow
++	 * (because there are a lot of pages), and also blocks memory accesses of
++	 * all VCPUs because it needs to hold the MMU lock.
++	 *
++	 * To make it be more scalable, kvm maintains a global generation number
++	 * which is stored in kvm->arch.mmu_valid_gen.  Every shadow page stores
++	 * the current global generation-number into sp->mmu_valid_gen when it
++	 * is created.  Pages with a mismatching generation number are "obsolete".
++	 *
++	 * When KVM need zap all shadow pages sptes, it just simply increases the global
++	 * generation-number then reload root shadow pages on all vcpus.  As the VCPUs
++	 * create new shadow page tables, the old pages are not used because of the
++	 * mismatching generation number.
++	 *
++	 * KVM then walks through all pages and zaps obsolete pages.  While the zap
++	 * operation needs to take the MMU lock, the lock can be released periodically
++	 * so that the VCPUs can make progress.
++	 */
+ 	unsigned long mmu_valid_gen;
++	/*
++	 * 通过hash可以快速获得一个gfn对应的也表页面
++	 */
+ 	struct hlist_head mmu_page_hash[KVM_NUM_MMU_PAGES];
+ 	/*
+ 	 * Hash table of struct kvm_mmu_page.
+@@ -972,6 +1131,10 @@ struct kvm_vcpu_stat {
+ 	u64 halt_poll_invalid;
+ 	u64 halt_wakeup;
+ 	u64 request_irq_exits;
++	/*
++	 * 在以下增加irq_exits:
++	 *   - arch/x86/kvm/vmx/vmx.c|4589| <<handle_external_interrupt>> ++vcpu->stat.irq_exits;
++	 */
+ 	u64 irq_exits;
+ 	u64 host_state_reload;
+ 	u64 fpu_reload;
+@@ -1002,6 +1165,10 @@ struct kvm_lapic_irq {
+ 	bool msi_redir_hint;
+ };
+ 
++/*
++ * intel : vmx_x86_ops
++ * amd   : svm_x86_ops
++ */
+ struct kvm_x86_ops {
+ 	int (*cpu_has_kvm_support)(void);          /* __init */
+ 	int (*disabled_by_bios)(void);             /* __init */
+@@ -1226,6 +1393,10 @@ extern struct kmem_cache *x86_fpu_cache;
+ #define __KVM_HAVE_ARCH_VM_ALLOC
+ static inline struct kvm *kvm_arch_alloc_vm(void)
+ {
++	/*
++	 * intel: vmx_vm_alloc()
++	 * amd  : svm_vm_alloc()
++	 */
+ 	return kvm_x86_ops->vm_alloc();
+ }
+ 
+@@ -1434,8 +1605,16 @@ static inline gpa_t translate_gpa(struct kvm_vcpu *vcpu, gpa_t gpa, u32 access,
+ 	return gpa;
+ }
+ 
++/*
++ * shadow_page可能是一个指向某个pte的地址 (shadow_page保存的这个pte的地址而不是内容)
++ * 获得包含这个地址的页表页对应的kvm_mmu_page
++ */
+ static inline struct kvm_mmu_page *page_header(hpa_t shadow_page)
+ {
++	/*
++	 * shadow_page可能是一个指向某个pte的地址 (shadow_page保存的这个pte的地址而不是内容)
++	 * shadow_page向右移动PAGE_SHIFT是这个pte所在的页表页的基地址的pfn
++	 */
+ 	struct page *page = pfn_to_page(shadow_page >> PAGE_SHIFT);
+ 
+ 	return (struct kvm_mmu_page *)page_private(page);
+diff --git a/arch/x86/kernel/apic/apic.c b/arch/x86/kernel/apic/apic.c
+index 08fb79f..92f27c7 100644
+--- a/arch/x86/kernel/apic/apic.c
++++ b/arch/x86/kernel/apic/apic.c
+@@ -1118,6 +1118,9 @@ static void local_apic_timer_interrupt(void)
+  * [ if a single-CPU system runs an SMP kernel then we call the local
+  *   interrupt as well. Thus we cannot inline the local irq ... ]
+  */
++/*
++ *  arch/x86/entry/entry_64.S: 用作LOCAL_TIMER_VECTOR (0xec)的处理函数
++ */
+ __visible void __irq_entry smp_apic_timer_interrupt(struct pt_regs *regs)
+ {
+ 	struct pt_regs *old_regs = set_irq_regs(regs);
+diff --git a/arch/x86/kernel/kvmclock.c b/arch/x86/kernel/kvmclock.c
+index 904494b..1be440e 100644
+--- a/arch/x86/kernel/kvmclock.c
++++ b/arch/x86/kernel/kvmclock.c
+@@ -23,6 +23,76 @@
+ #include <asm/reboot.h>
+ #include <asm/kvmclock.h>
+ 
++/*
++ * FROM SUSE!!!
++ * When using kvm-clock, it is not recommended to use NTP in the VM Guest, as
++ * well. Using NTP on the VM Host Server, however, is still recommended.
++ */
++
++/*
++ * Clocksource is a device that can give a timestamp whenever you need it. In
++ * other words, Clocksource is any ticking counter that allows you to get its
++ * value.
++ *
++ * Clockevent device is an alarm clock—you ask the device to signal a time in
++ * the future (e.g., "wake me up in 1ms") and when the alarm is triggered, you
++ * get the signal.
++ *
++ * sched_clock() function is similar to clocksource, but this particular one
++ * should be "cheap" to read (meaning that one can get its value fast), as
++ * sched_clock() is used for task-scheduling purposes and scheduling happens
++ * often. We're ready to sacrifice accuracy and other characteristics for
++ * speed.
++ *
++ * > CLOCK_REALTIME clock gives the time passed since January 1, 1970. This
++ *   clock is affected by NTP adjustments and can jump forward and backward when
++ *   a system administrator adjusts system time.
++ *
++ * > CLOCK_MONOTONIC clock gives the time since a fixed starting point-usually
++ *   since you booted the system. This clock is affected by NTP, but it can't
++ *   jump backward.
++ *
++ * > CLOCK_MONOTONIC_RAW clock gives the same time as CLOCK_MONOTONIC, but this
++ *   clock is not affected by NTP adjustments.
++ *
++ * > CLOCK_REALTIME_COARSE and CLOCK_MONOTONIC_COARSE are faster but
++ *   less-accurate variants of CLOCK_REALTIME and CLOCK_MONOTONIC.
++ *
++ *
++ *
++ * Hardware extensions for virtualizing TSC
++ *
++ * Since the early days of hardware-assisted virtualization, Intel was
++ * supplying an option to do TSC offsetting for virtual guests in hardware,
++ * which would mean that a guest's rdtsc reading will return a host's TSC value
++ * + offset. Unfortunately, this wasn't enough to support migration between
++ * different hosts because TSC frequency may differ, so pvclock and TSC page
++ * protocol were introduced. In late 2015, Intel introduced the TSC scaling
++ * feature (which was already present in AMD processors for several years) and,
++ * in theory, this is a game changer making pvclock and TSC page protocols
++ * redundant. However, an immediate switch to using plain TSC as a clocksource
++ * for virtualized guests seems impractical; one must be sure that all
++ * potential migration recipient hosts support the feature, but it is not yet
++ * widely available. Extensive testing also must be performed to make sure
++ * there are no drawbacks to switching from paravirtualized protocols.
++ */
++
++/*
++ * To get the current TSC reading, guests must do the following math:
++ *
++ * PerCPUTime = ((RDTSC() - tsc_timestamp) >> tsc_shift) * tsc_to_system_mul + system_time 
++ *
++ *
++ *
++ * kvmclock or KVM pvclock lets guests read the host's wall clock time. It's
++ * really very simple: the guest sets aside a page of its RAM and asks the host
++ * to write time into that page (using an MSR). The host writes a structure
++ * containing the current time to this page - in theory the host updates this
++ * page constantly, but in reality that would be wasteful and the structure is
++ * only updated just before reentering the guest after some VM event.
++ * host更新clock的时间的函数在kvm_guest_time_update(), 只被vcpu_enter_guest()调用
++ */
++
+ static int kvmclock __initdata = 1;
+ static int kvmclock_vsyscall __initdata = 1;
+ static int msr_kvm_system_time __ro_after_init = MSR_KVM_SYSTEM_TIME;
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index e904ff0..cafc1d2 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -2278,6 +2278,20 @@ static enum hrtimer_restart apic_timer_fn(struct hrtimer *data)
+ 		return HRTIMER_NORESTART;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|9241| <<kvm_arch_vcpu_init>> r = kvm_create_lapic(vcpu, lapic_timer_advance_ns);
++ *
++ * QEMU和KVM都实现了对中断芯片的模拟,这是由于历史原因造成的.早在KVM诞生之前,
++ * QEMU就提供了一整套对设备的模拟,包括中断芯片.而KVM诞生之后,为了进一步提高
++ * 中断性能,因此又在KVM中实现了一套中断芯片.我们可以通过QEMU的启动参数
++ * kernel-irqchip来决定使用谁的中断芯片(irq chip)/
++ *   on: KVM模拟全部
++ *   split: QEMU模拟IOAPIC和PIC,KVM模拟LAPIC
++ *   off: QEMU模拟全部
++ *
++ * 分配并且初始化vcpu的apic (在内核中模拟)
++ */
+ int kvm_create_lapic(struct kvm_vcpu *vcpu, int timer_advance_ns)
+ {
+ 	struct kvm_lapic *apic;
+diff --git a/arch/x86/kvm/mmu.c b/arch/x86/kvm/mmu.c
+index a63964e..a8c4ce1 100644
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@ -48,15 +48,41 @@
+ #include "trace.h"
+ 
+ /*
++ * 当QEMU通过ioctl创建vcpu时,调用kvm_mmu_create初始化mmu相关信息,
++ * 为页表项结构分配slab cache.
++ *
++ * 当KVM要进入Guest前,vcpu_enter_guest => kvm_mmu_reload会将根级
++ * 页表地址加载到VMCS,让Guest使用该页表.
++ *
++ * 当EPT Violation发生时,VMEXIT到KVM中.如果是缺页,则拿到对应的GPA,
++ * 根据GPA算出gfn,根据gfn找到对应的memory slot,得到对应的HVA.然后
++ * 根据HVA找到对应的pfn,确保该page位于内存.在把缺的页填上后,需要更
++ * 新EPT,完善其中缺少的页表项.于是从L4开始,逐层补全页表,对于在某层
++ * 上缺少的页表页,会从slab中分配后将新页的HPA填入到上一级页表中.
++ *
++ * 除了建立上级页表到下级页表的关联外,KVM 还会建立反向映射,可以直
++ * 接根据GPA找到gfn相关的页表项,而无需再次走EPT查询.
++ */
++
++/*
+  * When setting this variable to true it enables Two-Dimensional-Paging
+  * where the hardware walks 2 page tables:
+  * 1. the guest-virtual to guest-physical
+  * 2. while doing 1. it walks guest-physical to host-physical
+  * If the hardware supports that we don't need to do shadow paging.
+  */
++/*
++ * 设置tdp_enabled的地方, 默认是false:
++ *   - arch/x86/kvm/mmu.c|5531| <<kvm_enable_tdp>> tdp_enabled = true;
++ *   - arch/x86/kvm/mmu.c|5537| <<kvm_disable_tdp>> tdp_enabled = false;
++ */
+ bool tdp_enabled = false;
+ 
+ enum {
++	/*
++	 * 只在以下使用AUDIT_PRE_PAGE_FAULT:
++	 *   - arch/x86/kvm/paging_tmpl.h|848| <<FNAME(page_fault)>> kvm_mmu_audit(vcpu, AUDIT_PRE_PAGE_FAULT);
++	 */
+ 	AUDIT_PRE_PAGE_FAULT,
+ 	AUDIT_POST_PAGE_FAULT,
+ 	AUDIT_PRE_PTE_WRITE,
+@@ -80,16 +106,63 @@ module_param(dbg, bool, 0644);
+ #define MMU_WARN_ON(x) do { } while (0)
+ #endif
+ 
++/*
++ * 在以下使用PTE_PREFETCH_NUM:
++ *   - arch/x86/kvm/paging_tmpl.h|89| <<global>> pt_element_t prefetch_ptes[PTE_PREFETCH_NUM];
++ *   - arch/x86/kvm/mmu.c|1054| <<mmu_topup_memory_caches>> pte_list_desc_cache, 8 + PTE_PREFETCH_NUM);
++ *   - arch/x86/kvm/mmu.c|3135| <<direct_pte_prefetch_many>> struct page *pages[PTE_PREFETCH_NUM];
++ *   - arch/x86/kvm/mmu.c|3167| <<__direct_pte_prefetch>> i = (sptep - sp->spt) & ~(PTE_PREFETCH_NUM - 1);
++ *   - arch/x86/kvm/mmu.c|3170| <<__direct_pte_prefetch>> for (i = 0; i < PTE_PREFETCH_NUM; i++, spte++) {
++ *   - arch/x86/kvm/paging_tmpl.h|564| <<FNAME>> mask = PTE_PREFETCH_NUM * sizeof(pt_element_t) - 1;
++ *   - arch/x86/kvm/paging_tmpl.h|594| <<FNAME>> i = (sptep - sp->spt) & ~(PTE_PREFETCH_NUM - 1);
++ *   - arch/x86/kvm/paging_tmpl.h|597| <<FNAME>> for (i = 0; i < PTE_PREFETCH_NUM; i++, spte++) {
++ */
+ #define PTE_PREFETCH_NUM		8
+ 
++/*
++ * 在以下使用PT_FIRST_AVAIL_BITS_SHIFT:
++ *   - arch/x86/kvm/mmu.c|184| <<SPTE_HOST_WRITEABLE>> #define SPTE_HOST_WRITEABLE (1ULL << PT_FIRST_AVAIL_BITS_SHIFT)
++ *   - arch/x86/kvm/mmu.c|185| <<SPTE_MMU_WRITEABLE>> #define SPTE_MMU_WRITEABLE (1ULL << (PT_FIRST_AVAIL_BITS_SHIFT + 1))
++ */
+ #define PT_FIRST_AVAIL_BITS_SHIFT 10
++/*
++ * 在以下使用:
++ *   - arch/x86/kvm/mmu.c|277| <<global>> static const u64 shadow_acc_track_saved_bits_shift = PT64_SECOND_AVAIL_BITS_SHIFT;
++ */
+ #define PT64_SECOND_AVAIL_BITS_SHIFT 52
+ 
++/*
++ * 在以下使用PT64_LEVEL_BITS:
++ *   - arch/x86/kvm/mmu.c|129| <<PT64_LEVEL_SHIFT>> (PAGE_SHIFT + (level - 1) * PT64_LEVEL_BITS)
++ *   - arch/x86/kvm/mmu.c|135| <<PT64_INDEX>> (((address) >> PT64_LEVEL_SHIFT(level)) & ((1 << PT64_LEVEL_BITS) - 1))
++ *   - arch/x86/kvm/mmu.c|158| <<PT64_LVL_ADDR_MASK>> * PT64_LEVEL_BITS))) - 1))
++ *   - arch/x86/kvm/mmu.c|161| <<PT64_LVL_OFFSET_MASK>> * PT64_LEVEL_BITS))) - 1))
++ *   - arch/x86/kvm/mmu.c|1140| <<kvm_mmu_page_get_gfn>> return sp->gfn + (index << ((sp->role.level - 1) * PT64_LEVEL_BITS));
++ *   - arch/x86/kvm/paging_tmpl.h|31| <<PT_LEVEL_BITS>> #define PT_LEVEL_BITS PT64_LEVEL_BITS
++ *   - arch/x86/kvm/paging_tmpl.h|64| <<PT_LEVEL_BITS>> #define PT_LEVEL_BITS PT64_LEVEL_BITS
++ *   - arch/x86/kvm/paging_tmpl.h|870| <<FNAME(get_level1_sp_gpa)>> offset = sp->role.quadrant << PT64_LEVEL_BITS;
++ */
+ #define PT64_LEVEL_BITS 9
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|160| <<PT64_INDEX>> (((address) >> PT64_LEVEL_SHIFT(level)) & ((1 << PT64_LEVEL_BITS) - 1))
++ *
++ * PT64_LEVEL_SHIFT(1) = 12 + (1 - 1) * 9 = 12
++ * PT64_LEVEL_SHIFT(2) = 12 + (2 - 1) * 9 = 21
++ * PT64_LEVEL_SHIFT(3) = 12 + (3 - 1) * 9 = 30
++ */
+ #define PT64_LEVEL_SHIFT(level) \
+ 		(PAGE_SHIFT + (level - 1) * PT64_LEVEL_BITS)
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|187| <<SHADOW_PT_INDEX>> #define SHADOW_PT_INDEX(addr, level) PT64_INDEX(addr, level)
++ *   - arch/x86/kvm/paging_tmpl.h|30| <<PT_INDEX>> #define PT_INDEX(addr, level) PT64_INDEX(addr, level)
++ *   - arch/x86/kvm/paging_tmpl.h|63| <<PT_INDEX>> #define PT_INDEX(addr, level) PT64_INDEX(addr, level)
++ *
++ * 先把adress根据level右移若干位, 然后取出最后9位作为index
++ */
+ #define PT64_INDEX(address, level)\
+ 	(((address) >> PT64_LEVEL_SHIFT(level)) & ((1 << PT64_LEVEL_BITS) - 1))
+ 
+@@ -110,11 +183,28 @@ module_param(dbg, bool, 0644);
+ #ifdef CONFIG_DYNAMIC_PHYSICAL_MASK
+ #define PT64_BASE_ADDR_MASK (physical_mask & ~(u64)(PAGE_SIZE-1))
+ #else
++/*
++ * ((1ULL << 52) - 1)  = 0x000fffffffffffff
++ * ~(u64)(PAGE_SIZE-1) = 是64位中就后面12位是0
++ *
++ * 在普通模式下相当于表示的51位最大物理地址mask了最后12位 = 0x000ffffffffff000
++ * 在CONFIG_DYNAMIC_PHYSICAL_MASK下不是52位, 是physical_mask
++ */
+ #define PT64_BASE_ADDR_MASK (((1ULL << 52) - 1) & ~(u64)(PAGE_SIZE-1))
+ #endif
++/*
++ * 在以下使用PT64_LVL_ADDR_MASK()
++ *   - arch/x86/kvm/paging_tmpl.h|28| <<PT_LVL_ADDR_MASK>> #define PT_LVL_ADDR_MASK(lvl) PT64_LVL_ADDR_MASK(lvl)
++ *   - arch/x86/kvm/paging_tmpl.h|61| <<PT_LVL_ADDR_MASK>> #define PT_LVL_ADDR_MASK(lvl) PT64_LVL_ADDR_MASK(lvl)
++ */
+ #define PT64_LVL_ADDR_MASK(level) \
+ 	(PT64_BASE_ADDR_MASK & ~((1ULL << (PAGE_SHIFT + (((level) - 1) \
+ 						* PT64_LEVEL_BITS))) - 1))
++/*
++ * 在以下使用PT64_LVL_OFFSET_MASK:
++ *   - arch/x86/kvm/paging_tmpl.h|29| <<PT_LVL_OFFSET_MASK>> #define PT_LVL_OFFSET_MASK(lvl) PT64_LVL_OFFSET_MASK(lvl)
++ *   - arch/x86/kvm/paging_tmpl.h|62| <<PT_LVL_OFFSET_MASK>> #define PT_LVL_OFFSET_MASK(lvl) PT64_LVL_OFFSET_MASK(lvl)
++ */
+ #define PT64_LVL_OFFSET_MASK(level) \
+ 	(PT64_BASE_ADDR_MASK & ((1ULL << (PAGE_SHIFT + (((level) - 1) \
+ 						* PT64_LEVEL_BITS))) - 1))
+@@ -126,26 +216,81 @@ module_param(dbg, bool, 0644);
+ 	(PAGE_MASK & ~((1ULL << (PAGE_SHIFT + (((level) - 1) \
+ 					    * PT32_LEVEL_BITS))) - 1))
+ 
++/*
++ * 在以下使用:
++ *   - arch/x86/kvm/mmu.c|5216| <<need_remote_flush>> return (old & ~new & PT64_PERM_MASK) != 0;
++ */
+ #define PT64_PERM_MASK (PT_PRESENT_MASK | PT_WRITABLE_MASK | shadow_user_mask \
+ 			| shadow_x_mask | shadow_nx_mask | shadow_me_mask)
+ 
+ #define ACC_EXEC_MASK    1
++/* 1 << 1 */
+ #define ACC_WRITE_MASK   PT_WRITABLE_MASK
++/* 1 << 2 */
+ #define ACC_USER_MASK    PT_USER_MASK
++/*
++ * 最后三位111全部设置
++ */
+ #define ACC_ALL          (ACC_EXEC_MASK | ACC_WRITE_MASK | ACC_USER_MASK)
+ 
+ /* The mask for the R/X bits in EPT PTEs */
++/*
++ * 在以下使用PT64_EPT_READABLE_MASK:
++ *   - arch/x86/kvm/mmu.c|321| <<global>> static const u64 shadow_acc_track_saved_bits_mask = PT64_EPT_READABLE_MASK |
++ */
+ #define PT64_EPT_READABLE_MASK			0x1ull
+ #define PT64_EPT_EXECUTABLE_MASK		0x4ull
+ 
+ #include <trace/events/kvm.h>
+ 
++/*
++ * 在以下使用SPTE_HOST_WRITEABLE:
++ *   - arch/x86/kvm/mmu.c|1519| <<spte_can_locklessly_be_made_writable>> return (spte & (SPTE_HOST_WRITEABLE | SPTE_MMU_WRITEABLE)) ==
++ *   - arch/x86/kvm/mmu.c|1520| <<spte_can_locklessly_be_made_writable>> (SPTE_HOST_WRITEABLE | SPTE_MMU_WRITEABLE);
++ *   - arch/x86/kvm/mmu.c|2669| <<kvm_set_pte_rmapp>> new_spte &= ~SPTE_HOST_WRITEABLE;
++ *   - arch/x86/kvm/mmu.c|3845| <<set_spte>> spte |= SPTE_HOST_WRITEABLE;
++ *   - arch/x86/kvm/paging_tmpl.h|1043| <<FNAME(sync_page)>> host_writable = sp->spt[i] & SPTE_HOST_WRITEABLE;
++ *
++ * 1往左移10位
++ *
++ * SPTE_HOST_WRITEABLE means the gfn is writable on host.
++ */
+ #define SPTE_HOST_WRITEABLE	(1ULL << PT_FIRST_AVAIL_BITS_SHIFT)
++/*
++ * 在以下使用SPTE_MMU_WRITEABLE:
++ *   - arch/x86/kvm/mmu.c|1476| <<spte_can_locklessly_be_made_writable>> return (spte & (SPTE_HOST_WRITEABLE | SPTE_MMU_WRITEABLE)) ==
++ *   - arch/x86/kvm/mmu.c|1477| <<spte_can_locklessly_be_made_writable>> (SPTE_HOST_WRITEABLE | SPTE_MMU_WRITEABLE);
++ *   - arch/x86/kvm/mmu.c|2366| <<spte_write_protect>> spte &= ~SPTE_MMU_WRITEABLE;
++ *   - arch/x86/kvm/mmu.c|3813| <<set_spte>> spte |= PT_WRITABLE_MASK | SPTE_MMU_WRITEABLE;
++ *   - arch/x86/kvm/mmu.c|3829| <<set_spte>> spte &= ~(PT_WRITABLE_MASK | SPTE_MMU_WRITEABLE);
++ *
++ * 1往左移11位
++ *
++ * SPTE_MMU_WRITEABLE means the gfn is writable on mmu. The bit is set when
++ * the gfn is writable on guest mmu and it is not write-protected by shadow
++ * page write-protection.
++ */
+ #define SPTE_MMU_WRITEABLE	(1ULL << (PT_FIRST_AVAIL_BITS_SHIFT + 1))
+ 
++/*
++ * 使用SHADOW_PT_INDEX()的地方:
++ *   - arch/x86/kvm/mmu.c|2701| <<shadow_walk_okay>> iterator->index = SHADOW_PT_INDEX(iterator->addr, iterator->level);
++ *
++ * 先把adress根据level右移若干位, 然后取出最后9位作为index
++ */
+ #define SHADOW_PT_INDEX(addr, level) PT64_INDEX(addr, level)
+ 
+ /* make pte_list_desc fit well in cache line */
++/*
++ * 使用PTE_LIST_EXT的地方:
++ *   - arch/x86/kvm/mmu.c|253| <<global>> u64 *sptes[PTE_LIST_EXT];
++ *   - arch/x86/kvm/mmu.c|1415| <<pte_list_add>> while (desc->sptes[PTE_LIST_EXT-1] && desc->more) {
++ *   - arch/x86/kvm/mmu.c|1417| <<pte_list_add>> count += PTE_LIST_EXT;
++ *   - arch/x86/kvm/mmu.c|1419| <<pte_list_add>> if (desc->sptes[PTE_LIST_EXT-1]) {
++ *   - arch/x86/kvm/mmu.c|1437| <<pte_list_desc_remove_entry>> for (j = PTE_LIST_EXT - 1; !desc->sptes[j] && j > i; --j)
++ *   - arch/x86/kvm/mmu.c|1474| <<__pte_list_remove>> for (i = 0; i < PTE_LIST_EXT && desc->sptes[i]; ++i) {
++ *   - arch/x86/kvm/mmu.c|1595| <<rmap_get_next>> if (iter->pos < PTE_LIST_EXT - 1) {
++ */
+ #define PTE_LIST_EXT 3
+ 
+ /*
+@@ -168,13 +313,26 @@ struct pte_list_desc {
+ };
+ 
+ struct kvm_shadow_walk_iterator {
++	/* 发生page fault的GPA,迭代过程就是要把GPA所涉及的页表项都填上 */
+ 	u64 addr;
++	/* 当前页表项的 HPA，在 shadow_walk_init 中设置为 vcpu->arch.mmu.root_hpa */
+ 	hpa_t shadow_addr;
++	/* 指向当前页表项, 在shadow_walk_okay()中更新 */
+ 	u64 *sptep;
++	/* 当前层级,在shadow_walk_okay()中设置为4 (x86_64 PT64_ROOT_LEVEL), 在shadow_walk_next()中减1 */
+ 	int level;
++	/* 在当前level页表中的索引,在shadow_walk_okey中更新 */
+ 	unsigned index;
+ };
+ 
++/*
++ * 在以下使用mmu_base_role_mask:
++ *   - arch/x86/kvm/mmu.c|5125| <<init_kvm_tdp_mmu>> new_role.base.word &= mmu_base_role_mask.word;
++ *   - arch/x86/kvm/mmu.c|5197| <<kvm_init_shadow_mmu>> new_role.base.word &= mmu_base_role_mask.word;
++ *   - arch/x86/kvm/mmu.c|5254| <<kvm_init_shadow_ept_mmu>> new_role.base.word &= mmu_base_role_mask.word;
++ *   - arch/x86/kvm/mmu.c|5295| <<init_kvm_nested_mmu>> new_role.base.word &= mmu_base_role_mask.word;
++ *   - arch/x86/kvm/mmu.c|5590| <<kvm_mmu_pte_write>> & mmu_base_role_mask.word) && rmap_can_add(vcpu))
++ */
+ static const union kvm_mmu_page_role mmu_base_role_mask = {
+ 	.cr0_wp = 1,
+ 	.gpte_is_8_bytes = 1,
+@@ -186,17 +344,34 @@ static const union kvm_mmu_page_role mmu_base_role_mask = {
+ 	.ad_disabled = 1,
+ };
+ 
++/*
++ * 在以下调用for_each_shadow_entry_using_root():
++ *   - arch/x86/kvm/paging_tmpl.h|896| <<FNAME(invlpg)>> for_each_shadow_entry_using_root(vcpu, root_hpa, gva, iterator) {
++ */
+ #define for_each_shadow_entry_using_root(_vcpu, _root, _addr, _walker)     \
+ 	for (shadow_walk_init_using_root(&(_walker), (_vcpu),              \
+ 					 (_root), (_addr));                \
+ 	     shadow_walk_okay(&(_walker));			           \
+ 	     shadow_walk_next(&(_walker)))
+ 
++/*
++ * 在以下调用for_each_shadow_entry():
++ *   - arch/x86/kvm/mmu.c|3433| <<__direct_map>> for_each_shadow_entry(vcpu, gpa, it) {
++ *
++ * 对于一个gpa的每一级(level)的pte
++ */
+ #define for_each_shadow_entry(_vcpu, _addr, _walker)            \
+ 	for (shadow_walk_init(&(_walker), _vcpu, _addr);	\
+ 	     shadow_walk_okay(&(_walker));			\
+ 	     shadow_walk_next(&(_walker)))
+ 
++/*
++ * 在以下调用for_each_shadow_entry_lockless():
++ *   - arch/x86/kvm/mmu.c|3641| <<fast_page_fault>> for_each_shadow_entry_lockless(vcpu, gva, iterator, spte)
++ *   - arch/x86/kvm/mmu.c|4230| <<shadow_page_table_clear_flood>> for_each_shadow_entry_lockless(vcpu, addr, iterator, spte) {
++ *
++ * 对于一个gpa的每一级(level)的pte
++ */
+ #define for_each_shadow_entry_lockless(_vcpu, _addr, _walker, spte)	\
+ 	for (shadow_walk_init(&(_walker), _vcpu, _addr);		\
+ 	     shadow_walk_okay(&(_walker)) &&				\
+@@ -207,14 +382,121 @@ static struct kmem_cache *pte_list_desc_cache;
+ static struct kmem_cache *mmu_page_header_cache;
+ static struct percpu_counter kvm_total_used_mmu_pages;
+ 
++/*
++ * 更新mask们的核心函数:
++ *  - kvm_mmu_set_mask_ptes()
++ *  - kvm_mmu_reset_all_pte_masks()
++ *  - kvm_mmu_set_mmio_spte_mask()
++ *
++ * vmx_init()
++ *  -> kvm_init()
++ *      -> kvm_arch_init()
++ *          -> kvm_mmu_module_init()
++ *              -> kvm_mmu_reset_all_pte_masks()
++ *              -> kvm_set_mmio_spte_mask()
++ *                   -> kvm_mmu_set_mmio_spte_mask() --> 第一次
++ *          -> kvm_mmu_set_mask_ptes() --> 第一次
++ *      -> kvm_arch_hardware_setup()
++ *          -> kvm_x86_ops->hardware_setup = hardware_setup()
++ *              -> vmx_enable_tdp()
++ *                  -> kvm_mmu_set_mask_ptes() --> 第二次
++ *                  -> ept_set_mmio_spte_mask()
++ *                      -> kvm_mmu_set_mmio_spte_mask() --> 第二次
++ */
++
++/*
++ * 在以下设置shadow_nx_mask:
++ *   - arch/x86/kvm/mmu.c|645| <<kvm_mmu_set_mask_ptes>> shadow_nx_mask = nx_mask;
++ *   - arch/x86/kvm/mmu.c|679| <<kvm_mmu_reset_all_pte_masks>> shadow_nx_mask = 0;
++ *
++ * 在new machine上是0x0
++ */
+ static u64 __read_mostly shadow_nx_mask;
++/*
++ * 在以下设置shadow_x_mask:
++ *   - arch/x86/kvm/mmu.c|646| <<kvm_mmu_set_mask_ptes>> shadow_x_mask = x_mask;
++ *   - arch/x86/kvm/mmu.c|680| <<kvm_mmu_reset_all_pte_masks>> shadow_x_mask = 0;
++ *
++ * 在new machine上是VMX_EPT_EXECUTABLE_MASK
++ */
+ static u64 __read_mostly shadow_x_mask;	/* mutual exclusive with nx_mask */
++/*
++ * 在以下设置:
++ *   - arch/x86/kvm/mmu.c|642| <<kvm_mmu_set_mask_ptes>> shadow_user_mask = user_mask;
++ *   - arch/x86/kvm/mmu.c|676| <<kvm_mmu_reset_all_pte_masks>> shadow_user_mask = 0;
++ *
++ * 在new machine上是VMX_EPT_READABLE_MASK
++ */
+ static u64 __read_mostly shadow_user_mask;
++/*
++ * 在以下设置shadow_accessed_mask:
++ *   - arch/x86/kvm/mmu.c|643| <<kvm_mmu_set_mask_ptes>> shadow_accessed_mask = accessed_mask;
++ *   - arch/x86/kvm/mmu.c|677| <<kvm_mmu_reset_all_pte_masks>> shadow_accessed_mask = 0;
++ *
++ * 在new machine上从vmx_enable_tdp()第二次进来的结果:
++ *   shadow_accessed_mask = enable_ept_ad_bits ? VMX_EPT_ACCESS_BIT : 0ull;
++ *   也就是0x0000000000000100
++ */
+ static u64 __read_mostly shadow_accessed_mask;
++/*
++ * 在以下设置shadow_dirty_mask:
++ *   - arch/x86/kvm/mmu.c|644| <<kvm_mmu_set_mask_ptes>> shadow_dirty_mask = dirty_mask;
++ *   - arch/x86/kvm/mmu.c|678| <<kvm_mmu_reset_all_pte_masks>> shadow_dirty_mask = 0;
++ *
++ * 在new machine上从vmx_enable_tdp()第二次进来的结果:
++ *   shadow_dirty_mask = enable_ept_ad_bits ? VMX_EPT_DIRTY_BIT : 0ull,
++ *   也就是0x0000000000000200
++ */
+ static u64 __read_mostly shadow_dirty_mask;
++/*
++ * 在以下设置shadow_mmio_mask:
++ *   - arch/x86/kvm/mmu.c|482| <<kvm_mmu_set_mmio_spte_mask>> shadow_mmio_mask = mmio_mask | SPTE_SPECIAL_MASK;
++ *
++ * 从vmx_enable_tdp()-->ept_set_mmio_spte_mask()第二次进入的例子:
++ *   shadow_mmio_value = VMX_EPT_MISCONFIG_WX_VALUE | SPTE_SPECIAL_MASK;
++ *   shadow_mmio_mask = VMX_EPT_RWX_MASK | SPTE_SPECIAL_MASK;
++ *
++ * 第二次从vmx_enable_tdp()-->ept_set_mmio_spte_mask()进入的结果:
++ *   mmio_value = 0x0000000000000006
++ *   mmio_mask  = 0x0000000000000007
++ *   shadow_mmio_mask  = 0x4000000000000007
++ *   shadow_mmio_value = 0x4000000000000006
++ *
++ * 设置RWX并且还有1往左62位 (SPTE_SPECIAL_MASK)
++ */
+ static u64 __read_mostly shadow_mmio_mask;
++/*
++ * 在以下设置shadow_mmio_value:
++ *   - arch/x86/kvm/mmu.c|481| <<kvm_mmu_set_mmio_spte_mask>> shadow_mmio_value = mmio_value | SPTE_SPECIAL_MASK;
++ *
++ * 从vmx_enable_tdp()-->ept_set_mmio_spte_mask()第二次进入的例子:
++ *   shadow_mmio_value = VMX_EPT_MISCONFIG_WX_VALUE | SPTE_SPECIAL_MASK;
++ *   shadow_mmio_mask = VMX_EPT_RWX_MASK | SPTE_SPECIAL_MASK;
++ *
++ * 第二次从vmx_enable_tdp()-->ept_set_mmio_spte_mask()进入的结果:
++ *   mmio_value = 0x0000000000000006
++ *   mmio_mask  = 0x0000000000000007
++ *   shadow_mmio_mask  = 0x4000000000000007
++ *   shadow_mmio_value = 0x4000000000000006
++ *
++ * 设置WX并且还有1往左62位 (SPTE_SPECIAL_MASK)
++ */
+ static u64 __read_mostly shadow_mmio_value;
++/*
++ * 在以下设置shadow_present_mask:
++ *   - arch/x86/kvm/mmu.c|647| <<kvm_mmu_set_mask_ptes>> shadow_present_mask = p_mask;
++ *   - arch/x86/kvm/mmu.c|682| <<kvm_mmu_reset_all_pte_masks>> shadow_present_mask = 0;
++ *
++ * 在new machine上是0ull
++ * cpu_has_vmx_ept_execute_only() ? 0ull : VMX_EPT_READABLE_MASK;
++ */
+ static u64 __read_mostly shadow_present_mask;
++/*
++ * 在以下设置shadow_me_mask:
++ *   - arch/x86/kvm/mmu.c|649| <<kvm_mmu_set_mask_ptes>> shadow_me_mask = me_mask;
++ *
++ * 在new machine上是0ull
++ */
+ static u64 __read_mostly shadow_me_mask;
+ 
+ /*
+@@ -222,7 +504,34 @@ static u64 __read_mostly shadow_me_mask;
+  * Non-present SPTEs with shadow_acc_track_value set are in place for access
+  * tracking.
+  */
++/*
++ * 设置shadow_acc_track_mask的地方:
++ *   - arch/x86/kvm/mmu.c|578| <<kvm_mmu_set_mask_ptes>> shadow_acc_track_mask = acc_track_mask;
++ *   - arch/x86/kvm/mmu.c|613| <<kvm_mmu_reset_all_pte_masks>> shadow_acc_track_mask = 0;
++ *
++ * 在new machine上从vmx_enable_tdp()第二次进来的结果:
++ *   shadow_acc_track_mask = VMX_EPT_RWX_MASK;
++ *   也就是0x0000000000000007
++ */
+ static u64 __read_mostly shadow_acc_track_mask;
++/*
++ * SPTE_SPECIAL_MASK的意义:
++ * The mask used to denote special SPTEs, which can be either MMIO SPTEs or
++ * Access Tracking SPTEs. We use bit 62 instead of bit 63 to avoid conflicting
++ * with the SVE bit in EPT PTEs.
++ *
++ * 只在这里修改shadow_acc_track_value, 使用的地方:
++ *   - arch/x86/kvm/mmu.c|424| <<spte_ad_enabled>> return !(spte & shadow_acc_track_value);
++ *   - arch/x86/kvm/mmu.c|570| <<kvm_mmu_set_mask_ptes>> BUG_ON(acc_track_mask & shadow_acc_track_value);
++ *   - arch/x86/kvm/mmu.c|2734| <<link_shadow_page>> spte |= shadow_acc_track_value;
++ *   - arch/x86/kvm/mmu.c|3075| <<set_spte>> spte |= shadow_acc_track_value;
++ *
++ * 1向左移动62位, 也就是SPTE_SPECIAL_MASK
++ * SPTE_SPECIAL_MASK的意义:
++ * The mask used to denote special SPTEs, which can be either MMIO SPTEs or
++ * Access Tracking SPTEs. We use bit 62 instead of bit 63 to avoid conflicting
++ * with the SVE bit in EPT PTEs.
++ */
+ static const u64 shadow_acc_track_value = SPTE_SPECIAL_MASK;
+ 
+ /*
+@@ -231,19 +540,48 @@ static const u64 shadow_acc_track_value = SPTE_SPECIAL_MASK;
+  * PTEs being access tracked also need to be dirty tracked, so the W bit will be
+  * restored only when a write is attempted to the page.
+  */
++/*
++ * 只在这里修改, 使用shadow_acc_track_saved_bits_mask的地方:
++ *   - arch/x86/kvm/mmu.c|1023| <<mark_spte_for_access_track>> WARN_ONCE(spte & (shadow_acc_track_saved_bits_mask <<
++ *   - arch/x86/kvm/mmu.c|1027| <<mark_spte_for_access_track>> spte |= (spte & shadow_acc_track_saved_bits_mask) <<
++ *   - arch/x86/kvm/mmu.c|1039| <<restore_acc_track_spte>> & shadow_acc_track_saved_bits_mask;
++ *   - arch/x86/kvm/mmu.c|1045| <<restore_acc_track_spte>> new_spte &= ~(shadow_acc_track_saved_bits_mask <<
++ *
++ * 第0位和第2位 (read and exec)是1
++ */
+ static const u64 shadow_acc_track_saved_bits_mask = PT64_EPT_READABLE_MASK |
+ 						    PT64_EPT_EXECUTABLE_MASK;
++/*
++ * 只在这里修改, 使用shadow_acc_track_saved_bits_shift的地方:
++ *   - arch/x86/kvm/mmu.c|1024| <<mark_spte_for_access_track>> shadow_acc_track_saved_bits_shift),
++ *   - arch/x86/kvm/mmu.c|1028| <<mark_spte_for_access_track>> shadow_acc_track_saved_bits_shift;
++ *   - arch/x86/kvm/mmu.c|1038| <<restore_acc_track_spte>> u64 saved_bits = (spte >> shadow_acc_track_saved_bits_shift)
++ *   - arch/x86/kvm/mmu.c|1046| <<restore_acc_track_spte>> shadow_acc_track_saved_bits_shift);
++ *
++ * 52
++ */
+ static const u64 shadow_acc_track_saved_bits_shift = PT64_SECOND_AVAIL_BITS_SHIFT;
+ 
+ /*
+  * This mask must be set on all non-zero Non-Present or Reserved SPTEs in order
+  * to guard against L1TF attacks.
+  */
++/*
++ * 在以下修改shadow_nonpresent_or_rsvd_mask:
++ *   - arch/x86/kvm/mmu.c|627| <<kvm_mmu_reset_all_pte_masks>> shadow_nonpresent_or_rsvd_mask = 0;
++ *   - arch/x86/kvm/mmu.c|631| <<kvm_mmu_reset_all_pte_masks>> shadow_nonpresent_or_rsvd_mask =
++ *                                                                       rsvd_bits(boot_cpu_data.x86_cache_bits -
++ *                                                                                 shadow_nonpresent_or_rsvd_mask_len,
++ *                                                                                 boot_cpu_data.x86_cache_bits - 1);
++ */
+ static u64 __read_mostly shadow_nonpresent_or_rsvd_mask;
+ 
+ /*
+  * The number of high-order 1 bits to use in the mask above.
+  */
++/*
++ * 只在这一处修改shadow_nonpresent_or_rsvd_mask_len
++ */
+ static const u64 shadow_nonpresent_or_rsvd_mask_len = 5;
+ 
+ /*
+@@ -254,12 +592,25 @@ static const u64 shadow_nonpresent_or_rsvd_mask_len = 5;
+  * left into the reserved bits, i.e. the GFN in the SPTE will be split into
+  * high and low parts.  This mask covers the lower bits of the GFN.
+  */
++/*
++ * 只在一处设置shadow_nonpresent_or_rsvd_lower_gfn_mask:
++ *   - arch/x86/kvm/mmu.c|621| <<kvm_mmu_reset_all_pte_masks>> shadow_nonpresent_or_rsvd_lower_gfn_mask =
++ *                                                                           rsvd_bits(boot_cpu_data.x86_cache_bits -
++ *                                                                           shadow_nonpresent_or_rsvd_mask_len,
++ *                                                                           boot_cpu_data.x86_cache_bits - 1);
++ */
+ static u64 __read_mostly shadow_nonpresent_or_rsvd_lower_gfn_mask;
+ 
+ /*
+  * The number of non-reserved physical address bits irrespective of features
+  * that repurpose legal bits, e.g. MKTME.
+  */
++/*
++ * 只在一处设置shadow_phys_bits:
++ *   - arch/x86/kvm/mmu.c|597| <<kvm_mmu_reset_all_pte_masks>> shadow_phys_bits = kvm_get_shadow_phys_bits();
++ *
++ * 在new machine上是39
++ */
+ static u8 __read_mostly shadow_phys_bits;
+ 
+ static void mmu_spte_set(u64 *sptep, u64 spte);
+@@ -271,11 +622,20 @@ kvm_mmu_calc_root_page_role(struct kvm_vcpu *vcpu);
+ #include "mmutrace.h"
+ 
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|1830| <<kvm_set_pte_rmapp>> if (need_flush && kvm_available_flush_tlb_with_range()) {
++ *   - arch/x86/kvm/mmu.c|5873| <<kvm_mmu_zap_collapsible_spte>> if (kvm_available_flush_tlb_with_range())
++ */
+ static inline bool kvm_available_flush_tlb_with_range(void)
+ {
+ 	return kvm_x86_ops->tlb_remote_flush_with_range;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|559| <<kvm_flush_remote_tlbs_with_address>> kvm_flush_remote_tlbs_with_range(kvm, &range);
++ */
+ static void kvm_flush_remote_tlbs_with_range(struct kvm *kvm,
+ 		struct kvm_tlb_range *range)
+ {
+@@ -288,6 +648,23 @@ static void kvm_flush_remote_tlbs_with_range(struct kvm *kvm,
+ 		kvm_flush_remote_tlbs(kvm);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|1825| <<drop_large_spte>> kvm_flush_remote_tlbs_with_address(vcpu->kvm, sp->gfn,
++ *   - arch/x86/kvm/mmu.c|2114| <<kvm_set_pte_rmapp>> kvm_flush_remote_tlbs_with_address(kvm, gfn, 1);
++ *   - arch/x86/kvm/mmu.c|2297| <<rmap_recycle>> kvm_flush_remote_tlbs_with_address(vcpu->kvm, sp->gfn,
++ *   - arch/x86/kvm/mmu.c|2822| <<kvm_mmu_get_page>> kvm_flush_remote_tlbs_with_address(vcpu->kvm, gfn, 1);
++ *   - arch/x86/kvm/mmu.c|2942| <<validate_direct_spte>> kvm_flush_remote_tlbs_with_address(vcpu->kvm, child->gfn, 1);
++ *   - arch/x86/kvm/mmu.c|3380| <<mmu_set_spte>> kvm_flush_remote_tlbs_with_address(vcpu->kvm, gfn,
++ *   - arch/x86/kvm/mmu.c|5878| <<slot_handle_level_range>> kvm_flush_remote_tlbs_with_address(kvm,
++ *   - arch/x86/kvm/mmu.c|5888| <<slot_handle_level_range>> kvm_flush_remote_tlbs_with_address(kvm, start_gfn,
++ *   - arch/x86/kvm/mmu.c|6150| <<kvm_mmu_slot_remove_write_access>> kvm_flush_remote_tlbs_with_address(kvm, memslot->base_gfn,
++ *   - arch/x86/kvm/mmu.c|6181| <<kvm_mmu_zap_collapsible_spte>> kvm_flush_remote_tlbs_with_address(kvm, sp->gfn,
++ *   - arch/x86/kvm/mmu.c|6221| <<kvm_mmu_slot_leaf_clear_dirty>> kvm_flush_remote_tlbs_with_address(kvm, memslot->base_gfn,
++ *   - arch/x86/kvm/mmu.c|6240| <<kvm_mmu_slot_largepage_remove_write_access>> kvm_flush_remote_tlbs_with_address(kvm, memslot->base_gfn,
++ *   - arch/x86/kvm/mmu.c|6258| <<kvm_mmu_slot_set_dirty>> kvm_flush_remote_tlbs_with_address(kvm, memslot->base_gfn,
++ *   - arch/x86/kvm/paging_tmpl.h|912| <<FNAME>> kvm_flush_remote_tlbs_with_address(vcpu->kvm,
++ */
+ static void kvm_flush_remote_tlbs_with_address(struct kvm *kvm,
+ 		u64 start_gfn, u64 pages)
+ {
+@@ -299,39 +676,166 @@ static void kvm_flush_remote_tlbs_with_address(struct kvm *kvm,
+ 	kvm_flush_remote_tlbs_with_range(kvm, &range);
+ }
+ 
++/*
++ * 第一次进入:
++ * [0] kvm_mmu_set_mmio_spte_mask
++ * [0] kvm_mmu_module_init [kvm]
++ * [0] kvm_arch_init [kvm]
++ * [0] kvm_init [kvm]
++ * [0] vmx_init [kvm_intel]
++ * [0] do_one_initcall
++ * [0] do_init_module
++ * [0] load_module
++ * [0] __do_sys_finit_module
++ * [0] do_syscall_64
++ * [0] entry_SYSCALL_64_after_hwframe
++ *
++ * 第二次进入:
++ * [0] kvm_mmu_set_mmio_spte_mask
++ * [0] hardware_setup [kvm_intel]
++ * [0] kvm_arch_hardware_setup [kvm]
++ * [0] kvm_init [kvm]
++ * [0] vmx_init [kvm_intel]
++ * [0] do_one_initcall
++ * [0] do_init_module
++ * [0] load_module
++ * [0] __do_sys_finit_module
++ * [0] do_syscall_64
++ * [0] entry_SYSCALL_64_after_hwframe
++ *
++ * called by:
++ *   - arch/x86/kvm/mmu.c|6324| <<kvm_set_mmio_spte_mask>> kvm_mmu_set_mmio_spte_mask(mask, mask);
++ *   - arch/x86/kvm/vmx/vmx.c|4035| <<ept_set_mmio_spte_mask>> kvm_mmu_set_mmio_spte_mask(VMX_EPT_RWX_MASK,
++ */
+ void kvm_mmu_set_mmio_spte_mask(u64 mmio_mask, u64 mmio_value)
+ {
++	/*
++	 * 第一次从kvm_mmu_module_init()-->kvm_set_mmio_spte_mask()进入的结果:
++	 *   mmio_value = 0x0008000000000001
++	 *   mmio_mask  = 0x0008000000000001
++	 *   shadow_mmio_mask  = 0x4008000000000001
++	 *   shadow_mmio_value = 0x4008000000000001
++	 *
++	 * 第二次从vmx_enable_tdp()-->ept_set_mmio_spte_mask()进入的结果:
++	 *   mmio_value = 0x0000000000000006
++	 *   mmio_mask  = 0x0000000000000007
++	 *   shadow_mmio_mask  = 0x4000000000000007
++	 *   shadow_mmio_value = 0x4000000000000006
++	 */
++	/*
++	 * 从vmx_enable_tdp()-->ept_set_mmio_spte_mask()第二次进入的例子:
++	 *   shadow_mmio_value = VMX_EPT_MISCONFIG_WX_VALUE | SPTE_SPECIAL_MASK;
++	 *   shadow_mmio_mask = VMX_EPT_RWX_MASK | SPTE_SPECIAL_MASK;
++	 */
+ 	BUG_ON((mmio_mask & mmio_value) != mmio_value);
+ 	shadow_mmio_value = mmio_value | SPTE_SPECIAL_MASK;
+ 	shadow_mmio_mask = mmio_mask | SPTE_SPECIAL_MASK;
+ }
+ EXPORT_SYMBOL_GPL(kvm_mmu_set_mmio_spte_mask);
+ 
++/*
++ * 应该是用来判断硬件ept是否支持ad bit (access & dirty)
++ */
+ static inline bool sp_ad_disabled(struct kvm_mmu_page *sp)
+ {
++	/*
++	 * 设置ad_disabled的地方:
++	 *   - 在struct kvm_mmu_page_role中默认是1
++	 *   - union kvm_mmu_page_role mmu_base_role_mask中默认是1 (.ad_disabled = 1)
++	 *   - arch/x86/kvm/mmu.c|5343| <<kvm_calc_tdp_mmu_root_page_role>> role.base.ad_disabled = (shadow_accessed_mask == 0);
++	 *   - arch/x86/kvm/mmu.c|5459| <<kvm_calc_shadow_ept_root_page_role>> role.base.ad_disabled = !accessed_dirty;
++	 *   - arch/x86/kvm/vmx/nested.c|5009| <<nested_vmx_eptp_switching>> mmu->mmu_role.base.ad_disabled = !accessed_dirty;
++	 */
+ 	return sp->role.ad_disabled;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|542| <<spte_shadow_accessed_mask>> return spte_ad_enabled(spte) ? shadow_accessed_mask : 0;
++ *   - arch/x86/kvm/mmu.c|548| <<spte_shadow_dirty_mask>> return spte_ad_enabled(spte) ? shadow_dirty_mask : 0;
++ *   - arch/x86/kvm/mmu.c|553| <<is_access_track_spte>> return !spte_ad_enabled(spte) && (spte & shadow_acc_track_mask) == 0;
++ *   - arch/x86/kvm/mmu.c|959| <<spte_has_volatile_bits>> if (spte_ad_enabled(spte)) {
++ *   - arch/x86/kvm/mmu.c|1120| <<mark_spte_for_access_track>> if (spte_ad_enabled(spte))
++ *   - arch/x86/kvm/mmu.c|1153| <<restore_acc_track_spte>> WARN_ON_ONCE(spte_ad_enabled(spte));
++ *   - arch/x86/kvm/mmu.c|1172| <<mmu_spte_age>> if (spte_ad_enabled(spte)) {
++ *   - arch/x86/kvm/mmu.c|1842| <<__rmap_clear_dirty>> if (spte_ad_enabled(*sptep))
++ *   - arch/x86/kvm/mmu.c|1868| <<__rmap_set_dirty>> if (spte_ad_enabled(*sptep))
++ *
++ * 如果spte的SPTE_SPECIAL_MASK=1<<62设置了, 说明ad不支持, 没enabled, 返回false
++ */
+ static inline bool spte_ad_enabled(u64 spte)
+ {
+ 	MMU_WARN_ON((spte & shadow_mmio_mask) == shadow_mmio_value);
++	/*
++	 * 1向左移动62位, 也就是SPTE_SPECIAL_MASK
++	 * SPTE_SPECIAL_MASK的意义:
++	 * The mask used to denote special SPTEs, which can be either MMIO SPTEs or
++	 * Access Tracking SPTEs. We use bit 62 instead of bit 63 to avoid conflicting
++	 * with the SVE bit in EPT PTEs.
++	 */
+ 	return !(spte & shadow_acc_track_value);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|1536| <<is_accessed_spte>> u64 accessed_mask = spte_shadow_accessed_mask(spte);
++ *   - arch/x86/kvm/mmu.c|3810| <<set_spte>> spte |= spte_shadow_accessed_mask(spte);
++ *
++ * 如果spte的SPTE_SPECIAL_MASK=1<<62设置了, 说明ad不支持, 返回0
++ * 如果没设置, 说明pte支持ad bit, 所以返回shadow_accessed_mask
++ */
+ static inline u64 spte_shadow_accessed_mask(u64 spte)
+ {
+ 	MMU_WARN_ON((spte & shadow_mmio_mask) == shadow_mmio_value);
++	/*
++	 * 关于shadow_accessed_mask
++	 * 在new machine上从vmx_enable_tdp()第二次进来的结果:
++	 *   shadow_accessed_mask = enable_ept_ad_bits ? VMX_EPT_ACCESS_BIT : 0ull;
++	 *   也就是0x0000000000000100
++	 */
+ 	return spte_ad_enabled(spte) ? shadow_accessed_mask : 0;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|1544| <<is_dirty_spte>> u64 dirty_mask = spte_shadow_dirty_mask(spte);
++ *   - arch/x86/kvm/mmu.c|3870| <<set_spte>> spte |= spte_shadow_dirty_mask(spte);
++ *
++ * 如果spte的SPTE_SPECIAL_MASK=1<<62设置了, 说明ad不支持, 返回0
++ * 如果没设置, 说明pte支持ad bit, 所以返回shadow_dirty_mask
++ */
+ static inline u64 spte_shadow_dirty_mask(u64 spte)
+ {
+ 	MMU_WARN_ON((spte & shadow_mmio_mask) == shadow_mmio_value);
++	/*
++	 * 关于shadow_dirty_mask
++	 * 在new machine上从vmx_enable_tdp()第二次进来的结果:
++	 *   shadow_dirty_mask = enable_ept_ad_bits ? VMX_EPT_DIRTY_BIT : 0ull,
++	 *   也就是0x0000000000000200
++	 */
+ 	return spte_ad_enabled(spte) ? shadow_dirty_mask : 0;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|1225| <<spte_has_volatile_bits>> is_access_track_spte(spte))
++ *   - arch/x86/kvm/mmu.c|1242| <<is_accessed_spte>> : !is_access_track_spte(spte);
++ *   - arch/x86/kvm/mmu.c|1392| <<mark_spte_for_access_track>> if (is_access_track_spte(spte))
++ *   - arch/x86/kvm/mmu.c|1423| <<restore_acc_track_spte>> WARN_ON_ONCE(!is_access_track_spte(spte));
++ *   - arch/x86/kvm/mmu.c|3936| <<fast_page_fault>> if (is_access_track_spte(spte))
++ *
++ * 如果spte的SPTE_SPECIAL_MASK=1<<62设置了(说明ad不支持),
++ * 并且spte在shadow_acc_track_mask中的bit都没设置
++ * 则返回true (如果返回true说明ad bit不支持)
++ */
+ static inline bool is_access_track_spte(u64 spte)
+ {
++	/*
++	 * 关于shadow_acc_track_mask
++	 * 在new machine上从vmx_enable_tdp()第二次进来的结果:
++	 *   shadow_acc_track_mask = VMX_EPT_RWX_MASK;
++	 *   也就是0x0000000000000007
++	 */
+ 	return !spte_ad_enabled(spte) && (spte & shadow_acc_track_mask) == 0;
+ }
+ 
+@@ -360,52 +864,165 @@ static inline bool is_access_track_spte(u64 spte)
+ #define MMIO_SPTE_GEN_HIGH_END		61
+ #define MMIO_SPTE_GEN_HIGH_MASK		GENMASK_ULL(MMIO_SPTE_GEN_HIGH_END, \
+ 						    MMIO_SPTE_GEN_HIGH_START)
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|848| <<mark_mmio_spte>> u64 mask = generation_mmio_spte_mask(gen);
++ *   - arch/x86/kvm/mmu.c|888| <<get_mmio_spte_access>> u64 mask = generation_mmio_spte_mask(MMIO_SPTE_GEN_MASK) | shadow_mmio_mask;
++ *
++ * spte bits 3-11 are used as bits 0-8 of the generation number,
++ * the bits 52-61 are used as bits 9-18 of the generation number.
++ *
++ * 把gen的第0-8位取出来左移2位, 变成spte的3-11位
++ * 把gen的第9-18位取出来左移52位, 变成spte的52-61位
++ * 把两个拼在一起, 成为了spte的gen mask
++ */
+ static u64 generation_mmio_spte_mask(u64 gen)
+ {
+ 	u64 mask;
+ 
++	/*
++	 * ~MMIO_SPTE_GEN_MASK除了0-18位都是1
++	 * 说明要求参数gen必须只是gen
++	 */
+ 	WARN_ON(gen & ~MMIO_SPTE_GEN_MASK);
+ 
++	/*
++	 * spte bits 3-11 are used as bits 1-9 of the generation number,
++	 * the bits 52-61 are used as bits 10-19 of the generation number.
++	 *
++	 * 把gen的第0-8位取出来左移2位, 变成spte的3-11位
++	 * 把gen的第9-18位取出来左移52位, 变成spte的52-61位
++	 * 把两个拼在一起, 成为了spte的gen mask
++	 */
+ 	mask = (gen << MMIO_SPTE_GEN_LOW_START) & MMIO_SPTE_GEN_LOW_MASK;
+ 	mask |= (gen << MMIO_SPTE_GEN_HIGH_START) & MMIO_SPTE_GEN_HIGH_MASK;
+ 	return mask;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|912| <<check_mmio_spte>> spte_gen = get_mmio_spte_generation(spte);
++ *
++ * spte bits 3-11 are used as bits 0-8 of the generation number,
++ * the bits 52-61 are used as bits 9-18 of the generation number.
++ *
++ * 给定一个spte, 获得其中的mmio generation
++ * 把spte的3-11位和52-61位取出来拼在一起, 组成gen
++ */
+ static u64 get_mmio_spte_generation(u64 spte)
+ {
+ 	u64 gen;
+ 
++	/* 把spte的最后3位清0 */
+ 	spte &= ~shadow_mmio_mask;
+ 
++	/*
++	 * spte bits 3-11 are used as bits 0-8 of the generation number,
++	 * the bits 52-61 are used as bits 9-18 of the generation number.
++	 *
++	 * 把spte的3-11位和52-61位取出来拼在一起, 组成gen
++	 */
+ 	gen = (spte & MMIO_SPTE_GEN_LOW_MASK) >> MMIO_SPTE_GEN_LOW_START;
+ 	gen |= (spte & MMIO_SPTE_GEN_HIGH_MASK) >> MMIO_SPTE_GEN_HIGH_START;
+ 	return gen;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|708| <<set_mmio_spte>> mark_mmio_spte(vcpu, sptep, gfn, access);
++ *   - arch/x86/kvm/mmu.c|4605| <<sync_mmio_spte>> mark_mmio_spte(vcpu, sptep, gfn, access);
++ *
++ * 根据gfn为sptep设置entry, 最后3位是110, 用来作为mmio的entry
++ * 似乎是设置完mmio之后:
++ * 1. SPTE_SPECIAL_MASK(1往左移62位)是1
++ * 2. 结尾是110
++ * 3. 还有gen的信息
++ */
+ static void mark_mmio_spte(struct kvm_vcpu *vcpu, u64 *sptep, u64 gfn,
+ 			   unsigned access)
+ {
++	/* 返回kvm_vcpu_memslots(vcpu)->generation中的0-18位 */
+ 	u64 gen = kvm_vcpu_memslots(vcpu)->generation & MMIO_SPTE_GEN_MASK;
++	/*
++	 * spte bits 3-11 are used as bits 0-8 of the generation number,
++	 * the bits 52-61 are used as bits 9-18 of the generation number.
++	 *
++	 * 把gen的第0-8位取出来左移2位, 变成spte的3-11位
++	 * 把gen的第9-18位取出来左移52位, 变成spte的52-61位
++	 * 把两个拼在一起, 成为了spte的gen mask
++	 */
+ 	u64 mask = generation_mmio_spte_mask(gen);
+ 	u64 gpa = gfn << PAGE_SHIFT;
+ 
++	/* 获取access的第1和第2位 (从第0位开始) */
+ 	access &= ACC_WRITE_MASK | ACC_USER_MASK;
++	/*
++	 * shadow_mmio_value是110 (还有SPTE_SPECIAL_MASK是1往左移62位)
++	 */
+ 	mask |= shadow_mmio_value | access;
+ 	mask |= gpa | shadow_nonpresent_or_rsvd_mask;
+ 	mask |= (gpa & shadow_nonpresent_or_rsvd_mask)
+ 		<< shadow_nonpresent_or_rsvd_mask_len;
+ 
++	/*
++	 * page_header():
++	 * __pa(sptep)可能是一个指向某个pte的地址 (__pa(sptep)保存的这个pte的地址而不是内容)
++	 * 获得包含这个地址的页表页对应的kvm_mmu_page
++	 *
++	 * 在以下使用mmio_cached:
++	 *   - arch/x86/kvm/mmu.c|952| <<mark_mmio_spte>> page_header(__pa(sptep))->mmio_cached = true;
++	 *   - arch/x86/kvm/mmu.c|6916| <<__kvm_mmu_zap_all>> if (mmio_only && !sp->mmio_cached)
++	 */
+ 	page_header(__pa(sptep))->mmio_cached = true;
+ 
+ 	trace_mark_mmio_spte(sptep, gfn, access, gen);
++	/* 核心就是用WRITE_ONCE(*sptep, spte)更新spte */
+ 	mmu_spte_set(sptep, mask);
++	
++	/*
++	 * 似乎是设置完mmio之后:
++	 * 1. SPTE_SPECIAL_MASK(1往左移62位)是1
++	 * 2. 结尾是110
++	 * 3. 还有gen的信息
++	 */
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|833| <<is_shadow_present_pte>> return (pte != 0) && !is_mmio_spte(pte);
++ *   - arch/x86/kvm/mmu.c|2965| <<mmu_page_zap_pte>> if (is_mmio_spte(pte))
++ *   - arch/x86/kvm/mmu.c|3383| <<mmu_set_spte>> if (unlikely(is_mmio_spte(*sptep)))
++ *   - arch/x86/kvm/mmu.c|4245| <<handle_mmio_page_fault>> if (is_mmio_spte(spte)) {
++ *   - arch/x86/kvm/mmu.c|4598| <<sync_mmio_spte>> if (unlikely(is_mmio_spte(*sptep))) {
++ *
++ * 如果最后3位的最后1位没设置(EW=110)并且还有SPTE_SPECIAL_MASK是1往左移62位,
++ * 就是mmio的spte
++ */
+ static bool is_mmio_spte(u64 spte)
+ {
++	/*
++	 * 从vmx_enable_tdp()-->ept_set_mmio_spte_mask()第二次进入的例子:
++	 *   shadow_mmio_value = VMX_EPT_MISCONFIG_WX_VALUE | SPTE_SPECIAL_MASK;
++	 *   shadow_mmio_mask = VMX_EPT_RWX_MASK | SPTE_SPECIAL_MASK;
++	 *
++	 * 第二次从vmx_enable_tdp()-->ept_set_mmio_spte_mask()进入的结果:
++	 *   mmio_value = 0x0000000000000006
++	 *   mmio_mask  = 0x0000000000000007
++	 *   shadow_mmio_mask  = 0x4000000000000007
++	 *   shadow_mmio_value = 0x4000000000000006
++	 *
++	 * 设置RWX并且还有1往左62位 (SPTE_SPECIAL_MASK)
++	 */
+ 	return (spte & shadow_mmio_mask) == shadow_mmio_value;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|4600| <<handle_mmio_page_fault>> gfn_t gfn = get_mmio_spte_gfn(spte);
++ *   - arch/x86/kvm/mmu.c|4953| <<sync_mmio_spte>> if (gfn != get_mmio_spte_gfn(*sptep)) {
++ *
++ * ept页表是gpa-to-hpa, 这里核心是把spte右移动PAGE_SHIFT(12)
++ */
+ static gfn_t get_mmio_spte_gfn(u64 spte)
+ {
+ 	u64 gpa = spte & shadow_nonpresent_or_rsvd_lower_gfn_mask;
+@@ -416,16 +1033,62 @@ static gfn_t get_mmio_spte_gfn(u64 spte)
+ 	return gpa >> PAGE_SHIFT;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|4601| <<handle_mmio_page_fault>> unsigned access = get_mmio_spte_access(spte);
++ *
++ * spte bits 3-11 are used as bits 0-8 of the generation number,
++ * the bits 52-61 are used as bits 9-18 of the generation number.
++ *
++ * 把spte中0-11位和52-61位都清0并返回
++ * (包括gen的3-11位和52-61位, 以及最后3位, 还有0-11位的PAGE_MASK)
++ * 还有62位的SPTE_SPECIAL_MASK也情况
++ * 剩下的就是access?
++ */
+ static unsigned get_mmio_spte_access(u64 spte)
+ {
++	/*
++	 * generation_mmio_spte_mask():
++	 *     spte bits 3-11 are used as bits 0-8 of the generation number,
++	 *     the bits 52-61 are used as bits 9-18 of the generation number.
++	 *
++	 *     把gen的第0-8位取出来左移2位, 变成spte的3-11位
++	 *     把gen的第9-18位取出来左移52位, 变成spte的52-61位
++	 *     把两个拼在一起, 成为了spte的gen mask
++	 *
++	 * 总之把一个spte中对应gen的3-11位和52-61位, 以及最后3位做成mask
++	 */
+ 	u64 mask = generation_mmio_spte_mask(MMIO_SPTE_GEN_MASK) | shadow_mmio_mask;
++	/*
++	 * 把spte中0-11位和52-61位都清0并返回
++	 * (包括gen的3-11位和52-61位, 以及最后3位, 还有0-11位的PAGE_MASK)
++	 * 还有62位的SPTE_SPECIAL_MASK也情况
++	 * 剩下的就是access?
++	 */
+ 	return (spte & ~mask) & ~PAGE_MASK;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|3602| <<set_spte>> if (set_mmio_spte(vcpu, sptep, gfn, pfn, pte_access))
++ *
++ * 根据gfn为sptep设置entry, 最后3位是110, 用来作为mmio的entry
++ * 似乎是设置完mmio之后:
++ * 1. SPTE_SPECIAL_MASK(1往左移62位)是1
++ * 2. 结尾是110
++ * 3. 还有gen的信息
++ */
+ static bool set_mmio_spte(struct kvm_vcpu *vcpu, u64 *sptep, gfn_t gfn,
+ 			  kvm_pfn_t pfn, unsigned access)
+ {
+ 	if (unlikely(is_noslot_pfn(pfn))) {
++		/*
++		 * 根据gfn为sptep设置entry, 最后3位是110, 用来作为mmio的entry
++		 * 似乎是设置完mmio之后:
++		 * 1. SPTE_SPECIAL_MASK(1往左移62位)是1
++		 * 2. 结尾是110
++		 * 3. 还有gen的信息
++		 */
+ 		mark_mmio_spte(vcpu, sptep, gfn, access);
+ 		return true;
+ 	}
+@@ -433,15 +1096,35 @@ static bool set_mmio_spte(struct kvm_vcpu *vcpu, u64 *sptep, gfn_t gfn,
+ 	return false;
+ }
+ 
++/*
++ * 判断spte中的gen (把spte的3-11位和52-61位取出来拼在一起, 组成gen)
++ * 是否和kvm_vcpu_memslots(vcpu)->generation & MMIO_SPTE_GEN_MASK(0-18位)相等
++ */
+ static bool check_mmio_spte(struct kvm_vcpu *vcpu, u64 spte)
+ {
+ 	u64 kvm_gen, spte_gen, gen;
+ 
+ 	gen = kvm_vcpu_memslots(vcpu)->generation;
++	/*
++	 * 在以下使用KVM_MEMSLOT_GEN_UPDATE_IN_PROGRESS:
++	 *   - arch/x86/kvm/mmu.c|958| <<check_mmio_spte>> if (unlikely(gen & KVM_MEMSLOT_GEN_UPDATE_IN_PROGRESS))
++	 *   - arch/x86/kvm/mmu.c|6668| <<kvm_mmu_invalidate_mmio_sptes>> WARN_ON(gen & KVM_MEMSLOT_GEN_UPDATE_IN_PROGRESS);
++	 *   - arch/x86/kvm/x86.h|191| <<vcpu_cache_mmio_info>> if (unlikely(gen & KVM_MEMSLOT_GEN_UPDATE_IN_PROGRESS))
++	 *   - virt/kvm/kvm_main.c|891| <<install_new_memslots>> WARN_ON(gen & KVM_MEMSLOT_GEN_UPDATE_IN_PROGRESS);
++	 *   - virt/kvm/kvm_main.c|892| <<install_new_memslots>> slots->generation = gen | KVM_MEMSLOT_GEN_UPDATE_IN_PROGRESS;
++	 *   - virt/kvm/kvm_main.c|903| <<install_new_memslots>> gen = slots->generation & ~KVM_MEMSLOT_GEN_UPDATE_IN_PROGRESS;
++	 */
+ 	if (unlikely(gen & KVM_MEMSLOT_GEN_UPDATE_IN_PROGRESS))
+ 		return false;
+ 
+ 	kvm_gen = gen & MMIO_SPTE_GEN_MASK;
++	/*
++	 * spte bits 3-11 are used as bits 0-8 of the generation number,
++	 * the bits 52-61 are used as bits 9-18 of the generation number.
++	 *
++	 * 给定一个spte, 获得其中的mmio generation
++	 * 把spte的3-11位和52-61位取出来拼在一起, 组成gen
++	 */
+ 	spte_gen = get_mmio_spte_generation(spte);
+ 
+ 	trace_check_mmio_spte(spte, kvm_gen, spte_gen);
+@@ -455,6 +1138,36 @@ static bool check_mmio_spte(struct kvm_vcpu *vcpu, u64 spte)
+  *  - Setting either @accessed_mask or @dirty_mask requires setting both
+  *  - At least one of @accessed_mask or @acc_track_mask must be set
+  */
++/*
++ * 第一次:
++ * [0] kvm_mmu_set_mask_ptes
++ * [0] kvm_arch_init [kvm]
++ * [0] kvm_init [kvm]
++ * [0] vmx_init [kvm_intel]
++ * [0] do_one_initcall
++ * [0] do_init_module
++ * [0] load_module
++ * [0] __do_sys_finit_module
++ * [0] do_syscall_64
++ * [0] entry_SYSCALL_64_after_hwframe
++ *
++ * 第二次:
++ * [0] kvm_mmu_set_mask_ptes
++ * [0] hardware_setup [kvm_intel]
++ * [0] kvm_arch_hardware_setup [kvm]
++ * [0] kvm_init [kvm]
++ * [0] vmx_init [kvm_intel]
++ * [0] do_one_initcall
++ * [0] do_init_module
++ * [0] load_module
++ * [0] __do_sys_finit_module
++ * [0] do_syscall_64
++ * [0] entry_SYSCALL_64_after_hwframe
++ *
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|5289| <<vmx_enable_tdp>> kvm_mmu_set_mask_ptes(VMX_EPT_READABLE_MASK,
++ *   - arch/x86/kvm/x86.c|7070| <<kvm_arch_init>> kvm_mmu_set_mask_ptes(PT_USER_MASK, PT_ACCESSED_MASK,
++ */
+ void kvm_mmu_set_mask_ptes(u64 user_mask, u64 accessed_mask,
+ 		u64 dirty_mask, u64 nx_mask, u64 x_mask, u64 p_mask,
+ 		u64 acc_track_mask, u64 me_mask)
+@@ -463,6 +1176,50 @@ void kvm_mmu_set_mask_ptes(u64 user_mask, u64 accessed_mask,
+ 	BUG_ON(!accessed_mask && !acc_track_mask);
+ 	BUG_ON(acc_track_mask & shadow_acc_track_value);
+ 
++	/*
++	 * 第一次从kvm_arch_init()进入new machine的结果:
++	 *   shadow_user_mask = 0x0000000000000004
++	 *   shadow_accessed_mask = 0x0000000000000020
++	 *   shadow_dirty_mask = 0x0000000000000040
++	 *   shadow_nx_mask = 0x8000000000000000
++	 *   shadow_x_mask = 0x0000000000000000
++	 *   shadow_present_mask = 0x0000000000000001
++	 *   shadow_acc_track_mask = 0x0000000000000000
++	 *   shadow_me_mask = 0x0000000000000000
++	 *
++	 * 第二次从vmx_enable_tdp()进入new machine的结果:
++	 *   shadow_user_mask = 0x0000000000000001
++	 *   shadow_accessed_mask = 0x0000000000000100
++	 *   shadow_dirty_mask = 0x0000000000000200
++	 *   shadow_nx_mask = 0x0000000000000000
++	 *   shadow_x_mask = 0x0000000000000004
++	 *   shadow_present_mask = 0x0000000000000000
++	 *   shadow_acc_track_mask = 0x0000000000000007
++	 *   shadow_me_mask = 0x0000000000000000
++	 */
++
++	/*
++	 * 从kvm_arch_init()进来的结果:
++	 *   shadow_user_mask = PT_USER_MASK;
++	 *   shadow_accessed_mask = PT_ACCESSED_MASK;
++	 *   shadow_dirty_mask = PT_DIRTY_MASK;
++	 *   shadow_nx_mask = PT64_NX_MASK;
++	 *   shadow_x_mask = 0;
++	 *   shadow_present_mask = PT_PRESENT_MASK;
++	 *   shadow_acc_track_mask = 0;
++	 *   shadow_me_mask = sme_me_mask;
++	 *
++	 * 从vmx_enable_tdp()进来的结果:
++	 *   shadow_user_mask = VMX_EPT_READABLE_MASK;
++	 *   shadow_accessed_mask = enable_ept_ad_bits ? VMX_EPT_ACCESS_BIT : 0ull;
++	 *   shadow_dirty_mask = enable_ept_ad_bits ? VMX_EPT_DIRTY_BIT : 0ull,
++	 *   shadow_nx_mask = 0ull;
++	 *   shadow_x_mask = VMX_EPT_EXECUTABLE_MASK;
++	 *   shadow_present_mask = cpu_has_vmx_ept_execute_only() ? 0ull : VMX_EPT_READABLE_MASK;
++	 *   shadow_acc_track_mask = VMX_EPT_RWX_MASK;
++	 *   shadow_me_mask = 0ull;
++	 */
++
+ 	shadow_user_mask = user_mask;
+ 	shadow_accessed_mask = accessed_mask;
+ 	shadow_dirty_mask = dirty_mask;
+@@ -474,6 +1231,12 @@ void kvm_mmu_set_mask_ptes(u64 user_mask, u64 accessed_mask,
+ }
+ EXPORT_SYMBOL_GPL(kvm_mmu_set_mask_ptes);
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|597| <<kvm_mmu_reset_all_pte_masks>> shadow_phys_bits = kvm_get_shadow_phys_bits();
++ *
++ * 在new machine上kvm_get_shadow_phys_bits()返回39
++ */
+ static u8 kvm_get_shadow_phys_bits(void)
+ {
+ 	/*
+@@ -489,6 +1252,19 @@ static u8 kvm_get_shadow_phys_bits(void)
+ 	return cpuid_eax(0x80000008) & 0xff;
+ }
+ 
++/*
++ * [0] kvm_mmu_reset_all_pte_masks
++ * [0] kvm_mmu_module_init [kvm]
++ * [0] kvm_arch_init [kvm]
++ * [0] kvm_init [kvm]
++ * [0] vmx_init [kvm_intel]
++ * [0] do_one_initcall
++ * [0] do_init_module
++ * [0] load_module
++ * [0] __do_sys_finit_module
++ * [0] do_syscall_64
++ * [0] entry_SYSCALL_64_after_hwframe
++ */
+ static void kvm_mmu_reset_all_pte_masks(void)
+ {
+ 	u8 low_phys_bits;
+@@ -515,6 +1291,11 @@ static void kvm_mmu_reset_all_pte_masks(void)
+ 	 * the most significant bits of legal physical address space.
+ 	 */
+ 	shadow_nonpresent_or_rsvd_mask = 0;
++	/*
++	 * 在new machine上:
++	 *   shadow_phys_bits = 39
++	 *   low_phys_bits = 44
++	 */
+ 	low_phys_bits = boot_cpu_data.x86_cache_bits;
+ 	if (boot_cpu_data.x86_cache_bits <
+ 	    52 - shadow_nonpresent_or_rsvd_mask_len) {
+@@ -540,30 +1321,66 @@ static int is_nx(struct kvm_vcpu *vcpu)
+ 	return vcpu->arch.efer & EFER_NX;
+ }
+ 
++/*
++ * 如果pte不为0并且pte的最后3位不是110并且62位(SPTE_SPECIAL_MASK)也没设置, 返回true
++ * 如果spte是0x0,或者spte的最后3位是110(62位也设置了), 函数返回false
++ * 或者说, 如果spte是0或者是mmio, is_shadow_present_pte()返回false
++ */
+ static int is_shadow_present_pte(u64 pte)
+ {
++	/*
++	 * 如果最后3位的最后1位没设置(110)并且还有SPTE_SPECIAL_MASK是1往左移62位,
++	 * 就是mmio的spte
++	 */
+ 	return (pte != 0) && !is_mmio_spte(pte);
+ }
+ 
++/*
++ * 查看pte的从0开始数第7位, 判断是否支持大页
++ */
+ static int is_large_pte(u64 pte)
+ {
++	/*
++	 * 1后面跟着7个0
++	 * 从0开始数是第7位
++	 */
+ 	return pte & PT_PAGE_SIZE_MASK;
+ }
+ 
++/*
++ * 判断是否指向最后一级页表了(4K/2M/1G), 而不是下一级页表
++ */
+ static int is_last_spte(u64 pte, int level)
+ {
+ 	if (level == PT_PAGE_TABLE_LEVEL)
+ 		return 1;
++	/* 查看pte的从0开始数第7位, 判断是否支持大页 */
+ 	if (is_large_pte(pte))
+ 		return 1;
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|4238| <<is_access_allowed>> return is_executable_pte(spte);
++ *
++ * 判断spte的从0开始的第3位(exec)是否设置了
++ */
+ static bool is_executable_pte(u64 spte)
+ {
++	/*
++	 * hadow_nx_mask在vmx下是0x0
++	 * shadow_x_mask在vmx下是VMX_EPT_EXECUTABLE_MASK
++	 *
++	 * 相当于在vmx上是:
++	 *   return (spte & (0x4 | 0x1)) == 0x1
++	 */
+ 	return (spte & (shadow_x_mask | shadow_nx_mask)) == shadow_x_mask;
+ }
+ 
++/*
++ * 根据pte中的内容获得gfn
++ */
+ static kvm_pfn_t spte_to_pfn(u64 pte)
+ {
+ 	return (pte & PT64_BASE_ADDR_MASK) >> PAGE_SHIFT;
+@@ -577,26 +1394,36 @@ static gfn_t pse36_gfn_delta(u32 gpte)
+ }
+ 
+ #ifdef CONFIG_X86_64
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|1058| <<mmu_spte_set>> __set_spte(sptep, new_spte);
++ *
++ * 用WRITE_ONCE(*sptep, spte)更新spte
++ */
+ static void __set_spte(u64 *sptep, u64 spte)
+ {
+ 	WRITE_ONCE(*sptep, spte);
+ }
+ 
++/* 用WRITE_ONCE(*sptep, spte)更新spte */
+ static void __update_clear_spte_fast(u64 *sptep, u64 spte)
+ {
+ 	WRITE_ONCE(*sptep, spte);
+ }
+ 
++/* 用xchg(sptep, spte)更新spte */
+ static u64 __update_clear_spte_slow(u64 *sptep, u64 spte)
+ {
+ 	return xchg(sptep, spte);
+ }
+ 
++/* 用READ_ONCE(*sptep)读取spte的内容 */
+ static u64 __get_spte_lockless(u64 *sptep)
+ {
+ 	return READ_ONCE(*sptep);
+ }
+ #else
++/* 不是CONFIG_X86_64使用 */
+ union split_spte {
+ 	struct {
+ 		u32 spte_low;
+@@ -605,6 +1432,7 @@ union split_spte {
+ 	u64 spte;
+ };
+ 
++/* 不是CONFIG_X86_64使用 */
+ static void count_spte_clear(u64 *sptep, u64 spte)
+ {
+ 	struct kvm_mmu_page *sp =  page_header(__pa(sptep));
+@@ -617,6 +1445,7 @@ static void count_spte_clear(u64 *sptep, u64 spte)
+ 	sp->clear_spte_count++;
+ }
+ 
++/* 不是CONFIG_X86_64使用 */
+ static void __set_spte(u64 *sptep, u64 spte)
+ {
+ 	union split_spte *ssptep, sspte;
+@@ -636,6 +1465,7 @@ static void __set_spte(u64 *sptep, u64 spte)
+ 	WRITE_ONCE(ssptep->spte_low, sspte.spte_low);
+ }
+ 
++/* 不是CONFIG_X86_64使用 */
+ static void __update_clear_spte_fast(u64 *sptep, u64 spte)
+ {
+ 	union split_spte *ssptep, sspte;
+@@ -655,6 +1485,7 @@ static void __update_clear_spte_fast(u64 *sptep, u64 spte)
+ 	count_spte_clear(sptep, spte);
+ }
+ 
++/* 不是CONFIG_X86_64使用 */
+ static u64 __update_clear_spte_slow(u64 *sptep, u64 spte)
+ {
+ 	union split_spte *ssptep, sspte, orig;
+@@ -689,6 +1520,7 @@ static u64 __update_clear_spte_slow(u64 *sptep, u64 spte)
+  * present->non-present updates: if it changed while reading the spte,
+  * we might have hit the race.  This is done using clear_spte_count.
+  */
++/* 不是CONFIG_X86_64使用 */
+ static u64 __get_spte_lockless(u64 *sptep)
+ {
+ 	struct kvm_mmu_page *sp =  page_header(__pa(sptep));
+@@ -713,14 +1545,40 @@ static u64 __get_spte_lockless(u64 *sptep)
+ }
+ #endif
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|1475| <<spte_has_volatile_bits>> if (spte_can_locklessly_be_made_writable(spte) ||
++ *   - arch/x86/kvm/mmu.c|1575| <<mmu_spte_update>> if (spte_can_locklessly_be_made_writable(old_spte) &&
++ *   - arch/x86/kvm/mmu.c|1663| <<mark_spte_for_access_track>> !spte_can_locklessly_be_made_writable(spte),
++ *   - arch/x86/kvm/mmu.c|2313| <<spte_write_protect>> !(pt_protect && spte_can_locklessly_be_made_writable(spte)))
++ *   - arch/x86/kvm/mmu.c|4207| <<fast_page_fault>> spte_can_locklessly_be_made_writable(spte))
++ *
++ * 测试spte的第11位和第12位是否是1
++ *
++ * SPTE_HOST_WRITEABLE means the gfn is writable on host.
++ *
++ * SPTE_MMU_WRITEABLE means the gfn is writable on mmu. The bit is set when
++ * the gfn is writable on guest mmu and it is not write-protected by shadow
++ * page write-protection.
++ */
+ static bool spte_can_locklessly_be_made_writable(u64 spte)
+ {
+ 	return (spte & (SPTE_HOST_WRITEABLE | SPTE_MMU_WRITEABLE)) ==
+ 		(SPTE_HOST_WRITEABLE | SPTE_MMU_WRITEABLE);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|1557| <<mmu_spte_update_no_track>> if (!spte_has_volatile_bits(old_spte))
++ *   - arch/x86/kvm/mmu.c|1624| <<mmu_spte_clear_track_bits>> if (!spte_has_volatile_bits(old_spte))
++ */
+ static bool spte_has_volatile_bits(u64 spte)
+ {
++	/*
++	 * 如果pte不为0并且pte的最后3位不是110并且62位(SPTE_SPECIAL_MASK)也没设置, 返回true
++	 * 如果spte是0x0,或者spte的最后3位是110(62位也设置了), 函数返回false
++	 * 或者说, 如果spte是0或者是mmio, is_shadow_present_pte()返回false
++	 */
+ 	if (!is_shadow_present_pte(spte))
+ 		return false;
+ 
+@@ -730,10 +1588,23 @@ static bool spte_has_volatile_bits(u64 spte)
+ 	 * also, it can help us to get a stable is_writable_pte()
+ 	 * to ensure tlb flush is not missed.
+ 	 */
++	/*
++	 * spte_can_locklessly_be_made_writable():
++	 * 测试spte的第11位和第12位是否是1 (SPTE_HOST_WRITEABLE和SPTE_MMU_WRITEABLE)
++	 *
++	 * is_access_track_spte():
++	 * 如果spte的SPTE_SPECIAL_MASK=1<<62设置了(说明ad不支持),
++	 * 并且spte在shadow_acc_track_mask中的bit都没设置
++	 * 则返回true (如果返回true说明ad bit不支持)
++	 */
+ 	if (spte_can_locklessly_be_made_writable(spte) ||
+ 	    is_access_track_spte(spte))
+ 		return true;
+ 
++	/*
++	 * spte_ad_enabled():
++	 * 如果spte的SPTE_SPECIAL_MASK=1<<62设置了, 说明ad不支持, 没enabled, 返回false
++	 */
+ 	if (spte_ad_enabled(spte)) {
+ 		if ((spte & shadow_accessed_mask) == 0 ||
+ 	    	    (is_writable_pte(spte) && (spte & shadow_dirty_mask) == 0))
+@@ -743,16 +1614,48 @@ static bool spte_has_volatile_bits(u64 spte)
+ 	return false;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|1709| <<mmu_spte_update>> if (is_accessed_spte(old_spte) && !is_accessed_spte(new_spte)) {
++ *   - arch/x86/kvm/mmu.c|1750| <<mmu_spte_clear_track_bits>> if (is_accessed_spte(old_spte))
++ *   - arch/x86/kvm/mmu.c|1835| <<mmu_spte_age>> if (!is_accessed_spte(spte))
++ *   - arch/x86/kvm/mmu.c|2888| <<kvm_test_age_rmapp>> if (is_accessed_spte(*sptep))
++ *
++ * 如果spte的SPTE_SPECIAL_MASK=1<<62设置了, 说明ad不支持, 返回!is_access_track_spte(spte)
++ * 支持ad bit的时候返回access bit是否设置
++ */
+ static bool is_accessed_spte(u64 spte)
+ {
++	/*
++	 * 如果spte的SPTE_SPECIAL_MASK=1<<62设置了, 说明ad不支持, 返回0
++	 * 如果没设置, 说明pte支持ad bit, 所以返回shadow_accessed_mask
++	 */
+ 	u64 accessed_mask = spte_shadow_accessed_mask(spte);
+ 
++	/*
++	 * is_access_track_spte():
++	 * 如果spte的SPTE_SPECIAL_MASK=1<<62设置了(说明ad不支持),
++	 * 并且spte在shadow_acc_track_mask中的bit都没设置
++	 * 则返回true (如果返回true说明ad bit不支持)
++	 */
+ 	return accessed_mask ? spte & accessed_mask
+ 			     : !is_access_track_spte(spte);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|1714| <<mmu_spte_update>> if (is_dirty_spte(old_spte) && !is_dirty_spte(new_spte)) {
++ *   - arch/x86/kvm/mmu.c|1753| <<mmu_spte_clear_track_bits>> if (is_dirty_spte(old_spte))
++ *
++ * 如果支持ad, 返回spte & shadow_dirty_mask
++ * 如果不支持ad, 返回spte & PT_WRITABLE_MASK, 也就是spte的write bit
++ */
+ static bool is_dirty_spte(u64 spte)
+ {
++	/*
++	 * 如果spte的SPTE_SPECIAL_MASK=1<<62设置了, 说明ad不支持, 返回0
++	 * 如果没设置, 说明pte支持ad bit, 所以返回shadow_dirty_mask
++	 */
+ 	u64 dirty_mask = spte_shadow_dirty_mask(spte);
+ 
+ 	return dirty_mask ? spte & dirty_mask : spte & PT_WRITABLE_MASK;
+@@ -764,9 +1667,20 @@ static bool is_dirty_spte(u64 spte)
+  * or in a state where the hardware will not attempt to update
+  * the spte.
+  */
++/*
++ * 核心就是用WRITE_ONCE(*sptep, spte)更新spte
++ */
+ static void mmu_spte_set(u64 *sptep, u64 new_spte)
+ {
++	/*
++	 * 如果pte不为0并且pte的最后3位不是110并且62位(SPTE_SPECIAL_MASK)也没设置, 返回true
++	 * 如果spte是0x0,或者spte的最后3位是110(62位也设置了), 函数返回false
++	 * 或者说, 如果spte是0或者是mmio, is_shadow_present_pte()返回false
++	 */
+ 	WARN_ON(is_shadow_present_pte(*sptep));
++	/*
++	 * 用WRITE_ONCE(*sptep, spte)更新spte
++	 */
+ 	__set_spte(sptep, new_spte);
+ }
+ 
+@@ -774,17 +1688,45 @@ static void mmu_spte_set(u64 *sptep, u64 new_spte)
+  * Update the SPTE (excluding the PFN), but do not track changes in its
+  * accessed/dirty status.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|1690| <<mmu_spte_update>> u64 old_spte = mmu_spte_update_no_track(sptep, new_spte);
++ *   - arch/x86/kvm/mmu.c|1850| <<mmu_spte_age>> mmu_spte_update_no_track(sptep, spte);
++ *
++ * Update the SPTE (excluding the PFN), but do not track changes in its
++ * accessed/dirty status.
++ * 根据是否有volatile bits用WRITE_ONCE(*sptep, spte)或者xchg(sptep, spte)更新spte
++ * 核心思想就是把new_spte拷贝到sptep, 返回旧的pte
++ */
+ static u64 mmu_spte_update_no_track(u64 *sptep, u64 new_spte)
+ {
+ 	u64 old_spte = *sptep;
+ 
++	/*
++	 * 如果pte不为0并且pte的最后3位不是110并且62位(SPTE_SPECIAL_MASK)也没设置, 返回true
++	 * 如果spte是0x0,或者spte的最后3位是110(62位也设置了), 函数返回false
++	 * 或者说, 如果spte是0或者是mmio, is_shadow_present_pte()返回false
++	 */
+ 	WARN_ON(!is_shadow_present_pte(new_spte));
+ 
++	/*
++	 * 如果pte不为0并且pte的最后3位不是110并且62位(SPTE_SPECIAL_MASK)也没设置, 返回true
++	 * 如果spte是0x0,或者spte的最后3位是110(62位也设置了), 函数返回false
++	 * 或者说, 如果spte是0或者是mmio, is_shadow_present_pte()返回false
++	 */
+ 	if (!is_shadow_present_pte(old_spte)) {
++		/* 核心就是用WRITE_ONCE(*sptep, spte)更新spte */
+ 		mmu_spte_set(sptep, new_spte);
+ 		return old_spte;
+ 	}
+ 
++	/*
++	 * __update_clear_spte_fast():
++	 * 用WRITE_ONCE(*sptep, spte)更新spte
++	 *
++	 * __update_clear_spte_slow():
++	 * 用xchg(sptep, spte)更新spte
++	 */
+ 	if (!spte_has_volatile_bits(old_spte))
+ 		__update_clear_spte_fast(sptep, new_spte);
+ 	else
+@@ -806,11 +1748,32 @@ static u64 mmu_spte_update_no_track(u64 *sptep, u64 new_spte)
+  *
+  * Returns true if the TLB needs to be flushed
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|2508| <<spte_write_protect>> return mmu_spte_update(sptep, spte);
++ *   - arch/x86/kvm/mmu.c|2533| <<spte_clear_dirty>> return mmu_spte_update(sptep, spte);
++ *   - arch/x86/kvm/mmu.c|2575| <<spte_set_dirty>> return mmu_spte_update(sptep, spte);
++ *   - arch/x86/kvm/mmu.c|3981| <<set_spte>> if (mmu_spte_update(sptep, spte))
++ *
++ * update the SPTE (excluding the PFN), but do not track changes in its
++ * accessed/dirty status.
++ * 根据是否有volatile bits用WRITE_ONCE(*sptep, spte)或者xchg(sptep, spte)更新spte
++ * 然后再根据情况(access和dirty)决定是否flush并返回决定的结果true/false
++ */
+ static bool mmu_spte_update(u64 *sptep, u64 new_spte)
+ {
+ 	bool flush = false;
++	/*
++	 * Update the SPTE (excluding the PFN), but do not track changes in its
++	 * accessed/dirty status.
++	 */
+ 	u64 old_spte = mmu_spte_update_no_track(sptep, new_spte);
+ 
++	/*
++	 * 如果pte不为0并且pte的最后3位不是110并且62位(SPTE_SPECIAL_MASK)也没设置, 返回true
++	 * 如果spte是0x0,或者spte的最后3位是110(62位也设置了), 函数返回false
++	 * 或者说, 如果spte是0或者是mmio, is_shadow_present_pte()返回false
++	 */
+ 	if (!is_shadow_present_pte(old_spte))
+ 		return false;
+ 
+@@ -847,19 +1810,42 @@ static bool mmu_spte_update(u64 *sptep, u64 new_spte)
+  * state bits, it is used to clear the last level sptep.
+  * Returns non-zero if the PTE was previously valid.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|2320| <<pte_list_remove>> mmu_spte_clear_track_bits(sptep);
++ *   - arch/x86/kvm/mmu.c|2453| <<drop_spte>> if (mmu_spte_clear_track_bits(sptep))
++ *   - arch/x86/kvm/mmu.c|2759| <<kvm_set_pte_rmapp>> mmu_spte_clear_track_bits(sptep);
++ *
++ * 根据是否有volatile bits用WRITE_ONCE(*sptep, spte)或者xchg(sptep, spte)更新spte为0!
++ * 如果之前如果spte是0或者是mmio, 则退出返回0
++ * 否则根据情况把pfn在host的struct page设置accessed或者dirty返回1
++ */
+ static int mmu_spte_clear_track_bits(u64 *sptep)
+ {
+ 	kvm_pfn_t pfn;
+ 	u64 old_spte = *sptep;
+ 
++	/*
++	 * __update_clear_spte_fast():
++	 * 用WRITE_ONCE(*sptep, spte)更新spte
++	 *
++	 * __update_clear_spte_slow()
++	 * 用xchg(sptep, spte)更新spte
++	 */
+ 	if (!spte_has_volatile_bits(old_spte))
+ 		__update_clear_spte_fast(sptep, 0ull);
+ 	else
+ 		old_spte = __update_clear_spte_slow(sptep, 0ull);
+ 
++	/*
++	 * 如果pte不为0并且pte的最后3位不是110并且62位(SPTE_SPECIAL_MASK)也没设置, 返回true
++	 * 如果spte是0x0,或者spte的最后3位是110(62位也设置了), 函数返回false
++	 * 或者说, 如果spte是0或者是mmio, is_shadow_present_pte()返回false
++	 */
+ 	if (!is_shadow_present_pte(old_spte))
+ 		return 0;
+ 
++	/* 根据pte中的内容获得gfn */
+ 	pfn = spte_to_pfn(old_spte);
+ 
+ 	/*
+@@ -883,21 +1869,58 @@ static int mmu_spte_clear_track_bits(u64 *sptep)
+  * Directly clear spte without caring the state bits of sptep,
+  * it is used to set the upper level spte.
+  */
++/*
++ * 用WRITE_ONCE(*sptep, spte)更新spte为0ull
++ */
+ static void mmu_spte_clear_no_track(u64 *sptep)
+ {
++	/* 用WRITE_ONCE(*sptep, spte)更新spte */
+ 	__update_clear_spte_fast(sptep, 0ull);
+ }
+ 
++/*
++ * 用READ_ONCE(*sptep)读取spte的内容
++ */
+ static u64 mmu_spte_get_lockless(u64 *sptep)
+ {
++	/* 用READ_ONCE(*sptep)读取spte的内容 */
+ 	return __get_spte_lockless(sptep);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|1753| <<mmu_spte_age>> spte = mark_spte_for_access_track(spte);
++ *   - arch/x86/kvm/mmu.c|2618| <<kvm_set_pte_rmapp>> new_spte = mark_spte_for_access_track(new_spte);
++ *   - arch/x86/kvm/mmu.c|3839| <<set_spte>> spte = mark_spte_for_access_track(spte);
++ *
++ * 如果ept支持ad bit, 直接清空spte的access bit就可以了
++ * 否则把第0位和第2位 (r+x) 保存在52位之后, 清除最后的3位
++ */
+ static u64 mark_spte_for_access_track(u64 spte)
+ {
++	/*
++	 * spte_ad_enabled():
++	 * 如果spte的SPTE_SPECIAL_MASK=1<<62设置了, 说明ad不支持, 没enabled, 返回false
++	 *
++	 * shadow_accessed_mask
++	 * 在new machine上从vmx_enable_tdp()第二次进来的结果:
++	 *   shadow_accessed_mask = enable_ept_ad_bits ? VMX_EPT_ACCESS_BIT : 0ull;
++	 *   也就是0x0000000000000100
++	 *
++	 * 如果ept支持ad bit, 直接清空spte的access bit就可以了
++	 */
+ 	if (spte_ad_enabled(spte))
+ 		return spte & ~shadow_accessed_mask;
+ 
++	/*
++	 * 下面应该就是ept不支持ad bit的情况了
++	 */
++
++	/*
++	 * 如果spte的SPTE_SPECIAL_MASK=1<<62设置了(说明ad不支持),
++	 * 并且spte在shadow_acc_track_mask中的bit都没设置
++	 * 则返回true (如果返回true说明ad bit不支持)
++	 */
+ 	if (is_access_track_spte(spte))
+ 		return spte;
+ 
+@@ -914,39 +1937,88 @@ static u64 mark_spte_for_access_track(u64 spte)
+ 			  shadow_acc_track_saved_bits_shift),
+ 		  "kvm: Access Tracking saved bit locations are not zero\n");
+ 
++	/* 把第0位和第2位 (r+x) 保存在52位之后 */
+ 	spte |= (spte & shadow_acc_track_saved_bits_mask) <<
+ 		shadow_acc_track_saved_bits_shift;
++	/*
++	 * 清除最后的3位
++	 * 上面已经把第0位和第2位 (r+x) 保存在52位之后
++	 */
+ 	spte &= ~shadow_acc_track_mask;
+ 
+ 	return spte;
+ }
+ 
+ /* Restore an acc-track PTE back to a regular PTE */
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|4246| <<fast_page_fault>> new_spte = restore_acc_track_spte(new_spte);
++ *
++ * Restore an acc-track PTE back to a regular PTE
++ * 把52位之后临时保存的的r+x清空
++ * 把52位之后临时保存的的r+x设置回来
++ */
+ static u64 restore_acc_track_spte(u64 spte)
+ {
+ 	u64 new_spte = spte;
++	/*
++	 * shadow_acc_track_saved_bits_shift是52
++	 *
++	 * shadow_acc_track_saved_bits_mask是第0位和第2位 (read and exec)是1
++	 *
++	 * 把保存在52位开始的第0位和第2位保存到saved_bits
++	 */
+ 	u64 saved_bits = (spte >> shadow_acc_track_saved_bits_shift)
+ 			 & shadow_acc_track_saved_bits_mask;
+ 
+ 	WARN_ON_ONCE(spte_ad_enabled(spte));
+ 	WARN_ON_ONCE(!is_access_track_spte(spte));
+ 
++	/*
++	 * 在new machine上shadow_acc_track_mask是111, 也就是7
++	 * 这里是清空最后3位
++	 */
+ 	new_spte &= ~shadow_acc_track_mask;
++	/*
++	 * 这里清空52位开始的第0位和第2位
++	 */
+ 	new_spte &= ~(shadow_acc_track_saved_bits_mask <<
+ 		      shadow_acc_track_saved_bits_shift);
++	/*
++	 * 把52位开始的第0位和第2位放入pte的第0位和第2位
++	 */
+ 	new_spte |= saved_bits;
+ 
+ 	return new_spte;
+ }
+ 
+ /* Returns the Accessed status of the PTE and resets it at the same time. */
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|3176| <<kvm_age_rmapp>> young |= mmu_spte_age(sptep);
++ *
++ * 清空pte的access
++ * 如果支持硬件a/d直接把对应的bit清空就可以了
++ * 否则把第0位和第2位 (r+x) 保存在52位之后, 清除最后的3位
++ */
+ static bool mmu_spte_age(u64 *sptep)
+ {
++	/*
++	 * 用READ_ONCE(*sptep)读取spte的内容
++	 */
+ 	u64 spte = mmu_spte_get_lockless(sptep);
+ 
++	/*
++	 * 如果spte的SPTE_SPECIAL_MASK=1<<62设置了, 说明ad不支持, 返回!is_access_track_spte(spte)
++	 * 支持ad bit的时候返回access bit是否设置
++	 */
+ 	if (!is_accessed_spte(spte))
+ 		return false;
+ 
++	/*
++	 * spte_ad_enabled():
++	 * 如果spte的SPTE_SPECIAL_MASK=1<<62设置了, 说明ad不支持, 没enabled, 返回false
++	 */
+ 	if (spte_ad_enabled(spte)) {
+ 		clear_bit((ffs(shadow_accessed_mask) - 1),
+ 			  (unsigned long *)sptep);
+@@ -958,13 +2030,31 @@ static bool mmu_spte_age(u64 *sptep)
+ 		if (is_writable_pte(spte))
+ 			kvm_set_pfn_dirty(spte_to_pfn(spte));
+ 
++		/*
++		 * 如果ept支持ad bit, 直接清空spte的access bit就可以了
++		 * 否则把第0位和第2位 (r+x) 保存在52位之后, 清除最后的3位
++		 */
+ 		spte = mark_spte_for_access_track(spte);
++		/*
++		 * Update the SPTE (excluding the PFN), but do not track changes in its
++		 * accessed/dirty status.
++		 * 根据是否有volatile bits用WRITE_ONCE(*sptep, spte)或者xchg(sptep, spte)更新spte
++		 * 核心思想就是把new_spte拷贝到sptep, 返回旧的pte
++		 */
+ 		mmu_spte_update_no_track(sptep, spte);
+ 	}
+ 
+ 	return true;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|4353| <<fast_page_fault>> walk_shadow_page_lockless_begin(vcpu);
++ *   - arch/x86/kvm/mmu.c|4850| <<walk_shadow_page_get_mmio_spte>> walk_shadow_page_lockless_begin(vcpu);
++ *   - arch/x86/kvm/mmu.c|4950| <<shadow_page_table_clear_flood>> walk_shadow_page_lockless_begin(vcpu);
++ *
++ * 关闭中断, 把READING_SHADOW_PAGE_TABLES存入vcpu->mode
++ */
+ static void walk_shadow_page_lockless_begin(struct kvm_vcpu *vcpu)
+ {
+ 	/*
+@@ -977,9 +2067,20 @@ static void walk_shadow_page_lockless_begin(struct kvm_vcpu *vcpu)
+ 	 * Make sure a following spte read is not reordered ahead of the write
+ 	 * to vcpu->mode.
+ 	 */
++	/*
++	 * x86只在这里使用READING_SHADOW_PAGE_TABLES
++	 */
+ 	smp_store_mb(vcpu->mode, READING_SHADOW_PAGE_TABLES);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|4438| <<fast_page_fault>> walk_shadow_page_lockless_end(vcpu);
++ *   - arch/x86/kvm/mmu.c|4868| <<walk_shadow_page_get_mmio_spte>> walk_shadow_page_lockless_end(vcpu);
++ *   - arch/x86/kvm/mmu.c|4956| <<shadow_page_table_clear_flood>> walk_shadow_page_lockless_end(vcpu);
++ *
++ * 把OUTSIDE_GUEST_MODE存入vcpu->mode, 开启中断
++ */
+ static void walk_shadow_page_lockless_end(struct kvm_vcpu *vcpu)
+ {
+ 	/*
+@@ -987,10 +2088,24 @@ static void walk_shadow_page_lockless_end(struct kvm_vcpu *vcpu)
+ 	 * reads to sptes.  If it does, kvm_mmu_commit_zap_page() can see us
+ 	 * OUTSIDE_GUEST_MODE and proceed to free the shadow page table.
+ 	 */
++	/*
++	 * x86下使用OUTSIDE_GUEST_MODE的地方:
++	 *   - arch/x86/kvm/mmu.c|1963| <<walk_shadow_page_lockless_end>> smp_store_release(&vcpu->mode, OUTSIDE_GUEST_MODE);
++	 *   - arch/x86/kvm/x86.c|8001| <<vcpu_enter_guest>> vcpu->mode = OUTSIDE_GUEST_MODE;
++	 *   - arch/x86/kvm/x86.c|8060| <<vcpu_enter_guest>> vcpu->mode = OUTSIDE_GUEST_MODE;
++	 *   - virt/kvm/kvm_main.c|202| <<kvm_request_needs_ipi>> return mode != OUTSIDE_GUEST_MODE;
++	 */
+ 	smp_store_release(&vcpu->mode, OUTSIDE_GUEST_MODE);
+ 	local_irq_enable();
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|2021| <<mmu_topup_memory_caches>> r = mmu_topup_memory_cache(&vcpu->arch.mmu_pte_list_desc_cache,
++ *   - arch/x86/kvm/mmu.c|2028| <<mmu_topup_memory_caches>> r = mmu_topup_memory_cache(&vcpu->arch.mmu_page_header_cache,
++ *
++ * 核心就是分配, 然后放入cache->objects[cache->nobjs++] = obj
++ */
+ static int mmu_topup_memory_cache(struct kvm_mmu_memory_cache *cache,
+ 				  struct kmem_cache *base_cache, int min)
+ {
+@@ -1067,6 +2182,16 @@ static void mmu_free_memory_caches(struct kvm_vcpu *vcpu)
+ 				mmu_page_header_cache);
+ }
+ 
++/*
++ * x86下的调用:
++ *   - arch/x86/kvm/mmu.c|2059| <<mmu_alloc_pte_list_desc>> return mmu_memory_cache_alloc(&vcpu->arch.mmu_pte_list_desc_cache);
++ *   - arch/x86/kvm/mmu.c|3083| <<kvm_mmu_alloc_page>> sp = mmu_memory_cache_alloc(&vcpu->arch.mmu_page_header_cache);
++ *   - arch/x86/kvm/mmu.c|3084| <<kvm_mmu_alloc_page>> sp->spt = mmu_memory_cache_alloc(&vcpu->arch.mmu_page_cache);
++ *   - arch/x86/kvm/mmu.c|3086| <<kvm_mmu_alloc_page>> sp->gfns = mmu_memory_cache_alloc(&vcpu->arch.mmu_page_cache);
++ *
++ * 获得p = mc->objects[--mc->nobjs]并返回
++ * mc->nobjs是可用的数目
++ */
+ static void *mmu_memory_cache_alloc(struct kvm_mmu_memory_cache *mc)
+ {
+ 	void *p;
+@@ -1076,24 +2201,66 @@ static void *mmu_memory_cache_alloc(struct kvm_mmu_memory_cache *mc)
+ 	return p;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|2236| <<pte_list_add>> desc = mmu_alloc_pte_list_desc(vcpu);
++ *   - arch/x86/kvm/mmu.c|2249| <<pte_list_add>> desc->more = mmu_alloc_pte_list_desc(vcpu);
++ *
++ * 分配一个pte_list_desc
++ */
+ static struct pte_list_desc *mmu_alloc_pte_list_desc(struct kvm_vcpu *vcpu)
+ {
++	/*
++	 * 获得p = mc->objects[--mc->nobjs]并返回
++	 * mc->nobjs是可用的数目
++	 */
+ 	return mmu_memory_cache_alloc(&vcpu->arch.mmu_pte_list_desc_cache);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|2326| <<pte_list_desc_remove_entry>> mmu_free_pte_list_desc(desc);
++ *
++ * 回收一个pte_list_desc
++ */
+ static void mmu_free_pte_list_desc(struct pte_list_desc *pte_list_desc)
+ {
+ 	kmem_cache_free(pte_list_desc_cache, pte_list_desc);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|2219| <<kvm_mmu_page_set_gfn>> if (WARN_ON(gfn != kvm_mmu_page_get_gfn(sp, index)))
++ *   - arch/x86/kvm/mmu.c|2223| <<kvm_mmu_page_set_gfn>> kvm_mmu_page_get_gfn(sp, index), gfn);
++ *   - arch/x86/kvm/mmu.c|2629| <<rmap_remove>> gfn = kvm_mmu_page_get_gfn(sp, spte - sp->spt);
++ *   - arch/x86/kvm/mmu.c|4352| <<direct_pte_prefetch_many>> gfn = kvm_mmu_page_get_gfn(sp, start - sp->spt);
++ *   - arch/x86/kvm/mmu.c|4591| <<fast_pf_fix_direct_spte>> gfn = kvm_mmu_page_get_gfn(sp, sptep - sp->spt);
++ *   - arch/x86/kvm/mmu_audit.c|113| <<audit_mappings>> gfn = kvm_mmu_page_get_gfn(sp, sptep - sp->spt);
++ *   - arch/x86/kvm/mmu_audit.c|136| <<inspect_spte_has_rmap>> gfn = kvm_mmu_page_get_gfn(rev_sp, sptep - rev_sp->spt);
++ *
++ * 因为可能是大页, 根据index返回对应的gfn
++ */
+ static gfn_t kvm_mmu_page_get_gfn(struct kvm_mmu_page *sp, int index)
+ {
+ 	if (!sp->role.direct)
+ 		return sp->gfns[index];
+ 
++	/*
++	 * 1往左移动9位是512!!!!!
++	 *
++	 * ((1 - 1) * PT64_LEVEL_BITS) = 0
++	 * ((2 - 1) * PT64_LEVEL_BITS) = 9
++	 * ((3 - 1) * PT64_LEVEL_BITS) = 18
++	 */
+ 	return sp->gfn + (index << ((sp->role.level - 1) * PT64_LEVEL_BITS));
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|2617| <<rmap_add>> kvm_mmu_page_set_gfn(sp, spte - sp->spt, gfn);
++ *
++ * direct==true什么也不做
++ */
+ static void kvm_mmu_page_set_gfn(struct kvm_mmu_page *sp, int index, gfn_t gfn)
+ {
+ 	if (!sp->role.direct) {
+@@ -1112,39 +2279,98 @@ static void kvm_mmu_page_set_gfn(struct kvm_mmu_page *sp, int index, gfn_t gfn)
+  * Return the pointer to the large page information for a given gfn,
+  * handling slots that are not large page aligned.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|2110| <<update_gfn_disallow_lpage_count>> linfo = lpage_info_slot(gfn, slot, i);
++ *   - arch/x86/kvm/mmu.c|2176| <<__mmu_gfn_lpage_is_disallowed>> linfo = lpage_info_slot(gfn, slot, level);
++ *
++ * lpage_info的第二维的数量是对应level的page的数量, level越大(大页)数量越少
++ * 这里根据gfn返回对应的第二维的struct kvm_lpage_info: slot->arch.lpage_info[level - 2][idx]
++ */
+ static struct kvm_lpage_info *lpage_info_slot(gfn_t gfn,
+ 					      struct kvm_memory_slot *slot,
+ 					      int level)
+ {
+ 	unsigned long idx;
+ 
++	/*
++	 * base_gfn是基于4k开始的gfn
++	 * gfn是基于4k结束的gfn
++	 * 计算从开始到结束需要用到几个hugepage (或者普通page)
++	 *   level是1的时候hugepage大小是4K
++	 *   level是2的时候hugepage大小是2M
++	 *   level是3的时候hugepage大小是1G
++	 */
+ 	idx = gfn_to_index(gfn, slot->base_gfn, level);
++	/*
++	 * rmap和lpage_info的第二维都是在kvm_arch_create_memslot()分配
++	 * 数量是对应level的page的数量
++	 * level越大(大页)数量越少
++	 */
+ 	return &slot->arch.lpage_info[level - 2][idx];
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|2118| <<kvm_mmu_gfn_disallow_lpage>> update_gfn_disallow_lpage_count(slot, gfn, 1);
++ *   - arch/x86/kvm/mmu.c|2123| <<kvm_mmu_gfn_allow_lpage>> update_gfn_disallow_lpage_count(slot, gfn, -1);
++ *
++ * 根据gfn,找到其每一个1-3level上的二维struct kvm_lpage_info: slot->arch.lpage_info[level - 2][idx]
++ * 然后linfo->disallow_lpage += count
++ */
+ static void update_gfn_disallow_lpage_count(struct kvm_memory_slot *slot,
+ 					    gfn_t gfn, int count)
+ {
+ 	struct kvm_lpage_info *linfo;
+ 	int i;
+ 
++	/*
++	 * PT_DIRECTORY_LEVEL    = 1
++	 * PT_MAX_HUGEPAGE_LEVEL = 3
++	 */
+ 	for (i = PT_DIRECTORY_LEVEL; i <= PT_MAX_HUGEPAGE_LEVEL; ++i) {
++		/*
++		 * lpage_info的第二维的数量是对应level的page的数量, level越大(大页)数量越少
++		 * 这里根据gfn返回对应的第二维的struct kvm_lpage_info: slot->arch.lpage_info[level - 2][idx]
++		 */
+ 		linfo = lpage_info_slot(gfn, slot, i);
+ 		linfo->disallow_lpage += count;
+ 		WARN_ON(linfo->disallow_lpage < 0);
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|2217| <<account_shadowed>> kvm_mmu_gfn_disallow_lpage(slot, gfn);
++ *   - arch/x86/kvm/page_track.c|104| <<kvm_slot_page_track_add_page>> kvm_mmu_gfn_disallow_lpage(slot, gfn);
++ *
++ * 根据gfn,找到其每一个1-3level上的二维struct kvm_lpage_info: slot->arch.lpage_info[level - 2][idx]
++ * 然后linfo->disallow_lpage增加1
++ */
+ void kvm_mmu_gfn_disallow_lpage(struct kvm_memory_slot *slot, gfn_t gfn)
+ {
+ 	update_gfn_disallow_lpage_count(slot, gfn, 1);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|2238| <<unaccount_shadowed>> kvm_mmu_gfn_allow_lpage(slot, gfn);
++ *   - arch/x86/kvm/page_track.c|138| <<kvm_slot_page_track_remove_page>> kvm_mmu_gfn_allow_lpage(slot, gfn);
++ *
++ * 根据gfn,找到其每一个1-3level上的二维struct kvm_lpage_info: slot->arch.lpage_info[level - 2][idx]
++ * 然后linfo->disallow_lpage减少1
++ */
+ void kvm_mmu_gfn_allow_lpage(struct kvm_memory_slot *slot, gfn_t gfn)
+ {
+ 	update_gfn_disallow_lpage_count(slot, gfn, -1);
+ }
+ 
++/*
++ * called by:
++ *   arch/x86/kvm/mmu.c|3300| <<kvm_mmu_get_page>> account_shadowed(vcpu->kvm, sp);
++ *
++ * 在caller中不会在(direct == 0)的情况下使用
++ */
+ static void account_shadowed(struct kvm *kvm, struct kvm_mmu_page *sp)
+ {
+ 	struct kvm_memslots *slots;
+@@ -1164,6 +2390,12 @@ static void account_shadowed(struct kvm *kvm, struct kvm_mmu_page *sp)
+ 	kvm_mmu_gfn_disallow_lpage(slot, gfn);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|3511| <<__kvm_mmu_prepare_zap_page>> unaccount_shadowed(kvm, sp);
++ *
++ * 在caller中不会在(direct == 0)的情况下使用
++ */
+ static void unaccount_shadowed(struct kvm *kvm, struct kvm_mmu_page *sp)
+ {
+ 	struct kvm_memslots *slots;
+@@ -1181,12 +2413,24 @@ static void unaccount_shadowed(struct kvm *kvm, struct kvm_mmu_page *sp)
+ 	kvm_mmu_gfn_allow_lpage(slot, gfn);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|2362| <<mmu_gfn_lpage_is_disallowed>> return __mmu_gfn_lpage_is_disallowed(gfn, level, slot);
++ *   - arch/x86/kvm/mmu.c|2467| <<mapping_level>> if (__mmu_gfn_lpage_is_disallowed(large_gfn, level, slot))
++ *
++ * 如果(slot == NULL)直接返回true
++ * 否则根据gfn返回对应的第二维的struct kvm_lpage_info: slot->arch.lpage_info[level - 2][idx]的disallow_lpage作为true/false
++ */
+ static bool __mmu_gfn_lpage_is_disallowed(gfn_t gfn, int level,
+ 					  struct kvm_memory_slot *slot)
+ {
+ 	struct kvm_lpage_info *linfo;
+ 
+ 	if (slot) {
++		/*
++		 * lpage_info的第二维的数量是对应level的page的数量, level越大(大页)数量越少
++		 * 这里根据gfn返回对应的第二维的struct kvm_lpage_info: slot->arch.lpage_info[level - 2][idx]
++		 */
+ 		linfo = lpage_info_slot(gfn, slot, level);
+ 		return !!linfo->disallow_lpage;
+ 	}
+@@ -1194,23 +2438,75 @@ static bool __mmu_gfn_lpage_is_disallowed(gfn_t gfn, int level,
+ 	return true;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|4226| <<set_spte>> mmu_gfn_lpage_is_disallowed(vcpu, gfn, level))
++ *   - arch/x86/kvm/mmu.c|4488| <<transparent_hugepage_adjust>> !mmu_gfn_lpage_is_disallowed(vcpu, gfn, PT_DIRECTORY_LEVEL)) {
++ *
++ * 根据gfn找到对应的slot (struct kvm_memory_slot)
++ * 如果(slot == NULL)直接返回true
++ * 否则根据gfn返回对应的第二维的struct kvm_lpage_info: slot->arch.lpage_info[level - 2][idx]的disallow_lpage作为true/false
++ */
+ static bool mmu_gfn_lpage_is_disallowed(struct kvm_vcpu *vcpu, gfn_t gfn,
+ 					int level)
+ {
+ 	struct kvm_memory_slot *slot;
+ 
+ 	slot = kvm_vcpu_gfn_to_memslot(vcpu, gfn);
++	/*
++	 * 如果(slot == NULL)直接返回true
++	 * 否则根据gfn返回对应的第二维的struct kvm_lpage_info: slot->arch.lpage_info[level - 2][idx]的disallow_lpage作为true/false
++	 */
+ 	return __mmu_gfn_lpage_is_disallowed(gfn, level, slot);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|2318| <<mapping_level>> host_level = host_mapping_level(vcpu->kvm, large_gfn);
++ *
++ * 根据gfn获取其对于hva在host中的page size (4K,2M还是1G)
++ *     根据gfn获取在qemu中对应的hva, 把hva转化为vm_area_struct
++ *     然后就知道vm_area_struct的page size了
++ * 然后根据这个page size获取其在host上的mapping level
++ *
++ * 如果gfn对应的hva在host上的page size是4K
++ *   host_mapping_level()返回1
++ * 如果gfn对应的hva在host上的page size是2M
++ *   host_mapping_level()返回2
++ * 如果gfn对应的hva在host上的page size是1G
++ *   host_mapping_level()返回3
++ */
+ static int host_mapping_level(struct kvm *kvm, gfn_t gfn)
+ {
+ 	unsigned long page_size;
+ 	int i, ret = 0;
+ 
++	/*
++	 * 根据gfn获取其对于hva在host中的page size (4K,2M还是1G)
++	 *     根据gfn获取在qemu中对应的hva, 把hva转化为vm_area_struct
++	 *     然后就知道vm_area_struct的page size了
++	 */
+ 	page_size = kvm_host_page_size(kvm, gfn);
+ 
++	/*
++	 * PT_PAGE_TABLE_LEVEL   = 1
++	 * PT_MAX_HUGEPAGE_LEVEL = 3
++	 */
+ 	for (i = PT_PAGE_TABLE_LEVEL; i <= PT_MAX_HUGEPAGE_LEVEL; ++i) {
++		/*
++		 * KVM_HPAGE_SIZE(1) = 1 << 12 = 4K
++		 * KVM_HPAGE_SIZE(2) = 1 << 21 = 2M
++		 * KVM_HPAGE_SIZE(3) = 1 << 30 = 1G
++		 *
++		 * 假设上面返回的page_size是4K
++		 * 下面函数最终的返回值就是1
++		 *
++		 * 假设上面返回的page_size是2M
++		 * 下面函数最终的返回值就是2
++		 *
++		 * 假设上面返回的page_size是1G
++		 * 下面函数最终的返回值就是3
++		 */
+ 		if (page_size >= KVM_HPAGE_SIZE(i))
+ 			ret = i;
+ 		else
+@@ -1220,6 +2516,15 @@ static int host_mapping_level(struct kvm *kvm, gfn_t gfn)
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|2518| <<gfn_to_memslot_dirty_bitmap>> if (!memslot_valid_for_gpte(slot, no_dirty_log))
++ *   - arch/x86/kvm/mmu.c|2534| <<mapping_level>> *force_pt_level = !memslot_valid_for_gpte(slot, true);
++ *
++ * 以下情况返回false:
++ *   - (!slot || slot->flags & KVM_MEMSLOT_INVALID)
++ *   - (no_dirty_log && slot->dirty_bitmap)
++ */
+ static inline bool memslot_valid_for_gpte(struct kvm_memory_slot *slot,
+ 					  bool no_dirty_log)
+ {
+@@ -1231,19 +2536,47 @@ static inline bool memslot_valid_for_gpte(struct kvm_memory_slot *slot,
+ 	return true;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|4414| <<pte_prefetch_gfn_to_pfn>> slot = gfn_to_memslot_dirty_bitmap(vcpu, gfn, no_dirty_log);
++ *   - arch/x86/kvm/mmu.c|4432| <<direct_pte_prefetch_many>> slot = gfn_to_memslot_dirty_bitmap(vcpu, gfn, access & ACC_WRITE_MASK);
++ *
++ * 根据gfn得到slot (struct kvm_memory_slot)
++ * 如果slot满足以下情况把返回NULL:
++ *   - (!slot || slot->flags & KVM_MEMSLOT_INVALID)
++ *   - (no_dirty_log && slot->dirty_bitmap)
++ * 否则返回slot
++ */
+ static struct kvm_memory_slot *
+ gfn_to_memslot_dirty_bitmap(struct kvm_vcpu *vcpu, gfn_t gfn,
+ 			    bool no_dirty_log)
+ {
+ 	struct kvm_memory_slot *slot;
+ 
++	/*
++	 * truct kvm中有struct kvm_memslots __rcu *memslots[KVM_ADDRESS_SPACE_NUM];
++	 * struct kvm_memslots中有:
++	 *       struct kvm_memory_slot memslots[KVM_MEM_SLOTS_NUM];
++	 *       short id_to_index[KVM_MEM_SLOTS_NUM];
++	 */
+ 	slot = kvm_vcpu_gfn_to_memslot(vcpu, gfn);
++	/*
++	 * 以下情况返回false:
++	 *   - (!slot || slot->flags & KVM_MEMSLOT_INVALID)
++	 *   - (no_dirty_log && slot->dirty_bitmap)
++	 */
+ 	if (!memslot_valid_for_gpte(slot, no_dirty_log))
+ 		slot = NULL;
+ 
+ 	return slot;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|4813| <<nonpaging_map>> level = mapping_level(vcpu, gfn, &force_pt_level);
++ *   - arch/x86/kvm/mmu.c|5448| <<tdp_page_fault>> level = mapping_level(vcpu, gfn, &force_pt_level);
++ *   - arch/x86/kvm/paging_tmpl.h|805| <<FNAME(page_fault)>> level = mapping_level(vcpu, walker.gfn, &force_pt_level);
++ */
+ static int mapping_level(struct kvm_vcpu *vcpu, gfn_t large_gfn,
+ 			 bool *force_pt_level)
+ {
+@@ -1253,19 +2586,68 @@ static int mapping_level(struct kvm_vcpu *vcpu, gfn_t large_gfn,
+ 	if (unlikely(*force_pt_level))
+ 		return PT_PAGE_TABLE_LEVEL;
+ 
++	/*
++	 * struct kvm中有struct kvm_memslots __rcu *memslots[KVM_ADDRESS_SPACE_NUM];
++	 * struct kvm_memslots中有:
++	 *       struct kvm_memory_slot memslots[KVM_MEM_SLOTS_NUM];
++	 *       short id_to_index[KVM_MEM_SLOTS_NUM];
++	 */
+ 	slot = kvm_vcpu_gfn_to_memslot(vcpu, large_gfn);
++	/*
++	 * 以下情况返回false:
++	 *   - (!slot || slot->flags & KVM_MEMSLOT_INVALID)
++	 *   - (no_dirty_log && slot->dirty_bitmap)
++	 */
+ 	*force_pt_level = !memslot_valid_for_gpte(slot, true);
+ 	if (unlikely(*force_pt_level))
+ 		return PT_PAGE_TABLE_LEVEL;
+ 
++	/*
++	 * 根据gfn获取其对于hva在host中的page size (4K,2M还是1G)
++	 *     根据gfn获取在qemu中对应的hva, 把hva转化为vm_area_struct
++	 *     然后就知道vm_area_struct的page size了
++	 * 然后根据这个page size获取其在host上的mapping level
++	 *
++	 * 如果gfn对应的hva在host上的page size是4K
++	 *   host_mapping_level()返回1
++	 * 如果gfn对应的hva在host上的page size是2M
++	 *   host_mapping_level()返回2
++	 * 如果gfn对应的hva在host上的page size是1G
++	 *   host_mapping_level()返回3
++	 */
+ 	host_level = host_mapping_level(vcpu->kvm, large_gfn);
+ 
++	/*
++	 * 如果hva在host上是4K的粒度,直接返回PT_PAGE_TABLE_LEVEL就可以了
++	 */
+ 	if (host_level == PT_PAGE_TABLE_LEVEL)
+ 		return host_level;
+ 
++	/*
++	 * vmx_get_lpage_level()
++	 * svm_get_lpage_level()
++	 *
++	 * vmx_get_lpage_level()根据配置返回2或者3, large page不是2M就是1G
++	 *
++	 * 注意, 这里是min()!!!!!!
++	 */
+ 	max_level = min(kvm_x86_ops->get_lpage_level(), host_level);
+ 
+ 	for (level = PT_DIRECTORY_LEVEL; level <= max_level; ++level)
++		/*
++		 * 在以下修改disallow_lpage:
++		 *   - arch/x86/kvm/mmu.c|1154| <<update_gfn_disallow_lpage_count>> linfo->disallow_lpage += count;
++		 *   - arch/x86/kvm/x86.c|9528| <<kvm_arch_create_memslot>> linfo[0].disallow_lpage = 1;
++		 *   - arch/x86/kvm/x86.c|9530| <<kvm_arch_create_memslot>> linfo[lpages - 1].disallow_lpage = 1;
++		 *   - arch/x86/kvm/x86.c|9542| <<kvm_arch_create_memslot>> linfo[j].disallow_lpage = 1;
++		 *
++		 * 在以下使用disallow_lpage:
++		 *   - arch/x86/kvm/mmu.c|2112| <<update_gfn_disallow_lpage_count>> WARN_ON(linfo->disallow_lpage < 0);
++		 *   - arch/x86/kvm/mmu.c|2177| <<__mmu_gfn_lpage_is_disallowed>> return !!linfo->disallow_lpage;
++		 *
++		 * 如果(slot == NULL)直接返回true
++		 * 否则根据gfn返回对应的第二维的struct kvm_lpage_info: slot->arch.lpage_info[level - 2][idx]的disallow_lpage作为true/false
++		 */
+ 		if (__mmu_gfn_lpage_is_disallowed(large_gfn, level, slot))
+ 			break;
+ 
+@@ -1283,6 +2665,11 @@ static int mapping_level(struct kvm_vcpu *vcpu, gfn_t large_gfn,
+ /*
+  * Returns the number of pointers in the rmap chain, not counting the new one.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|2803| <<rmap_add>> return pte_list_add(vcpu, spte, rmap_head);
++ *   - arch/x86/kvm/mmu.c|3455| <<mmu_page_add_parent_pte>> pte_list_add(vcpu, parent_pte, &sp->parent_ptes);
++ */
+ static int pte_list_add(struct kvm_vcpu *vcpu, u64 *spte,
+ 			struct kvm_rmap_head *rmap_head)
+ {
+@@ -1317,6 +2704,10 @@ static int pte_list_add(struct kvm_vcpu *vcpu, u64 *spte,
+ 	return count;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|2748| <<__pte_list_remove>> pte_list_desc_remove_entry(rmap_head,
++ */
+ static void
+ pte_list_desc_remove_entry(struct kvm_rmap_head *rmap_head,
+ 			   struct pte_list_desc *desc, int i,
+@@ -1340,6 +2731,12 @@ pte_list_desc_remove_entry(struct kvm_rmap_head *rmap_head,
+ 	mmu_free_pte_list_desc(desc);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|2764| <<pte_list_remove>> __pte_list_remove(sptep, rmap_head);
++ *   - arch/x86/kvm/mmu.c|2815| <<rmap_remove>> __pte_list_remove(spte, rmap_head);
++ *   - arch/x86/kvm/mmu.c|3461| <<mmu_page_remove_parent_pte>> __pte_list_remove(parent_pte, &sp->parent_ptes);
++ */
+ static void __pte_list_remove(u64 *spte, struct kvm_rmap_head *rmap_head)
+ {
+ 	struct pte_list_desc *desc;
+@@ -1376,21 +2773,72 @@ static void __pte_list_remove(u64 *spte, struct kvm_rmap_head *rmap_head)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|3155| <<kvm_zap_rmapp>> pte_list_remove(rmap_head, sptep);
++ *   - arch/x86/kvm/mmu.c|3191| <<kvm_set_pte_rmapp>> pte_list_remove(rmap_head, sptep);
++ *   - arch/x86/kvm/mmu.c|7381| <<kvm_mmu_zap_collapsible_spte>> pte_list_remove(rmap_head, sptep);
++ */
+ static void pte_list_remove(struct kvm_rmap_head *rmap_head, u64 *sptep)
+ {
+ 	mmu_spte_clear_track_bits(sptep);
+ 	__pte_list_remove(sptep, rmap_head);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|2805| <<gfn_to_rmap>> return __gfn_to_rmap(gfn, sp->role.level, slot);
++ *   - arch/x86/kvm/mmu.c|3088| <<kvm_mmu_write_protect_pt_masked>> rmap_head = __gfn_to_rmap(slot->base_gfn + gfn_offset + __ffs(mask),
++ *   - arch/x86/kvm/mmu.c|3114| <<kvm_mmu_clear_dirty_pt_masked>> rmap_head = __gfn_to_rmap(slot->base_gfn + gfn_offset + __ffs(mask),
++ *   - arch/x86/kvm/mmu.c|3168| <<kvm_mmu_slot_gfn_write_protect>> rmap_head = __gfn_to_rmap(gfn, i, slot);
++ *   - arch/x86/kvm/mmu.c|3274| <<rmap_walk_init_level>> iterator->rmap = __gfn_to_rmap(iterator->gfn, level, iterator->slot);
++ *   - arch/x86/kvm/mmu.c|3275| <<rmap_walk_init_level>> iterator->end_rmap = __gfn_to_rmap(iterator->end_gfn, level,
++ *   - arch/x86/kvm/mmu_audit.c|150| <<inspect_spte_has_rmap>> rmap_head = __gfn_to_rmap(gfn, rev_sp->role.level, slot);
++ *   - arch/x86/kvm/mmu_audit.c|203| <<audit_write_protection>> rmap_head = __gfn_to_rmap(sp->gfn, PT_PAGE_TABLE_LEVEL, slot);
++ *
++ * 根据gfn和level找到其在slot(kvm_memory_slot)中的index
++ * 然后返回对应的kvm_rmap_head: slot->arch.rmap[level - PT_PAGE_TABLE_LEVEL][idx]
++ */
+ static struct kvm_rmap_head *__gfn_to_rmap(gfn_t gfn, int level,
+ 					   struct kvm_memory_slot *slot)
+ {
+ 	unsigned long idx;
+ 
++	/*
++	 * base_gfn是基于4k开始的gfn
++	 * gfn是基于4k结束的gfn
++	 * 计算从开始到结束需要用到几个hugepage (或者普通page)
++	 *   level是1的时候hugepage大小是4K
++	 *   level是2的时候hugepage大小是2M
++	 *   level是3的时候hugepage大小是1G
++	 */
+ 	idx = gfn_to_index(gfn, slot->base_gfn, level);
++	/*
++	 * About rmap_head encoding:
++	 *
++	 * If the bit zero of rmap_head->val is clear, then it points to the only spte
++	 * in this rmap chain. Otherwise, (rmap_head->val & ~1) points to a struct
++	 * pte_list_desc containing more mappings.
++	 *
++	 * rmap和lpage_info的第二维都是在kvm_arch_create_memslot()分配
++	 * 数量是对应level的page的数量
++	 * level越大(大页)数量越少
++	 *
++	 * struct kvm_rmap_head *rmap[KVM_NR_PAGE_SIZES];
++	 */
+ 	return &slot->arch.rmap[level - PT_PAGE_TABLE_LEVEL][idx];
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|2823| <<rmap_add>> rmap_head = gfn_to_rmap(vcpu->kvm, gfn, sp);
++ *   - arch/x86/kvm/mmu.c|2835| <<rmap_remove>> rmap_head = gfn_to_rmap(kvm, gfn, sp);
++ *   - arch/x86/kvm/mmu.c|3425| <<rmap_recycle>> rmap_head = gfn_to_rmap(vcpu->kvm, gfn, sp);
++ *
++ * 根据gfn找到slot (struct kvm_memory_slot)
++ * 然后根据gfn和sp->role.level找到其在slot(kvm_memory_slot)中的index
++ * 然后返回对应的kvm_rmap_head: slot->arch.rmap[level - PT_PAGE_TABLE_LEVEL][idx]
++ */
+ static struct kvm_rmap_head *gfn_to_rmap(struct kvm *kvm, gfn_t gfn,
+ 					 struct kvm_mmu_page *sp)
+ {
+@@ -1399,9 +2847,20 @@ static struct kvm_rmap_head *gfn_to_rmap(struct kvm *kvm, gfn_t gfn,
+ 
+ 	slots = kvm_memslots_for_spte_role(kvm, sp->role);
+ 	slot = __gfn_to_memslot(slots, gfn);
++	/*
++	 * 根据gfn和level找到其在slot(kvm_memory_slot)中的index
++	 * 然后返回对应的kvm_rmap_head: slot->arch.rmap[level - PT_PAGE_TABLE_LEVEL][idx]
++	 */
+ 	return __gfn_to_rmap(gfn, sp->role.level, slot);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|6838| <<kvm_mmu_pte_write>> & mmu_base_role_mask.word) && rmap_can_add(vcpu))
++ *   - arch/x86/kvm/paging_tmpl.h|915| <<FNAME(invlpg)>> if (!rmap_can_add(vcpu))
++ *
++ * 检查是否还能分配pte_list_desc
++ */
+ static bool rmap_can_add(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_mmu_memory_cache *cache;
+@@ -1410,17 +2869,59 @@ static bool rmap_can_add(struct kvm_vcpu *vcpu)
+ 	return mmu_memory_cache_free_objects(cache);
+ }
+ 
++/*
++ * 在KVM中,逆向映射机制的作用是类似的,但是完成的却
++ * 不是从HPA到对应的EPT页表项的定位,而是从gfn到对应的
++ * 页表项的定位.
++ *
++ * 理论上讲根据gfn一步步遍历EPT也未尝不可,但是效率较低;
++ * 况且在EPT所维护的页面不同于host的页表,理论上讲是虚
++ * 拟机之间是禁止主动的共享内存的,为了提高效率,就有了
++ * 当前的逆向映射机制.
++ *
++ * 问题:
++ * 从gfn找到页表项最多只要查询访问4次(4级页表),为啥还要用反向映射,
++ * 况且建立rmap还得有一定内存开销,并没有提高太多效率吧?
++ */
++
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|4542| <<mmu_set_spte>> rmap_count = rmap_add(vcpu, sptep, gfn);
++ *
++ * 根据gfn找到kvm_rmap_head
++ * 把一个spte加入到kvm_rmap_head
++ */
+ static int rmap_add(struct kvm_vcpu *vcpu, u64 *spte, gfn_t gfn)
+ {
+ 	struct kvm_mmu_page *sp;
+ 	struct kvm_rmap_head *rmap_head;
+ 
++	/*
++	 * page_header():
++	 * __pa(spte)可能是一个指向某个pte的地址 (__pa(spte)保存的这个pte的地址而不是内容)
++	 * 获得包含这个地址的页表页对应的kvm_mmu_page
++	 *
++	 * 根据spte找到kvm_mmu_page
++	 */
+ 	sp = page_header(__pa(spte));
++	/*
++	 * irect==true什么也不做
++	 */
+ 	kvm_mmu_page_set_gfn(sp, spte - sp->spt, gfn);
++	/*
++	 * 根据gfn找到slot (struct kvm_memory_slot)
++	 * 然后根据gfn和sp->role.level找到其在slot(kvm_memory_slot)中的index
++	 * 然后返回对应的kvm_rmap_head: slot->arch.rmap[level - PT_PAGE_TABLE_LEVEL][idx]
++	 */
+ 	rmap_head = gfn_to_rmap(vcpu->kvm, gfn, sp);
++	/* 把一个spte加入到kvm_rmap_head */
+ 	return pte_list_add(vcpu, spte, rmap_head);
+ }
+ 
++/*
++ * called only by:
++ *   - arch/x86/kvm/mmu.c|2934| <<drop_spte>> rmap_remove(kvm, sptep);
++ */
+ static void rmap_remove(struct kvm *kvm, u64 *spte)
+ {
+ 	struct kvm_mmu_page *sp;
+@@ -1450,6 +2951,12 @@ struct rmap_iterator {
+  *
+  * Returns sptep if found, NULL otherwise.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|2928| <<for_each_rmap_spte>> for (_spte_ = rmap_get_first(_rmap_head_, _iter_); \
++ *   - arch/x86/kvm/mmu.c|3189| <<kvm_zap_rmapp>> while ((sptep = rmap_get_first(rmap_head, &iter))) {
++ *   - arch/x86/kvm/mmu.c|4134| <<kvm_mmu_unlink_parents>> while ((sptep = rmap_get_first(&sp->parent_ptes, &iter)))
++ */
+ static u64 *rmap_get_first(struct kvm_rmap_head *rmap_head,
+ 			   struct rmap_iterator *iter)
+ {
+@@ -1477,6 +2984,10 @@ static u64 *rmap_get_first(struct kvm_rmap_head *rmap_head,
+  *
+  * Returns sptep if found, NULL otherwise.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|2892| <<for_each_rmap_spte>> _spte_; _spte_ = rmap_get_next(_iter_))
++ */
+ static u64 *rmap_get_next(struct rmap_iterator *iter)
+ {
+ 	u64 *sptep;
+@@ -1505,6 +3016,20 @@ static u64 *rmap_get_next(struct rmap_iterator *iter)
+ 	return sptep;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|2962| <<__rmap_write_protect>> for_each_rmap_spte(rmap_head, &iter, sptep)
++ *   - arch/x86/kvm/mmu.c|3001| <<__rmap_clear_dirty>> for_each_rmap_spte(rmap_head, &iter, sptep)
++ *   - arch/x86/kvm/mmu.c|3027| <<__rmap_set_dirty>> for_each_rmap_spte(rmap_head, &iter, sptep)
++ *   - arch/x86/kvm/mmu.c|3184| <<kvm_set_pte_rmapp>> for_each_rmap_spte(rmap_head, &iter, sptep) {
++ *   - arch/x86/kvm/mmu.c|3359| <<kvm_age_rmapp>> for_each_rmap_spte(rmap_head, &iter, sptep)
++ *   - arch/x86/kvm/mmu.c|3373| <<kvm_test_age_rmapp>> for_each_rmap_spte(rmap_head, &iter, sptep)
++ *   - arch/x86/kvm/mmu.c|3501| <<kvm_mmu_mark_parents_unsync>> for_each_rmap_spte(&sp->parent_ptes, &iter, sptep) {
++ *   - arch/x86/kvm/mmu.c|7367| <<kvm_mmu_zap_collapsible_spte>> for_each_rmap_spte(rmap_head, &iter, sptep) {
++ *   - arch/x86/kvm/mmu_audit.c|205| <<audit_write_protection>> for_each_rmap_spte(rmap_head, &iter, sptep) {
++ *
++ * 通过struct rmap_iterator遍历kvm_rmap_head中的每一个pte
++ */
+ #define for_each_rmap_spte(_rmap_head_, _iter_, _spte_)			\
+ 	for (_spte_ = rmap_get_first(_rmap_head_, _iter_);		\
+ 	     _spte_; _spte_ = rmap_get_next(_iter_))
+@@ -1659,6 +3184,12 @@ static bool __rmap_set_dirty(struct kvm *kvm, struct kvm_rmap_head *rmap_head)
+  * Used when we do not need to care about huge page mappings: e.g. during dirty
+  * logging we do not have any such mappings.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|3142| <<kvm_arch_mmu_enable_log_dirty_pt_masked>> kvm_mmu_write_protect_pt_masked(kvm, slot, gfn_offset, mask);
++ *   - virt/kvm/arm/mmu.c|1559| <<kvm_mmu_write_protect_pt_masked>> static void kvm_mmu_write_protect_pt_masked(struct kvm *kvm,
++ *   - virt/kvm/arm/mmu.c|1581| <<kvm_arch_mmu_enable_log_dirty_pt_masked>> kvm_mmu_write_protect_pt_masked(kvm, slot, gfn_offset, mask);
++ */
+ static void kvm_mmu_write_protect_pt_masked(struct kvm *kvm,
+ 				     struct kvm_memory_slot *slot,
+ 				     gfn_t gfn_offset, unsigned long mask)
+@@ -1784,6 +3315,10 @@ static int kvm_unmap_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
+ 	return kvm_zap_rmapp(kvm, rmap_head);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|3385| <<kvm_set_spte_hva>> return kvm_handle_hva(kvm, hva, (unsigned long )&pte, kvm_set_pte_rmapp);
++ */
+ static int kvm_set_pte_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
+ 			     struct kvm_memory_slot *slot, gfn_t gfn, int level,
+ 			     unsigned long data)
+@@ -2086,6 +3621,10 @@ static void drop_parent_pte(struct kvm_mmu_page *sp,
+ 	mmu_spte_clear_no_track(parent_pte);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|3458| <<kvm_mmu_get_page>> sp = kvm_mmu_alloc_page(vcpu, direct);
++ */
+ static struct kvm_mmu_page *kvm_mmu_alloc_page(struct kvm_vcpu *vcpu, int direct)
+ {
+ 	struct kvm_mmu_page *sp;
+@@ -2320,6 +3859,10 @@ static bool kvm_sync_page(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
+ }
+ 
+ /* @gfn should be write-protected at the call site */
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|3647| <<kvm_mmu_get_page>> flush |= kvm_sync_pages(vcpu, gfn, &invalid_list);
++ */
+ static bool kvm_sync_pages(struct kvm_vcpu *vcpu, gfn_t gfn,
+ 			   struct list_head *invalid_list)
+ {
+@@ -2456,6 +3999,16 @@ static void clear_sp_write_flooding_count(u64 *spte)
+ 	__clear_sp_write_flooding_count(sp);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|4328| <<__direct_map>> sp = kvm_mmu_get_page(vcpu, base_gfn, it.addr,
++ *   - arch/x86/kvm/mmu.c|4756| <<mmu_alloc_direct_roots>> sp = kvm_mmu_get_page(vcpu, 0, 0,
++ *   - arch/x86/kvm/mmu.c|4771| <<mmu_alloc_direct_roots>> sp = kvm_mmu_get_page(vcpu, i << (30 - PAGE_SHIFT),
++ *   - arch/x86/kvm/mmu.c|4813| <<mmu_alloc_shadow_roots>> sp = kvm_mmu_get_page(vcpu, root_gfn, 0,
++ *   - arch/x86/kvm/mmu.c|4850| <<mmu_alloc_shadow_roots>> sp = kvm_mmu_get_page(vcpu, root_gfn, i << 30, PT32_ROOT_LEVEL,
++ *   - arch/x86/kvm/paging_tmpl.h|653| <<FNAME(fetch)>> sp = kvm_mmu_get_page(vcpu, table_gfn, addr, it.level-1,
++ *   - arch/x86/kvm/paging_tmpl.h|683| <<FNAME(fetch)>> sp = kvm_mmu_get_page(vcpu, base_gfn, addr,
++ */
+ static struct kvm_mmu_page *kvm_mmu_get_page(struct kvm_vcpu *vcpu,
+ 					     gfn_t gfn,
+ 					     gva_t gaddr,
+@@ -3045,6 +4598,13 @@ static int set_spte(struct kvm_vcpu *vcpu, u64 *sptep,
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|4684| <<direct_pte_prefetch_many>> mmu_set_spte(vcpu, start, access, 0, sp->role.level, gfn,
++ *   - arch/x86/kvm/mmu.c|4763| <<__direct_map>> ret = mmu_set_spte(vcpu, it.sptep, ACC_ALL,
++ *   - arch/x86/kvm/paging_tmpl.h|540| <<FNAME(prefetch_gpte)>> mmu_set_spte(vcpu, spte, pte_access, 0, PT_PAGE_TABLE_LEVEL, gfn, pfn,
++ *   - arch/x86/kvm/paging_tmpl.h|689| <<FNAME(fetch)>> ret = mmu_set_spte(vcpu, it.sptep, gw->pte_access, write_fault,
++ */
+ static int mmu_set_spte(struct kvm_vcpu *vcpu, u64 *sptep, unsigned pte_access,
+ 			int write_fault, int level, gfn_t gfn, kvm_pfn_t pfn,
+ 		       	bool speculative, bool host_writable)
+@@ -3058,6 +4618,11 @@ static int mmu_set_spte(struct kvm_vcpu *vcpu, u64 *sptep, unsigned pte_access,
+ 	pgprintk("%s: spte %llx write_fault %d gfn %llx\n", __func__,
+ 		 *sptep, write_fault, gfn);
+ 
++	/*
++	 * 如果pte不为0并且pte的最后3位不是110并且62位(SPTE_SPECIAL_MASK)也没设置, 返回true
++	 * 如果spte是0x0,或者spte的最后3位是110(62位也设置了), 函数返回false
++	 * 或者说, 如果spte是0或者是mmio, is_shadow_present_pte()返回false
++	 */
+ 	if (is_shadow_present_pte(*sptep)) {
+ 		/*
+ 		 * If we overwrite a PTE page pointer with a 2MB PMD, unlink
+@@ -3194,6 +4759,11 @@ static void direct_pte_prefetch(struct kvm_vcpu *vcpu, u64 *sptep)
+ 	__direct_pte_prefetch(vcpu, sp, sptep);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|5089| <<nonpaging_map>> r = __direct_map(vcpu, v, write, map_writable, level, pfn, prefault);
++ *   - arch/x86/kvm/mmu.c|5719| <<tdp_page_fault>> r = __direct_map(vcpu, gpa, write, map_writable, level, pfn, prefault);
++ */
+ static int __direct_map(struct kvm_vcpu *vcpu, gpa_t gpa, int write,
+ 			int map_writable, int level, kvm_pfn_t pfn,
+ 			bool prefault)
+@@ -3208,6 +4778,9 @@ static int __direct_map(struct kvm_vcpu *vcpu, gpa_t gpa, int write,
+ 		return RET_PF_RETRY;
+ 
+ 	trace_kvm_mmu_spte_requested(gpa, level, pfn);
++	/*
++	 * 对于一个gpa的每一级(level)的pte
++	 */
+ 	for_each_shadow_entry(vcpu, gpa, it) {
+ 		base_gfn = gfn & ~(KVM_PAGES_PER_HPAGE(it.level) - 1);
+ 		if (it.level == level)
+@@ -3942,6 +5515,10 @@ walk_shadow_page_get_mmio_spte(struct kvm_vcpu *vcpu, u64 addr, u64 *sptep)
+ 	return reserved;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|6337| <<kvm_mmu_page_fault>> r = handle_mmio_page_fault(vcpu, cr2, direct);
++ */
+ static int handle_mmio_page_fault(struct kvm_vcpu *vcpu, u64 addr, bool direct)
+ {
+ 	u64 spte;
+@@ -4286,6 +5863,11 @@ static void __kvm_mmu_new_cr3(struct kvm_vcpu *vcpu, gpa_t new_cr3,
+ 				   KVM_MMU_ROOT_CURRENT);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/vmx/nested.c|976| <<nested_vmx_load_cr3>> kvm_mmu_new_cr3(vcpu, cr3, false);
++ *   - arch/x86/kvm/x86.c|971| <<kvm_set_cr3>> kvm_mmu_new_cr3(vcpu, cr3, skip_tlb_flush);
++ */
+ void kvm_mmu_new_cr3(struct kvm_vcpu *vcpu, gpa_t new_cr3, bool skip_tlb_flush)
+ {
+ 	__kvm_mmu_new_cr3(vcpu, new_cr3, kvm_mmu_calc_root_page_role(vcpu),
+@@ -4807,6 +6389,11 @@ static void paging32E_init_context(struct kvm_vcpu *vcpu,
+ 	paging64_init_context_common(vcpu, context, PT32E_ROOT_LEVEL);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|5682| <<kvm_calc_mmu_role_common>> role.ext = kvm_calc_mmu_role_ext(vcpu);
++ *   - arch/x86/kvm/mmu.c|5847| <<kvm_calc_shadow_ept_root_page_role>> role.ext = kvm_calc_mmu_role_ext(vcpu);
++ */
+ static union kvm_mmu_extended_role kvm_calc_mmu_role_ext(struct kvm_vcpu *vcpu)
+ {
+ 	union kvm_mmu_extended_role ext = {0};
+@@ -4825,6 +6412,12 @@ static union kvm_mmu_extended_role kvm_calc_mmu_role_ext(struct kvm_vcpu *vcpu)
+ 	return ext;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|5695| <<kvm_calc_tdp_mmu_root_page_role>> union kvm_mmu_role role = kvm_calc_mmu_role_common(vcpu, base_only);
++ *   - arch/x86/kvm/mmu.c|5776| <<kvm_calc_shadow_mmu_root_page_role>> union kvm_mmu_role role = kvm_calc_mmu_role_common(vcpu, base_only);
++ *   - arch/x86/kvm/mmu.c|5909| <<init_kvm_nested_mmu>> union kvm_mmu_role new_role = kvm_calc_mmu_role_common(vcpu, false);
++ */
+ static union kvm_mmu_role kvm_calc_mmu_role_common(struct kvm_vcpu *vcpu,
+ 						   bool base_only)
+ {
+@@ -4844,11 +6437,25 @@ static union kvm_mmu_role kvm_calc_mmu_role_common(struct kvm_vcpu *vcpu,
+ 	return role;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|5355| <<init_kvm_tdp_mmu>> kvm_calc_tdp_mmu_root_page_role(vcpu, false);
++ *   - arch/x86/kvm/mmu.c|5597| <<kvm_mmu_calc_root_page_role>> role = kvm_calc_tdp_mmu_root_page_role(vcpu, true);
++ */
+ static union kvm_mmu_role
+ kvm_calc_tdp_mmu_root_page_role(struct kvm_vcpu *vcpu, bool base_only)
+ {
+ 	union kvm_mmu_role role = kvm_calc_mmu_role_common(vcpu, base_only);
+ 
++	/*
++	 * shadow_accessed_mask:
++	 * 在new machine上从vmx_enable_tdp()第二次进来的结果:
++	 *   shadow_accessed_mask = enable_ept_ad_bits ? VMX_EPT_ACCESS_BIT : 0ull;
++	 *   也就是0x0000000000000100
++	 *
++	 * 这里shadow_accessed_mask不为0, 所以role.base.ad_disabled = false
++	 * 也就是ad没有disable
++	 */
+ 	role.base.ad_disabled = (shadow_accessed_mask == 0);
+ 	role.base.level = kvm_x86_ops->get_tdp_level(vcpu);
+ 	role.base.direct = true;
+@@ -4857,6 +6464,10 @@ kvm_calc_tdp_mmu_root_page_role(struct kvm_vcpu *vcpu, bool base_only)
+ 	return role;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|5913| <<kvm_init_mmu>> init_kvm_tdp_mmu(vcpu);
++ */
+ static void init_kvm_tdp_mmu(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_mmu *context = vcpu->arch.mmu;
+@@ -4907,6 +6518,11 @@ static void init_kvm_tdp_mmu(struct kvm_vcpu *vcpu)
+ 	reset_tdp_shadow_zero_bits_mask(vcpu, context);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|5427| <<kvm_init_shadow_mmu>> kvm_calc_shadow_mmu_root_page_role(vcpu, false);
++ *   - arch/x86/kvm/mmu.c|5599| <<kvm_mmu_calc_root_page_role>> role = kvm_calc_shadow_mmu_root_page_role(vcpu, true);
++ */
+ static union kvm_mmu_role
+ kvm_calc_shadow_mmu_root_page_role(struct kvm_vcpu *vcpu, bool base_only)
+ {
+@@ -4929,6 +6545,11 @@ kvm_calc_shadow_mmu_root_page_role(struct kvm_vcpu *vcpu, bool base_only)
+ 	return role;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|5843| <<init_kvm_softmmu>> kvm_init_shadow_mmu(vcpu);
++ *   - arch/x86/kvm/svm.c|2980| <<nested_svm_init_mmu_context>> kvm_init_shadow_mmu(vcpu);
++ */
+ void kvm_init_shadow_mmu(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_mmu *context = vcpu->arch.mmu;
+@@ -4953,6 +6574,10 @@ void kvm_init_shadow_mmu(struct kvm_vcpu *vcpu)
+ }
+ EXPORT_SYMBOL_GPL(kvm_init_shadow_mmu);
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|5862| <<kvm_init_shadow_ept_mmu>> kvm_calc_shadow_ept_root_page_role(vcpu, accessed_dirty,
++ */
+ static union kvm_mmu_role
+ kvm_calc_shadow_ept_root_page_role(struct kvm_vcpu *vcpu, bool accessed_dirty,
+ 				   bool execonly)
+@@ -4982,6 +6607,10 @@ kvm_calc_shadow_ept_root_page_role(struct kvm_vcpu *vcpu, bool accessed_dirty,
+ 	return role;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/vmx/nested.c|333| <<nested_ept_init_mmu_context>> kvm_init_shadow_ept_mmu(vcpu,
++ */
+ void kvm_init_shadow_ept_mmu(struct kvm_vcpu *vcpu, bool execonly,
+ 			     bool accessed_dirty, gpa_t new_eptp)
+ {
+@@ -5017,6 +6646,10 @@ void kvm_init_shadow_ept_mmu(struct kvm_vcpu *vcpu, bool execonly,
+ }
+ EXPORT_SYMBOL_GPL(kvm_init_shadow_ept_mmu);
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|5915| <<kvm_init_mmu>> init_kvm_softmmu(vcpu);
++ */
+ static void init_kvm_softmmu(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_mmu *context = vcpu->arch.mmu;
+@@ -5077,6 +6710,12 @@ static void init_kvm_nested_mmu(struct kvm_vcpu *vcpu)
+ 	update_last_nonleaf_level(vcpu, g_context);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|5935| <<kvm_mmu_reset_context>> kvm_init_mmu(vcpu, true);
++ *   - arch/x86/kvm/vmx/nested.c|981| <<nested_vmx_load_cr3>> kvm_init_mmu(vcpu, false);
++ *   - arch/x86/kvm/x86.c|8940| <<kvm_arch_vcpu_setup>> kvm_init_mmu(vcpu, false);
++ */
+ void kvm_init_mmu(struct kvm_vcpu *vcpu, bool reset_roots)
+ {
+ 	if (reset_roots) {
+@@ -5097,6 +6736,10 @@ void kvm_init_mmu(struct kvm_vcpu *vcpu, bool reset_roots)
+ }
+ EXPORT_SYMBOL_GPL(kvm_init_mmu);
+ 
++/*
++ * used by only:
++ *   - arch/x86/kvm/mmu.c|5091| <<kvm_mmu_new_cr3>> __kvm_mmu_new_cr3(vcpu, new_cr3, kvm_mmu_calc_root_page_role(vcpu),
++ */
+ static union kvm_mmu_page_role
+ kvm_mmu_calc_root_page_role(struct kvm_vcpu *vcpu)
+ {
+@@ -5376,6 +7019,30 @@ static int make_mmu_pages_available(struct kvm_vcpu *vcpu)
+ 	return 0;
+ }
+ 
++/*
++ * kvm mmio处理:
++ *
++ * 开始的时候mmio的内存都没有kvm_memory_slot, pte也都不存在,所以访问的时候会ept violation.
++ * handle_ept_violation()会调用kvm_mmu_page_fault().因为handle_ept_violation()不会为
++ * error_code设置PFERR_RSVD_MASK,所以kvm_mmu_page_fault()调用tdp_page_fault().
++ *
++ * tdp_page_fault()-->try_async_pf()-->__gfn_to_pfn_memslot()-->__gfn_to_hva_many().
++ * __gfn_to_hva_many()返回KVM_HVA_ERR_BAD=PAGE_OFFSET,所以__gfn_to_pfn_memslot()返回
++ * KVM_PFN_NOSLOT.
++ *
++ * 然后tdp_page_fault()-->__direct_map(),通过mmu_set_spte()-->set_mmio_spte()设置对应
++ * 的pte为mmio类型,也就是:
++ *
++ * 1. SPTE_SPECIAL_MASK(1往左移62位)是1
++ * 2. 结尾是110
++ * 3. 还有gen的信息
++ *
++ * 最后进行RET_PF_EMULATE
++ *
++ * 等到下一次page fault的时候,mmio的内存会触发handle_ept_misconfig()-->kvm_mmu_page_fault().
++ * 因为这次handle_ept_misconfig()设置error_code=PFERR_RSVD_MASK,kvm_mmu_page_fault()会调
++ * 用handle_mmio_page_fault(),返回进行emulate.
++ */
+ int kvm_mmu_page_fault(struct kvm_vcpu *vcpu, gva_t cr2, u64 error_code,
+ 		       void *insn, int insn_len)
+ {
+@@ -5526,6 +7193,11 @@ void kvm_mmu_invpcid_gva(struct kvm_vcpu *vcpu, gva_t gva, unsigned long pcid)
+ }
+ EXPORT_SYMBOL_GPL(kvm_mmu_invpcid_gva);
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/svm.c|1367| <<svm_hardware_setup>> kvm_enable_tdp();
++ *   - arch/x86/kvm/vmx/vmx.c|5286| <<vmx_enable_tdp>> kvm_enable_tdp();
++ */
+ void kvm_enable_tdp(void)
+ {
+ 	tdp_enabled = true;
+@@ -5645,6 +7317,10 @@ static int alloc_mmu_pages(struct kvm_vcpu *vcpu)
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|9239| <<kvm_arch_vcpu_init>> r = kvm_mmu_create(vcpu);
++ */
+ int kvm_mmu_create(struct kvm_vcpu *vcpu)
+ {
+ 	uint i;
+@@ -5669,6 +7345,10 @@ int kvm_mmu_create(struct kvm_vcpu *vcpu)
+ }
+ 
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|6958| <<kvm_mmu_zap_all_fast>> kvm_zap_obsolete_pages(kvm);
++ */
+ static void kvm_zap_obsolete_pages(struct kvm *kvm)
+ {
+ 	struct kvm_mmu_page *sp, *node;
+@@ -5753,6 +7433,10 @@ static void kvm_mmu_invalidate_zap_pages_in_memslot(struct kvm *kvm,
+ 	kvm_mmu_zap_all_fast(kvm);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|9347| <<kvm_arch_init_vm>> kvm_mmu_init_vm(kvm);
++ */
+ void kvm_mmu_init_vm(struct kvm *kvm)
+ {
+ 	struct kvm_page_track_notifier_node *node = &kvm->arch.mmu_sp_tracker;
+@@ -5801,6 +7485,11 @@ static bool slot_rmap_write_protect(struct kvm *kvm,
+ 	return __rmap_write_protect(kvm, rmap_head, false);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|9597| <<kvm_mmu_slot_apply_flags>> kvm_mmu_slot_remove_write_access(kvm, new);
++ *   - arch/x86/kvm/x86.c|9635| <<kvm_mmu_slot_apply_flags>> kvm_mmu_slot_remove_write_access(kvm, new);
++ */
+ void kvm_mmu_slot_remove_write_access(struct kvm *kvm,
+ 				      struct kvm_memory_slot *memslot)
+ {
+@@ -5834,6 +7523,10 @@ void kvm_mmu_slot_remove_write_access(struct kvm *kvm,
+ 			memslot->npages);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|6699| <<kvm_mmu_zap_collapsible_sptes>> kvm_mmu_zap_collapsible_spte, true);
++ */
+ static bool kvm_mmu_zap_collapsible_spte(struct kvm *kvm,
+ 					 struct kvm_rmap_head *rmap_head)
+ {
+@@ -5925,6 +7618,10 @@ void kvm_mmu_slot_largepage_remove_write_access(struct kvm *kvm,
+ }
+ EXPORT_SYMBOL_GPL(kvm_mmu_slot_largepage_remove_write_access);
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|7182| <<vmx_slot_disable_log_dirty>> kvm_mmu_slot_set_dirty(kvm, slot);
++ */
+ void kvm_mmu_slot_set_dirty(struct kvm *kvm,
+ 			    struct kvm_memory_slot *memslot)
+ {
+@@ -5943,6 +7640,11 @@ void kvm_mmu_slot_set_dirty(struct kvm *kvm,
+ }
+ EXPORT_SYMBOL_GPL(kvm_mmu_slot_set_dirty);
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|6790| <<kvm_mmu_zap_all>> return __kvm_mmu_zap_all(kvm, false);
++ *   - arch/x86/kvm/mmu.c|6814| <<kvm_mmu_invalidate_mmio_sptes>> __kvm_mmu_zap_all(kvm, true);
++ */
+ static void __kvm_mmu_zap_all(struct kvm *kvm, bool mmio_only)
+ {
+ 	struct kvm_mmu_page *sp, *node;
+@@ -5968,11 +7670,19 @@ static void __kvm_mmu_zap_all(struct kvm *kvm, bool mmio_only)
+ 	spin_unlock(&kvm->mmu_lock);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|9685| <<kvm_arch_flush_shadow_all>> kvm_mmu_zap_all(kvm);
++ */
+ void kvm_mmu_zap_all(struct kvm *kvm)
+ {
+ 	return __kvm_mmu_zap_all(kvm, false);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|9581| <<kvm_arch_memslots_updated>> kvm_mmu_invalidate_mmio_sptes(kvm, gen);
++ */
+ void kvm_mmu_invalidate_mmio_sptes(struct kvm *kvm, u64 gen)
+ {
+ 	WARN_ON(gen & KVM_MEMSLOT_GEN_UPDATE_IN_PROGRESS);
+@@ -5998,6 +7708,9 @@ void kvm_mmu_invalidate_mmio_sptes(struct kvm *kvm, u64 gen)
+ 	}
+ }
+ 
++/*
++ * struct shrinker mmu_shrinker.scan_objects = mmu_shrink_scan()
++ */
+ static unsigned long
+ mmu_shrink_scan(struct shrinker *shrink, struct shrink_control *sc)
+ {
+@@ -6051,24 +7764,41 @@ mmu_shrink_scan(struct shrinker *shrink, struct shrink_control *sc)
+ 	return freed;
+ }
+ 
++/*
++ * struct shrinker mmu_shrinker.count_objects = mmu_shrink_count()
++ */
+ static unsigned long
+ mmu_shrink_count(struct shrinker *shrink, struct shrink_control *sc)
+ {
+ 	return percpu_counter_read_positive(&kvm_total_used_mmu_pages);
+ }
+ 
++/*
++ * 在以下使用mmu_shrinker:
++ *   - arch/x86/kvm/mmu.c|7382| <<kvm_mmu_module_init>> ret = register_shrinker(&mmu_shrinker);
++ *   - arch/x86/kvm/mmu.c|7441| <<kvm_mmu_module_exit>> unregister_shrinker(&mmu_shrinker);
++ */
+ static struct shrinker mmu_shrinker = {
+ 	.count_objects = mmu_shrink_count,
+ 	.scan_objects = mmu_shrink_scan,
+ 	.seeks = DEFAULT_SEEKS * 10,
+ };
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|6965| <<kvm_mmu_module_init>> mmu_destroy_caches();
++ *   - arch/x86/kvm/mmu.c|7002| <<kvm_mmu_module_exit>> mmu_destroy_caches();
++ */
+ static void mmu_destroy_caches(void)
+ {
+ 	kmem_cache_destroy(pte_list_desc_cache);
+ 	kmem_cache_destroy(mmu_page_header_cache);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|6437| <<kvm_mmu_module_init>> kvm_set_mmio_spte_mask();
++ */
+ static void kvm_set_mmio_spte_mask(void)
+ {
+ 	u64 mask;
+@@ -6097,6 +7827,10 @@ static void kvm_set_mmio_spte_mask(void)
+ 	kvm_mmu_set_mmio_spte_mask(mask, mask);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|7060| <<kvm_arch_init>> r = kvm_mmu_module_init();
++ */
+ int kvm_mmu_module_init(void)
+ {
+ 	int ret = -ENOMEM;
+@@ -6144,6 +7878,10 @@ int kvm_mmu_module_init(void)
+ /*
+  * Calculate mmu pages needed for kvm.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|9650| <<kvm_arch_commit_memory_region>> kvm_mmu_calculate_default_mmu_pages(kvm));
++ */
+ unsigned long kvm_mmu_calculate_default_mmu_pages(struct kvm *kvm)
+ {
+ 	unsigned long nr_mmu_pages;
+@@ -6165,6 +7903,11 @@ unsigned long kvm_mmu_calculate_default_mmu_pages(struct kvm *kvm)
+ 	return nr_mmu_pages;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|9288| <<kvm_arch_vcpu_init>> kvm_mmu_destroy(vcpu);
++ *   - arch/x86/kvm/x86.c|9304| <<kvm_arch_vcpu_uninit>> kvm_mmu_destroy(vcpu);
++ */
+ void kvm_mmu_destroy(struct kvm_vcpu *vcpu)
+ {
+ 	kvm_mmu_unload(vcpu);
+@@ -6172,6 +7915,10 @@ void kvm_mmu_destroy(struct kvm_vcpu *vcpu)
+ 	mmu_free_memory_caches(vcpu);
+ }
+ 
++/*
++ * called by only:
++ *   - arch/x86/kvm/x86.c|7121| <<kvm_arch_exit>> kvm_mmu_module_exit();
++ */
+ void kvm_mmu_module_exit(void)
+ {
+ 	mmu_destroy_caches();
+diff --git a/arch/x86/kvm/vmx/ops.h b/arch/x86/kvm/vmx/ops.h
+index 2200fb6..17bc868 100644
+--- a/arch/x86/kvm/vmx/ops.h
++++ b/arch/x86/kvm/vmx/ops.h
+@@ -232,6 +232,10 @@ static inline void __invept(unsigned long ext, u64 eptp, gpa_t gpa)
+ 	BUG_ON(error);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|2735| <<vmx_flush_tlb_gva>> if (!vpid_sync_vcpu_addr(vpid, addr))
++ */
+ static inline bool vpid_sync_vcpu_addr(int vpid, gva_t addr)
+ {
+ 	if (vpid == 0)
+diff --git a/arch/x86/kvm/vmx/vmenter.S b/arch/x86/kvm/vmx/vmenter.S
+index 4010d51..ef2c75d 100644
+--- a/arch/x86/kvm/vmx/vmenter.S
++++ b/arch/x86/kvm/vmx/vmenter.S
+@@ -43,6 +43,9 @@
+  * they VM-Fail, whereas a successful VM-Enter + VM-Exit will jump
+  * to vmx_vmexit.
+  */
++/**
++ * 在下面同样是汇编的__vmx_vcpu_run()调用
++ */
+ ENTRY(vmx_vmenter)
+ 	/* EFLAGS.ZF is set if VMCS.LAUNCHED == 0 */
+ 	je 2f
+@@ -77,6 +80,10 @@ ENDPROC(vmx_vmenter)
+  * here after hardware loads the host's state, i.e. this is the destination
+  * referred to by VMCS.HOST_RIP.
+  */
++/**
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|3805| <<vmx_set_constant_host_state>> vmcs_writel(HOST_RIP, (unsigned long )vmx_vmexit);
++ */
+ ENTRY(vmx_vmexit)
+ #ifdef CONFIG_RETPOLINE
+ 	ALTERNATIVE "jmp .Lvmexit_skip_rsb", "", X86_FEATURE_RETPOLINE
+@@ -101,6 +108,10 @@ ENDPROC(vmx_vmexit)
+  * Returns:
+  *	0 on VM-Exit, 1 on VM-Fail
+  */
++/**
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|6499| <<vmx_vcpu_run>> vmx->fail = __vmx_vcpu_run(vmx, (unsigned long *)&vcpu->arch.regs,
++ */
+ ENTRY(__vmx_vcpu_run)
+ 	push %_ASM_BP
+ 	mov  %_ASM_SP, %_ASM_BP
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index c030c96..259650c 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -79,6 +79,10 @@ module_param_named(vnmi, enable_vnmi, bool, S_IRUGO);
+ bool __read_mostly flexpriority_enabled = 1;
+ module_param_named(flexpriority, flexpriority_enabled, bool, S_IRUGO);
+ 
++/*
++ * 只有可能在下面修改成0:
++ *   - arch/x86/kvm/vmx/vmx.c|7554| <<hardware_setup>> enable_ept = 0;
++ */
+ bool __read_mostly enable_ept = 1;
+ module_param_named(ept, enable_ept, bool, S_IRUGO);
+ 
+@@ -86,6 +90,11 @@ bool __read_mostly enable_unrestricted_guest = 1;
+ module_param_named(unrestricted_guest,
+ 			enable_unrestricted_guest, bool, S_IRUGO);
+ 
++/*
++ * 在以下设置enable_ept_ad_bits:
++ *   - arch/x86/kvm/vmx/vmx.c|90| <<global>> module_param_named(eptad, enable_ept_ad_bits, bool, S_IRUGO);
++ *   - arch/x86/kvm/vmx/vmx.c|7539| <<hardware_setup>> enable_ept_ad_bits = 0;
++ */
+ bool __read_mostly enable_ept_ad_bits = 1;
+ module_param_named(eptad, enable_ept_ad_bits, bool, S_IRUGO);
+ 
+@@ -2728,6 +2737,13 @@ static void exit_lmode(struct kvm_vcpu *vcpu)
+ 
+ #endif
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|5497| <<kvm_mmu_invlpg>> kvm_x86_ops->tlb_flush_gva(vcpu, gva);
++ *   - arch/x86/kvm/mmu.c|5522| <<kvm_mmu_invpcid_gva>> kvm_x86_ops->tlb_flush_gva(vcpu, gva);
++ *
++ * struct kvm_x86_ops vmx_x86_ops.tlb_flush_gva = vmx_flush_tlb_gva()
++ */
+ static void vmx_flush_tlb_gva(struct kvm_vcpu *vcpu, gva_t addr)
+ {
+ 	int vpid = to_vmx(vcpu)->vpid;
+@@ -4019,6 +4035,10 @@ static void vmx_compute_secondary_exec_control(struct vcpu_vmx *vmx)
+ 	vmx->secondary_exec_control = exec_control;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|5310| <<vmx_enable_tdp>> ept_set_mmio_spte_mask();
++ */
+ static void ept_set_mmio_spte_mask(void)
+ {
+ 	/*
+@@ -5076,6 +5096,15 @@ static int handle_task_switch(struct kvm_vcpu *vcpu)
+ 	return 1;
+ }
+ 
++/*
++ * 当Guest第一次访问某个页面时,由于没有GVA到GPA的映射,触发Guest OS的page fault.
++ * 于是Guest OS会建立对应的pte并修复好各级页表,最后访问对应的GPA.由于没有建立
++ * GPA到HVA的映射,于是触发EPT Violation,VMEXIT到KVM.  KVM在vmx_handle_exit中执
++ * 行kvm_vmx_exit_handlers[exit_reason],发现exit_reason是
++ * EXIT_REASON_EPT_VIOLATION,因此调用 handle_ept_violation.
++ *
++ * kvm_vmx_exit_handlers[EXIT_REASON_EPT_VIOLATION]
++ */
+ static int handle_ept_violation(struct kvm_vcpu *vcpu)
+ {
+ 	unsigned long exit_qualification;
+@@ -5273,6 +5302,10 @@ static void wakeup_handler(void)
+ 	spin_unlock(&per_cpu(blocked_vcpu_on_cpu_lock, cpu));
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|7572| <<hardware_setup>> vmx_enable_tdp();
++ */
+ static void vmx_enable_tdp(void)
+ {
+ 	kvm_mmu_set_mask_ptes(VMX_EPT_READABLE_MASK,
+@@ -6409,6 +6442,12 @@ void vmx_update_host_rsp(struct vcpu_vmx *vmx, unsigned long host_rsp)
+ 
+ bool __vmx_vcpu_run(struct vcpu_vmx *vmx, unsigned long *regs, bool launched);
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|8023| <<vcpu_enter_guest>> kvm_x86_ops->run(vcpu);
++ *
++ * struct kvm_x86_ops vmx_x86_ops.run = vmx_vcpu_run()
++ */
+ static void vmx_vcpu_run(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+@@ -7474,6 +7513,12 @@ static bool vmx_need_emulation_on_page_fault(struct kvm_vcpu *vcpu)
+ 	return false;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|9149| <<kvm_arch_hardware_setup>> r = kvm_x86_ops->hardware_setup();
++ *
++ * struct kvm_x86_ops vmx_x86_ops.hardware_setup = hardware_setup()
++ */
+ static __init int hardware_setup(void)
+ {
+ 	unsigned long host_bndcfgs;
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 91602d3..743c686 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -7009,6 +7009,10 @@ static struct notifier_block pvclock_gtod_notifier = {
+ };
+ #endif
+ 
++/*
++ * called by:
++ *   - virt/kvm/kvm_main.c|4280| <<kvm_init>> r = kvm_arch_init(opaque);
++ */
+ int kvm_arch_init(void *opaque)
+ {
+ 	int r;
+@@ -7020,6 +7024,10 @@ int kvm_arch_init(void *opaque)
+ 		goto out;
+ 	}
+ 
++	/*
++	 * vmx: cpu_has_kvm_support()
++	 * svm: has_svm()
++	 */
+ 	if (!ops->cpu_has_kvm_support()) {
+ 		printk(KERN_ERR "kvm: no hardware support\n");
+ 		r = -EOPNOTSUPP;
+@@ -7800,6 +7808,10 @@ EXPORT_SYMBOL_GPL(__kvm_request_immediate_exit);
+  * exiting to the userspace.  Otherwise, the value will be returned to the
+  * userspace.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|8163| <<vcpu_run>> r = vcpu_enter_guest(vcpu);
++ */
+ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ {
+ 	int r;
+@@ -8146,6 +8158,10 @@ static inline bool kvm_vcpu_running(struct kvm_vcpu *vcpu)
+ 		!vcpu->arch.apf.halted);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|8371| <<kvm_arch_vcpu_ioctl_run>> r = vcpu_run(vcpu);
++ */
+ static int vcpu_run(struct kvm_vcpu *vcpu)
+ {
+ 	int r;
+@@ -8308,6 +8324,10 @@ static void kvm_put_guest_fpu(struct kvm_vcpu *vcpu)
+ 	trace_kvm_fpu(0);
+ }
+ 
++/*
++ * called by (处理KVM_RUN):
++ *   - virt/kvm/kvm_main.c|2765| <<kvm_vcpu_ioctl>> r = kvm_arch_vcpu_ioctl_run(vcpu, vcpu->run);
++ */
+ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu, struct kvm_run *kvm_run)
+ {
+ 	int r;
+@@ -9142,6 +9162,10 @@ void kvm_arch_hardware_disable(void)
+ 	drop_user_return_notifiers();
+ }
+ 
++/*
++ * x86下的调用:
++ *   - virt/kvm/kvm_main.c|4270| <<kvm_init>> r = kvm_arch_hardware_setup();
++ */
+ int kvm_arch_hardware_setup(void)
+ {
+ 	int r;
+@@ -9365,6 +9389,13 @@ void kvm_arch_sync_events(struct kvm *kvm)
+ 	kvm_free_pit(kvm);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/svm.c|1680| <<avic_init_access_page>> ret = __x86_set_memory_region(kvm,
++ *   - arch/x86/kvm/vmx/vmx.c|3393| <<init_rmode_identity_map>> r = __x86_set_memory_region(kvm, IDENTITY_PAGETABLE_PRIVATE_MEMSLOT,
++ *   - arch/x86/kvm/vmx/vmx.c|3444| <<alloc_apic_access_page>> r = __x86_set_memory_region(kvm, APIC_ACCESS_PAGE_PRIVATE_MEMSLOT,
++ *   - arch/x86/kvm/x86.c|9449| <<x86_set_memory_region>> r = __x86_set_memory_region(kvm, id, gpa, size);
++ */
+ int __x86_set_memory_region(struct kvm *kvm, int id, gpa_t gpa, u32 size)
+ {
+ 	int i, r;
+@@ -9541,6 +9572,10 @@ int kvm_arch_create_memslot(struct kvm *kvm, struct kvm_memory_slot *slot,
+ 	return -ENOMEM;
+ }
+ 
++/*
++ * called by:
++ *   - virt/kvm/kvm_main.c|938| <<install_new_memslots>> kvm_arch_memslots_updated(kvm, gen);
++ */
+ void kvm_arch_memslots_updated(struct kvm *kvm, u64 gen)
+ {
+ 	/*
+@@ -9649,6 +9684,11 @@ void kvm_arch_commit_memory_region(struct kvm *kvm,
+ 		kvm_mmu_slot_apply_flags(kvm, (struct kvm_memory_slot *) new);
+ }
+ 
++/*
++ * x86下的调用:
++ *   - virt/kvm/kvm_main.c|510| <<kvm_mmu_notifier_release>> kvm_arch_flush_shadow_all(kvm);
++ *   - virt/kvm/kvm_main.c|758| <<kvm_destroy_vm>> kvm_arch_flush_shadow_all(kvm);
++ */
+ void kvm_arch_flush_shadow_all(struct kvm *kvm)
+ {
+ 	kvm_mmu_zap_all(kvm);
+diff --git a/drivers/vhost/vhost.c b/drivers/vhost/vhost.c
+index 36ca2cf..8411814 100644
+--- a/drivers/vhost/vhost.c
++++ b/drivers/vhost/vhost.c
+@@ -185,6 +185,12 @@ void vhost_work_init(struct vhost_work *work, vhost_work_fn_t fn)
+ EXPORT_SYMBOL_GPL(vhost_work_init);
+ 
+ /* Init poll structure */
++/*
++ * called by:
++ *   - drivers/vhost/net.c|1329| <<vhost_net_open>> vhost_poll_init(n->poll + VHOST_NET_VQ_TX, handle_tx_net, EPOLLOUT, dev);
++ *   - drivers/vhost/net.c|1330| <<vhost_net_open>> vhost_poll_init(n->poll + VHOST_NET_VQ_RX, handle_rx_net, EPOLLIN, dev);
++ *   - drivers/vhost/vhost.c|489| <<vhost_dev_init>> vhost_poll_init(&vq->poll, vq->handle_kick,
++ */
+ void vhost_poll_init(struct vhost_poll *poll, vhost_work_fn_t fn,
+ 		     __poll_t mask, struct vhost_dev *dev)
+ {
+@@ -452,6 +458,13 @@ static size_t vhost_get_desc_size(struct vhost_virtqueue *vq,
+ 	return sizeof(*vq->desc) * num;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vhost/net.c|1325| <<vhost_net_open>> vhost_dev_init(dev, vqs, VHOST_NET_VQ_MAX,
++ *   - drivers/vhost/scsi.c|1630| <<vhost_scsi_open>> vhost_dev_init(&vs->dev, vqs, VHOST_SCSI_MAX_VQ, UIO_MAXIOV,
++ *   - drivers/vhost/test.c|122| <<vhost_test_open>> vhost_dev_init(dev, vqs, VHOST_TEST_VQ_MAX, UIO_MAXIOV,
++ *   - drivers/vhost/vsock.c|556| <<vhost_vsock_dev_open>> vhost_dev_init(&vsock->dev, vqs, ARRAY_SIZE(vsock->vqs),
++ */
+ void vhost_dev_init(struct vhost_dev *dev,
+ 		    struct vhost_virtqueue **vqs, int nvqs,
+ 		    int iov_limit, int weight, int byte_weight)
+diff --git a/drivers/vhost/vsock.c b/drivers/vhost/vsock.c
+index 6a50e1d..b356158 100644
+--- a/drivers/vhost/vsock.c
++++ b/drivers/vhost/vsock.c
+@@ -35,6 +35,11 @@ enum {
+ 
+ /* Used to track all the vhost_vsock instances on the system. */
+ static DEFINE_MUTEX(vhost_vsock_mutex);
++/*
++ * vhost_vsock_hash在以下使用:
++ *   - drivers/vhost/vsock.c|68| <<vhost_vsock_get>> hash_for_each_possible_rcu(vhost_vsock_hash, vsock, hash, guest_cid) {
++ *   - drivers/vhost/vsock.c|658| <<vhost_vsock_set_cid>> hash_add_rcu(vhost_vsock_hash, &vsock->hash, vsock->guest_cid);
++ */
+ static DEFINE_READ_MOSTLY_HASHTABLE(vhost_vsock_hash, 8);
+ 
+ struct vhost_vsock {
+@@ -206,6 +211,9 @@ static void vhost_transport_send_pkt_work(struct vhost_work *work)
+ 	vhost_transport_do_send_pkt(vsock, vq);
+ }
+ 
++/*
++ * struct virtio_transport vhost_transport.send_pkt = vhost_transport_send_pkt()
++ */
+ static int
+ vhost_transport_send_pkt(struct virtio_vsock_pkt *pkt)
+ {
+@@ -434,6 +442,10 @@ static void vhost_vsock_handle_rx_kick(struct vhost_work *work)
+ 	vhost_transport_do_send_pkt(vsock, vq);
+ }
+ 
++/*
++ * 处理VHOST_VSOCK_SET_RUNNING:
++ *   - drivers/vhost/vsock.c|725| <<vhost_vsock_dev_ioctl>> return vhost_vsock_start(vsock);
++ */
+ static int vhost_vsock_start(struct vhost_vsock *vsock)
+ {
+ 	struct vhost_virtqueue *vq;
+@@ -514,6 +526,9 @@ static void vhost_vsock_free(struct vhost_vsock *vsock)
+ 	kvfree(vsock);
+ }
+ 
++/*
++ * struct file_operations vhost_vsock_fops.open = vhost_vsock_dev_open()
++ */
+ static int vhost_vsock_dev_open(struct inode *inode, struct file *file)
+ {
+ 	struct vhost_virtqueue **vqs;
+@@ -527,6 +542,7 @@ static int vhost_vsock_dev_open(struct inode *inode, struct file *file)
+ 	if (!vsock)
+ 		return -ENOMEM;
+ 
++	/* vsock->vqs类型是"struct vhost_virtqueue vqs[2];" */
+ 	vqs = kmalloc_array(ARRAY_SIZE(vsock->vqs), sizeof(*vqs), GFP_KERNEL);
+ 	if (!vqs) {
+ 		ret = -ENOMEM;
+@@ -593,6 +609,9 @@ static void vhost_vsock_reset_orphans(struct sock *sk)
+ 	sk->sk_error_report(sk);
+ }
+ 
++/*
++ * struct file_operations vhost_vsock_fops.vhost_vsock_dev_release()
++ */
+ static int vhost_vsock_dev_release(struct inode *inode, struct file *file)
+ {
+ 	struct vhost_vsock *vsock = file->private_data;
+@@ -630,6 +649,10 @@ static int vhost_vsock_dev_release(struct inode *inode, struct file *file)
+ 	return 0;
+ }
+ 
++/*
++ * 处理VHOST_VSOCK_SET_GUEST_CID:
++ *   - drivers/vhost/vsock.c|720| <<vhost_vsock_dev_ioctl>> return vhost_vsock_set_cid(vsock, guest_cid);
++ */
+ static int vhost_vsock_set_cid(struct vhost_vsock *vsock, u64 guest_cid)
+ {
+ 	struct vhost_vsock *other;
+@@ -661,6 +684,10 @@ static int vhost_vsock_set_cid(struct vhost_vsock *vsock, u64 guest_cid)
+ 	return 0;
+ }
+ 
++/*
++ * 处理VHOST_SET_FEATURES:
++ *   - drivers/vhost/vsock.c|736| <<vhost_vsock_dev_ioctl>> return vhost_vsock_set_features(vsock, features);
++ */
+ static int vhost_vsock_set_features(struct vhost_vsock *vsock, u64 features)
+ {
+ 	struct vhost_virtqueue *vq;
+@@ -686,6 +713,9 @@ static int vhost_vsock_set_features(struct vhost_vsock *vsock, u64 features)
+ 	return 0;
+ }
+ 
++/*
++ * struct file_operations vhost_vsock_fops.unlocked_ioctl = vhost_vsock_dev_ioctl()
++ */
+ static long vhost_vsock_dev_ioctl(struct file *f, unsigned int ioctl,
+ 				  unsigned long arg)
+ {
+@@ -730,6 +760,9 @@ static long vhost_vsock_dev_ioctl(struct file *f, unsigned int ioctl,
+ }
+ 
+ #ifdef CONFIG_COMPAT
++/*
++ * struct file_operations vhost_vsock_fops.compat_ioctl = vhost_vsock_dev_compat_ioctl()
++ */
+ static long vhost_vsock_dev_compat_ioctl(struct file *f, unsigned int ioctl,
+ 					 unsigned long arg)
+ {
+@@ -755,6 +788,9 @@ static struct miscdevice vhost_vsock_misc = {
+ };
+ 
+ static struct virtio_transport vhost_transport = {
++	/*
++	 * transport的类型是"struct vsock_transport transport;"
++	 */
+ 	.transport = {
+ 		.get_local_cid            = vhost_transport_get_local_cid,
+ 
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index fcb46b3..11bc4a7 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -44,6 +44,13 @@
+  * in kvm, other bits are visible for userspace which are defined in
+  * include/linux/kvm_h.
+  */
++/*
++ * x86下使用的例子:
++ *   - arch/x86/kvm/mmu.c|1868| <<memslot_valid_for_gpte>> if (!slot || slot->flags & KVM_MEMSLOT_INVALID)
++ *   - virt/kvm/kvm_main.c|1048| <<__kvm_set_memory_region>> slot->flags |= KVM_MEMSLOT_INVALID;
++ *   - virt/kvm/kvm_main.c|1349| <<kvm_is_visible_gfn>> memslot->flags & KVM_MEMSLOT_INVALID)
++ *   - virt/kvm/kvm_main.c|1388| <<__gfn_to_hva_many>> if (!slot || slot->flags & KVM_MEMSLOT_INVALID)
++ */
+ #define KVM_MEMSLOT_INVALID	(1UL << 16)
+ 
+ /*
+@@ -65,9 +72,23 @@
+  * the actual generation number against accesses that were inserted into the
+  * cache *before* the memslots were updated.
+  */
++/*
++ * 在以下使用KVM_MEMSLOT_GEN_UPDATE_IN_PROGRESS:
++ *   - arch/x86/kvm/mmu.c|958| <<check_mmio_spte>> if (unlikely(gen & KVM_MEMSLOT_GEN_UPDATE_IN_PROGRESS))
++ *   - arch/x86/kvm/mmu.c|6668| <<kvm_mmu_invalidate_mmio_sptes>> WARN_ON(gen & KVM_MEMSLOT_GEN_UPDATE_IN_PROGRESS);
++ *   - arch/x86/kvm/x86.h|191| <<vcpu_cache_mmio_info>> if (unlikely(gen & KVM_MEMSLOT_GEN_UPDATE_IN_PROGRESS))
++ *   - virt/kvm/kvm_main.c|891| <<install_new_memslots>> WARN_ON(gen & KVM_MEMSLOT_GEN_UPDATE_IN_PROGRESS);
++ *   - virt/kvm/kvm_main.c|892| <<install_new_memslots>> slots->generation = gen | KVM_MEMSLOT_GEN_UPDATE_IN_PROGRESS;
++ *   - virt/kvm/kvm_main.c|903| <<install_new_memslots>> gen = slots->generation & ~KVM_MEMSLOT_GEN_UPDATE_IN_PROGRESS;
++ */
+ #define KVM_MEMSLOT_GEN_UPDATE_IN_PROGRESS	BIT_ULL(63)
+ 
+ /* Two fragments for cross MMIO pages. */
++/*
++ * 在以下使用KVM_MAX_MMIO_FRAGMENTS:
++ *   - include/linux/kvm_host.h|296| <<global>> struct kvm_mmio_fragment mmio_fragments[KVM_MAX_MMIO_FRAGMENTS];
++ *   - arch/x86/kvm/x86.c|5523| <<emulator_read_write_onepage>> WARN_ON(vcpu->mmio_nr_fragments >= KVM_MAX_MMIO_FRAGMENTS);
++ */
+ #define KVM_MAX_MMIO_FRAGMENTS	2
+ 
+ #ifndef KVM_ADDRESS_SPACE_NUM
+@@ -107,6 +128,12 @@ static inline bool is_error_noslot_pfn(kvm_pfn_t pfn)
+ }
+ 
+ /* noslot pfn indicates that the gfn is not in slot. */
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|1058| <<set_mmio_spte>> if (unlikely(is_noslot_pfn(pfn))) {
++ *   - arch/x86/kvm/mmu.c|4157| <<handle_abnormal_pfn>> if (unlikely(is_noslot_pfn(pfn)))
++ *   - arch/x86/kvm/paging_tmpl.h|829| <<FNAME(page_fault)>> !is_noslot_pfn(pfn)) {
++ */
+ static inline bool is_noslot_pfn(kvm_pfn_t pfn)
+ {
+ 	return pfn == KVM_PFN_NOSLOT;
+@@ -143,6 +170,11 @@ static inline bool is_error_page(struct page *page)
+  * Bits 4-7 are reserved for more arch-independent bits.
+  */
+ #define KVM_REQ_TLB_FLUSH         (0 | KVM_REQUEST_WAIT | KVM_REQUEST_NO_WAKEUP)
++/*
++ * x86上在以下使用KVM_REQ_MMU_RELOAD:
++ *   - arch/x86/kvm/x86.c|7827| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_MMU_RELOAD, vcpu))
++ *   - virt/kvm/kvm_main.c|299| <<kvm_reload_remote_mmus>> kvm_make_all_cpus_request(kvm, KVM_REQ_MMU_RELOAD);
++ */
+ #define KVM_REQ_MMU_RELOAD        (1 | KVM_REQUEST_WAIT | KVM_REQUEST_NO_WAKEUP)
+ #define KVM_REQ_PENDING_TIMER     2
+ #define KVM_REQ_UNHALT            3
+@@ -218,9 +250,20 @@ int kvm_async_pf_wakeup_all(struct kvm_vcpu *vcpu);
+ #endif
+ 
+ enum {
++	/*
++	 * x86下使用OUTSIDE_GUEST_MODE的地方:
++	 *   - arch/x86/kvm/mmu.c|1963| <<walk_shadow_page_lockless_end>> smp_store_release(&vcpu->mode, OUTSIDE_GUEST_MODE);
++	 *   - arch/x86/kvm/x86.c|8001| <<vcpu_enter_guest>> vcpu->mode = OUTSIDE_GUEST_MODE;
++	 *   - arch/x86/kvm/x86.c|8060| <<vcpu_enter_guest>> vcpu->mode = OUTSIDE_GUEST_MODE;
++	 *   - virt/kvm/kvm_main.c|202| <<kvm_request_needs_ipi>> return mode != OUTSIDE_GUEST_MODE;
++	 */
+ 	OUTSIDE_GUEST_MODE,
+ 	IN_GUEST_MODE,
+ 	EXITING_GUEST_MODE,
++	/*
++	 * x86在以下使用READING_SHADOW_PAGE_TABLES:
++	 *    - arch/x86/kvm/mmu.c|1947| <<walk_shadow_page_lockless_begin>> smp_store_mb(vcpu->mode, READING_SHADOW_PAGE_TABLES)
++	 */
+ 	READING_SHADOW_PAGE_TABLES,
+ };
+ 
+@@ -343,6 +386,13 @@ static inline int kvm_vcpu_exiting_guest_mode(struct kvm_vcpu *vcpu)
+ struct kvm_memory_slot {
+ 	gfn_t base_gfn;
+ 	unsigned long npages;
++	/*
++	 * 一个slot有许多客户机虚拟页面组成,通过dirty_bitmap
++	 * 标记每一个页是否可用,一个页面对应一个位
++	 *
++	 * 比如在如下分配:
++	 *   - virt/kvm/kvm_main.c|804| <<kvm_create_dirty_bitmap>> memslot->dirty_bitmap = kvzalloc(dirty_bytes, GFP_KERNEL_ACCOUNT);
++	 */
+ 	unsigned long *dirty_bitmap;
+ 	struct kvm_arch_memory_slot arch;
+ 	unsigned long userspace_addr;
+@@ -435,6 +485,15 @@ struct kvm_memslots {
+ 	u64 generation;
+ 	struct kvm_memory_slot memslots[KVM_MEM_SLOTS_NUM];
+ 	/* The mapping table from slot id to the index in memslots[]. */
++	/*
++	 * 更新和使用id_to_index的地方:
++	 *   - virt/kvm/kvm_main.c|549| <<kvm_alloc_memslots>> slots->id_to_index[i] = slots->memslots[i].id = i;
++	 *   - virt/kvm/kvm_main.c|844| <<update_memslots>> slots->id_to_index[mslots[i].id] = i;
++	 *   - virt/kvm/kvm_main.c|861| <<update_memslots>> slots->id_to_index[mslots[i].id] = i;
++	 *   - virt/kvm/kvm_main.c|868| <<update_memslots>> slots->id_to_index[mslots[i].id] = i;
++	 *   - include/linux/kvm_host.h|684| <<id_to_memslot>> int index = slots->id_to_index[id];
++	 *   - virt/kvm/kvm_main.c|822| <<update_memslots>> int i = slots->id_to_index[id];
++	 */
+ 	short id_to_index[KVM_MEM_SLOTS_NUM];
+ 	atomic_t lru_slot;
+ 	int used_slots;
+@@ -444,6 +503,9 @@ struct kvm {
+ 	spinlock_t mmu_lock;
+ 	struct mutex slots_lock;
+ 	struct mm_struct *mm; /* userspace tied to this vm */
++	/*
++	 * KVM_ADDRESS_SPACE_NUM是1或者2
++	 */
+ 	struct kvm_memslots __rcu *memslots[KVM_ADDRESS_SPACE_NUM];
+ 	struct kvm_vcpu *vcpus[KVM_MAX_VCPUS];
+ 
+@@ -623,6 +685,10 @@ void kvm_exit(void);
+ void kvm_get_kvm(struct kvm *kvm);
+ void kvm_put_kvm(struct kvm *kvm);
+ 
++/*
++ * 利用srcu返回kvm->memslots[as_id]
++ * struct kvm中有struct kvm_memslots __rcu *memslots[KVM_ADDRESS_SPACE_NUM];
++ */
+ static inline struct kvm_memslots *__kvm_memslots(struct kvm *kvm, int as_id)
+ {
+ 	as_id = array_index_nospec(as_id, KVM_ADDRESS_SPACE_NUM);
+@@ -643,9 +709,26 @@ static inline struct kvm_memslots *kvm_vcpu_memslots(struct kvm_vcpu *vcpu)
+ 	return __kvm_memslots(vcpu->kvm, as_id);
+ }
+ 
++/*
++ * struct kvm中有struct kvm_memslots __rcu *memslots[KVM_ADDRESS_SPACE_NUM];
++ * struct kvm_memslots有以下两个
++ *     struct kvm_memory_slot memslots[KVM_MEM_SLOTS_NUM];
++ *     short id_to_index[KVM_MEM_SLOTS_NUM];
++ * 这个函数先把id通过id_to_index[]转换成index
++ * 然后用来索引并返回slots->memslots[index]
++ */
+ static inline struct kvm_memory_slot *
+ id_to_memslot(struct kvm_memslots *slots, int id)
+ {
++	/*
++	 * 更新和使用id_to_index的地方:
++	 *   - virt/kvm/kvm_main.c|549| <<kvm_alloc_memslots>> slots->id_to_index[i] = slots->memslots[i].id = i;
++	 *   - virt/kvm/kvm_main.c|844| <<update_memslots>> slots->id_to_index[mslots[i].id] = i;
++	 *   - virt/kvm/kvm_main.c|861| <<update_memslots>> slots->id_to_index[mslots[i].id] = i;
++	 *   - virt/kvm/kvm_main.c|868| <<update_memslots>> slots->id_to_index[mslots[i].id] = i;
++	 *   - include/linux/kvm_host.h|684| <<id_to_memslot>> int index = slots->id_to_index[id];
++	 *   - virt/kvm/kvm_main.c|822| <<update_memslots>> int i = slots->id_to_index[id];
++	 */
+ 	int index = slots->id_to_index[id];
+ 	struct kvm_memory_slot *slot;
+ 
+@@ -1001,6 +1084,10 @@ bool kvm_arch_irqfd_allowed(struct kvm *kvm, struct kvm_irqfd *args);
+  * gfn_to_memslot() itself isn't here as an inline because that would
+  * bloat other code too much.
+  */
++/*
++ * called by:
++ *   - include/linux/kvm_host.h|1102| <<__gfn_to_memslot>> return search_memslots(slots, gfn);
++ */
+ static inline struct kvm_memory_slot *
+ search_memslots(struct kvm_memslots *slots, gfn_t gfn)
+ {
+@@ -1030,12 +1117,27 @@ search_memslots(struct kvm_memslots *slots, gfn_t gfn)
+ 	return NULL;
+ }
+ 
++/*
++ * x86下调用的例子:
++ *   - arch/x86/kvm/mmu.c|1799| <<account_shadowed>> slot = __gfn_to_memslot(slots, gfn);
++ *   - arch/x86/kvm/mmu.c|1818| <<unaccount_shadowed>> slot = __gfn_to_memslot(slots, gfn);
++ *   - arch/x86/kvm/mmu.c|2043| <<gfn_to_rmap>> slot = __gfn_to_memslot(slots, gfn);
++ *   - arch/x86/kvm/mmu_audit.c|139| <<inspect_spte_has_rmap>> slot = __gfn_to_memslot(slots, gfn);
++ *   - arch/x86/kvm/mmu_audit.c|202| <<audit_write_protection>> slot = __gfn_to_memslot(slots, sp->gfn);
++ *   - virt/kvm/kvm_main.c|1335| <<gfn_to_memslot>> return __gfn_to_memslot(kvm_memslots(kvm), gfn);
++ *   - virt/kvm/kvm_main.c|1341| <<kvm_vcpu_gfn_to_memslot>> return __gfn_to_memslot(kvm_vcpu_memslots(vcpu), gfn);
++ *   - virt/kvm/kvm_main.c|2120| <<__kvm_gfn_to_hva_cache_init>> ghc->memslot = __gfn_to_memslot(slots, start_gfn);
++ */
+ static inline struct kvm_memory_slot *
+ __gfn_to_memslot(struct kvm_memslots *slots, gfn_t gfn)
+ {
+ 	return search_memslots(slots, gfn);
+ }
+ 
++/*
++ * x86下调用的例子:
++ *   - virt/kvm/kvm_main.c|1397| <<__gfn_to_hva_many>> return __gfn_to_hva_memslot(slot, gfn);
++ */
+ static inline unsigned long
+ __gfn_to_hva_memslot(struct kvm_memory_slot *slot, gfn_t gfn)
+ {
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index c6a91b0..348cc91 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -99,6 +99,17 @@ DEFINE_MUTEX(kvm_lock);
+ static DEFINE_RAW_SPINLOCK(kvm_count_lock);
+ LIST_HEAD(vm_list);
+ 
++/*
++ * 在以下使用cpus_hardware_enabled:
++ *   - virt/kvm/kvm_main.c|3534| <<hardware_enable_nolock>> if (cpumask_test_cpu(cpu, cpus_hardware_enabled))
++ *   - virt/kvm/kvm_main.c|3537| <<hardware_enable_nolock>> cpumask_set_cpu(cpu, cpus_hardware_enabled);
++ *   - virt/kvm/kvm_main.c|3542| <<hardware_enable_nolock>> cpumask_clear_cpu(cpu, cpus_hardware_enabled);
++ *   - virt/kvm/kvm_main.c|3561| <<hardware_disable_nolock>> if (!cpumask_test_cpu(cpu, cpus_hardware_enabled))
++ *   - virt/kvm/kvm_main.c|3563| <<hardware_disable_nolock>> cpumask_clear_cpu(cpu, cpus_hardware_enabled);
++ *   - virt/kvm/kvm_main.c|4271| <<kvm_init>> if (!zalloc_cpumask_var(&cpus_hardware_enabled, GFP_KERNEL)) {
++ *   - virt/kvm/kvm_main.c|4343| <<kvm_init>> free_cpumask_var(cpus_hardware_enabled);
++ *   - virt/kvm/kvm_main.c|4366| <<kvm_exit>> free_cpumask_var(cpus_hardware_enabled);
++ */
+ static cpumask_var_t cpus_hardware_enabled;
+ static int kvm_usage_count;
+ static atomic_t hardware_enable_failed;
+@@ -347,6 +358,12 @@ static inline struct kvm *mmu_notifier_to_kvm(struct mmu_notifier *mn)
+ 	return container_of(mn, struct kvm, mmu_notifier);
+ }
+ 
++/*
++ * called by:
++ *   - mm/mmu_notifier.c|163| <<__mmu_notifier_change_pte>> mn->ops->change_pte(mn, mm, address, pte);
++ *
++ * struct mmu_notifier_ops kvm_mmu_notifier_ops.change_pte = kvm_mmu_notifier_change_pte()
++ */
+ static void kvm_mmu_notifier_change_pte(struct mmu_notifier *mn,
+ 					struct mm_struct *mm,
+ 					unsigned long address,
+@@ -366,6 +383,9 @@ static void kvm_mmu_notifier_change_pte(struct mmu_notifier *mn,
+ 	srcu_read_unlock(&kvm->srcu, idx);
+ }
+ 
++/*
++ * struct mmu_notifier_ops kvm_mmu_notifier_ops.invalicate_range_start = kvm_mmu_notifier_invalidate_range_start()
++ */
+ static int kvm_mmu_notifier_invalidate_range_start(struct mmu_notifier *mn,
+ 					const struct mmu_notifier_range *range)
+ {
+@@ -398,6 +418,9 @@ static int kvm_mmu_notifier_invalidate_range_start(struct mmu_notifier *mn,
+ 	return ret;
+ }
+ 
++/*
++ * struct mmu_notifier_ops kvm_mmu_notifier_ops.invalidate_range_end = kvm_mmu_notifier_invalidate_range_end()
++ */
+ static void kvm_mmu_notifier_invalidate_range_end(struct mmu_notifier *mn,
+ 					const struct mmu_notifier_range *range)
+ {
+@@ -422,6 +445,9 @@ static void kvm_mmu_notifier_invalidate_range_end(struct mmu_notifier *mn,
+ 	BUG_ON(kvm->mmu_notifier_count < 0);
+ }
+ 
++/*
++ * struct mmu_notifier_ops kvm_mmu_notifier_ops.clear_flush_young = kvm_mmu_notifier_clear_flush_young()
++ */
+ static int kvm_mmu_notifier_clear_flush_young(struct mmu_notifier *mn,
+ 					      struct mm_struct *mm,
+ 					      unsigned long start,
+@@ -443,6 +469,9 @@ static int kvm_mmu_notifier_clear_flush_young(struct mmu_notifier *mn,
+ 	return young;
+ }
+ 
++/*
++ * struct mmu_notifier_ops kvm_mmu_notifier_ops.clear_young = kvm_mmu_notifier_clear_young()
++ */
+ static int kvm_mmu_notifier_clear_young(struct mmu_notifier *mn,
+ 					struct mm_struct *mm,
+ 					unsigned long start,
+@@ -473,6 +502,9 @@ static int kvm_mmu_notifier_clear_young(struct mmu_notifier *mn,
+ 	return young;
+ }
+ 
++/*
++ * struct mmu_notifier_ops kvm_mmu_notifier_ops.test_young = kvm_mmu_notifier_test_young()
++ */
+ static int kvm_mmu_notifier_test_young(struct mmu_notifier *mn,
+ 				       struct mm_struct *mm,
+ 				       unsigned long address)
+@@ -489,6 +521,9 @@ static int kvm_mmu_notifier_test_young(struct mmu_notifier *mn,
+ 	return young;
+ }
+ 
++/*
++ * struct mmu_notifier_ops kvm_mmu_notifier_ops.release = kvm_mmu_notifier_release()
++ */
+ static void kvm_mmu_notifier_release(struct mmu_notifier *mn,
+ 				     struct mm_struct *mm)
+ {
+@@ -915,6 +950,11 @@ static struct kvm_memslots *install_new_memslots(struct kvm *kvm,
+  *
+  * Must be called holding kvm->slots_lock for write.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|9432| <<__x86_set_memory_region>> r = __kvm_set_memory_region(kvm, &m);
++ *   - virt/kvm/kvm_main.c|1098| <<kvm_set_memory_region>> r = __kvm_set_memory_region(kvm, mem);
++ */
+ int __kvm_set_memory_region(struct kvm *kvm,
+ 			    const struct kvm_userspace_memory_region *mem)
+ {
+@@ -1060,6 +1100,12 @@ int __kvm_set_memory_region(struct kvm *kvm,
+ 		memset(&new.arch, 0, sizeof(new.arch));
+ 	}
+ 
++	/*
++	 * Insert memslot and re-sort memslots based on their GFN,
++	 * so binary search could be used to lookup GFN.
++	 * Sorting algorithm takes advantage of having initially
++	 * sorted array and known changed memslot position.
++	 */
+ 	update_memslots(slots, &new, change);
+ 	old_memslots = install_new_memslots(kvm, as_id, slots);
+ 
+@@ -1078,6 +1124,10 @@ int __kvm_set_memory_region(struct kvm *kvm,
+ }
+ EXPORT_SYMBOL_GPL(__kvm_set_memory_region);
+ 
++/*
++ * called by:
++ *   - virt/kvm/kvm_main.c|1110| <<kvm_vm_ioctl_set_memory_region>> return kvm_set_memory_region(kvm, mem);
++ */
+ int kvm_set_memory_region(struct kvm *kvm,
+ 			  const struct kvm_userspace_memory_region *mem)
+ {
+@@ -1310,6 +1360,12 @@ struct kvm_memory_slot *gfn_to_memslot(struct kvm *kvm, gfn_t gfn)
+ }
+ EXPORT_SYMBOL_GPL(gfn_to_memslot);
+ 
++/*
++ * struct kvm中有struct kvm_memslots __rcu *memslots[KVM_ADDRESS_SPACE_NUM];
++ * struct kvm_memslots中有:
++ *       struct kvm_memory_slot memslots[KVM_MEM_SLOTS_NUM];
++ *       short id_to_index[KVM_MEM_SLOTS_NUM];
++ */
+ struct kvm_memory_slot *kvm_vcpu_gfn_to_memslot(struct kvm_vcpu *vcpu, gfn_t gfn)
+ {
+ 	return __gfn_to_memslot(kvm_vcpu_memslots(vcpu), gfn);
+@@ -1327,6 +1383,11 @@ bool kvm_is_visible_gfn(struct kvm *kvm, gfn_t gfn)
+ }
+ EXPORT_SYMBOL_GPL(kvm_is_visible_gfn);
+ 
++/*
++ * 根据gfn获取其对于hva在host中的page size (4K,2M还是1G)
++ *     根据gfn获取在qemu中对应的hva, 把hva转化为vm_area_struct
++ *     然后就知道vm_area_struct的page size了
++ */
+ unsigned long kvm_host_page_size(struct kvm *kvm, gfn_t gfn)
+ {
+ 	struct vm_area_struct *vma;
+@@ -1860,6 +1921,11 @@ void kvm_set_pfn_dirty(kvm_pfn_t pfn)
+ }
+ EXPORT_SYMBOL_GPL(kvm_set_pfn_dirty);
+ 
++/*
++ * x86下的使用:
++ *   - arch/x86/kvm/mmu.c|1761| <<mmu_spte_update>> kvm_set_pfn_accessed(spte_to_pfn(old_spte));
++ *   - arch/x86/kvm/mmu.c|1807| <<mmu_spte_clear_track_bits>> kvm_set_pfn_accessed(pfn);
++ */
+ void kvm_set_pfn_accessed(kvm_pfn_t pfn)
+ {
+ 	if (!kvm_is_reserved_pfn(pfn))
+@@ -2203,6 +2269,13 @@ int kvm_clear_guest(struct kvm *kvm, gpa_t gpa, unsigned long len)
+ }
+ EXPORT_SYMBOL_GPL(kvm_clear_guest);
+ 
++/*
++ * called by:
++ *   - virt/kvm/kvm_main.c|2009| <<__kvm_write_guest_page>> mark_page_dirty_in_slot(memslot, gfn);
++ *   - virt/kvm/kvm_main.c|2141| <<kvm_write_guest_offset_cached>> mark_page_dirty_in_slot(ghc->memslot, gpa >> PAGE_SHIFT);
++ *   - virt/kvm/kvm_main.c|2221| <<mark_page_dirty>> mark_page_dirty_in_slot(memslot, gfn);
++ *   - virt/kvm/kvm_main.c|2230| <<kvm_vcpu_mark_page_dirty>> mark_page_dirty_in_slot(memslot, gfn);
++ */
+ static void mark_page_dirty_in_slot(struct kvm_memory_slot *memslot,
+ 				    gfn_t gfn)
+ {
+@@ -2716,6 +2789,12 @@ static int kvm_vcpu_ioctl_set_sigmask(struct kvm_vcpu *vcpu, sigset_t *sigset)
+ 	return 0;
+ }
+ 
++/*
++ * 还有一处调用:
++ *   - virt/kvm/kvm_main.c|2961| <<kvm_vcpu_compat_ioctl>> r = kvm_vcpu_ioctl(filp, ioctl, arg);
++ *
++ * struct file_operations kvm_vcpu_fops.unlocked_ioctl = kvm_vcpu_ioctl()
++ */
+ static long kvm_vcpu_ioctl(struct file *filp,
+ 			   unsigned int ioctl, unsigned long arg)
+ {
+@@ -4241,6 +4320,12 @@ static void check_processor_compat(void *rtn)
+ 	*(int *)rtn = kvm_arch_check_processor_compat();
+ }
+ 
++/*
++ * x86和arm的例子:
++ *   - arch/x86/kvm/svm.c|7336| <<svm_init>> return kvm_init(&svm_x86_ops, sizeof(struct vcpu_svm),
++ *   - arch/x86/kvm/vmx/vmx.c|7882| <<vmx_init>> r = kvm_init(&vmx_x86_ops, sizeof(struct vcpu_vmx),
++ *   - virt/kvm/arm/arm.c|1729| <<arm_init>> int rc = kvm_init(NULL, sizeof(struct kvm_vcpu), 0, THIS_MODULE);
++ */
+ int kvm_init(void *opaque, unsigned vcpu_size, unsigned vcpu_align,
+ 		  struct module *module)
+ {
+-- 
+2.7.4
+
