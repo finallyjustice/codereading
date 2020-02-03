@@ -1,6 +1,6 @@
-From 2713a4c1849a0b6f22e35c42ab3f85380775c3f5 Mon Sep 17 00:00:00 2001
+From 9a8138bc8f934c6d01e4906931f50a4f5cb8ba3b Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Sun, 2 Feb 2020 23:55:03 -0800
+Date: Mon, 3 Feb 2020 11:27:43 -0800
 Subject: [PATCH 1/1] linux block for linux-5.5
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
@@ -11,20 +11,26 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  block/blk-mq-rdma.c       |   5 +
  block/blk-mq-sysfs.c      |  19 +++
  block/blk-mq-tag.c        |  33 ++++
- block/blk-mq-tag.h        |  53 +++++++
+ block/blk-mq-tag.h        |  53 ++++++
  block/blk-mq-virtio.c     |  31 ++++
- block/blk-mq.c            | 314 ++++++++++++++++++++++++++++++++++++++
- block/blk-mq.h            |  87 +++++++++++
+ block/blk-mq.c            | 339 ++++++++++++++++++++++++++++++++++++++
+ block/blk-mq.h            |  87 ++++++++++
  block/blk-softirq.c       |  39 +++++
- block/blk-stat.c          | 275 +++++++++++++++++++++++++++++++++
- block/blk-stat.h          |  27 ++++
- block/blk-sysfs.c         |   4 +
- drivers/nvme/host/pci.c   |  24 +++
+ block/blk-stat.c          | 275 +++++++++++++++++++++++++++++++
+ block/blk-stat.h          |  27 +++
+ block/blk-sysfs.c         |  19 +++
+ drivers/nvme/host/pci.c   |  45 +++++
  drivers/pci/msi.c         |  14 ++
+ fs/direct-io.c            |  15 ++
+ fs/ext4/file.c            |   5 +
+ fs/iomap/direct-io.c      |  28 ++++
+ include/linux/bio.h       |   6 +
  include/linux/blk-mq.h    |  65 ++++++++
- include/linux/blk_types.h |  12 ++
- include/linux/blkdev.h    |  78 ++++++++++
- 19 files changed, 1152 insertions(+)
+ include/linux/blk_types.h |  22 +++
+ include/linux/blkdev.h    |  88 ++++++++++
+ include/linux/fs.h        |  32 ++++
+ include/uapi/linux/fs.h   |  11 ++
+ 25 files changed, 1330 insertions(+)
 
 diff --git a/block/blk-core.c b/block/blk-core.c
 index 089e890ab208..07b4f52d414a 100644
@@ -478,7 +484,7 @@ index 488341628256..16ece920ec49 100644
  		struct virtio_device *vdev, int first_vec)
  {
 diff --git a/block/blk-mq.c b/block/blk-mq.c
-index 323c9cb28066..43bab57b84a3 100644
+index 323c9cb28066..436b3e384528 100644
 --- a/block/blk-mq.c
 +++ b/block/blk-mq.c
 @@ -43,13 +43,22 @@
@@ -949,7 +955,7 @@ index 323c9cb28066..43bab57b84a3 100644
  static bool blk_mq_poll_hybrid(struct request_queue *q,
  			       struct blk_mq_hw_ctx *hctx, blk_qc_t cookie)
  {
-@@ -3463,6 +3709,62 @@ static bool blk_mq_poll_hybrid(struct request_queue *q,
+@@ -3463,6 +3709,87 @@ static bool blk_mq_poll_hybrid(struct request_queue *q,
   *    looping until at least one completion is found, unless the task is
   *    otherwise marked running (or we need to reschedule).
   */
@@ -999,6 +1005,25 @@ index 323c9cb28066..43bab57b84a3 100644
 + * 116         return ctx->hctxs[type];
 + * 117 }
 + *
++ * 激活poll的方法:
++ *
++ * 激活io_poll:
++ * # echo 1 > /sys/block/nvme0n1/queue/io_poll
++ *
++ * 在fio中使用pvsync2加上hipri:
++ * # fio -name iops -rw=read -bs=4k -runtime=60 -iodepth 32 -filename /dev/nvme0n1 -ioengine pvsync2 -direct=1 -hipri=1
++ *
++ * [0] blk_poll
++ * [0] __blkdev_direct_IO_simple
++ * [0] blkdev_direct_IO
++ * [0] generic_file_read_iter
++ * [0] do_iter_readv_writev
++ * [0] do_iter_read
++ * [0] vfs_readv
++ * [0] do_preadv
++ * [0] do_syscall_64
++ * [0] entry_SYSCALL_64_after_hwframe
++ *
 + * called by:
 + *   - drivers/nvme/host/core.c|812| <<nvme_execute_rq_polled>> blk_poll(q, request_to_qc_t(rq->mq_hctx, rq), true);
 + *   - fs/block_dev.c|257| <<__blkdev_direct_IO_simple>> !blk_poll(bdev_get_queue(bdev), qc, true))
@@ -1008,11 +1033,17 @@ index 323c9cb28066..43bab57b84a3 100644
 + *   - fs/iomap/direct-io.c|57| <<iomap_dio_iopoll>> return blk_poll(q, READ_ONCE(kiocb->ki_cookie), spin);
 + *   - fs/iomap/direct-io.c|562| <<iomap_dio_rw>> !blk_poll(dio->submit.last_queue,
 + *   - mm/page_io.c|424| <<swap_readpage>> if (!blk_poll(disk->queue, qc, true))
++ *
++ * Polling is tried for any block I/O belonging to a high-priority I/O context (IOCB_HIPRI)
++ *
++ * For applications, set only for preadv2/pwritev2 with RWF_HIPRI flag
++ *
++ * Not related to ioprio_set!
 + */
  int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
  {
  	struct blk_mq_hw_ctx *hctx;
-@@ -3475,6 +3777,10 @@ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
+@@ -3475,6 +3802,10 @@ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
  	if (current->plug)
  		blk_flush_plug_list(current->plug, false);
  
@@ -1023,7 +1054,7 @@ index 323c9cb28066..43bab57b84a3 100644
  	hctx = q->queue_hw_ctx[blk_qc_t_to_queue_num(cookie)];
  
  	/*
-@@ -3495,6 +3801,9 @@ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
+@@ -3495,6 +3826,9 @@ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
  
  		hctx->poll_invoked++;
  
@@ -1033,7 +1064,7 @@ index 323c9cb28066..43bab57b84a3 100644
  		ret = q->mq_ops->poll(hctx);
  		if (ret > 0) {
  			hctx->poll_success++;
-@@ -3517,6 +3826,11 @@ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
+@@ -3517,6 +3851,11 @@ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
  }
  EXPORT_SYMBOL_GPL(blk_poll);
  
@@ -1749,10 +1780,34 @@ index 17b47a86eefb..5cd0d92b34a7 100644
  					   unsigned int msecs)
  {
 diff --git a/block/blk-sysfs.c b/block/blk-sysfs.c
-index fca9b158f4a0..1ff764db605c 100644
+index fca9b158f4a0..231bb884efdb 100644
 --- a/block/blk-sysfs.c
 +++ b/block/blk-sysfs.c
-@@ -873,6 +873,10 @@ static void blk_exit_queue(struct request_queue *q)
+@@ -390,8 +390,23 @@ static ssize_t queue_poll_delay_store(struct request_queue *q, const char *page,
+ 	return count;
+ }
+ 
++/*
++ * nvme.poll_queues=2
++ *
++ * # cat /sys/block/nvme0n1/queue/io_poll
++ */
+ static ssize_t queue_poll_show(struct request_queue *q, char *page)
+ {
++	/*
++	 * 使用QUEUE_FLAG_POLL的地方:
++	 *   - block/blk-mq.c|3021| <<blk_mq_init_allocated_queue>> blk_queue_flag_set(QUEUE_FLAG_POLL, q);
++	 *   - block/blk-sysfs.c|413| <<queue_poll_store>> blk_queue_flag_set(QUEUE_FLAG_POLL, q);
++	 *   - block/blk-sysfs.c|415| <<queue_poll_store>> blk_queue_flag_clear(QUEUE_FLAG_POLL, q);
++	 *   - block/blk-core.c|936| <<generic_make_request_checks>> if (!test_bit(QUEUE_FLAG_POLL, &q->queue_flags))
++	 *   - block/blk-mq.c|3774| <<blk_poll>> !test_bit(QUEUE_FLAG_POLL, &q->queue_flags))
++	 *   - drivers/nvme/host/core.c|805| <<nvme_execute_rq_polled>> WARN_ON_ONCE(!test_bit(QUEUE_FLAG_POLL, &q->queue_flags));
++	 *   - block/blk-sysfs.c|395| <<queue_poll_show>> return queue_var_show(test_bit(QUEUE_FLAG_POLL, &q->queue_flags), page);
++	 */
+ 	return queue_var_show(test_bit(QUEUE_FLAG_POLL, &q->queue_flags), page);
+ }
+ 
+@@ -873,6 +888,10 @@ static void blk_exit_queue(struct request_queue *q)
   *     of the request queue reaches zero, blk_release_queue is called to release
   *     all allocated resources of the request queue.
   */
@@ -1764,10 +1819,38 @@ index fca9b158f4a0..1ff764db605c 100644
  {
  	struct request_queue *q = container_of(work, typeof(*q), release_work);
 diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
-index 365a2ddbeaa7..830bd0b1bd3a 100644
+index 365a2ddbeaa7..4009ac63668a 100644
 --- a/drivers/nvme/host/pci.c
 +++ b/drivers/nvme/host/pci.c
-@@ -1492,6 +1492,12 @@ static int nvme_alloc_queue(struct nvme_dev *dev, int qid, int depth)
+@@ -1073,6 +1073,27 @@ static int nvme_poll_irqdisable(struct nvme_queue *nvmeq, unsigned int tag)
+ 	return found;
+ }
+ 
++/*
++ * 激活poll的方法:
++ *
++ * 激活io_poll:
++ * # echo 1 > /sys/block/nvme0n1/queue/io_poll
++ *
++ * 在fio中使用pvsync2加上hipri:
++ * # fio -name iops -rw=read -bs=4k -runtime=60 -iodepth 32 -filename /dev/nvme0n1 -ioengine pvsync2 -direct=1 -hipri=1
++ *
++ * [0] nvme_poll
++ * [0] blk_poll
++ * [0] __blkdev_direct_IO_simple
++ * [0] blkdev_direct_IO
++ * [0] generic_file_read_iter
++ * [0] do_iter_readv_writev
++ * [0] do_iter_read
++ * [0] vfs_readv
++ * [0] do_preadv
++ * [0] do_syscall_64
++ * [0] entry_SYSCALL_64_after_hwframe
++ */
+ static int nvme_poll(struct blk_mq_hw_ctx *hctx)
+ {
+ 	struct nvme_queue *nvmeq = hctx->driver_data;
+@@ -1492,6 +1513,12 @@ static int nvme_alloc_queue(struct nvme_dev *dev, int qid, int depth)
  	return -ENOMEM;
  }
  
@@ -1780,7 +1863,7 @@ index 365a2ddbeaa7..830bd0b1bd3a 100644
  static int queue_request_irq(struct nvme_queue *nvmeq)
  {
  	struct pci_dev *pdev = to_pci_dev(nvmeq->dev->dev);
-@@ -2045,8 +2051,26 @@ static void nvme_calc_irq_sets(struct irq_affinity *affd, unsigned int nrirqs)
+@@ -2045,8 +2072,26 @@ static void nvme_calc_irq_sets(struct irq_affinity *affd, unsigned int nrirqs)
  	affd->nr_sets = nr_read_queues ? 2 : 1;
  }
  
@@ -1832,6 +1915,146 @@ index c7709e49f0e4..b2825afe777d 100644
  	struct irq_affinity msi_default_affd = {0};
  	int msix_vecs = -ENOSPC;
  	int msi_vecs = -ENOSPC;
+diff --git a/fs/direct-io.c b/fs/direct-io.c
+index 00b4d15bb811..356584570bc3 100644
+--- a/fs/direct-io.c
++++ b/fs/direct-io.c
+@@ -940,6 +940,10 @@ static inline void dio_zero_block(struct dio *dio, struct dio_submit *sdio,
+  * it should set b_size to PAGE_SIZE or more inside get_block().  This gives
+  * fine alignment but still allows this function to work in PAGE_SIZE units.
+  */
++/*
++ * called by:
++ *   - fs/direct-io.c|1311| <<do_blockdev_direct_IO>> retval = do_direct_IO(dio, &sdio, &map_bh);
++ */
+ static int do_direct_IO(struct dio *dio, struct dio_submit *sdio,
+ 			struct buffer_head *map_bh)
+ {
+@@ -1141,6 +1145,10 @@ static inline int drop_refcount(struct dio *dio)
+  * individual fields and will generate much worse code. This is important
+  * for the whole file.
+  */
++/*
++ * called by:
++ *   - fs/direct-io.c|1393| <<__blockdev_direct_IO>> return do_blockdev_direct_IO(iocb, inode, bdev, iter, get_block,
++ */
+ static inline ssize_t
+ do_blockdev_direct_IO(struct kiocb *iocb, struct inode *inode,
+ 		      struct block_device *bdev, struct iov_iter *iter,
+@@ -1372,6 +1380,13 @@ do_blockdev_direct_IO(struct kiocb *iocb, struct inode *inode,
+ 	return retval;
+ }
+ 
++/*
++ * called by:
++ *   - fs/btrfs/inode.c|8741| <<btrfs_direct_IO>> ret = __blockdev_direct_IO(iocb, inode,
++ *   - fs/f2fs/data.c|2972| <<f2fs_direct_IO>> err = __blockdev_direct_IO(iocb, inode, inode->i_sb->s_bdev,
++ *   - fs/ocfs2/aops.c|2470| <<ocfs2_direct_IO>> return __blockdev_direct_IO(iocb, inode, inode->i_sb->s_bdev,
++ *   - include/linux/fs.h|3171| <<blockdev_direct_IO>> return __blockdev_direct_IO(iocb, inode, inode->i_sb->s_bdev, iter,
++ */
+ ssize_t __blockdev_direct_IO(struct kiocb *iocb, struct inode *inode,
+ 			     struct block_device *bdev, struct iov_iter *iter,
+ 			     get_block_t get_block,
+diff --git a/fs/ext4/file.c b/fs/ext4/file.c
+index 6a7293a5cda2..a3a0432c6db4 100644
+--- a/fs/ext4/file.c
++++ b/fs/ext4/file.c
+@@ -36,6 +36,11 @@
+ #include "acl.h"
+ #include "truncate.h"
+ 
++/*
++ * called by:
++ *   - fs/ext4/file.c|64| <<ext4_dio_read_iter>> if (!ext4_dio_supported(inode)) {
++ *   - fs/ext4/file.c|382| <<ext4_dio_write_iter>> if (!ext4_dio_supported(inode)) {
++ */
+ static bool ext4_dio_supported(struct inode *inode)
+ {
+ 	if (IS_ENABLED(CONFIG_FS_ENCRYPTION) && IS_ENCRYPTED(inode))
+diff --git a/fs/iomap/direct-io.c b/fs/iomap/direct-io.c
+index 23837926c0c5..d5663a649119 100644
+--- a/fs/iomap/direct-io.c
++++ b/fs/iomap/direct-io.c
+@@ -58,6 +58,11 @@ int iomap_dio_iopoll(struct kiocb *kiocb, bool spin)
+ }
+ EXPORT_SYMBOL_GPL(iomap_dio_iopoll);
+ 
++/*
++ * called by:
++ *   - fs/iomap/direct-io.c|194| <<iomap_dio_zero>> iomap_dio_submit_bio(dio, iomap, bio);
++ *   - fs/iomap/direct-io.c|306| <<iomap_dio_bio_actor>> iomap_dio_submit_bio(dio, iomap, bio);
++ */
+ static void iomap_dio_submit_bio(struct iomap_dio *dio, struct iomap *iomap,
+ 		struct bio *bio)
+ {
+@@ -174,6 +179,11 @@ static void iomap_dio_bio_end_io(struct bio *bio)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - fs/iomap/direct-io.c|256| <<iomap_dio_bio_actor>> iomap_dio_zero(dio, iomap, pos - pad, pad);
++ *   - fs/iomap/direct-io.c|321| <<iomap_dio_bio_actor>> iomap_dio_zero(dio, iomap, pos, fs_block_size - pad);
++ */
+ static void
+ iomap_dio_zero(struct iomap_dio *dio, struct iomap *iomap, loff_t pos,
+ 		unsigned len)
+@@ -194,6 +204,11 @@ iomap_dio_zero(struct iomap_dio *dio, struct iomap *iomap, loff_t pos,
+ 	iomap_dio_submit_bio(dio, iomap, bio);
+ }
+ 
++/*
++ * called by:
++ *   - fs/iomap/direct-io.c|380| <<iomap_dio_actor>> return iomap_dio_bio_actor(inode, pos, length, dio, iomap);
++ *   - fs/iomap/direct-io.c|382| <<iomap_dio_actor>> return iomap_dio_bio_actor(inode, pos, length, dio, iomap);
++ */
+ static loff_t
+ iomap_dio_bio_actor(struct inode *inode, loff_t pos, loff_t length,
+ 		struct iomap_dio *dio, struct iomap *iomap)
+@@ -363,6 +378,10 @@ iomap_dio_inline_actor(struct inode *inode, loff_t pos, loff_t length,
+ 	return copied;
+ }
+ 
++/*
++ * called by:
++ *   - fs/iomap/direct-io.c|523| <<iomap_dio_rw>> iomap_dio_actor);
++ */
+ static loff_t
+ iomap_dio_actor(struct inode *inode, loff_t pos, loff_t length,
+ 		void *data, struct iomap *iomap, struct iomap *srcmap)
+@@ -397,6 +416,15 @@ iomap_dio_actor(struct inode *inode, loff_t pos, loff_t length,
+  * may be pure data writes. In that case, we still need to do a full data sync
+  * completion.
+  */
++/*
++ * called by:
++ *   - fs/ext4/file.c|77| <<ext4_dio_read_iter>> ret = iomap_dio_rw(iocb, to, &ext4_iomap_ops, NULL,
++ *   - fs/ext4/file.c|438| <<ext4_dio_write_iter>> ret = iomap_dio_rw(iocb, from, &ext4_iomap_ops, &ext4_dio_write_ops,
++ *   - fs/gfs2/file.c|774| <<gfs2_file_direct_read>> ret = iomap_dio_rw(iocb, to, &gfs2_iomap_ops, NULL,
++ *   - fs/gfs2/file.c|810| <<gfs2_file_direct_write>> ret = iomap_dio_rw(iocb, from, &gfs2_iomap_ops, NULL,
++ *   - fs/xfs/xfs_file.c|191| <<xfs_file_dio_aio_read>> ret = iomap_dio_rw(iocb, to, &xfs_read_iomap_ops, NULL,
++ *   - fs/xfs/xfs_file.c|554| <<xfs_file_dio_aio_write>> ret = iomap_dio_rw(iocb, from, &xfs_direct_write_iomap_ops,
++ */
+ ssize_t
+ iomap_dio_rw(struct kiocb *iocb, struct iov_iter *iter,
+ 		const struct iomap_ops *ops, const struct iomap_dio_ops *dops,
+diff --git a/include/linux/bio.h b/include/linux/bio.h
+index 853d92ceee64..c1c44f9e943f 100644
+--- a/include/linux/bio.h
++++ b/include/linux/bio.h
+@@ -827,6 +827,12 @@ static inline int bio_integrity_add_page(struct bio *bio, struct page *page,
+  * must be found by the caller. This is different than IRQ driven IO, where
+  * it's safe to wait for IO to complete.
+  */
++/*
++ * called by:
++ *   - fs/block_dev.c|249| <<__blkdev_direct_IO_simple>> bio_set_polled(&bio, iocb);
++ *   - fs/block_dev.c|410| <<__blkdev_direct_IO>> bio_set_polled(bio, iocb);
++ *   - fs/iomap/direct-io.c|67| <<iomap_dio_submit_bio>> bio_set_polled(bio, dio->iocb);
++ */
+ static inline void bio_set_polled(struct bio *bio, struct kiocb *kiocb)
+ {
+ 	bio->bi_opf |= REQ_HIPRI;
 diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
 index 11cfd6470b1a..5cc5440f1b6d 100644
 --- a/include/linux/blk-mq.h
@@ -1955,10 +2178,27 @@ index 11cfd6470b1a..5cc5440f1b6d 100644
  	for ((i) = 0; (i) < (hctx)->nr_ctx &&				\
  	     ({ ctx = (hctx)->ctxs[(i)]; 1; }); (i)++)
 diff --git a/include/linux/blk_types.h b/include/linux/blk_types.h
-index 70254ae11769..00398d151629 100644
+index 70254ae11769..c558f996cd1f 100644
 --- a/include/linux/blk_types.h
 +++ b/include/linux/blk_types.h
-@@ -461,16 +461,28 @@ static inline bool blk_qc_t_valid(blk_qc_t cookie)
+@@ -362,6 +362,16 @@ enum req_flag_bits {
+ #define REQ_CGROUP_PUNT		(1ULL << __REQ_CGROUP_PUNT)
+ 
+ #define REQ_NOUNMAP		(1ULL << __REQ_NOUNMAP)
++/*
++ * 使用REQ_HIPRI的地方:
++ *   - block/blk-core.c|937| <<generic_make_request_checks>> bio->bi_opf &= ~REQ_HIPRI;
++ *   - block/blk-mq.c|608| <<__blk_mq_complete_request>> if ((rq->cmd_flags & REQ_HIPRI) ||
++ *   - block/blk-mq.h|191| <<blk_mq_map_queue>> if (flags & REQ_HIPRI)
++ *   - drivers/nvme/host/core.c|807| <<nvme_execute_rq_polled>> rq->cmd_flags |= REQ_HIPRI;
++ *   - fs/direct-io.c|1243| <<do_blockdev_direct_IO>> dio->op_flags |= REQ_HIPRI;
++ *   - include/linux/bio.h|832| <<bio_set_polled>> bio->bi_opf |= REQ_HIPRI;
++ *   - mm/page_io.c|412| <<swap_readpage>> bio->bi_opf |= REQ_HIPRI;
++ */
+ #define REQ_HIPRI		(1ULL << __REQ_HIPRI)
+ 
+ #define REQ_DRV			(1ULL << __REQ_DRV)
+@@ -461,16 +471,28 @@ static inline bool blk_qc_t_valid(blk_qc_t cookie)
  	return cookie != BLK_QC_T_NONE && cookie != BLK_QC_T_EAGAIN;
  }
  
@@ -1988,7 +2228,7 @@ index 70254ae11769..00398d151629 100644
  {
  	return (cookie & BLK_QC_T_INTERNAL) != 0;
 diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
-index 4c636c42ad68..7877a169909a 100644
+index 4c636c42ad68..133cbdbaadd1 100644
 --- a/include/linux/blkdev.h
 +++ b/include/linux/blkdev.h
 @@ -106,6 +106,11 @@ typedef __u32 __bitwise req_flags_t;
@@ -2083,7 +2323,21 @@ index 4c636c42ad68..7877a169909a 100644
  	struct blk_rq_stat	poll_stat[BLK_MQ_POLL_STATS_BKTS];
  
  	struct timer_list	timeout;
-@@ -604,7 +658,21 @@ struct request_queue {
+@@ -600,11 +654,35 @@ struct request_queue {
+ #define QUEUE_FLAG_SAME_FORCE	12	/* force complete on same CPU */
+ #define QUEUE_FLAG_DEAD		13	/* queue tear-down finished */
+ #define QUEUE_FLAG_INIT_DONE	14	/* queue is initialized */
++/*
++ * 使用QUEUE_FLAG_POLL的地方:
++ *   - block/blk-mq.c|3021| <<blk_mq_init_allocated_queue>> blk_queue_flag_set(QUEUE_FLAG_POLL, q);
++ *   - block/blk-sysfs.c|413| <<queue_poll_store>> blk_queue_flag_set(QUEUE_FLAG_POLL, q);
++ *   - block/blk-sysfs.c|415| <<queue_poll_store>> blk_queue_flag_clear(QUEUE_FLAG_POLL, q);
++ *   - block/blk-core.c|936| <<generic_make_request_checks>> if (!test_bit(QUEUE_FLAG_POLL, &q->queue_flags))
++ *   - block/blk-mq.c|3774| <<blk_poll>> !test_bit(QUEUE_FLAG_POLL, &q->queue_flags))
++ *   - drivers/nvme/host/core.c|805| <<nvme_execute_rq_polled>> WARN_ON_ONCE(!test_bit(QUEUE_FLAG_POLL, &q->queue_flags));
++ *   - block/blk-sysfs.c|395| <<queue_poll_show>> return queue_var_show(test_bit(QUEUE_FLAG_POLL, &q->queue_flags), page);
++ */
+ #define QUEUE_FLAG_POLL		16	/* IO polling enabled if set */
  #define QUEUE_FLAG_WC		17	/* Write back caching */
  #define QUEUE_FLAG_FUA		18	/* device supports FUA writes */
  #define QUEUE_FLAG_DAX		19	/* device supports DAX */
@@ -2105,7 +2359,7 @@ index 4c636c42ad68..7877a169909a 100644
  #define QUEUE_FLAG_POLL_STATS	21	/* collecting stats for hybrid polling */
  #define QUEUE_FLAG_REGISTERED	22	/* queue has been registered to a disk */
  #define QUEUE_FLAG_SCSI_PASSTHROUGH 23	/* queue supports SCSI commands */
-@@ -948,6 +1016,16 @@ static inline unsigned int blk_rq_cur_sectors(const struct request *rq)
+@@ -948,6 +1026,16 @@ static inline unsigned int blk_rq_cur_sectors(const struct request *rq)
  
  static inline unsigned int blk_rq_stats_sectors(const struct request *rq)
  {
@@ -2121,6 +2375,85 @@ index 4c636c42ad68..7877a169909a 100644
 +	 */
  	return rq->stats_sectors;
  }
+ 
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 98e0349adb52..887db5860145 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -309,6 +309,25 @@ enum rw_hint {
+ #define IOCB_EVENTFD		(1 << 0)
+ #define IOCB_APPEND		(1 << 1)
+ #define IOCB_DIRECT		(1 << 2)
++/*
++ * 设置和取消IOCB_HIPRI的地方:
++ *   - include/linux/fs.h|3427| <<kiocb_set_rw_flags>> ki->ki_flags |= IOCB_HIPRI;
++ *   - fs/io_uring.c|1536| <<io_prep_rw>> kiocb->ki_flags |= IOCB_HIPRI;
++ *   - fs/aio.c|1476| <<aio_prep_rw>> req->ki_flags &= ~IOCB_HIPRI;
++ * 其他使用IOCB_HIPRI的地方:
++ *   - fs/block_dev.c|248| <<__blkdev_direct_IO_simple>> if (iocb->ki_flags & IOCB_HIPRI)
++ *   - fs/block_dev.c|256| <<__blkdev_direct_IO_simple>> if (!(iocb->ki_flags & IOCB_HIPRI) ||
++ *   - fs/block_dev.c|346| <<__blkdev_direct_IO>> bool is_poll = (iocb->ki_flags & IOCB_HIPRI) != 0;
++ *   - fs/block_dev.c|409| <<__blkdev_direct_IO>> if (iocb->ki_flags & IOCB_HIPRI) {
++ *   - fs/block_dev.c|450| <<__blkdev_direct_IO>> if (!(iocb->ki_flags & IOCB_HIPRI) ||
++ *   - fs/direct-io.c|501| <<dio_await_one>> if (!(dio->iocb->ki_flags & IOCB_HIPRI) ||
++ *   - fs/direct-io.c|1250| <<do_blockdev_direct_IO>> if (iocb->ki_flags & IOCB_HIPRI)
++ *   - fs/io_uring.c|1540| <<io_prep_rw>> if (kiocb->ki_flags & IOCB_HIPRI)
++ *   - fs/io_uring.c|1710| <<loop_rw_iter>> if (kiocb->ki_flags & IOCB_HIPRI)
++ *   - fs/iomap/direct-io.c|71| <<iomap_dio_submit_bio>> if (dio->iocb->ki_flags & IOCB_HIPRI)
++ *   - fs/iomap/direct-io.c|584| <<iomap_dio_rw>> if (!(iocb->ki_flags & IOCB_HIPRI) ||
++ *   - fs/overlayfs/file.c|218| <<ovl_iocb_to_rwf>> if (ifl & IOCB_HIPRI)
++ */
+ #define IOCB_HIPRI		(1 << 3)
+ #define IOCB_DSYNC		(1 << 4)
+ #define IOCB_SYNC		(1 << 5)
+@@ -3163,6 +3182,19 @@ ssize_t __blockdev_direct_IO(struct kiocb *iocb, struct inode *inode,
+ 			     dio_iodone_t end_io, dio_submit_t submit_io,
+ 			     int flags);
+ 
++/*
++ * called by:
++ *   - drivers/staging/exfat/exfat_super.c|3089| <<exfat_direct_IO>> ret = blockdev_direct_IO(iocb, inode, iter, exfat_get_block);
++ *   - fs/affs/file.c|409| <<affs_direct_IO>> ret = blockdev_direct_IO(iocb, inode, iter, affs_get_block);
++ *   - fs/ext2/inode.c|948| <<ext2_direct_IO>> ret = blockdev_direct_IO(iocb, inode, iter, ext2_get_block);
++ *   - fs/fat/inode.c|288| <<fat_direct_IO>> ret = blockdev_direct_IO(iocb, inode, iter, fat_get_block);
++ *   - fs/hfs/inode.c|137| <<hfs_direct_IO>> ret = blockdev_direct_IO(iocb, inode, iter, hfs_get_block);
++ *   - fs/hfsplus/inode.c|134| <<hfsplus_direct_IO>> ret = blockdev_direct_IO(iocb, inode, iter, hfsplus_get_block);
++ *   - fs/jfs/inode.c|342| <<jfs_direct_IO>> ret = blockdev_direct_IO(iocb, inode, iter, jfs_get_block);
++ *   - fs/nilfs2/inode.c|303| <<nilfs_direct_IO>> return blockdev_direct_IO(iocb, inode, iter, nilfs_get_block);
++ *   - fs/reiserfs/inode.c|3270| <<reiserfs_direct_IO>> ret = blockdev_direct_IO(iocb, inode, iter,
++ *   - fs/udf/inode.c|224| <<udf_direct_IO>> ret = blockdev_direct_IO(iocb, inode, iter, udf_get_block);
++ */
+ static inline ssize_t blockdev_direct_IO(struct kiocb *iocb,
+ 					 struct inode *inode,
+ 					 struct iov_iter *iter,
+diff --git a/include/uapi/linux/fs.h b/include/uapi/linux/fs.h
+index 379a612f8f1d..f1fd79764d02 100644
+--- a/include/uapi/linux/fs.h
++++ b/include/uapi/linux/fs.h
+@@ -285,6 +285,13 @@ struct fsxattr {
+ typedef int __bitwise __kernel_rwf_t;
+ 
+ /* high priority request, poll if possible */
++/*
++ * 在以下使用RWF_HIPRI:
++ *   - fs/overlayfs/file.c|219| <<ovl_iocb_to_rwf>> flags |= RWF_HIPRI;
++ *   - fs/read_write.c|706| <<do_loop_readv_writev>> if (flags & ~RWF_HIPRI)
++ *   - include/linux/fs.h|3426| <<kiocb_set_rw_flags>> if (flags & RWF_HIPRI)
++ *   - include/uapi/linux/fs.h|303| <<RWF_SUPPORTED>> #define RWF_SUPPORTED (RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_NOWAIT |\
++ */
+ #define RWF_HIPRI	((__force __kernel_rwf_t)0x00000001)
+ 
+ /* per-IO O_DSYNC */
+@@ -300,6 +307,10 @@ typedef int __bitwise __kernel_rwf_t;
+ #define RWF_APPEND	((__force __kernel_rwf_t)0x00000010)
+ 
+ /* mask of flags supported by the kernel */
++/*
++ * 在以下使用RWF_SUPPORTED:
++ *   - include/linux/fs.h|3418| <<kiocb_set_rw_flags>> if (unlikely(flags & ~RWF_SUPPORTED))
++ */
+ #define RWF_SUPPORTED	(RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_NOWAIT |\
+ 			 RWF_APPEND)
  
 -- 
 2.17.1
