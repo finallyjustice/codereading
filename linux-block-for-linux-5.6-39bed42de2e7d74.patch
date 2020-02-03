@@ -1,1103 +1,1065 @@
-From 8e6fda4a42cf66a9cb45fc01167d56e0405468e8 Mon Sep 17 00:00:00 2001
+From 72c1e76b23c213470e1bb0f392b0bcd9ac3dc262 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Fri, 31 Jan 2020 15:24:36 -0800
+Date: Sun, 2 Feb 2020 19:25:33 -0800
 Subject: [PATCH 1/1] linux block for linux-5.6-39bed42de2e7d74
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
- block/blk-mq-cpumap.c  |  28 ++++++++
- block/blk-mq-pci.c     |  32 +++++++++
- block/blk-mq-rdma.c    |   5 ++
- block/blk-mq-sysfs.c   |  19 ++++++
- block/blk-mq-tag.c     |  33 ++++++++++
- block/blk-mq-tag.h     |  56 ++++++++++++++++
- block/blk-mq-virtio.c  |  31 +++++++++
- block/blk-mq.c         | 146 +++++++++++++++++++++++++++++++++++++++++
- block/blk-mq.h         |  89 +++++++++++++++++++++++++
- block/blk-softirq.c    |  41 ++++++++++++
- include/linux/blk-mq.h |  68 +++++++++++++++++++
- include/linux/blkdev.h |   4 ++
- 12 files changed, 552 insertions(+)
+ block/blk-core.c          |  12 ++
+ block/blk-mq.c            | 172 ++++++++++++++++++++++++
+ block/blk-stat.c          | 275 ++++++++++++++++++++++++++++++++++++++
+ block/blk-stat.h          |  27 ++++
+ block/blk-sysfs.c         |   4 +
+ drivers/nvme/host/pci.c   |  24 ++++
+ drivers/pci/msi.c         |  14 ++
+ include/linux/blk_types.h |  12 ++
+ include/linux/blkdev.h    |  74 ++++++++++
+ 9 files changed, 614 insertions(+)
 
-diff --git a/block/blk-mq-cpumap.c b/block/blk-mq-cpumap.c
-index 0157f2b3485a..8479d0d4ef4f 100644
---- a/block/blk-mq-cpumap.c
-+++ b/block/blk-mq-cpumap.c
-@@ -15,9 +15,17 @@
- #include "blk.h"
- #include "blk-mq.h"
- 
-+/*
-+ * 参数的'struct blk_mq_queue_map'是在set中的
-+ */
- static int queue_index(struct blk_mq_queue_map *qmap,
- 		       unsigned int nr_queues, const int q)
- {
-+	/*
-+	 * First hardware queue to map onto. Used by the PCIe NVMe
-+	 * driver to map each hardware queue type (enum hctx_type) onto a distinct
-+	 * set of hardware queues.
-+	 */
- 	return qmap->queue_offset + (q % nr_queues);
- }
- 
-@@ -32,6 +40,20 @@ static int get_first_sibling(unsigned int cpu)
- 	return cpu;
- }
- 
-+/*
-+ * called by:
-+ *   - block/blk-mq-rdma.c|42| <<blk_mq_rdma_map_queues>> return blk_mq_map_queues(map);
-+ *   - block/blk-mq-virtio.c|75| <<blk_mq_virtio_map_queues>> return blk_mq_map_queues(qmap);
-+ *   - block/blk-mq.c|3163| <<blk_mq_update_queue_map>> return blk_mq_map_queues(&set->map[HCTX_TYPE_DEFAULT]);
-+ *   - block/blk-mq.c|3463| <<__blk_mq_update_nr_hw_queues>> blk_mq_map_queues(&set->map[HCTX_TYPE_DEFAULT]);
-+ *   - drivers/nvme/host/pci.c|454| <<nvme_pci_map_queues>> blk_mq_map_queues(map);
-+ *   - drivers/nvme/host/rdma.c|1852| <<nvme_rdma_map_queues>> blk_mq_map_queues(&set->map[HCTX_TYPE_POLL]);
-+ *   - drivers/nvme/host/tcp.c|2195| <<nvme_tcp_map_queues>> blk_mq_map_queues(&set->map[HCTX_TYPE_DEFAULT]);
-+ *   - drivers/nvme/host/tcp.c|2196| <<nvme_tcp_map_queues>> blk_mq_map_queues(&set->map[HCTX_TYPE_READ]);
-+ *   - drivers/nvme/host/tcp.c|2205| <<nvme_tcp_map_queues>> blk_mq_map_queues(&set->map[HCTX_TYPE_POLL]);
-+ *   - drivers/scsi/qla2xxx/qla_os.c|7118| <<qla2xxx_map_queues>> rc = blk_mq_map_queues(qmap);
-+ *   - drivers/scsi/scsi_lib.c|1778| <<scsi_map_queues>> return blk_mq_map_queues(&set->map[HCTX_TYPE_DEFAULT]);
-+ */
- int blk_mq_map_queues(struct blk_mq_queue_map *qmap)
- {
- 	unsigned int *map = qmap->mq_map;
-@@ -83,6 +105,12 @@ EXPORT_SYMBOL_GPL(blk_mq_map_queues);
-  * We have no quick way of doing reverse lookups. This is only used at
-  * queue init time, so runtime isn't important.
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 089e890ab208..b49e4e5db35a 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -476,6 +476,18 @@ static void blk_timeout_work(struct work_struct *work)
+  * @gfp_mask: memory allocation flags
+  * @node_id: NUMA node to allocate memory from
   */
 +/*
 + * called by:
-+ *   - block/blk-mq.c|2126| <<blk_mq_alloc_rq_map>> node = blk_mq_hw_queue_to_node(&set->map[HCTX_TYPE_DEFAULT], hctx_idx);
-+ *   - block/blk-mq.c|2182| <<blk_mq_alloc_rqs>> node = blk_mq_hw_queue_to_node(&set->map[HCTX_TYPE_DEFAULT], hctx_idx);
-+ *   - block/blk-mq.c|2938| <<blk_mq_realloc_hw_ctxs>> node = blk_mq_hw_queue_to_node(&set->map[HCTX_TYPE_DEFAULT], i);
++ *   - block/blk-core.c|394| <<blk_alloc_queue>> return blk_alloc_queue_node(gfp_mask, NUMA_NO_NODE);
++ *   - block/blk-mq.c|2743| <<blk_mq_init_queue>> uninit_q = blk_alloc_queue_node(GFP_KERNEL, set->numa_node);
++ *   - drivers/block/drbd/drbd_main.c|2804| <<drbd_create_device>> q = blk_alloc_queue_node(GFP_KERNEL, NUMA_NO_NODE);
++ *   - drivers/block/null_blk_main.c|1724| <<null_add_dev>> nullb->q = blk_alloc_queue_node(GFP_KERNEL, dev->home_node);
++ *   - drivers/block/umem.c|888| <<mm_pci_probe>> card->queue = blk_alloc_queue_node(GFP_KERNEL, NUMA_NO_NODE);
++ *   - drivers/lightnvm/core.c|383| <<nvm_create_tgt>> tqueue = blk_alloc_queue_node(GFP_KERNEL, dev->q->node);
++ *   - drivers/md/dm.c|1949| <<alloc_dev>> md->queue = blk_alloc_queue_node(GFP_KERNEL, numa_node_id);
++ *   - drivers/nvdimm/pmem.c|404| <<pmem_attach_disk>> q = blk_alloc_queue_node(GFP_KERNEL, dev_to_node(dev));
++ *   - drivers/nvme/host/multipath.c|380| <<nvme_mpath_alloc_disk>> q = blk_alloc_queue_node(GFP_KERNEL, ctrl->numa_node);
 + */
- int blk_mq_hw_queue_to_node(struct blk_mq_queue_map *qmap, unsigned int index)
+ struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id)
  {
- 	int i;
-diff --git a/block/blk-mq-pci.c b/block/blk-mq-pci.c
-index b595a94c4d16..be25785e9b4b 100644
---- a/block/blk-mq-pci.c
-+++ b/block/blk-mq-pci.c
-@@ -11,6 +11,32 @@
- 
- #include "blk-mq.h"
- 
-+/*
-+ * 认真来说,set中没有hwqueue的概念.set中主要是tags.
-+ * tags (struct blk_mq_tags) 在数组中管理,每个数组元素相当于是一个hwqueue了.
-+ *
-+ * 'struct request_queue'中的'struct blk_mq_hw_ctx'可以告诉我们去找哪一个'struct blk_mq_tags'.
-+ *
-+ * 因为'struct blk_mq_tags'没法管理下发的request,所以在'struct blk_mq_hw_ctx'中管理.
-+ *
-+ * 在set中记录cpu到hw queue的mapping
-+ *
-+ * struct blk_mq_tag_set
-+ *  -> struct blk_mq_queue_map map[HCTX_MAX_TYPES];
-+ *      -> unsigned int *mq_map; --> 记录set中cpu到hw queue的mapping
-+ *      -> unsigned int nr_queues;
-+ *      -> unsigned int queue_offset;
-+ *
-+ * 在blk_mq_update_queue_map()设置的set中的mapping
-+ *
-+ *
-+ * struct request_queue:
-+ *  -> struct blk_mq_ctx __percpu *queue_ctx;
-+ *  -> struct blk_mq_hw_ctx **queue_hw_ctx;
-+ *
-+ * 在blk_mq_alloc_ctxs()分配percpu的sw queue
-+ */
-+
- /**
-  * blk_mq_pci_map_queues - provide a default queue mapping for PCI device
-  * @qmap:	CPU to hardware queue map.
-@@ -23,6 +49,12 @@
-  * that maps a queue to the CPUs that have irq affinity for the corresponding
-  * vector.
-  */
-+/*
-+ * called by:
-+ *   - drivers/nvme/host/pci.c|452| <<nvme_pci_map_queues>> blk_mq_pci_map_queues(map, to_pci_dev(dev->dev), offset);
-+ *   - drivers/scsi/qla2xxx/qla_os.c|7120| <<qla2xxx_map_queues>> rc = blk_mq_pci_map_queues(qmap, vha->hw->pdev, vha->irq_offset);
-+ *   - drivers/scsi/smartpqi/smartpqi_init.c|5830| <<pqi_map_queues>> return blk_mq_pci_map_queues(&shost->tag_set.map[HCTX_TYPE_DEFAULT],
-+ */
- int blk_mq_pci_map_queues(struct blk_mq_queue_map *qmap, struct pci_dev *pdev,
- 			    int offset)
- {
-diff --git a/block/blk-mq-rdma.c b/block/blk-mq-rdma.c
-index 14f968e58b8f..9292c590e68e 100644
---- a/block/blk-mq-rdma.c
-+++ b/block/blk-mq-rdma.c
-@@ -21,6 +21,11 @@
-  * @set->nr_hw_queues, or @dev does not provide an affinity mask for a
-  * vector, we fallback to the naive mapping.
-  */
-+/*
-+ * called by:
-+ *   - drivers/nvme/host/rdma.c|1840| <<nvme_rdma_map_queues>> blk_mq_rdma_map_queues(&set->map[HCTX_TYPE_DEFAULT],
-+ *   - drivers/nvme/host/rdma.c|1842| <<nvme_rdma_map_queues>> blk_mq_rdma_map_queues(&set->map[HCTX_TYPE_READ],
-+ */
- int blk_mq_rdma_map_queues(struct blk_mq_queue_map *map,
- 		struct ib_device *dev, int first_vec)
- {
-diff --git a/block/blk-mq-sysfs.c b/block/blk-mq-sysfs.c
-index 062229395a50..64a374636cc1 100644
---- a/block/blk-mq-sysfs.c
-+++ b/block/blk-mq-sysfs.c
-@@ -253,6 +253,9 @@ static int blk_mq_register_hctx(struct blk_mq_hw_ctx *hctx)
- 	if (ret)
- 		return ret;
- 
-+	/*
-+	 * 对于hctx->nr_ctx范围内的每一个hctx->ctxs[i]
-+	 */
- 	hctx_for_each_ctx(hctx, ctx, i) {
- 		ret = kobject_add(&ctx->kobj, &hctx->kobj, "cpu%u", ctx->cpu);
- 		if (ret)
-@@ -269,6 +272,7 @@ void blk_mq_unregister_dev(struct device *dev, struct request_queue *q)
- 
- 	lockdep_assert_held(&q->sysfs_dir_lock);
- 
-+	/* 对于q->nr_hw_queues范围内的每一个q->queue_hw_ctx[i] */
- 	queue_for_each_hw_ctx(q, hctx, i)
- 		blk_mq_unregister_hctx(hctx);
- 
-@@ -296,6 +300,10 @@ void blk_mq_sysfs_deinit(struct request_queue *q)
- 	kobject_put(q->mq_kobj);
- }
- 
-+/*
-+ * called by:
-+ *   - block/blk-mq.c|3009| <<blk_mq_init_allocated_queue>> blk_mq_sysfs_init(q);
-+ */
- void blk_mq_sysfs_init(struct request_queue *q)
- {
- 	struct blk_mq_ctx *ctx;
-@@ -311,6 +319,10 @@ void blk_mq_sysfs_init(struct request_queue *q)
- 	}
- }
- 
-+/*
-+ * called by:
-+ *   - block/blk-sysfs.c|979| <<blk_register_queue>> __blk_mq_register_dev(dev, q);
-+ */
- int __blk_mq_register_dev(struct device *dev, struct request_queue *q)
- {
- 	struct blk_mq_hw_ctx *hctx;
-@@ -325,6 +337,7 @@ int __blk_mq_register_dev(struct device *dev, struct request_queue *q)
- 
- 	kobject_uevent(q->mq_kobj, KOBJ_ADD);
- 
-+	/* 对于q->nr_hw_queues范围内的每一个q->queue_hw_ctx[i] */
- 	queue_for_each_hw_ctx(q, hctx, i) {
- 		ret = blk_mq_register_hctx(hctx);
- 		if (ret)
-@@ -355,6 +368,7 @@ void blk_mq_sysfs_unregister(struct request_queue *q)
- 	if (!q->mq_sysfs_init_done)
- 		goto unlock;
- 
-+	/* 对于q->nr_hw_queues范围内的每一个q->queue_hw_ctx[i] */
- 	queue_for_each_hw_ctx(q, hctx, i)
- 		blk_mq_unregister_hctx(hctx);
- 
-@@ -362,6 +376,10 @@ void blk_mq_sysfs_unregister(struct request_queue *q)
- 	mutex_unlock(&q->sysfs_dir_lock);
- }
- 
-+/*
-+ * called by:
-+ *   - block/blk-mq.c|3471| <<__blk_mq_update_nr_hw_queues>> blk_mq_sysfs_register(q);
-+ */
- int blk_mq_sysfs_register(struct request_queue *q)
- {
- 	struct blk_mq_hw_ctx *hctx;
-@@ -371,6 +389,7 @@ int blk_mq_sysfs_register(struct request_queue *q)
- 	if (!q->mq_sysfs_init_done)
- 		goto unlock;
- 
-+	/* 对于q->nr_hw_queues范围内的每一个q->queue_hw_ctx[i] */
- 	queue_for_each_hw_ctx(q, hctx, i) {
- 		ret = blk_mq_register_hctx(hctx);
- 		if (ret)
-diff --git a/block/blk-mq-tag.c b/block/blk-mq-tag.c
-index fbacde454718..0800677f909e 100644
---- a/block/blk-mq-tag.c
-+++ b/block/blk-mq-tag.c
-@@ -21,8 +21,28 @@
-  * to get tag when first time, the other shared-tag users could reserve
-  * budget for it.
-  */
-+/*
-+ * called by:
-+ *   - block/blk-mq-tag.h|60| <<blk_mq_tag_busy>> return __blk_mq_tag_busy(hctx);
-+ */
- bool __blk_mq_tag_busy(struct blk_mq_hw_ctx *hctx)
- {
-+	/*
-+	 * 使用BLK_MQ_S_TAG_ACTIVE的例子:
-+	 *   - block/blk-mq-tag.c|40| <<__blk_mq_tag_busy>> if (!test_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state) &&
-+	 *   - block/blk-mq-tag.c|41| <<__blk_mq_tag_busy>> !test_and_set_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
-+	 *   - block/blk-mq-tag.c|65| <<__blk_mq_tag_idle>> if (!test_and_clear_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
-+	 *   - block/blk-mq-tag.c|88| <<hctx_may_queue>> if (!test_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
-+	 *
-+	 * 使用active_queues的地方:
-+	 *   - block/blk-mq-tag.c|28| <<__blk_mq_tag_busy>> atomic_inc(&hctx->tags->active_queues);
-+	 *   - block/blk-mq-tag.c|54| <<__blk_mq_tag_idle>> atomic_dec(&tags->active_queues);
-+	 *   - block/blk-mq-tag.c|79| <<hctx_may_queue>> users = atomic_read(&hctx->tags->active_queues);
-+	 *   - block/blk-mq-debugfs.c|449| <<blk_mq_debugfs_tags_show>> atomic_read(&tags->active_queues));
-+	 *
-+	 * For shared tag users, we track the number of currently active users
-+	 * and attempt to provide a fair share of the tag depth for each of them.
-+	 */
- 	if (!test_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state) &&
- 	    !test_and_set_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
- 		atomic_inc(&hctx->tags->active_queues);
-@@ -33,6 +53,11 @@ bool __blk_mq_tag_busy(struct blk_mq_hw_ctx *hctx)
- /*
-  * Wakeup all potentially sleeping on tags
-  */
-+/*
-+ * called by:
-+ *   - block/blk-mq-tag.c|70| <<__blk_mq_tag_idle>> blk_mq_tag_wakeup_all(tags, false);
-+ *   - block/blk-mq.c|260| <<blk_mq_wake_waiters>> blk_mq_tag_wakeup_all(hctx->tags, true);
-+ */
- void blk_mq_tag_wakeup_all(struct blk_mq_tags *tags, bool include_reserve)
- {
- 	sbitmap_queue_wake_all(&tags->bitmap_tags);
-@@ -60,6 +85,10 @@ void __blk_mq_tag_idle(struct blk_mq_hw_ctx *hctx)
-  * For shared tag users, we track the number of currently active users
-  * and attempt to provide a fair share of the tag depth for each of them.
-  */
-+/*
-+ * called by:
-+ *   - block/blk-mq-tag.c|94| <<__blk_mq_get_tag>> !hctx_may_queue(data->hctx, bt))
-+ */
- static inline bool hctx_may_queue(struct blk_mq_hw_ctx *hctx,
- 				  struct sbitmap_queue *bt)
- {
-@@ -452,6 +481,10 @@ static struct blk_mq_tags *blk_mq_init_bitmap_tags(struct blk_mq_tags *tags,
- 	return NULL;
- }
- 
-+/*
-+ * called by:
-+ *   - block/blk-mq.c|2130| <<blk_mq_alloc_rq_map>> tags = blk_mq_init_tags(nr_tags, reserved_tags, node,
-+ */
- struct blk_mq_tags *blk_mq_init_tags(unsigned int total_tags,
- 				     unsigned int reserved_tags,
- 				     int node, int alloc_policy)
-diff --git a/block/blk-mq-tag.h b/block/blk-mq-tag.h
-index 15bc74acb57e..36b119c7475a 100644
---- a/block/blk-mq-tag.h
-+++ b/block/blk-mq-tag.h
-@@ -9,14 +9,40 @@
-  */
- struct blk_mq_tags {
- 	unsigned int nr_tags;
-+	/*
-+	 * 设置nr_reserved_tags的地方:
-+	 *   - block/blk-mq-tag.c|471| <<blk_mq_init_tags>> tags->nr_reserved_tags = reserved_tags;
-+	 */
- 	unsigned int nr_reserved_tags;
- 
-+	/*
-+	 * 使用active_queues的地方:
-+	 *   - block/blk-mq-tag.c|28| <<__blk_mq_tag_busy>> atomic_inc(&hctx->tags->active_queues);
-+	 *   - block/blk-mq-tag.c|54| <<__blk_mq_tag_idle>> atomic_dec(&tags->active_queues);
-+	 *   - block/blk-mq-tag.c|79| <<hctx_may_queue>> users = atomic_read(&hctx->tags->active_queues);
-+	 *   - block/blk-mq-debugfs.c|449| <<blk_mq_debugfs_tags_show>> atomic_read(&tags->active_queues));
-+	 *
-+	 * For shared tag users, we track the number of currently active users
-+	 * and attempt to provide a fair share of the tag depth for each of them.
-+	 */
- 	atomic_t active_queues;
- 
- 	struct sbitmap_queue bitmap_tags;
- 	struct sbitmap_queue breserved_tags;
- 
- 	struct request **rqs;
-+	/*
-+	 * static_rqs一共是二维.
-+	 *   - block/blk-mq.c|276| <<blk_mq_rq_ctx_init>> struct request *rq = tags->static_rqs[tag];
-+	 *   - block/blk-mq.c|2087| <<blk_mq_free_rqs>> struct request *rq = tags->static_rqs[i];
-+	 *   - block/blk-mq.c|2092| <<blk_mq_free_rqs>> tags->static_rqs[i] = NULL;
-+	 *   - block/blk-mq.c|2112| <<blk_mq_free_rq_map>> kfree(tags->static_rqs);
-+	 *   - block/blk-mq.c|2113| <<blk_mq_free_rq_map>> tags->static_rqs = NULL;
-+	 *   - block/blk-mq.c|2143| <<blk_mq_alloc_rq_map>> tags->static_rqs = kcalloc_node(nr_tags, sizeof(struct request *),
-+	 *   - block/blk-mq.c|2146| <<blk_mq_alloc_rq_map>> if (!tags->static_rqs) {
-+	 *   - block/blk-mq.c|2235| <<blk_mq_alloc_rqs>> tags->static_rqs[i] = rq;
-+	 *   - block/blk-mq.c|2237| <<blk_mq_alloc_rqs>> tags->static_rqs[i] = NULL;
-+	 */
- 	struct request **static_rqs;
- 	struct list_head page_list;
- };
-@@ -35,11 +61,21 @@ extern void blk_mq_tag_wakeup_all(struct blk_mq_tags *tags, bool);
- void blk_mq_queue_tag_busy_iter(struct request_queue *q, busy_iter_fn *fn,
- 		void *priv);
- 
-+/*
-+ * called by:
-+ *   - block/blk-mq-tag.c|148| <<blk_mq_get_tag>> ws = bt_wait_ptr(bt, data->hctx);
-+ *   - block/blk-mq-tag.c|195| <<blk_mq_get_tag>> ws = bt_wait_ptr(bt, data->hctx);
-+ *   - block/blk-mq.c|1117| <<blk_mq_mark_tag_wait>> wq = &bt_wait_ptr(sbq, hctx)->wait;
-+ */
- static inline struct sbq_wait_state *bt_wait_ptr(struct sbitmap_queue *bt,
- 						 struct blk_mq_hw_ctx *hctx)
- {
- 	if (!hctx)
- 		return &bt->ws[0];
-+	/*
-+	 * 这里似乎是唯一使用的地方:
-+	 * Index of next available dispatch_wait queue to insert requests.
-+	 */
- 	return sbq_wait_ptr(bt, &hctx->wait_index);
- }
- 
-@@ -52,6 +88,11 @@ enum {
- extern bool __blk_mq_tag_busy(struct blk_mq_hw_ctx *);
- extern void __blk_mq_tag_idle(struct blk_mq_hw_ctx *);
- 
-+/*
-+ * called by:
-+ *   - block/blk-mq.c|379| <<blk_mq_get_request>> blk_mq_tag_busy(data->hctx);
-+ *   - block/blk-mq.c|1051| <<blk_mq_get_driver_tag>> shared = blk_mq_tag_busy(data.hctx);
-+ */
- static inline bool blk_mq_tag_busy(struct blk_mq_hw_ctx *hctx)
- {
- 	if (!(hctx->flags & BLK_MQ_F_TAG_SHARED))
-@@ -60,6 +101,11 @@ static inline bool blk_mq_tag_busy(struct blk_mq_hw_ctx *hctx)
- 	return __blk_mq_tag_busy(hctx);
- }
- 
-+/*
-+ * called by:
-+ *   - block/blk-mq.c|947| <<blk_mq_timeout_work>> blk_mq_tag_idle(hctx);
-+ *   - block/blk-mq.c|2298| <<blk_mq_exit_hctx>> blk_mq_tag_idle(hctx);
-+ */
- static inline void blk_mq_tag_idle(struct blk_mq_hw_ctx *hctx)
- {
- 	if (!(hctx->flags & BLK_MQ_F_TAG_SHARED))
-@@ -74,12 +120,22 @@ static inline void blk_mq_tag_idle(struct blk_mq_hw_ctx *hctx)
-  * in flight at the same time. The caller has to make sure the tag
-  * can't be freed.
-  */
-+/*
-+ * called by:
-+ *   - block/blk-flush.c|243| <<flush_end_io>> blk_mq_tag_set_rq(hctx, flush_rq->tag, fq->orig_rq);
-+ *   - block/blk-flush.c|326| <<blk_kick_flush>> blk_mq_tag_set_rq(flush_rq->mq_hctx, first_rq->tag, flush_rq);
-+ */
- static inline void blk_mq_tag_set_rq(struct blk_mq_hw_ctx *hctx,
- 		unsigned int tag, struct request *rq)
- {
- 	hctx->tags->rqs[tag] = rq;
- }
- 
-+/*
-+ * called by:
-+ *   - block/blk-mq-tag.c|207| <<blk_mq_put_tag>> if (!blk_mq_tag_is_reserved(tags, tag)) {
-+ *   - block/blk-mq.c|1048| <<blk_mq_get_driver_tag>> if (blk_mq_tag_is_reserved(data.hctx->sched_tags, rq->internal_tag))
-+ */
- static inline bool blk_mq_tag_is_reserved(struct blk_mq_tags *tags,
- 					  unsigned int tag)
- {
-diff --git a/block/blk-mq-virtio.c b/block/blk-mq-virtio.c
-index 488341628256..cca2b3ede16e 100644
---- a/block/blk-mq-virtio.c
-+++ b/block/blk-mq-virtio.c
-@@ -9,6 +9,32 @@
- #include <linux/module.h>
- #include "blk-mq.h"
- 
-+/*
-+ * 认真来说,set中没有hwqueue的概念.set中主要是tags.
-+ * tags (struct blk_mq_tags) 在数组中管理,每个数组元素相当于是一个hwqueue了.
-+ *
-+ * 'struct request_queue'中的'struct blk_mq_hw_ctx'可以告诉我们去找哪一个'struct blk_mq_tags'.
-+ *
-+ * 因为'struct blk_mq_tags'没法管理下发的request,所以在'struct blk_mq_hw_ctx'中管理.
-+ *
-+ * 在set中记录cpu到hw queue的mapping
-+ *
-+ * struct blk_mq_tag_set
-+ *  -> struct blk_mq_queue_map map[HCTX_MAX_TYPES];
-+ *      -> unsigned int *mq_map; --> 记录set中cpu到hw queue的mapping
-+ *      -> unsigned int nr_queues;
-+ *      -> unsigned int queue_offset;
-+ *
-+ * 在blk_mq_update_queue_map()设置的set中的mapping
-+ *
-+ *
-+ * struct request_queue:
-+ *  -> struct blk_mq_ctx __percpu *queue_ctx;
-+ *  -> struct blk_mq_hw_ctx **queue_hw_ctx;
-+ *
-+ * 在blk_mq_alloc_ctxs()分配percpu的sw queue
-+ */
-+
- /**
-  * blk_mq_virtio_map_queues - provide a default queue mapping for virtio device
-  * @qmap:	CPU to hardware queue map.
-@@ -21,6 +47,11 @@
-  * that maps a queue to the CPUs that have irq affinity for the corresponding
-  * vector.
-  */
-+/*
-+ * called by:
-+ *   - drivers/block/virtio_blk.c|700| <<virtblk_map_queues>> return blk_mq_virtio_map_queues(&set->map[HCTX_TYPE_DEFAULT],
-+ *   - drivers/scsi/virtio_scsi.c|708| <<virtscsi_map_queues>> return blk_mq_virtio_map_queues(qmap, vscsi->vdev, 2);
-+ */
- int blk_mq_virtio_map_queues(struct blk_mq_queue_map *qmap,
- 		struct virtio_device *vdev, int first_vec)
- {
+ 	struct request_queue *q;
 diff --git a/block/blk-mq.c b/block/blk-mq.c
-index a12b1763508d..ce94c3078bae 100644
+index a12b1763508d..7bb2f1998664 100644
 --- a/block/blk-mq.c
 +++ b/block/blk-mq.c
-@@ -280,6 +280,11 @@ static struct request *blk_mq_rq_ctx_init(struct blk_mq_alloc_data *data,
- 		rq->tag = -1;
- 		rq->internal_tag = tag;
- 	} else {
+@@ -43,13 +43,22 @@
+ static void blk_mq_poll_stats_start(struct request_queue *q);
+ static void blk_mq_poll_stats_fn(struct blk_stat_callback *cb);
+ 
++/*
++ * called by;
++ *   - block/blk-mq.c|2904| <<blk_mq_init_allocated_queue>> blk_mq_poll_stats_bkt,
++ *   - block/blk-mq.c|3452| <<blk_mq_poll_nsecs>> bucket = blk_mq_poll_stats_bkt(rq);
++ */
+ static int blk_mq_poll_stats_bkt(const struct request *rq)
+ {
+ 	int ddir, sectors, bucket;
+ 
++	/* read or write */
+ 	ddir = rq_data_dir(rq);
+ 	sectors = blk_rq_stats_sectors(rq);
+ 
++	/*
++	 * ilog2(sectors)相当于获得sectors的order吧
++	 */
+ 	bucket = ddir + 2 * ilog2(sectors);
+ 
+ 	if (bucket < 0)
+@@ -64,6 +73,10 @@ static int blk_mq_poll_stats_bkt(const struct request *rq)
+  * Check if any of the ctx, dispatch list or elevator
+  * have pending work in this hardware queue.
+  */
++/*
++ * called by:
++ *   - block/blk-mq.c|1508| <<blk_mq_run_hw_queue>> blk_mq_hctx_has_pending(hctx);
++ */
+ static bool blk_mq_hctx_has_pending(struct blk_mq_hw_ctx *hctx)
+ {
+ 	return !list_empty_careful(&hctx->dispatch) ||
+@@ -655,7 +668,23 @@ void blk_mq_start_request(struct request *rq)
+ 
+ 	trace_block_rq_issue(q, rq);
+ 
++	/*
++	 * 在以下使用QUEUE_FLAG_STATS:
++	 *   - block/blk-mq.c|671| <<blk_mq_start_request>> if (test_bit(QUEUE_FLAG_STATS, &q->queue_flags)) {
++	 *   - block/blk-stat.c|308| <<blk_stat_add_callback>> blk_queue_flag_set(QUEUE_FLAG_STATS, q);
++	 *   - block/blk-stat.c|323| <<blk_stat_remove_callback>> blk_queue_flag_clear(QUEUE_FLAG_STATS, q);
++	 *   - block/blk-stat.c|364| <<blk_stat_enable_accounting>> blk_queue_flag_set(QUEUE_FLAG_STATS, q);
++	 */
+ 	if (test_bit(QUEUE_FLAG_STATS, &q->queue_flags)) {
 +		/*
-+		 * struct blk_mq_alloc_data:
-+		 *   -> struct blk_mq_ctx *ctx;
-+		 *   -> struct blk_mq_hw_ctx *hctx;
++		 * 在以下使用io_start_time_ns:
++		 *   - block/bfq-iosched.c|5911| <<bfq_finish_requeue_request>> rq->io_start_time_ns,
++		 *   - block/blk-mq.c|318| <<blk_mq_rq_ctx_init>> rq->io_start_time_ns = 0;
++		 *   - block/blk-mq.c|663| <<blk_mq_start_request>> rq->io_start_time_ns = ktime_get_ns();
++		 *   - block/blk-stat.c|137| <<blk_stat_add>> value = (now >= rq->io_start_time_ns) ? now - rq->io_start_time_ns : 0;
++		 *   - block/blk-wbt.c|619| <<wbt_issue>> rwb->sync_issue = rq->io_start_time_ns;
++		 *   - block/kyber-iosched.c|651| <<kyber_completed_request>> now - rq->io_start_time_ns);
 +		 */
- 		if (data->hctx->flags & BLK_MQ_F_TAG_SHARED) {
- 			rq_flags = RQF_MQ_INFLIGHT;
- 			atomic_inc(&data->hctx->nr_active);
-@@ -557,6 +562,10 @@ static void __blk_mq_complete_request_remote(void *data)
- 	q->mq_ops->complete(rq);
- }
+ 		rq->io_start_time_ns = ktime_get_ns();
+ 		rq->stats_sectors = blk_rq_sectors(rq);
+ 		rq->rq_flags |= RQF_STATS;
+@@ -3364,8 +3393,19 @@ void blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set, int nr_hw_queues)
+ EXPORT_SYMBOL_GPL(blk_mq_update_nr_hw_queues);
  
+ /* Enable polling stats and return whether they were already enabled. */
 +/*
 + * called by:
-+ *   - block/blk-mq.c|644| <<blk_mq_complete_request>> __blk_mq_complete_request(rq);
++ *   - block/blk-mq.c|3411| <<blk_mq_poll_nsecs>> if (!blk_poll_stats_enable(q))
 + */
- static void __blk_mq_complete_request(struct request *rq)
+ static bool blk_poll_stats_enable(struct request_queue *q)
  {
- 	struct blk_mq_ctx *ctx = rq->mq_ctx;
-@@ -632,6 +641,23 @@ static void hctx_lock(struct blk_mq_hw_ctx *hctx, int *srcu_idx)
-  *	Ends all I/O on a request. It does not handle partial completions.
-  *	The actual completion happens out-of-order, through a IPI handler.
-  **/
++	/*
++	 * 在以下使用QUEUE_FLAG_POLL_STATS (collecting stats for hybrid polling):
++	 *   - block/blk-mq.c|3395| <<blk_poll_stats_enable>> if (test_bit(QUEUE_FLAG_POLL_STATS, &q->queue_flags) ||
++	 *   - block/blk-mq.c|3396| <<blk_poll_stats_enable>> blk_queue_flag_test_and_set(QUEUE_FLAG_POLL_STATS, q))
++	 *   - block/blk-mq.c|3412| <<blk_mq_poll_stats_start>> if (!test_bit(QUEUE_FLAG_POLL_STATS, &q->queue_flags) ||
++	 *   - block/blk-sysfs.c|884| <<__blk_release_queue>> if (test_bit(QUEUE_FLAG_POLL_STATS, &q->queue_flags))
++	 */
+ 	if (test_bit(QUEUE_FLAG_POLL_STATS, &q->queue_flags) ||
+ 	    blk_queue_flag_test_and_set(QUEUE_FLAG_POLL_STATS, q))
+ 		return true;
+@@ -3373,6 +3413,10 @@ static bool blk_poll_stats_enable(struct request_queue *q)
+ 	return false;
+ }
+ 
 +/*
-+ * 部分调用的例子:
-+ *   - block/bsg-lib.c|186| <<bsg_job_done>> blk_mq_complete_request(blk_mq_rq_from_pdu(job));
-+ *   - drivers/block/loop.c|499| <<lo_rw_aio_do_completion>> blk_mq_complete_request(rq);
-+ *   - drivers/block/loop.c|1957| <<loop_handle_cmd>> blk_mq_complete_request(rq);
-+ *   - drivers/block/nbd.c|452| <<nbd_xmit_timeout>> blk_mq_complete_request(req);
-+ *   - drivers/block/nbd.c|788| <<recv_work>> blk_mq_complete_request(blk_mq_rq_from_pdu(cmd));
-+ *   - drivers/block/nbd.c|804| <<nbd_clear_req>> blk_mq_complete_request(req);
-+ *   - drivers/block/null_blk_main.c|1242| <<nullb_complete_cmd>> blk_mq_complete_request(cmd->rq);
-+ *   - drivers/block/null_blk_main.c|1369| <<null_timeout_rq>> blk_mq_complete_request(rq);
-+ *   - drivers/block/virtio_blk.c|244| <<virtblk_done>> blk_mq_complete_request(req);
-+ *   - drivers/block/xen-blkfront.c|1648| <<blkif_interrupt>> blk_mq_complete_request(req);
-+ *   - drivers/md/dm-rq.c|291| <<dm_complete_request>> blk_mq_complete_request(rq)
-+ *   - drivers/nvme/host/core.c|321| <<nvme_cancel_request>> blk_mq_complete_request(req);
-+ *   - drivers/nvme/host/nvme.h|460| <<nvme_end_request>> blk_mq_complete_request(req);
-+ *   - drivers/scsi/scsi_lib.c|1618| <<scsi_mq_done>> if (unlikely(!blk_mq_complete_request(cmd->request)))
++ * called by:
++ *   - block/blk-mq.c|526| <<__blk_mq_end_request>> blk_mq_poll_stats_start(rq->q);
 + */
- bool blk_mq_complete_request(struct request *rq)
+ static void blk_mq_poll_stats_start(struct request_queue *q)
  {
- 	if (unlikely(blk_should_fake_timeout(rq->q)))
-@@ -2333,6 +2359,10 @@ static int blk_mq_hw_ctx_size(struct blk_mq_tag_set *tag_set)
- 	return hw_ctx_size;
+ 	/*
+@@ -3386,6 +3430,12 @@ static void blk_mq_poll_stats_start(struct request_queue *q)
+ 	blk_stat_activate_msecs(q->poll_cb, 100);
  }
  
 +/*
-+ * called by:
-+ *   - block/blk-mq.c|2812| <<blk_mq_alloc_and_init_hctx>> if (blk_mq_init_hctx(q, set, hctx, hctx_idx))
++ * 在以下使用blk_mq_poll_stats_fn():
++ *   - block/blk-mq.c|2890| <<blk_mq_init_allocated_queue>> q->poll_cb = blk_stat_alloc_callback(blk_mq_poll_stats_fn,
++ *
++ * 核心思想是把BLK_MQ_POLL_STATS_BKTS个bucket设置q->poll_stat[bucket] = cb->stat[bucket]
 + */
- static int blk_mq_init_hctx(struct request_queue *q,
- 		struct blk_mq_tag_set *set,
- 		struct blk_mq_hw_ctx *hctx, unsigned hctx_idx)
-@@ -2360,6 +2390,10 @@ static int blk_mq_init_hctx(struct request_queue *q,
- 	return -1;
- }
- 
-+/*
-+ * called by:
-+ *   - block/blk-mq.c|2808| <<blk_mq_alloc_and_init_hctx>> hctx = blk_mq_alloc_hctx(q, set, node);
-+ */
- static struct blk_mq_hw_ctx *
- blk_mq_alloc_hctx(struct request_queue *q, struct blk_mq_tag_set *set,
- 		int node)
-@@ -2487,6 +2521,35 @@ static void blk_mq_free_map_and_requests(struct blk_mq_tag_set *set,
+ static void blk_mq_poll_stats_fn(struct blk_stat_callback *cb)
+ {
+ 	struct request_queue *q = cb->data;
+@@ -3397,6 +3447,12 @@ static void blk_mq_poll_stats_fn(struct blk_stat_callback *cb)
  	}
  }
  
 +/*
-+ * * 认真来说,set中没有hwqueue的概念.set中主要是tags.
-+ * tags (struct blk_mq_tags) 在数组中管理,每个数组元素相当于是一个hwqueue了.
-+ *
-+ * 'struct request_queue'中的'struct blk_mq_hw_ctx'可以告诉我们去找哪一个'struct blk_mq_tags'.
-+ *
-+ * 因为'struct blk_mq_tags'没法管理下发的request,所以在'struct blk_mq_hw_ctx'中管理.
-+ *
-+ * 在set中记录cpu到hw queue的mapping
-+ *
-+ * struct blk_mq_tag_set
-+ *  -> struct blk_mq_queue_map map[HCTX_MAX_TYPES];
-+ *      -> unsigned int *mq_map; --> 记录set中cpu到hw queue的mapping
-+ *      -> unsigned int nr_queues;
-+ *      -> unsigned int queue_offset;
-+ *
-+ * 在blk_mq_update_queue_map()设置的set中的mapping
-+ *
-+ *
-+ * struct request_queue:
-+ *  -> struct blk_mq_ctx __percpu *queue_ctx;
-+ *  -> struct blk_mq_hw_ctx **queue_hw_ctx;
-+ *
-+ * 在blk_mq_alloc_ctxs()分配percpu的sw queue
-+ *
 + * called by:
-+ *   - block/blk-mq.c|2939| <<blk_mq_init_allocated_queue>> blk_mq_map_swqueue(q);
-+ *   - block/blk-mq.c|3341| <<__blk_mq_update_nr_hw_queues>> blk_mq_map_swqueue(q);
++ *   - block/blk-mq.c|3458| <<blk_mq_poll_hybrid_sleep>> nsecs = blk_mq_poll_nsecs(q, hctx, rq);
++ *
++ * 这个函数应该就是用来估算一个要sleep的时间
 + */
- static void blk_mq_map_swqueue(struct request_queue *q)
- {
- 	unsigned int i, j, hctx_idx;
-@@ -2494,6 +2557,9 @@ static void blk_mq_map_swqueue(struct request_queue *q)
- 	struct blk_mq_ctx *ctx;
- 	struct blk_mq_tag_set *set = q->tag_set;
+ static unsigned long blk_mq_poll_nsecs(struct request_queue *q,
+ 				       struct blk_mq_hw_ctx *hctx,
+ 				       struct request *rq)
+@@ -3430,6 +3486,10 @@ static unsigned long blk_mq_poll_nsecs(struct request_queue *q,
+ 	return ret;
+ }
  
-+	/*
-+	 * 对于q->nr_hw_queues范围内的每一个q->queue_hw_ctx[i]
-+	 */
- 	queue_for_each_hw_ctx(q, hctx, i) {
- 		cpumask_clear(hctx->cpumask);
- 		hctx->nr_ctx = 0;
-@@ -2506,6 +2572,9 @@ static void blk_mq_map_swqueue(struct request_queue *q)
- 	 * If the cpu isn't present, the cpu is mapped to first hctx.
- 	 */
- 	for_each_possible_cpu(i) {
-+		/*
-+		 * hctx_idx用来索引set->tags[hctx_idx]
-+		 */
- 		hctx_idx = set->map[HCTX_TYPE_DEFAULT].mq_map[i];
- 		/* unmapped hw queue can be remapped after CPU topo changed */
- 		if (!set->tags[hctx_idx] &&
-@@ -2528,6 +2597,9 @@ static void blk_mq_map_swqueue(struct request_queue *q)
- 			}
- 
- 			hctx = blk_mq_map_queue_type(q, j, i);
-+			/*
-+			 * struct blk_mq_hw_ctx *hctxs[HCTX_MAX_TYPES];
-+			 */
- 			ctx->hctxs[j] = hctx;
- 			/*
- 			 * If the CPU is already set in the mask, then we've
-@@ -2593,6 +2665,11 @@ static void blk_mq_map_swqueue(struct request_queue *q)
-  * Caller needs to ensure that we're either frozen/quiesced, or that
-  * the queue isn't live yet.
-  */
 +/*
 + * called by:
-+ *   - block/blk-mq.c|2632| <<blk_mq_update_tag_set_depth>> queue_set_hctx_shared(q, shared);
-+ *   - block/blk-mq.c|2668| <<blk_mq_add_queue_tag_set>> queue_set_hctx_shared(q, true);
++ *   - block/blk-mq.c|3534| <<blk_mq_poll_hybrid>> return blk_mq_poll_hybrid_sleep(q, hctx, rq);
 + */
- static void queue_set_hctx_shared(struct request_queue *q, bool shared)
+ static bool blk_mq_poll_hybrid_sleep(struct request_queue *q,
+ 				     struct blk_mq_hw_ctx *hctx,
+ 				     struct request *rq)
+@@ -3439,6 +3499,13 @@ static bool blk_mq_poll_hybrid_sleep(struct request_queue *q,
+ 	unsigned int nsecs;
+ 	ktime_t kt;
+ 
++	/*
++	 * 只在以下使用RQF_MQ_POLL_SLEPT:
++	 *   - block/blk-mq.c|3486| <<blk_mq_poll_hybrid_sleep>> if (rq->rq_flags & RQF_MQ_POLL_SLEPT)
++	 *   - block/blk-mq.c|3503| <<blk_mq_poll_hybrid_sleep>> rq->rq_flags |= RQF_MQ_POLL_SLEPT;
++	 *
++	 * already slept for hybrid poll
++	 */
+ 	if (rq->rq_flags & RQF_MQ_POLL_SLEPT)
+ 		return false;
+ 
+@@ -3462,6 +3529,9 @@ static bool blk_mq_poll_hybrid_sleep(struct request_queue *q,
+ 	 * This will be replaced with the stats tracking code, using
+ 	 * 'avg_completion_time / 2' as the pre-sleep target.
+ 	 */
++	/*
++	 * kt是非常核心的时间!!!
++	 */
+ 	kt = nsecs;
+ 
+ 	mode = HRTIMER_MODE_REL;
+@@ -3469,6 +3539,13 @@ static bool blk_mq_poll_hybrid_sleep(struct request_queue *q,
+ 	hrtimer_set_expires(&hs.timer, kt);
+ 
+ 	do {
++		/*
++		 * 使用MQ_RQ_COMPLETE的地方:
++		 *   - block/blk-mq-debugfs.c|313| <<global>> [MQ_RQ_COMPLETE] = "complete",
++		 *   - block/blk-mq.c|580| <<__blk_mq_complete_request>> WRITE_ONCE(rq->state, MQ_RQ_COMPLETE);
++		 *   - block/blk-mq.c|3516| <<blk_mq_poll_hybrid_sleep>> if (blk_mq_rq_state(rq) == MQ_RQ_COMPLETE)
++		 *   - include/linux/blk-mq.h|481| <<blk_mq_request_completed>> return blk_mq_rq_state(rq) == MQ_RQ_COMPLETE;
++		 */
+ 		if (blk_mq_rq_state(rq) == MQ_RQ_COMPLETE)
+ 			break;
+ 		set_current_state(TASK_UNINTERRUPTIBLE);
+@@ -3484,6 +3561,33 @@ static bool blk_mq_poll_hybrid_sleep(struct request_queue *q,
+ 	return true;
+ }
+ 
++/*
++ * 在以下patch加入的函数
++ * commit 06426adf072bca62ac31ea396ff2159a34f276c2
++ * Author: Jens Axboe <axboe@fb.com>
++ * Date:   Mon Nov 14 13:01:59 2016 -0700
++ *
++ * blk-mq: implement hybrid poll mode for sync O_DIRECT
++ *
++ * This patch enables a hybrid polling mode. Instead of polling after IO
++ * submission, we can induce an artificial delay, and then poll after that.
++ * For example, if the IO is presumed to complete in 8 usecs from now, we
++ * can sleep for 4 usecs, wake up, and then do our polling. This still puts
++ * a sleep/wakeup cycle in the IO path, but instead of the wakeup happening
++ * after the IO has completed, it'll happen before. With this hybrid
++ * scheme, we can achieve big latency reductions while still using the same
++ * (or less) amount of CPU.
++ *
++ * Signed-off-by: Jens Axboe <axboe@fb.com>
++ * Tested-By: Stephen Bates <sbates@raithlin.com>
++ * Reviewed-By: Stephen Bates <sbates@raithlin.com>
++ *
++ * called by:
++ *   - block/blk-mq.c|3608| <<blk_poll>> if (blk_mq_poll_hybrid(q, hctx, cookie))
++ *
++ * If the device access time exceeds the IRQ model overhead,
++ * sleeping before the I/O completion will not hurt latency
++ */
+ static bool blk_mq_poll_hybrid(struct request_queue *q,
+ 			       struct blk_mq_hw_ctx *hctx, blk_qc_t cookie)
+ {
+@@ -3521,6 +3625,62 @@ static bool blk_mq_poll_hybrid(struct request_queue *q,
+  *    looping until at least one completion is found, unless the task is
+  *    otherwise marked running (or we need to reschedule).
+  */
++/*
++ * poll是可以有专门的hctx的. 用cookie来标记用的哪个hctx甚至哪个tag.
++ *
++ * blk_qc_t_to_queue_num()把cookie转换成q->queue_hw_ctx[]的index.
++ *
++ * blk_qc_t_to_tag()把cookie转换成tag.
++ *
++ * ext4_direct_IO_write()
++ *  -> __blockdev_direct_IO()
++ *      -> do_blockdev_direct_IO
++ *          -> dio_bio_submit
++ *              -> submit_bio()
++ *          -> dio_await_completion()
++ *              -> dio_await_one()
++ *                  -> blk_poll()
++ *
++ * cookie一直通过submit_bio()返回, 然后通过blk_poll()去poll()查看IO是否完成.
++ *
++ * slides: I/O Latency Optimization with Polling
++ *
++ *
++ * 根据一位网友的测试:
++ * 从上述测试结果来看,IO-Polling对于sync模式的direct-io的延迟有较好的提升,
++ * sync模式下,无论4K随机读或者随机写IO压力下,延迟平均大约减少5μs,而这5μs
++ * 几乎就是中断模式下,处理中断时,上下文切换的时间差.
++ * 相比随机读,对随机写的延迟降低约20%,这对延迟敏感的IO请求来说是极大的性能提升.
++ *
++ *
++ * 根据blk_mq_map_queue(), 只有REQ_HIPRI的才会被map到poll的queue.
++ *
++ * 102 static inline struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *q,
++ * 103                                                      unsigned int flags,
++ * 104                                                      struct blk_mq_ctx *ctx)
++ * 105 {
++ * 106         enum hctx_type type = HCTX_TYPE_DEFAULT;
++ * 107
++ * 108         //
++ * 109	    // The caller ensure that if REQ_HIPRI, poll must be enabled.
++ * 110	    //
++ * 111         if (flags & REQ_HIPRI)
++ * 112                 type = HCTX_TYPE_POLL;
++ * 113         else if ((flags & REQ_OP_MASK) == REQ_OP_READ)
++ * 114                 type = HCTX_TYPE_READ;115
++ * 116         return ctx->hctxs[type];
++ * 117 }
++ *
++ * called by:
++ *   - drivers/nvme/host/core.c|812| <<nvme_execute_rq_polled>> blk_poll(q, request_to_qc_t(rq->mq_hctx, rq), true);
++ *   - fs/block_dev.c|257| <<__blkdev_direct_IO_simple>> !blk_poll(bdev_get_queue(bdev), qc, true))
++ *   - fs/block_dev.c|295| <<blkdev_iopoll>> return blk_poll(q, READ_ONCE(kiocb->ki_cookie), wait);
++ *   - fs/block_dev.c|451| <<__blkdev_direct_IO>> !blk_poll(bdev_get_queue(bdev), qc, true))
++ *   - fs/direct-io.c|502| <<dio_await_one>> !blk_poll(dio->bio_disk->queue, dio->bio_cookie, true))
++ *   - fs/iomap/direct-io.c|57| <<iomap_dio_iopoll>> return blk_poll(q, READ_ONCE(kiocb->ki_cookie), spin);
++ *   - fs/iomap/direct-io.c|562| <<iomap_dio_rw>> !blk_poll(dio->submit.last_queue,
++ *   - mm/page_io.c|424| <<swap_readpage>> if (!blk_poll(disk->queue, qc, true))
++ */
+ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
  {
  	struct blk_mq_hw_ctx *hctx;
-@@ -2606,6 +2683,11 @@ static void queue_set_hctx_shared(struct request_queue *q, bool shared)
- 	}
- }
+@@ -3533,6 +3693,10 @@ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
+ 	if (current->plug)
+ 		blk_flush_plug_list(current->plug, false);
  
-+/*
-+ * called by:
-+ *   - block/blk-mq.c|2647| <<blk_mq_del_queue_tag_set>> blk_mq_update_tag_set_depth(set, false);
-+ *   - block/blk-mq.c|2665| <<blk_mq_add_queue_tag_set>> blk_mq_update_tag_set_depth(set, true);
-+ */
- static void blk_mq_update_tag_set_depth(struct blk_mq_tag_set *set,
- 					bool shared)
- {
-@@ -2658,8 +2740,16 @@ static void blk_mq_add_queue_tag_set(struct blk_mq_tag_set *set,
- }
- 
- /* All allocations will be freed in release handler of q->mq_kobj */
-+/*
-+ * called by:
-+ *   - block/blk-mq.c|2919| <<blk_mq_init_allocated_queue>> if (blk_mq_alloc_ctxs(q))
-+ */
- static int blk_mq_alloc_ctxs(struct request_queue *q)
- {
 +	/*
-+	 * struct request_queue:
-+	 *  -> struct blk_mq_ctx __percpu *queue_ctx;
++	 * blk_qc_t_to_queue_num():
++	 * 把cookie的第31位(最高位)清空,然后向右移动16位,获得queue num
 +	 */
- 	struct blk_mq_ctxs *ctxs;
- 	int cpu;
+ 	hctx = q->queue_hw_ctx[blk_qc_t_to_queue_num(cookie)];
  
-@@ -2714,6 +2804,32 @@ void blk_mq_release(struct request_queue *q)
- 	blk_mq_sysfs_deinit(q);
- }
+ 	/*
+@@ -3553,6 +3717,9 @@ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
  
-+/*
-+ * 部分调用的例子:
-+ *   - block/blk-mq.c|2830| <<blk_mq_init_sq_queue>> q = blk_mq_init_queue(set);
-+ *   - block/bsg-lib.c|387| <<bsg_setup_queue>> q = blk_mq_init_queue(set);
-+ *   - drivers/block/loop.c|2022| <<loop_add>> lo->lo_queue = blk_mq_init_queue(&lo->tag_set);
-+ *   - drivers/block/nbd.c|1692| <<nbd_dev_add>> q = blk_mq_init_queue(&nbd->tag_set);
-+ *   - drivers/block/null_blk_main.c|1717| <<null_add_dev>> nullb->q = blk_mq_init_queue(nullb->tag_set);
-+ *   - drivers/block/virtio_blk.c|805| <<virtblk_probe>> q = blk_mq_init_queue(&vblk->tag_set);
-+ *   - drivers/block/xen-blkfront.c|986| <<xlvbd_init_blk_queue>> rq = blk_mq_init_queue(&info->tag_set);
-+ *   - drivers/ide/ide-probe.c|790| <<ide_init_queue>> q = blk_mq_init_queue(set);
-+ *   - drivers/nvme/host/core.c|3495| <<nvme_alloc_ns>> ns->queue = blk_mq_init_queue(ctrl->tagset);
-+ *   - drivers/nvme/host/fc.c|2481| <<nvme_fc_create_io_queues>> ctrl->ctrl.connect_q = blk_mq_init_queue(&ctrl->tag_set);
-+ *   - drivers/nvme/host/fc.c|3148| <<nvme_fc_init_ctrl>> ctrl->ctrl.fabrics_q = blk_mq_init_queue(&ctrl->admin_tag_set);
-+ *   - drivers/nvme/host/fc.c|3154| <<nvme_fc_init_ctrl>> ctrl->ctrl.admin_q = blk_mq_init_queue(&ctrl->admin_tag_set);
-+ *   - drivers/nvme/host/pci.c|1622| <<nvme_alloc_admin_tags>> dev->ctrl.admin_q = blk_mq_init_queue(&dev->admin_tagset);
-+ *   - drivers/nvme/host/rdma.c|809| <<nvme_rdma_configure_admin_queue>> ctrl->ctrl.fabrics_q = blk_mq_init_queue(&ctrl->admin_tag_set);
-+ *   - drivers/nvme/host/rdma.c|815| <<nvme_rdma_configure_admin_queue>> ctrl->ctrl.admin_q = blk_mq_init_queue(&ctrl->admin_tag_set);
-+ *   - drivers/nvme/host/rdma.c|886| <<nvme_rdma_configure_io_queues>> ctrl->ctrl.connect_q = blk_mq_init_queue(&ctrl->tag_set);
-+ *   - drivers/nvme/host/tcp.c|1676| <<nvme_tcp_configure_io_queues>> ctrl->connect_q = blk_mq_init_queue(ctrl->tagset);
-+ *   - drivers/nvme/host/tcp.c|1729| <<nvme_tcp_configure_admin_queue>> ctrl->fabrics_q = blk_mq_init_queue(ctrl->admin_tagset);
-+ *   - drivers/nvme/host/tcp.c|1735| <<nvme_tcp_configure_admin_queue>> ctrl->admin_q = blk_mq_init_queue(ctrl->admin_tagset);
-+ *   - drivers/nvme/target/loop.c|362| <<nvme_loop_configure_admin_queue>> ctrl->ctrl.fabrics_q = blk_mq_init_queue(&ctrl->admin_tag_set);
-+ *   - drivers/nvme/target/loop.c|368| <<nvme_loop_configure_admin_queue>> ctrl->ctrl.admin_q = blk_mq_init_queue(&ctrl->admin_tag_set);
-+ *   - drivers/nvme/target/loop.c|529| <<nvme_loop_create_io_queues>> ctrl->ctrl.connect_q = blk_mq_init_queue(&ctrl->tag_set);
-+ *   - drivers/scsi/scsi_lib.c|1871| <<scsi_mq_alloc_queue>> sdev->request_queue = blk_mq_init_queue(&sdev->host->tag_set);
-+ */
- struct request_queue *blk_mq_init_queue(struct blk_mq_tag_set *set)
- {
- 	struct request_queue *uninit_q, *q;
-@@ -2768,6 +2884,10 @@ struct request_queue *blk_mq_init_sq_queue(struct blk_mq_tag_set *set,
- }
- EXPORT_SYMBOL(blk_mq_init_sq_queue);
+ 		hctx->poll_invoked++;
  
-+/*
-+ * called by:
-+ *   - block/blk-mq.c|2857| <<blk_mq_realloc_hw_ctxs>> hctx = blk_mq_alloc_and_init_hctx(set, q, i, node);
-+ */
- static struct blk_mq_hw_ctx *blk_mq_alloc_and_init_hctx(
- 		struct blk_mq_tag_set *set, struct request_queue *q,
- 		int hctx_idx, int node)
-@@ -2802,6 +2922,11 @@ static struct blk_mq_hw_ctx *blk_mq_alloc_and_init_hctx(
- 	return NULL;
- }
- 
-+/*
-+ * called by:
-+ *   - block/blk-mq.c|2919| <<blk_mq_init_allocated_queue>> blk_mq_realloc_hw_ctxs(set, q);
-+ *   - block/blk-mq.c|3347| <<__blk_mq_update_nr_hw_queues>> blk_mq_realloc_hw_ctxs(set, q);
-+ */
- static void blk_mq_realloc_hw_ctxs(struct blk_mq_tag_set *set,
- 						struct request_queue *q)
- {
-@@ -2880,6 +3005,11 @@ static void blk_mq_realloc_hw_ctxs(struct blk_mq_tag_set *set,
- 	mutex_unlock(&q->sysfs_lock);
- }
- 
-+/*
-+ * called by:
-+ *   - block/blk-mq.c|2743| <<blk_mq_init_queue>> q = blk_mq_init_allocated_queue(set, uninit_q, false);
-+ *   - drivers/md/dm-rq.c|566| <<dm_mq_init_request_queue>> q = blk_mq_init_allocated_queue(md->tag_set, md->queue, true);
-+ */
- struct request_queue *blk_mq_init_allocated_queue(struct blk_mq_tag_set *set,
- 						  struct request_queue *q,
- 						  bool elevator_init)
-@@ -3017,6 +3147,11 @@ static int blk_mq_alloc_rq_maps(struct blk_mq_tag_set *set)
- 	return 0;
- }
- 
-+/*
-+ * called by:
-+ *   - block/blk-mq.c|3161| <<blk_mq_alloc_tag_set>> ret = blk_mq_update_queue_map(set);
-+ *   - block/blk-mq.c|3353| <<__blk_mq_update_nr_hw_queues>> blk_mq_update_queue_map(set);
-+ */
- static int blk_mq_update_queue_map(struct blk_mq_tag_set *set)
- {
- 	if (set->ops->map_queues && !is_kdump_kernel()) {
-@@ -3036,6 +3171,10 @@ static int blk_mq_update_queue_map(struct blk_mq_tag_set *set)
- 		 * killing stale mapping since one CPU may not be mapped
- 		 * to any hw queue.
- 		 */
 +		/*
-+		 * 对于每一种类型的map,
-+		 * 清空所有cpu的blk_mq_queue_map->mq_map[cpu] = 0
++		 * nvme pci的例子是nvme_poll()
 +		 */
- 		for (i = 0; i < set->nr_maps; i++)
- 			blk_mq_clear_mq_map(&set->map[i]);
- 
-@@ -3127,6 +3266,13 @@ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
- 
- 	ret = -ENOMEM;
- 	for (i = 0; i < set->nr_maps; i++) {
-+		/*
-+		 * struct blk_mq_queue_map {
-+		 *	unsigned int *mq_map;
-+		 *	unsigned int nr_queues;
-+		 *	unsigned int queue_offset;
-+		 * };
-+		 */
- 		set->map[i].mq_map = kcalloc_node(nr_cpu_ids,
- 						  sizeof(set->map[i].mq_map[0]),
- 						  GFP_KERNEL, set->numa_node);
-diff --git a/block/blk-mq.h b/block/blk-mq.h
-index eaaca8fc1c28..e7473a3754e1 100644
---- a/block/blk-mq.h
-+++ b/block/blk-mq.h
-@@ -9,19 +9,84 @@ struct blk_mq_tag_set;
- 
- struct blk_mq_ctxs {
- 	struct kobject kobj;
-+	/*
-+	 * 主要设置和使用的地方:
-+	 *   - block/blk-mq.c|2438| <<blk_mq_init_cpu_queues>> struct blk_mq_ctx *__ctx = per_cpu_ptr(q->queue_ctx, i);
-+	 *   - block/blk-mq.c|2522| <<blk_mq_map_swqueue>> ctx = per_cpu_ptr(q->queue_ctx, i);
-+	 *   - block/blk-mq.c|2670| <<blk_mq_alloc_ctxs>> ctxs->queue_ctx = alloc_percpu(struct blk_mq_ctx);
-+	 *   - block/blk-mq.c|2671| <<blk_mq_alloc_ctxs>> if (!ctxs->queue_ctx)
-+	 *   - block/blk-mq.c|2675| <<blk_mq_alloc_ctxs>> struct blk_mq_ctx *ctx = per_cpu_ptr(ctxs->queue_ctx, cpu);
-+	 *   - block/blk-mq.c|2680| <<blk_mq_alloc_ctxs>> q->queue_ctx = ctxs->queue_ctx;
-+	 *   - block/blk-mq.h|134| <<__blk_mq_get_ctx>> return per_cpu_ptr(q->queue_ctx, cpu);
-+	 */
- 	struct blk_mq_ctx __percpu	*queue_ctx;
- };
- 
-+/*
-+ * 认真来说,set中没有hwqueue的概念.set中主要是tags.
-+ * tags (struct blk_mq_tags) 在数组中管理,每个数组元素相当于是一个hwqueue了.
-+ *
-+ * 'struct request_queue'中的'struct blk_mq_hw_ctx'可以告诉我们去找哪一个'struct blk_mq_tags'.
-+ *
-+ * 因为'struct blk_mq_tags'没法管理下发的request,所以在'struct blk_mq_hw_ctx'中管理.
-+ *
-+ * 在set中记录cpu到hw queue的mapping
-+ *
-+ * struct blk_mq_tag_set
-+ *  -> struct blk_mq_queue_map map[HCTX_MAX_TYPES];
-+ *      -> unsigned int *mq_map; --> 记录set中cpu到hw queue的mapping
-+ *      -> unsigned int nr_queues;
-+ *      -> unsigned int queue_offset;
-+ *      
-+ * 在blk_mq_update_queue_map()设置的set中的mapping
-+ *
-+ *
-+ * struct request_queue:
-+ *  -> struct blk_mq_ctx __percpu *queue_ctx;
-+ *  -> struct blk_mq_hw_ctx **queue_hw_ctx;
-+ *
-+ * 在blk_mq_alloc_ctxs()分配percpu的sw queue
-+ */
-+
- /**
-  * struct blk_mq_ctx - State for a software queue facing the submitting CPUs
-  */
- struct blk_mq_ctx {
- 	struct {
- 		spinlock_t		lock;
-+		/*
-+		 * 使用rq_lists[]的地方:
-+		 *   - block/blk-mq-debugfs.c|632| <<CTX_RQ_SEQ_OPS>> return seq_list_start(&ctx->rq_lists[type], *pos); \
-+		 *   - block/blk-mq-debugfs.c|640| <<CTX_RQ_SEQ_OPS>> return seq_list_next(v, &ctx->rq_lists[type], pos); \
-+		 *   - block/blk-mq-sched.c|316| <<blk_mq_attempt_merge>> if (blk_mq_bio_list_merge(q, &ctx->rq_lists[type], bio, nr_segs)) {
-+		 *   - block/blk-mq-sched.c|338| <<__blk_mq_sched_bio_merge>> !list_empty_careful(&ctx->rq_lists[type])) {
-+		 *   - block/blk-mq.c|961| <<flush_busy_ctx>> list_splice_tail_init(&ctx->rq_lists[type], flush_data->list);
-+		 *   - block/blk-mq.c|996| <<dispatch_rq_from_ctx>> if (!list_empty(&ctx->rq_lists[type])) {
-+		 *   - block/blk-mq.c|997| <<dispatch_rq_from_ctx>> dispatch_data->rq = list_entry_rq(ctx->rq_lists[type].next);
-+		 *   - block/blk-mq.c|999| <<dispatch_rq_from_ctx>> if (list_empty(&ctx->rq_lists[type]))
-+		 *   - block/blk-mq.c|1656| <<__blk_mq_insert_req_list>> list_add(&rq->queuelist, &ctx->rq_lists[type]);
-+		 *   - block/blk-mq.c|1658| <<__blk_mq_insert_req_list>> list_add_tail(&rq->queuelist, &ctx->rq_lists[type]);
-+		 *   - block/blk-mq.c|1709| <<blk_mq_insert_requests>> list_splice_tail_init(list, &ctx->rq_lists[type]);
-+		 *   - block/blk-mq.c|2264| <<blk_mq_hctx_notify_dead>> if (!list_empty(&ctx->rq_lists[type])) {
-+		 *   - block/blk-mq.c|2265| <<blk_mq_hctx_notify_dead>> list_splice_init(&ctx->rq_lists[type], &tmp);
-+		 *   - block/blk-mq.c|2445| <<blk_mq_init_cpu_queues>> INIT_LIST_HEAD(&__ctx->rq_lists[k]);
-+		 */
- 		struct list_head	rq_lists[HCTX_MAX_TYPES];
- 	} ____cacheline_aligned_in_smp;
- 
- 	unsigned int		cpu;
-+	/*
-+	 * 设置index_hw[]的地方:
-+	 *   - block/blk-mq.c|2542| <<blk_mq_map_swqueue>> ctx->index_hw[hctx->type] = hctx->nr_ctx;
-+	 * 其余使用index_hw[]的地方:
-+	 *   - block/blk-mq-sched.c|121| <<blk_mq_next_ctx>> unsigned short idx = ctx->index_hw[hctx->type];
-+	 *   - block/blk-mq.c|80| <<blk_mq_hctx_mark_pending>> const int bit = ctx->index_hw[hctx->type];
-+	 *   - block/blk-mq.c|89| <<blk_mq_hctx_clear_pending>> const int bit = ctx->index_hw[hctx->type];
-+	 *   - block/blk-mq.c|1010| <<blk_mq_dequeue_from_ctx>> unsigned off = start ? start->index_hw[hctx->type] : 0;
-+	 *   - block/kyber-iosched.c|570| <<kyber_bio_merge>> struct kyber_ctx_queue *kcq = &khd->kcqs[ctx->index_hw[hctx->type]];
-+	 *   - block/kyber-iosched.c|595| <<kyber_insert_requests>> struct kyber_ctx_queue *kcq = &khd->kcqs[rq->mq_ctx->index_hw[hctx->type]];
-+	 *   - block/kyber-iosched.c|604| <<kyber_insert_requests>> rq->mq_ctx->index_hw[hctx->type]);
-+	 */
- 	unsigned short		index_hw[HCTX_MAX_TYPES];
- 	struct blk_mq_hw_ctx 	*hctxs[HCTX_MAX_TYPES];
- 
-@@ -30,6 +95,12 @@ struct blk_mq_ctx {
- 	unsigned long		rq_merged;
- 
- 	/* incremented at completion time */
-+	/*
-+	 * 使用rq_completed[2]的地方:
-+	 *   - block/blk-mq-debugfs.c|700| <<ctx_completed_show>> seq_printf(m, "%lu %lu\n", ctx->rq_completed[1], ctx->rq_completed[0]);
-+	 *   - block/blk-mq-debugfs.c|709| <<ctx_completed_write>> ctx->rq_completed[0] = ctx->rq_completed[1] = 0;
-+	 *   - block/blk-mq.c|503| <<blk_mq_free_request>> ctx->rq_completed[rq_is_sync(rq)]++;
-+	 */
- 	unsigned long		____cacheline_aligned_in_smp rq_completed[2];
- 
- 	struct request_queue	*queue;
-@@ -86,10 +157,21 @@ extern int blk_mq_hw_queue_to_node(struct blk_mq_queue_map *qmap, unsigned int);
-  * @type: the hctx type index
-  * @cpu: CPU
-  */
-+/*
-+ * called by:
-+ *   - block/blk-mq.c|2454| <<blk_mq_init_cpu_queues>> hctx = blk_mq_map_queue_type(q, j, i);
-+ *   - block/blk-mq.c|2536| <<blk_mq_map_swqueue>> ctx->hctxs[j] = blk_mq_map_queue_type(q,
-+ *   - block/blk-mq.c|2541| <<blk_mq_map_swqueue>> hctx = blk_mq_map_queue_type(q, j, i);
-+ *   - block/blk-mq.c|2567| <<blk_mq_map_swqueue>> ctx->hctxs[j] = blk_mq_map_queue_type(q,
-+ */
- static inline struct blk_mq_hw_ctx *blk_mq_map_queue_type(struct request_queue *q,
- 							  enum hctx_type type,
- 							  unsigned int cpu)
- {
-+	/*
-+	 * 设置queue_hw_ctx的地方:
-+	 *   - block/blk-mq.c|2836| <<blk_mq_realloc_hw_ctxs>> q->queue_hw_ctx = new_hctxs;
-+	 */
- 	return q->queue_hw_ctx[q->tag_set->map[type].mq_map[cpu]];
+ 		ret = q->mq_ops->poll(hctx);
+ 		if (ret > 0) {
+ 			hctx->poll_success++;
+@@ -3575,6 +3742,11 @@ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
  }
- 
-@@ -216,6 +298,13 @@ static inline void blk_mq_put_driver_tag(struct request *rq)
- 	__blk_mq_put_driver_tag(rq->mq_hctx, rq);
- }
+ EXPORT_SYMBOL_GPL(blk_poll);
  
 +/*
 + * called by:
-+ *   - block/blk-mq-pci.c|45| <<blk_mq_pci_map_queues>> blk_mq_clear_mq_map(qmap);
-+ *   - block/blk-mq.c|3063| <<blk_mq_update_queue_map>> blk_mq_clear_mq_map(&set->map[i]);
-+ *
-+ * 清空所有cpu的blk_mq_queue_map->mq_map[cpu] = 0
++ *   - drivers/scsi/bnx2i/bnx2i_hwi.c|1918| <<bnx2i_queue_scsi_cmd_resp>> p = &per_cpu(bnx2i_percpu, blk_mq_rq_cpu(sc->request));
++ *   - drivers/scsi/csiostor/csio_scsi.c|1789| <<csio_queuecommand>> sqset = &hw->sqset[ln->portid][blk_mq_rq_cpu(cmnd->request)];
 + */
- static inline void blk_mq_clear_mq_map(struct blk_mq_queue_map *qmap)
+ unsigned int blk_mq_rq_cpu(struct request *rq)
  {
- 	int cpu;
-diff --git a/block/blk-softirq.c b/block/blk-softirq.c
-index 6e7ec87d49fa..a53272075e41 100644
---- a/block/blk-softirq.c
-+++ b/block/blk-softirq.c
-@@ -14,12 +14,32 @@
- 
+ 	return rq->mq_ctx->cpu;
+diff --git a/block/blk-stat.c b/block/blk-stat.c
+index 7da302ff88d0..b15a5afbd665 100644
+--- a/block/blk-stat.c
++++ b/block/blk-stat.c
+@@ -12,12 +12,115 @@
+ #include "blk-mq.h"
  #include "blk.h"
  
 +/*
-+ * 在以下使用blk_cpu_done:
-+ *   - block/blk-softirq.c|28| <<blk_done_softirq>> cpu_list = this_cpu_ptr(&blk_cpu_done);
-+ *   - block/blk-softirq.c|47| <<trigger_softirq>> list = this_cpu_ptr(&blk_cpu_done);
-+ *   - block/blk-softirq.c|86| <<blk_softirq_cpu_dead>> list_splice_init(&per_cpu(blk_cpu_done, cpu),
-+ *   - block/blk-softirq.c|87| <<blk_softirq_cpu_dead>> this_cpu_ptr(&blk_cpu_done));
-+ *   - block/blk-softirq.c|126| <<__blk_complete_request>> list = this_cpu_ptr(&blk_cpu_done);
-+ *   - block/blk-softirq.c|148| <<blk_softirq_init>> INIT_LIST_HEAD(&per_cpu(blk_cpu_done, i));
++ * 核心的patch
 + *
-+ * 上面放的是request
++ * commit 34dbad5d26e2f4b88e60f0e9ad03f99480802812
++ * Author: Omar Sandoval <osandov@fb.com>
++ * Date:   Tue Mar 21 08:56:08 2017 -0700
++ *
++ * blk-stat: convert to callback-based statistics reporting
++ *
++ * Currently, statistics are gathered in ~0.13s windows, and users grab the
++ * statistics whenever they need them. This is not ideal for both in-tree
++ * users:
++ *
++ * 1. Writeback throttling wants its own dynamically sized window of
++ *    statistics. Since the blk-stats statistics are reset after every
++ *    window and the wbt windows don't line up with the blk-stats windows,
++ *    wbt doesn't see every I/O.
++ * 2. Polling currently grabs the statistics on every I/O. Again, depending
++ *    on how the window lines up, we may miss some I/Os. It's also
++ *    unnecessary overhead to get the statistics on every I/O; the hybrid
++ *    polling heuristic would be just as happy with the statistics from the
++ *    previous full window.
++ *
++ * This reworks the blk-stats infrastructure to be callback-based: users
++ * register a callback that they want called at a given time with all of
++ * the statistics from the window during which the callback was active.
++ * Users can dynamically bucketize the statistics. wbt and polling both
++ * currently use read vs. write, but polling can be extended to further
++ * subdivide based on request size.
++ *
++ * The callbacks are kept on an RCU list, and each callback has percpu
++ * stats buffers. There will only be a few users, so the overhead on the
++ * I/O completion side is low. The stats flushing is also simplified
++ * considerably: since the timer function is responsible for clearing the
++ * statistics, we don't have to worry about stale statistics.
++ *
++ * wbt is a trivial conversion. After the conversion, the windowing problem
++ * mentioned above is fixed.
++ *
++ * For polling, we register an extra callback that caches the previous
++ * window's statistics in the struct request_queue for the hybrid polling
++ * heuristic to use.
++ *
++ * Since we no longer have a single stats buffer for the request queue,
++ * this also removes the sysfs and debugfs stats entries. To replace those,
++ * we add a debugfs entry for the poll statistics.
++ *
++ * Signed-off-by: Omar Sandoval <osandov@fb.com>
++ * Signed-off-by: Jens Axboe <axboe@fb.com>
++ *
++ *
++ * 在blk_alloc_queue_stats()分配一个struct blk_queue_stats结构,
++ * 初始化清空callback链表,设置stats->enable_accounting = false.
++ *
++ * blk_alloc_queue_node()
++ *  -> blk_alloc_queue_stats()
++ *
++ * 在poll的时候把struct blk_stat_callback链接入q->stats->callbacks链表
++ * 设置blk_queue_flag_set(QUEUE_FLAG_STATS, q)
++ *
++ * blk_poll()
++ *  -> blk_mq_poll_hybrid()
++ *      -> blk_mq_poll_hybrid_sleep()
++ *          -> blk_mq_poll_nsecs()
++ *              -> blk_poll_stats_enable()
++ *                  -> blk_stat_add_callback()
++ *
++ * 在end request的时候, 会调用blk_stat_add().
++ * 核心思想是找到request的request_queue->stats,遍历其callback链表,
++ * 对于链表上的每一个struct blk_stat_callback, 调用cb->bucket_fn()选取bucket,
++ * 然后把参数的now汇入对应bucket的struct blk_rq_stat
++ *
++ * 在end request的时候, 还会触发timer,
++ *
++ * __blk_mq_end_request()
++ *  -> blk_mq_poll_stats_start()
++ *      -> blk_stat_activate_msecs()
++ *          -> mod_timer(&cb->timer, jiffies + msecs_to_jiffies(msecs));
++ *
++ * 
++ * timer最终触发blk_stat_timer_fn()->blk_mq_poll_stats_fn().
++ * blk_mq_poll_stats_fn()的核心思想是把每个bucket的
++ * q->poll_stat[bucket] = cb->stat[bucket];
++ *
++ * 在poll的时候会根据这些stat决定要先在hybrid的时候sleep多久!
++ *
++ *
++ * slides: I/O Latency Optimization with Polling
 + */
- static DEFINE_PER_CPU(struct list_head, blk_cpu_done);
++
+ struct blk_queue_stats {
+ 	struct list_head callbacks;
+ 	spinlock_t lock;
++	/*
++	 * 在以下使用enable_accounting:
++	 *   - block/blk-stat.c|161| <<blk_stat_remove_callback>> if (list_empty(&q->stats->callbacks) && !q->stats->enable_accounting)
++	 *   - block/blk-stat.c|187| <<blk_stat_enable_accounting>> q->stats->enable_accounting = true;
++	 *   - block/blk-stat.c|203| <<blk_alloc_queue_stats>> stats->enable_accounting = false;
++	 */
+ 	bool enable_accounting;
+ };
  
- /*
-  * Softirq action handler - move entries to local list and loop over them
-  * while passing them to the queue registered handler.
-  */
-+/*
-+ * 在以下使用blk_done_softirq:
-+ *   - block/blk-softirq.c|150| <<blk_softirq_init>> open_softirq(BLOCK_SOFTIRQ, blk_done_softirq);
-+ *
-+ * 针对percpu的blk_cpu_done上的每一个request
-+ * 调用rq->q->mq_ops->complete(rq)
-+ * Softirq action handler - move entries to local list and loop over them
-+ * while passing them to the queue registered handler.
-+ */
- static __latent_entropy void blk_done_softirq(struct softirq_action *h)
- {
- 	struct list_head *cpu_list, local_list;
-@@ -39,6 +59,13 @@ static __latent_entropy void blk_done_softirq(struct softirq_action *h)
- }
- 
- #ifdef CONFIG_SMP
-+/*
-+ * 在以下使用trigger_softirq():
-+ *   - block/blk-softirq.c|75| <<raise_blk_irq>> data->func = trigger_softirq;
-+ *
-+ * 把data表示的request放入percpu的blk_cpu_done
-+ * 触发raise_softirq_irqoff(BLOCK_SOFTIRQ) = blk_done_softirq()
-+ */
- static void trigger_softirq(void *data)
- {
- 	struct request *rq = data;
-@@ -54,6 +81,10 @@ static void trigger_softirq(void *data)
- /*
-  * Setup and invoke a run of 'trigger_softirq' on the given cpu.
-  */
 +/*
 + * called by:
-+ *   - block/blk-softirq.c|150| <<__blk_complete_request>> } else if (raise_blk_irq(ccpu, req))
++ *   - block/blk-iolatency.c|199| <<latency_stat_init>> blk_rq_stat_init(&stat->rqs);
++ *   - block/blk-stat.c|87| <<blk_stat_timer_fn>> blk_rq_stat_init(&cb->stat[bucket]);
++ *   - block/blk-stat.c|95| <<blk_stat_timer_fn>> blk_rq_stat_init(&cpu_stat[bucket]);
++ *   - block/blk-stat.c|147| <<blk_stat_add_callback>> blk_rq_stat_init(&cpu_stat[bucket]);
 + */
- static int raise_blk_irq(int cpu, struct request *rq)
+ void blk_rq_stat_init(struct blk_rq_stat *stat)
  {
- 	if (cpu_online(cpu)) {
-@@ -76,6 +107,12 @@ static int raise_blk_irq(int cpu, struct request *rq)
+ 	stat->min = -1ULL;
+@@ -26,6 +129,11 @@ void blk_rq_stat_init(struct blk_rq_stat *stat)
  }
- #endif
  
+ /* src is a per-cpu stat, mean isn't initialized */
 +/*
-+ * 在blk_softirq_init()中被使用:
-+ * cpuhp_setup_state_nocalls(CPUHP_BLOCK_SOFTIRQ_DEAD,
-+ *                           "block/softirq:dead", NULL,
-+ *                           blk_softirq_cpu_dead);
++ * called by:
++ *   - block/blk-iolatency.c|210| <<latency_stat_sum>> blk_rq_stat_sum(&sum->rqs, &stat->rqs);
++ *   - block/blk-stat.c|94| <<blk_stat_timer_fn>> blk_rq_stat_sum(&cb->stat[bucket], &cpu_stat[bucket]);
 + */
- static int blk_softirq_cpu_dead(unsigned int cpu)
+ void blk_rq_stat_sum(struct blk_rq_stat *dst, struct blk_rq_stat *src)
  {
- 	/*
-@@ -91,6 +128,10 @@ static int blk_softirq_cpu_dead(unsigned int cpu)
- 	return 0;
+ 	if (!src->nr_samples)
+@@ -40,6 +148,18 @@ void blk_rq_stat_sum(struct blk_rq_stat *dst, struct blk_rq_stat *src)
+ 	dst->nr_samples += src->nr_samples;
  }
  
 +/*
 + * called by:
-+ *   - block/blk-mq.c|583| <<__blk_mq_complete_request>> __blk_complete_request(rq);
++ *   - block/blk-iolatency.c|222| <<latency_stat_record_time>> blk_rq_stat_add(&stat->rqs, req_time);
++ *   - block/blk-stat.c|74| <<blk_stat_add>> blk_rq_stat_add(stat, value);
++ *
++ * 调用的一个例子:
++ * __blk_mq_end_request()
++ *  -> blk_stat_add()
++ *      -> blk_rq_stat_add()
++ *
++ * 把参数的value汇入struct blk_rq_stat
 + */
- void __blk_complete_request(struct request *req)
+ void blk_rq_stat_add(struct blk_rq_stat *stat, u64 value)
  {
- 	struct request_queue *q = req->q;
-diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
-index 11cfd6470b1a..ad6ad7589b9b 100644
---- a/include/linux/blk-mq.h
-+++ b/include/linux/blk-mq.h
-@@ -107,6 +107,10 @@ struct blk_mq_hw_ctx {
- 	 * @wait_index: Index of next available dispatch_wait queue to insert
- 	 * requests.
- 	 */
-+	/*
-+	 * 使用的地方:
-+	 *   - block/blk-mq-tag.h|66| <<bt_wait_ptr>> return sbq_wait_ptr(bt, &hctx->wait_index);
-+	 */
- 	atomic_t		wait_index;
+ 	stat->min = min(stat->min, value);
+@@ -48,6 +168,14 @@ void blk_rq_stat_add(struct blk_rq_stat *stat, u64 value)
+ 	stat->nr_samples++;
+ }
  
- 	/**
-@@ -138,6 +142,19 @@ struct blk_mq_hw_ctx {
- 	 * @nr_active: Number of active requests. Only used when a tag set is
- 	 * shared across request queues.
- 	 */
-+	/*
-+	 * 修改nr_active的地方:
-+	 *   - block/blk-mq.c|285| <<blk_mq_rq_ctx_init>> atomic_inc(&data->hctx->nr_active);
-+	 *   - block/blk-mq.c|505| <<blk_mq_free_request>> atomic_dec(&hctx->nr_active);
-+	 *   - block/blk-mq.c|1051| <<blk_mq_get_driver_tag>> atomic_inc(&data.hctx->nr_active);
-+	 *   - block/blk-mq.c|2377| <<blk_mq_alloc_hctx>> atomic_set(&hctx->nr_active, 0);
-+	 *   - block/blk-mq.h|259| <<__blk_mq_put_driver_tag>> atomic_dec(&hctx->nr_active);
-+	 * 读取nr_active的地方:
-+	 *   - block/blk-mq-debugfs.c|613| <<hctx_active_show>> seq_printf(m, "%d\n", atomic_read(&hctx->nr_active));
-+	 *   - block/blk-mq-tag.c|87| <<hctx_may_queue>> return atomic_read(&hctx->nr_active) < depth;
-+	 *   - drivers/scsi/megaraid/megaraid_sas_fusion.c|380| <<megasas_get_msix_index>> sdev_busy = atomic_read(&hctx->nr_active);
-+	 *   - drivers/scsi/mpt3sas/mpt3sas_base.c|3588| <<_base_sdev_nr_inflight_request>> return atomic_read(&hctx->nr_active);
-+	 */
- 	atomic_t		nr_active;
++/*
++ * called by:
++ *   - block/blk-mq.c|527| <<__blk_mq_end_request>> blk_stat_add(rq, now);
++ *
++ * 核心思想是找到request的request_queue->stats,遍历其callback链表,
++ * 对于链表上的每一个struct blk_stat_callback, 调用cb->bucket_fn()选取bucket,
++ * 然后把参数的now汇入对应bucket的struct blk_rq_stat
++ */
+ void blk_stat_add(struct request *rq, u64 now)
+ {
+ 	struct request_queue *q = rq->q;
+@@ -56,6 +184,15 @@ void blk_stat_add(struct request *rq, u64 now)
+ 	int bucket, cpu;
+ 	u64 value;
  
- 	/** @cpuhp_dead: List to store request if some CPU die. */
-@@ -186,6 +203,15 @@ struct blk_mq_hw_ctx {
- struct blk_mq_queue_map {
- 	unsigned int *mq_map;
- 	unsigned int nr_queues;
 +	/*
-+	 * 对于nvme来说
-+	 * The poll queue(s) doesn't have an IRQ (and hence IRQ
-+	 * affinity), so use the regular blk-mq cpu mapping
++	 * 在以下使用io_start_time_ns:
++	 *   - block/bfq-iosched.c|5911| <<bfq_finish_requeue_request>> rq->io_start_time_ns,
++	 *   - block/blk-mq.c|318| <<blk_mq_rq_ctx_init>> rq->io_start_time_ns = 0;
++	 *   - block/blk-mq.c|663| <<blk_mq_start_request>> rq->io_start_time_ns = ktime_get_ns();
++	 *   - block/blk-stat.c|137| <<blk_stat_add>> value = (now >= rq->io_start_time_ns) ? now - rq->io_start_time_ns : 0;
++	 *   - block/blk-wbt.c|619| <<wbt_issue>> rwb->sync_issue = rq->io_start_time_ns;
++	 *   - block/kyber-iosched.c|651| <<kyber_completed_request>> now - rq->io_start_time_ns);
++	 */
+ 	value = (now >= rq->io_start_time_ns) ? now - rq->io_start_time_ns : 0;
+ 
+ 	blk_throtl_stat_add(rq, value);
+@@ -70,13 +207,34 @@ void blk_stat_add(struct request *rq, u64 now)
+ 		if (bucket < 0)
+ 			continue;
+ 
++		/*
++		 * struct blk_stat_callback:
++		 *  -> struct blk_rq_stat __percpu *cpu_stat;
++		 *  -> struct blk_rq_stat stat;
++		 */
+ 		stat = &per_cpu_ptr(cb->cpu_stat, cpu)[bucket];
++		/*
++		 * 把参数的value汇入struct blk_rq_stat
++		 */
+ 		blk_rq_stat_add(stat, value);
+ 	}
+ 	put_cpu();
+ 	rcu_read_unlock();
+ }
+ 
++/*
++ * __blk_mq_end_request()
++ *  -> blk_mq_poll_stats_start()
++ *      -> blk_stat_activate_msecs()
++ *          -> mod_timer(&cb->timer, jiffies + msecs_to_jiffies(msecs));
++ *
++ * 说明end request的时候mod timer
++ * The timer callback will be called when the window expires
++ * to gather block statistics during a time window in milliseconds.
++ *
++ * 在以下使用blk_stat_timer_fn():
++ *   - block/blk-stat.c|131| <<blk_stat_alloc_callback>> timer_setup(&cb->timer, blk_stat_timer_fn, 0);
++ */
+ static void blk_stat_timer_fn(struct timer_list *t)
+ {
+ 	struct blk_stat_callback *cb = from_timer(cb, t, timer);
+@@ -89,16 +247,44 @@ static void blk_stat_timer_fn(struct timer_list *t)
+ 	for_each_online_cpu(cpu) {
+ 		struct blk_rq_stat *cpu_stat;
+ 
++		/*
++		 * 注意!!! 每个cpu都有一个buckets * sizeof(struct blk_rq_stat)!!
++		 */
+ 		cpu_stat = per_cpu_ptr(cb->cpu_stat, cpu);
+ 		for (bucket = 0; bucket < cb->buckets; bucket++) {
++			/*
++			 * 注意!!! 每个cpu都有一个buckets * sizeof(struct blk_rq_stat)!!
++			 */
+ 			blk_rq_stat_sum(&cb->stat[bucket], &cpu_stat[bucket]);
+ 			blk_rq_stat_init(&cpu_stat[bucket]);
+ 		}
+ 	}
+ 
++	/*
++	 * __blk_mq_end_request()
++	 *  -> blk_mq_poll_stats_start()
++	 *      -> blk_stat_activate_msecs()
++	 *          -> mod_timer(&cb->timer, jiffies + msecs_to_jiffies(msecs));
 +	 *
-+	 * First hardware queue to map onto. Used by the PCIe NVMe
-+	 * driver to map each hardware queue type (enum hctx_type) onto a distinct
-+	 * set of hardware queues.
++	 * 说明end request的时候mod timer
++	 * The timer callback will be called when the window expires
++	 * to gather block statistics during a time window in milliseconds.
++	 *
++	 * -----------------------------------------
++	 *
++	 * 从blk_mq_init_allocated_queue()进来blk_stat_alloc_callback()
++	 * 的话timer_fn是blk_mq_poll_stats_fn()
 +	 */
- 	unsigned int queue_offset;
- };
- 
-@@ -232,6 +258,31 @@ enum hctx_type {
-  * @tag_list:	   List of the request queues that use this tag set. See also
-  *		   request_queue.tag_set_list.
-  */
-+/*
-+ * 认真来说,set中没有hwqueue的概念.set中主要是tags.
-+ * tags (struct blk_mq_tags) 在数组中管理,每个数组元素相当于是一个hwqueue了.
-+ *
-+ * 'struct request_queue'中的'struct blk_mq_hw_ctx'可以告诉我们去找哪一个'struct blk_mq_tags'.
-+ *
-+ * 因为'struct blk_mq_tags'没法管理下发的request,所以在'struct blk_mq_hw_ctx'中管理.
-+ *
-+ * 在set中记录cpu到hw queue的mapping
-+ *
-+ * struct blk_mq_tag_set
-+ *  -> struct blk_mq_queue_map map[HCTX_MAX_TYPES];
-+ *      -> unsigned int *mq_map; --> 记录set中cpu到hw queue的mapping
-+ *      -> unsigned int nr_queues;
-+ *      -> unsigned int queue_offset;
-+ *
-+ * 在blk_mq_update_queue_map()设置的set中的mapping
-+ *
-+ *
-+ * struct request_queue:
-+ *  -> struct blk_mq_ctx __percpu *queue_ctx;
-+ *  -> struct blk_mq_hw_ctx **queue_hw_ctx;
-+ *
-+ * 在blk_mq_alloc_ctxs()分配percpu的sw queue
-+ */
- struct blk_mq_tag_set {
- 	struct blk_mq_queue_map	map[HCTX_MAX_TYPES];
- 	unsigned int		nr_maps;
-@@ -248,6 +299,10 @@ struct blk_mq_tag_set {
- 	struct blk_mq_tags	**tags;
- 
- 	struct mutex		tag_list_lock;
-+	/*
-+	 * 添加的地方:
-+	 *   - block/blk-mq.c|2716| <<blk_mq_add_queue_tag_set>> list_add_tail_rcu(&q->tag_set_list, &set->tag_list);
-+	 */
- 	struct list_head	tag_list;
- };
- 
-@@ -394,6 +449,13 @@ enum {
- 	BLK_MQ_F_ALLOC_POLICY_BITS = 1,
- 
- 	BLK_MQ_S_STOPPED	= 0,
-+	/*
-+	 * 使用BLK_MQ_S_TAG_ACTIVE的例子:
-+	 *   - block/blk-mq-tag.c|40| <<__blk_mq_tag_busy>> if (!test_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state) &&
-+	 *   - block/blk-mq-tag.c|41| <<__blk_mq_tag_busy>> !test_and_set_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
-+	 *   - block/blk-mq-tag.c|65| <<__blk_mq_tag_idle>> if (!test_and_clear_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
-+	 *   - block/blk-mq-tag.c|88| <<hctx_may_queue>> if (!test_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
-+	 */
- 	BLK_MQ_S_TAG_ACTIVE	= 1,
- 	BLK_MQ_S_SCHED_RESTART	= 2,
- 
-@@ -548,10 +610,16 @@ static inline void *blk_mq_rq_to_pdu(struct request *rq)
- 	return rq + 1;
+ 	cb->timer_fn(cb);
  }
  
 +/*
-+ * 对于q->nr_hw_queues范围内的每一个q->queue_hw_ctx[i]
++ * called by:
++ *   - block/blk-mq.c|2890| <<blk_mq_init_allocated_queue>> q->poll_cb = blk_stat_alloc_callback(blk_mq_poll_stats_fn,
++ *   - block/blk-wbt.c|829| <<wbt_init>> rwb->cb = blk_stat_alloc_callback(wb_timer_fn, wbt_data_dir, 2, rwb);
++ *
++ * 分配一个struct blk_stat_callback
 + */
- #define queue_for_each_hw_ctx(q, hctx, i)				\
- 	for ((i) = 0; (i) < (q)->nr_hw_queues &&			\
- 	     ({ hctx = (q)->queue_hw_ctx[i]; 1; }); (i)++)
+ struct blk_stat_callback *
+ blk_stat_alloc_callback(void (*timer_fn)(struct blk_stat_callback *),
+ 			int (*bucket_fn)(const struct request *),
+@@ -110,12 +296,18 @@ blk_stat_alloc_callback(void (*timer_fn)(struct blk_stat_callback *),
+ 	if (!cb)
+ 		return NULL;
+ 
++	/*
++	 * 从blk_mq_init_allocated_queue()进来的话buckets是BLK_MQ_POLL_STATS_BKTS
++	 */
+ 	cb->stat = kmalloc_array(buckets, sizeof(struct blk_rq_stat),
+ 				 GFP_KERNEL);
+ 	if (!cb->stat) {
+ 		kfree(cb);
+ 		return NULL;
+ 	}
++	/*
++	 * 注意!!! 每个cpu都有一个buckets * sizeof(struct blk_rq_stat)!!
++	 */
+ 	cb->cpu_stat = __alloc_percpu(buckets * sizeof(struct blk_rq_stat),
+ 				      __alignof__(struct blk_rq_stat));
+ 	if (!cb->cpu_stat) {
+@@ -124,15 +316,59 @@ blk_stat_alloc_callback(void (*timer_fn)(struct blk_stat_callback *),
+ 		return NULL;
+ 	}
+ 
++	/*
++	 * 调用timer_fn的地方:
++	 *   - block/blk-stat.c|190| <<blk_stat_timer_fn>> cb->timer_fn(cb);
++	 *
++	 * 从blk_mq_init_allocated_queue()进来的话timer_fn是blk_mq_poll_stats_fn()
++	 */
+ 	cb->timer_fn = timer_fn;
++	/*
++	 * 调用bucket_fn的地方: __blk_mq_end_request()-->blk_stat_add()
++	 *   - block/blk-stat.c|156| <<blk_stat_add>> bucket = cb->bucket_fn(rq);
++	 *
++	 * 从blk_mq_init_allocated_queue()进来的话bucket_fn是blk_mq_poll_stats_bkt()
++	 */
+ 	cb->bucket_fn = bucket_fn;
++	/*
++	 * 从blk_mq_init_allocated_queue()进来的话data是'struct request_queue'
++	 */
+ 	cb->data = data;
++	/*
++	 * 从blk_mq_init_allocated_queue()进来的话buckets是BLK_MQ_POLL_STATS_BKTS
++	 */
+ 	cb->buckets = buckets;
++	/*
++	 * __blk_mq_end_request()
++	 *  -> blk_mq_poll_stats_start()
++	 *      -> blk_stat_activate_msecs()
++	 *          -> mod_timer(&cb->timer, jiffies + msecs_to_jiffies(msecs));
++	 *
++	 * 说明end request的时候mod timer
++	 * The timer callback will be called when the window expires
++	 * to gather block statistics during a time window in milliseconds.
++	 */
+ 	timer_setup(&cb->timer, blk_stat_timer_fn, 0);
+ 
+ 	return cb;
+ }
  
 +/*
-+ * 对于hctx->nr_ctx范围内的每一个hctx->ctxs[i]
++ * called by:
++ *   - block/blk-mq.c|3376| <<blk_poll_stats_enable>> blk_stat_add_callback(q, q->poll_cb);
++ *   - block/blk-wbt.c|852| <<wbt_init>> blk_stat_add_callback(q, rwb->cb);
++ *
++ * poll调用的例子
++ * blk_poll()
++ *  -> blk_mq_poll_hybrid()
++ *      -> blk_mq_poll_hybrid_sleep()
++ *          -> blk_mq_poll_nsecs()
++ *              -> blk_poll_stats_enable()
++ *                  -> blk_stat_add_callback()
++ *
++ * 核心思想是把struct blk_stat_callback链接入q->stats->callbacks链表
++ * 设置blk_queue_flag_set(QUEUE_FLAG_STATS, q)
 + */
- #define hctx_for_each_ctx(hctx, ctx, i)					\
- 	for ((i) = 0; (i) < (hctx)->nr_ctx &&				\
- 	     ({ ctx = (hctx)->ctxs[(i)]; 1; }); (i)++)
+ void blk_stat_add_callback(struct request_queue *q,
+ 			   struct blk_stat_callback *cb)
+ {
+@@ -149,10 +385,22 @@ void blk_stat_add_callback(struct request_queue *q,
+ 
+ 	spin_lock(&q->stats->lock);
+ 	list_add_tail_rcu(&cb->list, &q->stats->callbacks);
++	/*
++	 * 在以下使用QUEUE_FLAG_STATS:
++	 *   - block/blk-mq.c|671| <<blk_mq_start_request>> if (test_bit(QUEUE_FLAG_STATS, &q->queue_flags)) {
++	 *   - block/blk-stat.c|308| <<blk_stat_add_callback>> blk_queue_flag_set(QUEUE_FLAG_STATS, q);
++	 *   - block/blk-stat.c|323| <<blk_stat_remove_callback>> blk_queue_flag_clear(QUEUE_FLAG_STATS, q);
++	 *   - block/blk-stat.c|364| <<blk_stat_enable_accounting>> blk_queue_flag_set(QUEUE_FLAG_STATS, q);
++	 */
+ 	blk_queue_flag_set(QUEUE_FLAG_STATS, q);
+ 	spin_unlock(&q->stats->lock);
+ }
+ 
++/*
++ * called by:
++ *   - block/blk-sysfs.c|881| <<__blk_release_queue>> blk_stat_remove_callback(q, q->poll_cb);
++ *   - block/blk-wbt.c|696| <<wbt_exit>> blk_stat_remove_callback(q, rwb->cb);
++ */
+ void blk_stat_remove_callback(struct request_queue *q,
+ 			      struct blk_stat_callback *cb)
+ {
+@@ -165,6 +413,10 @@ void blk_stat_remove_callback(struct request_queue *q,
+ 	del_timer_sync(&cb->timer);
+ }
+ 
++/*
++ * 在以下使用blk_stat_free_callback_rcu():
++ *   - block/blk-stat.c|303| <<blk_stat_free_callback>> call_rcu(&cb->rcu, blk_stat_free_callback_rcu);
++ */
+ static void blk_stat_free_callback_rcu(struct rcu_head *head)
+ {
+ 	struct blk_stat_callback *cb;
+@@ -175,12 +427,23 @@ static void blk_stat_free_callback_rcu(struct rcu_head *head)
+ 	kfree(cb);
+ }
+ 
++/*
++ * called by:
++ *   - block/blk-mq.c|2973| <<blk_mq_init_allocated_queue>> blk_stat_free_callback(q->poll_cb);
++ *   - block/blk-sysfs.c|882| <<__blk_release_queue>> blk_stat_free_callback(q->poll_cb);
++ *   - block/blk-wbt.c|697| <<wbt_exit>> blk_stat_free_callback(rwb->cb);
++ */
+ void blk_stat_free_callback(struct blk_stat_callback *cb)
+ {
+ 	if (cb)
+ 		call_rcu(&cb->rcu, blk_stat_free_callback_rcu);
+ }
+ 
++/*
++ * called by:
++ *   - block/blk-throttle.c|2503| <<blk_throtl_register_queue>> blk_stat_enable_accounting(q);
++ *   - block/kyber-iosched.c|431| <<kyber_init_sched>> blk_stat_enable_accounting(q);
++ */
+ void blk_stat_enable_accounting(struct request_queue *q)
+ {
+ 	spin_lock(&q->stats->lock);
+@@ -190,6 +453,13 @@ void blk_stat_enable_accounting(struct request_queue *q)
+ }
+ EXPORT_SYMBOL_GPL(blk_stat_enable_accounting);
+ 
++/*
++ * called by:
++ *   - block/blk-core.c|503| <<blk_alloc_queue_node>> q->stats = blk_alloc_queue_stats();
++ *
++ * 分配一个struct blk_queue_stats结构, 初始化清空callback链表
++ * 设置stats->enable_accounting = false;
++ */
+ struct blk_queue_stats *blk_alloc_queue_stats(void)
+ {
+ 	struct blk_queue_stats *stats;
+@@ -205,6 +475,11 @@ struct blk_queue_stats *blk_alloc_queue_stats(void)
+ 	return stats;
+ }
+ 
++/*
++ * called by:
++ *   - block/blk-core.c|550| <<blk_alloc_queue_node>> blk_free_queue_stats(q->stats);
++ *   - block/blk-sysfs.c|884| <<__blk_release_queue>> blk_free_queue_stats(q->stats);
++ */
+ void blk_free_queue_stats(struct blk_queue_stats *stats)
+ {
+ 	if (!stats)
+diff --git a/block/blk-stat.h b/block/blk-stat.h
+index 17b47a86eefb..447c50693721 100644
+--- a/block/blk-stat.h
++++ b/block/blk-stat.h
+@@ -126,6 +126,12 @@ void blk_stat_free_callback(struct blk_stat_callback *cb);
+  * gathering statistics.
+  * @cb: The callback.
+  */
++/*
++ * called by:
++ *   - block/blk-mq.c|3420| <<blk_mq_poll_stats_start>> blk_stat_is_active(q->poll_cb))
++ *   - block/blk-stat.c|153| <<blk_stat_add>> if (!blk_stat_is_active(cb))
++ *   - block/blk-wbt.c|593| <<wbt_wait>> if (!blk_stat_is_active(rwb->cb))
++ */
+ static inline bool blk_stat_is_active(struct blk_stat_callback *cb)
+ {
+ 	return timer_pending(&cb->timer);
+@@ -139,12 +145,20 @@ static inline bool blk_stat_is_active(struct blk_stat_callback *cb)
+  *
+  * The timer callback will be called when the window expires.
+  */
++/*
++ * called by:
++ *   - block/blk-wbt.c|349| <<rwb_arm_timer>> blk_stat_activate_nsecs(rwb->cb, rwb->cur_win_nsec);
++ */
+ static inline void blk_stat_activate_nsecs(struct blk_stat_callback *cb,
+ 					   u64 nsecs)
+ {
+ 	mod_timer(&cb->timer, jiffies + nsecs_to_jiffies(nsecs));
+ }
+ 
++/*
++ * called by:
++ *   - block/blk-wbt.c|712| <<wbt_disable_default>> blk_stat_deactivate(rwb->cb);
++ */
+ static inline void blk_stat_deactivate(struct blk_stat_callback *cb)
+ {
+ 	del_timer_sync(&cb->timer);
+@@ -158,6 +172,19 @@ static inline void blk_stat_deactivate(struct blk_stat_callback *cb)
+  *
+  * The timer callback will be called when the window expires.
+  */
++/*
++ * called by:
++ *   - block/blk-mq.c|3394| <<blk_mq_poll_stats_start>> blk_stat_activate_msecs(q->poll_cb, 100);
++ *
++ * __blk_mq_end_request()
++ *  -> blk_mq_poll_stats_start()
++ *      -> blk_stat_activate_msecs()
++ *          -> mod_timer(&cb->timer, jiffies + msecs_to_jiffies(msecs));
++ *
++ * 说明end request的时候mod timer
++ * The timer callback will be called when the window expires
++ * to gather block statistics during a time window in milliseconds.
++ */
+ static inline void blk_stat_activate_msecs(struct blk_stat_callback *cb,
+ 					   unsigned int msecs)
+ {
+diff --git a/block/blk-sysfs.c b/block/blk-sysfs.c
+index fca9b158f4a0..1ff764db605c 100644
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@ -873,6 +873,10 @@ static void blk_exit_queue(struct request_queue *q)
+  *     of the request queue reaches zero, blk_release_queue is called to release
+  *     all allocated resources of the request queue.
+  */
++/*
++ * 在以下使用__blk_release_queue():
++ *   - block/blk-sysfs.c|912| <<blk_release_queue>> INIT_WORK(&q->release_work, __blk_release_queue);
++ */
+ static void __blk_release_queue(struct work_struct *work)
+ {
+ 	struct request_queue *q = container_of(work, typeof(*q), release_work);
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 365a2ddbeaa7..830bd0b1bd3a 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -1492,6 +1492,12 @@ static int nvme_alloc_queue(struct nvme_dev *dev, int qid, int depth)
+ 	return -ENOMEM;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/nvme/host/pci.c|1555| <<nvme_create_queue>> result = queue_request_irq(nvmeq);
++ *   - drivers/nvme/host/pci.c|1703| <<nvme_pci_configure_admin_queue>> result = queue_request_irq(nvmeq);
++ *   - drivers/nvme/host/pci.c|2160| <<nvme_setup_io_queues>> result = queue_request_irq(adminq);
++ */
+ static int queue_request_irq(struct nvme_queue *nvmeq)
+ {
+ 	struct pci_dev *pdev = to_pci_dev(nvmeq->dev->dev);
+@@ -2045,8 +2051,26 @@ static void nvme_calc_irq_sets(struct irq_affinity *affd, unsigned int nrirqs)
+ 	affd->nr_sets = nr_read_queues ? 2 : 1;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/nvme/host/pci.c|2146| <<nvme_setup_io_queues>> result = nvme_setup_irqs(dev, nr_io_queues);
++ */
+ static int nvme_setup_irqs(struct nvme_dev *dev, unsigned int nr_io_queues)
+ {
++	/*
++	 * struct irq_affinity - Description for automatic irq affinity assignements
++	 * @pre_vectors:        Don't apply affinity to @pre_vectors at beginning of
++	 *                      the MSI(-X) vector space
++	 * @post_vectors:       Don't apply affinity to @post_vectors at end of
++	 *                      the MSI(-X) vector space
++	 * @nr_sets:            The number of interrupt sets for which affinity
++	 *                      spreading is required
++	 * @set_size:           Array holding the size of each interrupt set
++	 * @calc_sets:          Callback for calculating the number and size
++	 *                      of interrupt sets
++	 * @priv:               Private data for usage by @calc_sets, usually a
++	 *                      pointer to driver/device specific data.
++	 */
+ 	struct pci_dev *pdev = to_pci_dev(dev->dev);
+ 	struct irq_affinity affd = {
+ 		.pre_vectors	= 1,
+diff --git a/drivers/pci/msi.c b/drivers/pci/msi.c
+index 6b43a5455c7a..e6817052992a 100644
+--- a/drivers/pci/msi.c
++++ b/drivers/pci/msi.c
+@@ -1190,6 +1190,20 @@ int pci_alloc_irq_vectors_affinity(struct pci_dev *dev, unsigned int min_vecs,
+ 				   unsigned int max_vecs, unsigned int flags,
+ 				   struct irq_affinity *affd)
+ {
++	/*
++	 * struct irq_affinity - Description for automatic irq affinity assignements
++280  * @pre_vectors:        Don't apply affinity to @pre_vectors at beginning of
++281  *                      the MSI(-X) vector space
++282  * @post_vectors:       Don't apply affinity to @post_vectors at end of
++283  *                      the MSI(-X) vector space
++284  * @nr_sets:            The number of interrupt sets for which affinity
++285  *                      spreading is required
++286  * @set_size:           Array holding the size of each interrupt set
++287  * @calc_sets:          Callback for calculating the number and size
++288  *                      of interrupt sets
++289  * @priv:               Private data for usage by @calc_sets, usually a
++290  *                      pointer to driver/device specific data.
++	 */
+ 	struct irq_affinity msi_default_affd = {0};
+ 	int msix_vecs = -ENOSPC;
+ 	int msi_vecs = -ENOSPC;
+diff --git a/include/linux/blk_types.h b/include/linux/blk_types.h
+index 70254ae11769..00398d151629 100644
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@ -461,16 +461,28 @@ static inline bool blk_qc_t_valid(blk_qc_t cookie)
+ 	return cookie != BLK_QC_T_NONE && cookie != BLK_QC_T_EAGAIN;
+ }
+ 
++/*
++ * 把cookie的第31位(最高位)清空,然后向右移动16位,获得queue num
++ */
+ static inline unsigned int blk_qc_t_to_queue_num(blk_qc_t cookie)
+ {
++	/*
++	 * ~BLK_QC_T_INTERNAL的第31位是0, 剩下都是1
++	 */
+ 	return (cookie & ~BLK_QC_T_INTERNAL) >> BLK_QC_T_SHIFT;
+ }
+ 
++/*
++ * 获取cookie的低16位, 表示tag id
++ */
+ static inline unsigned int blk_qc_t_to_tag(blk_qc_t cookie)
+ {
+ 	return cookie & ((1u << BLK_QC_T_SHIFT) - 1);
+ }
+ 
++/*
++ * 如果cookie最高位31位设置了,就是INTERNAL
++ */
+ static inline bool blk_qc_t_is_internal(blk_qc_t cookie)
+ {
+ 	return (cookie & BLK_QC_T_INTERNAL) != 0;
 diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
-index 053ea4b51988..d02b968dc4b1 100644
+index 053ea4b51988..d0490c8c485d 100644
 --- a/include/linux/blkdev.h
 +++ b/include/linux/blkdev.h
-@@ -409,6 +409,10 @@ struct request_queue {
- 	unsigned int		queue_depth;
- 
- 	/* hw dispatch queues */
+@@ -106,6 +106,11 @@ typedef __u32 __bitwise req_flags_t;
+ /* The per-zone write lock is held for this request */
+ #define RQF_ZONE_WRITE_LOCKED	((__force req_flags_t)(1 << 19))
+ /* already slept for hybrid poll */
++/*
++ * 只在以下使用RQF_MQ_POLL_SLEPT:
++ *   - block/blk-mq.c|3486| <<blk_mq_poll_hybrid_sleep>> if (rq->rq_flags & RQF_MQ_POLL_SLEPT)
++ *   - block/blk-mq.c|3503| <<blk_mq_poll_hybrid_sleep>> rq->rq_flags |= RQF_MQ_POLL_SLEPT;
++ */
+ #define RQF_MQ_POLL_SLEPT	((__force req_flags_t)(1 << 20))
+ /* ->timeout has been called, don't expire again */
+ #define RQF_TIMED_OUT		((__force req_flags_t)(1 << 21))
+@@ -120,6 +125,13 @@ typedef __u32 __bitwise req_flags_t;
+ enum mq_rq_state {
+ 	MQ_RQ_IDLE		= 0,
+ 	MQ_RQ_IN_FLIGHT		= 1,
 +	/*
-+	 * 设置queue_hw_ctx的地方:
-+	 *   - block/blk-mq.c|2836| <<blk_mq_realloc_hw_ctxs>> q->queue_hw_ctx = new_hctxs;
++	 * 使用MQ_RQ_COMPLETE的地方:
++	 *   - block/blk-mq-debugfs.c|313| <<global>> [MQ_RQ_COMPLETE] = "complete",
++	 *   - block/blk-mq.c|580| <<__blk_mq_complete_request>> WRITE_ONCE(rq->state, MQ_RQ_COMPLETE);
++	 *   - block/blk-mq.c|3516| <<blk_mq_poll_hybrid_sleep>> if (blk_mq_rq_state(rq) == MQ_RQ_COMPLETE)
++	 *   - include/linux/blk-mq.h|481| <<blk_mq_request_completed>> return blk_mq_rq_state(rq) == MQ_RQ_COMPLETE;
 +	 */
- 	struct blk_mq_hw_ctx	**queue_hw_ctx;
- 	unsigned int		nr_hw_queues;
+ 	MQ_RQ_COMPLETE		= 2,
+ };
+ 
+@@ -211,6 +223,12 @@ struct request {
+ 	 * with blk_rq_sectors(rq), except that it never be zeroed
+ 	 * by completion.
+ 	 */
++	/*
++	 * 在以下使用stats_sectors:
++	 *   - block/blk-mq.c|319| <<blk_mq_rq_ctx_init>> rq->stats_sectors = 0;
++	 *   - block/blk-mq.c|673| <<blk_mq_start_request>> rq->stats_sectors = blk_rq_sectors(rq);
++	 *   - include/linux/blkdev.h|951| <<blk_rq_stats_sectors>> return rq->stats_sectors;
++	 */
+ 	unsigned short stats_sectors;
+ 
+ 	/*
+@@ -475,9 +493,41 @@ struct request_queue {
+ 	unsigned int		dma_alignment;
+ 
+ 	unsigned int		rq_timeout;
++	/*
++	 * 设置poll_nsec的地方:
++	 *   - block/blk-mq.c|2957| <<blk_mq_init_allocated_queue>> q->poll_nsec = BLK_MQ_POLL_CLASSIC;
++	 *   - block/blk-sysfs.c|384| <<queue_poll_dely_store>> q->poll_nsec = BLK_MQ_POLL_CLASSIC;
++	 *   - block/blk-sysfs.c|386| <<queue_poll_delay_store>> q->poll_nsec = val * 1000;
++	 * 使用poll_nsec的地方:
++	 *   - block/blk-mq.c|3495| <<blk_mq_poll_hybrid_sleep>> if (q->poll_nsec > 0)
++	 *   - block/blk-mq.c|3496| <<blk_mq_poll_hybrid_sleep>> nsecs = q->poll_nsec;
++	 *   - block/blk-mq.c|3560| <<blk_mq_poll_hybrid>> if (q->poll_nsec == BLK_MQ_POLL_CLASSIC)
++	 *   - block/blk-sysfs.c|363| <<queue_poll_delay_show>> if (q->poll_nsec == BLK_MQ_POLL_CLASSIC)
++	 *   - block/blk-sysfs.c|366| <<queue_poll_delay_show>> val = q->poll_nsec / 1000;
++	 */
+ 	int			poll_nsec;
+ 
++	/*
++	 * 使用poll_cb的地方:
++	 *   - block/blk-mq.c|2912| <<blk_mq_init_allocated_queue>> q->poll_cb = blk_stat_alloc_callback(blk_mq_poll_stats_fn,
++	 *   - block/blk-mq.c|2915| <<blk_mq_init_allocated_queue>> if (!q->poll_cb)
++	 *   - block/blk-mq.c|2973| <<blk_mq_init_allocated_queue>> blk_stat_free_callback(q->poll_cb);
++	 *   - block/blk-mq.c|2974| <<blk_mq_init_allocated_queue>> q->poll_cb = NULL;
++	 *   - block/blk-mq.c|3398| <<blk_poll_stats_enable>> blk_stat_add_callback(q, q->poll_cb);
++	 *   - block/blk-mq.c|3413| <<blk_mq_poll_stats_start>> blk_stat_is_active(q->poll_cb))
++	 *   - block/blk-mq.c|3416| <<blk_mq_poll_stats_start>> blk_stat_activate_msecs(q->poll_cb, 100);
++	 *   - block/blk-sysfs.c|881| <<__blk_release_queue>> blk_stat_remove_callback(q, q->poll_cb);
++	 *   - block/blk-sysfs.c|882| <<__blk_release_queue>> blk_stat_free_callback(q->poll_cb);
++	 */
+ 	struct blk_stat_callback	*poll_cb;
++	/*
++	 * 使用poll_stat[]的地方:
++	 *   - block/blk-mq-debugfs.c|34| <<queue_poll_stat_show>> print_stat(m, &q->poll_stat[2 * bucket]);
++	 *   - block/blk-mq-debugfs.c|38| <<queue_poll_stat_show>> print_stat(m, &q->poll_stat[2 * bucket + 1]);
++	 *   - block/blk-mq.c|3432| <<blk_mq_poll_stats_fn>> q->poll_stat[bucket] = cb->stat[bucket];
++	 *   - block/blk-mq.c|3467| <<blk_mq_poll_nsecs>> if (q->poll_stat[bucket].nr_samples)
++	 *   - block/blk-mq.c|3468| <<blk_mq_poll_nsecs>> ret = (q->poll_stat[bucket].mean + 1) / 2;
++	 */
+ 	struct blk_rq_stat	poll_stat[BLK_MQ_POLL_STATS_BKTS];
+ 
+ 	struct timer_list	timeout;
+@@ -604,7 +654,21 @@ struct request_queue {
+ #define QUEUE_FLAG_WC		17	/* Write back caching */
+ #define QUEUE_FLAG_FUA		18	/* device supports FUA writes */
+ #define QUEUE_FLAG_DAX		19	/* device supports DAX */
++/*
++ * 在以下使用QUEUE_FLAG_STATS:
++ *   - block/blk-mq.c|671| <<blk_mq_start_request>> if (test_bit(QUEUE_FLAG_STATS, &q->queue_flags)) {
++ *   - block/blk-stat.c|308| <<blk_stat_add_callback>> blk_queue_flag_set(QUEUE_FLAG_STATS, q);
++ *   - block/blk-stat.c|323| <<blk_stat_remove_callback>> blk_queue_flag_clear(QUEUE_FLAG_STATS, q);
++ *   - block/blk-stat.c|364| <<blk_stat_enable_accounting>> blk_queue_flag_set(QUEUE_FLAG_STATS, q);
++ */
+ #define QUEUE_FLAG_STATS	20	/* track IO start and completion times */
++/*
++ * 在以下使用QUEUE_FLAG_POLL_STATS:
++ *   - block/blk-mq.c|3395| <<blk_poll_stats_enable>> if (test_bit(QUEUE_FLAG_POLL_STATS, &q->queue_flags) ||
++ *   - block/blk-mq.c|3396| <<blk_poll_stats_enable>> blk_queue_flag_test_and_set(QUEUE_FLAG_POLL_STATS, q))
++ *   - block/blk-mq.c|3412| <<blk_mq_poll_stats_start>> if (!test_bit(QUEUE_FLAG_POLL_STATS, &q->queue_flags) ||
++ *   - block/blk-sysfs.c|884| <<__blk_release_queue>> if (test_bit(QUEUE_FLAG_POLL_STATS, &q->queue_flags))
++ */
+ #define QUEUE_FLAG_POLL_STATS	21	/* collecting stats for hybrid polling */
+ #define QUEUE_FLAG_REGISTERED	22	/* queue has been registered to a disk */
+ #define QUEUE_FLAG_SCSI_PASSTHROUGH 23	/* queue supports SCSI commands */
+@@ -948,6 +1012,16 @@ static inline unsigned int blk_rq_cur_sectors(const struct request *rq)
+ 
+ static inline unsigned int blk_rq_stats_sectors(const struct request *rq)
+ {
++	/*
++	 * rq sectors used for blk stats. It has the same value
++	 * with blk_rq_sectors(rq), except that it never be zeroed
++	 * by completion.
++	 *
++	 * 在以下使用stats_sectors:
++	 *   - block/blk-mq.c|319| <<blk_mq_rq_ctx_init>> rq->stats_sectors = 0;
++	 *   - block/blk-mq.c|673| <<blk_mq_start_request>> rq->stats_sectors = blk_rq_sectors(rq);
++	 *   - include/linux/blkdev.h|951| <<blk_rq_stats_sectors>> return rq->stats_sectors;
++	 */
+ 	return rq->stats_sectors;
+ }
  
 -- 
 2.17.1

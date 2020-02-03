@@ -15,4 +15,66 @@ ext4_direct_IO_write()
 
 cookie一直通过submit_bio()返回, 然后通过blk_poll()去poll()查看IO是否完成.
 
+-------------------------------------------------------
+
+根据blk_mq_map_queue(), 只有REQ_HIPRI的才会被map到poll的queue.
+
+102 static inline struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *q,
+103                                                      unsigned int flags,
+104                                                      struct blk_mq_ctx *ctx)
+105 {                                          
+106         enum hctx_type type = HCTX_TYPE_DEFAULT;
+107 
+108         /*
+109          * The caller ensure that if REQ_HIPRI, poll must be enabled.
+110          */
+111         if (flags & REQ_HIPRI)
+112                 type = HCTX_TYPE_POLL;
+113         else if ((flags & REQ_OP_MASK) == REQ_OP_READ)
+114                 type = HCTX_TYPE_READ;
+115  
+116         return ctx->hctxs[type];
+117 }
+
+-------------------------------------------------------
+
+在blk_alloc_queue_stats()分配一个struct blk_queue_stats结构,
+初始化清空callback链表,设置stats->enable_accounting = false.
+
+blk_alloc_queue_node()
+ -> blk_alloc_queue_stats()
+
+
+在poll的时候把struct blk_stat_callback链接入q->stats->callbacks链表
+设置blk_queue_flag_set(QUEUE_FLAG_STATS, q)
+
+blk_poll()
+ -> blk_mq_poll_hybrid()
+     -> blk_mq_poll_hybrid_sleep()
+         -> blk_mq_poll_nsecs()
+             -> blk_poll_stats_enable()
+                 -> blk_stat_add_callback()
+
+
+在end request的时候, 会调用blk_stat_add().
+核心思想是找到request的request_queue->stats,遍历其callback链表,
+对于链表上的每一个struct blk_stat_callback, 调用cb->bucket_fn()选取bucket,
+然后把参数的now汇入对应bucket的struct blk_rq_stat
+
+
+在end request的时候, 还会触发timer,
+
+__blk_mq_end_request()
+ -> blk_mq_poll_stats_start()
+     -> blk_stat_activate_msecs()
+         -> mod_timer(&cb->timer, jiffies + msecs_to_jiffies(msecs));
+
+
+timer最终触发blk_stat_timer_fn()->blk_mq_poll_stats_fn().
+blk_mq_poll_stats_fn()的核心思想是把每个bucket的
+q->poll_stat[bucket] = cb->stat[bucket];
+
+
+在poll的时候会根据这些stat决定要先在hybrid的时候sleep多久!
+
 slides: I/O Latency Optimization with Polling
