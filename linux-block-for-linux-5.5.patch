@@ -1,36 +1,39 @@
-From 9a8138bc8f934c6d01e4906931f50a4f5cb8ba3b Mon Sep 17 00:00:00 2001
+From 387ae4f285c619d313b6c045caf13fdb64538183 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Mon, 3 Feb 2020 11:27:43 -0800
+Date: Tue, 4 Feb 2020 10:31:27 -0800
 Subject: [PATCH 1/1] linux block for linux-5.5
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
  block/blk-core.c          |  12 ++
- block/blk-mq-cpumap.c     |  28 ++++
+ block/blk-flush.c         | 226 +++++++++++++++++++++++++
+ block/blk-mq-cpumap.c     |  28 +++
  block/blk-mq-pci.c        |  32 ++++
  block/blk-mq-rdma.c       |   5 +
  block/blk-mq-sysfs.c      |  19 +++
  block/blk-mq-tag.c        |  33 ++++
  block/blk-mq-tag.h        |  53 ++++++
  block/blk-mq-virtio.c     |  31 ++++
- block/blk-mq.c            | 339 ++++++++++++++++++++++++++++++++++++++
+ block/blk-mq.c            | 347 ++++++++++++++++++++++++++++++++++++++
  block/blk-mq.h            |  87 ++++++++++
+ block/blk-settings.c      |  16 ++
  block/blk-softirq.c       |  39 +++++
- block/blk-stat.c          | 275 +++++++++++++++++++++++++++++++
+ block/blk-stat.c          | 275 ++++++++++++++++++++++++++++++
  block/blk-stat.h          |  27 +++
  block/blk-sysfs.c         |  19 +++
+ block/blk.h               |   6 +
  drivers/nvme/host/pci.c   |  45 +++++
  drivers/pci/msi.c         |  14 ++
  fs/direct-io.c            |  15 ++
  fs/ext4/file.c            |   5 +
- fs/iomap/direct-io.c      |  28 ++++
+ fs/iomap/direct-io.c      |  28 +++
  include/linux/bio.h       |   6 +
- include/linux/blk-mq.h    |  65 ++++++++
+ include/linux/blk-mq.h    |  65 +++++++
  include/linux/blk_types.h |  22 +++
- include/linux/blkdev.h    |  88 ++++++++++
+ include/linux/blkdev.h    | 117 +++++++++++++
  include/linux/fs.h        |  32 ++++
  include/uapi/linux/fs.h   |  11 ++
- 25 files changed, 1330 insertions(+)
+ 28 files changed, 1615 insertions(+)
 
 diff --git a/block/blk-core.c b/block/blk-core.c
 index 089e890ab208..07b4f52d414a 100644
@@ -55,6 +58,366 @@ index 089e890ab208..07b4f52d414a 100644
  struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id)
  {
  	struct request_queue *q;
+diff --git a/block/blk-flush.c b/block/blk-flush.c
+index 3f977c517960..522908b5c74e 100644
+--- a/block/blk-flush.c
++++ b/block/blk-flush.c
+@@ -76,13 +76,72 @@
+ #include "blk-mq-tag.h"
+ #include "blk-mq-sched.h"
+ 
++/*
++ * 硬盘在控制器上的一块内存芯片,其类型一般以SDRAM为主,具有极快的存取速度,
++ * 它是硬盘内部存储和外界接口之间的缓冲器.由于硬盘的内部数据传输速度和外界
++ * 介面传输速度不同,缓存在其中起到一个缓冲的作用.缓存的大小与速度是直接关
++ * 系到硬盘的传输速度的重要因素,能够大幅度地提高硬盘整体性能.
++ *
++ * 如果硬盘的cache启用了,那么很有可能写入的数据是写到了硬盘的cache中,而没
++ * 有真正写到磁盘介质上.
++ *
++ * 在linux下,查看磁盘cache是否开启可通过hdparm命令:
++ *
++ * #hdparm -W /dev/sdx    //是否开启cache，1为enable
++ * #hdparm -W 0 /dev/sdx  //关闭cache
++ * #hdparm -W 1 /dev/sdx  //enable cache
++ *
++ * REQ_FUA     : forced unit access,绕过磁盘cache,直接把数据写到磁盘介质中.
++ * REQ_PREFLUSH: request for cache flush, 表示把磁盘cache中的data刷新到磁盘介质中,防止掉电丢失
++ *
++ * blk_insert_flush()是非常重要的入口!
++ *
++ *
++ * 部分调用blk_queue_write_cache()的例子:
++ *   - drivers/block/loop.c|1007| <<loop_set_fd>> blk_queue_write_cache(lo->lo_queue, true, false);
++ *   - drivers/block/nbd.c|1136| <<nbd_parse_flags>> blk_queue_write_cache(nbd->disk->queue, true, true);
++ *   - drivers/block/nbd.c|1138| <<nbd_parse_flags>> blk_queue_write_cache(nbd->disk->queue, true, false);
++ *   - drivers/block/nbd.c|1141| <<nbd_parse_flags>> blk_queue_write_cache(nbd->disk->queue, false, false);
++ *   - drivers/block/null_blk_main.c|1742| <<null_add_dev>> blk_queue_write_cache(nullb->q, true, true);
++ *   - rivers/block/virtio_blk.c|609| <<virtblk_update_cache_mode>> blk_queue_write_cache(vblk->disk->queue, writeback, false);
++ *   - drivers/block/xen-blkfront.c|1014| <<xlvbd_flush>> blk_queue_write_cache(info->rq, info->feature_flush ? true : false,
++ *   - drivers/ide/ide-disk.c|554| <<update_flush>> blk_queue_write_cache(drive->queue, wc, false);
++ *   - drivers/md/dm-table.c|1910| <<dm_table_set_restrictions>> blk_queue_write_cache(q, wc, fua);
++ *   - drivers/md/md.c|5506| <<md_alloc>> blk_queue_write_cache(mddev->queue, true, true);
++ *   - drivers/nvme/host/core.c|2204| <<nvme_set_queue_limits>> blk_queue_write_cache(q, vwc, vwc);
++ *   - drivers/nvme/host/multipath.c|393| <<nvme_mpath_alloc_disk>> blk_queue_write_cache(q, vwc, vwc);
++ *   - drivers/scsi/sd.c|152| <<sd_set_flush_flag>> blk_queue_write_cache(sdkp->disk->queue, wc, fua);
++ */
++
++/*
++ * 冲刷的过程中request_queue为什么要使用双缓冲队列来存放fs_request?
++ *
++ * 双缓冲队列可以做到只执行一次冲刷请求就可以完成多个fs_request的冲刷要求.队列自
++ * 带的冲刷request在执行的过程中,blk_insert_flush()可以被调用多次,来自上层的
++ * fs_request被添加到pending1队列,等待冲刷request的下一次执行,当冲刷requst可以再
++ * 次被执行时,pending1队列不再接收新的fs_request(fs_request被加入到pending2队列),
++ * 冲刷request执行完毕后,pending1队列所有的fs_request的PREFLUSH/POSTFLUSH执行完毕.
++ */
++
+ /* PREFLUSH/FUA sequences */
+ enum {
++	/*
++	 * 在以下使用REQ_FSEQ_PREFLUSH:
++	 *   - block/blk-flush.c|117| <<global>> REQ_FSEQ_ACTIONS = REQ_FSEQ_PREFLUSH | REQ_FSEQ_DATA |
++	 *   - block/blk-flush.c|143| <<blk_flush_policy>> policy |= REQ_FSEQ_PREFLUSH;
++	 *   - block/blk-flush.c|244| <<blk_flush_complete_seq>> case REQ_FSEQ_PREFLUSH:
++	 *   - block/blk-flush.c|323| <<flush_end_io>> BUG_ON(seq != REQ_FSEQ_PREFLUSH && seq != REQ_FSEQ_POSTFLUSH);
++	 *   - block/blk-flush.c|486| <<blk_insert_flush>> !(policy & (REQ_FSEQ_PREFLUSH | REQ_FSEQ_POSTFLUSH))) {
++	 */
+ 	REQ_FSEQ_PREFLUSH	= (1 << 0), /* pre-flushing in progress */
+ 	REQ_FSEQ_DATA		= (1 << 1), /* data write in progress */
+ 	REQ_FSEQ_POSTFLUSH	= (1 << 2), /* post-flushing in progress */
+ 	REQ_FSEQ_DONE		= (1 << 3),
+ 
++	/*
++	 * 在以下使用REQ_FSEQ_ACTIONS:
++	 *   - block/blk-flush.c|511| <<blk_insert_flush>> blk_flush_complete_seq(rq, fq, REQ_FSEQ_ACTIONS & ~policy, 0);
++	 */
+ 	REQ_FSEQ_ACTIONS	= REQ_FSEQ_PREFLUSH | REQ_FSEQ_DATA |
+ 				  REQ_FSEQ_POSTFLUSH,
+ 
+@@ -96,8 +155,24 @@ enum {
+ static void blk_kick_flush(struct request_queue *q,
+ 			   struct blk_flush_queue *fq, unsigned int flags);
+ 
++/*
++ * called by:
++ *   - block/blk-flush.c|377| <<blk_insert_flush>> unsigned int policy = blk_flush_policy(fflags, rq);
++ *
++ * 根据情况把REQ_FSEQ_DATA,REQ_FSEQ_PREFLUSH和REQ_FSEQ_POSTFLUSH返回到返回值中
++ * 这些可以表明flush需要做的步骤(包含3步)
++ *  - REQ_FSEQ_PREFLUSH(在数据请求以前冲刷磁盘缓存)
++ *  - REQ_FSEQ_DATA(写入数据请求)
++ *  - REQ_FSEQ_POSTFLUSH(在数据请求之后冲刷磁盘缓存)
++ * 如果磁盘不支持FUA,那么可以使用REQ_FSEQ_POSTFLUSH代替
++ * 假定我们分析的场景中,磁盘不支持FUA,则最终我们的冲刷策略为3步都做(policy=111).
++ */
+ static unsigned int blk_flush_policy(unsigned long fflags, struct request *rq)
+ {
++	/*
++	 * 因为blk_flush_policy()只被blk_insert_flush()调用
++	 * 所以参数的fflags来自q->queue_flags
++	 */
+ 	unsigned int policy = 0;
+ 
+ 	if (blk_rq_sectors(rq))
+@@ -106,6 +181,9 @@ static unsigned int blk_flush_policy(unsigned long fflags, struct request *rq)
+ 	if (fflags & (1UL << QUEUE_FLAG_WC)) {
+ 		if (rq->cmd_flags & REQ_PREFLUSH)
+ 			policy |= REQ_FSEQ_PREFLUSH;
++		/*
++		 * 如果磁盘不支持FUA,那么可以使用REQ_FSEQ_POSTFLUSH代替
++		 */
+ 		if (!(fflags & (1UL << QUEUE_FLAG_FUA)) &&
+ 		    (rq->cmd_flags & REQ_FUA))
+ 			policy |= REQ_FSEQ_POSTFLUSH;
+@@ -113,11 +191,20 @@ static unsigned int blk_flush_policy(unsigned long fflags, struct request *rq)
+ 	return policy;
+ }
+ 
++/*
++ * called by:
++ *   - block/blk-flush.c|184| <<blk_flush_complete_seq>> seq = blk_flush_cur_seq(rq);
++ *   - block/blk-flush.c|262| <<flush_end_io>> unsigned int seq = blk_flush_cur_seq(rq);
++ */
+ static unsigned int blk_flush_cur_seq(struct request *rq)
+ {
+ 	return 1 << ffz(rq->flush.seq);
+ }
+ 
++/*
++ * called by:
++ *   - block/blk-flush.c|211| <<blk_flush_complete_seq>> blk_flush_restore_request(rq);
++ */
+ static void blk_flush_restore_request(struct request *rq)
+ {
+ 	/*
+@@ -132,11 +219,20 @@ static void blk_flush_restore_request(struct request *rq)
+ 	rq->end_io = rq->flush.saved_end_io;
+ }
+ 
++/*
++ * called by:
++ *   - block/blk-flush.c|199| <<blk_flush_complete_seq>> blk_flush_queue_rq(rq, true);
++ *   - block/blk-flush.c|341| <<blk_kick_flush>> blk_flush_queue_rq(flush_rq, false);
++ */
+ static void blk_flush_queue_rq(struct request *rq, bool add_front)
+ {
+ 	blk_mq_add_to_requeue_list(rq, add_front, true);
+ }
+ 
++/*
++ * called by:
++ *   - block/blk-flush.c|231| <<flush_end_io>> blk_account_io_flush(flush_rq);
++ */
+ static void blk_account_io_flush(struct request *rq)
+ {
+ 	struct hd_struct *part = &rq->rq_disk->part0;
+@@ -164,6 +260,12 @@ static void blk_account_io_flush(struct request *rq)
+  * RETURNS:
+  * %true if requests were added to the dispatch queue, %false otherwise.
+  */
++/*
++ * called by:
++ *   - block/blk-flush.c|265| <<flush_end_io>> blk_flush_complete_seq(rq, fq, seq, error);
++ *   - block/blk-flush.c|366| <<mq_flush_data_end_io>> blk_flush_complete_seq(rq, fq, REQ_FSEQ_DATA, error);
++ *   - block/blk-flush.c|444| <<blk_insert_flush>> blk_flush_complete_seq(rq, fq, REQ_FSEQ_ACTIONS & ~policy, 0);
++ */
+ static void blk_flush_complete_seq(struct request *rq,
+ 				   struct blk_flush_queue *fq,
+ 				   unsigned int seq, blk_status_t error)
+@@ -215,6 +317,10 @@ static void blk_flush_complete_seq(struct request *rq,
+ 	blk_kick_flush(q, fq, cmd_flags);
+ }
+ 
++/*
++ * 在以下使用flush_end_io():
++ *   - block/blk-flush.c|339| <<blk_kick_flush>> flush_rq->end_io = flush_end_io;
++ */
+ static void flush_end_io(struct request *flush_rq, blk_status_t error)
+ {
+ 	struct request_queue *q = flush_rq->q;
+@@ -337,6 +443,31 @@ static void blk_kick_flush(struct request_queue *q, struct blk_flush_queue *fq,
+ 	blk_flush_queue_rq(flush_rq, false);
+ }
+ 
++/*
++ * [0] mq_flush_data_end_io
++ * [0] blk_mq_complete_request
++ * [0] virtblk_done
++ * [0] vring_interrupt
++ * [0] __handle_irq_event_percpu
++ * [0] handle_irq_event_percpu
++ * [0] handle_irq_event
++ * [0] handle_edge_irq
++ * [0] do_IRQ
++ * [0] common_interrupt
++ *
++ * [0] mq_flush_data_end_io
++ * [0] blk_mq_complete_request
++ * [0] nvme_irq
++ * [0] __handle_irq_event_percpu
++ * [0] handle_irq_event_percpu
++ * [0] handle_irq_event
++ * [0] handle_edge_irq
++ * [0] do_IRQ
++ * [0] common_interrupt
++ *
++ * 在以下使用mq_flush_data_end_io():
++ *   - block/blk-flush.c|437| <<blk_insert_flush>> rq->end_io = mq_flush_data_end_io;
++ */
+ static void mq_flush_data_end_io(struct request *rq, blk_status_t error)
+ {
+ 	struct request_queue *q = rq->q;
+@@ -370,13 +501,54 @@ static void mq_flush_data_end_io(struct request *rq, blk_status_t error)
+  * @rq is being submitted.  Analyze what needs to be done and put it on the
+  * right queue.
+  */
++/*
++ * [0] blk_insert_flush
++ * [0] blk_mq_make_request
++ * [0] generic_make_request
++ * [0] submit_bio
++ * [0] submit_bh_wbc.isra
++ * [0] __sync_dirty_buffer
++ * [0] ext4_commit_super
++ * [0] ext4_mark_recovery_complete.isra
++ * [0] ext4_fill_super
++ * [0] mount_bdev
++ * [0] legacy_get_tree
++ * [0] vfs_get_tree
++ * [0] do_mount
++ * [0] do_mount_root
++ * [0] mount_block_root
++ * [0] mount_root
++ * [0] prepare_namespace
++ * [0] kernel_init_freeable
++ * [0] kernel_init
++ * [0] ret_from_fork
++ *
++ * called by:
++ *   - block/blk-mq-sched.c|388| <<blk_mq_sched_insert_request>> blk_insert_flush(rq);
++ *   - block/blk-mq.c|2011| <<blk_mq_make_request>> blk_insert_flush(rq);
++ */
+ void blk_insert_flush(struct request *rq)
+ {
+ 	struct request_queue *q = rq->q;
+ 	unsigned long fflags = q->queue_flags;	/* may change, cache */
++	/*
++	 * 根据情况把REQ_FSEQ_DATA,REQ_FSEQ_PREFLUSH和REQ_FSEQ_POSTFLUSH返回到返回值中
++	 * 这些可以表明flush需要做的步骤(包含3步) ---> 也就是说,policy的3个bit表明要做哪些步骤!!!!
++	 *  - REQ_FSEQ_PREFLUSH(在数据请求以前冲刷磁盘缓存)
++	 *  - REQ_FSEQ_DATA(写入数据请求)
++	 *  - REQ_FSEQ_POSTFLUSH(在数据请求之后冲刷磁盘缓存)
++	 * 如果磁盘不支持FUA,那么可以使用REQ_FSEQ_POSTFLUSH代替
++	 * 假定我们分析的场景中,磁盘不支持FUA,则最终我们的冲刷策略为3步都做(policy=111).
++	 */
+ 	unsigned int policy = blk_flush_policy(fflags, rq);
++	/* 根据rq获取对应的hctx的blk_mq_hw_ctx->fq */
+ 	struct blk_flush_queue *fq = blk_get_flush_queue(q, rq->mq_ctx);
+ 
++	/*
++	 * REQ_FUA     : forced unit access,绕过磁盘cache,直接把数据写到磁盘介质中.
++	 * REQ_PREFLUSH: request for cache flush, 表示把磁盘cache中的data刷新到磁盘介质中,防止掉电丢失
++	 */
++
+ 	/*
+ 	 * @policy now records what operations need to be done.  Adjust
+ 	 * REQ_PREFLUSH and FUA for the driver.
+@@ -398,6 +570,10 @@ void blk_insert_flush(struct request *rq)
+ 	 * advertise a write-back cache.  In this case, simply
+ 	 * complete the request.
+ 	 */
++	/*
++	 * 正如上面注释,policy的3个bit表明要做哪些步骤!!!!
++	 * 没设置任何bit说明什么也不做
++	 */
+ 	if (!policy) {
+ 		blk_mq_end_request(rq, 0);
+ 		return;
+@@ -422,12 +598,29 @@ void blk_insert_flush(struct request *rq)
+ 	 */
+ 	memset(&rq->flush, 0, sizeof(rq->flush));
+ 	INIT_LIST_HEAD(&rq->flush.list);
++	/*
++	 * 在以下使用RQF_FLUSH_SEQ:
++	 *   - block/blk-core.c|244| <<req_bio_endio>> if (bio->bi_iter.bi_size == 0 && !(rq->rq_flags & RQF_FLUSH_SEQ))
++	 *   - block/blk-core.c|1347| <<blk_account_io_done>> !(req->rq_flags & RQF_FLUSH_SEQ)) {
++	 *   - block/blk-flush.c|205| <<blk_flush_restore_request>> rq->rq_flags &= ~RQF_FLUSH_SEQ;
++	 *   - block/blk-flush.c|426| <<blk_kick_flush>> flush_rq->rq_flags |= RQF_FLUSH_SEQ;
++	 *   - block/blk-flush.c|528| <<blk_insert_flush>> rq->rq_flags |= RQF_FLUSH_SEQ;
++	 *   - block/blk-mq-sched.c|365| <<blk_mq_sched_bypass_insert>> if (rq->rq_flags & RQF_FLUSH_SEQ) {
++	 *   - block/blk-mq-sched.c|387| <<blk_mq_sched_insert_request>> if (!(rq->rq_flags & RQF_FLUSH_SEQ) && op_is_flush(rq->cmd_flags)) {
++	 *   - include/linux/blkdev.h|120| <<RQF_NOMERGE_FLAGS>> (RQF_STARTED | RQF_SOFTBARRIER | RQF_FLUSH_SEQ | RQF_SPECIAL_PAYLOAD)
++	 */
+ 	rq->rq_flags |= RQF_FLUSH_SEQ;
+ 	rq->flush.saved_end_io = rq->end_io; /* Usually NULL */
+ 
+ 	rq->end_io = mq_flush_data_end_io;
+ 
+ 	spin_lock_irq(&fq->mq_flush_lock);
++	/*
++	 * 参数REQ_FSEQ_ACTIONS & ~policy表示可以跳过的步骤!!!
++	 * blk_insert_flush()初始化request的完成函数为flush_data_end_io()后,
++	 * 调用REQ_FSEQ_ACTIONS & ~policy把可以跳过的步骤对应的位置填1,
++	 * 调用blk_flush_complete_seq()开始冲刷过程.
++	 */
+ 	blk_flush_complete_seq(rq, fq, REQ_FSEQ_ACTIONS & ~policy, 0);
+ 	spin_unlock_irq(&fq->mq_flush_lock);
+ }
+@@ -443,6 +636,31 @@ void blk_insert_flush(struct request *rq)
+  *    room for storing the error offset in case of a flush error, if they
+  *    wish to.
+  */
++/*
++ * called by:
++ *   - drivers/md/dm-integrity.c|2551| <<bitmap_flush_work>> blkdev_issue_flush(ic->dev->bdev, GFP_NOIO, NULL);
++ *   - drivers/md/dm-zoned-metadata.c|663| <<dmz_write_sb>> ret = blkdev_issue_flush(zmd->dev->bdev, GFP_NOIO, NULL);
++ *   - drivers/md/dm-zoned-metadata.c|705| <<dmz_write_dirty_mblocks>> ret = blkdev_issue_flush(zmd->dev->bdev, GFP_NOIO, NULL);
++ *   - drivers/md/dm-zoned-metadata.c|774| <<dmz_flush_metadata>> ret = blkdev_issue_flush(zmd->dev->bdev, GFP_NOIO, NULL);
++ *   - drivers/md/raid5-ppl.c|1040| <<ppl_recover>> ret = blkdev_issue_flush(rdev->bdev, GFP_KERNEL, NULL);
++ *   - drivers/nvme/target/io-cmd-bdev.c|229| <<nvmet_bdev_flush>> if (blkdev_issue_flush(req->ns->bdev, GFP_KERNEL, NULL))
++ *   - fs/block_dev.c|675| <<blkdev_fsync>> error = blkdev_issue_flush(bdev, GFP_KERNEL, NULL);
++ *   - fs/ext4/fsync.c|179| <<ext4_sync_file>> err = blkdev_issue_flush(inode->i_sb->s_bdev, GFP_KERNEL, NULL);
++ *   - fs/ext4/ialloc.c|1422| <<ext4_init_inode_table>> blkdev_issue_flush(sb->s_bdev, GFP_NOFS, NULL);
++ *   - fs/ext4/super.c|5170| <<ext4_sync_fs>> err = blkdev_issue_flush(sb->s_bdev, GFP_KERNEL, NULL);
++ *   - fs/fat/file.c|198| <<fat_file_fsync>> return blkdev_issue_flush(inode->i_sb->s_bdev, GFP_KERNEL, NULL);
++ *   - fs/hfsplus/inode.c|343| <<hfsplus_file_fsync>> blkdev_issue_flush(inode->i_sb->s_bdev, GFP_KERNEL, NULL);
++ *   - fs/hfsplus/super.c|242| <<hfsplus_sync_fs>> blkdev_issue_flush(sb->s_bdev, GFP_KERNEL, NULL);
++ *   - fs/jbd2/checkpoint.c|417| <<jbd2_cleanup_journal_tail>> blkdev_issue_flush(journal->j_fs_dev, GFP_NOFS, NULL);
++ *   - fs/jbd2/commit.c|778| <<jbd2_journal_commit_transaction>> blkdev_issue_flush(journal->j_fs_dev, GFP_NOFS, NULL);
++ *   - fs/jbd2/commit.c|885| <<jbd2_journal_commit_transaction>> blkdev_issue_flush(journal->j_dev, GFP_NOFS, NULL);
++ *   - fs/jbd2/recovery.c|289| <<jbd2_journal_recover>> err2 = blkdev_issue_flush(journal->j_fs_dev, GFP_KERNEL, NULL);
++ *   - fs/libfs.c|1044| <<generic_file_fsync>> return blkdev_issue_flush(inode->i_sb->s_bdev, GFP_KERNEL, NULL);
++ *   - fs/nilfs2/the_nilfs.h|378| <<nilfs_flush_device>> err = blkdev_issue_flush(nilfs->ns_bdev, GFP_KERNEL, NULL);
++ *   - fs/ocfs2/file.c|197| <<ocfs2_sync_file>> ret = blkdev_issue_flush(inode->i_sb->s_bdev, GFP_KERNEL, NULL);
++ *   - fs/reiserfs/file.c|162| <<reiserfs_sync_file>> blkdev_issue_flush(inode->i_sb->s_bdev, GFP_KERNEL, NULL);
++ *   - fs/xfs/xfs_super.c|339| <<xfs_blkdev_issue_flush>> blkdev_issue_flush(buftarg->bt_bdev, GFP_NOFS, NULL);
++ */
+ int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
+ 		sector_t *error_sector)
+ {
+@@ -485,6 +703,10 @@ int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
+ }
+ EXPORT_SYMBOL(blkdev_issue_flush);
+ 
++/*
++ * called by:
++ *   - block/blk-mq.c|2415| <<blk_mq_alloc_hctx>> hctx->fq = blk_alloc_flush_queue(q, hctx->numa_node, set->cmd_size,
++ */
+ struct blk_flush_queue *blk_alloc_flush_queue(struct request_queue *q,
+ 		int node, int cmd_size, gfp_t flags)
+ {
+@@ -517,6 +739,10 @@ struct blk_flush_queue *blk_alloc_flush_queue(struct request_queue *q,
+ 	return NULL;
+ }
+ 
++/*
++ * called by:
++ *   - block/blk-mq-sysfs.c|43| <<blk_mq_hw_sysfs_release>> blk_free_flush_queue(hctx->fq);
++ */
+ void blk_free_flush_queue(struct blk_flush_queue *fq)
+ {
+ 	/* bio based request queue hasn't flush queue */
 diff --git a/block/blk-mq-cpumap.c b/block/blk-mq-cpumap.c
 index 0157f2b3485a..5675db0eb4cf 100644
 --- a/block/blk-mq-cpumap.c
@@ -484,7 +847,7 @@ index 488341628256..16ece920ec49 100644
  		struct virtio_device *vdev, int first_vec)
  {
 diff --git a/block/blk-mq.c b/block/blk-mq.c
-index 323c9cb28066..436b3e384528 100644
+index 323c9cb28066..0dcc64dede5d 100644
 --- a/block/blk-mq.c
 +++ b/block/blk-mq.c
 @@ -43,13 +43,22 @@
@@ -594,7 +957,22 @@ index 323c9cb28066..436b3e384528 100644
  		rq->io_start_time_ns = ktime_get_ns();
  		rq->stats_sectors = blk_rq_sectors(rq);
  		rq->rq_flags |= RQF_STATS;
-@@ -2275,6 +2332,10 @@ static int blk_mq_hw_ctx_size(struct blk_mq_tag_set *tag_set)
+@@ -1629,6 +1686,14 @@ void __blk_mq_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
+  * Should only be used carefully, when the caller knows we want to
+  * bypass a potential IO scheduler on the target device.
+  */
++/*
++ * called by:
++ *   - block/blk-flush.c|518| <<blk_insert_flush>> blk_mq_request_bypass_insert(rq, false);
++ *   - block/blk-mq.c|787| <<blk_mq_requeue_work>> blk_mq_request_bypass_insert(rq, false);
++ *   - block/blk-mq.c|1884| <<__blk_mq_try_issue_directly>> blk_mq_request_bypass_insert(rq, run_queue);
++ *   - block/blk-mq.c|1900| <<blk_mq_try_issue_directly>> blk_mq_request_bypass_insert(rq, true);
++ *   - block/blk-mq.c|1934| <<blk_mq_try_issue_list_directly>> blk_mq_request_bypass_insert(rq,
++ */
+ void blk_mq_request_bypass_insert(struct request *rq, bool run_queue)
+ {
+ 	struct blk_mq_hw_ctx *hctx = rq->mq_hctx;
+@@ -2275,6 +2340,10 @@ static int blk_mq_hw_ctx_size(struct blk_mq_tag_set *tag_set)
  	return hw_ctx_size;
  }
  
@@ -605,7 +983,7 @@ index 323c9cb28066..436b3e384528 100644
  static int blk_mq_init_hctx(struct request_queue *q,
  		struct blk_mq_tag_set *set,
  		struct blk_mq_hw_ctx *hctx, unsigned hctx_idx)
-@@ -2302,6 +2363,10 @@ static int blk_mq_init_hctx(struct request_queue *q,
+@@ -2302,6 +2371,10 @@ static int blk_mq_init_hctx(struct request_queue *q,
  	return -1;
  }
  
@@ -616,7 +994,7 @@ index 323c9cb28066..436b3e384528 100644
  static struct blk_mq_hw_ctx *
  blk_mq_alloc_hctx(struct request_queue *q, struct blk_mq_tag_set *set,
  		int node)
-@@ -2429,6 +2494,35 @@ static void blk_mq_free_map_and_requests(struct blk_mq_tag_set *set,
+@@ -2429,6 +2502,35 @@ static void blk_mq_free_map_and_requests(struct blk_mq_tag_set *set,
  	}
  }
  
@@ -652,7 +1030,7 @@ index 323c9cb28066..436b3e384528 100644
  static void blk_mq_map_swqueue(struct request_queue *q)
  {
  	unsigned int i, j, hctx_idx;
-@@ -2436,6 +2530,9 @@ static void blk_mq_map_swqueue(struct request_queue *q)
+@@ -2436,6 +2538,9 @@ static void blk_mq_map_swqueue(struct request_queue *q)
  	struct blk_mq_ctx *ctx;
  	struct blk_mq_tag_set *set = q->tag_set;
  
@@ -662,7 +1040,7 @@ index 323c9cb28066..436b3e384528 100644
  	queue_for_each_hw_ctx(q, hctx, i) {
  		cpumask_clear(hctx->cpumask);
  		hctx->nr_ctx = 0;
-@@ -2448,6 +2545,9 @@ static void blk_mq_map_swqueue(struct request_queue *q)
+@@ -2448,6 +2553,9 @@ static void blk_mq_map_swqueue(struct request_queue *q)
  	 * If the cpu isn't present, the cpu is mapped to first hctx.
  	 */
  	for_each_possible_cpu(i) {
@@ -672,7 +1050,7 @@ index 323c9cb28066..436b3e384528 100644
  		hctx_idx = set->map[HCTX_TYPE_DEFAULT].mq_map[i];
  		/* unmapped hw queue can be remapped after CPU topo changed */
  		if (!set->tags[hctx_idx] &&
-@@ -2470,6 +2570,9 @@ static void blk_mq_map_swqueue(struct request_queue *q)
+@@ -2470,6 +2578,9 @@ static void blk_mq_map_swqueue(struct request_queue *q)
  			}
  
  			hctx = blk_mq_map_queue_type(q, j, i);
@@ -682,7 +1060,7 @@ index 323c9cb28066..436b3e384528 100644
  			ctx->hctxs[j] = hctx;
  			/*
  			 * If the CPU is already set in the mask, then we've
-@@ -2535,6 +2638,11 @@ static void blk_mq_map_swqueue(struct request_queue *q)
+@@ -2535,6 +2646,11 @@ static void blk_mq_map_swqueue(struct request_queue *q)
   * Caller needs to ensure that we're either frozen/quiesced, or that
   * the queue isn't live yet.
   */
@@ -694,7 +1072,7 @@ index 323c9cb28066..436b3e384528 100644
  static void queue_set_hctx_shared(struct request_queue *q, bool shared)
  {
  	struct blk_mq_hw_ctx *hctx;
-@@ -2548,6 +2656,11 @@ static void queue_set_hctx_shared(struct request_queue *q, bool shared)
+@@ -2548,6 +2664,11 @@ static void queue_set_hctx_shared(struct request_queue *q, bool shared)
  	}
  }
  
@@ -706,7 +1084,7 @@ index 323c9cb28066..436b3e384528 100644
  static void blk_mq_update_tag_set_depth(struct blk_mq_tag_set *set,
  					bool shared)
  {
-@@ -2600,8 +2713,16 @@ static void blk_mq_add_queue_tag_set(struct blk_mq_tag_set *set,
+@@ -2600,8 +2721,16 @@ static void blk_mq_add_queue_tag_set(struct blk_mq_tag_set *set,
  }
  
  /* All allocations will be freed in release handler of q->mq_kobj */
@@ -723,7 +1101,7 @@ index 323c9cb28066..436b3e384528 100644
  	struct blk_mq_ctxs *ctxs;
  	int cpu;
  
-@@ -2656,6 +2777,33 @@ void blk_mq_release(struct request_queue *q)
+@@ -2656,6 +2785,33 @@ void blk_mq_release(struct request_queue *q)
  	blk_mq_sysfs_deinit(q);
  }
  
@@ -757,7 +1135,7 @@ index 323c9cb28066..436b3e384528 100644
  struct request_queue *blk_mq_init_queue(struct blk_mq_tag_set *set)
  {
  	struct request_queue *uninit_q, *q;
-@@ -2710,6 +2858,10 @@ struct request_queue *blk_mq_init_sq_queue(struct blk_mq_tag_set *set,
+@@ -2710,6 +2866,10 @@ struct request_queue *blk_mq_init_sq_queue(struct blk_mq_tag_set *set,
  }
  EXPORT_SYMBOL(blk_mq_init_sq_queue);
  
@@ -768,7 +1146,7 @@ index 323c9cb28066..436b3e384528 100644
  static struct blk_mq_hw_ctx *blk_mq_alloc_and_init_hctx(
  		struct blk_mq_tag_set *set, struct request_queue *q,
  		int hctx_idx, int node)
-@@ -2744,6 +2896,11 @@ static struct blk_mq_hw_ctx *blk_mq_alloc_and_init_hctx(
+@@ -2744,6 +2904,11 @@ static struct blk_mq_hw_ctx *blk_mq_alloc_and_init_hctx(
  	return NULL;
  }
  
@@ -780,7 +1158,7 @@ index 323c9cb28066..436b3e384528 100644
  static void blk_mq_realloc_hw_ctxs(struct blk_mq_tag_set *set,
  						struct request_queue *q)
  {
-@@ -2822,6 +2979,11 @@ static void blk_mq_realloc_hw_ctxs(struct blk_mq_tag_set *set,
+@@ -2822,6 +2987,11 @@ static void blk_mq_realloc_hw_ctxs(struct blk_mq_tag_set *set,
  	mutex_unlock(&q->sysfs_lock);
  }
  
@@ -792,7 +1170,7 @@ index 323c9cb28066..436b3e384528 100644
  struct request_queue *blk_mq_init_allocated_queue(struct blk_mq_tag_set *set,
  						  struct request_queue *q,
  						  bool elevator_init)
-@@ -2959,6 +3121,11 @@ static int blk_mq_alloc_rq_maps(struct blk_mq_tag_set *set)
+@@ -2959,6 +3129,11 @@ static int blk_mq_alloc_rq_maps(struct blk_mq_tag_set *set)
  	return 0;
  }
  
@@ -804,7 +1182,7 @@ index 323c9cb28066..436b3e384528 100644
  static int blk_mq_update_queue_map(struct blk_mq_tag_set *set)
  {
  	if (set->ops->map_queues && !is_kdump_kernel()) {
-@@ -2978,6 +3145,10 @@ static int blk_mq_update_queue_map(struct blk_mq_tag_set *set)
+@@ -2978,6 +3153,10 @@ static int blk_mq_update_queue_map(struct blk_mq_tag_set *set)
  		 * killing stale mapping since one CPU may not be mapped
  		 * to any hw queue.
  		 */
@@ -815,7 +1193,7 @@ index 323c9cb28066..436b3e384528 100644
  		for (i = 0; i < set->nr_maps; i++)
  			blk_mq_clear_mq_map(&set->map[i]);
  
-@@ -3069,6 +3240,13 @@ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
+@@ -3069,6 +3248,13 @@ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
  
  	ret = -ENOMEM;
  	for (i = 0; i < set->nr_maps; i++) {
@@ -829,7 +1207,7 @@ index 323c9cb28066..436b3e384528 100644
  		set->map[i].mq_map = kcalloc_node(nr_cpu_ids,
  						  sizeof(set->map[i].mq_map[0]),
  						  GFP_KERNEL, set->numa_node);
-@@ -3306,8 +3484,19 @@ void blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set, int nr_hw_queues)
+@@ -3306,8 +3492,19 @@ void blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set, int nr_hw_queues)
  EXPORT_SYMBOL_GPL(blk_mq_update_nr_hw_queues);
  
  /* Enable polling stats and return whether they were already enabled. */
@@ -849,7 +1227,7 @@ index 323c9cb28066..436b3e384528 100644
  	if (test_bit(QUEUE_FLAG_POLL_STATS, &q->queue_flags) ||
  	    blk_queue_flag_test_and_set(QUEUE_FLAG_POLL_STATS, q))
  		return true;
-@@ -3315,6 +3504,10 @@ static bool blk_poll_stats_enable(struct request_queue *q)
+@@ -3315,6 +3512,10 @@ static bool blk_poll_stats_enable(struct request_queue *q)
  	return false;
  }
  
@@ -860,7 +1238,7 @@ index 323c9cb28066..436b3e384528 100644
  static void blk_mq_poll_stats_start(struct request_queue *q)
  {
  	/*
-@@ -3328,6 +3521,12 @@ static void blk_mq_poll_stats_start(struct request_queue *q)
+@@ -3328,6 +3529,12 @@ static void blk_mq_poll_stats_start(struct request_queue *q)
  	blk_stat_activate_msecs(q->poll_cb, 100);
  }
  
@@ -873,7 +1251,7 @@ index 323c9cb28066..436b3e384528 100644
  static void blk_mq_poll_stats_fn(struct blk_stat_callback *cb)
  {
  	struct request_queue *q = cb->data;
-@@ -3339,6 +3538,12 @@ static void blk_mq_poll_stats_fn(struct blk_stat_callback *cb)
+@@ -3339,6 +3546,12 @@ static void blk_mq_poll_stats_fn(struct blk_stat_callback *cb)
  	}
  }
  
@@ -886,7 +1264,7 @@ index 323c9cb28066..436b3e384528 100644
  static unsigned long blk_mq_poll_nsecs(struct request_queue *q,
  				       struct blk_mq_hw_ctx *hctx,
  				       struct request *rq)
-@@ -3372,6 +3577,10 @@ static unsigned long blk_mq_poll_nsecs(struct request_queue *q,
+@@ -3372,6 +3585,10 @@ static unsigned long blk_mq_poll_nsecs(struct request_queue *q,
  	return ret;
  }
  
@@ -897,7 +1275,7 @@ index 323c9cb28066..436b3e384528 100644
  static bool blk_mq_poll_hybrid_sleep(struct request_queue *q,
  				     struct blk_mq_hw_ctx *hctx,
  				     struct request *rq)
-@@ -3381,6 +3590,13 @@ static bool blk_mq_poll_hybrid_sleep(struct request_queue *q,
+@@ -3381,6 +3598,13 @@ static bool blk_mq_poll_hybrid_sleep(struct request_queue *q,
  	unsigned int nsecs;
  	ktime_t kt;
  
@@ -911,7 +1289,7 @@ index 323c9cb28066..436b3e384528 100644
  	if (rq->rq_flags & RQF_MQ_POLL_SLEPT)
  		return false;
  
-@@ -3404,6 +3620,9 @@ static bool blk_mq_poll_hybrid_sleep(struct request_queue *q,
+@@ -3404,6 +3628,9 @@ static bool blk_mq_poll_hybrid_sleep(struct request_queue *q,
  	 * This will be replaced with the stats tracking code, using
  	 * 'avg_completion_time / 2' as the pre-sleep target.
  	 */
@@ -921,7 +1299,7 @@ index 323c9cb28066..436b3e384528 100644
  	kt = nsecs;
  
  	mode = HRTIMER_MODE_REL;
-@@ -3426,6 +3645,33 @@ static bool blk_mq_poll_hybrid_sleep(struct request_queue *q,
+@@ -3426,6 +3653,33 @@ static bool blk_mq_poll_hybrid_sleep(struct request_queue *q,
  	return true;
  }
  
@@ -955,7 +1333,7 @@ index 323c9cb28066..436b3e384528 100644
  static bool blk_mq_poll_hybrid(struct request_queue *q,
  			       struct blk_mq_hw_ctx *hctx, blk_qc_t cookie)
  {
-@@ -3463,6 +3709,87 @@ static bool blk_mq_poll_hybrid(struct request_queue *q,
+@@ -3463,6 +3717,87 @@ static bool blk_mq_poll_hybrid(struct request_queue *q,
   *    looping until at least one completion is found, unless the task is
   *    otherwise marked running (or we need to reschedule).
   */
@@ -1043,7 +1421,7 @@ index 323c9cb28066..436b3e384528 100644
  int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
  {
  	struct blk_mq_hw_ctx *hctx;
-@@ -3475,6 +3802,10 @@ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
+@@ -3475,6 +3810,10 @@ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
  	if (current->plug)
  		blk_flush_plug_list(current->plug, false);
  
@@ -1054,7 +1432,7 @@ index 323c9cb28066..436b3e384528 100644
  	hctx = q->queue_hw_ctx[blk_qc_t_to_queue_num(cookie)];
  
  	/*
-@@ -3495,6 +3826,9 @@ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
+@@ -3495,6 +3834,9 @@ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
  
  		hctx->poll_invoked++;
  
@@ -1064,7 +1442,7 @@ index 323c9cb28066..436b3e384528 100644
  		ret = q->mq_ops->poll(hctx);
  		if (ret > 0) {
  			hctx->poll_success++;
-@@ -3517,6 +3851,11 @@ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
+@@ -3517,6 +3859,11 @@ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
  }
  EXPORT_SYMBOL_GPL(blk_poll);
  
@@ -1212,6 +1590,33 @@ index eaaca8fc1c28..917b0aae5766 100644
  static inline void blk_mq_clear_mq_map(struct blk_mq_queue_map *qmap)
  {
  	int cpu;
+diff --git a/block/blk-settings.c b/block/blk-settings.c
+index c8eda2e7b91e..939cc14c9280 100644
+--- a/block/blk-settings.c
++++ b/block/blk-settings.c
+@@ -818,6 +818,22 @@ EXPORT_SYMBOL(blk_set_queue_depth);
+  *
+  * Tell the block layer about the write cache of @q.
+  */
++/*
++ * 部分调用blk_queue_write_cache()的例子:
++ *   - drivers/block/loop.c|1007| <<loop_set_fd>> blk_queue_write_cache(lo->lo_queue, true, false);
++ *   - drivers/block/nbd.c|1136| <<nbd_parse_flags>> blk_queue_write_cache(nbd->disk->queue, true, true);
++ *   - drivers/block/nbd.c|1138| <<nbd_parse_flags>> blk_queue_write_cache(nbd->disk->queue, true, false);
++ *   - drivers/block/nbd.c|1141| <<nbd_parse_flags>> blk_queue_write_cache(nbd->disk->queue, false, false);
++ *   - drivers/block/null_blk_main.c|1742| <<null_add_dev>> blk_queue_write_cache(nullb->q, true, true);
++ *   - rivers/block/virtio_blk.c|609| <<virtblk_update_cache_mode>> blk_queue_write_cache(vblk->disk->queue, writeback, false);
++ *   - drivers/block/xen-blkfront.c|1014| <<xlvbd_flush>> blk_queue_write_cache(info->rq, info->feature_flush ? true : false,
++ *   - drivers/ide/ide-disk.c|554| <<update_flush>> blk_queue_write_cache(drive->queue, wc, false);
++ *   - drivers/md/dm-table.c|1910| <<dm_table_set_restrictions>> blk_queue_write_cache(q, wc, fua);
++ *   - drivers/md/md.c|5506| <<md_alloc>> blk_queue_write_cache(mddev->queue, true, true);
++ *   - drivers/nvme/host/core.c|2204| <<nvme_set_queue_limits>> blk_queue_write_cache(q, vwc, vwc);
++ *   - drivers/nvme/host/multipath.c|393| <<nvme_mpath_alloc_disk>> blk_queue_write_cache(q, vwc, vwc);
++ *   - drivers/scsi/sd.c|152| <<sd_set_flush_flag>> blk_queue_write_cache(sdkp->disk->queue, wc, fua);
++ */
+ void blk_queue_write_cache(struct request_queue *q, bool wc, bool fua)
+ {
+ 	if (wc)
 diff --git a/block/blk-softirq.c b/block/blk-softirq.c
 index 6e7ec87d49fa..71a852ff1c86 100644
 --- a/block/blk-softirq.c
@@ -1818,6 +2223,23 @@ index fca9b158f4a0..231bb884efdb 100644
  static void __blk_release_queue(struct work_struct *work)
  {
  	struct request_queue *q = container_of(work, typeof(*q), release_work);
+diff --git a/block/blk.h b/block/blk.h
+index 0b8884353f6b..581c087a71e6 100644
+--- a/block/blk.h
++++ b/block/blk.h
+@@ -38,6 +38,12 @@ extern struct kmem_cache *blk_requestq_cachep;
+ extern struct kobj_type blk_queue_ktype;
+ extern struct ida blk_queue_ida;
+ 
++/*
++ * called by:
++ *   - block/blk-flush.c|301| <<flush_end_io>> struct blk_flush_queue *fq = blk_get_flush_queue(q, flush_rq->mq_ctx);
++ *   - block/blk-flush.c|427| <<mq_flush_data_end_io>> struct blk_flush_queue *fq = blk_get_flush_queue(q, ctx);
++ *   - block/blk-flush.c|464| <<blk_insert_flush>> struct blk_flush_queue *fq = blk_get_flush_queue(q, rq->mq_ctx);
++ */
+ static inline struct blk_flush_queue *
+ blk_get_flush_queue(struct request_queue *q, struct blk_mq_ctx *ctx)
+ {
 diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
 index 365a2ddbeaa7..4009ac63668a 100644
 --- a/drivers/nvme/host/pci.c
@@ -2228,10 +2650,28 @@ index 70254ae11769..c558f996cd1f 100644
  {
  	return (cookie & BLK_QC_T_INTERNAL) != 0;
 diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
-index 4c636c42ad68..133cbdbaadd1 100644
+index 4c636c42ad68..15b1d5b7f3fa 100644
 --- a/include/linux/blkdev.h
 +++ b/include/linux/blkdev.h
-@@ -106,6 +106,11 @@ typedef __u32 __bitwise req_flags_t;
+@@ -72,6 +72,17 @@ typedef __u32 __bitwise req_flags_t;
+ /* may not be passed by ioscheduler */
+ #define RQF_SOFTBARRIER		((__force req_flags_t)(1 << 3))
+ /* request for flush sequence */
++/*
++ * 在以下使用RQF_FLUSH_SEQ:
++ *   - block/blk-core.c|244| <<req_bio_endio>> if (bio->bi_iter.bi_size == 0 && !(rq->rq_flags & RQF_FLUSH_SEQ))
++ *   - block/blk-core.c|1347| <<blk_account_io_done>> !(req->rq_flags & RQF_FLUSH_SEQ)) {
++ *   - block/blk-flush.c|205| <<blk_flush_restore_request>> rq->rq_flags &= ~RQF_FLUSH_SEQ;
++ *   - block/blk-flush.c|426| <<blk_kick_flush>> flush_rq->rq_flags |= RQF_FLUSH_SEQ;
++ *   - block/blk-flush.c|528| <<blk_insert_flush>> rq->rq_flags |= RQF_FLUSH_SEQ;
++ *   - block/blk-mq-sched.c|365| <<blk_mq_sched_bypass_insert>> if (rq->rq_flags & RQF_FLUSH_SEQ) {
++ *   - block/blk-mq-sched.c|387| <<blk_mq_sched_insert_request>> if (!(rq->rq_flags & RQF_FLUSH_SEQ) && op_is_flush(rq->cmd_flags)) {
++ *   - include/linux/blkdev.h|120| <<RQF_NOMERGE_FLAGS>> (RQF_STARTED | RQF_SOFTBARRIER | RQF_FLUSH_SEQ | RQF_SPECIAL_PAYLOAD)
++ */
+ #define RQF_FLUSH_SEQ		((__force req_flags_t)(1 << 4))
+ /* merge of different types, fail separately */
+ #define RQF_MIXED_MERGE		((__force req_flags_t)(1 << 5))
+@@ -106,6 +117,11 @@ typedef __u32 __bitwise req_flags_t;
  /* The per-zone write lock is held for this request */
  #define RQF_ZONE_WRITE_LOCKED	((__force req_flags_t)(1 << 19))
  /* already slept for hybrid poll */
@@ -2243,7 +2683,7 @@ index 4c636c42ad68..133cbdbaadd1 100644
  #define RQF_MQ_POLL_SLEPT	((__force req_flags_t)(1 << 20))
  /* ->timeout has been called, don't expire again */
  #define RQF_TIMED_OUT		((__force req_flags_t)(1 << 21))
-@@ -120,6 +125,13 @@ typedef __u32 __bitwise req_flags_t;
+@@ -120,6 +136,13 @@ typedef __u32 __bitwise req_flags_t;
  enum mq_rq_state {
  	MQ_RQ_IDLE		= 0,
  	MQ_RQ_IN_FLIGHT		= 1,
@@ -2257,7 +2697,7 @@ index 4c636c42ad68..133cbdbaadd1 100644
  	MQ_RQ_COMPLETE		= 2,
  };
  
-@@ -211,6 +223,12 @@ struct request {
+@@ -211,6 +234,12 @@ struct request {
  	 * with blk_rq_sectors(rq), except that it never be zeroed
  	 * by completion.
  	 */
@@ -2270,7 +2710,7 @@ index 4c636c42ad68..133cbdbaadd1 100644
  	unsigned short stats_sectors;
  
  	/*
-@@ -409,6 +427,10 @@ struct request_queue {
+@@ -409,6 +438,10 @@ struct request_queue {
  	unsigned int		queue_depth;
  
  	/* hw dispatch queues */
@@ -2281,7 +2721,7 @@ index 4c636c42ad68..133cbdbaadd1 100644
  	struct blk_mq_hw_ctx	**queue_hw_ctx;
  	unsigned int		nr_hw_queues;
  
-@@ -475,9 +497,41 @@ struct request_queue {
+@@ -475,9 +508,41 @@ struct request_queue {
  	unsigned int		dma_alignment;
  
  	unsigned int		rq_timeout;
@@ -2323,7 +2763,7 @@ index 4c636c42ad68..133cbdbaadd1 100644
  	struct blk_rq_stat	poll_stat[BLK_MQ_POLL_STATS_BKTS];
  
  	struct timer_list	timeout;
-@@ -600,11 +654,35 @@ struct request_queue {
+@@ -600,11 +665,53 @@ struct request_queue {
  #define QUEUE_FLAG_SAME_FORCE	12	/* force complete on same CPU */
  #define QUEUE_FLAG_DEAD		13	/* queue tear-down finished */
  #define QUEUE_FLAG_INIT_DONE	14	/* queue is initialized */
@@ -2338,7 +2778,25 @@ index 4c636c42ad68..133cbdbaadd1 100644
 + *   - block/blk-sysfs.c|395| <<queue_poll_show>> return queue_var_show(test_bit(QUEUE_FLAG_POLL, &q->queue_flags), page);
 + */
  #define QUEUE_FLAG_POLL		16	/* IO polling enabled if set */
++/*
++ * 在以下设置QUEUE_FLAG_WC的几个例子:
++ *   - block/blk-settings.c|824| <<blk_queue_write_cache>> blk_queue_flag_set(QUEUE_FLAG_WC, q);
++ *   - block/blk-settings.c|826| <<blk_queue_write_cache>> blk_queue_flag_clear(QUEUE_FLAG_WC, q)
++ *   - block/blk-sysfs.c|530| <<queue_wc_store>> blk_queue_flag_set(QUEUE_FLAG_WC, q);
++ *   - drivers/md/dm-table.c|1905| <<dm_table_set_restrictions>> if (dm_table_supports_flush(t, (1UL << QUEUE_FLAG_WC))) {
++ */
  #define QUEUE_FLAG_WC		17	/* Write back caching */
++/*
++ * 使用QUEUE_FLAG_FUA的地方:
++ *   - block/blk-flush.c|158| <<blk_flush_policy>> if (!(fflags & (1UL << QUEUE_FLAG_FUA)) &&
++ *   - block/blk-flush.c|471| <<blk_insert_flush>> if (!(fflags & (1UL << QUEUE_FLAG_FUA)))
++ *   - block/blk-settings.c|828| <<blk_queue_write_cache>> blk_queue_flag_set(QUEUE_FLAG_FUA, q);
++ *   - block/blk-settings.c|830| <<blk_queue_write_cache>> blk_queue_flag_clear(QUEUE_FLAG_FUA, q);
++ *   - block/blk-sysfs.c|539| <<queue_fua_show>> return sprintf(page, "%u\n", test_bit(QUEUE_FLAG_FUA, &q->queue_flags));
++ *   - drivers/md/dm-table.c|1907| <<dm_table_set_restrictions>> if (dm_table_supports_flush(t, (1UL << QUEUE_FLAG_FUA)))
++ *   - drivers/target/target_core_iblock.c|703| <<iblock_execute_rw>> if (test_bit(QUEUE_FLAG_FUA, &q->queue_flags)) {
++ *   - include/linux/blkdev.h|733| <<blk_queue_fua>> #define blk_queue_fua(q) test_bit(QUEUE_FLAG_FUA, &(q)->queue_flags)
++ */
  #define QUEUE_FLAG_FUA		18	/* device supports FUA writes */
  #define QUEUE_FLAG_DAX		19	/* device supports DAX */
 +/*
@@ -2359,7 +2817,7 @@ index 4c636c42ad68..133cbdbaadd1 100644
  #define QUEUE_FLAG_POLL_STATS	21	/* collecting stats for hybrid polling */
  #define QUEUE_FLAG_REGISTERED	22	/* queue has been registered to a disk */
  #define QUEUE_FLAG_SCSI_PASSTHROUGH 23	/* queue supports SCSI commands */
-@@ -948,6 +1026,16 @@ static inline unsigned int blk_rq_cur_sectors(const struct request *rq)
+@@ -948,6 +1055,16 @@ static inline unsigned int blk_rq_cur_sectors(const struct request *rq)
  
  static inline unsigned int blk_rq_stats_sectors(const struct request *rq)
  {
