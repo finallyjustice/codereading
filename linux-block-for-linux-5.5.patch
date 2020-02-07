@@ -1,39 +1,40 @@
-From 918e488c5cb669a0fe05ffa258229ecae4f32004 Mon Sep 17 00:00:00 2001
+From d3b2351b6e4084172e1ca1d80268745245e4b7b3 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Tue, 4 Feb 2020 10:41:59 -0800
+Date: Thu, 6 Feb 2020 16:51:04 -0800
 Subject: [PATCH 1/1] linux block for linux-5.5
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
  block/blk-core.c          |  12 ++
- block/blk-flush.c         | 228 +++++++++++++++++++++++++
+ block/blk-flush.c         | 433 ++++++++++++++++++++++++++++++++++++++
  block/blk-mq-cpumap.c     |  28 +++
- block/blk-mq-pci.c        |  32 ++++
+ block/blk-mq-pci.c        |  32 +++
  block/blk-mq-rdma.c       |   5 +
- block/blk-mq-sysfs.c      |  19 +++
- block/blk-mq-tag.c        |  33 ++++
- block/blk-mq-tag.h        |  53 ++++++
- block/blk-mq-virtio.c     |  31 ++++
- block/blk-mq.c            | 347 ++++++++++++++++++++++++++++++++++++++
- block/blk-mq.h            |  87 ++++++++++
+ block/blk-mq-sysfs.c      |  19 ++
+ block/blk-mq-tag.c        |  33 +++
+ block/blk-mq-tag.h        |  53 +++++
+ block/blk-mq-virtio.c     |  31 +++
+ block/blk-mq.c            | 347 ++++++++++++++++++++++++++++++
+ block/blk-mq.h            |  87 ++++++++
  block/blk-settings.c      |  16 ++
- block/blk-softirq.c       |  39 +++++
- block/blk-stat.c          | 275 ++++++++++++++++++++++++++++++
+ block/blk-softirq.c       |  39 ++++
+ block/blk-stat.c          | 275 ++++++++++++++++++++++++
  block/blk-stat.h          |  27 +++
- block/blk-sysfs.c         |  19 +++
- block/blk.h               |   6 +
- drivers/nvme/host/pci.c   |  45 +++++
+ block/blk-sysfs.c         |  19 ++
+ block/blk.h               |  67 ++++++
+ block/genhd.c             |  29 +++
+ drivers/nvme/host/pci.c   |  45 ++++
  drivers/pci/msi.c         |  14 ++
  fs/direct-io.c            |  15 ++
  fs/ext4/file.c            |   5 +
  fs/iomap/direct-io.c      |  28 +++
  include/linux/bio.h       |   6 +
- include/linux/blk-mq.h    |  65 +++++++
- include/linux/blk_types.h |  22 +++
- include/linux/blkdev.h    | 117 +++++++++++++
- include/linux/fs.h        |  32 ++++
- include/uapi/linux/fs.h   |  11 ++
- 28 files changed, 1617 insertions(+)
+ include/linux/blk-mq.h    |  65 ++++++
+ include/linux/blk_types.h |  22 ++
+ include/linux/blkdev.h    | 122 +++++++++++
+ include/linux/fs.h        |  32 +++
+ include/uapi/linux/fs.h   |  11 +
+ 29 files changed, 1917 insertions(+)
 
 diff --git a/block/blk-core.c b/block/blk-core.c
 index 089e890ab208..07b4f52d414a 100644
@@ -59,10 +60,10 @@ index 089e890ab208..07b4f52d414a 100644
  {
  	struct request_queue *q;
 diff --git a/block/blk-flush.c b/block/blk-flush.c
-index 3f977c517960..fa6a3e3db96b 100644
+index 3f977c517960..9aa810fcab67 100644
 --- a/block/blk-flush.c
 +++ b/block/blk-flush.c
-@@ -76,13 +76,74 @@
+@@ -76,13 +76,81 @@
  #include "blk-mq-tag.h"
  #include "blk-mq-sched.h"
  
@@ -113,6 +114,13 @@ index 3f977c517960..fa6a3e3db96b 100644
 + * fs_request被添加到pending1队列,等待冲刷request的下一次执行,当冲刷requst可以再
 + * 次被执行时,pending1队列不再接收新的fs_request(fs_request被加入到pending2队列),
 + * 冲刷request执行完毕后,pending1队列所有的fs_request的PREFLUSH/POSTFLUSH执行完毕.
++ * The actual execution of flush is double buffered.  Whenever a request
++ * needs to execute PRE or POSTFLUSH, it queues at
++ * fq->flush_queue[fq->flush_pending_idx].  Once certain criteria are met, a
++ * REQ_OP_FLUSH is issued and the pending_idx is toggled.  When the flush
++ * completes, all the requests which were pending are proceeded to the next
++ * step.  This allows arbitrary merging of different types of PREFLUSH/FUA
++ * requests.
 + */
 +
  /* PREFLUSH/FUA sequences */
@@ -137,7 +145,7 @@ index 3f977c517960..fa6a3e3db96b 100644
  	REQ_FSEQ_ACTIONS	= REQ_FSEQ_PREFLUSH | REQ_FSEQ_DATA |
  				  REQ_FSEQ_POSTFLUSH,
  
-@@ -96,8 +157,24 @@ enum {
+@@ -96,16 +164,52 @@ enum {
  static void blk_kick_flush(struct request_queue *q,
  			   struct blk_flush_queue *fq, unsigned int flags);
  
@@ -162,17 +170,35 @@ index 3f977c517960..fa6a3e3db96b 100644
  	unsigned int policy = 0;
  
  	if (blk_rq_sectors(rq))
-@@ -106,6 +183,9 @@ static unsigned int blk_flush_policy(unsigned long fflags, struct request *rq)
+ 		policy |= REQ_FSEQ_DATA;
+ 
++	/*
++	 * 在以下设置QUEUE_FLAG_WC的几个例子:
++	 *   - block/blk-settings.c|824| <<blk_queue_write_cache>> blk_queue_flag_set(QUEUE_FLAG_WC, q);
++	 *   - block/blk-settings.c|826| <<blk_queue_write_cache>> blk_queue_flag_clear(QUEUE_FLAG_WC, q)
++	 *   - block/blk-sysfs.c|530| <<queue_wc_store>> blk_queue_flag_set(QUEUE_FLAG_WC, q);
++	 *   - drivers/md/dm-table.c|1905| <<dm_table_set_restrictions>> if (dm_table_supports_flush(t, (1UL << QUEUE_FLAG_WC))) {
++	 */
  	if (fflags & (1UL << QUEUE_FLAG_WC)) {
  		if (rq->cmd_flags & REQ_PREFLUSH)
  			policy |= REQ_FSEQ_PREFLUSH;
 +		/*
++		 * 使用QUEUE_FLAG_FUA的地方:
++		 *   - block/blk-flush.c|158| <<blk_flush_policy>> if (!(fflags & (1UL << QUEUE_FLAG_FUA)) &&
++		 *   - block/blk-flush.c|471| <<blk_insert_flush>> if (!(fflags & (1UL << QUEUE_FLAG_FUA)))
++		 *   - block/blk-settings.c|828| <<blk_queue_write_cache>> blk_queue_flag_set(QUEUE_FLAG_FUA, q);
++		 *   - block/blk-settings.c|830| <<blk_queue_write_cache>> blk_queue_flag_clear(QUEUE_FLAG_FUA, q);
++		 *   - block/blk-sysfs.c|539| <<queue_fua_show>> return sprintf(page, "%u\n", test_bit(QUEUE_FLAG_FUA, &q->queue_flags));
++		 *   - drivers/md/dm-table.c|1907| <<dm_table_set_restrictions>> if (dm_table_supports_flush(t, (1UL << QUEUE_FLAG_FUA)))
++		 *   - drivers/target/target_core_iblock.c|703| <<iblock_execute_rw>> if (test_bit(QUEUE_FLAG_FUA, &q->queue_flags)) {
++		 *   - include/linux/blkdev.h|733| <<blk_queue_fua>> #define blk_queue_fua(q) test_bit(QUEUE_FLAG_FUA, &(q)->queue_flags)
++		 *
 +		 * 如果磁盘不支持FUA,那么可以使用REQ_FSEQ_POSTFLUSH代替
 +		 */
  		if (!(fflags & (1UL << QUEUE_FLAG_FUA)) &&
  		    (rq->cmd_flags & REQ_FUA))
  			policy |= REQ_FSEQ_POSTFLUSH;
-@@ -113,11 +193,20 @@ static unsigned int blk_flush_policy(unsigned long fflags, struct request *rq)
+@@ -113,11 +217,27 @@ static unsigned int blk_flush_policy(unsigned long fflags, struct request *rq)
  	return policy;
  }
  
@@ -180,6 +206,13 @@ index 3f977c517960..fa6a3e3db96b 100644
 + * called by:
 + *   - block/blk-flush.c|184| <<blk_flush_complete_seq>> seq = blk_flush_cur_seq(rq);
 + *   - block/blk-flush.c|262| <<flush_end_io>> unsigned int seq = blk_flush_cur_seq(rq);
++ *
++ * 获得rq->flush.seq中第一个为0的bit (因为rq->flush.seq表示的是可以跳过的)
++ * struct {
++ *     unsigned int            seq;
++ *     struct list_head        list;
++ *     rq_end_io_fn            *saved_end_io;
++ * } flush;
 + */
  static unsigned int blk_flush_cur_seq(struct request *rq)
  {
@@ -193,7 +226,7 @@ index 3f977c517960..fa6a3e3db96b 100644
  static void blk_flush_restore_request(struct request *rq)
  {
  	/*
-@@ -132,11 +221,20 @@ static void blk_flush_restore_request(struct request *rq)
+@@ -132,11 +252,20 @@ static void blk_flush_restore_request(struct request *rq)
  	rq->end_io = rq->flush.saved_end_io;
  }
  
@@ -214,11 +247,46 @@ index 3f977c517960..fa6a3e3db96b 100644
  static void blk_account_io_flush(struct request *rq)
  {
  	struct hd_struct *part = &rq->rq_disk->part0;
-@@ -164,6 +262,12 @@ static void blk_account_io_flush(struct request *rq)
+@@ -164,11 +293,65 @@ static void blk_account_io_flush(struct request *rq)
   * RETURNS:
   * %true if requests were added to the dispatch queue, %false otherwise.
   */
 +/*
++ * [0] blk_flush_complete_seq
++ * [0] blk_insert_flush
++ * [0] blk_mq_make_request
++ * [0] generic_make_request
++ * [0] submit_bio
++ * [0] submit_bh_wbc.isra.55
++ * [0] jbd2_write_superblock
++ * [0] jbd2_mark_journal_empty
++ * [0] jbd2_journal_flush
++ * [0] ext4_mark_recovery_complete.isra.224
++ * [0] ext4_fill_super
++ * [0] mount_bdev
++ * [0] legacy_get_tree
++ * [0] vfs_get_tree
++ * [0] do_mount
++ * [0] do_mount_root
++ * [0] mount_block_root
++ * [0] mount_root
++ * [0] prepare_namespace
++ * [0] kernel_init_freeable
++ * [0] kernel_init
++ * [0] ret_from_fork
++ *
++ * [0] blk_flush_complete_seq
++ * [0] mq_flush_data_end_io
++ * [0] blk_mq_complete_request
++ * [0] virtblk_done
++ * [0] vring_interrupt
++ * [0] __handle_irq_event_percpu
++ * [0] handle_irq_event_percpu
++ * [0] handle_irq_event
++ * [0] handle_edge_irq
++ * [0] do_IRQ
++ * [0] common_interrupt
++ *
 + * called by:
 + *   - block/blk-flush.c|265| <<flush_end_io>> blk_flush_complete_seq(rq, fq, seq, error);
 + *   - block/blk-flush.c|366| <<mq_flush_data_end_io>> blk_flush_complete_seq(rq, fq, REQ_FSEQ_DATA, error);
@@ -227,7 +295,78 @@ index 3f977c517960..fa6a3e3db96b 100644
  static void blk_flush_complete_seq(struct request *rq,
  				   struct blk_flush_queue *fq,
  				   unsigned int seq, blk_status_t error)
-@@ -215,6 +319,10 @@ static void blk_flush_complete_seq(struct request *rq,
+ {
+ 	struct request_queue *q = rq->q;
++	/*
++	 * 在以下修改flushing_pending_idx:
++	 *   - block/blk-flush.c|416| <<blk_kick_flush>> fq->flush_pending_idx ^= 1;
++	 * 在以下使用flush_pending_idx:
++	 *   - block/blk-flush.c|276| <<blk_flush_complete_seq>> struct list_head *pending = &fq->flush_queue[fq->flush_pending_idx];
++	 *   - block/blk-flush.c|359| <<flush_end_io>> BUG_ON(fq->flush_pending_idx == fq->flush_running_idx);
++	 *   - block/blk-flush.c|392| <<blk_kick_flush>> struct list_head *pending = &fq->flush_queue[fq->flush_pending_idx];
++	 *   - block/blk-flush.c|398| <<blk_kick_flush>> if (fq->flush_pending_idx != fq->flush_running_idx || list_empty(pending))
++	 * 默认初始化是1
++	 *
++	 * 在这个函数里REQ_FSEQ_DATA和REQ_FSEQ_DONE都不用pending (&fq->flush_queue[fq->flush_pending_idx])
++	 * 只有REQ_FSEQ_PREFLUSH和REQ_FSEQ_POSTFLUSH才用
++	 */
+ 	struct list_head *pending = &fq->flush_queue[fq->flush_pending_idx];
+ 	unsigned int cmd_flags;
+ 
+@@ -176,22 +359,52 @@ static void blk_flush_complete_seq(struct request *rq,
+ 	rq->flush.seq |= seq;
+ 	cmd_flags = rq->cmd_flags;
+ 
++	/*
++	 * 第一次从blk_insert_flush()进来, error是0
++	 *
++	 * blk_flush_cur_seq():
++	 * 获得rq->flush.seq中第一个为0的bit (因为rq->flush.seq表示的是可以跳过的)
++	 * struct {
++	 *     unsigned int            seq;
++	 *     struct list_head        list;
++	 *     rq_end_io_fn            *saved_end_io;
++	 * } flush;
++	 *
++	 * 假设三步都要执行,第一次到这里就是REQ_FSEQ_PREFLUSH
++	 */
+ 	if (likely(!error))
+ 		seq = blk_flush_cur_seq(rq);
+ 	else
+ 		seq = REQ_FSEQ_DONE;
+ 
++	/*
++	 * 假设三步都要执行,
++	 * 第一次从blk_insert_flush()到这里就是REQ_FSEQ_PREFLUSH
++	 */
+ 	switch (seq) {
+ 	case REQ_FSEQ_PREFLUSH:
+ 	case REQ_FSEQ_POSTFLUSH:
+ 		/* queue for flush */
++		/*
++		 * pending来自上面的&fq->flush_queue[fq->flush_pending_idx];
++		 */
+ 		if (list_empty(pending))
+ 			fq->flush_pending_since = jiffies;
++		/*
++		 * 插入的时候插入的是tail!!!!!
++		 */
+ 		list_move_tail(&rq->flush.list, pending);
+ 		break;
+ 
+ 	case REQ_FSEQ_DATA:
+ 		list_move_tail(&rq->flush.list, &fq->flush_data_in_flight);
++		/*
++		 * called by:
++		 *   - block/blk-flush.c|199| <<blk_flush_complete_seq>> blk_flush_queue_rq(rq, true);
++		 *   - block/blk-flush.c|341| <<blk_kick_flush>> blk_flush_queue_rq(flush_rq, false);
++		 *
++		 * 下面下发end的时候应该调用mq_flush_data_end_io()
++		 */
+ 		blk_flush_queue_rq(rq, true);
+ 		break;
+ 
+@@ -215,6 +428,10 @@ static void blk_flush_complete_seq(struct request *rq,
  	blk_kick_flush(q, fq, cmd_flags);
  }
  
@@ -238,7 +377,126 @@ index 3f977c517960..fa6a3e3db96b 100644
  static void flush_end_io(struct request *flush_rq, blk_status_t error)
  {
  	struct request_queue *q = flush_rq->q;
-@@ -337,6 +445,31 @@ static void blk_kick_flush(struct request_queue *q, struct blk_flush_queue *fq,
+@@ -251,10 +468,40 @@ static void flush_end_io(struct request *flush_rq, blk_status_t error)
+ 	BUG_ON(fq->flush_pending_idx == fq->flush_running_idx);
+ 
+ 	/* account completion of the flush request */
++	/*
++	 * 在以下修改flushing_pending_idx:
++	 *   - block/blk-flush.c|416| <<blk_kick_flush>> fq->flush_pending_idx ^= 1;
++	 * 在以下修改flush_running_idx: 
++	 *   - block/blk-flush.c|362| <<flush_end_io>> fq->flush_running_idx ^= 1;
++	 */
+ 	fq->flush_running_idx ^= 1;
+ 
+ 	/* and push the waiting requests to the next stage */
+ 	list_for_each_entry_safe(rq, n, running, flush.list) {
++		/*
++		 * 这里的代码写的太隐晦了
++		 *
++		 * 假设是PREFLUSH执行完了到的这里, seq没清空过
++		 * 所以这里获得rq->flush.seq中第一个为0的bit 
++		 * 因为rq->flush.seq表示的是可以跳过的)肯定还是PREFLUSH
++		 *
++		 * 所以seq作为参数传入下面的blk_flush_complete_seq()的时候
++		 * 是告诉后面PREFLUSH要被跳过了!!!
++		 */
++		/*
++		 * 但是这里又不明白为什么是list_for_each_entry_safe()遍历所有的request.
++		 * 根据代码阅读发现这些request实际会被blk_flush_complete_seq()忽略preflush.
++		 * 相当于下发了多个preflush只执行了一次.
++		 * 根据下面的资料可以解释 (http://www.unjeep.com/article/40696.html):
++		 *
++		 * 冲刷的过程中request_queue为什么要使用双缓冲队列来存放fs_request.?
++                 * A:双缓冲队列可以做到只执行一次冲刷请求就可以完成多个fs_request的冲刷要求.
++		 * 队列自带的冲刷request在执行的过程中,blk_insert_flush()可以被调用多次,来自
++		 * 上层的fs_request被添加到pending1队列,等待冲刷request的下一次执行,当冲刷
++		 * requst可以再次被执行时,pending1队列不再接收新的fs_request(fs_request被加入
++		 * 到pending2队列),冲刷request执行完毕后,pending1队列所有的fs_request的
++		 * PREFLUSH/POSTFLUSH执行完毕.
++		 */
+ 		unsigned int seq = blk_flush_cur_seq(rq);
+ 
+ 		BUG_ON(seq != REQ_FSEQ_PREFLUSH && seq != REQ_FSEQ_POSTFLUSH);
+@@ -278,15 +525,60 @@ static void flush_end_io(struct request *flush_rq, blk_status_t error)
+  * spin_lock_irq(fq->mq_flush_lock)
+  *
+  */
++/*
++ * called by:
++ *   - block/blk-flush.c|415| <<blk_flush_complete_seq>> blk_kick_flush(q, fq, cmd_flags);
++ */
+ static void blk_kick_flush(struct request_queue *q, struct blk_flush_queue *fq,
+ 			   unsigned int flags)
+ {
++	/*
++	 * 在以下修改flushing_pending_idx:
++	 *   - block/blk-flush.c|416| <<blk_kick_flush>> fq->flush_pending_idx ^= 1;
++	 * 在以下使用flush_pending_idx:
++	 *   - block/blk-flush.c|276| <<blk_flush_complete_seq>> struct list_head *pending = &fq->flush_queue[fq->flush_pending_idx];
++	 *   - block/blk-flush.c|359| <<flush_end_io>> BUG_ON(fq->flush_pending_idx == fq->flush_running_idx);
++	 *   - block/blk-flush.c|392| <<blk_kick_flush>> struct list_head *pending = &fq->flush_queue[fq->flush_pending_idx];
++	 *   - block/blk-flush.c|398| <<blk_kick_flush>> if (fq->flush_pending_idx != fq->flush_running_idx || list_empty(pending))
++	 *
++	 * 
++	 * 使用flush_queue[2]的地方:
++	 *   - block/blk-flush.c|352| <<blk_flush_complete_seq>> struct list_head *pending = &fq->flush_queue[fq->flush_pending_idx];
++	 *   - block/blk-flush.c|454| <<flush_end_io>> running = &fq->flush_queue[fq->flush_running_idx];
++	 *   - block/blk-flush.c|501| <<blk_kick_flush>> struct list_head *pending = &fq->flush_queue[fq->flush_pending_idx];
++	 *   - block/blk-flush.c|849| <<blk_alloc_flush_queue>> INIT_LIST_HEAD(&fq->flush_queue[0]);
++	 *   - block/blk-flush.c|850| <<blk_alloc_flush_queue>> INIT_LIST_HEAD(&fq->flush_queue[1]);
++	 */
+ 	struct list_head *pending = &fq->flush_queue[fq->flush_pending_idx];
++	/*
++	 * 插入的是tail, 用的是head
++	 * 注意, 这里只是用, 没有取出来!!!
++	 */
+ 	struct request *first_rq =
+ 		list_first_entry(pending, struct request, flush.list);
++	/*
++	 * 使用flush_rq的地方:
++	 *   - block/blk-flush.c|504| <<blk_kick_flush>> struct request *flush_rq = fq->flush_rq;
++	 *   - block/blk-flush.c|845| <<blk_alloc_flush_queue>> fq->flush_rq = kzalloc_node(rq_sz, flags, node);
++	 *   - block/blk-flush.c|846| <<blk_alloc_flush_queue>> if (!fq->flush_rq)
++	 *   - block/blk-flush.c|875| <<blk_free_flush_queue>> kfree(fq->flush_rq);
++	 *   - block/blk-mq.c|2303| <<blk_mq_exit_hctx>> set->ops->exit_request(set, hctx->fq->flush_rq, hctx_idx);
++	 *   - block/blk-mq.c|2361| <<blk_mq_init_hctx>> if (blk_mq_init_request(set, hctx->fq->flush_rq, hctx_idx,
++	 *   - block/blk.h|81| <<is_flush_rq>> return hctx->fq->flush_rq == req;
++	 */
+ 	struct request *flush_rq = fq->flush_rq;
+ 
+ 	/* C1 described at the top of this file */
++	/*
++	 * C1. At any given time, only one flush shall be in progress.  This makes
++	 *     double buffering sufficient.
++	 *
++	 * 在以下修改flushing_pending_idx:
++	 *   - block/blk-flush.c|416| <<blk_kick_flush>> fq->flush_pending_idx ^= 1;
++	 *
++	 * 在以下修改flush_running_idx:
++	 *   - block/blk-flush.c|362| <<flush_end_io>> fq->flush_running_idx ^= 1;
++	 */
+ 	if (fq->flush_pending_idx != fq->flush_running_idx || list_empty(pending))
+ 		return;
+ 
+@@ -296,6 +588,16 @@ static void blk_kick_flush(struct request_queue *q, struct blk_flush_queue *fq,
+ 	 * assigned to empty flushes, and we deadlock if we are expecting
+ 	 * other requests to make progress. Don't defer for that case.
+ 	 */
++	/*
++	 * C2. Flush is deferred if any request is executing DATA of its sequence.
++	 *     This avoids issuing separate POSTFLUSHes for requests which shared
++	 *     PREFLUSH.
++	 *
++	 * C3. The second condition is ignored if there is a request which has
++	 *     waited longer than FLUSH_PENDING_TIMEOUT.  This is to avoid
++	 *     starvation in the unlikely case where there are continuous stream of
++	 *     FUA (without PREFLUSH) requests.
++	 */
+ 	if (!list_empty(&fq->flush_data_in_flight) && q->elevator &&
+ 	    time_before(jiffies,
+ 			fq->flush_pending_since + FLUSH_PENDING_TIMEOUT))
+@@ -337,6 +639,31 @@ static void blk_kick_flush(struct request_queue *q, struct blk_flush_queue *fq,
  	blk_flush_queue_rq(flush_rq, false);
  }
  
@@ -270,7 +528,7 @@ index 3f977c517960..fa6a3e3db96b 100644
  static void mq_flush_data_end_io(struct request *rq, blk_status_t error)
  {
  	struct request_queue *q = rq->q;
-@@ -370,13 +503,54 @@ static void mq_flush_data_end_io(struct request *rq, blk_status_t error)
+@@ -370,13 +697,54 @@ static void mq_flush_data_end_io(struct request *rq, blk_status_t error)
   * @rq is being submitted.  Analyze what needs to be done and put it on the
   * right queue.
   */
@@ -325,7 +583,7 @@ index 3f977c517960..fa6a3e3db96b 100644
  	/*
  	 * @policy now records what operations need to be done.  Adjust
  	 * REQ_PREFLUSH and FUA for the driver.
-@@ -398,6 +572,10 @@ void blk_insert_flush(struct request *rq)
+@@ -398,6 +766,10 @@ void blk_insert_flush(struct request *rq)
  	 * advertise a write-back cache.  In this case, simply
  	 * complete the request.
  	 */
@@ -336,7 +594,7 @@ index 3f977c517960..fa6a3e3db96b 100644
  	if (!policy) {
  		blk_mq_end_request(rq, 0);
  		return;
-@@ -422,12 +600,29 @@ void blk_insert_flush(struct request *rq)
+@@ -422,12 +794,40 @@ void blk_insert_flush(struct request *rq)
  	 */
  	memset(&rq->flush, 0, sizeof(rq->flush));
  	INIT_LIST_HEAD(&rq->flush.list);
@@ -352,6 +610,17 @@ index 3f977c517960..fa6a3e3db96b 100644
 +	 *   - include/linux/blkdev.h|120| <<RQF_NOMERGE_FLAGS>> (RQF_STARTED | RQF_SOFTBARRIER | RQF_FLUSH_SEQ | RQF_SPECIAL_PAYLOAD)
 +	 */
  	rq->rq_flags |= RQF_FLUSH_SEQ;
++	/*
++	 * struct {
++	 *     unsigned int            seq;
++	 *     struct list_head        list;
++	 *     rq_end_io_fn            *saved_end_io;
++	 * } flush;
++	 *
++	 * 使用saved_end_io的地方:
++	 *   - block/blk-flush.c|221| <<blk_flush_restore_request>> rq->end_io = rq->flush.saved_end_io;
++	 *   - block/blk-flush.c|615| <<blk_insert_flush>> rq->flush.saved_end_io = rq->end_io;
++	 */
  	rq->flush.saved_end_io = rq->end_io; /* Usually NULL */
  
  	rq->end_io = mq_flush_data_end_io;
@@ -366,7 +635,7 @@ index 3f977c517960..fa6a3e3db96b 100644
  	blk_flush_complete_seq(rq, fq, REQ_FSEQ_ACTIONS & ~policy, 0);
  	spin_unlock_irq(&fq->mq_flush_lock);
  }
-@@ -443,6 +638,31 @@ void blk_insert_flush(struct request *rq)
+@@ -443,6 +843,31 @@ void blk_insert_flush(struct request *rq)
   *    room for storing the error offset in case of a flush error, if they
   *    wish to.
   */
@@ -398,7 +667,7 @@ index 3f977c517960..fa6a3e3db96b 100644
  int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
  		sector_t *error_sector)
  {
-@@ -485,6 +705,10 @@ int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
+@@ -485,6 +910,10 @@ int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
  }
  EXPORT_SYMBOL(blkdev_issue_flush);
  
@@ -409,7 +678,7 @@ index 3f977c517960..fa6a3e3db96b 100644
  struct blk_flush_queue *blk_alloc_flush_queue(struct request_queue *q,
  		int node, int cmd_size, gfp_t flags)
  {
-@@ -517,6 +741,10 @@ struct blk_flush_queue *blk_alloc_flush_queue(struct request_queue *q,
+@@ -517,6 +946,10 @@ struct blk_flush_queue *blk_alloc_flush_queue(struct request_queue *q,
  	return NULL;
  }
  
@@ -2226,10 +2495,94 @@ index fca9b158f4a0..231bb884efdb 100644
  {
  	struct request_queue *q = container_of(work, typeof(*q), release_work);
 diff --git a/block/blk.h b/block/blk.h
-index 0b8884353f6b..581c087a71e6 100644
+index 0b8884353f6b..bffe40d4a663 100644
 --- a/block/blk.h
 +++ b/block/blk.h
-@@ -38,6 +38,12 @@ extern struct kmem_cache *blk_requestq_cachep;
+@@ -15,22 +15,83 @@
+ extern struct dentry *blk_debugfs_root;
+ #endif
+ 
++/*
++ * blk_flush_queue来自blk_mq_hw_ctx->fq
++ */
+ struct blk_flush_queue {
+ 	unsigned int		flush_queue_delayed:1;
++	/*
++	 * 在以下修改flushing_pending_idx:
++	 *   - block/blk-flush.c|416| <<blk_kick_flush>> fq->flush_pending_idx ^= 1;
++	 * 在以下使用flush_pending_idx:
++	 *   - block/blk-flush.c|276| <<blk_flush_complete_seq>> struct list_head *pending = &fq->flush_queue[fq->flush_pending_idx];
++	 *   - block/blk-flush.c|359| <<flush_end_io>> BUG_ON(fq->flush_pending_idx == fq->flush_running_idx);
++	 *   - block/blk-flush.c|392| <<blk_kick_flush>> struct list_head *pending = &fq->flush_queue[fq->flush_pending_idx];
++	 *   - block/blk-flush.c|398| <<blk_kick_flush>> if (fq->flush_pending_idx != fq->flush_running_idx || list_empty(pending))
++	 */
+ 	unsigned int		flush_pending_idx:1;
++	/*
++	 * 在以下修改flush_running_idx:
++	 *   - block/blk-flush.c|362| <<flush_end_io>> fq->flush_running_idx ^= 1;
++	 * 在以下使用flush_running_idx:
++	 *   - block/blk-flush.c|358| <<flush_end_io>> running = &fq->flush_queue[fq->flush_running_idx];
++	 *   - block/blk-flush.c|359| <<flush_end_io>> BUG_ON(fq->flush_pending_idx == fq->flush_running_idx);
++	 *   - block/blk-flush.c|398| <<blk_kick_flush>> if (fq->flush_pending_idx != fq->flush_running_idx || list_empty(pending))
++	 */
+ 	unsigned int		flush_running_idx:1;
+ 	blk_status_t 		rq_status;
+ 	unsigned long		flush_pending_since;
++	/*
++	 * 使用flush_queue[2]的地方:
++	 *   - block/blk-flush.c|352| <<blk_flush_complete_seq>> struct list_head *pending = &fq->flush_queue[fq->flush_pending_idx];
++	 *   - block/blk-flush.c|454| <<flush_end_io>> running = &fq->flush_queue[fq->flush_running_idx];
++	 *   - block/blk-flush.c|501| <<blk_kick_flush>> struct list_head *pending = &fq->flush_queue[fq->flush_pending_idx];
++	 *   - block/blk-flush.c|849| <<blk_alloc_flush_queue>> INIT_LIST_HEAD(&fq->flush_queue[0]);
++	 *   - block/blk-flush.c|850| <<blk_alloc_flush_queue>> INIT_LIST_HEAD(&fq->flush_queue[1]);
++	 */
+ 	struct list_head	flush_queue[2];
++	/*
++	 * 在以下使用flush_data_in_flight:
++	 *   - block/blk-flush.c|400| <<blk_flush_complete_seq>> list_move_tail(&rq->flush.list, &fq->flush_data_in_flight);
++	 *   - block/blk-flush.c|599| <<blk_kick_flush>> if (!list_empty(&fq->flush_data_in_flight) && q->elevator &&
++	 *   - block/blk-flush.c|934| <<blk_alloc_flush_queue>> INIT_LIST_HEAD(&fq->flush_data_in_flight);
++	 */
+ 	struct list_head	flush_data_in_flight;
++	/*
++	 * 使用flush_rq的地方:
++	 *   - block/blk-flush.c|504| <<blk_kick_flush>> struct request *flush_rq = fq->flush_rq;
++	 *   - block/blk-flush.c|845| <<blk_alloc_flush_queue>> fq->flush_rq = kzalloc_node(rq_sz, flags, node);
++	 *   - block/blk-flush.c|846| <<blk_alloc_flush_queue>> if (!fq->flush_rq)
++	 *   - block/blk-flush.c|875| <<blk_free_flush_queue>> kfree(fq->flush_rq);
++	 *   - block/blk-mq.c|2303| <<blk_mq_exit_hctx>> set->ops->exit_request(set, hctx->fq->flush_rq, hctx_idx);
++	 *   - block/blk-mq.c|2361| <<blk_mq_init_hctx>> if (blk_mq_init_request(set, hctx->fq->flush_rq, hctx_idx,
++	 *   - block/blk.h|81| <<is_flush_rq>> return hctx->fq->flush_rq == req;
++	 */
+ 	struct request		*flush_rq;
+ 
+ 	/*
+ 	 * flush_rq shares tag with this rq, both can't be active
+ 	 * at the same time
+ 	 */
++	/*
++	 * orig_rq在以下使用:
++	 *   - block/blk-flush.c|458| <<flush_end_io>> blk_mq_tag_set_rq(hctx, flush_rq->tag, fq->orig_rq);
++	 *   - block/blk-flush.c|624| <<blk_kick_flush>> fq->orig_rq = first_rq;
++	 */
+ 	struct request		*orig_rq;
+ 	struct lock_class_key	key;
++	/*
++	 * 使用mq_flush_lock的地方:
++	 *   - block/blk-flush.c|434| <<flush_end_io>> spin_lock_irqsave(&fq->mq_flush_lock, flags);
++	 *   - block/blk-flush.c|438| <<flush_end_io>> spin_unlock_irqrestore(&fq->mq_flush_lock, flags);
++	 *   - block/blk-flush.c|469| <<flush_end_io>> spin_unlock_irqrestore(&fq->mq_flush_lock, flags);
++	 *   - block/blk-flush.c|631| <<mq_flush_data_end_io>> spin_lock_irqsave(&fq->mq_flush_lock, flags);
++	 *   - block/blk-flush.c|633| <<mq_flush_data_end_io>> spin_unlock_irqrestore(&fq->mq_flush_lock, flags);
++	 *   - block/blk-flush.c|771| <<blk_insert_flush>> spin_lock_irq(&fq->mq_flush_lock);
++	 *   - block/blk-flush.c|779| <<blk_insert_flush>> spin_unlock_irq(&fq->mq_flush_lock);
++	 *   - block/blk-flush.c|874| <<blk_alloc_flush_queue>> spin_lock_init(&fq->mq_flush_lock);
++	 *   - block/blk-flush.c|886| <<blk_alloc_flush_queue>> lockdep_set_class(&fq->mq_flush_lock, &fq->key);
++	 */
+ 	spinlock_t		mq_flush_lock;
+ };
+ 
+@@ -38,6 +99,12 @@ extern struct kmem_cache *blk_requestq_cachep;
  extern struct kobj_type blk_queue_ktype;
  extern struct ida blk_queue_ida;
  
@@ -2242,6 +2595,60 @@ index 0b8884353f6b..581c087a71e6 100644
  static inline struct blk_flush_queue *
  blk_get_flush_queue(struct request_queue *q, struct blk_mq_ctx *ctx)
  {
+diff --git a/block/genhd.c b/block/genhd.c
+index ff6268970ddc..b0bad725f305 100644
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -86,6 +86,10 @@ unsigned int part_in_flight(struct request_queue *q, struct hd_struct *part)
+ 	return inflight;
+ }
+ 
++/*
++ * called by:
++ *   - block/partition-generic.c|159| <<part_inflight_show>> part_in_flight_rw(q, p, inflight);
++ */
+ void part_in_flight_rw(struct request_queue *q, struct hd_struct *part,
+ 		       unsigned int inflight[2])
+ {
+@@ -305,6 +309,14 @@ EXPORT_SYMBOL_GPL(disk_map_sector_rcu);
+  * Can be deleted altogether. Later.
+  *
+  */
++/*
++ * 在以下使用major_names[]:
++ *   - block/genhd.c|327| <<blkdev_show>> for (dp = major_names[major_to_index(offset)]; dp; dp = dp->next)
++ *   - block/genhd.c|363| <<register_blkdev>> for (index = ARRAY_SIZE(major_names)-1; index > 0; index--) {
++ *   - block/genhd.c|364| <<register_blkdev>> if (major_names[index] == NULL)
++ *   - block/genhd.c|397| <<register_blkdev>> for (n = &major_names[index]; *n; n = &(*n)->next) {
++ *   - block/genhd.c|425| <<unregister_blkdev>> for (n = &major_names[index]; *n; n = &(*n)->next)
++ */
+ #define BLKDEV_MAJOR_HASH_SIZE 255
+ static struct blk_major_name {
+ 	struct blk_major_name *next;
+@@ -351,6 +363,23 @@ void blkdev_show(struct seq_file *seqf, off_t offset)
+  * See Documentation/admin-guide/devices.txt for the list of allocated
+  * major numbers.
+  */
++/*
++ * 部分调用register_blkdev()的例子:
++ *   - block/genhd.c|1105| <<genhd_device_init>> register_blkdev(BLOCK_EXT_MAJOR, "blkext");
++ *   - drivers/block/loop.c|2274| <<loop_init>> if (register_blkdev(LOOP_MAJOR, "loop")) {
++ *   - drivers/block/nbd.c|2372| <<nbd_init>> if (register_blkdev(NBD_MAJOR, "nbd"))
++ *   - drivers/block/null_blk_main.c|1845| <<null_init>> null_major = register_blkdev(0, "nullb");
++ *   - drivers/block/virtio_blk.c|1033| <<init>> major = register_blkdev(0, "virtblk");
++ *   - drivers/block/xen-blkfront.c|2718| <<xlblk_init>> if (register_blkdev(XENVBD_MAJOR, DEV_NAME)) {
++ *   - drivers/ide/ide-probe.c|1002| <<hwif_init>> if (register_blkdev(hwif->major, hwif->name))
++ *   - drivers/md/dm.c|235| <<local_init>> r = register_blkdev(_major, _name);
++ *   - drivers/md/md.c|9328| <<md_init>> if ((ret = register_blkdev(MD_MAJOR, "md")) < 0)
++ *   - drivers/md/md.c|9331| <<md_init>> if ((ret = register_blkdev(0, "mdp")) < 0)
++ *   - drivers/scsi/sd.c|3644| <<init_sd>> if (register_blkdev(sd_major(i), "sd") != 0)
++ *   - drivers/scsi/sr.c|1036| <<init_sr>> rc = register_blkdev(SCSI_CDROM_MAJOR, "sr");
++ *
++ * 核心思想是在major_names[]找到一个可用的major
++ */
+ int register_blkdev(unsigned int major, const char *name)
+ {
+ 	struct blk_major_name **n, *p;
 diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
 index 365a2ddbeaa7..4009ac63668a 100644
 --- a/drivers/nvme/host/pci.c
@@ -2652,7 +3059,7 @@ index 70254ae11769..c558f996cd1f 100644
  {
  	return (cookie & BLK_QC_T_INTERNAL) != 0;
 diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
-index 4c636c42ad68..15b1d5b7f3fa 100644
+index 4c636c42ad68..6b13a774e510 100644
 --- a/include/linux/blkdev.h
 +++ b/include/linux/blkdev.h
 @@ -72,6 +72,17 @@ typedef __u32 __bitwise req_flags_t;
@@ -2699,7 +3106,19 @@ index 4c636c42ad68..15b1d5b7f3fa 100644
  	MQ_RQ_COMPLETE		= 2,
  };
  
-@@ -211,6 +234,12 @@ struct request {
+@@ -188,6 +211,11 @@ struct request {
+ 		struct {
+ 			unsigned int		seq;
+ 			struct list_head	list;
++			/*
++			 * 使用saved_end_io的地方:
++			 *   - block/blk-flush.c|221| <<blk_flush_restore_request>> rq->end_io = rq->flush.saved_end_io;
++			 *   - block/blk-flush.c|615| <<blk_insert_flush>> rq->flush.saved_end_io = rq->end_io;
++			 */
+ 			rq_end_io_fn		*saved_end_io;
+ 		} flush;
+ 	};
+@@ -211,6 +239,12 @@ struct request {
  	 * with blk_rq_sectors(rq), except that it never be zeroed
  	 * by completion.
  	 */
@@ -2712,7 +3131,7 @@ index 4c636c42ad68..15b1d5b7f3fa 100644
  	unsigned short stats_sectors;
  
  	/*
-@@ -409,6 +438,10 @@ struct request_queue {
+@@ -409,6 +443,10 @@ struct request_queue {
  	unsigned int		queue_depth;
  
  	/* hw dispatch queues */
@@ -2723,7 +3142,7 @@ index 4c636c42ad68..15b1d5b7f3fa 100644
  	struct blk_mq_hw_ctx	**queue_hw_ctx;
  	unsigned int		nr_hw_queues;
  
-@@ -475,9 +508,41 @@ struct request_queue {
+@@ -475,9 +513,41 @@ struct request_queue {
  	unsigned int		dma_alignment;
  
  	unsigned int		rq_timeout;
@@ -2765,7 +3184,7 @@ index 4c636c42ad68..15b1d5b7f3fa 100644
  	struct blk_rq_stat	poll_stat[BLK_MQ_POLL_STATS_BKTS];
  
  	struct timer_list	timeout;
-@@ -600,11 +665,53 @@ struct request_queue {
+@@ -600,11 +670,53 @@ struct request_queue {
  #define QUEUE_FLAG_SAME_FORCE	12	/* force complete on same CPU */
  #define QUEUE_FLAG_DEAD		13	/* queue tear-down finished */
  #define QUEUE_FLAG_INIT_DONE	14	/* queue is initialized */
@@ -2819,7 +3238,7 @@ index 4c636c42ad68..15b1d5b7f3fa 100644
  #define QUEUE_FLAG_POLL_STATS	21	/* collecting stats for hybrid polling */
  #define QUEUE_FLAG_REGISTERED	22	/* queue has been registered to a disk */
  #define QUEUE_FLAG_SCSI_PASSTHROUGH 23	/* queue supports SCSI commands */
-@@ -948,6 +1055,16 @@ static inline unsigned int blk_rq_cur_sectors(const struct request *rq)
+@@ -948,6 +1060,16 @@ static inline unsigned int blk_rq_cur_sectors(const struct request *rq)
  
  static inline unsigned int blk_rq_stats_sectors(const struct request *rq)
  {
