@@ -1,10 +1,11 @@
-From 289f9da81b5820317f07724677444cba45d20b4f Mon Sep 17 00:00:00 2001
+From 496455c139e5debc75d2bc739b9660762c218bec Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Thu, 27 Feb 2020 00:08:54 -0800
+Date: Thu, 27 Feb 2020 10:03:45 -0800
 Subject: [PATCH 1/1] linux block for linux-5.5
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
+ block/badblocks.c              |   73 +++
  block/blk-core.c               |   16 +
  block/blk-flush.c              |  433 +++++++++++++
  block/blk-lib.c                |    5 +
@@ -45,6 +46,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  fs/direct-io.c                 |   15 +
  fs/ext4/file.c                 |    5 +
  fs/iomap/direct-io.c           |   28 +
+ include/linux/badblocks.h      |   61 ++
  include/linux/bio.h            |    6 +
  include/linux/blk-mq.h         |  161 +++++
  include/linux/blk_types.h      |   34 +
@@ -56,8 +58,166 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  include/scsi/scsi_host.h       |    6 +
  include/uapi/linux/fs.h        |   11 +
  kernel/trace/blktrace.c        |   13 +
- 51 files changed, 4509 insertions(+)
+ 53 files changed, 4643 insertions(+)
 
+diff --git a/block/badblocks.c b/block/badblocks.c
+index 2e5f5697db35..0696c5925b32 100644
+--- a/block/badblocks.c
++++ b/block/badblocks.c
+@@ -16,6 +16,10 @@
+ #include <linux/types.h>
+ #include <linux/slab.h>
+ 
++/*
++ * 一个u64表示一个最多512-sector的范围
++ */
++
+ /**
+  * badblocks_check() - check a given range for bad sectors
+  * @bb:		the badblocks structure that holds all badblock information
+@@ -50,6 +54,20 @@
+  * -1: there are bad blocks which have not yet been acknowledged in metadata.
+  * plus the start/length of the first bad section we overlap.
+  */
++/*
++ * called by:
++ *   - drivers/block/null_blk_main.c|1999| <<null_handle_badblocks>> if (badblocks_check(bb, sector, nr_sectors, &first_bad, &bad_sectors))
++ *   - drivers/md/md.h|214| <<is_badblock>> int rv = badblocks_check(&rdev->badblocks, rdev->data_offset + s,
++ *   - drivers/nvdimm/nd.h|424| <<is_bad_pmem>> return !!badblocks_check(bb, sector, len / 512, &first_bad,
++ *   - drivers/nvdimm/pfn_devs.c|390| <<nd_pfn_clear_memmap_errors>> bb_present = badblocks_check(&nd_region->bb, meta_start,
++ *
++ * badblocks_check() - check a given range for bad sectors
++ * @bb:         the badblocks structure that holds all badblock information
++ * @s:          sector (start) at which to check for badblocks
++ * @sectors:    number of sectors to check for badblocks
++ * @first_bad:  pointer to store location of the first badblock
++ * @bad_sectors: pointer to store number of badblocks after @first_bad
++ */
+ int badblocks_check(struct badblocks *bb, sector_t s, int sectors,
+ 			sector_t *first_bad, int *bad_sectors)
+ {
+@@ -160,6 +178,14 @@ static void badblocks_update_acked(struct badblocks *bb)
+  *  0: success
+  *  1: failed to set badblocks (out of space)
+  */
++/*
++ * called by:
++ *   - block/badblocks.c|565| <<badblocks_store>> if (badblocks_set(bb, sector, length, !unack))
++ *   - drivers/block/null_blk_main.c|685| <<nullb_device_badblocks_store>> ret = badblocks_set(&t_dev->badblocks, start,
++ *   - drivers/md/md.c|1665| <<super_1_load>> if (badblocks_set(&rdev->badblocks, sector, count, 1))
++ *   - drivers/md/md.c|9243| <<rdev_set_badblocks>> rv = badblocks_set(&rdev->badblocks, s, sectors, 0);
++ *   - drivers/nvdimm/badrange.c|170| <<set_badblock>> if (badblocks_set(bb, s, num, 1)
++ */
+ int badblocks_set(struct badblocks *bb, sector_t s, int sectors,
+ 			int acknowledged)
+ {
+@@ -291,10 +317,16 @@ int badblocks_set(struct badblocks *bb, sector_t s, int sectors,
+ 		} else {
+ 			int this_sectors = sectors;
+ 
++			/*
++			 * 从p+hi拷贝到p+hi+1, 相当于集体右移1格
++			 */
+ 			memmove(p + hi + 1, p + hi,
+ 				(bb->count - hi) * 8);
+ 			bb->count++;
+ 
++			/*
++			 * 一个u64最多只能表示BB_MAX_LEN=512个sector
++			 */
+ 			if (this_sectors > BB_MAX_LEN)
+ 				this_sectors = BB_MAX_LEN;
+ 			p[hi] = BB_MAKE(s, this_sectors, acknowledged);
+@@ -464,6 +496,14 @@ EXPORT_SYMBOL_GPL(ack_all_badblocks);
+  * Return:
+  *  Length of returned data
+  */
++/*
++ * called by:
++ *   - block/genhd.c|928| <<disk_badblocks_show>> return badblocks_show(disk->bb, page, 0);
++ *   - drivers/block/null_blk_main.c|636| <<nullb_device_badblocks_show>> return badblocks_show(&t_dev->badblocks, page, 0);
++ *   - drivers/md/md.c|3372| <<bb_show>> return badblocks_show(&rdev->badblocks, page, 0);
++ *   - drivers/md/md.c|3387| <<ubb_show>> return badblocks_show(&rdev->badblocks, page, 1);
++ *   - drivers/nvdimm/region_devs.c|540| <<region_badblocks_show>> rc = badblocks_show(&nd_region->bb, buf, 0);
++ */
+ ssize_t badblocks_show(struct badblocks *bb, char *page, int unack)
+ {
+ 	size_t len;
+@@ -481,6 +521,9 @@ ssize_t badblocks_show(struct badblocks *bb, char *page, int unack)
+ 	i = 0;
+ 
+ 	while (len < PAGE_SIZE && i < bb->count) {
++		/*
++		 * 这里p[i]是一个u64
++		 */
+ 		sector_t s = BB_OFFSET(p[i]);
+ 		unsigned int length = BB_LEN(p[i]);
+ 		int ack = BB_ACK(p[i]);
+@@ -490,6 +533,14 @@ ssize_t badblocks_show(struct badblocks *bb, char *page, int unack)
+ 		if (unack && ack)
+ 			continue;
+ 
++		/*
++		 * The return value is the number of characters which would be
++		 * generated for the given input, excluding the trailing null,
++		 * as per ISO C99.  If the return is greater than or equal to
++		 * @size, the resulting string is truncated.
++		 *
++		 * 输入的最后有一个'\n'
++		 */
+ 		len += snprintf(page+len, PAGE_SIZE-len, "%llu %u\n",
+ 				(unsigned long long)s << bb->shift,
+ 				length << bb->shift);
+@@ -514,6 +565,12 @@ EXPORT_SYMBOL_GPL(badblocks_show);
+  * Return:
+  *  Length of the buffer processed or -ve error.
+  */
++/*
++ * called by:
++ *   - block/genhd.c|940| <<disk_badblocks_store>> return badblocks_store(disk->bb, page, len, 0);
++ *   - drivers/md/md.c|3376| <<bb_store>> int rv = badblocks_store(&rdev->badblocks, page, len, 0);
++ *   - drivers/md/md.c|3391| <<ubb_store>> return badblocks_store(&rdev->badblocks, page, len, 1);
++ */
+ ssize_t badblocks_store(struct badblocks *bb, const char *page, size_t len,
+ 			int unack)
+ {
+@@ -541,6 +598,11 @@ ssize_t badblocks_store(struct badblocks *bb, const char *page, size_t len,
+ }
+ EXPORT_SYMBOL_GPL(badblocks_store);
+ 
++/*
++ * called by:
++ *   - block/badblocks.c|577| <<badblocks_init>> return __badblocks_init(NULL, bb, enable);
++ *   - block/badblocks.c|585| <<devm_init_badblocks>> return __badblocks_init(dev, bb, 1);
++ */
+ static int __badblocks_init(struct device *dev, struct badblocks *bb,
+ 		int enable)
+ {
+@@ -550,6 +612,12 @@ static int __badblocks_init(struct device *dev, struct badblocks *bb,
+ 		bb->shift = 0;
+ 	else
+ 		bb->shift = -1;
++	/*
++	 * devm_kzalloc():
++	 * Managed kmalloc.  Memory allocated with this function is
++	 * automatically freed on driver detach.  Like all other devres
++	 * resources, guaranteed alignment is unsigned long long.
++	 */
+ 	if (dev)
+ 		bb->page = devm_kzalloc(dev, PAGE_SIZE, GFP_KERNEL);
+ 	else
+@@ -572,6 +640,11 @@ static int __badblocks_init(struct device *dev, struct badblocks *bb,
+  *  0: success
+  *  -ve errno: on error
+  */
++/*
++ * called by:
++ *   - drivers/block/null_blk_main.c|865| <<null_alloc_dev>> if (badblocks_init(&dev->badblocks, 0)) {
++ *   - drivers/md/md.c|3557| <<md_rdev_init>> return badblocks_init(&rdev->badblocks, 0);
++ */
+ int badblocks_init(struct badblocks *bb, int enable)
+ {
+ 	return __badblocks_init(NULL, bb, enable);
 diff --git a/block/blk-core.c b/block/blk-core.c
 index 089e890ab208..5c1d5ad64462 100644
 --- a/block/blk-core.c
@@ -7331,6 +7491,104 @@ index 23837926c0c5..d5663a649119 100644
  ssize_t
  iomap_dio_rw(struct kiocb *iocb, struct iov_iter *iter,
  		const struct iomap_ops *ops, const struct iomap_dio_ops *dops,
+diff --git a/include/linux/badblocks.h b/include/linux/badblocks.h
+index 2426276b9bd3..1d7eeb551403 100644
+--- a/include/linux/badblocks.h
++++ b/include/linux/badblocks.h
+@@ -8,13 +8,40 @@
+ #include <linux/stddef.h>
+ #include <linux/types.h>
+ 
++/*
++ * 在以下使用BB_LEN_MASK:
++ *   - include/linux/badblocks.h|16| <<BB_LEN>> #define BB_LEN(x) (((x) & BB_LEN_MASK) + 1)
++ *
++ * 最后9个bit都是1 (表示1个range的长度, 最多512个sector)
++ */
+ #define BB_LEN_MASK	(0x00000000000001FFULL)
++/*
++ * 在以下使用BB_OFFSET_MASK:
++ *   - include/linux/badblocks.h|15| <<BB_OFFSET>> #define BB_OFFSET(x) (((x) & BB_OFFSET_MASK) >> 9)
++ */
+ #define BB_OFFSET_MASK	(0x7FFFFFFFFFFFFE00ULL)
++/*
++ * 在以下使用BB_ACK_MASK:
++ *   - include/linux/badblocks.h|17| <<BB_ACK>> #define BB_ACK(x) (!!((x) & BB_ACK_MASK))
++ */
+ #define BB_ACK_MASK	(0x8000000000000000ULL)
+ #define BB_MAX_LEN	512
+ #define BB_OFFSET(x)	(((x) & BB_OFFSET_MASK) >> 9)
+ #define BB_LEN(x)	(((x) & BB_LEN_MASK) + 1)
+ #define BB_ACK(x)	(!!((x) & BB_ACK_MASK))
++/*
++ * 在以下调用BB_MAKE():
++ *   - block/badblocks.c|244| <<badblocks_set>> p[lo] = BB_MAKE(a, e-a, ack);
++ *   - block/badblocks.c|251| <<badblocks_set>> p[lo] = BB_MAKE(a, BB_MAX_LEN, ack);
++ *   - block/badblocks.c|276| <<badblocks_set>> p[hi] = BB_MAKE(a, e-a, ack);
++ *   - block/badblocks.c|279| <<badblocks_set>> p[hi] = BB_MAKE(a, BB_MAX_LEN, ack);
++ *   - block/badblocks.c|299| <<badblocks_set>> p[lo] = BB_MAKE(BB_OFFSET(p[lo]), newlen, ack);
++ *   - block/badblocks.c|322| <<badblocks_set>> p[hi] = BB_MAKE(s, this_sectors, acknowledged);
++ *   - block/badblocks.c|408| <<badblocks_clear>> p[lo] = BB_MAKE(a, s-a, ack);
++ *   - block/badblocks.c|411| <<badblocks_clear>> p[lo] = BB_MAKE(target, end - target, ack);
++ *   - block/badblocks.c|425| <<badblocks_clear>> p[lo] = BB_MAKE(start, s - start, ack);
++ *   - block/badblocks.c|471| <<ack_all_badblocks>> p[i] = BB_MAKE(start, len, 1);
++ */
+ #define BB_MAKE(a, l, ack) (((a)<<9) | ((l)-1) | ((u64)(!!(ack)) << 63))
+ 
+ /* Bad block numbers are stored sorted in a single page.
+@@ -22,18 +49,52 @@
+  * 54 bits are sector number, 9 bits are extent size,
+  * 1 bit is an 'acknowledged' flag.
+  */
++/*
++ * 在以下使用MAX_BADBLOCKS:
++ *   - block/badblocks.c|309| <<badblocks_set>> if (bb->count >= MAX_BADBLOCKS) {
++ *   - block/badblocks.c|402| <<badblocks_clear>> if (bb->count >= MAX_BADBLOCKS) {
++ */
+ #define MAX_BADBLOCKS	(PAGE_SIZE/8)
+ 
+ struct badblocks {
+ 	struct device *dev;	/* set by devm_init_badblocks */
++	/*
++	 * 在以下修改count:
++	 *   - block/badblocks.c|294| <<badblocks_set>> bb->count--;
++	 *   - block/badblocks.c|310| <<badblocks_set>> bb->count++;
++	 *   - block/badblocks.c|399| <<badblocks_clear>> bb->count++;
++	 *   - block/badblocks.c|428| <<badblocks_clear>> bb->count -= (hi - lo - 1);
++	 *   - block/badblocks.c|581| <<__badblocks_init>> bb->count = 0;
++	 */
+ 	int count;		/* count of bad blocks */
++	/*
++	 * 在以下使用unacked_exist:
++	 *   - block/badblocks.c|148| <<badblocks_update_acked>> if (!bb->unacked_exist)
++	 *   - block/badblocks.c|159| <<badblocks_update_acked>> bb->unacked_exist = 0;
++	 *   - block/badblocks.c|330| <<badblocks_set>> bb->unacked_exist = 1;
++	 *   - block/badblocks.c|462| <<ack_all_badblocks>> if (bb->changed == 0 && bb->unacked_exist) {
++	 *   - block/badblocks.c|474| <<ack_all_badblocks>> bb->unacked_exist = 0;
++	 *   - block/badblocks.c|537| <<badblocks_show>> bb->unacked_exist = 0;
++	 *   - drivers/md/md.c|2810| <<state_show>> rdev->badblocks.unacked_exist))
++	 *   - drivers/md/md.c|2819| <<state_show>> (rdev->badblocks.unacked_exist
++	 *   - drivers/md/md.c|2903| <<state_store>> rdev->badblocks.unacked_exist) {
++	 */
+ 	int unacked_exist;	/* there probably are unacknowledged
+ 				 * bad blocks.  This is only cleared
+ 				 * when a read discovers none
+ 				 */
++	/*
++	 * 设置shift的地方:
++	 *   - block/badblocks.c|600| <<__badblocks_init>> bb->shift = 0;
++	 *   - block/badblocks.c|602| <<__badblocks_init>> bb->shift = -1;
++	 *   - block/badblocks.c|614| <<__badblocks_init>> bb->shift = -1;
++	 */
+ 	int shift;		/* shift from sectors to block size
+ 				 * a -ve shift means badblocks are
+ 				 * disabled.*/
++	/*
++	 * 在__badblocks_init()中分配PAGE_SIZE
++	 */
+ 	u64 *page;		/* badblock list */
+ 	int changed;
+ 	seqlock_t lock;
 diff --git a/include/linux/bio.h b/include/linux/bio.h
 index 853d92ceee64..c1c44f9e943f 100644
 --- a/include/linux/bio.h
