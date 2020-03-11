@@ -1,10 +1,11 @@
-From 75ffed2fae255204eaff1340cba9c6ba40513e8b Mon Sep 17 00:00:00 2001
+From 3adb7be900687dcaf8acfb7e2c71399d0af2a095 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Thu, 5 Mar 2020 16:17:54 -0800
+Date: Wed, 11 Mar 2020 00:29:43 -0700
 Subject: [PATCH 1/1] linux block for linux-5.5
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
+ arch/x86/kernel/apic/vector.c    |   12 +
  block/badblocks.c                |   73 ++
  block/blk-core.c                 |   16 +
  block/blk-flush.c                |  433 ++++++++++++
@@ -41,7 +42,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  drivers/nvme/host/nvme.h         |   22 +
  drivers/nvme/host/pci.c          |  146 ++++
  drivers/nvme/target/loop.c       |    3 +
- drivers/pci/msi.c                |   74 +++
+ drivers/pci/msi.c                |   82 +++
  drivers/virtio/virtio_ring.c     |   24 +
  fs/block_dev.c                   |    9 +
  fs/direct-io.c                   |   15 +
@@ -54,19 +55,52 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  include/linux/blkdev.h           |  160 +++++
  include/linux/fs.h               |   32 +
  include/linux/genhd.h            |   42 ++
- include/linux/irq.h              |   19 +
+ include/linux/irq.h              |   42 ++
  include/linux/nvme.h             |   13 +
  include/linux/pci.h              |    6 +
  include/linux/virtio_config.h    |    7 +
  include/scsi/scsi_device.h       |   18 +
  include/scsi/scsi_host.h         |    6 +
  include/uapi/linux/fs.h          |   11 +
- kernel/irq/affinity.c            |    6 +
- kernel/irq/msi.c                 |   30 +
+ kernel/irq/affinity.c            |   14 +
+ kernel/irq/manage.c              |   13 +
+ kernel/irq/matrix.c              |    4 +
+ kernel/irq/msi.c                 |   31 +
+ kernel/irq/proc.c                |   26 +
  kernel/trace/blktrace.c          |   13 +
  lib/fault-inject.c               |   12 +
- 60 files changed, 4925 insertions(+)
+ 64 files changed, 5020 insertions(+)
 
+diff --git a/arch/x86/kernel/apic/vector.c b/arch/x86/kernel/apic/vector.c
+index 2c5676b0a6e7..8abe0e4d620c 100644
+--- a/arch/x86/kernel/apic/vector.c
++++ b/arch/x86/kernel/apic/vector.c
+@@ -114,6 +114,13 @@ static void free_apic_chip_data(struct apic_chip_data *apicd)
+ 	kfree(apicd);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kernel/apic/vector.c|180| <<vector_assign_managed_shutdown>> apic_update_irq_cfg(irqd, MANAGED_IRQ_SHUTDOWN_VECTOR, cpu);
++ *   - arch/x86/kernel/apic/vector.c|252| <<assign_vector_locked>> apic_update_irq_cfg(irqd, vector, cpu);
++ *   - arch/x86/kernel/apic/vector.c|325| <<assign_managed_vector>> apic_update_irq_cfg(irqd, vector, cpu);
++ *   - arch/x86/kernel/apic/vector.c|516| <<vector_configure_legacy>> apic_update_irq_cfg(irqd, apicd->vector, apicd->cpu);
++ */
+ static void apic_update_irq_cfg(struct irq_data *irqd, unsigned int vector,
+ 				unsigned int cpu)
+ {
+@@ -304,6 +311,11 @@ assign_irq_vector_policy(struct irq_data *irqd, struct irq_alloc_info *info)
+ 	return reserve_irq_vector(irqd);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kernel/apic/vector.c|427| <<activate_managed>> ret = assign_managed_vector(irqd, vector_searchmask);
++ *   - arch/x86/kernel/apic/vector.c|790| <<apic_set_affinity>> err = assign_managed_vector(irqd, vector_searchmask);
++ */
+ static int
+ assign_managed_vector(struct irq_data *irqd, const struct cpumask *dest)
+ {
 diff --git a/block/badblocks.c b/block/badblocks.c
 index 2e5f5697db35..0696c5925b32 100644
 --- a/block/badblocks.c
@@ -7512,7 +7546,7 @@ index 4df4ebde208a..78c72579e2a1 100644
  		struct nvmf_ctrl_options *opts)
  {
 diff --git a/drivers/pci/msi.c b/drivers/pci/msi.c
-index c7709e49f0e4..b5f00d0fff10 100644
+index c7709e49f0e4..24b00ada30d6 100644
 --- a/drivers/pci/msi.c
 +++ b/drivers/pci/msi.c
 @@ -691,6 +691,39 @@ static void __iomem *msix_map_region(struct pci_dev *dev, unsigned nr_entries)
@@ -7555,7 +7589,20 @@ index c7709e49f0e4..b5f00d0fff10 100644
  static int msix_setup_entries(struct pci_dev *dev, void __iomem *base,
  			      struct msix_entry *entries, int nvec,
  			      struct irq_affinity *affd)
-@@ -703,6 +736,28 @@ static int msix_setup_entries(struct pci_dev *dev, void __iomem *base,
+@@ -698,11 +731,41 @@ static int msix_setup_entries(struct pci_dev *dev, void __iomem *base,
+ 	struct irq_affinity_desc *curmsk, *masks = NULL;
+ 	struct msi_desc *entry;
+ 	int ret, i;
++	/* return the number of device's MSI-X table entries */
+ 	int vec_count = pci_msix_vec_count(dev);
+ 
++	/*
++	 * irq_create_affinity_masks - Create affinity masks for multiqueue spreading
++	 * @nvecs:      The total number of vectors
++	 * @affd:       Description of the affinity requirements
++	 *
++	 * Returns the irq_affinity_desc pointer or NULL if allocation failed.
++	 */
  	if (affd)
  		masks = irq_create_affinity_masks(nvec, affd);
  
@@ -7584,7 +7631,7 @@ index c7709e49f0e4..b5f00d0fff10 100644
  	for (i = 0, curmsk = masks; i < nvec; i++) {
  		entry = alloc_msi_entry(&dev->dev, 1, curmsk);
  		if (!entry) {
-@@ -771,6 +826,10 @@ static void msix_program_entries(struct pci_dev *dev,
+@@ -771,6 +834,10 @@ static void msix_program_entries(struct pci_dev *dev,
   * single MSI-X IRQ. A return of zero indicates the successful setup of
   * requested MSI-X entries with allocated IRQs or non-zero for otherwise.
   **/
@@ -7595,7 +7642,7 @@ index c7709e49f0e4..b5f00d0fff10 100644
  static int msix_capability_init(struct pci_dev *dev, struct msix_entry *entries,
  				int nvec, struct irq_affinity *affd)
  {
-@@ -1190,6 +1249,20 @@ int pci_alloc_irq_vectors_affinity(struct pci_dev *dev, unsigned int min_vecs,
+@@ -1190,6 +1257,20 @@ int pci_alloc_irq_vectors_affinity(struct pci_dev *dev, unsigned int min_vecs,
  				   unsigned int max_vecs, unsigned int flags,
  				   struct irq_affinity *affd)
  {
@@ -7616,7 +7663,7 @@ index c7709e49f0e4..b5f00d0fff10 100644
  	struct irq_affinity msi_default_affd = {0};
  	int msix_vecs = -ENOSPC;
  	int msi_vecs = -ENOSPC;
-@@ -1295,6 +1368,7 @@ const struct cpumask *pci_irq_get_affinity(struct pci_dev *dev, int nr)
+@@ -1295,6 +1376,7 @@ const struct cpumask *pci_irq_get_affinity(struct pci_dev *dev, int nr)
  		struct msi_desc *entry;
  		int i = 0;
  
@@ -8657,7 +8704,7 @@ index ea4c133b4139..56baa3980e06 100644
  {
  	percpu_ref_kill(&part->ref);
 diff --git a/include/linux/irq.h b/include/linux/irq.h
-index 7853eb9301f2..6403dd3ec0d7 100644
+index 7853eb9301f2..f389a291dc75 100644
 --- a/include/linux/irq.h
 +++ b/include/linux/irq.h
 @@ -225,6 +225,12 @@ enum {
@@ -8693,6 +8740,36 @@ index 7853eb9301f2..6403dd3ec0d7 100644
  static inline bool irqd_affinity_is_managed(struct irq_data *d)
  {
  	return __irqd_to_state(d) & IRQD_AFFINITY_MANAGED;
+@@ -834,6 +853,29 @@ struct cpumask *irq_data_get_effective_affinity_mask(struct irq_data *d)
+ {
+ 	return d->common->effective_affinity;
+ }
++/*
++ * [0] irq_data_update_effective_affinity()
++ * [0] apic_update_irq_cfg
++ * [0] assign_managed_vector.constprop.27
++ * [0] x86_vector_activate
++ * [0] __irq_domain_activate_irq
++ * [0] __irq_domain_activate_irq
++ * [0] irq_domain_activate_irq
++ * [0] irq_startup
++ * [0] __setup_irq
++ * [0] request_threaded_irq
++ * [0] pci_request_irq
++ * [0] queue_request_irq
++ * [0] nvme_reset_work
++ * [0] process_one_work
++ * [0] worker_thread
++ * [0] kthread
++ * [0] ret_from_fork
++ *
++ * x86调用irq_data_update_effective_affinity()的例子:
++ *   - arch/x86/kernel/apic/vector.c|126| <<apic_update_irq_cfg>> irq_data_update_effective_affinity(irqd, cpumask_of(cpu));
++ *   - drivers/xen/events/events_base.c|1329| <<set_affinity_irq>> irq_data_update_effective_affinity(data, cpumask_of(tcpu));
++ */
+ static inline void irq_data_update_effective_affinity(struct irq_data *d,
+ 						      const struct cpumask *m)
+ {
 diff --git a/include/linux/nvme.h b/include/linux/nvme.h
 index 3d5189f46cb1..b61d3c71d0bf 100644
 --- a/include/linux/nvme.h
@@ -8828,7 +8905,7 @@ index 379a612f8f1d..f1fd79764d02 100644
  			 RWF_APPEND)
  
 diff --git a/kernel/irq/affinity.c b/kernel/irq/affinity.c
-index 4d89ad4fae3b..f81bfeecd1a8 100644
+index 4d89ad4fae3b..c1c6a1cf0691 100644
 --- a/kernel/irq/affinity.c
 +++ b/kernel/irq/affinity.c
 @@ -412,6 +412,12 @@ static void default_calc_sets(struct irq_affinity *affd, unsigned int affvecs)
@@ -8844,8 +8921,76 @@ index 4d89ad4fae3b..f81bfeecd1a8 100644
  struct irq_affinity_desc *
  irq_create_affinity_masks(unsigned int nvecs, struct irq_affinity *affd)
  {
+@@ -437,6 +443,9 @@ irq_create_affinity_masks(unsigned int nvecs, struct irq_affinity *affd)
+ 		affd->calc_sets = default_calc_sets;
+ 
+ 	/* Recalculate the sets */
++	/*
++	 * nvme: nvme_calc_irq_sets()
++	 */
+ 	affd->calc_sets(affd, affvecs);
+ 
+ 	if (WARN_ON_ONCE(affd->nr_sets > IRQ_AFFINITY_MAX_SETS))
+@@ -462,6 +471,11 @@ irq_create_affinity_masks(unsigned int nvecs, struct irq_affinity *affd)
+ 		unsigned int this_vecs = affd->set_size[i];
+ 		int ret;
+ 
++		/*
++		 * build affinity in two stages:
++		 *      1) spread present CPU on these vectors
++		 *      2) spread other possible CPUs on these vectors
++		 */
+ 		ret = irq_build_affinity_masks(curvec, this_vecs,
+ 					       curvec, masks);
+ 		if (ret) {
+diff --git a/kernel/irq/manage.c b/kernel/irq/manage.c
+index 1753486b440c..5c42254b552f 100644
+--- a/kernel/irq/manage.c
++++ b/kernel/irq/manage.c
+@@ -207,6 +207,14 @@ static void irq_validate_effective_affinity(struct irq_data *data)
+ #endif
+ }
+ 
++/*
++ * called by:
++ *   - kernel/irq/chip.c|272| <<irq_startup>> irq_do_set_affinity(d, aff, false);
++ *   - kernel/irq/cpuhotplug.c|131| <<migrate_one_irq>> err = irq_do_set_affinity(d, affinity, false);
++ *   - kernel/irq/manage.c|256| <<irq_try_set_affinity>> int ret = irq_do_set_affinity(data, dest, force);
++ *   - kernel/irq/manage.c|435| <<irq_setup_affinity>> ret = irq_do_set_affinity(&desc->irq_data, &mask, false);
++ *   - kernel/irq/migration.c|80| <<irq_move_masked_irq>> ret = irq_do_set_affinity(data, desc->pending_mask, false);
++ */
+ int irq_do_set_affinity(struct irq_data *data, const struct cpumask *mask,
+ 			bool force)
+ {
+@@ -396,6 +404,11 @@ EXPORT_SYMBOL_GPL(irq_set_affinity_notifier);
+ /*
+  * Generic version of the affinity autoselector.
+  */
++/*
++ * called by:
++ *   - kernel/irq/chip.c|269| <<irq_startup>> irq_setup_affinity(desc);
++ *   - kernel/irq/manage.c|457| <<irq_select_affinity_usr>> ret = irq_setup_affinity(desc);
++ */
+ int irq_setup_affinity(struct irq_desc *desc)
+ {
+ 	struct cpumask *set = irq_default_affinity;
+diff --git a/kernel/irq/matrix.c b/kernel/irq/matrix.c
+index 30cc217b8631..70b1ae641845 100644
+--- a/kernel/irq/matrix.c
++++ b/kernel/irq/matrix.c
+@@ -282,6 +282,10 @@ void irq_matrix_remove_managed(struct irq_matrix *m, const struct cpumask *msk)
+  * @m:		Matrix pointer
+  * @cpu:	On which CPU the interrupt should be allocated
+  */
++/*
++ * called by:
++ *   - arch/x86/kernel/apic/vector.c|319| <<assign_managed_vector>> vector = irq_matrix_alloc_managed(vector_matrix, vector_searchmask,
++ */
+ int irq_matrix_alloc_managed(struct irq_matrix *m, const struct cpumask *msk,
+ 			     unsigned int *mapped_cpu)
+ {
 diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
-index ad26fbcfbfc8..7a83152a4508 100644
+index ad26fbcfbfc8..21f720a481c9 100644
 --- a/kernel/irq/msi.c
 +++ b/kernel/irq/msi.c
 @@ -26,6 +26,14 @@
@@ -8863,7 +9008,15 @@ index ad26fbcfbfc8..7a83152a4508 100644
  struct msi_desc *alloc_msi_entry(struct device *dev, int nvec,
  				 const struct irq_affinity_desc *affinity)
  {
-@@ -98,6 +106,28 @@ static void msi_check_level(struct irq_domain *domain, struct msi_msg *msg)
+@@ -39,6 +47,7 @@ struct msi_desc *alloc_msi_entry(struct device *dev, int nvec,
+ 	desc->dev = dev;
+ 	desc->nvec_used = nvec;
+ 	if (affinity) {
++		/* duplicate region of memory */
+ 		desc->affinity = kmemdup(affinity,
+ 			nvec * sizeof(*desc->affinity), GFP_KERNEL);
+ 		if (!desc->affinity) {
+@@ -98,6 +107,28 @@ static void msi_check_level(struct irq_domain *domain, struct msi_msg *msg)
   * Intended to be used by MSI interrupt controllers which are
   * implemented with hierarchical domains.
   */
@@ -8892,6 +9045,45 @@ index ad26fbcfbfc8..7a83152a4508 100644
  int msi_domain_set_affinity(struct irq_data *irq_data,
  			    const struct cpumask *mask, bool force)
  {
+diff --git a/kernel/irq/proc.c b/kernel/irq/proc.c
+index cfc4f088a0e7..6b7c65a98c35 100644
+--- a/kernel/irq/proc.c
++++ b/kernel/irq/proc.c
+@@ -43,8 +43,34 @@ enum {
+ 	EFFECTIVE_LIST,
+ };
+ 
++/*
++ * 更新effective_affinity的地方:
++ * [0] irq_data_update_effective_affinity()
++ * [0] apic_update_irq_cfg
++ * [0] assign_managed_vector.constprop.27
++ * [0] x86_vector_activate
++ * [0] __irq_domain_activate_irq
++ * [0] __irq_domain_activate_irq
++ * [0] irq_domain_activate_irq
++ * [0] irq_startup
++ * [0] __setup_irq
++ * [0] request_threaded_irq
++ * [0] pci_request_irq
++ * [0] queue_request_irq
++ * [0] nvme_reset_work
++ * [0] process_one_work
++ * [0] worker_thread
++ * [0] kthread
++ * [0] ret_from_fork
++ */
+ static int show_irq_affinity(int type, struct seq_file *m)
+ {
++	/*
++	 * struct irq_common_data  irq_common_data;
++	 *   -> cpumask_var_t           affinity;
++	 *   -> cpumask_var_t           effective_affinity;
++	 * struct irq_data         irq_data;
++	 */
+ 	struct irq_desc *desc = irq_to_desc((long)m->private);
+ 	const struct cpumask *mask;
+ 
 diff --git a/kernel/trace/blktrace.c b/kernel/trace/blktrace.c
 index 475e29498bca..2dafe471a164 100644
 --- a/kernel/trace/blktrace.c
