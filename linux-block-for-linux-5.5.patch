@@ -1,11 +1,13 @@
-From 3adb7be900687dcaf8acfb7e2c71399d0af2a095 Mon Sep 17 00:00:00 2001
-From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Wed, 11 Mar 2020 00:29:43 -0700
+From b4d5894c677736c412ed06bc785a5f21aa1289b8 Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang@oracle.com>
+Date: Wed, 11 Mar 2020 14:22:19 -0700
 Subject: [PATCH 1/1] linux block for linux-5.5
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+Signed-off-by: Dongli Zhang <dongli.zhang@oracle.com>
 ---
- arch/x86/kernel/apic/vector.c    |   12 +
+ arch/x86/kernel/apic/msi.c       |   37 ++
+ arch/x86/kernel/apic/vector.c    |   27 +
  block/badblocks.c                |   73 ++
  block/blk-core.c                 |   16 +
  block/blk-flush.c                |  433 ++++++++++++
@@ -42,7 +44,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  drivers/nvme/host/nvme.h         |   22 +
  drivers/nvme/host/pci.c          |  146 ++++
  drivers/nvme/target/loop.c       |    3 +
- drivers/pci/msi.c                |   82 +++
+ drivers/pci/msi.c                |   93 +++
  drivers/virtio/virtio_ring.c     |   24 +
  fs/block_dev.c                   |    9 +
  fs/direct-io.c                   |   15 +
@@ -65,17 +67,72 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  kernel/irq/affinity.c            |   14 +
  kernel/irq/manage.c              |   13 +
  kernel/irq/matrix.c              |    4 +
- kernel/irq/msi.c                 |   31 +
+ kernel/irq/msi.c                 |   61 ++
  kernel/irq/proc.c                |   26 +
  kernel/trace/blktrace.c          |   13 +
  lib/fault-inject.c               |   12 +
- 64 files changed, 5020 insertions(+)
+ 65 files changed, 5113 insertions(+)
 
+diff --git a/arch/x86/kernel/apic/msi.c b/arch/x86/kernel/apic/msi.c
+index 7f7533462474..e26ebeaea339 100644
+--- a/arch/x86/kernel/apic/msi.c
++++ b/arch/x86/kernel/apic/msi.c
+@@ -23,6 +23,37 @@
+ 
+ static struct irq_domain *msi_default_domain;
+ 
++/*
++ * [0] irq_msi_compose_msg
++ * [0] irq_chip_compose_msi_msg+0x
++ * [0] msi_domain_set_affinity
++ * [0] irq_do_set_affinity
++ * [0] irq_startup
++ * [0] __setup_irq
++ * [0] request_threaded_irq
++ * [0] pci_request_irq
++ * [0] queue_request_irq
++ * [0] nvme_reset_work
++ * [0] process_one_work
++ * [0] worker_thread
++ * [0] kthread
++
++ * [0] irq_msi_compose_msg
++ * [0] irq_chip_compose_msi_msg
++ * [0] msi_domain_activate
++ * [0] __irq_domain_activate_irq
++ * [0] irq_domain_activate_irq
++ * [0] irq_startup
++ * [0] __setup_irq
++ * [0] request_threaded_irq
++ * [0] pci_request_irq
++ * [0] queue_request_irq
++ * [0] nvme_reset_work
++ * [0] process_one_work
++ * [0] worker_thread
++ * [0] kthread
++ * [0] ret_from_fork
++ */
+ static void irq_msi_compose_msg(struct irq_data *data, struct msi_msg *msg)
+ {
+ 	struct irq_cfg *cfg = irqd_cfg(data);
+@@ -32,6 +63,12 @@ static void irq_msi_compose_msg(struct irq_data *data, struct msi_msg *msg)
+ 	if (x2apic_enabled())
+ 		msg->address_hi |= MSI_ADDR_EXT_DEST_ID(cfg->dest_apicid);
+ 
++	/*
++	 * cfg->dest_apicid和cfg->vector更新的地方:
++	 *   - arch/x86/kernel/apic/vector.c|147| <<apic_update_irq_cfg>> apicd->hw_irq_cfg.dest_apicid = apic->calc_dest_apicid(cpu);
++	 *   - arch/x86/kernel/apic/vector.c|150| <<apic_update_irq_cfg>> apicd->hw_irq_cfg.dest_apicid);
++	 */
++
+ 	msg->address_lo =
+ 		MSI_ADDR_BASE_LO |
+ 		((apic->irq_dest_mode == 0) ?
 diff --git a/arch/x86/kernel/apic/vector.c b/arch/x86/kernel/apic/vector.c
-index 2c5676b0a6e7..8abe0e4d620c 100644
+index 2c5676b0a6e7..7196a4f65082 100644
 --- a/arch/x86/kernel/apic/vector.c
 +++ b/arch/x86/kernel/apic/vector.c
-@@ -114,6 +114,13 @@ static void free_apic_chip_data(struct apic_chip_data *apicd)
+@@ -114,9 +114,31 @@ static void free_apic_chip_data(struct apic_chip_data *apicd)
  	kfree(apicd);
  }
  
@@ -89,7 +146,25 @@ index 2c5676b0a6e7..8abe0e4d620c 100644
  static void apic_update_irq_cfg(struct irq_data *irqd, unsigned int vector,
  				unsigned int cpu)
  {
-@@ -304,6 +311,11 @@ assign_irq_vector_policy(struct irq_data *irqd, struct irq_alloc_info *info)
++	/*
++	 * struct apic_chip_data {
++	 *	struct irq_cfg          hw_irq_cfg;
++	 *	unsigned int            vector;
++	 *	unsigned int            prev_vector;
++	 *	unsigned int            cpu;
++	 *	unsigned int            prev_cpu;
++	 *	unsigned int            irq;
++	 *	struct hlist_node       clist;
++	 *	unsigned int            move_in_progress        : 1,
++	 *				is_managed              : 1,
++	 *				can_reserve             : 1,
++	 *				has_reserved            : 1;
++	 * };
++	 */
+ 	struct apic_chip_data *apicd = apic_chip_data(irqd);
+ 
+ 	lockdep_assert_held(&vector_lock);
+@@ -304,6 +326,11 @@ assign_irq_vector_policy(struct irq_data *irqd, struct irq_alloc_info *info)
  	return reserve_irq_vector(irqd);
  }
  
@@ -7546,7 +7621,7 @@ index 4df4ebde208a..78c72579e2a1 100644
  		struct nvmf_ctrl_options *opts)
  {
 diff --git a/drivers/pci/msi.c b/drivers/pci/msi.c
-index c7709e49f0e4..24b00ada30d6 100644
+index c7709e49f0e4..df696a7b51fd 100644
 --- a/drivers/pci/msi.c
 +++ b/drivers/pci/msi.c
 @@ -691,6 +691,39 @@ static void __iomem *msix_map_region(struct pci_dev *dev, unsigned nr_entries)
@@ -7663,7 +7738,24 @@ index c7709e49f0e4..24b00ada30d6 100644
  	struct irq_affinity msi_default_affd = {0};
  	int msix_vecs = -ENOSPC;
  	int msi_vecs = -ENOSPC;
-@@ -1295,6 +1376,7 @@ const struct cpumask *pci_irq_get_affinity(struct pci_dev *dev, int nr)
+@@ -1289,12 +1370,24 @@ EXPORT_SYMBOL(pci_irq_vector);
+  * @dev:	PCI device to operate on
+  * @nr:		device-relative interrupt vector index (0-based).
+  */
++/*
++ * called by:
++ *   - block/blk-mq-pci.c|65| <<blk_mq_pci_map_queues>> mask = pci_irq_get_affinity(pdev, queue + offset);
++ *   - drivers/scsi/hisi_sas/hisi_sas_v3_hw.c|2364| <<setup_reply_map_v3_hw>> mask = pci_irq_get_affinity(hisi_hba->pci_dev, queue +
++ *   - drivers/scsi/hpsa.c|7444| <<hpsa_setup_reply_map>> mask = pci_irq_get_affinity(h->pdev, queue);
++ *   - drivers/scsi/lpfc/lpfc_init.c|11124| <<lpfc_cpuhp_get_eq>> maskp = pci_irq_get_affinity(phba->pcidev, idx);
++ *   - drivers/scsi/lpfc/lpfc_init.c|11465| <<lpfc_sli4_enable_msix>> maskp = pci_irq_get_affinity(phba->pcidev, index);
++ *   - drivers/scsi/megaraid/megaraid_sas_base.c|5706| <<megasas_setup_reply_map>> mask = pci_irq_get_affinity(instance->pdev, queue);
++ *   - drivers/scsi/mpt3sas/mpt3sas_base.c|2927| <<_base_assign_reply_queues>> mask = pci_irq_get_affinity(ioc->pdev,
++ *   - drivers/virtio/virtio_pci_common.c|455| <<vp_get_vq_affinity>> return pci_irq_get_affinity(vp_dev->pci_dev,
++ */
+ const struct cpumask *pci_irq_get_affinity(struct pci_dev *dev, int nr)
+ {
+ 	if (dev->msix_enabled) {
  		struct msi_desc *entry;
  		int i = 0;
  
@@ -8990,7 +9082,7 @@ index 30cc217b8631..70b1ae641845 100644
  			     unsigned int *mapped_cpu)
  {
 diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
-index ad26fbcfbfc8..21f720a481c9 100644
+index ad26fbcfbfc8..698cc5145d24 100644
 --- a/kernel/irq/msi.c
 +++ b/kernel/irq/msi.c
 @@ -26,6 +26,14 @@
@@ -9044,6 +9136,50 @@ index ad26fbcfbfc8..21f720a481c9 100644
 + */
  int msi_domain_set_affinity(struct irq_data *irq_data,
  			    const struct cpumask *mask, bool force)
+ {
+@@ -105,6 +136,18 @@ int msi_domain_set_affinity(struct irq_data *irq_data,
+ 	struct msi_msg msg[2] = { [1] = { }, };
+ 	int ret;
+ 
++	/*
++	 * 对于virtblk和nvme, 到这里的时候:
++	 * parent->chip->name = APIC
++	 * parent->domain->name = VECTOR
++	 *
++	 * static struct irq_chip lapic_controller = {
++	 *	.name                   = "APIC",
++	 *	.irq_ack                = apic_ack_edge,
++	 *	.irq_set_affinity       = apic_set_affinity,
++	 *	.irq_retrigger          = apic_retrigger_irq,
++	 * };
++	 */
+ 	ret = parent->chip->irq_set_affinity(parent, mask, force);
+ 	if (ret >= 0 && ret != IRQ_SET_MASK_OK_DONE) {
+ 		BUG_ON(irq_chip_compose_msi_msg(irq_data, msg));
+@@ -396,6 +439,24 @@ static bool msi_check_reservation_mode(struct irq_domain *domain,
+  *
+  * Returns 0 on success or an error code.
+  */
++/*
++ * [0] msi_domain_alloc_irqs
++ * [0] native_setup_msi_irqs
++ * [0] __pci_enable_msix_range
++ * [0] pci_alloc_irq_vectors_affinity
++ * [0] nvme_reset_work
++ * [0] process_one_work
++ * [0] worker_thread
++ * [0] kthread
++ * [0] ret_from_fork
++ *
++ * called by:
++ *   - arch/x86/kernel/apic/msi.c|116| <<native_setup_msi_irqs>> return msi_domain_alloc_irqs(domain, &dev->dev, nvec);
++ *   - drivers/base/platform-msi.c|265| <<platform_msi_domain_alloc_irqs>> err = msi_domain_alloc_irqs(dev->msi_domain, dev, nvec);
++ *   - drivers/bus/fsl-mc/fsl-mc-msi.c|259| <<fsl_mc_msi_domain_alloc_irqs>> error = msi_domain_alloc_irqs(msi_domain, dev, irq_count);
++ *   - drivers/pci/msi.c|41| <<pci_msi_setup_msi_irqs>> return msi_domain_alloc_irqs(domain, &dev->dev, nvec);
++ *   - drivers/soc/ti/ti_sci_inta_msi.c|115| <<ti_sci_inta_msi_domain_alloc_irqs>> ret = msi_domain_alloc_irqs(msi_domain, dev, nvec);
++ */
+ int msi_domain_alloc_irqs(struct irq_domain *domain, struct device *dev,
+ 			  int nvec)
  {
 diff --git a/kernel/irq/proc.c b/kernel/irq/proc.c
 index cfc4f088a0e7..6b7c65a98c35 100644
