@@ -1,0 +1,279 @@
+From 48694442744936d81016e3639d547d7e5918da5c Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Tue, 24 Mar 2020 17:02:17 -0700
+Subject: [PATCH 1/1] qemu for v5.0.0-rc0
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ hw/block/nvme.c       | 42 ++++++++++++++++++++++++++++++++++++++++++
+ hw/pci/msix.c         | 18 ++++++++++++++++++
+ hw/vfio/common.c      |  6 ++++++
+ hw/vfio/pci.c         | 28 ++++++++++++++++++++++++++++
+ include/exec/memory.h |  5 +++++
+ memory.c              | 33 +++++++++++++++++++++++++++++++++
+ 6 files changed, 132 insertions(+)
+
+diff --git a/hw/block/nvme.c b/hw/block/nvme.c
+index d28335cbf3..0237a7f579 100644
+--- a/hw/block/nvme.c
++++ b/hw/block/nvme.c
+@@ -43,6 +43,48 @@
+ #include "trace.h"
+ #include "nvme.h"
+ 
++/*
++ * q35有两个ioport, MCH_HOST_BRIDGE_CONFIG_ADDR和MCH_HOST_BRIDGE_CONFIG_DATA
++ *
++ * pci的操作要通过这两个port,
++ * 比如先往MCH_HOST_BRIDGE_CONFIG_ADDR写入想操作设备的bdf和寄存器的offset,
++ * 然后把要写入寄存器的值写入MCH_HOST_BRIDGE_CONFIG_DATA
++ *
++ * 比如以下在seabios是想把bdf的config space的ofs区域(比如bar0的地址)写入addr:
++ *
++ * pci_config_writel(pci->bdf, ofs, addr);
++ *
++ * 实际实现(PORT_PCI_CMD就是MCH_HOST_BRIDGE_CONFIG_ADDR, PORT_PCI_DATA就是MCH_HOST_BRIDGE_CONFIG_DATA):
++ *
++ * void pci_config_writel(u16 bdf, u32 addr, u32 val)
++ * {
++ *     outl(0x80000000 | (bdf << 8) | (addr & 0xfc), PORT_PCI_CMD);
++ *     outl(val, PORT_PCI_DATA);
++ * }
++ *
++ *
++ * 假设guest或者bios想更新config space中某个bar的地址, 会调用上面的pci_config_writel()类似的函数
++ *
++ * qemu会拦截对MCH_HOST_BRIDGE_CONFIG_ADDR和MCH_HOST_BRIDGE_CONFIG_DATA的写,
++ * 根据bdf调用对于的pci设备的write_config, 比如pci_default_write_config()
++ *
++ * pci_default_write_config()会判断,
++ * 如果写的地址是一个bar地址, 会调用pci_update_mappings()
++ *
++ * 一个MemoryRegion, 如果其ram不是true(默认false), 就不会绑定真正的内存
++ * 这样guest写这个读bar的时候kvm就会trap到qemu,
++ * 调用PCIDevice->io_regions[i]的对应的MemoryRegion的read/write callback
++ *
++ *
++ * 比如nvme的某个bar的初始化, 里面n->iomem->ram是false!!!
++ *
++ * 1397     memory_region_init_io(&n->iomem, OBJECT(n), &nvme_mmio_ops, n,
++ * 1398                           "nvme", n->reg_size);
++ * 1399     pci_register_bar(pci_dev, 0,
++ * 1400         PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_TYPE_64,
++ * 1401         &n->iomem);
++ */
++
+ #define NVME_GUEST_ERR(trace, fmt, ...) \
+     do { \
+         (trace_##trace)(__VA_ARGS__); \
+diff --git a/hw/pci/msix.c b/hw/pci/msix.c
+index 29187898f2..b1b71962b9 100644
+--- a/hw/pci/msix.c
++++ b/hw/pci/msix.c
+@@ -265,6 +265,17 @@ static void msix_mask_all(struct PCIDevice *dev, unsigned nentries)
+  * also means a programming error, except device assignment, which can check
+  * if a real HW is broken.
+  */
++/*
++ * called by:
++ *   - hw/net/e1000e.c|296| <<e1000e_init_msix>> int res = msix_init(PCI_DEVICE(s), E1000E_MSIX_VEC_NUM,
++ *   - hw/net/rocker/rocker.c|1250| <<rocker_msix_init>> err = msix_init(dev, ROCKER_MSIX_VEC_COUNT(r->fp_ports),
++ *   - hw/net/vmxnet3.c|2105| <<vmxnet3_init_msix>> int res = msix_init(d, VMXNET3_MAX_INTRS,
++ *   - hw/pci/msix.c|370| <<msix_init_exclusive_bar>> ret = msix_init(dev, nentries, &dev->msix_exclusive_bar, bar_nr,
++ *   - hw/rdma/vmw/pvrdma_main.c|292| <<init_msix>> rc = msix_init(pdev, RDMA_MAX_INTRS, &dev->msix, RDMA_MSIX_BAR_IDX,
++ *   - hw/scsi/megasas.c|2354| <<megasas_scsi_realize>> msix_init(dev, 15, &s->mmio_io, b->mmio_bar, 0x2000,
++ *   - hw/usb/hcd-xhci.c|3472| <<usb_xhci_realize>> msix_init(dev, xhci->numintrs,
++ *   - hw/vfio/pci.c|1524| <<vfio_msix_setup>> ret = msix_init(&vdev->pdev, vdev->msix->entries,
++ */
+ int msix_init(struct PCIDevice *dev, unsigned short nentries,
+               MemoryRegion *table_bar, uint8_t table_bar_nr,
+               unsigned table_offset, MemoryRegion *pba_bar,
+@@ -337,6 +348,13 @@ int msix_init(struct PCIDevice *dev, unsigned short nentries,
+     return 0;
+ }
+ 
++/*
++ * called by:
++ *   - hw/block/nvme.c|1402| <<nvme_realize>> msix_init_exclusive_bar(pci_dev, n->num_queues, 4, NULL);
++ *   - hw/misc/ivshmem.c|732| <<ivshmem_setup_interrupts>> if (msix_init_exclusive_bar(PCI_DEVICE(s), s->vectors, 1, errp)) {
++ *   - hw/pci-bridge/gen_pcie_root_port.c|51| <<gen_rp_interrupts_init>> rc = msix_init_exclusive_bar(d, GEN_PCIE_ROOT_PORT_MSIX_NR_VECTOR, 0, errp);
++ *   - hw/virtio/virtio-pci.c|1643| <<virtio_pci_device_plugged>> int err = msix_init_exclusive_bar(&proxy->pci_dev, proxy->nvectors,
++ */
+ int msix_init_exclusive_bar(PCIDevice *dev, unsigned short nentries,
+                             uint8_t bar_nr, Error **errp)
+ {
+diff --git a/hw/vfio/common.c b/hw/vfio/common.c
+index 0b3593b3c0..d7c0efa34b 100644
+--- a/hw/vfio/common.c
++++ b/hw/vfio/common.c
+@@ -925,6 +925,12 @@ int vfio_region_setup(Object *obj, VFIODevice *vbasedev, VFIORegion *region,
+     return 0;
+ }
+ 
++/*
++ * called by:
++ *   - hw/vfio/display.c|443| <<vfio_display_region_update>> ret = vfio_region_mmap(&dpy->region.buffer);
++ *   - hw/vfio/pci.c|1652| <<vfio_bar_register>> if (vfio_region_mmap(&bar->region)) {
++ *   - hw/vfio/platform.c|663| <<vfio_platform_realize>> if (vfio_region_mmap(vdev->regions[i])) {
++ */
+ int vfio_region_mmap(VFIORegion *region)
+ {
+     int i, prot = 0;
+diff --git a/hw/vfio/pci.c b/hw/vfio/pci.c
+index 5e75a95129..8ef9810866 100644
+--- a/hw/vfio/pci.c
++++ b/hw/vfio/pci.c
+@@ -1514,6 +1514,10 @@ static void vfio_msix_early_setup(VFIOPCIDevice *vdev, Error **errp)
+     vfio_pci_relocate_msix(vdev, errp);
+ }
+ 
++/*
++ * called by:
++ *   - hw/vfio/pci.c|1995| <<vfio_add_std_cap>> ret = vfio_msix_setup(vdev, pos, errp);
++ */
+ static int vfio_msix_setup(VFIOPCIDevice *vdev, int pos, Error **errp)
+ {
+     int ret;
+@@ -1632,6 +1636,10 @@ static void vfio_bars_prepare(VFIOPCIDevice *vdev)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - hw/vfio/pci.c|1666| <<vfio_bars_register>> vfio_bar_register(vdev, i);
++ */
+ static void vfio_bar_register(VFIOPCIDevice *vdev, int nr)
+ {
+     VFIOBAR *bar = &vdev->bars[nr];
+@@ -1658,6 +1666,10 @@ static void vfio_bar_register(VFIOPCIDevice *vdev, int nr)
+     pci_register_bar(&vdev->pdev, nr, bar->type, bar->mr);
+ }
+ 
++/*
++ * called by:
++ *   - hw/vfio/pci.c|2926| <<vfio_realize>> vfio_bars_register(vdev);
++ */
+ static void vfio_bars_register(VFIOPCIDevice *vdev)
+ {
+     int i;
+@@ -1928,6 +1940,11 @@ static void vfio_check_af_flr(VFIOPCIDevice *vdev, uint8_t pos)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - hw/vfio/pci.c|1968| <<vfio_add_std_cap>> ret = vfio_add_std_cap(vdev, next, errp);
++ *   - hw/vfio/pci.c|2126| <<vfio_add_capabilities>> ret = vfio_add_std_cap(vdev, pdev->config[PCI_CAPABILITY_LIST], errp);
++ */
+ static int vfio_add_std_cap(VFIOPCIDevice *vdev, uint8_t pos, Error **errp)
+ {
+     PCIDevice *pdev = &vdev->pdev;
+@@ -2101,6 +2118,10 @@ static void vfio_add_ext_cap(VFIOPCIDevice *vdev)
+     return;
+ }
+ 
++/*
++ * called by:
++ *   - hw/vfio/pci.c|2940| <<vfio_realize>> ret = vfio_add_capabilities(vdev, errp);
++ */
+ static int vfio_add_capabilities(VFIOPCIDevice *vdev, Error **errp)
+ {
+     PCIDevice *pdev = &vdev->pdev;
+@@ -2181,6 +2202,13 @@ static void vfio_pci_post_reset(VFIOPCIDevice *vdev)
+     vfio_quirk_reset(vdev);
+ }
+ 
++/*
++ * called by:
++ *   - hw/vfio/pci.c|2273| <<vfio_pci_hot_reset>> if (vfio_pci_host_match(&host, vdev->vbasedev.name)) {
++ *   - hw/vfio/pci.c|2300| <<vfio_pci_hot_reset>> if (vfio_pci_host_match(&host, tmp->vbasedev.name)) {
++ *   - hw/vfio/pci.c|2362| <<vfio_pci_hot_reset>> if (vfio_pci_host_match(&host, vdev->vbasedev.name)) {
++ *   - hw/vfio/pci.c|2382| <<vfio_pci_hot_reset>> if (vfio_pci_host_match(&host, tmp->vbasedev.name)) {
++ */
+ static bool vfio_pci_host_match(PCIHostDeviceAddress *addr, const char *name)
+ {
+     char tmp[13];
+diff --git a/include/exec/memory.h b/include/exec/memory.h
+index 1614d9a02c..a00b8a0564 100644
+--- a/include/exec/memory.h
++++ b/include/exec/memory.h
+@@ -391,6 +391,11 @@ struct MemoryRegion {
+     void (*destructor)(MemoryRegion *mr);
+     uint64_t align;
+     bool terminates;
++    /*
++     * 在以下使用ram_device:
++     *   - memory.c|1644| <<memory_region_init_ram_device_ptr>> mr->ram_device = true;
++     *   - memory.c|1794| <<memory_region_is_ram_device>> return mr->ram_device;
++     */
+     bool ram_device;
+     bool enabled;
+     bool warning_printed; /* For reservations */
+diff --git a/memory.c b/memory.c
+index 601b749906..1944f4b36c 100644
+--- a/memory.c
++++ b/memory.c
+@@ -1623,6 +1623,15 @@ void memory_region_init_ram_ptr(MemoryRegion *mr,
+     mr->ram_block = qemu_ram_alloc_from_ptr(size, ptr, mr, &error_fatal);
+ }
+ 
++/*
++ * called by:
++ *   - hw/intc/spapr_xive_kvm.c|788| <<kvmppc_xive_connect>> memory_region_init_ram_device_ptr(&xsrc->esb_mmio_kvm, OBJECT(xsrc),
++ *   - hw/intc/spapr_xive_kvm.c|805| <<kvmppc_xive_connect>> memory_region_init_ram_device_ptr(&xive->tm_mmio_kvm, OBJECT(xive),
++ *   - hw/tpm/tpm_ppi.c|48| <<tpm_ppi_init>> memory_region_init_ram_device_ptr(&tpmppi->ram, obj, "tpm-ppi",
++ *   - hw/vfio/common.c|975| <<vfio_region_mmap>> memory_region_init_ram_device_ptr(&region->mmaps[i].mem,
++ *   - hw/vfio/pci-quirks.c|1691| <<vfio_pci_nvlink2_init>> memory_region_init_ram_device_ptr(&quirk->mem[0], OBJECT(vdev),
++ *   - hw/virtio/vhost-user.c|970| <<vhost_user_slave_handle_vring_host_notifier>> memory_region_init_ram_device_ptr(&n->mr, OBJECT(vdev), name,
++ */
+ void memory_region_init_ram_device_ptr(MemoryRegion *mr,
+                                        Object *owner,
+                                        const char *name,
+@@ -1632,6 +1641,11 @@ void memory_region_init_ram_device_ptr(MemoryRegion *mr,
+     memory_region_init(mr, owner, name, size);
+     mr->ram = true;
+     mr->terminates = true;
++    /*
++     * 在以下使用ram_device:
++     *   - memory.c|1644| <<memory_region_init_ram_device_ptr>> mr->ram_device = true;
++     *   - memory.c|1794| <<memory_region_is_ram_device>> return mr->ram_device;
++     */
+     mr->ram_device = true;
+     mr->ops = &ram_device_mem_ops;
+     mr->opaque = mr;
+@@ -1639,6 +1653,9 @@ void memory_region_init_ram_device_ptr(MemoryRegion *mr,
+     mr->dirty_log_mask = tcg_enabled() ? (1 << DIRTY_MEMORY_CODE) : 0;
+     /* qemu_ram_alloc_from_ptr cannot fail with ptr != NULL.  */
+     assert(ptr != NULL);
++    /*
++     * ram_block的类型是RAMBlock *ram_block;
++     */
+     mr->ram_block = qemu_ram_alloc_from_ptr(size, ptr, mr, &error_fatal);
+ }
+ 
+@@ -1780,6 +1797,22 @@ const char *memory_region_name(const MemoryRegion *mr)
+     return mr->name;
+ }
+ 
++/*
++ * called by:
++ *   - hw/vfio/common.c|662| <<vfio_listener_region_add>> if (memory_region_is_ram_device(section->mr)) {
++ *   - hw/vfio/common.c|681| <<vfio_listener_region_add>> if (memory_region_is_ram_device(section->mr)) {
++ *   - hw/vfio/common.c|692| <<vfio_listener_region_add>> if (memory_region_is_ram_device(section->mr)) {
++ *   - hw/vfio/common.c|775| <<vfio_listener_region_del>> if (memory_region_is_ram_device(section->mr)) {
++ *   - hw/vfio/spapr.c|30| <<vfio_prereg_listener_skipped_section>> memory_region_is_ram_device(section->mr);
++ *   - include/exec/memory.h|2360| <<memory_access_is_direct>> !mr->readonly && !memory_region_is_ram_device(mr);
++ *   - include/exec/memory.h|2362| <<memory_access_is_direct>> return (memory_region_is_ram(mr) && !memory_region_is_ram_device(mr)) ||
++ *   - memory.c|2828| <<memory_region_type>> if (memory_region_is_ram_device(mr)) {
++ *   - memory_mapping.c|208| <<guest_phys_blocks_region_add>> memory_region_is_ram_device(section->mr) ||
++ *   - target/i386/sev.c|144| <<sev_ram_block_added>> if (mr && memory_region_is_ram_device(mr)) {
++ *   - target/i386/sev.c|173| <<sev_ram_block_removed>> if (mr && memory_region_is_ram_device(mr)) {
++ *
++ * Returns %true if a memory region is a device backed ram region
++ */
+ bool memory_region_is_ram_device(MemoryRegion *mr)
+ {
+     return mr->ram_device;
+-- 
+2.17.1
+
