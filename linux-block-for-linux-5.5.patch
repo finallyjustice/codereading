@@ -1,6 +1,6 @@
-From 588aa11a69b1eefb984ddf6f5f24fe91a395cc87 Mon Sep 17 00:00:00 2001
+From 9e72c52bbf03dbe84563464586cd0388db82c2b0 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Tue, 24 Mar 2020 07:59:23 -0700
+Date: Wed, 25 Mar 2020 18:05:40 -0700
 Subject: [PATCH 1/1] linux block for linux-5.5
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
@@ -8,10 +8,13 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  arch/x86/kernel/apic/msi.c       |   37 ++
  arch/x86/kernel/apic/vector.c    |   35 +
  block/badblocks.c                |   73 ++
+ block/bio.c                      |    7 +
+ block/blk-cgroup.c               |   20 +
  block/blk-core.c                 |   53 ++
  block/blk-flush.c                |  433 ++++++++++++
  block/blk-lib.c                  |    5 +
  block/blk-mq-cpumap.c            |   28 +
+ block/blk-mq-debugfs.c           |    5 +
  block/blk-mq-pci.c               |   32 +
  block/blk-mq-rdma.c              |    5 +
  block/blk-mq-sched.c             |   43 ++
@@ -19,7 +22,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  block/blk-mq-tag.c               |   33 +
  block/blk-mq-tag.h               |   53 ++
  block/blk-mq-virtio.c            |   31 +
- block/blk-mq.c                   |  664 ++++++++++++++++++
+ block/blk-mq.c                   |  696 +++++++++++++++++++
  block/blk-mq.h                   |   87 +++
  block/blk-settings.c             |   41 ++
  block/blk-softirq.c              |   39 ++
@@ -31,6 +34,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  block/genhd.c                    |  113 ++++
  block/partition-generic.c        |   98 +++
  block/partitions/check.c         |   99 +++
+ drivers/ata/libata-scsi.c        |    3 +
  drivers/block/loop.c             |  100 +++
  drivers/block/loop.h             |   15 +
  drivers/block/null_blk.h         |  101 +++
@@ -55,7 +59,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  include/linux/blk_types.h        |   34 +
  include/linux/blkdev.h           |  160 +++++
  include/linux/fs.h               |   32 +
- include/linux/genhd.h            |   42 ++
+ include/linux/genhd.h            |   48 ++
  include/linux/irq.h              |   68 ++
  include/linux/irqdesc.h          |    7 +
  include/linux/nvme.h             |   24 +
@@ -74,7 +78,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  kernel/irq/proc.c                |   26 +
  kernel/trace/blktrace.c          |   13 +
  lib/fault-inject.c               |   12 +
- 69 files changed, 6112 insertions(+), 1 deletion(-)
+ 73 files changed, 6185 insertions(+), 1 deletion(-)
 
 diff --git a/arch/x86/kernel/apic/msi.c b/arch/x86/kernel/apic/msi.c
 index 7f7533462474..e26ebeaea339 100644
@@ -352,6 +356,55 @@ index 2e5f5697db35..0696c5925b32 100644
  int badblocks_init(struct badblocks *bb, int enable)
  {
  	return __badblocks_init(NULL, bb, enable);
+diff --git a/block/bio.c b/block/bio.c
+index 94d697217887..71fdfba6fc20 100644
+--- a/block/bio.c
++++ b/block/bio.c
+@@ -1752,6 +1752,13 @@ void bio_check_pages_dirty(struct bio *bio)
+ 	schedule_work(&bio_dirty_work);
+ }
+ 
++/*
++ * called by:
++ *   - block/bio.c|1778| <<generic_start_io_acct>> update_io_ticks(part, jiffies);
++ *   - block/bio.c|1796| <<generic_end_io_acct>> update_io_ticks(part, now);
++ *   - block/blk-core.c|1354| <<blk_account_io_done>> update_io_ticks(part, jiffies);
++ *   - block/blk-core.c|1396| <<blk_account_io_start>> update_io_ticks(part, jiffies);
++ */
+ void update_io_ticks(struct hd_struct *part, unsigned long now)
+ {
+ 	unsigned long stamp;
+diff --git a/block/blk-cgroup.c b/block/blk-cgroup.c
+index a229b94d5390..1a21b15ada50 100644
+--- a/block/blk-cgroup.c
++++ b/block/blk-cgroup.c
+@@ -34,6 +34,26 @@
+ 
+ #define MAX_KEY_LEN 100
+ 
++/*
++ * 来自mailing list
++ * Now the main block cgroup isolation policy:
++ * blk-iocost and bfq are weght based, blk-iolatency is latency based.
++ * The blk-iotrack can track the real percentage for IOs,kB,on disk time(d2c),
++ * and total time, it’s a good indicator to the real weight. For blk-iolatency, the
++ * blk-iotrack has 8 lantency thresholds to show latency distribution, so if we
++ * change these thresholds around to blk-iolateny.target.latency, we can tune
++ * the target latency to a more proper value.
++ *
++ * blk-iotrack extends the basic io.stat. It just export the important
++ * basic io statistics
++ * for cgroup,like what /prof/diskstats for block device. And it’s easy
++ * programming,
++ * iotrack just working like iostat, but focus on cgroup.
++ *
++ * blk-iotrack is friendly with these block cgroup isolation policies, a
++ * indicator for cgroup weight and lantency.
++ */
++
+ /*
+  * blkcg_pol_mutex protects blkcg_policy[] and policy [de]activation.
+  * blkcg_pol_register_mutex nests outside of it and synchronizes entire
 diff --git a/block/blk-core.c b/block/blk-core.c
 index 089e890ab208..ded6ca49425a 100644
 --- a/block/blk-core.c
@@ -1139,6 +1192,22 @@ index 0157f2b3485a..5675db0eb4cf 100644
  int blk_mq_hw_queue_to_node(struct blk_mq_queue_map *qmap, unsigned int index)
  {
  	int i;
+diff --git a/block/blk-mq-debugfs.c b/block/blk-mq-debugfs.c
+index b3f2ba483992..b169aef2e57b 100644
+--- a/block/blk-mq-debugfs.c
++++ b/block/blk-mq-debugfs.c
+@@ -128,6 +128,11 @@ static const char *const blk_queue_flag_name[] = {
+ };
+ #undef QUEUE_FLAG_NAME
+ 
++/*
++ * virtblk的例子
++ * # cat /sys/kernel/debug/block/vdb/state
++ * SAME_COMP|IO_STAT|DISCARD|INIT_DONE|WC|STATS|REGISTERED
++ */
+ static int queue_state_show(void *data, struct seq_file *m)
+ {
+ 	struct request_queue *q = data;
 diff --git a/block/blk-mq-pci.c b/block/blk-mq-pci.c
 index b595a94c4d16..c3f4495a2201 100644
 --- a/block/blk-mq-pci.c
@@ -1601,7 +1670,7 @@ index 488341628256..16ece920ec49 100644
  		struct virtio_device *vdev, int first_vec)
  {
 diff --git a/block/blk-mq.c b/block/blk-mq.c
-index 323c9cb28066..4b3d9297cbe6 100644
+index 323c9cb28066..91acac79d771 100644
 --- a/block/blk-mq.c
 +++ b/block/blk-mq.c
 @@ -43,13 +43,22 @@
@@ -1734,7 +1803,35 @@ index 323c9cb28066..4b3d9297cbe6 100644
  bool blk_mq_complete_request(struct request *rq)
  {
  	if (unlikely(blk_should_fake_timeout(rq->q)))
-@@ -647,7 +721,23 @@ void blk_mq_start_request(struct request *rq)
+@@ -641,13 +715,51 @@ bool blk_mq_complete_request(struct request *rq)
+ }
+ EXPORT_SYMBOL(blk_mq_complete_request);
+ 
++/*
++ * 部分调用blk_mq_start_request()的例子:
++ *   - block/bsg-lib.c|272| <<bsg_queue_rq>> blk_mq_start_request(req);
++ *   - drivers/block/loop.c|1985| <<loop_queue_rq>> blk_mq_start_request(rq);
++ *   - drivers/block/nbd.c|882| <<nbd_handle_cmd>> blk_mq_start_request(req);
++ *   - drivers/block/nbd.c|891| <<nbd_handle_cmd>> blk_mq_start_request(req);
++ *   - drivers/block/nbd.c|915| <<nbd_handle_cmd>> blk_mq_start_request(req);
++ *   - drivers/block/nbd.c|926| <<nbd_handle_cmd>> blk_mq_start_request(req);
++ *   - drivers/block/null_blk_main.c|2286| <<null_queue_rq>> blk_mq_start_request(bd->rq);
++ *   - drivers/block/virtio_blk.c|319| <<virtio_queue_rq>> blk_mq_start_request(req);
++ *   - drivers/block/xen-blkfront.c|891| <<blkif_queue_rq>> blk_mq_start_request(qd->rq);
++ *   - drivers/ide/ide-io.c|578| <<ide_queue_rq>> blk_mq_start_request(bd->rq);
++ *   - drivers/md/dm-rq.c|450| <<dm_start_request>> blk_mq_start_request(orig);
++ *   - drivers/nvme/host/fabrics.c|556| <<nvmf_fail_nonready_command>> blk_mq_start_request(rq);
++ *   - drivers/nvme/host/fc.c|2283| <<nvme_fc_start_fcp_op>> blk_mq_start_request(op->rq);
++ *   - drivers/nvme/host/pci.c|1050| <<nvme_queue_rq>> blk_mq_start_request(req);
++ *   - drivers/nvme/host/rdma.c|1763| <<nvme_rdma_queue_rq>> blk_mq_start_request(rq);
++ *   - drivers/nvme/host/tcp.c|2165| <<nvme_tcp_queue_rq>> blk_mq_start_request(rq);
++ *   - drivers/nvme/target/loop.c|148| <<nvme_loop_queue_rq>> blk_mq_start_request(req);
++ *   - drivers/scsi/scsi_lib.c|1601| <<scsi_mq_prep_fn>> blk_mq_start_request(req);
++ *   - drivers/scsi/scsi_lib.c|1677| <<scsi_queue_rq>> blk_mq_start_request(req);
++ */
+ void blk_mq_start_request(struct request *rq)
+ {
+ 	struct request_queue *q = rq->q;
  
  	trace_block_rq_issue(q, rq);
  
@@ -1758,7 +1855,20 @@ index 323c9cb28066..4b3d9297cbe6 100644
  		rq->io_start_time_ns = ktime_get_ns();
  		rq->stats_sectors = blk_rq_sectors(rq);
  		rq->rq_flags |= RQF_STATS;
-@@ -692,6 +782,29 @@ static void __blk_mq_requeue_request(struct request *rq)
+@@ -675,6 +787,12 @@ void blk_mq_start_request(struct request *rq)
+ }
+ EXPORT_SYMBOL(blk_mq_start_request);
+ 
++/*
++ * called by:
++ *   - block/blk-mq.c|810| <<blk_mq_requeue_request>> __blk_mq_requeue_request(rq);
++ *   - block/blk-mq.c|1483| <<blk_mq_dispatch_rq_list>> __blk_mq_requeue_request(rq);
++ *   - block/blk-mq.c|2087| <<__blk_mq_issue_directly>> __blk_mq_requeue_request(rq);
++ */
+ static void __blk_mq_requeue_request(struct request *rq)
+ {
+ 	struct request_queue *q = rq->q;
+@@ -692,6 +810,29 @@ static void __blk_mq_requeue_request(struct request *rq)
  	}
  }
  
@@ -1788,7 +1898,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  void blk_mq_requeue_request(struct request *rq, bool kick_requeue_list)
  {
  	__blk_mq_requeue_request(rq);
-@@ -704,6 +817,17 @@ void blk_mq_requeue_request(struct request *rq, bool kick_requeue_list)
+@@ -704,6 +845,17 @@ void blk_mq_requeue_request(struct request *rq, bool kick_requeue_list)
  }
  EXPORT_SYMBOL(blk_mq_requeue_request);
  
@@ -1806,7 +1916,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  static void blk_mq_requeue_work(struct work_struct *work)
  {
  	struct request_queue *q =
-@@ -720,6 +844,7 @@ static void blk_mq_requeue_work(struct work_struct *work)
+@@ -720,6 +872,7 @@ static void blk_mq_requeue_work(struct work_struct *work)
  			continue;
  
  		rq->rq_flags &= ~RQF_SOFTBARRIER;
@@ -1814,7 +1924,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  		list_del_init(&rq->queuelist);
  		/*
  		 * If RQF_DONTPREP, rq has contained some driver specific
-@@ -741,6 +866,20 @@ static void blk_mq_requeue_work(struct work_struct *work)
+@@ -741,6 +894,20 @@ static void blk_mq_requeue_work(struct work_struct *work)
  	blk_mq_run_hw_queues(q, false);
  }
  
@@ -1835,7 +1945,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  void blk_mq_add_to_requeue_list(struct request *rq, bool at_head,
  				bool kick_requeue_list)
  {
-@@ -766,8 +905,19 @@ void blk_mq_add_to_requeue_list(struct request *rq, bool at_head,
+@@ -766,8 +933,19 @@ void blk_mq_add_to_requeue_list(struct request *rq, bool at_head,
  		blk_mq_kick_requeue_list(q);
  }
  
@@ -1855,7 +1965,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  	kblockd_mod_delayed_work_on(WORK_CPU_UNBOUND, &q->requeue_work, 0);
  }
  EXPORT_SYMBOL(blk_mq_kick_requeue_list);
-@@ -780,6 +930,25 @@ void blk_mq_delay_kick_requeue_list(struct request_queue *q,
+@@ -780,6 +958,25 @@ void blk_mq_delay_kick_requeue_list(struct request_queue *q,
  }
  EXPORT_SYMBOL(blk_mq_delay_kick_requeue_list);
  
@@ -1881,7 +1991,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  struct request *blk_mq_tag_to_rq(struct blk_mq_tags *tags, unsigned int tag)
  {
  	if (tag < tags->nr_tags) {
-@@ -1148,6 +1317,39 @@ static bool blk_mq_mark_tag_wait(struct blk_mq_hw_ctx *hctx,
+@@ -1148,6 +1345,39 @@ static bool blk_mq_mark_tag_wait(struct blk_mq_hw_ctx *hctx,
   * - take 4 as factor for avoiding to get too small(0) result, and this
   *   factor doesn't matter because EWMA decreases exponentially
   */
@@ -1921,7 +2031,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  static void blk_mq_update_dispatch_busy(struct blk_mq_hw_ctx *hctx, bool busy)
  {
  	unsigned int ewma;
-@@ -1155,14 +1357,34 @@ static void blk_mq_update_dispatch_busy(struct blk_mq_hw_ctx *hctx, bool busy)
+@@ -1155,14 +1385,34 @@ static void blk_mq_update_dispatch_busy(struct blk_mq_hw_ctx *hctx, bool busy)
  	if (hctx->queue->elevator)
  		return;
  
@@ -1956,7 +2066,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  	ewma /= BLK_MQ_DISPATCH_BUSY_EWMA_WEIGHT;
  
  	hctx->dispatch_busy = ewma;
-@@ -1173,6 +1395,16 @@ static void blk_mq_update_dispatch_busy(struct blk_mq_hw_ctx *hctx, bool busy)
+@@ -1173,6 +1423,16 @@ static void blk_mq_update_dispatch_busy(struct blk_mq_hw_ctx *hctx, bool busy)
  /*
   * Returns true if we did some work AND can potentially do more.
   */
@@ -1973,7 +2083,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  bool blk_mq_dispatch_rq_list(struct request_queue *q, struct list_head *list,
  			     bool got_budget)
  {
-@@ -1220,6 +1452,7 @@ bool blk_mq_dispatch_rq_list(struct request_queue *q, struct list_head *list,
+@@ -1220,6 +1480,7 @@ bool blk_mq_dispatch_rq_list(struct request_queue *q, struct list_head *list,
  			}
  		}
  
@@ -1981,7 +2091,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  		list_del_init(&rq->queuelist);
  
  		bd.rq = rq;
-@@ -1278,6 +1511,21 @@ bool blk_mq_dispatch_rq_list(struct request_queue *q, struct list_head *list,
+@@ -1278,6 +1539,21 @@ bool blk_mq_dispatch_rq_list(struct request_queue *q, struct list_head *list,
  			q->mq_ops->commit_rqs(hctx);
  
  		spin_lock(&hctx->lock);
@@ -2003,7 +2113,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  		list_splice_init(list, &hctx->dispatch);
  		spin_unlock(&hctx->lock);
  
-@@ -1327,6 +1575,11 @@ bool blk_mq_dispatch_rq_list(struct request_queue *q, struct list_head *list,
+@@ -1327,6 +1603,11 @@ bool blk_mq_dispatch_rq_list(struct request_queue *q, struct list_head *list,
  	return (queued + errors) != 0;
  }
  
@@ -2015,7 +2125,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  static void __blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx)
  {
  	int srcu_idx;
-@@ -1424,6 +1677,11 @@ static int blk_mq_hctx_next_cpu(struct blk_mq_hw_ctx *hctx)
+@@ -1424,6 +1705,11 @@ static int blk_mq_hctx_next_cpu(struct blk_mq_hw_ctx *hctx)
  	return next_cpu;
  }
  
@@ -2027,7 +2137,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  static void __blk_mq_delay_run_hw_queue(struct blk_mq_hw_ctx *hctx, bool async,
  					unsigned long msecs)
  {
-@@ -1441,16 +1699,46 @@ static void __blk_mq_delay_run_hw_queue(struct blk_mq_hw_ctx *hctx, bool async,
+@@ -1441,16 +1727,46 @@ static void __blk_mq_delay_run_hw_queue(struct blk_mq_hw_ctx *hctx, bool async,
  		put_cpu();
  	}
  
@@ -2074,7 +2184,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  void blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx, bool async)
  {
  	int srcu_idx;
-@@ -1582,6 +1870,14 @@ void blk_mq_start_stopped_hw_queues(struct request_queue *q, bool async)
+@@ -1582,6 +1898,14 @@ void blk_mq_start_stopped_hw_queues(struct request_queue *q, bool async)
  }
  EXPORT_SYMBOL(blk_mq_start_stopped_hw_queues);
  
@@ -2089,7 +2199,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  static void blk_mq_run_work_fn(struct work_struct *work)
  {
  	struct blk_mq_hw_ctx *hctx;
-@@ -1629,6 +1925,14 @@ void __blk_mq_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
+@@ -1629,6 +1953,14 @@ void __blk_mq_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
   * Should only be used carefully, when the caller knows we want to
   * bypass a potential IO scheduler on the target device.
   */
@@ -2104,7 +2214,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  void blk_mq_request_bypass_insert(struct request *rq, bool run_queue)
  {
  	struct blk_mq_hw_ctx *hctx = rq->mq_hctx;
-@@ -1680,6 +1984,10 @@ static int plug_rq_cmp(void *priv, struct list_head *a, struct list_head *b)
+@@ -1680,6 +2012,10 @@ static int plug_rq_cmp(void *priv, struct list_head *a, struct list_head *b)
  	return blk_rq_pos(rqa) > blk_rq_pos(rqb);
  }
  
@@ -2115,7 +2225,18 @@ index 323c9cb28066..4b3d9297cbe6 100644
  void blk_mq_flush_plug_list(struct blk_plug *plug, bool from_schedule)
  {
  	struct blk_mq_hw_ctx *this_hctx;
-@@ -1787,6 +2095,11 @@ static blk_status_t __blk_mq_issue_directly(struct blk_mq_hw_ctx *hctx,
+@@ -1748,6 +2084,10 @@ static void blk_mq_bio_to_request(struct request *rq, struct bio *bio,
+ 	blk_account_io_start(rq, true);
+ }
+ 
++/*
++ * called by:
++ *   - block/blk-mq.c|2135| <<__blk_mq_try_issue_directly>> return __blk_mq_issue_directly(hctx, rq, cookie, last);
++ */
+ static blk_status_t __blk_mq_issue_directly(struct blk_mq_hw_ctx *hctx,
+ 					    struct request *rq,
+ 					    blk_qc_t *cookie, bool last)
+@@ -1787,6 +2127,11 @@ static blk_status_t __blk_mq_issue_directly(struct blk_mq_hw_ctx *hctx,
  	return ret;
  }
  
@@ -2127,7 +2248,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  static blk_status_t __blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
  						struct request *rq,
  						blk_qc_t *cookie,
-@@ -1847,6 +2160,11 @@ static void blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
+@@ -1847,6 +2192,11 @@ static void blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
  	hctx_unlock(hctx, srcu_idx);
  }
  
@@ -2139,7 +2260,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  blk_status_t blk_mq_request_issue_directly(struct request *rq, bool last)
  {
  	blk_status_t ret;
-@@ -1861,6 +2179,10 @@ blk_status_t blk_mq_request_issue_directly(struct request *rq, bool last)
+@@ -1861,6 +2211,10 @@ blk_status_t blk_mq_request_issue_directly(struct request *rq, bool last)
  	return ret;
  }
  
@@ -2150,7 +2271,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  void blk_mq_try_issue_list_directly(struct blk_mq_hw_ctx *hctx,
  		struct list_head *list)
  {
-@@ -2275,6 +2597,10 @@ static int blk_mq_hw_ctx_size(struct blk_mq_tag_set *tag_set)
+@@ -2275,6 +2629,10 @@ static int blk_mq_hw_ctx_size(struct blk_mq_tag_set *tag_set)
  	return hw_ctx_size;
  }
  
@@ -2161,7 +2282,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  static int blk_mq_init_hctx(struct request_queue *q,
  		struct blk_mq_tag_set *set,
  		struct blk_mq_hw_ctx *hctx, unsigned hctx_idx)
-@@ -2302,6 +2628,10 @@ static int blk_mq_init_hctx(struct request_queue *q,
+@@ -2302,6 +2660,10 @@ static int blk_mq_init_hctx(struct request_queue *q,
  	return -1;
  }
  
@@ -2172,7 +2293,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  static struct blk_mq_hw_ctx *
  blk_mq_alloc_hctx(struct request_queue *q, struct blk_mq_tag_set *set,
  		int node)
-@@ -2321,6 +2651,14 @@ blk_mq_alloc_hctx(struct request_queue *q, struct blk_mq_tag_set *set,
+@@ -2321,6 +2683,14 @@ blk_mq_alloc_hctx(struct request_queue *q, struct blk_mq_tag_set *set,
  		node = set->numa_node;
  	hctx->numa_node = node;
  
@@ -2187,7 +2308,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  	INIT_DELAYED_WORK(&hctx->run_work, blk_mq_run_work_fn);
  	spin_lock_init(&hctx->lock);
  	INIT_LIST_HEAD(&hctx->dispatch);
-@@ -2429,6 +2767,35 @@ static void blk_mq_free_map_and_requests(struct blk_mq_tag_set *set,
+@@ -2429,6 +2799,35 @@ static void blk_mq_free_map_and_requests(struct blk_mq_tag_set *set,
  	}
  }
  
@@ -2223,7 +2344,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  static void blk_mq_map_swqueue(struct request_queue *q)
  {
  	unsigned int i, j, hctx_idx;
-@@ -2436,6 +2803,9 @@ static void blk_mq_map_swqueue(struct request_queue *q)
+@@ -2436,6 +2835,9 @@ static void blk_mq_map_swqueue(struct request_queue *q)
  	struct blk_mq_ctx *ctx;
  	struct blk_mq_tag_set *set = q->tag_set;
  
@@ -2233,7 +2354,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  	queue_for_each_hw_ctx(q, hctx, i) {
  		cpumask_clear(hctx->cpumask);
  		hctx->nr_ctx = 0;
-@@ -2448,6 +2818,9 @@ static void blk_mq_map_swqueue(struct request_queue *q)
+@@ -2448,6 +2850,9 @@ static void blk_mq_map_swqueue(struct request_queue *q)
  	 * If the cpu isn't present, the cpu is mapped to first hctx.
  	 */
  	for_each_possible_cpu(i) {
@@ -2243,7 +2364,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  		hctx_idx = set->map[HCTX_TYPE_DEFAULT].mq_map[i];
  		/* unmapped hw queue can be remapped after CPU topo changed */
  		if (!set->tags[hctx_idx] &&
-@@ -2470,6 +2843,9 @@ static void blk_mq_map_swqueue(struct request_queue *q)
+@@ -2470,6 +2875,9 @@ static void blk_mq_map_swqueue(struct request_queue *q)
  			}
  
  			hctx = blk_mq_map_queue_type(q, j, i);
@@ -2253,7 +2374,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  			ctx->hctxs[j] = hctx;
  			/*
  			 * If the CPU is already set in the mask, then we've
-@@ -2535,6 +2911,11 @@ static void blk_mq_map_swqueue(struct request_queue *q)
+@@ -2535,6 +2943,11 @@ static void blk_mq_map_swqueue(struct request_queue *q)
   * Caller needs to ensure that we're either frozen/quiesced, or that
   * the queue isn't live yet.
   */
@@ -2265,7 +2386,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  static void queue_set_hctx_shared(struct request_queue *q, bool shared)
  {
  	struct blk_mq_hw_ctx *hctx;
-@@ -2548,6 +2929,11 @@ static void queue_set_hctx_shared(struct request_queue *q, bool shared)
+@@ -2548,6 +2961,11 @@ static void queue_set_hctx_shared(struct request_queue *q, bool shared)
  	}
  }
  
@@ -2277,7 +2398,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  static void blk_mq_update_tag_set_depth(struct blk_mq_tag_set *set,
  					bool shared)
  {
-@@ -2600,8 +2986,16 @@ static void blk_mq_add_queue_tag_set(struct blk_mq_tag_set *set,
+@@ -2600,8 +3018,16 @@ static void blk_mq_add_queue_tag_set(struct blk_mq_tag_set *set,
  }
  
  /* All allocations will be freed in release handler of q->mq_kobj */
@@ -2294,7 +2415,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  	struct blk_mq_ctxs *ctxs;
  	int cpu;
  
-@@ -2656,6 +3050,33 @@ void blk_mq_release(struct request_queue *q)
+@@ -2656,6 +3082,33 @@ void blk_mq_release(struct request_queue *q)
  	blk_mq_sysfs_deinit(q);
  }
  
@@ -2328,7 +2449,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  struct request_queue *blk_mq_init_queue(struct blk_mq_tag_set *set)
  {
  	struct request_queue *uninit_q, *q;
-@@ -2710,6 +3131,10 @@ struct request_queue *blk_mq_init_sq_queue(struct blk_mq_tag_set *set,
+@@ -2710,6 +3163,10 @@ struct request_queue *blk_mq_init_sq_queue(struct blk_mq_tag_set *set,
  }
  EXPORT_SYMBOL(blk_mq_init_sq_queue);
  
@@ -2339,7 +2460,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  static struct blk_mq_hw_ctx *blk_mq_alloc_and_init_hctx(
  		struct blk_mq_tag_set *set, struct request_queue *q,
  		int hctx_idx, int node)
-@@ -2744,6 +3169,11 @@ static struct blk_mq_hw_ctx *blk_mq_alloc_and_init_hctx(
+@@ -2744,6 +3201,11 @@ static struct blk_mq_hw_ctx *blk_mq_alloc_and_init_hctx(
  	return NULL;
  }
  
@@ -2351,7 +2472,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  static void blk_mq_realloc_hw_ctxs(struct blk_mq_tag_set *set,
  						struct request_queue *q)
  {
-@@ -2762,6 +3192,12 @@ static void blk_mq_realloc_hw_ctxs(struct blk_mq_tag_set *set,
+@@ -2762,6 +3224,12 @@ static void blk_mq_realloc_hw_ctxs(struct blk_mq_tag_set *set,
  			memcpy(new_hctxs, hctxs, q->nr_hw_queues *
  			       sizeof(*hctxs));
  		q->queue_hw_ctx = new_hctxs;
@@ -2364,7 +2485,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  		q->nr_hw_queues = set->nr_hw_queues;
  		kfree(hctxs);
  		hctxs = new_hctxs;
-@@ -2822,6 +3258,11 @@ static void blk_mq_realloc_hw_ctxs(struct blk_mq_tag_set *set,
+@@ -2822,6 +3290,11 @@ static void blk_mq_realloc_hw_ctxs(struct blk_mq_tag_set *set,
  	mutex_unlock(&q->sysfs_lock);
  }
  
@@ -2376,7 +2497,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  struct request_queue *blk_mq_init_allocated_queue(struct blk_mq_tag_set *set,
  						  struct request_queue *q,
  						  bool elevator_init)
-@@ -2959,6 +3400,11 @@ static int blk_mq_alloc_rq_maps(struct blk_mq_tag_set *set)
+@@ -2959,6 +3432,11 @@ static int blk_mq_alloc_rq_maps(struct blk_mq_tag_set *set)
  	return 0;
  }
  
@@ -2388,7 +2509,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  static int blk_mq_update_queue_map(struct blk_mq_tag_set *set)
  {
  	if (set->ops->map_queues && !is_kdump_kernel()) {
-@@ -2978,6 +3424,10 @@ static int blk_mq_update_queue_map(struct blk_mq_tag_set *set)
+@@ -2978,6 +3456,10 @@ static int blk_mq_update_queue_map(struct blk_mq_tag_set *set)
  		 * killing stale mapping since one CPU may not be mapped
  		 * to any hw queue.
  		 */
@@ -2399,7 +2520,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  		for (i = 0; i < set->nr_maps; i++)
  			blk_mq_clear_mq_map(&set->map[i]);
  
-@@ -3017,6 +3467,27 @@ static int blk_mq_realloc_tag_set_tags(struct blk_mq_tag_set *set,
+@@ -3017,6 +3499,27 @@ static int blk_mq_realloc_tag_set_tags(struct blk_mq_tag_set *set,
   * requested depth down, if it's too large. In that case, the set
   * value will be stored in set->queue_depth.
   */
@@ -2427,7 +2548,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
  {
  	int i, ret;
-@@ -3069,6 +3540,13 @@ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
+@@ -3069,6 +3572,13 @@ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
  
  	ret = -ENOMEM;
  	for (i = 0; i < set->nr_maps; i++) {
@@ -2441,7 +2562,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  		set->map[i].mq_map = kcalloc_node(nr_cpu_ids,
  						  sizeof(set->map[i].mq_map[0]),
  						  GFP_KERNEL, set->numa_node);
-@@ -3233,6 +3711,15 @@ static void blk_mq_elv_switch_back(struct list_head *head,
+@@ -3233,6 +3743,15 @@ static void blk_mq_elv_switch_back(struct list_head *head,
  	mutex_unlock(&q->sysfs_lock);
  }
  
@@ -2457,7 +2578,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  static void __blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set,
  							int nr_hw_queues)
  {
-@@ -3297,6 +3784,22 @@ static void __blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set,
+@@ -3297,6 +3816,22 @@ static void __blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set,
  		blk_mq_unfreeze_queue(q);
  }
  
@@ -2480,7 +2601,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  void blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set, int nr_hw_queues)
  {
  	mutex_lock(&set->tag_list_lock);
-@@ -3306,8 +3809,19 @@ void blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set, int nr_hw_queues)
+@@ -3306,8 +3841,19 @@ void blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set, int nr_hw_queues)
  EXPORT_SYMBOL_GPL(blk_mq_update_nr_hw_queues);
  
  /* Enable polling stats and return whether they were already enabled. */
@@ -2500,7 +2621,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  	if (test_bit(QUEUE_FLAG_POLL_STATS, &q->queue_flags) ||
  	    blk_queue_flag_test_and_set(QUEUE_FLAG_POLL_STATS, q))
  		return true;
-@@ -3315,6 +3829,10 @@ static bool blk_poll_stats_enable(struct request_queue *q)
+@@ -3315,6 +3861,10 @@ static bool blk_poll_stats_enable(struct request_queue *q)
  	return false;
  }
  
@@ -2511,7 +2632,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  static void blk_mq_poll_stats_start(struct request_queue *q)
  {
  	/*
-@@ -3328,6 +3846,12 @@ static void blk_mq_poll_stats_start(struct request_queue *q)
+@@ -3328,6 +3878,12 @@ static void blk_mq_poll_stats_start(struct request_queue *q)
  	blk_stat_activate_msecs(q->poll_cb, 100);
  }
  
@@ -2524,7 +2645,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  static void blk_mq_poll_stats_fn(struct blk_stat_callback *cb)
  {
  	struct request_queue *q = cb->data;
-@@ -3339,6 +3863,12 @@ static void blk_mq_poll_stats_fn(struct blk_stat_callback *cb)
+@@ -3339,6 +3895,12 @@ static void blk_mq_poll_stats_fn(struct blk_stat_callback *cb)
  	}
  }
  
@@ -2537,7 +2658,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  static unsigned long blk_mq_poll_nsecs(struct request_queue *q,
  				       struct blk_mq_hw_ctx *hctx,
  				       struct request *rq)
-@@ -3372,6 +3902,10 @@ static unsigned long blk_mq_poll_nsecs(struct request_queue *q,
+@@ -3372,6 +3934,10 @@ static unsigned long blk_mq_poll_nsecs(struct request_queue *q,
  	return ret;
  }
  
@@ -2548,7 +2669,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  static bool blk_mq_poll_hybrid_sleep(struct request_queue *q,
  				     struct blk_mq_hw_ctx *hctx,
  				     struct request *rq)
-@@ -3381,6 +3915,13 @@ static bool blk_mq_poll_hybrid_sleep(struct request_queue *q,
+@@ -3381,6 +3947,13 @@ static bool blk_mq_poll_hybrid_sleep(struct request_queue *q,
  	unsigned int nsecs;
  	ktime_t kt;
  
@@ -2562,7 +2683,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  	if (rq->rq_flags & RQF_MQ_POLL_SLEPT)
  		return false;
  
-@@ -3404,6 +3945,9 @@ static bool blk_mq_poll_hybrid_sleep(struct request_queue *q,
+@@ -3404,6 +3977,9 @@ static bool blk_mq_poll_hybrid_sleep(struct request_queue *q,
  	 * This will be replaced with the stats tracking code, using
  	 * 'avg_completion_time / 2' as the pre-sleep target.
  	 */
@@ -2572,7 +2693,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  	kt = nsecs;
  
  	mode = HRTIMER_MODE_REL;
-@@ -3426,6 +3970,33 @@ static bool blk_mq_poll_hybrid_sleep(struct request_queue *q,
+@@ -3426,6 +4002,33 @@ static bool blk_mq_poll_hybrid_sleep(struct request_queue *q,
  	return true;
  }
  
@@ -2606,7 +2727,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  static bool blk_mq_poll_hybrid(struct request_queue *q,
  			       struct blk_mq_hw_ctx *hctx, blk_qc_t cookie)
  {
-@@ -3463,6 +4034,87 @@ static bool blk_mq_poll_hybrid(struct request_queue *q,
+@@ -3463,6 +4066,87 @@ static bool blk_mq_poll_hybrid(struct request_queue *q,
   *    looping until at least one completion is found, unless the task is
   *    otherwise marked running (or we need to reschedule).
   */
@@ -2694,7 +2815,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
  {
  	struct blk_mq_hw_ctx *hctx;
-@@ -3475,6 +4127,10 @@ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
+@@ -3475,6 +4159,10 @@ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
  	if (current->plug)
  		blk_flush_plug_list(current->plug, false);
  
@@ -2705,7 +2826,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  	hctx = q->queue_hw_ctx[blk_qc_t_to_queue_num(cookie)];
  
  	/*
-@@ -3495,6 +4151,9 @@ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
+@@ -3495,6 +4183,9 @@ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
  
  		hctx->poll_invoked++;
  
@@ -2715,7 +2836,7 @@ index 323c9cb28066..4b3d9297cbe6 100644
  		ret = q->mq_ops->poll(hctx);
  		if (ret > 0) {
  			hctx->poll_success++;
-@@ -3517,6 +4176,11 @@ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
+@@ -3517,6 +4208,11 @@ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
  }
  EXPORT_SYMBOL_GPL(blk_poll);
  
@@ -4446,6 +4567,20 @@ index ffe408fead0c..148b2cd90ce0 100644
  		res = check_part[i++](state);
  		if (res < 0) {
  			/* We have hit an I/O error which we don't report now.
+diff --git a/drivers/ata/libata-scsi.c b/drivers/ata/libata-scsi.c
+index 58e09ffe8b9c..522921903e21 100644
+--- a/drivers/ata/libata-scsi.c
++++ b/drivers/ata/libata-scsi.c
+@@ -2017,6 +2017,9 @@ static int ata_scsi_translate(struct ata_device *dev, struct scsi_cmnd *cmd,
+ 	if (xlat_func(qc))
+ 		goto early_finish;
+ 
++	/*
++	 * 一个例子ata_std_qc_defer()
++	 */
+ 	if (ap->ops->qc_defer) {
+ 		if ((rc = ap->ops->qc_defer(qc)))
+ 			goto defer;
 diff --git a/drivers/block/loop.c b/drivers/block/loop.c
 index 739b372a5112..423bba5bcbc0 100644
 --- a/drivers/block/loop.c
@@ -10384,7 +10519,7 @@ index 98e0349adb52..887db5860145 100644
  					 struct inode *inode,
  					 struct iov_iter *iter,
 diff --git a/include/linux/genhd.h b/include/linux/genhd.h
-index ea4c133b4139..56baa3980e06 100644
+index ea4c133b4139..94179c59aed7 100644
 --- a/include/linux/genhd.h
 +++ b/include/linux/genhd.h
 @@ -24,6 +24,11 @@
@@ -10436,7 +10571,20 @@ index ea4c133b4139..56baa3980e06 100644
  static inline bool disk_has_partitions(struct gendisk *disk)
  {
  	bool ret = false;
-@@ -671,6 +699,16 @@ extern ssize_t part_fail_store(struct device *dev,
+@@ -384,6 +412,12 @@ static inline void free_part_stats(struct hd_struct *part)
+ 	 part_stat_read(part, field[STAT_WRITE]) +			\
+ 	 part_stat_read(part, field[STAT_DISCARD]))
+ 
++/*
++ * called by:
++ *   - block/bio.c|1762| <<update_io_ticks>> __part_stat_add(part, io_ticks, 1);
++ *   - include/linux/genhd.h|419| <<part_stat_add>> __part_stat_add((part), field, addnd); \
++ *   - include/linux/genhd.h|421| <<part_stat_add>> __part_stat_add(&part_to_disk((part))->part0, \
++ */
+ #define __part_stat_add(part, field, addnd)				\
+ 	(part_stat_get(part, field) += (addnd))
+ 
+@@ -671,6 +705,16 @@ extern ssize_t part_fail_store(struct device *dev,
  			       const char *buf, size_t count);
  #endif /* CONFIG_FAIL_MAKE_REQUEST */
  
@@ -10453,7 +10601,7 @@ index ea4c133b4139..56baa3980e06 100644
  #define alloc_disk_node(minors, node_id)				\
  ({									\
  	static struct lock_class_key __key;				\
-@@ -712,6 +750,10 @@ static inline void hd_struct_put(struct hd_struct *part)
+@@ -712,6 +756,10 @@ static inline void hd_struct_put(struct hd_struct *part)
  	percpu_ref_put(&part->ref);
  }
  
