@@ -1,17 +1,18 @@
-From 14c73e703c7e49ec11f55749bfd1e73aaaf50b08 Mon Sep 17 00:00:00 2001
+From 568f144841e423e7f13db7a19de61e6ba6e23b33 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Tue, 24 Mar 2020 17:04:15 -0700
+Date: Wed, 1 Apr 2020 16:27:12 -0700
 Subject: [PATCH 1/1] kvm for linux v5.5
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
+ arch/x86/include/asm/kvm_host.h      | 12 ++++
  arch/x86/include/uapi/asm/kvm_para.h | 14 +++++
  arch/x86/kvm/lapic.c                 | 34 ++++++++++
  arch/x86/kvm/lapic.h                 | 64 +++++++++++++++++++
  arch/x86/kvm/mmu.h                   |  6 ++
  arch/x86/kvm/mmu/mmu.c               |  5 ++
- arch/x86/kvm/vmx/vmx.c               |  6 ++
- arch/x86/kvm/x86.c                   | 38 ++++++++++++
+ arch/x86/kvm/vmx/vmx.c               | 10 +++
+ arch/x86/kvm/x86.c                   | 63 +++++++++++++++++++
  drivers/cpuidle/driver.c             |  9 +++
  drivers/vfio/pci/vfio_pci.c          | 45 ++++++++++++++
  drivers/vfio/pci/vfio_pci_config.c   |  4 ++
@@ -23,8 +24,32 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  include/linux/kvm_host.h             |  8 +++
  virt/kvm/eventfd.c                   | 18 ++++++
  virt/kvm/irqchip.c                   | 12 ++++
- 18 files changed, 519 insertions(+)
+ virt/kvm/kvm_main.c                  |  9 +++
+ 20 files changed, 569 insertions(+)
 
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index b79cd6aa4075..1ade14f3e59c 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -943,6 +943,18 @@ struct kvm_arch {
+ 
+ 	u64 disabled_quirks;
+ 
++	/*
++	 * 在以下设置irqchip_mode:
++	 *   - arch/x86/kvm/x86.c|4790| <<kvm_vm_ioctl_enable_cap>> kvm->arch.irqchip_mode = KVM_IRQCHIP_SPLIT;
++	 *   - arch/x86/kvm/x86.c|4911| <<kvm_arch_vm_ioctl>> kvm->arch.irqchip_mode = KVM_IRQCHIP_KERNEL;
++	 *
++	 * 在以下使用irqchip_mode:
++	 *   - arch/x86/kvm/ioapic.h|111| <<ioapic_in_kernel>> int mode = kvm->arch.irqchip_mode;
++	 *   - arch/x86/kvm/irq.h|71| <<pic_in_kernel>> int mode = kvm->arch.irqchip_mode;
++	 *   - arch/x86/kvm/irq.h|80| <<irqchip_split>> int mode = kvm->arch.irqchip_mode;
++	 *   - arch/x86/kvm/irq.h|89| <<irqchip_kernel>> int mode = kvm->arch.irqchip_mode;
++	 *   - arch/x86/kvm/irq.h|98| <<irqchip_in_kernel>> int mode = kvm->arch.irqchip_mode;
++	 */
+ 	enum kvm_irqchip_mode irqchip_mode;
+ 	u8 nr_reserved_ioapic_pins;
+ 
 diff --git a/arch/x86/include/uapi/asm/kvm_para.h b/arch/x86/include/uapi/asm/kvm_para.h
 index 2a8e0b6b9805..96499eb7231b 100644
 --- a/arch/x86/include/uapi/asm/kvm_para.h
@@ -261,7 +286,7 @@ index 6f92b40d798c..6d0b4d6216a3 100644
  {
  	int r;
 diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
-index e3394c839dea..969cfdd73808 100644
+index e3394c839dea..9e834fc0b8f4 100644
 --- a/arch/x86/kvm/vmx/vmx.c
 +++ b/arch/x86/kvm/vmx/vmx.c
 @@ -2622,6 +2622,12 @@ static void free_kvm_area(void)
@@ -277,11 +302,41 @@ index e3394c839dea..969cfdd73808 100644
  static __init int alloc_kvm_area(void)
  {
  	int cpu;
+@@ -6672,6 +6678,10 @@ static void vmx_free_vcpu(struct kvm_vcpu *vcpu)
+ 	kmem_cache_free(kvm_vcpu_cache, vmx);
+ }
+ 
++/*
++ * x86下的调用:
++ *   - arch/x86/kvm/x86.c|9132| <<kvm_arch_vcpu_create>> vcpu = kvm_x86_ops->vcpu_create(kvm, id);
++ */
+ static struct kvm_vcpu *vmx_create_vcpu(struct kvm *kvm, unsigned int id)
+ {
+ 	int err;
 diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
-index cf917139de6b..5bed5a8596de 100644
+index cf917139de6b..61bc14fdeebf 100644
 --- a/arch/x86/kvm/x86.c
 +++ b/arch/x86/kvm/x86.c
-@@ -7902,11 +7902,25 @@ void kvm_make_scan_ioapic_request_mask(struct kvm *kvm,
+@@ -4908,6 +4908,18 @@ long kvm_arch_vm_ioctl(struct file *filp,
+ 		}
+ 		/* Write kvm->irq_routing before enabling irqchip_in_kernel. */
+ 		smp_wmb();
++		/*
++		 * 在以下设置irqchip_mode:
++		 *   - arch/x86/kvm/x86.c|4790| <<kvm_vm_ioctl_enable_cap>> kvm->arch.irqchip_mode = KVM_IRQCHIP_SPLIT;
++		 *   - arch/x86/kvm/x86.c|4911| <<kvm_arch_vm_ioctl>> kvm->arch.irqchip_mode = KVM_IRQCHIP_KERNEL;
++		 *
++		 * 在以下使用irqchip_mode:
++		 *   - arch/x86/kvm/ioapic.h|111| <<ioapic_in_kernel>> int mode = kvm->arch.irqchip_mode;
++		 *   - arch/x86/kvm/irq.h|71| <<pic_in_kernel>> int mode = kvm->arch.irqchip_mode;
++		 *   - arch/x86/kvm/irq.h|80| <<irqchip_split>> int mode = kvm->arch.irqchip_mode;
++		 *   - arch/x86/kvm/irq.h|89| <<irqchip_kernel>> int mode = kvm->arch.irqchip_mode;
++		 *   - arch/x86/kvm/irq.h|98| <<irqchip_in_kernel>> int mode = kvm->arch.irqchip_mode;
++		 */
+ 		kvm->arch.irqchip_mode = KVM_IRQCHIP_KERNEL;
+ 	create_irqchip_unlock:
+ 		mutex_unlock(&kvm->lock);
+@@ -7902,11 +7914,34 @@ void kvm_make_scan_ioapic_request_mask(struct kvm *kvm,
  	free_cpumask_var(cpus);
  }
  
@@ -299,6 +354,15 @@ index cf917139de6b..5bed5a8596de 100644
  }
  
 +/*
++ * [0] vcpu_scan_ioapic
++ * [0] kvm_arch_vcpu_ioctl_run
++ * [0] kvm_vcpu_ioctl
++ * [0] do_vfs_ioctl
++ * [0] ksys_ioctl
++ * [0] __x64_sys_ioctl
++ * [0] do_syscall_64
++ * [0] entry_SYSCALL_64_after_hwframe
++ *
 + * called by:
 + *   - arch/x86/kvm/x86.c|8075| <<vcpu_enter_guest>> vcpu_scan_ioapic(vcpu);
 + * 8074                 if (kvm_check_request(KVM_REQ_SCAN_IOAPIC, vcpu))
@@ -307,7 +371,7 @@ index cf917139de6b..5bed5a8596de 100644
  static void vcpu_scan_ioapic(struct kvm_vcpu *vcpu)
  {
  	if (!kvm_apic_present(vcpu))
-@@ -8000,6 +8014,13 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+@@ -8000,6 +8035,13 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
  
  	bool req_immediate_exit = false;
  
@@ -321,7 +385,7 @@ index cf917139de6b..5bed5a8596de 100644
  	if (kvm_request_pending(vcpu)) {
  		if (kvm_check_request(KVM_REQ_GET_VMCS12_PAGES, vcpu)) {
  			if (unlikely(!kvm_x86_ops->get_vmcs12_pages(vcpu))) {
-@@ -8139,6 +8160,12 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+@@ -8139,6 +8181,12 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
  		}
  	}
  
@@ -334,7 +398,18 @@ index cf917139de6b..5bed5a8596de 100644
  	r = kvm_mmu_reload(vcpu);
  	if (unlikely(r)) {
  		goto cancel_injection;
-@@ -9389,9 +9416,20 @@ bool kvm_vcpu_is_bsp(struct kvm_vcpu *vcpu)
+@@ -9092,6 +9140,10 @@ void kvm_arch_vcpu_free(struct kvm_vcpu *vcpu)
+ 	free_cpumask_var(wbinvd_dirty_mask);
+ }
+ 
++/*
++ * called by:
++ *   - virt/kvm/kvm_main.c|2734| <<kvm_vm_ioctl_create_vcpu>> vcpu = kvm_arch_vcpu_create(kvm, id);
++ */
+ struct kvm_vcpu *kvm_arch_vcpu_create(struct kvm *kvm,
+ 						unsigned int id)
+ {
+@@ -9389,9 +9441,20 @@ bool kvm_vcpu_is_bsp(struct kvm_vcpu *vcpu)
  	return (vcpu->arch.apic_base & MSR_IA32_APICBASE_BSP) != 0;
  }
  
@@ -1174,6 +1249,33 @@ index 58e4f88b2b9f..2a28cba67930 100644
  int kvm_set_irq(struct kvm *kvm, int irq_source_id, u32 irq, int level,
  		bool line_status)
  {
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 00268290dcbd..1890c8bab13b 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -322,6 +322,11 @@ void kvm_reload_remote_mmus(struct kvm *kvm)
+ 	kvm_make_all_cpus_request(kvm, KVM_REQ_MMU_RELOAD);
+ }
+ 
++/*
++ * x86下的调用:
++ *   - arch/x86/kvm/svm.c|2181| <<svm_create_vcpu>> err = kvm_vcpu_init(&svm->vcpu, kvm, id);
++ *   - arch/x86/kvm/vmx/vmx.c|6713| <<vmx_create_vcpu>> err = kvm_vcpu_init(&vmx->vcpu, kvm, id);
++ */
+ int kvm_vcpu_init(struct kvm_vcpu *vcpu, struct kvm *kvm, unsigned id)
+ {
+ 	struct page *page;
+@@ -2714,6 +2719,10 @@ static void kvm_create_vcpu_debugfs(struct kvm_vcpu *vcpu)
+ /*
+  * Creates some virtual cpus.  Good luck creating more than one.
+  */
++/*
++ * called by:
++ *   - virt/kvm/kvm_main.c|3287| <<kvm_vm_ioctl(KVM_CREATE_VCPU)>> r = kvm_vm_ioctl_create_vcpu(kvm, arg);
++ */
+ static int kvm_vm_ioctl_create_vcpu(struct kvm *kvm, u32 id)
+ {
+ 	int r;
 -- 
 2.17.1
 
