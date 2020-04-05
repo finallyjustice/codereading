@@ -1,0 +1,434 @@
+From 77beb4297443681bb484e663dc660a66f53027be Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Sun, 5 Apr 2020 15:52:01 -0700
+Subject: [PATCH 1/1] linux-xen-interface-for-linux-5.5
+
+xen specific interface v5.5
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ arch/x86/kernel/cpu/hypervisor.c |  4 ++
+ arch/x86/kernel/pvclock.c        |  6 ++
+ arch/x86/kernel/setup.c          |  3 +
+ arch/x86/xen/enlighten.c         | 57 +++++++++++++++++++
+ arch/x86/xen/enlighten_hvm.c     | 24 ++++++++
+ arch/x86/xen/enlighten_pv.c      |  5 ++
+ arch/x86/xen/smp_hvm.c           | 12 ++++
+ arch/x86/xen/time.c              | 96 ++++++++++++++++++++++++++++++++
+ include/xen/interface/xen.h      |  5 ++
+ 9 files changed, 212 insertions(+)
+
+diff --git a/arch/x86/kernel/cpu/hypervisor.c b/arch/x86/kernel/cpu/hypervisor.c
+index 553bfbfc3a1b..3756e74ec2b2 100644
+--- a/arch/x86/kernel/cpu/hypervisor.c
++++ b/arch/x86/kernel/cpu/hypervisor.c
+@@ -92,6 +92,10 @@ static void __init copy_array(const void *src, void *target, unsigned int size)
+ 			to[i] = from[i];
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kernel/setup.c|1051| <<setup_arch>> init_hypervisor_platform();
++ */
+ void __init init_hypervisor_platform(void)
+ {
+ 	const struct hypervisor_x86 *h;
+diff --git a/arch/x86/kernel/pvclock.c b/arch/x86/kernel/pvclock.c
+index 10125358b9c4..3b9fcd1dc271 100644
+--- a/arch/x86/kernel/pvclock.c
++++ b/arch/x86/kernel/pvclock.c
+@@ -64,6 +64,12 @@ u8 pvclock_read_flags(struct pvclock_vcpu_time_info *src)
+ 	return flags & valid_flags;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kernel/kvmclock.c|90| <<kvm_clock_read>> ret = pvclock_clocksource_read(this_cpu_pvti());
++ *   - arch/x86/kernel/pvclock.c|137| <<pvclock_read_wallclock>> delta = pvclock_clocksource_read(vcpu_time);
++ *   - arch/x86/xen/time.c|52| <<xen_clocksource_read>> ret = pvclock_clocksource_read(src);
++ */
+ u64 pvclock_clocksource_read(struct pvclock_vcpu_time_info *src)
+ {
+ 	unsigned version;
+diff --git a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
+index cedfe2077a69..10bba7808308 100644
+--- a/arch/x86/kernel/setup.c
++++ b/arch/x86/kernel/setup.c
+@@ -1165,6 +1165,9 @@ void __init setup_arch(char **cmdline_p)
+ 	trim_platform_memory_ranges();
+ 	trim_low_memory_range();
+ 
++	/*
++	 * 会重新初始化vcpu0的vcpu info
++	 */
+ 	init_mem_mapping();
+ 
+ 	idt_setup_early_pf();
+diff --git a/arch/x86/xen/enlighten.c b/arch/x86/xen/enlighten.c
+index 205b1176084f..307f272fbda1 100644
+--- a/arch/x86/xen/enlighten.c
++++ b/arch/x86/xen/enlighten.c
+@@ -38,6 +38,30 @@ EXPORT_SYMBOL_GPL(hypercall_page);
+  * hypercall.
+  *
+  */
++/*
++ * 使用xen_vcpu的地方:
++ *   - arch/x86/xen/enlighten.c|191| <<xen_vcpu_info_reset>> per_cpu(xen_vcpu, cpu) =
++ *   - arch/x86/xen/enlighten.c|195| <<xen_vcpu_info_reset>> per_cpu(xen_vcpu, cpu) = NULL;
++ *   - arch/x86/xen/enlighten.c|219| <<xen_vcpu_setup>> if (per_cpu(xen_vcpu, cpu) == &per_cpu(xen_vcpu_info, cpu))
++ *   - arch/x86/xen/enlighten.c|250| <<xen_vcpu_setup>> per_cpu(xen_vcpu, cpu) = vcpup;
++ *   - arch/x86/xen/enlighten.c|257| <<xen_vcpu_setup>> return ((per_cpu(xen_vcpu, cpu) == NULL) ? -ENODEV : 0);
++ *   - arch/x86/xen/enlighten_pv.c|1405| <<xen_cpu_up_prepare_pv>> if (per_cpu(xen_vcpu, cpu) == NULL)
++ *   - arch/x86/xen/irq.c|32| <<xen_save_fl>> vcpu = this_cpu_read(xen_vcpu);
++ *   - arch/x86/xen/irq.c|54| <<xen_restore_fl>> vcpu = this_cpu_read(xen_vcpu);
++ *   - arch/x86/xen/irq.c|73| <<xen_irq_disable>> this_cpu_read(xen_vcpu)->evtchn_upcall_mask = 1;
++ *   - arch/x86/xen/irq.c|89| <<xen_irq_enable>> vcpu = this_cpu_read(xen_vcpu);
++ *   - arch/x86/xen/mmu_pv.c|1307| <<xen_write_cr2>> this_cpu_read(xen_vcpu)->arch.cr2 = cr2;
++ *   - arch/x86/xen/smp_pv.c|381| <<xen_pv_cpu_up>> per_cpu(xen_vcpu, cpu)->evtchn_upcall_mask = 1;
++ *   - arch/x86/xen/time.c|78| <<xen_clocksource_read>> src = &__this_cpu_read(xen_vcpu)->time;
++ *   - arch/x86/xen/time.c|118| <<xen_read_wallclock>> vcpu_time = &get_cpu_var(xen_vcpu)->time;
++ *   - arch/x86/xen/time.c|120| <<xen_read_wallclock>> put_cpu_var(xen_vcpu);
++ *   - arch/x86/xen/time.c|553| <<xen_time_init>> pvti = &__this_cpu_read(xen_vcpu)->time;
++ *   - drivers/xen/events/events_2l.c|121| <<evtchn_2l_unmask>> struct vcpu_info *vcpu_info = __this_cpu_read(xen_vcpu);
++ *   - drivers/xen/events/events_2l.c|171| <<evtchn_2l_handle_events>> struct vcpu_info *vcpu_info = __this_cpu_read(xen_vcpu);
++ *   - drivers/xen/events/events_2l.c|281| <<xen_debug_interrupt>> v = per_cpu(xen_vcpu, i);
++ *   - drivers/xen/events/events_2l.c|290| <<xen_debug_interrupt>> v = per_cpu(xen_vcpu, cpu);
++ *   - drivers/xen/events/events_base.c|1218| <<__xen_evtchn_do_upcall>> struct vcpu_info *vcpu_info = __this_cpu_read(xen_vcpu);
++ */
+ DEFINE_PER_CPU(struct vcpu_info *, xen_vcpu);
+ 
+ /*
+@@ -48,6 +72,17 @@ DEFINE_PER_CPU(struct vcpu_info *, xen_vcpu);
+ DEFINE_PER_CPU(struct vcpu_info, xen_vcpu_info);
+ 
+ /* Linux <-> Xen vCPU id mapping */
++/*
++ * 在以下使用xen_vcpu_id:
++ *   - arch/x86/xen/enlighten_hvm.c|116| <<init_hvm_pv_info>> this_cpu_write(xen_vcpu_id, ebx);
++ *   - arch/x86/xen/enlighten_hvm.c|118| <<init_hvm_pv_info>> this_cpu_write(xen_vcpu_id, smp_processor_id());
++ *   - arch/x86/xen/enlighten_hvm.c|150| <<xen_cpu_up_prepare_hvm>> per_cpu(xen_vcpu_id, cpu) = cpu_acpi_id(cpu);
++ *   - arch/x86/xen/enlighten_hvm.c|152| <<xen_cpu_up_prepare_hvm>> per_cpu(xen_vcpu_id, cpu) = cpu;
++ *   - arch/x86/xen/enlighten_pv.c|965| <<xen_setup_vcpu_info_placement>> per_cpu(xen_vcpu_id, cpu) = cpu;
++ *   - arch/x86/xen/enlighten_pv.c|1248| <<xen_start_kernel>> per_cpu(xen_vcpu_id, 0) = 0;
++ *   - arch/x86/xen/smp_hvm.c|52| <<xen_hvm_smp_prepare_cpus>> per_cpu(xen_vcpu_id, cpu) = XEN_VCPU_ID_INVALID;
++ *   - include/xen/xen-ops.h|17| <<xen_vcpu_nr>> return per_cpu(xen_vcpu_id, cpu);
++ */
+ DEFINE_PER_CPU(uint32_t, xen_vcpu_id);
+ EXPORT_PER_CPU_SYMBOL(xen_vcpu_id);
+ 
+@@ -185,9 +220,24 @@ void xen_vcpu_restore(void)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/xen/enlighten.c|128| <<xen_vcpu_setup_restore>> xen_vcpu_info_reset(cpu);
++ *   - arch/x86/xen/enlighten.c|255| <<xen_vcpu_setup>> xen_vcpu_info_reset(cpu);
++ *   - arch/x86/xen/enlighten_hvm.c|82| <<xen_hvm_init_mem_mapping>> xen_vcpu_info_reset(0);
++ *   - arch/x86/xen/enlighten_hvm.c|193| <<xen_hvm_guest_init>> xen_vcpu_info_reset(0);
++ *   - arch/x86/xen/enlighten_pv.c|138| <<xen_pv_init_platform>> xen_vcpu_info_reset(0);
++ *   - arch/x86/xen/enlighten_pv.c|1203| <<xen_start_kernel>> xen_vcpu_info_reset(0);
++ *   - arch/x86/xen/smp.c|141| <<xen_smp_cpus_done>> xen_vcpu_info_reset(cpu);
++ */
+ void xen_vcpu_info_reset(int cpu)
+ {
+ 	if (xen_vcpu_nr(cpu) < MAX_VIRT_CPUS) {
++		/*
++		 * 使用shared->vcpu_info的地方:
++		 *   - arch/x86/xen/enlighten.c|192| <<xen_vcpu_info_reset>> &HYPERVISOR_shared_info->vcpu_info[xen_vcpu_nr(cpu)];
++		 *   - arch/x86/xen/time.c|48| <<xen_tsc_khz>> &HYPERVISOR_shared_info->vcpu_info[0].time;
++		 */
+ 		per_cpu(xen_vcpu, cpu) =
+ 			&HYPERVISOR_shared_info->vcpu_info[xen_vcpu_nr(cpu)];
+ 	} else {
+@@ -196,6 +246,13 @@ void xen_vcpu_info_reset(int cpu)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/xen/enlighten.c|160| <<xen_vcpu_setup_restore>> rc = xen_vcpu_setup(cpu);
++ *   - arch/x86/xen/enlighten_hvm.c|153| <<xen_cpu_up_prepare_hvm>> rc = xen_vcpu_setup(cpu);
++ *   - arch/x86/xen/enlighten_pv.c|975| <<xen_setup_vcpu_info_placement>> (void ) xen_vcpu_setup(cpu);
++ *   - arch/x86/xen/smp_hvm.c|23| <<xen_hvm_smp_prepare_boot_cpu>> xen_vcpu_setup(0);
++ */
+ int xen_vcpu_setup(int cpu)
+ {
+ 	struct vcpu_register_vcpu_info info;
+diff --git a/arch/x86/xen/enlighten_hvm.c b/arch/x86/xen/enlighten_hvm.c
+index e138f7de52d2..d36e4908e24b 100644
+--- a/arch/x86/xen/enlighten_hvm.c
++++ b/arch/x86/xen/enlighten_hvm.c
+@@ -82,6 +82,10 @@ static void __init xen_hvm_init_mem_mapping(void)
+ 	xen_vcpu_info_reset(0);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/xen/enlighten_hvm.c|186| <<xen_hvm_guest_init>> init_hvm_pv_info();
++ */
+ static void __init init_hvm_pv_info(void)
+ {
+ 	int major, minor;
+@@ -111,6 +115,17 @@ static void __init init_hvm_pv_info(void)
+ 
+ 	xen_setup_features();
+ 
++	/*
++	 * 在以下使用xen_vcpu_id:
++	 *   - arch/x86/xen/enlighten_hvm.c|116| <<init_hvm_pv_info>> this_cpu_write(xen_vcpu_id, ebx);
++	 *   - arch/x86/xen/enlighten_hvm.c|118| <<init_hvm_pv_info>> this_cpu_write(xen_vcpu_id, smp_processor_id());
++	 *   - arch/x86/xen/enlighten_hvm.c|150| <<xen_cpu_up_prepare_hvm>> per_cpu(xen_vcpu_id, cpu) = cpu_acpi_id(cpu);
++	 *   - arch/x86/xen/enlighten_hvm.c|152| <<xen_cpu_up_prepare_hvm>> per_cpu(xen_vcpu_id, cpu) = cpu;
++	 *   - arch/x86/xen/enlighten_pv.c|965| <<xen_setup_vcpu_info_placement>> per_cpu(xen_vcpu_id, cpu) = cpu;
++	 *   - arch/x86/xen/enlighten_pv.c|1248| <<xen_start_kernel>> per_cpu(xen_vcpu_id, 0) = 0;
++	 *   - arch/x86/xen/smp_hvm.c|52| <<xen_hvm_smp_prepare_cpus>> per_cpu(xen_vcpu_id, cpu) = XEN_VCPU_ID_INVALID;
++	 *   - include/xen/xen-ops.h|17| <<xen_vcpu_nr>> return per_cpu(xen_vcpu_id, cpu);
++	 */
+ 	cpuid(base + 4, &eax, &ebx, &ecx, &edx);
+ 	if (eax & XEN_HVM_CPUID_VCPU_ID_PRESENT)
+ 		this_cpu_write(xen_vcpu_id, ebx);
+@@ -133,6 +148,12 @@ static void xen_hvm_crash_shutdown(struct pt_regs *regs)
+ }
+ #endif
+ 
++/*
++ * 在以下使用xen_cpu_up_prepare_hvm():
++ *   - arch/x86/xen/enlighten_hvm.c|219| <<xen_hvm_guest_init>> WARN_ON(xen_cpuhp_setup(xen_cpu_up_prepare_hvm, xen_cpu_dead_hvm));
++ *
++ * kdump只有一个cpu的时候没有为cpu=0调用过
++ */
+ static int xen_cpu_up_prepare_hvm(unsigned int cpu)
+ {
+ 	int rc = 0;
+@@ -175,6 +196,9 @@ static int xen_cpu_dead_hvm(unsigned int cpu)
+        return 0;
+ }
+ 
++/*
++ * struct hypervisor_x86 x86_hyper_xen_hvm.init.init_platform = xen_hvm_guest_init()
++ */
+ static void __init xen_hvm_guest_init(void)
+ {
+ 	if (xen_pv_domain())
+diff --git a/arch/x86/xen/enlighten_pv.c b/arch/x86/xen/enlighten_pv.c
+index ae4a41ca19f6..c932a75571d9 100644
+--- a/arch/x86/xen/enlighten_pv.c
++++ b/arch/x86/xen/enlighten_pv.c
+@@ -956,6 +956,11 @@ static void xen_write_msr(unsigned int msr, unsigned low, unsigned high)
+ }
+ 
+ /* This is called once we have the cpu_possible_mask */
++/*
++ * called by:
++ *   - arch/x86/xen/enlighten_pv.c|148| <<xen_pv_guest_late_init>> xen_setup_vcpu_info_placement();
++ *   - arch/x86/xen/smp_pv.c|222| <<xen_pv_smp_prepare_boot_cpu>> xen_setup_vcpu_info_placement();
++ */
+ void __init xen_setup_vcpu_info_placement(void)
+ {
+ 	int cpu;
+diff --git a/arch/x86/xen/smp_hvm.c b/arch/x86/xen/smp_hvm.c
+index f8d39440b292..0b105a7501e2 100644
+--- a/arch/x86/xen/smp_hvm.c
++++ b/arch/x86/xen/smp_hvm.c
+@@ -7,6 +7,10 @@
+ #include "smp.h"
+ 
+ 
++/*
++ * 在以下使用:
++ *   - arch/x86/xen/smp_hvm.c|74| <<xen_hvm_smp_init>> smp_ops.smp_prepare_boot_cpu = xen_hvm_smp_prepare_boot_cpu; 
++ */
+ static void __init xen_hvm_smp_prepare_boot_cpu(void)
+ {
+ 	BUG_ON(smp_processor_id() != 0);
+@@ -27,6 +31,10 @@ static void __init xen_hvm_smp_prepare_boot_cpu(void)
+ 	xen_init_spinlocks();
+ }
+ 
++/*
++ * 在以下使用xen_hvm_smp_prepare_cpus():
++ *   - arch/x86/xen/smp_hvm.c|73| <<xen_hvm_smp_init>> smp_ops.smp_prepare_cpus = xen_hvm_smp_prepare_cpus;
++ */
+ static void __init xen_hvm_smp_prepare_cpus(unsigned int max_cpus)
+ {
+ 	int cpu;
+@@ -61,6 +69,10 @@ static void xen_hvm_cpu_die(unsigned int cpu)
+ }
+ #endif
+ 
++/*
++ * called by:
++ *   - arch/x86/xen/enlighten_hvm.c|203| <<xen_hvm_guest_init>> xen_hvm_smp_init();
++ */
+ void __init xen_hvm_smp_init(void)
+ {
+ 	if (!xen_have_vector_callback)
+diff --git a/arch/x86/xen/time.c b/arch/x86/xen/time.c
+index befbdd8b17f0..b3b63e9b45bf 100644
+--- a/arch/x86/xen/time.c
++++ b/arch/x86/xen/time.c
+@@ -31,6 +31,14 @@
+ /* Minimum amount of time until next clock event fires */
+ #define TIMER_SLOP	100000
+ 
++/*
++ * 在以下使用xen_sched_clock_offset:
++ *   - arch/x86/xen/time.c|83| <<xen_sched_clock>> return xen_clocksource_read() - xen_sched_clock_offset;
++ *   - arch/x86/xen/time.c|406| <<xen_save_time_memory_area>> xen_clock_value_saved = xen_clocksource_read() - xen_sched_clock_offset;
++ *   - arch/x86/xen/time.c|448| <<xen_restore_time_memory_area>> xen_sched_clock_offset = xen_clocksource_read() - xen_clock_value_saved;
++ *   - arch/x86/xen/time.c|540| <<xen_init_time_ops>> xen_sched_clock_offset = xen_clocksource_read();
++ *   - arch/x86/xen/time.c|582| <<xen_hvm_init_time_ops>> xen_sched_clock_offset = xen_clocksource_read();
++ */
+ static u64 xen_sched_clock_offset __read_mostly;
+ 
+ /* Get the TSC speed from Xen */
+@@ -42,12 +50,55 @@ static unsigned long xen_tsc_khz(void)
+ 	return pvclock_tsc_khz(info);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/xen/time.c|59| <<xen_clocksource_get_cycles>> return xen_clocksource_read();
++ *   - arch/x86/xen/time.c|64| <<xen_sched_clock>> return xen_clocksource_read() - xen_sched_clock_offset;
++ *   - arch/x86/xen/time.c|116| <<xen_pvclock_gtod_notify>> op.u.settime64.system_time = xen_clocksource_read();
++ *   - arch/x86/xen/time.c|121| <<xen_pvclock_gtod_notify>> op.u.settime32.system_time = xen_clocksource_read();
++ *   - arch/x86/xen/time.c|189| <<get_abs_timeout>> return xen_clocksource_read() + delta;
++ *   - arch/x86/xen/time.c|387| <<xen_save_time_memory_area>> xen_clock_value_saved = xen_clocksource_read() - xen_sched_clock_offset;
++ *   - arch/x86/xen/time.c|429| <<xen_restore_time_memory_area>> xen_sched_clock_offset = xen_clocksource_read() - xen_clock_value_saved;
++ *   - arch/x86/xen/time.c|521| <<xen_init_time_ops>> xen_sched_clock_offset = xen_clocksource_read();
++ *   - arch/x86/xen/time.c|563| <<xen_hvm_init_time_ops>> xen_sched_clock_offset = xen_clocksource_read();
++ *
++ * setup_arch()
++ * -> init_hypervisor_platform()
++ *    -> x86_init.hyper.init_platform = xen_hvm_guest_init()
++ *       -> xen_hvm_init_time_ops()
++ *          -> xen_clocksource_read()
++ *             -> src = &__this_cpu_read(xen_vcpu)->time;
++ */
+ static u64 xen_clocksource_read(void)
+ {
+         struct pvclock_vcpu_time_info *src;
+ 	u64 ret;
+ 
+ 	preempt_disable_notrace();
++	/*
++	 * 使用xen_vcpu的地方:
++	 *   - arch/x86/xen/enlighten.c|191| <<xen_vcpu_info_reset>> per_cpu(xen_vcpu, cpu) =
++	 *   - arch/x86/xen/enlighten.c|195| <<xen_vcpu_info_reset>> per_cpu(xen_vcpu, cpu) = NULL;
++	 *   - arch/x86/xen/enlighten.c|219| <<xen_vcpu_setup>> if (per_cpu(xen_vcpu, cpu) == &per_cpu(xen_vcpu_info, cpu))
++	 *   - arch/x86/xen/enlighten.c|250| <<xen_vcpu_setup>> per_cpu(xen_vcpu, cpu) = vcpup;
++	 *   - arch/x86/xen/enlighten.c|257| <<xen_vcpu_setup>> return ((per_cpu(xen_vcpu, cpu) == NULL) ? -ENODEV : 0);
++	 *   - arch/x86/xen/enlighten_pv.c|1405| <<xen_cpu_up_prepare_pv>> if (per_cpu(xen_vcpu, cpu) == NULL)
++	 *   - arch/x86/xen/irq.c|32| <<xen_save_fl>> vcpu = this_cpu_read(xen_vcpu);
++	 *   - arch/x86/xen/irq.c|54| <<xen_restore_fl>> vcpu = this_cpu_read(xen_vcpu);
++	 *   - arch/x86/xen/irq.c|73| <<xen_irq_disable>> this_cpu_read(xen_vcpu)->evtchn_upcall_mask = 1;
++	 *   - arch/x86/xen/irq.c|89| <<xen_irq_enable>> vcpu = this_cpu_read(xen_vcpu);
++	 *   - arch/x86/xen/mmu_pv.c|1307| <<xen_write_cr2>> this_cpu_read(xen_vcpu)->arch.cr2 = cr2;
++	 *   - arch/x86/xen/smp_pv.c|381| <<xen_pv_cpu_up>> per_cpu(xen_vcpu, cpu)->evtchn_upcall_mask = 1;
++	 *   - arch/x86/xen/time.c|78| <<xen_clocksource_read>> src = &__this_cpu_read(xen_vcpu)->time;
++	 *   - arch/x86/xen/time.c|118| <<xen_read_wallclock>> vcpu_time = &get_cpu_var(xen_vcpu)->time;
++	 *   - arch/x86/xen/time.c|120| <<xen_read_wallclock>> put_cpu_var(xen_vcpu);
++	 *   - arch/x86/xen/time.c|553| <<xen_time_init>> pvti = &__this_cpu_read(xen_vcpu)->time;
++	 *   - drivers/xen/events/events_2l.c|121| <<evtchn_2l_unmask>> struct vcpu_info *vcpu_info = __this_cpu_read(xen_vcpu);
++	 *   - drivers/xen/events/events_2l.c|171| <<evtchn_2l_handle_events>> struct vcpu_info *vcpu_info = __this_cpu_read(xen_vcpu);
++	 *   - drivers/xen/events/events_2l.c|281| <<xen_debug_interrupt>> v = per_cpu(xen_vcpu, i);
++	 *   - drivers/xen/events/events_2l.c|290| <<xen_debug_interrupt>> v = per_cpu(xen_vcpu, cpu);
++	 *   - drivers/xen/events/events_base.c|1218| <<__xen_evtchn_do_upcall>> struct vcpu_info *vcpu_info = __this_cpu_read(xen_vcpu);
++	 */
+ 	src = &__this_cpu_read(xen_vcpu)->time;
+ 	ret = pvclock_clocksource_read(src);
+ 	preempt_enable_notrace();
+@@ -61,6 +112,24 @@ static u64 xen_clocksource_get_cycles(struct clocksource *cs)
+ 
+ static u64 xen_sched_clock(void)
+ {
++	/*
++	 * 在以下使用xen_sched_clock_offset:
++	 *   - arch/x86/xen/time.c|83| <<xen_sched_clock>> return xen_clocksource_read() - xen_sched_clock_offset;
++	 *   - arch/x86/xen/time.c|406| <<xen_save_time_memory_area>> xen_clock_value_saved = xen_clocksource_read() - xen_sched_clock_offset;
++	 *   - arch/x86/xen/time.c|448| <<xen_restore_time_memory_area>> xen_sched_clock_offset = xen_clocksource_read() - xen_clock_value_saved;
++	 *   - arch/x86/xen/time.c|540| <<xen_init_time_ops>> xen_sched_clock_offset = xen_clocksource_read();
++	 *   - arch/x86/xen/time.c|582| <<xen_hvm_init_time_ops>> xen_sched_clock_offset = xen_clocksource_read();
++	 *
++	 * 假设开始xen_sched_clock_offset=0
++	 * xen_save_time_memory_area()的时候: xen_clocksource_read()=100, xen_sched_clock_offset=0, 所以xen_clock_value_saved=100
++	 * xen_restore_time_memory_area()的时候: xen_clocksource_read()=150, xen_clock_value_saved=100, 所以xen_sched_clock_offset=50
++	 * 此时xen_sched_clock()会返回: xen_clocksource_read() - xen_sched_clock_offset = 150 - 50 = 100
++	 *
++	 * 假设再次进行一次迁移, 此时xen_sched_clock_offset=50, xen_clocksource_read()=180
++	 * xen_save_time_memory_area()的时候: xen_clocksource_read()=180, xen_sched_clock_offset=50, 所以xen_clock_value_saved=130
++	 * xen_restore_time_memory_area()的时候: xen_clocksource_read()=230, xen_clock_value_saved=130, 所以xen_sched_clock_offset=100
++	 * 此时xen_sched_clock()会返回: xen_clocksource_read() - xen_sched_clock_offset = 230 - 100 = 130
++	 */
+ 	return xen_clocksource_read() - xen_sched_clock_offset;
+ }
+ 
+@@ -377,6 +446,11 @@ static const struct pv_time_ops xen_time_ops __initconst = {
+ };
+ 
+ static struct pvclock_vsyscall_time_info *xen_clock __read_mostly;
++/*
++ * 在以下使用xen_clock_value_saved:
++ *   - arch/x86/xen/time.c|406| <<xen_save_time_memory_area>> xen_clock_value_saved = xen_clocksource_read() - xen_sched_clock_offset;
++ *   - arch/x86/xen/time.c|448| <<xen_restore_time_memory_area>> xen_sched_clock_offset = xen_clocksource_read() - xen_clock_value_saved;
++ */
+ static u64 xen_clock_value_saved;
+ 
+ void xen_save_time_memory_area(void)
+@@ -545,6 +619,10 @@ static void xen_hvm_setup_cpu_clockevents(void)
+ 	xen_setup_cpu_clockevents();
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/xen/enlighten_hvm.c|204| <<xen_hvm_guest_init>> xen_hvm_init_time_ops();
++ */
+ void __init xen_hvm_init_time_ops(void)
+ {
+ 	/*
+@@ -560,6 +638,24 @@ void __init xen_hvm_init_time_ops(void)
+ 		return;
+ 	}
+ 
++	/*
++	 * 在以下使用xen_sched_clock_offset:
++	 *   - arch/x86/xen/time.c|83| <<xen_sched_clock>> return xen_clocksource_read() - xen_sched_clock_offset;
++	 *   - arch/x86/xen/time.c|406| <<xen_save_time_memory_area>> xen_clock_value_saved = xen_clocksource_read() - xen_sched_clock_offset;
++	 *   - arch/x86/xen/time.c|448| <<xen_restore_time_memory_area>> xen_sched_clock_offset = xen_clocksource_read() - xen_clock_value_saved;
++	 *   - arch/x86/xen/time.c|540| <<xen_init_time_ops>> xen_sched_clock_offset = xen_clocksource_read();
++	 *   - arch/x86/xen/time.c|582| <<xen_hvm_init_time_ops>> xen_sched_clock_offset = xen_clocksource_read();
++	 *
++	 * 假设开始xen_sched_clock_offset=0
++	 * xen_save_time_memory_area()的时候: xen_clocksource_read()=100, xen_sched_clock_offset=0, 所以xen_clock_value_saved=100
++	 * xen_restore_time_memory_area()的时候: xen_clocksource_read()=150, xen_clock_value_saved=100, 所以xen_sched_clock_offset=50
++	 * 此时xen_sched_clock()会返回: xen_clocksource_read() - xen_sched_clock_offset = 150 - 50 = 100
++	 *
++	 * 假设再次进行一次迁移, 此时xen_sched_clock_offset=50, xen_clocksource_read()=180
++	 * xen_save_time_memory_area()的时候: xen_clocksource_read()=180, xen_sched_clock_offset=50, 所以xen_clock_value_saved=130
++	 * xen_restore_time_memory_area()的时候: xen_clocksource_read()=230, xen_clock_value_saved=130, 所以xen_sched_clock_offset=100
++	 * 此时xen_sched_clock()会返回: xen_clocksource_read() - xen_sched_clock_offset = 230 - 100 = 130
++	 */
+ 	xen_sched_clock_offset = xen_clocksource_read();
+ 	pv_ops.time = xen_time_ops;
+ 	x86_init.timers.setup_percpu_clockev = xen_time_init;
+diff --git a/include/xen/interface/xen.h b/include/xen/interface/xen.h
+index 8bfb242f433e..e9e2f1f32882 100644
+--- a/include/xen/interface/xen.h
++++ b/include/xen/interface/xen.h
+@@ -557,6 +557,11 @@ struct vcpu_info {
+  * NB. We expect that this struct is smaller than a page.
+  */
+ struct shared_info {
++	/*
++	 * 使用shared->vcpu_info的地方:
++	 *   - arch/x86/xen/enlighten.c|192| <<xen_vcpu_info_reset>> &HYPERVISOR_shared_info->vcpu_info[xen_vcpu_nr(cpu)];
++	 *   - arch/x86/xen/time.c|48| <<xen_tsc_khz>> &HYPERVISOR_shared_info->vcpu_info[0].time;
++	 */
+ 	struct vcpu_info vcpu_info[MAX_VIRT_CPUS];
+ 
+ 	/*
+-- 
+2.17.1
+
