@@ -1,6 +1,6 @@
-From 2825cc72cb89314d59f414a16e05d15a4eb02f67 Mon Sep 17 00:00:00 2001
+From c0a3c88a7bf864146e3ab5b2521afbd570ffd4b3 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Wed, 22 Apr 2020 13:55:50 -0700
+Date: Sun, 26 Apr 2020 17:41:15 -0700
 Subject: [PATCH 1/1] kvm for linux v5.5
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
@@ -16,12 +16,14 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  arch/x86/kvm/lapic.h                 |  64 +++
  arch/x86/kvm/mmu.h                   |   6 +
  arch/x86/kvm/mmu/mmu.c               |  38 ++
- arch/x86/kvm/vmx/vmx.c               |  24 ++
- arch/x86/kvm/x86.c                   | 573 +++++++++++++++++++++++++++
+ arch/x86/kvm/vmx/vmcs.h              |   9 +
+ arch/x86/kvm/vmx/vmenter.S           | 102 +++++
+ arch/x86/kvm/vmx/vmx.c               |  43 ++
+ arch/x86/kvm/x86.c                   | 589 +++++++++++++++++++++++++++
  drivers/cpuidle/driver.c             |   9 +
- drivers/vfio/pci/vfio_pci.c          |  45 +++
+ drivers/vfio/pci/vfio_pci.c          |  45 ++
  drivers/vfio/pci/vfio_pci_config.c   |   4 +
- drivers/vfio/pci/vfio_pci_intrs.c    |  45 +++
+ drivers/vfio/pci/vfio_pci_intrs.c    |  45 ++
  drivers/vfio/pci/vfio_pci_private.h  |  43 ++
  drivers/vfio/pci/vfio_pci_rdwr.c     |  27 ++
  drivers/vfio/vfio.c                  |  93 +++++
@@ -32,7 +34,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  virt/kvm/eventfd.c                   |  18 +
  virt/kvm/irqchip.c                   |  12 +
  virt/kvm/kvm_main.c                  |   9 +
- 27 files changed, 1418 insertions(+)
+ 29 files changed, 1564 insertions(+)
 
 diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
 index b79cd6aa4075..8e8635661e64 100644
@@ -673,11 +675,209 @@ index 6f92b40d798c..45d86f27bb08 100644
  int kvm_mmu_page_fault(struct kvm_vcpu *vcpu, gva_t cr2, u64 error_code,
  		       void *insn, int insn_len)
  {
+diff --git a/arch/x86/kvm/vmx/vmcs.h b/arch/x86/kvm/vmx/vmcs.h
+index 481ad879197b..667b168190ca 100644
+--- a/arch/x86/kvm/vmx/vmcs.h
++++ b/arch/x86/kvm/vmx/vmcs.h
+@@ -59,6 +59,15 @@ struct loaded_vmcs {
+ 	struct vmcs *vmcs;
+ 	struct vmcs *shadow_vmcs;
+ 	int cpu;
++	/*
++	 * 在以下使用launched:
++	 *   - arch/x86/kvm/vmx/nested.c|3008| <<nested_vmx_check_vmentry_hw>> [launched]"i"(offsetof(struct loaded_vmcs, launched)),
++	 *   - arch/x86/kvm/vmx/vmx.c|660| <<loaded_vmcs_init>> if (loaded_vmcs->shadow_vmcs && loaded_vmcs->launched)
++	 *   - arch/x86/kvm/vmx/vmx.c|663| <<loaded_vmcs_init>> loaded_vmcs->launched = 0;
++	 *   - arch/x86/kvm/vmx/vmx.c|6596| <<vmx_vcpu_run>> vmx->loaded_vmcs->launched);
++	 *   - arch/x86/kvm/vmx/vmx.c|6678| <<vmx_vcpu_run>> vmx->loaded_vmcs->launched = 1;
++	 *   - 在arch/x86/kvm/vmx/vmenter.S中也用到, 标志是应该vmresume还是vmlaunch
++	 */
+ 	bool launched;
+ 	bool nmi_known_unmasked;
+ 	bool hv_timer_soft_disabled;
+diff --git a/arch/x86/kvm/vmx/vmenter.S b/arch/x86/kvm/vmx/vmenter.S
+index 81ada2ce99e7..db945eb46778 100644
+--- a/arch/x86/kvm/vmx/vmenter.S
++++ b/arch/x86/kvm/vmx/vmenter.S
+@@ -7,6 +7,28 @@
+ 
+ #define WORD_SIZE (BITS_PER_LONG / 8)
+ 
++/*
++ * #define __VCPU_REGS_RAX  0
++ * #define __VCPU_REGS_RCX  1
++ * #define __VCPU_REGS_RDX  2
++ * #define __VCPU_REGS_RBX  3
++ * #define __VCPU_REGS_RSP  4
++ * #define __VCPU_REGS_RBP  5
++ * #define __VCPU_REGS_RSI  6
++ * #define __VCPU_REGS_RDI  7
++ *
++ * #ifdef CONFIG_X86_64
++ * #define __VCPU_REGS_R8   8
++ * #define __VCPU_REGS_R9   9
++ * #define __VCPU_REGS_R10 10
++ * #define __VCPU_REGS_R11 11
++ * #define __VCPU_REGS_R12 12
++ * #define __VCPU_REGS_R13 13
++ * #define __VCPU_REGS_R14 14
++ * #define __VCPU_REGS_R15 15
++ * #endif
++ */
++
+ #define VCPU_RAX	__VCPU_REGS_RAX * WORD_SIZE
+ #define VCPU_RCX	__VCPU_REGS_RCX * WORD_SIZE
+ #define VCPU_RDX	__VCPU_REGS_RDX * WORD_SIZE
+@@ -44,6 +66,15 @@
+  * to vmx_vmexit.
+  */
+ SYM_FUNC_START(vmx_vmenter)
++	/*
++	 * 在以下使用launched:
++	 *   - arch/x86/kvm/vmx/nested.c|3008| <<nested_vmx_check_vmentry_hw>> [launched]"i"(offsetof(struct loaded_vmcs, launched)),
++	 *   - arch/x86/kvm/vmx/vmx.c|660| <<loaded_vmcs_init>> if (loaded_vmcs->shadow_vmcs && loaded_vmcs->launched)
++	 *   - arch/x86/kvm/vmx/vmx.c|663| <<loaded_vmcs_init>> loaded_vmcs->launched = 0;
++	 *   - arch/x86/kvm/vmx/vmx.c|6596| <<vmx_vcpu_run>> vmx->loaded_vmcs->launched);
++	 *   - arch/x86/kvm/vmx/vmx.c|6678| <<vmx_vcpu_run>> vmx->loaded_vmcs->launched = 1;
++	 *   - 在arch/x86/kvm/vmx/vmenter.S中也用到, 标志是应该vmresume还是vmlaunch
++	 */
+ 	/* EFLAGS.ZF is set if VMCS.LAUNCHED == 0 */
+ 	je 2f
+ 
+@@ -62,6 +93,18 @@ SYM_FUNC_START(vmx_vmenter)
+ 5:	jmp 3b
+ 	.popsection
+ 
++	/*
++	 * https://lwn.net/Articles/531148/
++	 * 
++	 * The _ASM_EXTABLE(addr1, addr2) macro allows the page fault exception
++	 * handler to determine whether an exception was caused by a kernel
++	 * instruction at address addr1 while trying to read or write a byte
++	 * into a process address space. If so, the kernel jumps to addr2 that
++	 * contains the fixup code, otherwise a kernel oops occurs. The
++	 * delimiters of the __ex_table special section (see the previous
++	 * linker script example) set the range of critical kernel instructions
++	 * that transfer bytes from or to user space.
++	 */
+ 	_ASM_EXTABLE(1b, 5b)
+ 	_ASM_EXTABLE(2b, 5b)
+ 
+@@ -77,6 +120,10 @@ SYM_FUNC_END(vmx_vmenter)
+  * here after hardware loads the host's state, i.e. this is the destination
+  * referred to by VMCS.HOST_RIP.
+  */
++/*
++ * 在以下使用vmx_vmexit:
++ *   - arch/x86/kvm/vmx/vmx.c|3923| <<vmx_set_constant_host_state>> vmcs_writel(HOST_RIP, (unsigned long )vmx_vmexit);
++ */
+ SYM_FUNC_START(vmx_vmexit)
+ #ifdef CONFIG_RETPOLINE
+ 	ALTERNATIVE "jmp .Lvmexit_skip_rsb", "", X86_FEATURE_RETPOLINE
+@@ -101,6 +148,19 @@ SYM_FUNC_END(vmx_vmexit)
+  * Returns:
+  *	0 on VM-Exit, 1 on VM-Fail
+  */
++/*
++ * bool __vmx_vcpu_run(struct vcpu_vmx *vmx, unsigned long *regs, bool launched);
++ *
++ * vmx_vcpu_run()调用:
++ * 6595         vmx->fail = __vmx_vcpu_run(vmx, (unsigned long *)&vcpu->arch.regs,
++ * 6596                                    vmx->loaded_vmcs->launched);
++ *
++ * calling convention: RDI, RSI, RDX, RCX, R8, R9, [XYZ]MM0–7
++ *
++ * rdi: struct vcpu_vmx *vmx
++ * rsi: unsigned long *regs
++ * rdx: bool launched
++ */
+ SYM_FUNC_START(__vmx_vcpu_run)
+ 	push %_ASM_BP
+ 	mov  %_ASM_SP, %_ASM_BP
+@@ -119,18 +179,46 @@ SYM_FUNC_START(__vmx_vcpu_run)
+ 	 * Save @regs, _ASM_ARG2 may be modified by vmx_update_host_rsp() and
+ 	 * @regs is needed after VM-Exit to save the guest's register values.
+ 	 */
++	/* x86_64下的定义是_ASM_SI, 第二个参数(unsigned long *)&vcpu->arch.regs */
+ 	push %_ASM_ARG2
+ 
+ 	/* Copy @launched to BL, _ASM_ARG3 is volatile. */
++	/* x86_64下的定义是dl, 第三个参数vmx->loaded_vmcs->launched */
+ 	mov %_ASM_ARG3B, %bl
+ 
+ 	/* Adjust RSP to account for the CALL to vmx_vmenter(). */
++	/*
++	 * %_ASM_ARG2在x86_64下的定义是_ASM_SI,
++	 * 这里相当于把host的rsp地址(其实不包括(unsigned long *)&vcpu->arch.regs)放入_ASM_SI
++	 * 作为vmx_update_host_rsp()的参数"unsigned long host_rsp"
++	 */
+ 	lea -WORD_SIZE(%_ASM_SP), %_ASM_ARG2
++	/*
++	 * 6486 void vmx_update_host_rsp(struct vcpu_vmx *vmx, unsigned long host_rsp)
++	 * 6487 {
++	 * 6488         if (unlikely(host_rsp != vmx->loaded_vmcs->host_state.rsp)) {
++	 * 6489                 vmx->loaded_vmcs->host_state.rsp = host_rsp;
++	 * 6490                 vmcs_writel(HOST_RSP, host_rsp);
++	 * 6491         }
++	 * 6492 }
++	 */
+ 	call vmx_update_host_rsp
+ 
+ 	/* Load @regs to RAX. */
++	/*
++	 * 和上面的"lea -WORD_SIZE(%_ASM_SP), %_ASM_ARG2"对应
++	 */
+ 	mov (%_ASM_SP), %_ASM_AX
+ 
++	/*
++	 * 在以下使用launched:
++	 *   - arch/x86/kvm/vmx/nested.c|3008| <<nested_vmx_check_vmentry_hw>> [launched]"i"(offsetof(struct loaded_vmcs, launched)),
++	 *   - arch/x86/kvm/vmx/vmx.c|660| <<loaded_vmcs_init>> if (loaded_vmcs->shadow_vmcs && loaded_vmcs->launched)
++	 *   - arch/x86/kvm/vmx/vmx.c|663| <<loaded_vmcs_init>> loaded_vmcs->launched = 0;
++	 *   - arch/x86/kvm/vmx/vmx.c|6596| <<vmx_vcpu_run>> vmx->loaded_vmcs->launched);
++	 *   - arch/x86/kvm/vmx/vmx.c|6678| <<vmx_vcpu_run>> vmx->loaded_vmcs->launched = 1;
++	 *   - 在arch/x86/kvm/vmx/vmenter.S中也用到, 标志是应该vmresume还是vmlaunch
++	 */
+ 	/* Check if vmlaunch or vmresume is needed */
+ 	cmpb $0, %bl
+ 
+@@ -154,6 +242,20 @@ SYM_FUNC_START(__vmx_vcpu_run)
+ 	/* Load guest RAX.  This kills the @regs pointer! */
+ 	mov VCPU_RAX(%_ASM_AX), %_ASM_AX
+ 
++	/*
++	 * vmx_vmenter - VM-Enter the current loaded VMCS
++	 *
++	 * %RFLAGS.ZF:  !VMCS.LAUNCHED, i.e. controls VMLAUNCH vs. VMRESUME
++	 *
++	 * Returns:
++	 *      %RFLAGS.CF is set on VM-Fail Invalid
++	 *      %RFLAGS.ZF is set on VM-Fail Valid
++	 *      %RFLAGS.{CF,ZF} are cleared on VM-Success, i.e. VM-Exit
++	 *
++	 * Note that VMRESUME/VMLAUNCH fall-through and return directly if
++	 * they VM-Fail, whereas a successful VM-Enter + VM-Exit will jump
++	 * to vmx_vmexit.
++	 */
+ 	/* Enter guest mode */
+ 	call vmx_vmenter
+ 
 diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
-index e3394c839dea..d0ee26bc36a0 100644
+index e3394c839dea..75ccdef59989 100644
 --- a/arch/x86/kvm/vmx/vmx.c
 +++ b/arch/x86/kvm/vmx/vmx.c
-@@ -2622,6 +2622,12 @@ static void free_kvm_area(void)
+@@ -1085,6 +1085,10 @@ static inline void pt_save_msr(struct pt_ctx *ctx, u32 addr_range)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|6547| <<vmx_vcpu_run>> pt_guest_enter(vmx);
++ */
+ static void pt_guest_enter(struct vcpu_vmx *vmx)
+ {
+ 	if (pt_mode == PT_MODE_SYSTEM)
+@@ -2622,6 +2626,12 @@ static void free_kvm_area(void)
  	}
  }
  
@@ -690,7 +890,7 @@ index e3394c839dea..d0ee26bc36a0 100644
  static __init int alloc_kvm_area(void)
  {
  	int cpu;
-@@ -5062,6 +5068,9 @@ static int handle_apic_write(struct kvm_vcpu *vcpu)
+@@ -5062,6 +5072,9 @@ static int handle_apic_write(struct kvm_vcpu *vcpu)
  	return 1;
  }
  
@@ -700,7 +900,7 @@ index e3394c839dea..d0ee26bc36a0 100644
  static int handle_task_switch(struct kvm_vcpu *vcpu)
  {
  	struct vcpu_vmx *vmx = to_vmx(vcpu);
-@@ -5119,6 +5128,13 @@ static int handle_task_switch(struct kvm_vcpu *vcpu)
+@@ -5119,6 +5132,13 @@ static int handle_task_switch(struct kvm_vcpu *vcpu)
  			       reason, has_error_code, error_code);
  }
  
@@ -714,7 +914,7 @@ index e3394c839dea..d0ee26bc36a0 100644
  static int handle_ept_violation(struct kvm_vcpu *vcpu)
  {
  	unsigned long exit_qualification;
-@@ -5191,6 +5207,10 @@ static int handle_nmi_window(struct kvm_vcpu *vcpu)
+@@ -5191,6 +5211,10 @@ static int handle_nmi_window(struct kvm_vcpu *vcpu)
  	return 1;
  }
  
@@ -725,7 +925,36 @@ index e3394c839dea..d0ee26bc36a0 100644
  static int handle_invalid_guest_state(struct kvm_vcpu *vcpu)
  {
  	struct vcpu_vmx *vmx = to_vmx(vcpu);
-@@ -6672,6 +6692,10 @@ static void vmx_free_vcpu(struct kvm_vcpu *vcpu)
+@@ -6469,6 +6493,9 @@ void vmx_update_host_rsp(struct vcpu_vmx *vmx, unsigned long host_rsp)
+ 
+ bool __vmx_vcpu_run(struct vcpu_vmx *vmx, unsigned long *regs, bool launched);
+ 
++/*
++ * struct kvm_x86_ops vmx_x86_ops.run = vmx_vcpu_run()
++ */
+ static void vmx_vcpu_run(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+@@ -6553,6 +6580,18 @@ static void vmx_vcpu_run(struct kvm_vcpu *vcpu)
+ 	if (vcpu->arch.cr2 != read_cr2())
+ 		write_cr2(vcpu->arch.cr2);
+ 
++	/*
++	 * arch/x86/kvm/vmx/vmenter.S:
++	 * __vmx_vcpu_run - Run a vCPU via a transition to VMX guest mode
++	 * @vmx:        struct vcpu_vmx * (forwarded to vmx_update_host_rsp)
++	 * @regs:       unsigned long * (to guest registers)
++	 * @launched:   %true if the VMCS has been launched
++	 *
++	 * Returns:
++	 *      0 on VM-Exit, 1 on VM-Fail
++	 *
++	 * 只在这里调用__vmx_vcpu_run()
++	 */
+ 	vmx->fail = __vmx_vcpu_run(vmx, (unsigned long *)&vcpu->arch.regs,
+ 				   vmx->loaded_vmcs->launched);
+ 
+@@ -6672,6 +6711,10 @@ static void vmx_free_vcpu(struct kvm_vcpu *vcpu)
  	kmem_cache_free(kvm_vcpu_cache, vmx);
  }
  
@@ -737,7 +966,7 @@ index e3394c839dea..d0ee26bc36a0 100644
  {
  	int err;
 diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
-index cf917139de6b..c3ad0d5aa182 100644
+index cf917139de6b..a28ee5c341a8 100644
 --- a/arch/x86/kvm/x86.c
 +++ b/arch/x86/kvm/x86.c
 @@ -74,8 +74,21 @@
@@ -1759,7 +1988,51 @@ index cf917139de6b..c3ad0d5aa182 100644
  	r = kvm_mmu_reload(vcpu);
  	if (unlikely(r)) {
  		goto cancel_injection;
-@@ -8332,6 +8851,11 @@ static inline int vcpu_block(struct kvm *kvm, struct kvm_vcpu *vcpu)
+@@ -8146,6 +8665,10 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 
+ 	preempt_disable();
+ 
++	/*
++	 * vmx_prepare_switch_to_guest()
++	 * svm_prepare_guest_switch()
++	 */
+ 	kvm_x86_ops->prepare_guest_switch(vcpu);
+ 
+ 	/*
+@@ -8211,6 +8734,10 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 		vcpu->arch.switch_db_regs &= ~KVM_DEBUGREG_RELOAD;
+ 	}
+ 
++	/*
++	 * vmx_vcpu_run()
++	 * svm_vcpu_run()
++	 */
+ 	kvm_x86_ops->run(vcpu);
+ 
+ 	/*
+@@ -8243,6 +8770,10 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 	vcpu->mode = OUTSIDE_GUEST_MODE;
+ 	smp_wmb();
+ 
++	/*
++	 * vmx_handle_exit_irqoff()
++	 * svm_handle_exit_irqoff()
++	 */
+ 	kvm_x86_ops->handle_exit_irqoff(vcpu);
+ 
+ 	/*
+@@ -8287,6 +8818,10 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 		kvm_lapic_sync_from_vapic(vcpu);
+ 
+ 	vcpu->arch.gpa_available = false;
++	/*
++	 * vmx: vmx_handle_exit()
++	 * svm: handle_exit()
++	 */
+ 	r = kvm_x86_ops->handle_exit(vcpu);
+ 	return r;
+ 
+@@ -8332,6 +8867,11 @@ static inline int vcpu_block(struct kvm *kvm, struct kvm_vcpu *vcpu)
  	return 1;
  }
  
@@ -1771,7 +2044,7 @@ index cf917139de6b..c3ad0d5aa182 100644
  static inline bool kvm_vcpu_running(struct kvm_vcpu *vcpu)
  {
  	if (is_guest_mode(vcpu) && kvm_x86_ops->check_nested_events)
-@@ -8341,6 +8865,10 @@ static inline bool kvm_vcpu_running(struct kvm_vcpu *vcpu)
+@@ -8341,6 +8881,10 @@ static inline bool kvm_vcpu_running(struct kvm_vcpu *vcpu)
  		!vcpu->arch.apf.halted);
  }
  
@@ -1782,7 +2055,7 @@ index cf917139de6b..c3ad0d5aa182 100644
  static int vcpu_run(struct kvm_vcpu *vcpu)
  {
  	int r;
-@@ -8426,6 +8954,11 @@ static int complete_emulated_pio(struct kvm_vcpu *vcpu)
+@@ -8426,6 +8970,11 @@ static int complete_emulated_pio(struct kvm_vcpu *vcpu)
   *       copy data
   *       exit
   */
@@ -1794,7 +2067,7 @@ index cf917139de6b..c3ad0d5aa182 100644
  static int complete_emulated_mmio(struct kvm_vcpu *vcpu)
  {
  	struct kvm_run *run = vcpu->run;
-@@ -8760,6 +9293,11 @@ int kvm_arch_vcpu_ioctl_set_mpstate(struct kvm_vcpu *vcpu,
+@@ -8760,6 +9309,11 @@ int kvm_arch_vcpu_ioctl_set_mpstate(struct kvm_vcpu *vcpu,
  	return ret;
  }
  
@@ -1806,7 +2079,7 @@ index cf917139de6b..c3ad0d5aa182 100644
  int kvm_task_switch(struct kvm_vcpu *vcpu, u16 tss_selector, int idt_index,
  		    int reason, bool has_error_code, u32 error_code)
  {
-@@ -9092,6 +9630,10 @@ void kvm_arch_vcpu_free(struct kvm_vcpu *vcpu)
+@@ -9092,6 +9646,10 @@ void kvm_arch_vcpu_free(struct kvm_vcpu *vcpu)
  	free_cpumask_var(wbinvd_dirty_mask);
  }
  
@@ -1817,7 +2090,7 @@ index cf917139de6b..c3ad0d5aa182 100644
  struct kvm_vcpu *kvm_arch_vcpu_create(struct kvm *kvm,
  						unsigned int id)
  {
-@@ -9364,6 +9906,7 @@ int kvm_arch_hardware_setup(void)
+@@ -9364,6 +9922,7 @@ int kvm_arch_hardware_setup(void)
  	if (boot_cpu_has(X86_FEATURE_XSAVES))
  		rdmsrl(MSR_IA32_XSS, host_xss);
  
@@ -1825,7 +2098,7 @@ index cf917139de6b..c3ad0d5aa182 100644
  	kvm_init_msr_list();
  	return 0;
  }
-@@ -9389,9 +9932,20 @@ bool kvm_vcpu_is_bsp(struct kvm_vcpu *vcpu)
+@@ -9389,9 +9948,20 @@ bool kvm_vcpu_is_bsp(struct kvm_vcpu *vcpu)
  	return (vcpu->arch.apic_base & MSR_IA32_APICBASE_BSP) != 0;
  }
  
@@ -1846,7 +2119,7 @@ index cf917139de6b..c3ad0d5aa182 100644
  int kvm_arch_vcpu_init(struct kvm_vcpu *vcpu)
  {
  	struct page *page;
-@@ -9998,6 +10552,11 @@ void kvm_set_rflags(struct kvm_vcpu *vcpu, unsigned long rflags)
+@@ -9998,6 +10568,11 @@ void kvm_set_rflags(struct kvm_vcpu *vcpu, unsigned long rflags)
  }
  EXPORT_SYMBOL_GPL(kvm_set_rflags);
  
@@ -1858,7 +2131,7 @@ index cf917139de6b..c3ad0d5aa182 100644
  void kvm_arch_async_page_ready(struct kvm_vcpu *vcpu, struct kvm_async_pf *work)
  {
  	int r;
-@@ -10199,6 +10758,11 @@ bool kvm_arch_can_inject_async_page_present(struct kvm_vcpu *vcpu)
+@@ -10199,6 +10774,11 @@ bool kvm_arch_can_inject_async_page_present(struct kvm_vcpu *vcpu)
  		return kvm_can_do_async_pf(vcpu);
  }
  
@@ -1870,7 +2143,7 @@ index cf917139de6b..c3ad0d5aa182 100644
  void kvm_arch_start_assignment(struct kvm *kvm)
  {
  	atomic_inc(&kvm->arch.assigned_device_count);
-@@ -10240,6 +10804,10 @@ bool kvm_arch_has_irq_bypass(void)
+@@ -10240,6 +10820,10 @@ bool kvm_arch_has_irq_bypass(void)
  	return true;
  }
  
@@ -1881,7 +2154,7 @@ index cf917139de6b..c3ad0d5aa182 100644
  int kvm_arch_irq_bypass_add_producer(struct irq_bypass_consumer *cons,
  				      struct irq_bypass_producer *prod)
  {
-@@ -10280,6 +10848,11 @@ int kvm_arch_update_irqfd_routing(struct kvm *kvm, unsigned int host_irq,
+@@ -10280,6 +10864,11 @@ int kvm_arch_update_irqfd_routing(struct kvm *kvm, unsigned int host_irq,
  	return kvm_x86_ops->update_pi_irte(kvm, host_irq, guest_irq, set);
  }
  
