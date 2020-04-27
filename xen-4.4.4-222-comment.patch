@@ -1,6 +1,6 @@
-From 004bd7f8f592fd83ba498ba9ef694aa5e88e2598 Mon Sep 17 00:00:00 2001
+From 25650c8b85cc3d98e86a9e718a0bee476cc2da66 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Fri, 24 Apr 2020 15:48:24 -0700
+Date: Mon, 27 Apr 2020 00:02:14 -0700
 Subject: [PATCH 1/1] xen-4.4.4-222-comment
 
 xen-4.4.4-222
@@ -13,7 +13,11 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  tools/libxc/xc_hvm_build_x86.c          |  20 +
  tools/libxc/xc_misc.c                   |  14 +
  tools/python/xen/xend/XendDomainInfo.py |   2 +
- tools/xenstore/xenstored_transaction.c  |   4 +
+ tools/xenstore/xenstored_core.c         | 169 ++++++
+ tools/xenstore/xenstored_core.h         |  18 +
+ tools/xenstore/xenstored_domain.c       |  67 +++
+ tools/xenstore/xenstored_transaction.c  |  90 +++
+ tools/xenstore/xs.c                     |   7 +
  xen/arch/x86/domain.c                   |  66 ++
  xen/arch/x86/domain_page.c              |  17 +
  xen/arch/x86/hvm/hvm.c                  |  11 +
@@ -29,7 +33,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  xen/include/asm-x86/mm.h                |  34 ++
  xen/include/xen/mm.h                    |  77 +++
  xen/include/xen/sched.h                 |  42 ++
- 22 files changed, 1258 insertions(+)
+ 26 files changed, 1605 insertions(+)
 
 diff --git a/tools/libxc/xc_dom_x86.c b/tools/libxc/xc_dom_x86.c
 index b2256f2c5e..6ea4408480 100644
@@ -221,21 +225,651 @@ index 6d52be1ffa..6452299551 100644
          old_domid = self.domid
          self._writeVm(RESTART_IN_PROGRESS, 'True')
  
+diff --git a/tools/xenstore/xenstored_core.c b/tools/xenstore/xenstored_core.c
+index 6a28161523..b5d860e008 100644
+--- a/tools/xenstore/xenstored_core.c
++++ b/tools/xenstore/xenstored_core.c
+@@ -62,7 +62,26 @@ static unsigned int nr_fds;
+ 
+ #define ROUNDUP(_x, _w) (((unsigned long)(_x)+(1UL<<(_w))-1) & ~((1UL<<(_w))-1))
+ 
++/*
++ * 在以下使用xenstored的verbose:
++ *   - xenstore/xenstored_core.c|263| <<write_messages>> if (verbose)
++ *   - xenstore/xenstored_core.c|1415| <<consider_message>> if (verbose)
++ *   - xenstore/xenstored_core.c|2051| <<main>> verbose = true; --> 大写的V
++ *
++ * xenstored --pid-file /var/run/xenstored.pid -V -T /var/log/xen/xenstored-trace.log
++ */
+ static bool verbose = false;
++/*
++ * 在以下使用connections:
++ *   - xenstore/xenstored_core.c|66| <<global>> LIST_HEAD(connections);
++ *   - xenstore/xenstored_core.c|369| <<initialize_fds>> list_for_each_entry(conn, &connections, list) {
++ *   - xenstore/xenstored_core.c|1438| <<new_connection>> list_add_tail(&new->list, &connections);
++ *   - xenstore/xenstored_core.c|2099| <<main>> next = list_entry(connections.next, typeof(*conn), list);
++ *   - xenstore/xenstored_core.c|2100| <<main>> if (&next->list != &connections)
++ *   - xenstore/xenstored_core.c|2102| <<main>> while (&next->list != &connections) {
++ *   - xenstore/xenstored_core.c|2107| <<main>> if (&next->list != &connections)
++ *   - xenstore/xenstored_watch.c|109| <<fire_watches>> list_for_each_entry(i, &connections, list) {
++ */
+ LIST_HEAD(connections);
+ static int tracefd = -1;
+ static bool recovery = true;
+@@ -71,6 +90,13 @@ static int reopen_log_pipe[2];
+ static int reopen_log_pipe0_pollfd_idx = -1;
+ static char *tracefile = NULL;
+ static TDB_CONTEXT *tdb_ctx = NULL;
++/*
++ * 在以下使用trigger_talloc_report:
++ *   - xenstore/xenstored_core.c|74| <<global>> static bool trigger_talloc_report = false;
++ *   - xenstore/xenstored_core.c|1827| <<do_talloc_report>> trigger_talloc_report = true;
++ *   - xenstore/xenstored_core.c|2035| <<main>> if (trigger_talloc_report) {
++ *   - xenstore/xenstored_core.c|2039| <<main>> trigger_talloc_report = false;
++ */
+ static bool trigger_talloc_report = false;
+ 
+ static void corrupt(struct connection *conn, const char *fmt, ...);
+@@ -650,6 +676,18 @@ unsigned int get_strings(struct buffered_data *data,
+ 	return i;
+ }
+ 
++/*
++ * called by:
++ *   - xenstore/xenstored_core.c|722| <<send_ack>> send_reply(conn, type, "OK", sizeof("OK"));
++ *   - xenstore/xenstored_core.c|736| <<send_error>> send_reply(conn, XS_ERROR, xsd_errors[i].errstring,
++ *   - xenstore/xenstored_core.c|832| <<send_directory>> send_reply(conn, XS_DIRECTORY, node->children, node->childlen);
++ *   - xenstore/xenstored_core.c|847| <<do_read>> send_reply(conn, XS_READ, node->data, node->datalen);
++ *   - xenstore/xenstored_core.c|1185| <<do_get_perms>> send_reply(conn, XS_GET_PERMS, strings, len);
++ *   - xenstore/xenstored_domain.c|604| <<do_get_domain_path>> send_reply(conn, XS_GET_DOMAIN_PATH, path, strlen(path) + 1);
++ *   - xenstore/xenstored_domain.c|626| <<do_is_domain_introduced>> send_reply(conn, XS_IS_DOMAIN_INTRODUCED, result ? "T" : "F", 2);
++ *   - xenstore/xenstored_transaction.c|238| <<do_transaction_start>> send_reply(conn, XS_TRANSACTION_START, id_str, strlen(id_str)+1);
++ *   - xenstore/xenstored_watch.c|90| <<add_event>> send_reply(conn, XS_WATCH_EVENT, data, len);
++ */
+ void send_reply(struct connection *conn, enum xsd_sockmsg_type type,
+ 		const void *data, unsigned int len)
+ {
+@@ -682,6 +720,23 @@ void send_reply(struct connection *conn, enum xsd_sockmsg_type type,
+ }
+ 
+ /* Some routines (write, mkdir, etc) just need a non-error return */
++/*
++ * called by:
++ *   - xenstore/xenstored_core.c|986| <<do_write>> send_ack(conn, XS_WRITE);
++ *   - xenstore/xenstored_core.c|1019| <<do_mkdir>> send_ack(conn, XS_MKDIR);
++ *   - xenstore/xenstored_core.c|1126| <<do_rm>> send_ack(conn, XS_RM);
++ *   - xenstore/xenstored_core.c|1145| <<do_rm>> send_ack(conn, XS_RM);
++ *   - xenstore/xenstored_core.c|1222| <<do_set_perms>> send_ack(conn, XS_SET_PERMS);
++ *   - xenstore/xenstored_core.c|1247| <<do_debug>> send_ack(conn, XS_DEBUG);
++ *   - xenstore/xenstored_domain.c|467| <<do_introduce>> send_ack(conn, XS_INTRODUCE);
++ *   - xenstore/xenstored_domain.c|512| <<do_set_target>> send_ack(conn, XS_SET_TARGET);
++ *   - xenstore/xenstored_domain.c|551| <<do_release>> send_ack(conn, XS_RELEASE);
++ *   - xenstore/xenstored_domain.c|589| <<do_resume>> send_ack(conn, XS_RESUME);
++ *   - xenstore/xenstored_domain.c|635| <<do_reset_watches>> send_ack(conn, XS_RESET_WATCHES);
++ *   - xenstore/xenstored_transaction.c|276| <<do_transaction_end>> send_ack(conn, XS_TRANSACTION_END);
++ *   - xenstore/xenstored_watch.c|180| <<do_watch>> send_ack(conn, XS_WATCH);
++ *   - xenstore/xenstored_watch.c|202| <<do_unwatch>> send_ack(conn, XS_UNWATCH);
++ */
+ void send_ack(struct connection *conn, enum xsd_sockmsg_type type)
+ {
+ 	send_reply(conn, type, "OK", sizeof("OK"));
+@@ -691,6 +746,23 @@ void send_error(struct connection *conn, int error)
+ {
+ 	unsigned int i;
+ 
++	/*
++	 * XSD_ERROR(EINVAL),
++	 * XSD_ERROR(EACCES),
++	 * XSD_ERROR(EEXIST),
++	 * XSD_ERROR(EISDIR),
++	 * XSD_ERROR(ENOENT),
++	 * XSD_ERROR(ENOMEM),
++	 * XSD_ERROR(ENOSPC),
++	 * XSD_ERROR(EIO),
++	 * XSD_ERROR(ENOTEMPTY),
++	 * XSD_ERROR(ENOSYS),
++	 * XSD_ERROR(EROFS),
++	 * XSD_ERROR(EBUSY),
++	 * XSD_ERROR(EAGAIN),
++	 * XSD_ERROR(EISCONN),
++	 * XSD_ERROR(E2BIG)
++	 */
+ 	for (i = 0; error != xsd_errors[i].errnum; i++) {
+ 		if (i == ARRAY_SIZE(xsd_errors) - 1) {
+ 			eprintf("xenstored: error %i untranslatable", error);
+@@ -1232,6 +1304,13 @@ static void do_debug(struct connection *conn, struct buffered_data *in)
+ /* Process "in" for conn: "in" will vanish after this conversation, so
+  * we can talloc off it for temporary variables.  May free "conn".
+  */
++/*
++ * called by:
++ *   - xenstore/xenstored_core.c|1341| <<consider_message>> process_message(conn, conn->in);
++ *
++ * struct connection:
++ *  -> struct buffered_data *in; //Buffered incoming data.
++ */
+ static void process_message(struct connection *conn, struct buffered_data *in)
+ {
+ 	struct transaction *trans;
+@@ -1331,13 +1410,25 @@ static void process_message(struct connection *conn, struct buffered_data *in)
+ 	conn->transaction = NULL;
+ }
+ 
++/*
++ * called by:
++ *   - xenstore/xenstored_core.c|1387| <<handle_input>> consider_message(conn);
++ */
+ static void consider_message(struct connection *conn)
+ {
++	/*
++	 * struct connection:
++	 *  -> struct buffered_data *in; //Buffered incoming data.
++	 */
+ 	if (verbose)
+ 		xprintf("Got message %s len %i from %p\n",
+ 			sockmsg_string(conn->in->hdr.msg.type),
+ 			conn->in->hdr.msg.len, conn);
+ 
++	/*
++	 * struct connection:
++	 *  -> struct buffered_data *in; //Buffered incoming data.
++	 */
+ 	process_message(conn, conn->in);
+ 
+ 	talloc_free(conn->in);
+@@ -1346,6 +1437,11 @@ static void consider_message(struct connection *conn)
+ 
+ /* Errors in reading or allocating here mean we get out of sync, so we
+  * drop the whole client connection. */
++/*
++ * called by:
++ *   - xenstore/xenstored_core.c|2078| <<main>> handle_input(conn);
++ *   - xenstore/xenstored_core.c|2095| <<main>> handle_input(conn);
++ */
+ static void handle_input(struct connection *conn)
+ {
+ 	int bytes;
+@@ -1392,12 +1488,36 @@ bad_client:
+ 	talloc_free(conn);
+ }
+ 
++/*
++ * called by:
++ *   - xenstore/xenstored_core.c|2161| <<main>> handle_output(conn);
++ *   - xenstore/xenstored_core.c|2184| <<main>> handle_output(conn);
++ */
+ static void handle_output(struct connection *conn)
+ {
+ 	if (!write_messages(conn))
+ 		talloc_free(conn);
+ }
+ 
++/*
++ * (gdb) bt
++ * #0  new_connection (write=0x40631a <writechn>, read=0x406249 <readchn>) at xenstored_core.c:1405
++ * #1  0x000000000040607a in new_domain (context=<value optimized out>, domid=1, port=1) at xenstored_domain.c:316
++ * #2  0x00000000004069f7 in do_introduce (conn=0x16a64c0, in=0x16a6b10) at xenstored_domain.c:400
++ * #3  0x0000000000404971 in process_message (conn=0x16a64c0) at xenstored_core.c:1298
++ * #4  consider_message (conn=0x16a64c0) at xenstored_core.c:1341
++ * #5  handle_input (conn=0x16a64c0) at xenstored_core.c:1387
++ * #6  0x00000000004053ba in main (argc=<value optimized out>, argv=<value optimized out>) at xenstored_core.c:2095
++ *
++ * (gdb) bt
++ * #0  new_connection (write=0x4023c3 <writefd>, read=0x40234b <readfd>) at xenstored_core.c:1405
++ * #1  0x0000000000403101 in accept_connection (sock=<value optimized out>, canwrite=false) at xenstored_core.c:1483
++ * #2  0x00000000004052b2 in main (argc=<value optimized out>, argv=<value optimized out>) at xenstored_core.c:2050
++ *
++ * called by:
++ *   - xenstore/xenstored_core.c|1496| <<accept_connection>> conn = new_connection(writefd, readfd);
++ *   - xenstore/xenstored_domain.c|339| <<new_domain>> domain->conn = new_connection(writechn, readchn);
++ */
+ struct connection *new_connection(connwritefn_t *write, connreadfn_t *read)
+ {
+ 	struct connection *new;
+@@ -1471,6 +1591,11 @@ static int readfd(struct connection *conn, void *data, unsigned int len)
+ 	return rc;
+ }
+ 
++/*
++ * called by:
++ *   - xenstore/xenstored_core.c|2105| <<main>> accept_connection(*sock, true);
++ *   - xenstore/xenstored_core.c|2115| <<main>> accept_connection(*ro_sock, false);
++ */
+ static void accept_connection(int sock, bool canwrite)
+ {
+ 	int fd;
+@@ -1873,15 +1998,28 @@ int main(int argc, char *argv[])
+ 	int sock_pollfd_idx = -1, ro_sock_pollfd_idx = -1;
+ 	bool dofork = true;
+ 	bool outputpid = false;
++	/*
++	 * 在以下使用no_domain_init:
++	 *   - xenstore/xenstored_core.c|1898| <<main>> no_domain_init = true;
++	 *   - xenstore/xenstored_core.c|1986| <<main>> if (!no_domain_init)
++	 */ 
+ 	bool no_domain_init = false;
+ 	const char *pidfile = NULL;
+ 	const char *memfile = NULL;
+ 	int timeout;
+ 
++	/*
++	 * xenstored --pid-file /var/run/xenstored.pid --entry-nb=4096 --transaction=512
++	 */
+ 	while ((opt = getopt_long(argc, argv, "DE:F:HNPS:t:T:RLVW:M:", options,
+ 				  NULL)) != -1) {
+ 		switch (opt) {
+ 		case 'D':
++			/*
++			 * 在以下使用no_domain_init:
++			 *   - xenstore/xenstored_core.c|1898| <<main>> no_domain_init = true;
++			 *   - xenstore/xenstored_core.c|1986| <<main>> if (!no_domain_init)
++			 */
+ 			no_domain_init = true;
+ 			break;
+ 		case 'E':
+@@ -1963,6 +2101,9 @@ int main(int argc, char *argv[])
+ 		signal(SIGUSR1, do_talloc_report);
+ 	}
+ 
++	/*
++	 * sock的定义: int *sock;
++	 */
+ 	init_sockets(&sock, &ro_sock);
+ 	init_pipe(reopen_log_pipe);
+ 
+@@ -1970,6 +2111,11 @@ int main(int argc, char *argv[])
+ 	setup_structure();
+ 
+ 	/* Listen to hypervisor. */
++	/*
++	 * 在以下使用no_domain_init:
++	 *   - xenstore/xenstored_core.c|1898| <<main>> no_domain_init = true;
++	 *   - xenstore/xenstored_core.c|1986| <<main>> if (!no_domain_init)
++	 */
+ 	if (!no_domain_init)
+ 		domain_init();
+ 
+@@ -1992,12 +2138,20 @@ int main(int argc, char *argv[])
+ 		       &timeout);
+ 
+ 	/* Tell the kernel we're up and running. */
++	/* linux下什么也不做 */
+ 	xenbus_notify_running();
+ 
+ 	/* Main loop. */
+ 	for (;;) {
+ 		struct connection *conn, *next;
+ 
++		/*
++		 * 在以下使用trigger_talloc_report:
++		 *   - xenstore/xenstored_core.c|74| <<global>> static bool trigger_talloc_report = false;
++		 *   - xenstore/xenstored_core.c|1827| <<do_talloc_report>> trigger_talloc_report = true;
++		 *   - xenstore/xenstored_core.c|2035| <<main>> if (trigger_talloc_report) {
++		 *   - xenstore/xenstored_core.c|2039| <<main>> trigger_talloc_report = false;
++		 */
+ 		if (trigger_talloc_report) {
+ 			FILE *out;
+ 
+@@ -2062,6 +2216,17 @@ int main(int argc, char *argv[])
+ 			}
+ 		}
+ 
++		/*
++		 * 在以下使用connections:
++		 *   - xenstore/xenstored_core.c|66| <<global>> LIST_HEAD(connections);
++		 *   - xenstore/xenstored_core.c|369| <<initialize_fds>> list_for_each_entry(conn, &connections, list) {
++		 *   - xenstore/xenstored_core.c|1438| <<new_connection>> list_add_tail(&new->list, &connections);
++		 *   - xenstore/xenstored_core.c|2099| <<main>> next = list_entry(connections.next, typeof(*conn), list);
++		 *   - xenstore/xenstored_core.c|2100| <<main>> if (&next->list != &connections)
++		 *   - xenstore/xenstored_core.c|2102| <<main>> while (&next->list != &connections) {
++		 *   - xenstore/xenstored_core.c|2107| <<main>> if (&next->list != &connections)
++		 *   - xenstore/xenstored_watch.c|109| <<fire_watches>> list_for_each_entry(i, &connections, list) {
++		 */
+ 		next = list_entry(connections.next, typeof(*conn), list);
+ 		if (&next->list != &connections)
+ 			talloc_increase_ref_count(next);
+@@ -2073,6 +2238,10 @@ int main(int argc, char *argv[])
+ 			if (&next->list != &connections)
+ 				talloc_increase_ref_count(next);
+ 
++			/*
++			 * struct connection:
++			 *  -> struct domain *domain; //The domain I'm associated with, if any.
++			 */
+ 			if (conn->domain) {
+ 				if (domain_can_read(conn))
+ 					handle_input(conn);
+diff --git a/tools/xenstore/xenstored_core.h b/tools/xenstore/xenstored_core.h
+index 14e761343c..dce21f95f6 100644
+--- a/tools/xenstore/xenstored_core.h
++++ b/tools/xenstore/xenstored_core.h
+@@ -70,6 +70,10 @@ struct connection
+ 	int pollfd_idx;
+ 
+ 	/* Who am I? 0 for socket connections. */
++	/*
++	 * 找到的唯一设置conn->id的地方:
++	 *   - xenstore/xenstored_domain.c|341| <<new_domain>> domain->conn->id = domid;
++	 */
+ 	unsigned int id;
+ 
+ 	/* Is this a read-only connection? */
+@@ -85,8 +89,22 @@ struct connection
+ 	struct transaction *transaction;
+ 
+ 	/* List of in-progress transactions. */
++	/*
++	 * 在以下使用transaction_list:
++	 *   - xenstore/xenstored_transaction.c|135| <<transaction_lookup>> list_for_each_entry(trans, &conn->transaction_list, list)
++	 *   - xenstore/xenstored_transaction.c|184| <<do_transaction_start>> list_add_tail(&trans->list, &conn->transaction_list);
++	 *   - xenstore/xenstored_transaction.c|286| <<conn_delete_all_transactions>> while ((trans = list_top(&conn->transaction_list,
++	 */
+ 	struct list_head transaction_list;
+ 	uint32_t next_transaction_id;
++	/*
++	 * 在以下使用transaction_started:
++	 *   - xenstore/xenstored_core.c|1450| <<new_connection>> new->transaction_started = 0;
++	 *   - xenstore/xenstored_transaction.c|157| <<do_transaction_start>> if (conn->id && conn->transaction_started > quota_max_transaction) {
++	 *   - xenstore/xenstored_transaction.c|187| <<do_transaction_start>> conn->transaction_started++;
++	 *   - xenstore/xenstored_transaction.c|217| <<do_transaction_end>> conn->transaction_started--;
++	 *   - xenstore/xenstored_transaction.c|294| <<conn_delete_all_transactions>> conn->transaction_started = 0;
++	 */
+ 	unsigned int transaction_started;
+ 
+ 	/* The domain I'm associated with, if any. */
+diff --git a/tools/xenstore/xenstored_domain.c b/tools/xenstore/xenstored_domain.c
+index c99311ab3b..6c4bdee369 100644
+--- a/tools/xenstore/xenstored_domain.c
++++ b/tools/xenstore/xenstored_domain.c
+@@ -38,8 +38,31 @@
+ 
+ static xc_interface **xc_handle;
+ xc_gnttab **xcg_handle;
++/*
++ * 在以下使用virq_port:
++ *   - xenstore/xenstored_domain.c|279| <<handle_event>> if (port == virq_port)
++ *   - xenstore/xenstored_domain.c|721| <<domain_init>> virq_port = rc;
++ */
+ static evtchn_port_t virq_port;
+ 
++/*
++ * 在以下使用xce_handle:
++ *   - xenstore/xenstored_domain.c|43| <<global>> xc_evtchn *xce_handle = NULL;
++ *   - xenstore/xenstored_core.c|362| <<initialize_fds>> if (xce_handle != NULL)
++ *   - xenstore/xenstored_core.c|363| <<initialize_fds>> xce_pollfd_idx = set_fd(xc_evtchn_fd(xce_handle),
++ *   - xenstore/xenstored_domain.c|140| <<writechn>> xc_evtchn_notify(xce_handle, conn->domain->port);
++ *   - xenstore/xenstored_domain.c|170| <<readchn>> xc_evtchn_notify(xce_handle, conn->domain->port);
++ *   - xenstore/xenstored_domain.c|202| <<destroy_domain>> if (xc_evtchn_unbind(xce_handle, domain->port) == -1)
++ *   - xenstore/xenstored_domain.c|258| <<handle_event>> if ((port = xc_evtchn_pending(xce_handle)) == -1)
++ *   - xenstore/xenstored_domain.c|264| <<handle_event>> if (xc_evtchn_unmask(xce_handle, port) == -1)
++ *   - xenstore/xenstored_domain.c|311| <<new_domain>> rc = xc_evtchn_bind_interdomain(xce_handle, domid, port);
++ *   - xenstore/xenstored_domain.c|416| <<do_introduce>> xc_evtchn_unbind(xce_handle, domain->port);
++ *   - xenstore/xenstored_domain.c|417| <<do_introduce>> rc = xc_evtchn_bind_interdomain(xce_handle, domid, port);
++ *   - xenstore/xenstored_domain.c|642| <<dom0_init>> xc_evtchn_notify(xce_handle, dom0->port);
++ *   - xenstore/xenstored_domain.c|671| <<domain_init>> xce_handle = xc_evtchn_open(NULL, 0);
++ *   - xenstore/xenstored_domain.c|673| <<domain_init>> if (xce_handle == NULL)
++ *   - xenstore/xenstored_domain.c|679| <<domain_init>> if ((rc = xc_evtchn_bind_virq(xce_handle, VIRQ_DOM_EXC)) == -1)
++ */
+ xc_evtchn *xce_handle = NULL;
+ 
+ struct domain
+@@ -290,6 +313,19 @@ static char *talloc_domain_path(void *context, unsigned int domid)
+ 	return talloc_asprintf(context, "/local/domain/%u", domid);
+ }
+ 
++/*
++ * (gdb) bt
++ * #0  new_domain (context=0x16a6b10, domid=1, port=1) at xenstored_domain.c:299
++ * #1  0x00000000004069f7 in do_introduce (conn=0x16a64c0, in=0x16a6b10) at xenstored_domain.c:400
++ * #2  0x0000000000404971 in process_message (conn=0x16a64c0) at xenstored_core.c:1298
++ * #3  consider_message (conn=0x16a64c0) at xenstored_core.c:1341
++ * #4  handle_input (conn=0x16a64c0) at xenstored_core.c:1387
++ * #5  0x00000000004053ba in main (argc=<value optimized out>, argv=<value optimized out>) at xenstored_core.c:2095
++ *
++ * called by:
++ *   - xenstore/xenstored_domain.c|423| <<do_introduce>> domain = new_domain(in, domid, port);
++ *   - xenstore/xenstored_domain.c|655| <<dom0_init>> dom0 = new_domain(NULL, 0, port);
++ */
+ static struct domain *new_domain(void *context, unsigned int domid,
+ 				 int port)
+ {
+@@ -358,6 +394,10 @@ static void domain_conn_reset(struct domain *domain)
+ }
+ 
+ /* domid, mfn, evtchn, path */
++/*
++ * 处理XS_INTRODUCE:
++ *   - xenstore/xenstored_core.c|1320| <<process_message>> do_introduce(conn, in);
++ */
+ void do_introduce(struct connection *conn, struct buffered_data *in)
+ {
+ 	struct domain *domain;
+@@ -644,6 +684,10 @@ static int dom0_init(void)
+ 	return 0; 
+ }
+ 
++/*
++ * called by:
++ *   - xenstore/xenstored_core.c|1987| <<main>> domain_init();
++ */
+ void domain_init(void)
+ {
+ 	int rc;
+@@ -668,6 +712,24 @@ void domain_init(void)
+ 	else
+ 		talloc_set_destructor(xcg_handle, close_xcg_handle);
+ 
++	/*
++	 * 在以下使用xce_handle:
++	 *   - xenstore/xenstored_domain.c|43| <<global>> xc_evtchn *xce_handle = NULL;
++	 *   - xenstore/xenstored_core.c|362| <<initialize_fds>> if (xce_handle != NULL)
++	 *   - xenstore/xenstored_core.c|363| <<initialize_fds>> xce_pollfd_idx = set_fd(xc_evtchn_fd(xce_handle),
++	 *   - xenstore/xenstored_domain.c|140| <<writechn>> xc_evtchn_notify(xce_handle, conn->domain->port);
++	 *   - xenstore/xenstored_domain.c|170| <<readchn>> xc_evtchn_notify(xce_handle, conn->domain->port);
++	 *   - xenstore/xenstored_domain.c|202| <<destroy_domain>> if (xc_evtchn_unbind(xce_handle, domain->port) == -1)
++	 *   - xenstore/xenstored_domain.c|258| <<handle_event>> if ((port = xc_evtchn_pending(xce_handle)) == -1)
++	 *   - xenstore/xenstored_domain.c|264| <<handle_event>> if (xc_evtchn_unmask(xce_handle, port) == -1)
++	 *   - xenstore/xenstored_domain.c|311| <<new_domain>> rc = xc_evtchn_bind_interdomain(xce_handle, domid, port);
++	 *   - xenstore/xenstored_domain.c|416| <<do_introduce>> xc_evtchn_unbind(xce_handle, domain->port);
++	 *   - xenstore/xenstored_domain.c|417| <<do_introduce>> rc = xc_evtchn_bind_interdomain(xce_handle, domid, port);
++	 *   - xenstore/xenstored_domain.c|642| <<dom0_init>> xc_evtchn_notify(xce_handle, dom0->port);
++	 *   - xenstore/xenstored_domain.c|671| <<domain_init>> xce_handle = xc_evtchn_open(NULL, 0);
++	 *   - xenstore/xenstored_domain.c|673| <<domain_init>> if (xce_handle == NULL)
++	 *   - xenstore/xenstored_domain.c|679| <<domain_init>> if ((rc = xc_evtchn_bind_virq(xce_handle, VIRQ_DOM_EXC)) == -1)
++	 */
+ 	xce_handle = xc_evtchn_open(NULL, 0);
+ 
+ 	if (xce_handle == NULL)
+@@ -678,6 +740,11 @@ void domain_init(void)
+ 
+ 	if ((rc = xc_evtchn_bind_virq(xce_handle, VIRQ_DOM_EXC)) == -1)
+ 		barf_perror("Failed to bind to domain exception virq port");
++	/*
++	 * 在以下使用virq_port:
++	 *   - xenstore/xenstored_domain.c|279| <<handle_event>> if (port == virq_port)
++	 *   - xenstore/xenstored_domain.c|721| <<domain_init>> virq_port = rc;
++	 */
+ 	virq_port = rc;
+ }
+ 
 diff --git a/tools/xenstore/xenstored_transaction.c b/tools/xenstore/xenstored_transaction.c
-index 32ae47debf..5cc2e05b6d 100644
+index 32ae47debf..9c2f421747 100644
 --- a/tools/xenstore/xenstored_transaction.c
 +++ b/tools/xenstore/xenstored_transaction.c
-@@ -187,6 +187,10 @@ void do_transaction_start(struct connection *conn, struct buffered_data *in)
+@@ -69,6 +69,15 @@ struct transaction
+ 	uint32_t id;
+ 
+ 	/* Generation when transaction started. */
++	/*
++	 * 在以下使用generation:
++	 *   - xenstore/xenstored_transaction.c|102| <<add_change_node>> generation++;
++	 *   - xenstore/xenstored_transaction.c|256| <<do_transaction_end>> generation++;
++	 *
++	 * 在以下使用transaction->generation:
++	 *   - xenstore/xenstored_transaction.c|166| <<do_transaction_start>> trans->generation = generation;
++	 *   - xenstore/xenstored_transaction.c|235| <<do_transaction_end>> if (trans->generation != generation) {
++	 */
+ 	unsigned int generation;
+ 
+ 	/* TDB to work on, and filename */
+@@ -83,6 +92,15 @@ struct transaction
+ };
+ 
+ extern int quota_max_transaction;
++/*
++ * 在以下使用transaction->generation:
++ *   - xenstore/xenstored_transaction.c|166| <<do_transaction_start>> trans->generation = generation;
++ *   - xenstore/xenstored_transaction.c|235| <<do_transaction_end>> if (trans->generation != generation) {
++ *
++ * 在以下使用generation:
++ *   - xenstore/xenstored_transaction.c|102| <<add_change_node>> generation++;
++ *   - xenstore/xenstored_transaction.c|256| <<do_transaction_end>> generation++;
++ */
+ static unsigned int generation;
+ 
+ /* Return tdb context to use for this connection. */
+@@ -113,6 +131,10 @@ void add_change_node(struct transaction *trans, const char *node, bool recurse)
+ 	list_add_tail(&i->list, &trans->changes);
+ }
+ 
++/*
++ * called by:
++ *   - xenstore/xenstored_transaction.c|215| <<do_transaction_start>> talloc_set_destructor(trans, destroy_transaction);
++ */
+ static int destroy_transaction(void *_transaction)
+ {
+ 	struct transaction *trans = _transaction;
+@@ -132,6 +154,12 @@ struct transaction *transaction_lookup(struct connection *conn, uint32_t id)
+ 	if (id == 0)
+ 		return NULL;
+ 
++	/*
++	 * 在以下使用transaction_list:
++	 *   - xenstore/xenstored_transaction.c|135| <<transaction_lookup>> list_for_each_entry(trans, &conn->transaction_list, list)
++	 *   - xenstore/xenstored_transaction.c|184| <<do_transaction_start>> list_add_tail(&trans->list, &conn->transaction_list);
++	 *   - xenstore/xenstored_transaction.c|286| <<conn_delete_all_transactions>> while ((trans = list_top(&conn->transaction_list,
++	 */
+ 	list_for_each_entry(trans, &conn->transaction_list, list)
+ 		if (trans->id == id)
+ 			return trans;
+@@ -139,6 +167,10 @@ struct transaction *transaction_lookup(struct connection *conn, uint32_t id)
+ 	return ERR_PTR(-ENOENT);
+ }
+ 
++/*
++ * 处理XS_TRANSACTION_START:
++ *   - xenstore/xenstored_core.c|1290| <<process_message>> do_transaction_start(conn, in);
++ */
+ void do_transaction_start(struct connection *conn, struct buffered_data *in)
+ {
+ 	struct transaction *trans, *exists;
+@@ -177,9 +209,28 @@ void do_transaction_start(struct connection *conn, struct buffered_data *in)
+ 	} while (!IS_ERR(exists));
+ 
+ 	/* Now we own it. */
++	/*
++	 * 在以下使用transaction_list:
++	 *   - xenstore/xenstored_transaction.c|135| <<transaction_lookup>> list_for_each_entry(trans, &conn->transaction_list, list)
++	 *   - xenstore/xenstored_transaction.c|184| <<do_transaction_start>> list_add_tail(&trans->list, &conn->transaction_list);
++	 *   - xenstore/xenstored_transaction.c|286| <<conn_delete_all_transactions>> while ((trans = list_top(&conn->transaction_list,
++	 */
+ 	list_add_tail(&trans->list, &conn->transaction_list);
++	/*
++	 * move a lump of memory from one talloc context to another return the
++	 * ptr on success, or NULL if it could not be transferred.
++	 * passing NULL as ptr will always return NULL with no side effects.
++	 */
+ 	talloc_steal(conn, trans);
+ 	talloc_set_destructor(trans, destroy_transaction);
++	/*
++	 * 在以下使用transaction_started:
++	 *   - xenstore/xenstored_core.c|1450| <<new_connection>> new->transaction_started = 0;
++	 *   - xenstore/xenstored_transaction.c|157| <<do_transaction_start>> if (conn->id && conn->transaction_started > quota_max_transaction) {
++	 *   - xenstore/xenstored_transaction.c|187| <<do_transaction_start>> conn->transaction_started++;
++	 *   - xenstore/xenstored_transaction.c|217| <<do_transaction_end>> conn->transaction_started--;
++	 *   - xenstore/xenstored_transaction.c|294| <<conn_delete_all_transactions>> conn->transaction_started = 0;
++	 */
+ 	conn->transaction_started++;
+ 	wrl_ntransactions++;
+ 
+@@ -187,6 +238,28 @@ void do_transaction_start(struct connection *conn, struct buffered_data *in)
  	send_reply(conn, XS_TRANSACTION_START, id_str, strlen(id_str)+1);
  }
  
 +/*
++ * 967 // End a transaction.  
++ * 968 // If abandon is true, transaction is discarded instead of committed.
++ * 969 // Returns false on failure, which indicates an error: transactions will
++ * 970 // not fail spuriously.
++ * 971 //
++ * 972 bool xs_transaction_end(struct xs_handle *h, xs_transaction_t t,
++ * 973                         bool abort)
++ * 974 {
++ * 975         char abortstr[2];
++ * 976 
++ * 977         if (abort)
++ * 978                 strcpy(abortstr, "F");
++ * 979         else
++ * 980                 strcpy(abortstr, "T");
++ * 981                         
++ * 982         return xs_bool(xs_single(h, t, XS_TRANSACTION_END, abortstr, NULL));
++ * 983 }
++ *
 + * 处理XS_TRANSACTION_END:
 + *   - xenstore/xenstored_core.c|1294| <<process_message>> do_transaction_end(conn, in);
 + */
  void do_transaction_end(struct connection *conn, struct buffered_data *in)
  {
  	const char *arg = onearg(in);
+@@ -206,6 +279,14 @@ void do_transaction_end(struct connection *conn, struct buffered_data *in)
+ 
+ 	conn->transaction = NULL;
+ 	list_del(&trans->list);
++	/*
++	 * 在以下使用transaction_started:
++	 *   - xenstore/xenstored_core.c|1450| <<new_connection>> new->transaction_started = 0;
++	 *   - xenstore/xenstored_transaction.c|157| <<do_transaction_start>> if (conn->id && conn->transaction_started > quota_max_transaction) {
++	 *   - xenstore/xenstored_transaction.c|187| <<do_transaction_start>> conn->transaction_started++;
++	 *   - xenstore/xenstored_transaction.c|217| <<do_transaction_end>> conn->transaction_started--;
++	 *   - xenstore/xenstored_transaction.c|294| <<conn_delete_all_transactions>> conn->transaction_started = 0;
++	 */
+ 	conn->transaction_started--;
+ 
+ 	/* Attach transaction to arg for auto-cleanup */
+@@ -213,6 +294,15 @@ void do_transaction_end(struct connection *conn, struct buffered_data *in)
+ 
+ 	if (streq(arg, "T")) {
+ 		/* FIXME: Merge, rather failing on any change. */
++		/*
++		 * 在以下使用generation:
++		 *   - xenstore/xenstored_transaction.c|102| <<add_change_node>> generation++;
++		 *   - xenstore/xenstored_transaction.c|256| <<do_transaction_end>> generation++;
++		 *
++		 * 在以下使用transaction->generation:
++		 *   - xenstore/xenstored_transaction.c|166| <<do_transaction_start>> trans->generation = generation;
++		 *   - xenstore/xenstored_transaction.c|235| <<do_transaction_end>> if (trans->generation != generation) {
++		 */
+ 		if (trans->generation != generation) {
+ 			send_error(conn, EAGAIN);
+ 			return;
+diff --git a/tools/xenstore/xs.c b/tools/xenstore/xs.c
+index dd03a85755..9244d9a7e6 100644
+--- a/tools/xenstore/xs.c
++++ b/tools/xenstore/xs.c
+@@ -947,6 +947,13 @@ xs_transaction_t xs_transaction_start(struct xs_handle *h)
+ 	char *id_str;
+ 	xs_transaction_t id;
+ 
++	/*
++	 * 在以下使用XS_TRANSACTION_START:
++	 *   - xenstore/xenstored_core.c|120| <<sockmsg_string>> case XS_TRANSACTION_START: return "TRANSACTION_START";
++	 *   - xenstore/xenstored_core.c|1289| <<process_message>> case XS_TRANSACTION_START:
++	 *   - xenstore/xenstored_transaction.c|187| <<do_transaction_start>> send_reply(conn, XS_TRANSACTION_START, id_str, strlen(id_str)+1);
++	 *   - xenstore/xs.c|950| <<xs_transaction_start>> id_str = xs_single(h, XBT_NULL, XS_TRANSACTION_START, "", NULL);
++	 */
+ 	id_str = xs_single(h, XBT_NULL, XS_TRANSACTION_START, "", NULL);
+ 	if (id_str == NULL)
+ 		return XBT_NULL;
 diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
 index 8acc0c7d0c..b18a6747c2 100644
 --- a/xen/arch/x86/domain.c
