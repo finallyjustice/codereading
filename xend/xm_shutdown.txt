@@ -1,0 +1,147 @@
+1. 首先, shutdown()会打印"XendDomainInfo.shutdown(poweroff)", 然后往xenstore的"control/shutdown"写入poweoff.
+
+2. domU的kernel会处理并且清空"control/shutdown"
+
+3. xend会定期调用update()-->refreshShutdown()来打印:
+
+Domain has shutdown: name=vm1 id=3 reason=poweroff.
+
+... 或者 ...
+
+Domain shutdown timeout expired: name=vm1 id=3
+
+4. 任何xend或domU对"control/shutdown"的修改会触发xenwatch的_handleShutdownWatch(). _handleShutdownWatch()也会用timer调用refreshShutdown()检查shutdown的状态.
+
+===========================================================
+
+Here is from domU kernel (the step 2 in above):
+
+1. Once "xm shutdown", xend would write "poweroff" to the xenstore path "control/shutdown" for corresponding domU.
+
+2.domU kernel watches at "control/shutdown" (shutdown_watch in driver/xen/manage.c). Once there is "poweroff", the callstack is like:
+
+do_poweroff()
+ -> orderly_poweroff()
+     -> schedule_work(&poweroff_work);
+
+3. The "poweroff_work" in step 2 is poweroff_work_func():
+
+poweroff_work_func()
+ -> __orderly_poweroff
+     -> run_cmd(poweroff_cmd);
+        to call userspace "/sbin/poweroff" via call_usermodehelper()
+
+4. I do not know what will "/sbin/poweroff" do. Finally, I captured that there is thread "systemd-shutdown" calling sys_reboot() with cmd=LINUX_REBOOT_CMD_POWER_OFF:
+
+On ubuntu16.04: systemd-shutdown
+-> sys_reboot()
+    -> kernel_power_off()
+        -> machine_power_off()
+            -> machine_ops.power_off = native_machine_power_off()
+                -> machine_shutdown()
+                -> pm_power_off()
+
+The "pm_power_off" in step 4 is a function pointer. I do not know who it is, perhaps acpi_power_off()?
+
+5. I guess the "pm_power_off" trap to qemu-dm.
+
+qemu-xen-traditional/i386-dm/helper2.c: cpu_handle_ioreq()
+ -> print "shutdown requested in cpu_handle_ioreq"
+    to /var/log/xen/qemu-dm-xxx.log
+ -> destroy_hvm_domain()
+     -> xc_domain_shutdown()
+-> call __HYPERVISOR_sched_op with SCHEDOP_remote_shutdown
+     -> print "Issued domain %d poweroff\n"
+        to /var/log/xen/qemu-dm-xxx.log
+
+In step 5, qemu-dm prints below lines to /var/log/xen/qemu-dm-xxx.log:
+
+---------------------------------------
+shutdown requested in cpu_handle_ioreq
+Issued domain 1 poweroff
+---------------------------------------
+
+and trap to hypervisor via SCHEDOP_remote_shutdown. qemu-dm asks xen hypervisor to shutdown the domU via SCHEDOP_remote_shutdown.
+
+---------------------------------
+
+Now we come to xen hypervisor via SCHEDOP_remote_shutdown.
+
+do_sched_op()
+ -> SCHEDOP_remote_shutdown(): to shutdown domU by dom0
+     -> domain_shutdown()
+
+However, according to my test on Oracle VM, d->is_shut_down is set to 1 by __domain_finalise_shutdown() with below callstack:
+
+vcpu_check_shutdown()
+ -> __domain_finalise_shutdown()
+
+I did not check who triggers vcpu_check_shutdown(). The callstack is like below:
+
+(XEN) Xen call trace:
+(XEN)    [<ffff82d08020ddde>] domain.c#__domain_finalise_shutdown+0x5e/0xa0
+(XEN)    [<ffff82d08020de70>] domain.c#vcpu_check_shutdown+0x50/0x80
+(XEN)    [<ffff82d0802d77d2>] hvm_do_resume+0xe2/0x1f0
+(XEN)    [<ffff82d0802f42b0>] vmx_do_resume+0x150/0x220
+(XEN)    [<ffff82d080274ae8>] context_switch+0x138/0xf80
+(XEN)    [<ffff82d080274ae8>] context_switch+0x138/0xf80
+(XEN)    [<ffff82d0802380b2>] schedule.c#schedule+0x252/0x580
+(XEN)    [<ffff82d080239889>] softirq.c#__do_softirq+0x69/0xa0
+(XEN)    [<ffff82d080239889>] softirq.c#__do_softirq+0x69/0xa0
+(XEN)    [<ffff82d08027690a>] domain.c#idle_loop+0x1a/0x60
+
+
+===========================================================
+
+
+[2020-06-03 11:40:28 24951] WARNING (XendDomainInfo:605)   File "/usr/lib64/python2.6/threading.py", line 504, in __bootstrap
+    self.__bootstrap_inner()
+  File "/usr/lib64/python2.6/threading.py", line 532, in __bootstrap_inner
+    self.run()
+  File "/usr/lib64/python2.6/threading.py", line 484, in run
+    self.__target(*self.__args, **self.__kwargs)
+  File "/usr/lib64/python2.6/SocketServer.py", line 570, in process_request_thread
+    self.finish_request(request, client_address)
+  File "/usr/lib64/python2.6/SocketServer.py", line 332, in finish_request
+    self.RequestHandlerClass(request, client_address, self)
+  File "/usr/lib64/python2.6/site-packages/xen/util/xmlrpclib2.py", line 109, in <lambda>
+    requestHandler(allowed, x, y, z)),
+  File "/usr/lib64/python2.6/site-packages/xen/util/xmlrpclib2.py", line 68, in __init__
+    server)
+  File "/usr/lib64/python2.6/SocketServer.py", line 627, in __init__
+    self.handle()
+  File "/usr/lib64/python2.6/BaseHTTPServer.py", line 329, in handle
+    self.handle_one_request()
+  File "/usr/lib64/python2.6/BaseHTTPServer.py", line 323, in handle_one_request
+    method()
+  File "/usr/lib64/python2.6/site-packages/xen/util/xmlrpclib2.py", line 83, in do_POST
+    rsp = self.server._marshaled_dispatch(data)
+  File "/usr/lib64/python2.6/site-packages/xen/util/xmlrpclib2.py", line 134, in _marshaled_dispatch
+    response = self._dispatch(method, params)
+  File "/usr/lib64/python2.6/SimpleXMLRPCServer.py", line 418, in _dispatch
+    return func(*params)
+  File "<string>", line 1, in <lambda>
+  File "/usr/lib64/python2.6/site-packages/xen/xend/server/XMLRPCServer.py", line 58, in dispatch
+    return getattr(info, fn)(*args)
+  File "/usr/lib64/python2.6/site-packages/xen/xend/XendDomainInfo.py", line 605, in shutdown
+    log.warn("".join(traceback.format_stack()))
+
+
+[2020-06-03 16:22:22 20937] INFO (XendDomainInfo:2157)   File "/usr/lib64/python2.6/threading.py", line 504, in __bootstrap
+    self.__bootstrap_inner()
+  File "/usr/lib64/python2.6/threading.py", line 532, in __bootstrap_inner
+    self.run()
+  File "/usr/lib64/python2.6/threading.py", line 484, in run
+    self.__target(*self.__args, **self.__kwargs)
+  File "/usr/lib64/python2.6/site-packages/xen/xend/xenstore/xswatch.py", line 65, in watchMain
+    res = watch.fn(we[0], *watch.args, **watch.kwargs)
+  File "/usr/lib64/python2.6/site-packages/xen/xend/XendDomain.py", line 153, in _on_domains_changed
+    self._refresh()
+  File "/usr/lib64/python2.6/site-packages/xen/xend/XendDomain.py", line 429, in _refresh
+    self._refreshTxn(txn, refresh_shutdown)
+  File "/usr/lib64/python2.6/site-packages/xen/xend/XendDomain.py", line 442, in _refreshTxn
+    self.domains[domid].update(dom, refresh_shutdown, transaction)
+  File "/usr/lib64/python2.6/site-packages/xen/xend/XendDomainInfo.py", line 4418, in update
+    self.refreshShutdown(info)
+  File "/usr/lib64/python2.6/site-packages/xen/xend/XendDomainInfo.py", line 2157, in refreshShutdown
+    log.info("".join(traceback.format_stack()))
