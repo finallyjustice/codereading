@@ -1,0 +1,1168 @@
+From d797136722d8e843c499ce26ff2d3c4b202fe4fd Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Wed, 10 Jun 2020 00:10:28 -0700
+Subject: [PATCH 1/1] qemu for v5.0.0
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ block/block-backend.c  |   7 ++
+ block/file-posix.c     |  19 ++++
+ block/iscsi.c          |  19 ++++
+ cpus.c                 |  23 ++++
+ hw/block/virtio-blk.c  |  11 ++
+ hw/scsi/scsi-bus.c     |  51 +++++++++
+ hw/scsi/scsi-disk.c    | 107 +++++++++++++++++++
+ hw/scsi/scsi-generic.c |  35 ++++++
+ hw/scsi/virtio-scsi.c  | 237 +++++++++++++++++++++++++++++++++++++++++
+ scsi/qemu-pr-helper.c  |  11 ++
+ softmmu/vl.c           |   5 +
+ 11 files changed, 525 insertions(+)
+
+diff --git a/block/block-backend.c b/block/block-backend.c
+index 38ae413826..7438a229f2 100644
+--- a/block/block-backend.c
++++ b/block/block-backend.c
+@@ -1761,6 +1761,13 @@ static void send_qmp_error_event(BlockBackend *blk,
+  * about the error, it does not know whether an operation comes from
+  * the device or the block layer (from a job, for example).
+  */
++/*
++ * called by:
++ *   - hw/block/virtio-blk.c|111| <<virtio_blk_handle_rw_error>> blk_error_action(s->blk, action, is_read, error);
++ *   - hw/ide/ahci.c|1039| <<ncq_cb>> blk_error_action(ide_state->blk, action, is_read, -ret);
++ *   - hw/ide/core.c|841| <<ide_handle_rw_error>> blk_error_action(s->blk, action, is_read, error);
++ *   - hw/scsi/scsi-disk.c|487| <<scsi_handle_rw_error>> blk_error_action(s->qdev.conf.blk, action, is_read, error);
++ */
+ void blk_error_action(BlockBackend *blk, BlockErrorAction action,
+                       bool is_read, int error)
+ {
+diff --git a/block/file-posix.c b/block/file-posix.c
+index 7e19bbff5f..6bb987d390 100644
+--- a/block/file-posix.c
++++ b/block/file-posix.c
+@@ -3312,6 +3312,14 @@ static bool hdev_is_sg(BlockDriverState *bs)
+         return false;
+     }
+ 
++    /*
++     * 在以下使用SG_GET_VERSION_NUM:
++     *   - /usr/include/scsi/sg.h|168| <<global>> #define SG_GET_VERSION_NUM 0x2282
++     *   - block/file-posix.c|3315| <<hdev_is_sg>> ret = ioctl(s->fd, SG_GET_VERSION_NUM, &sg_version);
++     *   - block/iscsi.c|1017| <<iscsi_ioctl_handle_emulated>> case SG_GET_VERSION_NUM:
++     *   - hw/scsi/scsi-disk.c|2645| <<scsi_block_realize>> rc = blk_ioctl(s->qdev.conf.blk, SG_GET_VERSION_NUM, &sg_version);
++     *   - hw/scsi/scsi-generic.c|675| <<scsi_generic_realize>> rc = blk_ioctl(s->conf.blk, SG_GET_VERSION_NUM, &sg_version);
++     */
+     ret = ioctl(s->fd, SG_GET_VERSION_NUM, &sg_version);
+     if (ret < 0) {
+         return false;
+@@ -3440,6 +3448,17 @@ hdev_co_ioctl(BlockDriverState *bs, unsigned long int req, void *buf)
+         return ret;
+     }
+ 
++    /*
++     * 在以下使用SG_IO:
++     *   - /usr/include/scsi/sg.h|179| <<global>> #define SG_IO 0x2285
++     *   - block/file-posix.c|3451| <<hdev_co_ioctl>> if (req == SG_IO && s->pr_mgr) {
++     *   - block/iscsi.c|1058| <<iscsi_aio_ioctl>> if (req != SG_IO) {
++     *   - hw/block/virtio-blk.c|353| <<virtio_blk_handle_scsi_req>> acb = blk_aio_ioctl(blk->blk, SG_IO, &ioctl_req->hdr,
++     *   - hw/scsi/scsi-disk.c|2818| <<scsi_block_do_sgio>> aiocb = blk_aio_ioctl(s->qdev.conf.blk, SG_IO, io_header, cb, opaque);
++     *   - hw/scsi/scsi-generic.c|129| <<execute_command>> r->req.aiocb = blk_aio_ioctl(blk, SG_IO, &r->io_header, complete, r);
++     *   - hw/scsi/scsi-generic.c|523| <<scsi_SG_IO_FROM_DEV>> ret = blk_ioctl(blk, SG_IO, &io_header);
++     *   - scsi/qemu-pr-helper.c|151| <<do_sgio_worker>> ret = ioctl(data->fd, SG_IO, &io_hdr);
++     */
+     if (req == SG_IO && s->pr_mgr) {
+         struct sg_io_hdr *io_hdr = buf;
+         if (io_hdr->cmdp[0] == PERSISTENT_RESERVE_OUT ||
+diff --git a/block/iscsi.c b/block/iscsi.c
+index 0b4b7210df..a1c18a35b0 100644
+--- a/block/iscsi.c
++++ b/block/iscsi.c
+@@ -1014,6 +1014,14 @@ static void iscsi_ioctl_handle_emulated(IscsiAIOCB *acb, int req, void *buf)
+     int ret = 0;
+ 
+     switch (req) {
++    /*
++     * 在以下使用SG_GET_VERSION_NUM:
++     *   - /usr/include/scsi/sg.h|168| <<global>> #define SG_GET_VERSION_NUM 0x2282
++     *   - block/file-posix.c|3315| <<hdev_is_sg>> ret = ioctl(s->fd, SG_GET_VERSION_NUM, &sg_version);
++     *   - block/iscsi.c|1017| <<iscsi_ioctl_handle_emulated>> case SG_GET_VERSION_NUM:
++     *   - hw/scsi/scsi-disk.c|2645| <<scsi_block_realize>> rc = blk_ioctl(s->qdev.conf.blk, SG_GET_VERSION_NUM, &sg_version);
++     *   - hw/scsi/scsi-generic.c|675| <<scsi_generic_realize>> rc = blk_ioctl(s->conf.blk, SG_GET_VERSION_NUM, &sg_version);
++     */
+     case SG_GET_VERSION_NUM:
+         *(int *)buf = 30000;
+         break;
+@@ -1047,6 +1055,17 @@ static BlockAIOCB *iscsi_aio_ioctl(BlockDriverState *bs,
+     acb->ioh         = buf;
+     acb->cancelled   = false;
+ 
++    /*
++     * 在以下使用SG_IO:
++     *   - /usr/include/scsi/sg.h|179| <<global>> #define SG_IO 0x2285
++     *   - block/file-posix.c|3451| <<hdev_co_ioctl>> if (req == SG_IO && s->pr_mgr) {
++     *   - block/iscsi.c|1058| <<iscsi_aio_ioctl>> if (req != SG_IO) {
++     *   - hw/block/virtio-blk.c|353| <<virtio_blk_handle_scsi_req>> acb = blk_aio_ioctl(blk->blk, SG_IO, &ioctl_req->hdr,
++     *   - hw/scsi/scsi-disk.c|2818| <<scsi_block_do_sgio>> aiocb = blk_aio_ioctl(s->qdev.conf.blk, SG_IO, io_header, cb, opaque);
++     *   - hw/scsi/scsi-generic.c|129| <<execute_command>> r->req.aiocb = blk_aio_ioctl(blk, SG_IO, &r->io_header, complete, r);
++     *   - hw/scsi/scsi-generic.c|523| <<scsi_SG_IO_FROM_DEV>> ret = blk_ioctl(blk, SG_IO, &io_header);
++     *   - scsi/qemu-pr-helper.c|151| <<do_sgio_worker>> ret = ioctl(data->fd, SG_IO, &io_hdr);
++     */
+     if (req != SG_IO) {
+         iscsi_ioctl_handle_emulated(acb, req, buf);
+         return &acb->common;
+diff --git a/cpus.c b/cpus.c
+index ef441bdf62..ec046ec843 100644
+--- a/cpus.c
++++ b/cpus.c
+@@ -2120,6 +2120,11 @@ int vm_stop(RunState state)
+  * Returns -1 if the vCPUs are not to be restarted (e.g. if they are already
+  * running or in case of an error condition), 0 otherwise.
+  */
++/*
++ * called by:
++ *   - cpus.c|2154| <<vm_start>> if (!vm_prepare_start()) {
++ *   - gdbstub.c|494| <<gdb_continue_partial>> if (vm_prepare_start()) {
++ */
+ int vm_prepare_start(void)
+ {
+     RunState requested;
+@@ -2149,6 +2154,24 @@ int vm_prepare_start(void)
+     return 0;
+ }
+ 
++/*
++ * called by:
++ *   - dump/dump.c|100| <<dump_cleanup>> vm_start();
++ *   - gdbstub.c|465| <<gdb_continue>> vm_start();
++ *   - migration/colo.c|505| <<colo_do_checkpoint_transaction>> vm_start();
++ *   - migration/colo.c|570| <<colo_process_checkpoint>> vm_start();
++ *   - migration/colo.c|776| <<colo_incoming_process_checkpoint>> vm_start();
++ *   - migration/colo.c|866| <<colo_process_incoming_thread>> vm_start();
++ *   - migration/migration.c|427| <<process_incoming_migration_bh>> vm_start();
++ *   - migration/migration.c|433| <<process_incoming_migration_bh>> vm_start();
++ *   - migration/migration.c|3314| <<migration_iteration_finish>> vm_start();
++ *   - migration/savevm.c|1964| <<loadvm_postcopy_handle_run_bh>> vm_start();
++ *   - migration/savevm.c|2745| <<save_snapshot>> vm_start();
++ *   - migration/savevm.c|2796| <<qmp_xen_save_devices_state>> vm_start();
++ *   - monitor/hmp-cmds.c|1091| <<hmp_loadvm>> vm_start();
++ *   - monitor/qmp-cmds.c|160| <<qmp_cont>> vm_start();
++ *   - softmmu/vl.c|4470| <<qemu_init>> vm_start();
++ */
+ void vm_start(void)
+ {
+     if (!vm_prepare_start()) {
+diff --git a/hw/block/virtio-blk.c b/hw/block/virtio-blk.c
+index 97ba8a2187..6bf03c4ef2 100644
+--- a/hw/block/virtio-blk.c
++++ b/hw/block/virtio-blk.c
+@@ -350,6 +350,17 @@ static int virtio_blk_handle_scsi_req(VirtIOBlockReq *req)
+     ioctl_req->hdr.sbp = elem->in_sg[elem->in_num - 3].iov_base;
+     ioctl_req->hdr.mx_sb_len = elem->in_sg[elem->in_num - 3].iov_len;
+ 
++    /*
++     * 在以下使用SG_IO:
++     *   - /usr/include/scsi/sg.h|179| <<global>> #define SG_IO 0x2285
++     *   - block/file-posix.c|3451| <<hdev_co_ioctl>> if (req == SG_IO && s->pr_mgr) {
++     *   - block/iscsi.c|1058| <<iscsi_aio_ioctl>> if (req != SG_IO) {
++     *   - hw/block/virtio-blk.c|353| <<virtio_blk_handle_scsi_req>> acb = blk_aio_ioctl(blk->blk, SG_IO, &ioctl_req->hdr,
++     *   - hw/scsi/scsi-disk.c|2818| <<scsi_block_do_sgio>> aiocb = blk_aio_ioctl(s->qdev.conf.blk, SG_IO, io_header, cb, opaque);
++     *   - hw/scsi/scsi-generic.c|129| <<execute_command>> r->req.aiocb = blk_aio_ioctl(blk, SG_IO, &r->io_header, complete, r);
++     *   - hw/scsi/scsi-generic.c|523| <<scsi_SG_IO_FROM_DEV>> ret = blk_ioctl(blk, SG_IO, &io_header);
++     *   - scsi/qemu-pr-helper.c|151| <<do_sgio_worker>> ret = ioctl(data->fd, SG_IO, &io_hdr);
++     */
+     acb = blk_aio_ioctl(blk->blk, SG_IO, &ioctl_req->hdr,
+                         virtio_blk_ioctl_complete, ioctl_req);
+     if (!acb) {
+diff --git a/hw/scsi/scsi-bus.c b/hw/scsi/scsi-bus.c
+index 1c980cab38..2568681802 100644
+--- a/hw/scsi/scsi-bus.c
++++ b/hw/scsi/scsi-bus.c
+@@ -81,6 +81,10 @@ int scsi_bus_parse_cdb(SCSIDevice *dev, SCSICommand *cmd, uint8_t *buf,
+     return rc;
+ }
+ 
++/*
++ * called by:
++ *   - hw/scsi/scsi-bus.c|705| <<scsi_req_new>> req = scsi_device_alloc_req(d, tag, lun, buf, hba_private);
++ */
+ static SCSIRequest *scsi_device_alloc_req(SCSIDevice *s, uint32_t tag, uint32_t lun,
+                                           uint8_t *buf, void *hba_private)
+ {
+@@ -110,6 +114,10 @@ void scsi_bus_new(SCSIBus *bus, size_t bus_size, DeviceState *host,
+     qbus_set_bus_hotplug_handler(BUS(bus), &error_abort);
+ }
+ 
++/*
++ * 在以下使用scsi_dma_restart_bh():
++ *   - hw/scsi/scsi-bus.c|158| <<scsi_dma_restart_cb>> s->bh = aio_bh_new(ctx, scsi_dma_restart_bh, s);
++ */
+ static void scsi_dma_restart_bh(void *opaque)
+ {
+     SCSIDevice *s = opaque;
+@@ -644,6 +652,23 @@ SCSIRequest *scsi_req_alloc(const SCSIReqOps *reqops, SCSIDevice *d,
+     return req;
+ }
+ 
++/*
++ * called by:
++ *   - hw/scsi/esp.c|197| <<do_busid_cmd>> s->current_req = scsi_req_new(current_lun, 0, lun, buf, s);
++ *   - hw/scsi/lsi53c895a.c|867| <<lsi_do_command>> s->current->req = scsi_req_new(dev, s->current->tag, s->current_lun, buf,
++ *   - hw/scsi/megasas.c|1034| <<megasas_pd_get_info_submit>> cmd->req = scsi_req_new(sdev, cmd->index, lun, cmdbuf, cmd);
++ *   - hw/scsi/megasas.c|1052| <<megasas_pd_get_info_submit>> cmd->req = scsi_req_new(sdev, cmd->index, lun, cmdbuf, cmd);
++ *   - hw/scsi/megasas.c|1233| <<megasas_ld_get_info_submit>> cmd->req = scsi_req_new(sdev, cmd->index, lun, cdb, cmd);
++ *   - hw/scsi/megasas.c|1706| <<megasas_handle_scsi>> cmd->req = scsi_req_new(sdev, cmd->index, lun_id, cdb, cmd);
++ *   - hw/scsi/megasas.c|1780| <<megasas_handle_io>> cmd->req = scsi_req_new(sdev, cmd->index,
++ *   - hw/scsi/mptsas.c|327| <<mptsas_process_scsi_io_request>> req->sreq = scsi_req_new(sdev, scsi_io->MsgContext,
++ *   - hw/scsi/scsi-bus.c|1651| <<get_scsi_requests>> req = scsi_req_new(s, tag, lun, buf, NULL);
++ *   - hw/scsi/spapr_vscsi.c|805| <<vscsi_queue_cmd>> req->sreq = scsi_req_new(sdev, req->qtag, lun, srp->cmd.cdb, req);
++ *   - hw/scsi/virtio-scsi.c|570| <<virtio_scsi_handle_cmd_req_prepare>> req->sreq = scsi_req_new(d, req->req.cmd.tag,
++ *   - hw/scsi/vmw_pvscsi.c|692| <<pvscsi_process_request_descriptor>> r->sreq = scsi_req_new(d, descr->context, r->lun, descr->cdb, r);
++ *   - hw/usb/dev-storage.c|449| <<usb_msd_handle_data>> s->req = scsi_req_new(scsi_dev, tag, cbw.lun, cbw.cmd, NULL);
++ *   - hw/usb/dev-uas.c|724| <<usb_uas_command>> req->req = scsi_req_new(req->dev, req->tag,
++ */
+ SCSIRequest *scsi_req_new(SCSIDevice *d, uint32_t tag, uint32_t lun,
+                           uint8_t *buf, void *hba_private)
+ {
+@@ -1324,6 +1349,32 @@ void scsi_req_unref(SCSIRequest *req)
+ 
+ /* Tell the device that we finished processing this chunk of I/O.  It
+    will start the next chunk or complete the command.  */
++/*
++ * called by:
++ *   - hw/scsi/esp.c|209| <<do_busid_cmd>> scsi_req_continue(s->current_req);
++ *   - hw/scsi/esp.c|374| <<do_dma_pdma_cb>> scsi_req_continue(s->current_req);
++ *   - hw/scsi/esp.c|453| <<esp_do_dma>> scsi_req_continue(s->current_req);
++ *   - hw/scsi/lsi53c895a.c|663| <<lsi_do_dma>> scsi_req_continue(s->current->req);
++ *   - hw/scsi/lsi53c895a.c|877| <<lsi_do_command>> scsi_req_continue(s->current->req);
++ *   - hw/scsi/megasas.c|1047| <<megasas_pd_get_info_submit>> scsi_req_continue(cmd->req);
++ *   - hw/scsi/megasas.c|1063| <<megasas_pd_get_info_submit>> scsi_req_continue(cmd->req);
++ *   - hw/scsi/megasas.c|1246| <<megasas_ld_get_info_submit>> scsi_req_continue(cmd->req);
++ *   - hw/scsi/megasas.c|1651| <<megasas_enqueue_req>> scsi_req_continue(cmd->req);
++ *   - hw/scsi/megasas.c|1820| <<megasas_xfer_complete>> scsi_req_continue(req);
++ *   - hw/scsi/megasas.c|1835| <<megasas_xfer_complete>> scsi_req_continue(req);
++ *   - hw/scsi/megasas.c|1841| <<megasas_xfer_complete>> scsi_req_continue(req);
++ *   - hw/scsi/mptsas.c|354| <<mptsas_process_scsi_io_request>> scsi_req_continue(req->sreq);
++ *   - hw/scsi/scsi-bus.c|137| <<scsi_dma_restart_bh>> scsi_req_continue(req);
++ *   - hw/scsi/scsi-bus.c|1396| <<scsi_req_data>> scsi_req_continue(req);
++ *   - hw/scsi/spapr_vscsi.c|550| <<vscsi_transfer_data>> scsi_req_continue(sreq);
++ *   - hw/scsi/spapr_vscsi.c|826| <<vscsi_queue_cmd>> scsi_req_continue(req->sreq);
++ *   - hw/scsi/virtio-scsi.c|719| <<virtio_scsi_handle_cmd_req_submit>> scsi_req_continue(sreq);
++ *   - hw/scsi/vmw_pvscsi.c|712| <<pvscsi_process_request_descriptor>> scsi_req_continue(r->sreq);
++ *   - hw/usb/dev-storage.c|234| <<usb_msd_copy_data>> scsi_req_continue(s->req);
++ *   - hw/usb/dev-storage.c|455| <<usb_msd_handle_data>> scsi_req_continue(s->req);
++ *   - hw/usb/dev-uas.c|514| <<usb_uas_copy_data>> scsi_req_continue(req->req);
++ *   - hw/usb/dev-uas.c|733| <<usb_uas_command>> scsi_req_continue(req->req);
++ */
+ void scsi_req_continue(SCSIRequest *req)
+ {
+     if (req->io_canceled) {
+diff --git a/hw/scsi/scsi-disk.c b/hw/scsi/scsi-disk.c
+index 1c0cb63a6f..24d5753722 100644
+--- a/hw/scsi/scsi-disk.c
++++ b/hw/scsi/scsi-disk.c
+@@ -186,6 +186,16 @@ static void scsi_disk_load_request(QEMUFile *f, SCSIRequest *req)
+     qemu_iovec_init_external(&r->qiov, &r->iov, 1);
+ }
+ 
++/*
++ * called by:
++ *   - hw/scsi/scsi-disk.c|211| <<scsi_aio_complete>> if (scsi_disk_req_check_error(r, ret, true)) {
++ *   - hw/scsi/scsi-disk.c|270| <<scsi_dma_complete_noio>> if (scsi_disk_req_check_error(r, ret, false)) {
++ *   - hw/scsi/scsi-disk.c|310| <<scsi_read_complete_noio>> if (scsi_disk_req_check_error(r, ret, false)) {
++ *   - hw/scsi/scsi-disk.c|354| <<scsi_do_read>> if (scsi_disk_req_check_error(r, ret, false)) {
++ *   - hw/scsi/scsi-disk.c|509| <<scsi_write_complete_noio>> if (scsi_disk_req_check_error(r, ret, false)) {
++ *   - hw/scsi/scsi-disk.c|1662| <<scsi_unmap_complete>> if (scsi_disk_req_check_error(r, ret, true)) {
++ *   - hw/scsi/scsi-disk.c|1740| <<scsi_write_same_complete>> if (scsi_disk_req_check_error(r, ret, true)) {
++ */
+ static bool scsi_disk_req_check_error(SCSIDiskReq *r, int ret, bool acct_failed)
+ {
+     if (r->req.io_canceled) {
+@@ -264,6 +274,11 @@ static void scsi_write_do_fua(SCSIDiskReq *r)
+     scsi_req_unref(&r->req);
+ }
+ 
++/*
++ * called by:
++ *   - hw/scsi/scsi-disk.c|311| <<scsi_dma_complete>> scsi_dma_complete_noio(r, ret);
++ *   - hw/scsi/scsi-disk.c|592| <<scsi_write_data>> scsi_dma_complete_noio(r, 0);
++ */
+ static void scsi_dma_complete_noio(SCSIDiskReq *r, int ret)
+ {
+     assert(r->req.aiocb == NULL);
+@@ -340,6 +355,11 @@ static void scsi_read_complete(void *opaque, int ret)
+ }
+ 
+ /* Actually issue a read to the block device.  */
++/*
++ * called by:
++ *   - hw/scsi/scsi-disk.c|390| <<scsi_do_read_cb>> scsi_do_read(opaque, ret);
++ *   - hw/scsi/scsi-disk.c|431| <<scsi_read_data>> scsi_do_read(r, 0);
++ */
+ static void scsi_do_read(SCSIDiskReq *r, int ret)
+ {
+     SCSIDiskState *s = DO_UPCAST(SCSIDiskState, qdev, r->req.dev);
+@@ -373,6 +393,10 @@ done:
+     scsi_req_unref(&r->req);
+ }
+ 
++/*
++ * 在以下使用scsi_do_read_cb():
++ *   - hw/scsi/scsi-disk.c|444| <<scsi_read_data>> r->req.aiocb = blk_aio_flush(s->qdev.conf.blk, scsi_do_read_cb, r);
++ */
+ static void scsi_do_read_cb(void *opaque, int ret)
+ {
+     SCSIDiskReq *r = (SCSIDiskReq *)opaque;
+@@ -392,6 +416,10 @@ static void scsi_do_read_cb(void *opaque, int ret)
+ }
+ 
+ /* Read more data from scsi device into buffer.  */
++/*
++ * SCSIReqOps scsi_disk_dma_reqops.read_data = scsi_read_data()
++ * SCSIReqOps scsi_block_dma_reqops.read_data = scsi_read_data()
++ */
+ static void scsi_read_data(SCSIRequest *req)
+ {
+     SCSIDiskReq *r = DO_UPCAST(SCSIDiskReq, req, req);
+@@ -439,6 +467,10 @@ static void scsi_read_data(SCSIRequest *req)
+  * scsi_handle_rw_error always manages its reference counts, independent
+  * of the return value.
+  */
++/*
++ * called by:
++ *   - hw/scsi/scsi-disk.c|197| <<scsi_disk_req_check_error>> return scsi_handle_rw_error(r, -ret, acct_failed);
++ */
+ static bool scsi_handle_rw_error(SCSIDiskReq *r, int error, bool acct_failed)
+ {
+     bool is_read = (r->req.cmd.mode == SCSI_XFER_FROM_DEV);
+@@ -2330,6 +2362,13 @@ static void scsi_disk_unit_attention_reported(SCSIDevice *dev)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - hw/scsi/scsi-disk.c|2446| <<scsi_hd_realize>> scsi_realize(&s->qdev, errp);
++ *   - hw/scsi/scsi-disk.c|2474| <<scsi_cd_realize>> scsi_realize(&s->qdev, errp);
++ *   - hw/scsi/scsi-disk.c|2487| <<scsi_disk_realize>> scsi_realize(dev, &local_err);
++ *   - hw/scsi/scsi-disk.c|2680| <<scsi_block_realize>> scsi_realize(&s->qdev, errp);
++ */
+ static void scsi_realize(SCSIDevice *dev, Error **errp)
+ {
+     SCSIDiskState *s = DO_UPCAST(SCSIDiskState, qdev, dev);
+@@ -2443,6 +2482,13 @@ static void scsi_hd_realize(SCSIDevice *dev, Error **errp)
+     if (!s->product) {
+         s->product = g_strdup("QEMU HARDDISK");
+     }
++    /*
++     * called by:
++     *   - hw/scsi/scsi-disk.c|2446| <<scsi_hd_realize>> scsi_realize(&s->qdev, errp);
++     *   - hw/scsi/scsi-disk.c|2474| <<scsi_cd_realize>> scsi_realize(&s->qdev, errp);
++     *   - hw/scsi/scsi-disk.c|2487| <<scsi_disk_realize>> scsi_realize(dev, &local_err);
++     *   - hw/scsi/scsi-disk.c|2680| <<scsi_block_realize>> scsi_realize(&s->qdev, errp);
++     */
+     scsi_realize(&s->qdev, errp);
+     if (ctx) {
+         aio_context_release(ctx);
+@@ -2597,6 +2643,10 @@ static SCSIRequest *scsi_new_request(SCSIDevice *d, uint32_t tag, uint32_t lun,
+ }
+ 
+ #ifdef __linux__
++/*
++ * called by:
++ *   - hw/scsi/scsi-disk.c|2659| <<scsi_block_realize>> rc = get_device_type(s);
++ */
+ static int get_device_type(SCSIDiskState *s)
+ {
+     uint8_t cmd[16];
+@@ -2642,6 +2692,14 @@ static void scsi_block_realize(SCSIDevice *dev, Error **errp)
+     aio_context_acquire(ctx);
+ 
+     /* check we are using a driver managing SG_IO (version 3 and after) */
++    /*
++     * 在以下使用SG_GET_VERSION_NUM:
++     *   - /usr/include/scsi/sg.h|168| <<global>> #define SG_GET_VERSION_NUM 0x2282
++     *   - block/file-posix.c|3315| <<hdev_is_sg>> ret = ioctl(s->fd, SG_GET_VERSION_NUM, &sg_version);
++     *   - block/iscsi.c|1017| <<iscsi_ioctl_handle_emulated>> case SG_GET_VERSION_NUM:
++     *   - hw/scsi/scsi-disk.c|2645| <<scsi_block_realize>> rc = blk_ioctl(s->qdev.conf.blk, SG_GET_VERSION_NUM, &sg_version);
++     *   - hw/scsi/scsi-generic.c|675| <<scsi_generic_realize>> rc = blk_ioctl(s->conf.blk, SG_GET_VERSION_NUM, &sg_version);
++     */
+     rc = blk_ioctl(s->qdev.conf.blk, SG_GET_VERSION_NUM, &sg_version);
+     if (rc < 0) {
+         error_setg_errno(errp, -rc, "cannot get SG_IO version number");
+@@ -2656,6 +2714,9 @@ static void scsi_block_realize(SCSIDevice *dev, Error **errp)
+     }
+ 
+     /* get device type from INQUIRY data */
++    /*
++     * 只在这里被调用
++     */
+     rc = get_device_type(s);
+     if (rc < 0) {
+         error_setg(errp, "INQUIRY failed");
+@@ -2677,6 +2738,13 @@ static void scsi_block_realize(SCSIDevice *dev, Error **errp)
+      */
+     s->features |= (1 << SCSI_DISK_F_NO_REMOVABLE_DEVOPS);
+ 
++    /*
++     * called by:
++     *   - hw/scsi/scsi-disk.c|2446| <<scsi_hd_realize>> scsi_realize(&s->qdev, errp);
++     *   - hw/scsi/scsi-disk.c|2474| <<scsi_cd_realize>> scsi_realize(&s->qdev, errp);
++     *   - hw/scsi/scsi-disk.c|2487| <<scsi_disk_realize>> scsi_realize(dev, &local_err);
++     *   - hw/scsi/scsi-disk.c|2680| <<scsi_block_realize>> scsi_realize(&s->qdev, errp);
++     */
+     scsi_realize(&s->qdev, errp);
+     scsi_generic_read_device_inquiry(&s->qdev);
+ 
+@@ -2695,6 +2763,11 @@ typedef struct SCSIBlockReq {
+     uint8_t cdb[16];
+ } SCSIBlockReq;
+ 
++/*
++ * called by:
++ *   - hw/scsi/scsi-disk.c|2822| <<scsi_block_dma_readv>> return scsi_block_do_sgio(r, offset, iov,
++ *   - hw/scsi/scsi-disk.c|2832| <<scsi_block_dma_writev>> return scsi_block_do_sgio(r, offset, iov,
++ */
+ static BlockAIOCB *scsi_block_do_sgio(SCSIBlockReq *req,
+                                       int64_t offset, QEMUIOVector *iov,
+                                       int direction,
+@@ -2774,6 +2847,17 @@ static BlockAIOCB *scsi_block_do_sgio(SCSIBlockReq *req,
+     io_header->usr_ptr = r;
+     io_header->flags |= SG_FLAG_DIRECT_IO;
+ 
++    /*
++     * 在以下使用SG_IO:
++     *   - /usr/include/scsi/sg.h|179| <<global>> #define SG_IO 0x2285
++     *   - block/file-posix.c|3451| <<hdev_co_ioctl>> if (req == SG_IO && s->pr_mgr) {
++     *   - block/iscsi.c|1058| <<iscsi_aio_ioctl>> if (req != SG_IO) {
++     *   - hw/block/virtio-blk.c|353| <<virtio_blk_handle_scsi_req>> acb = blk_aio_ioctl(blk->blk, SG_IO, &ioctl_req->hdr,
++     *   - hw/scsi/scsi-disk.c|2818| <<scsi_block_do_sgio>> aiocb = blk_aio_ioctl(s->qdev.conf.blk, SG_IO, io_header, cb, opaque);
++     *   - hw/scsi/scsi-generic.c|129| <<execute_command>> r->req.aiocb = blk_aio_ioctl(blk, SG_IO, &r->io_header, complete, r);
++     *   - hw/scsi/scsi-generic.c|523| <<scsi_SG_IO_FROM_DEV>> ret = blk_ioctl(blk, SG_IO, &io_header);
++     *   - scsi/qemu-pr-helper.c|151| <<do_sgio_worker>> ret = ioctl(data->fd, SG_IO, &io_hdr);
++     */
+     aiocb = blk_aio_ioctl(s->qdev.conf.blk, SG_IO, io_header, cb, opaque);
+     assert(aiocb != NULL);
+     return aiocb;
+@@ -2784,6 +2868,10 @@ static bool scsi_block_no_fua(SCSICommand *cmd)
+     return false;
+ }
+ 
++/*
++ * 在以下使用scsi_block_dma_readv():
++ *   - hw/scsi/scsi-disk.c|3132| <<scsi_block_class_initfn>> sdc->dma_readv = scsi_block_dma_readv;
++ */
+ static BlockAIOCB *scsi_block_dma_readv(int64_t offset,
+                                         QEMUIOVector *iov,
+                                         BlockCompletionFunc *cb, void *cb_opaque,
+@@ -2892,6 +2980,10 @@ static int32_t scsi_block_dma_command(SCSIRequest *req, uint8_t *buf)
+     return scsi_disk_dma_command(req, buf);
+ }
+ 
++/*
++ * 在以下使用scsi_block_dma_reqops:
++ *   - hw/scsi/scsi-disk.c|2991| <<scsi_block_new_request>> return scsi_req_alloc(&scsi_block_dma_reqops, &s->qdev, tag, lun,
++ */
+ static const SCSIReqOps scsi_block_dma_reqops = {
+     .size         = sizeof(SCSIBlockReq),
+     .free_req     = scsi_free_request,
+@@ -2903,6 +2995,13 @@ static const SCSIReqOps scsi_block_dma_reqops = {
+     .save_request = scsi_disk_save_request,
+ };
+ 
++/*
++ * called by:
++ *   - hw/scsi/scsi-bus.c|89| <<scsi_device_alloc_req>> return sc->alloc_req(s, tag, lun, buf, hba_private);
++ *
++ * 在以下使用scsi_block_new_request():
++ *   - hw/scsi/scsi-disk.c|3176| <<scsi_block_class_initfn>> sc->alloc_req = scsi_block_new_request;
++ */
+ static SCSIRequest *scsi_block_new_request(SCSIDevice *d, uint32_t tag,
+                                            uint32_t lun, uint8_t *buf,
+                                            void *hba_private)
+@@ -3098,6 +3197,10 @@ static void scsi_block_class_initfn(ObjectClass *klass, void *data)
+     SCSIDiskClass *sdc = SCSI_DISK_BASE_CLASS(klass);
+ 
+     sc->realize      = scsi_block_realize;
++    /*
++     * called by:
++     *   - hw/scsi/scsi-bus.c|89| <<scsi_device_alloc_req>> return sc->alloc_req(s, tag, lun, buf, hba_private);
++     */
+     sc->alloc_req    = scsi_block_new_request;
+     sc->parse_cdb    = scsi_block_parse_cdb;
+     sdc->dma_readv   = scsi_block_dma_readv;
+@@ -3158,11 +3261,15 @@ static const TypeInfo scsi_disk_info = {
+ static void scsi_disk_register_types(void)
+ {
+     type_register_static(&scsi_disk_base_info);
++    /* virtual SCSI disk */
+     type_register_static(&scsi_hd_info);
++    /* virtual SCSI CD-ROM */
+     type_register_static(&scsi_cd_info);
+ #ifdef __linux__
++    /* SCSI block device passthrough */
+     type_register_static(&scsi_block_info);
+ #endif
++    /* virtual SCSI disk or CD-ROM (legacy) */
+     type_register_static(&scsi_disk_info);
+ }
+ 
+diff --git a/hw/scsi/scsi-generic.c b/hw/scsi/scsi-generic.c
+index 86ed0a3822..e207e411f8 100644
+--- a/hw/scsi/scsi-generic.c
++++ b/hw/scsi/scsi-generic.c
+@@ -126,6 +126,17 @@ static int execute_command(BlockBackend *blk,
+     r->io_header.usr_ptr = r;
+     r->io_header.flags |= SG_FLAG_DIRECT_IO;
+ 
++    /*
++     * 在以下使用SG_IO:
++     *   - /usr/include/scsi/sg.h|179| <<global>> #define SG_IO 0x2285
++     *   - block/file-posix.c|3451| <<hdev_co_ioctl>> if (req == SG_IO && s->pr_mgr) {
++     *   - block/iscsi.c|1058| <<iscsi_aio_ioctl>> if (req != SG_IO) {
++     *   - hw/block/virtio-blk.c|353| <<virtio_blk_handle_scsi_req>> acb = blk_aio_ioctl(blk->blk, SG_IO, &ioctl_req->hdr,
++     *   - hw/scsi/scsi-disk.c|2818| <<scsi_block_do_sgio>> aiocb = blk_aio_ioctl(s->qdev.conf.blk, SG_IO, io_header, cb, opaque);
++     *   - hw/scsi/scsi-generic.c|129| <<execute_command>> r->req.aiocb = blk_aio_ioctl(blk, SG_IO, &r->io_header, complete, r);
++     *   - hw/scsi/scsi-generic.c|523| <<scsi_SG_IO_FROM_DEV>> ret = blk_ioctl(blk, SG_IO, &io_header);
++     *   - scsi/qemu-pr-helper.c|151| <<do_sgio_worker>> ret = ioctl(data->fd, SG_IO, &io_hdr);
++     */
+     r->req.aiocb = blk_aio_ioctl(blk, SG_IO, &r->io_header, complete, r);
+     if (r->req.aiocb == NULL) {
+         return -EIO;
+@@ -520,6 +531,17 @@ int scsi_SG_IO_FROM_DEV(BlockBackend *blk, uint8_t *cmd, uint8_t cmd_size,
+     io_header.sbp = sensebuf;
+     io_header.timeout = 6000; /* XXX */
+ 
++    /*
++     * 在以下使用SG_IO:
++     *   - /usr/include/scsi/sg.h|179| <<global>> #define SG_IO 0x2285
++     *   - block/file-posix.c|3451| <<hdev_co_ioctl>> if (req == SG_IO && s->pr_mgr) {
++     *   - block/iscsi.c|1058| <<iscsi_aio_ioctl>> if (req != SG_IO) {
++     *   - hw/block/virtio-blk.c|353| <<virtio_blk_handle_scsi_req>> acb = blk_aio_ioctl(blk->blk, SG_IO, &ioctl_req->hdr,
++     *   - hw/scsi/scsi-disk.c|2818| <<scsi_block_do_sgio>> aiocb = blk_aio_ioctl(s->qdev.conf.blk, SG_IO, io_header, cb, opaque);
++     *   - hw/scsi/scsi-generic.c|129| <<execute_command>> r->req.aiocb = blk_aio_ioctl(blk, SG_IO, &r->io_header, complete, r);
++     *   - hw/scsi/scsi-generic.c|523| <<scsi_SG_IO_FROM_DEV>> ret = blk_ioctl(blk, SG_IO, &io_header);
++     *   - scsi/qemu-pr-helper.c|151| <<do_sgio_worker>> ret = ioctl(data->fd, SG_IO, &io_hdr);
++     */
+     ret = blk_ioctl(blk, SG_IO, &io_header);
+     if (ret < 0 || io_header.driver_status || io_header.host_status) {
+         return -1;
+@@ -614,6 +636,11 @@ static void scsi_generic_read_device_identification(SCSIDevice *s)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - hw/scsi/scsi-disk.c|2681| <<scsi_block_realize>> scsi_generic_read_device_inquiry(&s->qdev);
++ *   - hw/scsi/scsi-generic.c|728| <<scsi_generic_realize>> scsi_generic_read_device_inquiry(s);
++ */
+ void scsi_generic_read_device_inquiry(SCSIDevice *s)
+ {
+     scsi_generic_read_device_identification(s);
+@@ -672,6 +699,14 @@ static void scsi_generic_realize(SCSIDevice *s, Error **errp)
+     }
+ 
+     /* check we are using a driver managing SG_IO (version 3 and after */
++    /*
++     * 在以下使用SG_GET_VERSION_NUM:
++     *   - /usr/include/scsi/sg.h|168| <<global>> #define SG_GET_VERSION_NUM 0x2282
++     *   - block/file-posix.c|3315| <<hdev_is_sg>> ret = ioctl(s->fd, SG_GET_VERSION_NUM, &sg_version);
++     *   - block/iscsi.c|1017| <<iscsi_ioctl_handle_emulated>> case SG_GET_VERSION_NUM:
++     *   - hw/scsi/scsi-disk.c|2645| <<scsi_block_realize>> rc = blk_ioctl(s->qdev.conf.blk, SG_GET_VERSION_NUM, &sg_version);
++     *   - hw/scsi/scsi-generic.c|675| <<scsi_generic_realize>> rc = blk_ioctl(s->conf.blk, SG_GET_VERSION_NUM, &sg_version);
++     */
+     rc = blk_ioctl(s->conf.blk, SG_GET_VERSION_NUM, &sg_version);
+     if (rc < 0) {
+         error_setg_errno(errp, -rc, "cannot get SG_IO version number");
+diff --git a/hw/scsi/virtio-scsi.c b/hw/scsi/virtio-scsi.c
+index 472bbd233b..e179002739 100644
+--- a/hw/scsi/virtio-scsi.c
++++ b/hw/scsi/virtio-scsi.c
+@@ -28,11 +28,24 @@
+ #include "hw/virtio/virtio-bus.h"
+ #include "hw/virtio/virtio-access.h"
+ 
++/*
++ * called by:
++ *   - hw/scsi/virtio-scsi.c|44| <<virtio_scsi_device_find>> return scsi_device_find(&s->bus, 0, lun[1], virtio_scsi_get_lun(lun));
++ *   - hw/scsi/virtio-scsi.c|282| <<virtio_scsi_do_tmf>> if (d->lun != virtio_scsi_get_lun(req->req.tmf.lun)) {
++ *   - hw/scsi/virtio-scsi.c|319| <<virtio_scsi_do_tmf>> if (d->lun != virtio_scsi_get_lun(req->req.tmf.lun)) {
++ *   - hw/scsi/virtio-scsi.c|333| <<virtio_scsi_do_tmf>> if (d->lun != virtio_scsi_get_lun(req->req.tmf.lun)) {
++ *   - hw/scsi/virtio-scsi.c|571| <<virtio_scsi_handle_cmd_req_prepare>> virtio_scsi_get_lun(req->req.cmd.lun),
++ */
+ static inline int virtio_scsi_get_lun(uint8_t *lun)
+ {
+     return ((lun[2] << 8) | lun[3]) & 0x3FFF;
+ }
+ 
++/*
++ * called by:
++ *   - hw/scsi/virtio-scsi.c|259| <<virtio_scsi_do_tmf>> SCSIDevice *d = virtio_scsi_device_find(s, req->req.tmf.lun);
++ *   - hw/scsi/virtio-scsi.c|563| <<virtio_scsi_handle_cmd_req_prepare>> d = virtio_scsi_device_find(s, req->req.cmd.lun);
++ */
+ static inline SCSIDevice *virtio_scsi_device_find(VirtIOSCSI *s, uint8_t *lun)
+ {
+     if (lun[0] != 1) {
+@@ -44,6 +57,11 @@ static inline SCSIDevice *virtio_scsi_device_find(VirtIOSCSI *s, uint8_t *lun)
+     return scsi_device_find(&s->bus, 0, lun[1], virtio_scsi_get_lun(lun));
+ }
+ 
++/*
++ * called by:
++ *   - hw/scsi/virtio-scsi.c|185| <<virtio_scsi_pop_req>> virtio_scsi_init_req(s, vq, req);
++ *   - hw/scsi/virtio-scsi.c|214| <<virtio_scsi_load_request>> virtio_scsi_init_req(s, vs->cmd_vqs[n], req);
++ */
+ void virtio_scsi_init_req(VirtIOSCSI *s, VirtQueue *vq, VirtIOSCSIReq *req)
+ {
+     VirtIODevice *vdev = VIRTIO_DEVICE(s);
+@@ -57,6 +75,12 @@ void virtio_scsi_init_req(VirtIOSCSI *s, VirtQueue *vq, VirtIOSCSIReq *req)
+     memset((uint8_t *)req + zero_skip, 0, sizeof(*req) - zero_skip);
+ }
+ 
++/*
++ * called by:
++ *   - hw/scsi/virtio-scsi.c|85| <<virtio_scsi_complete_req>> virtio_scsi_free_req(req);
++ *   - hw/scsi/virtio-scsi.c|92| <<virtio_scsi_bad_req>> virtio_scsi_free_req(req);
++ *   - hw/scsi/virtio-scsi.c|623| <<virtio_scsi_handle_cmd_vq>> virtio_scsi_free_req(req);
++ */
+ void virtio_scsi_free_req(VirtIOSCSIReq *req)
+ {
+     qemu_iovec_destroy(&req->resp_iov);
+@@ -64,6 +88,13 @@ void virtio_scsi_free_req(VirtIOSCSIReq *req)
+     g_free(req);
+ }
+ 
++/*
++ * called by:
++ *   - hw/scsi/virtio-scsi.c|242| <<virtio_scsi_cancel_notify>> virtio_scsi_complete_req(n->tmf_req);
++ *   - hw/scsi/virtio-scsi.c|430| <<virtio_scsi_handle_ctrl_req>> virtio_scsi_complete_req(req);
++ *   - hw/scsi/virtio-scsi.c|469| <<virtio_scsi_complete_cmd_req>> virtio_scsi_complete_req(req);
++ *   - hw/scsi/virtio-scsi.c|761| <<virtio_scsi_push_event>> virtio_scsi_complete_req(req);
++ */
+ static void virtio_scsi_complete_req(VirtIOSCSIReq *req)
+ {
+     VirtIOSCSI *s = req->dev;
+@@ -85,6 +116,14 @@ static void virtio_scsi_complete_req(VirtIOSCSIReq *req)
+     virtio_scsi_free_req(req);
+ }
+ 
++/*
++ * called by:
++ *   - hw/scsi/virtio-scsi.c|404| <<virtio_scsi_handle_ctrl_req>> virtio_scsi_bad_req(req);
++ *   - hw/scsi/virtio-scsi.c|412| <<virtio_scsi_handle_ctrl_req>> virtio_scsi_bad_req(req);
++ *   - hw/scsi/virtio-scsi.c|422| <<virtio_scsi_handle_ctrl_req>> virtio_scsi_bad_req(req);
++ *   - hw/scsi/virtio-scsi.c|558| <<virtio_scsi_handle_cmd_req_prepare>> virtio_scsi_bad_req(req);
++ *   - hw/scsi/virtio-scsi.c|741| <<virtio_scsi_push_event>> virtio_scsi_bad_req(req);
++ */
+ static void virtio_scsi_bad_req(VirtIOSCSIReq *req)
+ {
+     virtio_error(VIRTIO_DEVICE(req->dev), "wrong size for virtio-scsi headers");
+@@ -92,6 +131,11 @@ static void virtio_scsi_bad_req(VirtIOSCSIReq *req)
+     virtio_scsi_free_req(req);
+ }
+ 
++/*
++ * called by:
++ *   - hw/scsi/virtio-scsi.c|195| <<virtio_scsi_parse_req>> out_size = qemu_sgl_concat(req, req->elem.out_sg,
++ *   - hw/scsi/virtio-scsi.c|198| <<virtio_scsi_parse_req>> in_size = qemu_sgl_concat(req, req->elem.in_sg,
++ */
+ static size_t qemu_sgl_concat(VirtIOSCSIReq *req, struct iovec *iov,
+                               hwaddr *addr, int num, size_t skip)
+ {
+@@ -115,6 +159,14 @@ static size_t qemu_sgl_concat(VirtIOSCSIReq *req, struct iovec *iov,
+     return copied;
+ }
+ 
++/*
++ * called by:
++ *   - hw/scsi/virtio-scsi.c|261| <<virtio_scsi_load_request>> if (virtio_scsi_parse_req(req, sizeof(VirtIOSCSICmdReq) + vs->cdb_size,
++ *   - hw/scsi/virtio-scsi.c|459| <<virtio_scsi_handle_ctrl_req>> if (virtio_scsi_parse_req(req, sizeof(VirtIOSCSICtrlTMFReq),
++ *   - hw/scsi/virtio-scsi.c|469| <<virtio_scsi_handle_ctrl_req>> if (virtio_scsi_parse_req(req, sizeof(VirtIOSCSICtrlANReq),
++ *   - hw/scsi/virtio-scsi.c|620| <<virtio_scsi_handle_cmd_req_prepare>> rc = virtio_scsi_parse_req(req, sizeof(VirtIOSCSICmdReq) + vs->cdb_size,
++ *   - hw/scsi/virtio-scsi.c|825| <<virtio_scsi_push_event>> if (virtio_scsi_parse_req(req, 0, sizeof(VirtIOSCSIEvent))) {
++ */
+ static int virtio_scsi_parse_req(VirtIOSCSIReq *req,
+                                  unsigned req_size, unsigned resp_size)
+ {
+@@ -173,6 +225,12 @@ static int virtio_scsi_parse_req(VirtIOSCSIReq *req,
+     return 0;
+ }
+ 
++/*
++ * called by:
++ *   - hw/scsi/virtio-scsi.c|490| <<virtio_scsi_handle_ctrl_vq>> while ((req = virtio_scsi_pop_req(s, vq))) {
++ *   - hw/scsi/virtio-scsi.c|684| <<virtio_scsi_handle_cmd_vq>> while ((req = virtio_scsi_pop_req(s, vq))) {
++ *   - hw/scsi/virtio-scsi.c|814| <<virtio_scsi_push_event>> req = virtio_scsi_pop_req(s, vs->event_vq);
++ */
+ static VirtIOSCSIReq *virtio_scsi_pop_req(VirtIOSCSI *s, VirtQueue *vq)
+ {
+     VirtIOSCSICommon *vs = (VirtIOSCSICommon *)s;
+@@ -186,6 +244,9 @@ static VirtIOSCSIReq *virtio_scsi_pop_req(VirtIOSCSI *s, VirtQueue *vq)
+     return req;
+ }
+ 
++/*
++ * struct SCSIBusInfo virtio_scsi_scsi_info.save_request = virtio_scsi_save_request()
++ */
+ static void virtio_scsi_save_request(QEMUFile *f, SCSIRequest *sreq)
+ {
+     VirtIOSCSIReq *req = sreq->hba_private;
+@@ -198,6 +259,9 @@ static void virtio_scsi_save_request(QEMUFile *f, SCSIRequest *sreq)
+     qemu_put_virtqueue_element(vdev, f, &req->elem);
+ }
+ 
++/*
++ * struct SCSIBusInfo virtio_scsi_scsi_info.load_request = virtio_scsi_load_request()
++ */
+ static void *virtio_scsi_load_request(QEMUFile *f, SCSIRequest *sreq)
+ {
+     SCSIBus *bus = sreq->bus;
+@@ -232,6 +296,11 @@ typedef struct {
+     VirtIOSCSIReq  *tmf_req;
+ } VirtIOSCSICancelNotifier;
+ 
++/*
++ * 在以下使用virtio_scsi_cancel_notify():
++ *   - hw/scsi/virtio-scsi.c|357| <<virtio_scsi_do_tmf>> notifier->notifier.notify = virtio_scsi_cancel_notify;
++ *   - hw/scsi/virtio-scsi.c|405| <<virtio_scsi_do_tmf>> notifier->notifier.notify = virtio_scsi_cancel_notify;
++ */
+ static void virtio_scsi_cancel_notify(Notifier *notifier, void *data)
+ {
+     VirtIOSCSICancelNotifier *n = container_of(notifier,
+@@ -244,6 +313,11 @@ static void virtio_scsi_cancel_notify(Notifier *notifier, void *data)
+     g_free(n);
+ }
+ 
++/*
++ * called by:
++ *   - hw/scsi/virtio-scsi.c|314| <<virtio_scsi_do_tmf>> virtio_scsi_ctx_check(s, d);
++ *   - hw/scsi/virtio-scsi.c|638| <<virtio_scsi_handle_cmd_req_prepare>> virtio_scsi_ctx_check(s, d);
++ */
+ static inline void virtio_scsi_ctx_check(VirtIOSCSI *s, SCSIDevice *d)
+ {
+     if (s->dataplane_started && d && blk_is_available(d->conf.blk)) {
+@@ -254,6 +328,10 @@ static inline void virtio_scsi_ctx_check(VirtIOSCSI *s, SCSIDevice *d)
+ /* Return 0 if the request is ready to be completed and return to guest;
+  * -EINPROGRESS if the request is submitted and will be completed later, in the
+  *  case of async cancellation. */
++/*
++ * called by:
++ *   - hw/scsi/virtio-scsi.c|415| <<virtio_scsi_handle_ctrl_req>> r = virtio_scsi_do_tmf(s, req);
++ */
+ static int virtio_scsi_do_tmf(VirtIOSCSI *s, VirtIOSCSIReq *req)
+ {
+     SCSIDevice *d = virtio_scsi_device_find(s, req->req.tmf.lun);
+@@ -393,6 +471,10 @@ fail:
+     return ret;
+ }
+ 
++/*
++ * called by:
++ *   - hw/scsi/virtio-scsi.c|526| <<virtio_scsi_handle_ctrl_vq>> virtio_scsi_handle_ctrl_req(s, req);
++ */
+ static void virtio_scsi_handle_ctrl_req(VirtIOSCSI *s, VirtIOSCSIReq *req)
+ {
+     VirtIODevice *vdev = (VirtIODevice *)s;
+@@ -433,6 +515,11 @@ static void virtio_scsi_handle_ctrl_req(VirtIOSCSI *s, VirtIOSCSIReq *req)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - hw/scsi/virtio-scsi-dataplane.c|73| <<virtio_scsi_data_plane_handle_ctrl>> progress = virtio_scsi_handle_ctrl_vq(s, vq);
++ *   - hw/scsi/virtio-scsi.c|547| <<virtio_scsi_handle_ctrl>> virtio_scsi_handle_ctrl_vq(s, vq);
++ */
+ bool virtio_scsi_handle_ctrl_vq(VirtIOSCSI *s, VirtQueue *vq)
+ {
+     VirtIOSCSIReq *req;
+@@ -445,6 +532,16 @@ bool virtio_scsi_handle_ctrl_vq(VirtIOSCSI *s, VirtQueue *vq)
+     return progress;
+ }
+ 
++/*
++ * 在以下使用virtio_scsi_handle_ctrl():
++ *   - hw/scsi/virtio-scsi.c|1060| <<virtio_scsi_device_realize>> virtio_scsi_handle_ctrl,
++ *
++ * 1092     virtio_scsi_common_realize(dev,
++ * 1093                                virtio_scsi_handle_ctrl,
++ * 1094                                virtio_scsi_handle_event,
++ * 1095                                virtio_scsi_handle_cmd,
++ * 1096                                &err);
++ */
+ static void virtio_scsi_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
+ {
+     VirtIOSCSI *s = (VirtIOSCSI *)vdev;
+@@ -460,6 +557,14 @@ static void virtio_scsi_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
+     virtio_scsi_release(s);
+ }
+ 
++/*
++ * called by:
++ *   - hw/scsi/virtio-scsi.c|587| <<virtio_scsi_command_complete>> virtio_scsi_complete_cmd_req(req);
++ *   - hw/scsi/virtio-scsi.c|636| <<virtio_scsi_request_cancelled>> virtio_scsi_complete_cmd_req(req);
++ *   - hw/scsi/virtio-scsi.c|646| <<virtio_scsi_fail_cmd_req>> virtio_scsi_complete_cmd_req(req);
++ *   - hw/scsi/virtio-scsi.c|674| <<virtio_scsi_handle_cmd_req_prepare>> virtio_scsi_complete_cmd_req(req);
++ *   - hw/scsi/virtio-scsi.c|686| <<virtio_scsi_handle_cmd_req_prepare>> virtio_scsi_complete_cmd_req(req);
++ */
+ static void virtio_scsi_complete_cmd_req(VirtIOSCSIReq *req)
+ {
+     /* Sense data is not in req->resp and is copied separately
+@@ -469,6 +574,9 @@ static void virtio_scsi_complete_cmd_req(VirtIOSCSIReq *req)
+     virtio_scsi_complete_req(req);
+ }
+ 
++/*
++ * struct SCSIBusInfo virtio_scsi_scsi_info.complete = virtio_scsi_command_complete()
++ */
+ static void virtio_scsi_command_complete(SCSIRequest *r, uint32_t status,
+                                          size_t resid)
+ {
+@@ -496,6 +604,9 @@ static void virtio_scsi_command_complete(SCSIRequest *r, uint32_t status,
+     virtio_scsi_complete_cmd_req(req);
+ }
+ 
++/*
++ * struct SCSIBusInfo virtio_scsi_scsi_inf.parse_cdb = virtio_scsi_parse_cdb()
++ */
+ static int virtio_scsi_parse_cdb(SCSIDevice *dev, SCSICommand *cmd,
+                                  uint8_t *buf, void *hba_private)
+ {
+@@ -514,6 +625,9 @@ static int virtio_scsi_parse_cdb(SCSIDevice *dev, SCSICommand *cmd,
+     return 0;
+ }
+ 
++/*
++ * struct SCSIBusInfo virtio_scsi_scsi_info.get_sg_list = virtio_scsi_get_sg_list()
++ */
+ static QEMUSGList *virtio_scsi_get_sg_list(SCSIRequest *r)
+ {
+     VirtIOSCSIReq *req = r->hba_private;
+@@ -521,6 +635,9 @@ static QEMUSGList *virtio_scsi_get_sg_list(SCSIRequest *r)
+     return &req->qsgl;
+ }
+ 
++/*
++ * struct SCSIBusInfo virtio_scsi_scsi_info.cancel = virtio_scsi_request_cancelled()
++ */
+ static void virtio_scsi_request_cancelled(SCSIRequest *r)
+ {
+     VirtIOSCSIReq *req = r->hba_private;
+@@ -536,12 +653,20 @@ static void virtio_scsi_request_cancelled(SCSIRequest *r)
+     virtio_scsi_complete_cmd_req(req);
+ }
+ 
++/*
++ * called by:
++ *   - hw/scsi/virtio-scsi.c|616| <<virtio_scsi_handle_cmd_req_prepare>> virtio_scsi_fail_cmd_req(req);
++ */
+ static void virtio_scsi_fail_cmd_req(VirtIOSCSIReq *req)
+ {
+     req->resp.cmd.response = VIRTIO_SCSI_S_FAILURE;
+     virtio_scsi_complete_cmd_req(req);
+ }
+ 
++/*
++ * called by:
++ *   - hw/scsi/virtio-scsi.c|673| <<virtio_scsi_handle_cmd_vq>> ret = virtio_scsi_handle_cmd_req_prepare(s, req);
++ */
+ static int virtio_scsi_handle_cmd_req_prepare(VirtIOSCSI *s, VirtIOSCSIReq *req)
+ {
+     VirtIOSCSICommon *vs = &s->parent_obj;
+@@ -583,6 +708,10 @@ static int virtio_scsi_handle_cmd_req_prepare(VirtIOSCSI *s, VirtIOSCSIReq *req)
+     return 0;
+ }
+ 
++/*
++ * called by:
++ *   - hw/scsi/virtio-scsi.c|760| <<virtio_scsi_handle_cmd_vq>> virtio_scsi_handle_cmd_req_submit(s, req);
++ */
+ static void virtio_scsi_handle_cmd_req_submit(VirtIOSCSI *s, VirtIOSCSIReq *req)
+ {
+     SCSIRequest *sreq = req->sreq;
+@@ -593,6 +722,11 @@ static void virtio_scsi_handle_cmd_req_submit(VirtIOSCSI *s, VirtIOSCSIReq *req)
+     scsi_req_unref(sreq);
+ }
+ 
++/*
++ * called by:
++ *   - hw/scsi/virtio-scsi-dataplane.c|60| <<virtio_scsi_data_plane_handle_cmd>> progress = virtio_scsi_handle_cmd_vq(s, vq);
++ *   - hw/scsi/virtio-scsi.c|712| <<virtio_scsi_handle_cmd>> virtio_scsi_handle_cmd_vq(s, vq);
++ */
+ bool virtio_scsi_handle_cmd_vq(VirtIOSCSI *s, VirtQueue *vq)
+ {
+     VirtIOSCSIReq *req, *next;
+@@ -636,6 +770,16 @@ bool virtio_scsi_handle_cmd_vq(VirtIOSCSI *s, VirtQueue *vq)
+     return progress;
+ }
+ 
++/*
++ * 在以下使用virtio_scsi_handle_cmd():
++ *   - hw/scsi/virtio-scsi.c|1109| <<virtio_scsi_device_realize>> virtio_scsi_handle_cmd,
++ *
++ * 1110     virtio_scsi_common_realize(dev,
++ * 1111                                virtio_scsi_handle_ctrl,
++ * 1112                                virtio_scsi_handle_event,
++ * 1113                                virtio_scsi_handle_cmd,
++ * 1114                                &err);
++ */
+ static void virtio_scsi_handle_cmd(VirtIODevice *vdev, VirtQueue *vq)
+ {
+     /* use non-QOM casts in the data path */
+@@ -652,6 +796,10 @@ static void virtio_scsi_handle_cmd(VirtIODevice *vdev, VirtQueue *vq)
+     virtio_scsi_release(s);
+ }
+ 
++/*
++ * 在以下使用virtio_scsi_get_config():
++ *   - hw/scsi/virtio-scsi.c|1203| <<virtio_scsi_common_class_init>> vdc->get_config = virtio_scsi_get_config;
++ */
+ static void virtio_scsi_get_config(VirtIODevice *vdev,
+                                    uint8_t *config)
+ {
+@@ -671,6 +819,10 @@ static void virtio_scsi_get_config(VirtIODevice *vdev,
+     virtio_stl_p(vdev, &scsiconf->max_lun, VIRTIO_SCSI_MAX_LUN);
+ }
+ 
++/*
++ * 在以下使用virtio_scsi_set_config():
++ *   - hw/scsi/virtio-scsi.c|1200| <<virtio_scsi_class_init>> vdc->set_config = virtio_scsi_set_config;
++ */
+ static void virtio_scsi_set_config(VirtIODevice *vdev,
+                                    const uint8_t *config)
+ {
+@@ -688,6 +840,10 @@ static void virtio_scsi_set_config(VirtIODevice *vdev,
+     vs->cdb_size = virtio_ldl_p(vdev, &scsiconf->cdb_size);
+ }
+ 
++/*
++ * 在以下使用virtio_scsi_get_features():
++ *   - hw/scsi/virtio-scsi.c|1201| <<virtio_scsi_class_init>> vdc->get_features = virtio_scsi_get_features;
++ */
+ static uint64_t virtio_scsi_get_features(VirtIODevice *vdev,
+                                          uint64_t requested_features,
+                                          Error **errp)
+@@ -699,6 +855,10 @@ static uint64_t virtio_scsi_get_features(VirtIODevice *vdev,
+     return requested_features;
+ }
+ 
++/*
++ * 在以下使用virtio_scsi_reset():
++ *   - hw/scsi/virtio-scsi.c|1139| <<virtio_scsi_class_init>> vdc->reset = virtio_scsi_reset;
++ */
+ static void virtio_scsi_reset(VirtIODevice *vdev)
+ {
+     VirtIOSCSI *s = VIRTIO_SCSI(vdev);
+@@ -714,6 +874,13 @@ static void virtio_scsi_reset(VirtIODevice *vdev)
+     s->events_dropped = false;
+ }
+ 
++/*
++ * called by:
++ *   - hw/scsi/virtio-scsi.c|833| <<virtio_scsi_handle_event_vq>> virtio_scsi_push_event(s, NULL, VIRTIO_SCSI_T_NO_EVENT, 0);
++ *   - hw/scsi/virtio-scsi.c|875| <<virtio_scsi_change>> virtio_scsi_push_event(s, dev, VIRTIO_SCSI_T_PARAM_CHANGE,
++ *   - hw/scsi/virtio-scsi.c|918| <<virtio_scsi_hotplug>> virtio_scsi_push_event(s, sd,
++ *   - hw/scsi/virtio-scsi.c|939| <<virtio_scsi_hotunplug>> virtio_scsi_push_event(s, sd,
++ */
+ void virtio_scsi_push_event(VirtIOSCSI *s, SCSIDevice *dev,
+                             uint32_t event, uint32_t reason)
+ {
+@@ -761,6 +928,11 @@ void virtio_scsi_push_event(VirtIOSCSI *s, SCSIDevice *dev,
+     virtio_scsi_complete_req(req);
+ }
+ 
++/*
++ * called by:
++ *   - hw/scsi/virtio-scsi-dataplane.c|86| <<virtio_scsi_data_plane_handle_event>> progress = virtio_scsi_handle_event_vq(s, vq);
++ *   - hw/scsi/virtio-scsi.c|845| <<virtio_scsi_handle_event>> virtio_scsi_handle_event_vq(s, vq);
++ */
+ bool virtio_scsi_handle_event_vq(VirtIOSCSI *s, VirtQueue *vq)
+ {
+     if (s->events_dropped) {
+@@ -770,6 +942,16 @@ bool virtio_scsi_handle_event_vq(VirtIOSCSI *s, VirtQueue *vq)
+     return false;
+ }
+ 
++/*
++ * 在以下使用virtio_scsi_handle_event():
++ *   - hw/scsi/virtio-scsi.c|1010| <<virtio_scsi_device_realize>> virtio_scsi_handle_event,
++ *
++ * 1024     virtio_scsi_common_realize(dev,
++ * 1025                                virtio_scsi_handle_ctrl,
++ * 1026                                virtio_scsi_handle_event,
++ * 1027                                virtio_scsi_handle_cmd,
++ * 1028                                &err);
++ */
+ static void virtio_scsi_handle_event(VirtIODevice *vdev, VirtQueue *vq)
+ {
+     VirtIOSCSI *s = VIRTIO_SCSI(vdev);
+@@ -785,6 +967,9 @@ static void virtio_scsi_handle_event(VirtIODevice *vdev, VirtQueue *vq)
+     virtio_scsi_release(s);
+ }
+ 
++/*
++ * struct SCSIBusInfo virtio_scsi_scsi_info.change = virtio_scsi_change()
++ */
+ static void virtio_scsi_change(SCSIBus *bus, SCSIDevice *dev, SCSISense sense)
+ {
+     VirtIOSCSI *s = container_of(bus, VirtIOSCSI, bus);
+@@ -799,6 +984,10 @@ static void virtio_scsi_change(SCSIBus *bus, SCSIDevice *dev, SCSISense sense)
+     }
+ }
+ 
++/*
++ * 在以下使用virtio_scsi_pre_hotplug():
++ *   - hw/scsi/virtio-scsi.c|1115| <<virtio_scsi_class_init>> hc->pre_plug = virtio_scsi_pre_hotplug;
++ */
+ static void virtio_scsi_pre_hotplug(HotplugHandler *hotplug_dev,
+                                     DeviceState *dev, Error **errp)
+ {
+@@ -806,6 +995,10 @@ static void virtio_scsi_pre_hotplug(HotplugHandler *hotplug_dev,
+     sd->hba_supports_iothread = true;
+ }
+ 
++/*
++ * 在以下使用virtio_scsi_hotplug():
++ *   - hw/scsi/virtio-scsi.c|1116| <<virtio_scsi_class_init>> hc->plug = virtio_scsi_hotplug;
++ */
+ static void virtio_scsi_hotplug(HotplugHandler *hotplug_dev, DeviceState *dev,
+                                 Error **errp)
+ {
+@@ -835,6 +1028,10 @@ static void virtio_scsi_hotplug(HotplugHandler *hotplug_dev, DeviceState *dev,
+     }
+ }
+ 
++/*
++ * 在以下使用virtio_scsi_hotunplug():
++ *   - hw/scsi/virtio-scsi.c|1117| <<virtio_scsi_class_init>> hc->unplug = virtio_scsi_hotunplug;
++ */
+ static void virtio_scsi_hotunplug(HotplugHandler *hotplug_dev, DeviceState *dev,
+                                   Error **errp)
+ {
+@@ -863,6 +1060,16 @@ static void virtio_scsi_hotunplug(HotplugHandler *hotplug_dev, DeviceState *dev,
+     }
+ }
+ 
++/*
++ * 在以下使用virtio_scsi_scsi_info:
++ *   - hw/scsi/virtio-scsi.c|978| <<virtio_scsi_device_realize>> &virtio_scsi_scsi_info, vdev->bus_name);
++ *
++ * 981     virtio_scsi_common_realize(dev,
++ * 982                                virtio_scsi_handle_ctrl,
++ * 983                                virtio_scsi_handle_event,
++ * 984                                virtio_scsi_handle_cmd,
++ * 985                                &err);
++ */
+ static struct SCSIBusInfo virtio_scsi_scsi_info = {
+     .tcq = true,
+     .max_channel = VIRTIO_SCSI_MAX_CHANNEL,
+@@ -878,6 +1085,12 @@ static struct SCSIBusInfo virtio_scsi_scsi_info = {
+     .load_request = virtio_scsi_load_request,
+ };
+ 
++/*
++ * called by:
++ *   - hw/scsi/vhost-scsi.c|194| <<vhost_scsi_realize>> virtio_scsi_common_realize(dev,
++ *   - hw/scsi/vhost-user-scsi.c|106| <<vhost_user_scsi_realize>> virtio_scsi_common_realize(dev, vhost_dummy_handle_output,
++ *   - hw/scsi/virtio-scsi.c|967| <<virtio_scsi_device_realize>> virtio_scsi_common_realize(dev,
++ */
+ void virtio_scsi_common_realize(DeviceState *dev,
+                                 VirtIOHandleOutput ctrl,
+                                 VirtIOHandleOutput evt,
+@@ -915,6 +1128,10 @@ void virtio_scsi_common_realize(DeviceState *dev,
+     }
+ }
+ 
++/*
++ * 在以下使用virtio_scsi_device_realize():
++ *   - hw/scsi/virtio-scsi.c|1055| <<virtio_scsi_class_init>> vdc->realize = virtio_scsi_device_realize;
++ */
+ static void virtio_scsi_device_realize(DeviceState *dev, Error **errp)
+ {
+     VirtIODevice *vdev = VIRTIO_DEVICE(dev);
+@@ -939,6 +1156,14 @@ static void virtio_scsi_device_realize(DeviceState *dev, Error **errp)
+     virtio_scsi_dataplane_setup(s, errp);
+ }
+ 
++/*
++ * called by:
++ *   - hw/scsi/vhost-scsi.c|245| <<vhost_scsi_realize>> virtio_scsi_common_unrealize(dev);
++ *   - hw/scsi/vhost-scsi.c|268| <<vhost_scsi_unrealize>> virtio_scsi_common_unrealize(dev);
++ *   - hw/scsi/vhost-user-scsi.c|143| <<vhost_user_scsi_realize>> virtio_scsi_common_unrealize(dev);
++ *   - hw/scsi/vhost-user-scsi.c|159| <<vhost_user_scsi_unrealize>> virtio_scsi_common_unrealize(dev);
++ *   - hw/scsi/virtio-scsi.c|1005| <<virtio_scsi_device_unrealize>> virtio_scsi_common_unrealize(dev);
++ */
+ void virtio_scsi_common_unrealize(DeviceState *dev)
+ {
+     VirtIODevice *vdev = VIRTIO_DEVICE(dev);
+@@ -954,6 +1179,10 @@ void virtio_scsi_common_unrealize(DeviceState *dev)
+     virtio_cleanup(vdev);
+ }
+ 
++/*
++ * 在以下使用virtio_scsi_device_unrealize():
++ *   - hw/scsi/virtio-scsi.c|1056| <<virtio_scsi_class_init>> vdc->unrealize = virtio_scsi_device_unrealize;
++ */
+ static void virtio_scsi_device_unrealize(DeviceState *dev, Error **errp)
+ {
+     VirtIOSCSI *s = VIRTIO_SCSI(dev);
+@@ -962,6 +1191,10 @@ static void virtio_scsi_device_unrealize(DeviceState *dev, Error **errp)
+     virtio_scsi_common_unrealize(dev);
+ }
+ 
++/*
++ * 在以下使用virtio_scsi_properties[]:
++ *   - hw/scsi/virtio-scsi.c|1230| <<virtio_scsi_class_init>> device_class_set_props(dc, virtio_scsi_properties);
++ */
+ static Property virtio_scsi_properties[] = {
+     DEFINE_PROP_UINT32("num_queues", VirtIOSCSI, parent_obj.conf.num_queues, 1),
+     DEFINE_PROP_UINT32("virtqueue_size", VirtIOSCSI,
+@@ -981,6 +1214,10 @@ static Property virtio_scsi_properties[] = {
+     DEFINE_PROP_END_OF_LIST(),
+ };
+ 
++/*
++ * 在以下使用vmstate_virtio_scsi:
++ *   - hw/scsi/virtio-scsi.c|1243| <<virtio_scsi_class_init>> dc->vmsd = &vmstate_virtio_scsi;
++ */
+ static const VMStateDescription vmstate_virtio_scsi = {
+     .name = "virtio-scsi",
+     .minimum_version_id = 1,
+diff --git a/scsi/qemu-pr-helper.c b/scsi/qemu-pr-helper.c
+index 181ed4a186..dd5e394af3 100644
+--- a/scsi/qemu-pr-helper.c
++++ b/scsi/qemu-pr-helper.c
+@@ -148,6 +148,17 @@ static int do_sgio_worker(void *opaque)
+     io_hdr.dxfer_direction = data->dir;
+     io_hdr.dxferp = (char *)data->buf;
+     io_hdr.dxfer_len = data->sz;
++    /*
++     * 在以下使用SG_IO:
++     *   - /usr/include/scsi/sg.h|179| <<global>> #define SG_IO 0x2285
++     *   - block/file-posix.c|3451| <<hdev_co_ioctl>> if (req == SG_IO && s->pr_mgr) {
++     *   - block/iscsi.c|1058| <<iscsi_aio_ioctl>> if (req != SG_IO) {
++     *   - hw/block/virtio-blk.c|353| <<virtio_blk_handle_scsi_req>> acb = blk_aio_ioctl(blk->blk, SG_IO, &ioctl_req->hdr,
++     *   - hw/scsi/scsi-disk.c|2818| <<scsi_block_do_sgio>> aiocb = blk_aio_ioctl(s->qdev.conf.blk, SG_IO, io_header, cb, opaque);
++     *   - hw/scsi/scsi-generic.c|129| <<execute_command>> r->req.aiocb = blk_aio_ioctl(blk, SG_IO, &r->io_header, complete, r);
++     *   - hw/scsi/scsi-generic.c|523| <<scsi_SG_IO_FROM_DEV>> ret = blk_ioctl(blk, SG_IO, &io_header);
++     *   - scsi/qemu-pr-helper.c|151| <<do_sgio_worker>> ret = ioctl(data->fd, SG_IO, &io_hdr);
++     */
+     ret = ioctl(data->fd, SG_IO, &io_hdr);
+     status = sg_io_sense_from_errno(ret < 0 ? errno : 0, &io_hdr,
+                                     &sense_code);
+diff --git a/softmmu/vl.c b/softmmu/vl.c
+index 32c0047889..3ff9fe44e1 100644
+--- a/softmmu/vl.c
++++ b/softmmu/vl.c
+@@ -715,6 +715,11 @@ StatusInfo *qmp_query_status(Error **errp)
+     return info;
+ }
+ 
++/*
++ * called by:
++ *   - cpus.c|2127| <<vm_prepare_start>> qemu_vmstop_requested(&requested);
++ *   - softmmu/vl.c|1649| <<main_loop_should_exit>> if (qemu_vmstop_requested(&r)) {
++ */
+ bool qemu_vmstop_requested(RunState *r)
+ {
+     qemu_mutex_lock(&vmstop_lock);
+-- 
+2.17.1
+
