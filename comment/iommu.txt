@@ -1,0 +1,86 @@
+Here is short summary about xen passthrough. I did not verify this summary by
+debugging xen code. This is just based on code analysis and prior bug analysis
+experience (e.g., the lost of msix irq issue).
+
+The idea of xen passthrough is to expose/emulate the config/bar of a pci device
+to domU. As a result, the pci device can only affect the status of such domU.
+For instance: (1) the domU kernel is able to configure only the pci config/bar
+in a manner that would not affect other domU. The domU is not allowed to
+directly configure the msix for pci device because as a result the msix irq may
+be routed to other domU; (2) the pci device DMA can access only memory pages
+assigned to the domU; (3) as mentioned in (1), the domU is not expected to
+receive irq from pci device that is not assigned to this domU.
+
+Here are key messages:
+
+1. !! The iommu (vt-d) would share the same page table with intel ept.
+Therefore, by default the iommu (assigned pci devices) would have access to the
+address space of this domU. This is supported by most ovm server ((XEN) Intel
+VT-d Shared EPT tables enabled). There is no need to setup a page table for
+iommu.
+
+2. Any update to pci config space from domU should trap to qemu. Some config is
+emulated by qemu while some would be routed to physical pci device.
+
+3. Any update to pci msix bar would be trapped to xen hypervisor or qemu. This
+is because we do not want other domU to receive irq from this pci device.
+
+4. As iommu and ept share the same page table, by default any update to pci
+bars (except msix bar) would be routed to physical device by iommu (iommu dma
+remapping). When to configure the ept entry attribute, if this entry is for
+mmio (e.g., pci bar), this entry would be configured mmio-friendly
+('p2m_mmio_direct'). Therefore, when we kick the dma ring buffer doorbell in
+domU kernel driver, it would not trap to xen/qemu.
+
+5. As iommu and ept share the same page table, by default any access to DMA
+ring buffers from pci devices would be routed by iommu dma remapping to the
+physical memory.
+
+6. Once irq is received from xen hypervisor, xen hypervisor may inject irq to
+domU via (cpu posted irq or iommu posted irq).
+
+
+The core message is iommu and ept share the same page table. In the worst case,
+if ept is not configured correctly (e.g., not mmio friendly, the mmio write
+might not take effect??).
+
+
+
+qemu/vfio的设备包括:
+
+1. 配置pci config
+
+vfio_pci_write_config()来配置, 如果需要更新bar的信息, 还要调用vfio_sub_page_bar_update_mapping()
+
+2. 配置pci bar
+
+因为用了subpage, msix和其他的bar可以分开
+
+3. 配置msix table
+
+4. ring buffer
+
+5. irq
+
+
+
+xen的设备包括:
+
+1. 配置pci config
+
+pci config的修改会trap到qemu
+
+2. 配置pci bar
+
+msix的bar要拦截住 (因为中断要隔离), 可是一般的bar不需要隔离, 可以直接通过ept map给VM (ept和iommu共享页表)
+mmio的region会通过ept也表显示出来 (比如p2m_mmio_direct)
+
+3. 配置msix table
+
+xen hypervisor会拦截msix bar的写, 如果xen hypervisor处理不了, 比如修改addr或者data, 则转给qemu. qemu会通过hypercall修改msix的配置 (hypercall最终还会involve iommu)
+
+4. ring buffer
+
+ring buffer是ept的内存, 因为ept和iommu共享页表, 所以ring buffer就可以被iommu使用.
+
+5. irq
