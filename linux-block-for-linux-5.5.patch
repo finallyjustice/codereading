@@ -1,6 +1,6 @@
-From e91a8a54c46f86ea25b46314fa66a9f1295a6002 Mon Sep 17 00:00:00 2001
+From 49471cc3b3cb2b58bc8d05e5596f826a2097d0fa Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Tue, 14 Jul 2020 14:02:26 -0700
+Date: Sun, 26 Jul 2020 07:07:06 -0700
 Subject: [PATCH 1/1] linux block for linux-5.5
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
@@ -17,7 +17,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  block/blk-cgroup.c                 |   20 +
  block/blk-core.c                   |  283 ++++
  block/blk-exec.c                   |   15 +
- block/blk-flush.c                  |  433 ++++++
+ block/blk-flush.c                  |  503 +++++++
  block/blk-lib.c                    |    5 +
  block/blk-merge.c                  |   37 +
  block/blk-mq-cpumap.c              |   32 +
@@ -51,6 +51,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  drivers/block/null_blk_main.c      | 1073 +++++++++++++++
  drivers/block/null_blk_zoned.c     |  101 ++
  drivers/block/virtio_blk.c         |   31 +
+ drivers/block/xen-blkfront.c       |    5 +
  drivers/md/dm-rq.c                 |   34 +
  drivers/md/dm.c                    |    5 +
  drivers/nvme/host/core.c           | 2010 ++++++++++++++++++++++++++++
@@ -114,7 +115,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  lib/fault-inject.c                 |   12 +
  lib/percpu-refcount.c              |   11 +
  lib/sbitmap.c                      |   23 +
- 109 files changed, 16154 insertions(+), 1 deletion(-)
+ 110 files changed, 16229 insertions(+), 1 deletion(-)
 
 diff --git a/arch/x86/include/asm/hw_irq.h b/arch/x86/include/asm/hw_irq.h
 index 4154bc5f6a4e..ca0a6196da1d 100644
@@ -1453,7 +1454,7 @@ index e20a852ae432..2fdeb7867228 100644
  			   struct request *rq, int at_head,
  			   rq_end_io_fn *done)
 diff --git a/block/blk-flush.c b/block/blk-flush.c
-index 3f977c517960..9aa810fcab67 100644
+index 3f977c517960..e46fe828b783 100644
 --- a/block/blk-flush.c
 +++ b/block/blk-flush.c
 @@ -76,13 +76,81 @@
@@ -1538,7 +1539,7 @@ index 3f977c517960..9aa810fcab67 100644
  	REQ_FSEQ_ACTIONS	= REQ_FSEQ_PREFLUSH | REQ_FSEQ_DATA |
  				  REQ_FSEQ_POSTFLUSH,
  
-@@ -96,16 +164,52 @@ enum {
+@@ -96,16 +164,54 @@ enum {
  static void blk_kick_flush(struct request_queue *q,
  			   struct blk_flush_queue *fq, unsigned int flags);
  
@@ -1571,6 +1572,8 @@ index 3f977c517960..9aa810fcab67 100644
 +	 *   - block/blk-settings.c|826| <<blk_queue_write_cache>> blk_queue_flag_clear(QUEUE_FLAG_WC, q)
 +	 *   - block/blk-sysfs.c|530| <<queue_wc_store>> blk_queue_flag_set(QUEUE_FLAG_WC, q);
 +	 *   - drivers/md/dm-table.c|1905| <<dm_table_set_restrictions>> if (dm_table_supports_flush(t, (1UL << QUEUE_FLAG_WC))) {
++	 *
++	 * blk_queue_write_cache()是设置的地方, 假设xen支持wc, 不支持fua
 +	 */
  	if (fflags & (1UL << QUEUE_FLAG_WC)) {
  		if (rq->cmd_flags & REQ_PREFLUSH)
@@ -1591,7 +1594,7 @@ index 3f977c517960..9aa810fcab67 100644
  		if (!(fflags & (1UL << QUEUE_FLAG_FUA)) &&
  		    (rq->cmd_flags & REQ_FUA))
  			policy |= REQ_FSEQ_POSTFLUSH;
-@@ -113,11 +217,27 @@ static unsigned int blk_flush_policy(unsigned long fflags, struct request *rq)
+@@ -113,11 +219,27 @@ static unsigned int blk_flush_policy(unsigned long fflags, struct request *rq)
  	return policy;
  }
  
@@ -1619,7 +1622,15 @@ index 3f977c517960..9aa810fcab67 100644
  static void blk_flush_restore_request(struct request *rq)
  {
  	/*
-@@ -132,11 +252,20 @@ static void blk_flush_restore_request(struct request *rq)
+@@ -129,14 +251,28 @@ static void blk_flush_restore_request(struct request *rq)
+ 
+ 	/* make @rq a normal request */
+ 	rq->rq_flags &= ~RQF_FLUSH_SEQ;
++	/*
++	 * 使用saved_end_io的地方:
++	 *   - block/blk-flush.c|221| <<blk_flush_restore_request>> rq->end_io = rq->flush.saved_end_io;
++	 *   - block/blk-flush.c|615| <<blk_insert_flush>> rq->flush.saved_end_io = rq->end_io;
++	 */
  	rq->end_io = rq->flush.saved_end_io;
  }
  
@@ -1640,7 +1651,7 @@ index 3f977c517960..9aa810fcab67 100644
  static void blk_account_io_flush(struct request *rq)
  {
  	struct hd_struct *part = &rq->rq_disk->part0;
-@@ -164,11 +293,65 @@ static void blk_account_io_flush(struct request *rq)
+@@ -164,11 +300,65 @@ static void blk_account_io_flush(struct request *rq)
   * RETURNS:
   * %true if requests were added to the dispatch queue, %false otherwise.
   */
@@ -1706,7 +1717,7 @@ index 3f977c517960..9aa810fcab67 100644
  	struct list_head *pending = &fq->flush_queue[fq->flush_pending_idx];
  	unsigned int cmd_flags;
  
-@@ -176,22 +359,52 @@ static void blk_flush_complete_seq(struct request *rq,
+@@ -176,22 +366,61 @@ static void blk_flush_complete_seq(struct request *rq,
  	rq->flush.seq |= seq;
  	cmd_flags = rq->cmd_flags;
  
@@ -1748,6 +1759,15 @@ index 3f977c517960..9aa810fcab67 100644
  		break;
  
  	case REQ_FSEQ_DATA:
++		/*
++		 * 在以下使用flush_data_in_flight:
++		 *   - block/blk-flush.c|400| <<blk_flush_complete_seq>> list_move_tail(&rq->flush.list, &fq->flush_data_in_flight);
++		 *   - block/blk-flush.c|599| <<blk_kick_flush>> if (!list_empty(&fq->flush_data_in_flight) && q->elevator &&
++		 *   - block/blk-flush.c|934| <<blk_alloc_flush_queue>> INIT_LIST_HEAD(&fq->flush_data_in_flight);
++		 *
++		 * 在&fq->flush_data_in_flight没什么别的意思,
++		 * 比如稍后处理REQ_FSEQ_POSTFLUSH(上面的case)会用到rq->flush.list
++		 */
  		list_move_tail(&rq->flush.list, &fq->flush_data_in_flight);
 +		/*
 +		 * called by:
@@ -1759,7 +1779,7 @@ index 3f977c517960..9aa810fcab67 100644
  		blk_flush_queue_rq(rq, true);
  		break;
  
-@@ -215,6 +428,10 @@ static void blk_flush_complete_seq(struct request *rq,
+@@ -215,6 +444,10 @@ static void blk_flush_complete_seq(struct request *rq,
  	blk_kick_flush(q, fq, cmd_flags);
  }
  
@@ -1770,7 +1790,26 @@ index 3f977c517960..9aa810fcab67 100644
  static void flush_end_io(struct request *flush_rq, blk_status_t error)
  {
  	struct request_queue *q = flush_rq->q;
-@@ -251,10 +468,40 @@ static void flush_end_io(struct request *flush_rq, blk_status_t error)
+@@ -248,13 +481,59 @@ static void flush_end_io(struct request *flush_rq, blk_status_t error)
+ 	}
+ 
+ 	running = &fq->flush_queue[fq->flush_running_idx];
++	/*
++	 * 在以下修改flushing_pending_idx:
++	 *   - block/blk-flush.c|416| <<blk_kick_flush>> fq->flush_pending_idx ^= 1;
++	 * 在以下使用flush_pending_idx:
++	 *   - block/blk-flush.c|276| <<blk_flush_complete_seq>> struct list_head *pending = &fq->flush_queue[fq->flush_pending_idx];
++	 *   - block/blk-flush.c|359| <<flush_end_io>> BUG_ON(fq->flush_pending_idx == fq->flush_running_idx);
++	 *   - block/blk-flush.c|392| <<blk_kick_flush>> struct list_head *pending = &fq->flush_queue[fq->flush_pending_idx];
++	 *   - block/blk-flush.c|398| <<blk_kick_flush>> if (fq->flush_pending_idx != fq->flush_running_idx || list_empty(pending))
++	 *
++	 * 在以下修改flush_running_idx:
++	 *   - block/blk-flush.c|362| <<flush_end_io>> fq->flush_running_idx ^= 1;
++	 * 在以下使用flush_running_idx:
++	 *   - block/blk-flush.c|358| <<flush_end_io>> running = &fq->flush_queue[fq->flush_running_idx];
++	 *   - block/blk-flush.c|359| <<flush_end_io>> BUG_ON(fq->flush_pending_idx == fq->flush_running_idx);
++	 *   - block/blk-flush.c|398| <<blk_kick_flush>> if (fq->flush_pending_idx != fq->flush_running_idx || list_empty(pending))
++	 */
  	BUG_ON(fq->flush_pending_idx == fq->flush_running_idx);
  
  	/* account completion of the flush request */
@@ -1811,7 +1850,7 @@ index 3f977c517960..9aa810fcab67 100644
  		unsigned int seq = blk_flush_cur_seq(rq);
  
  		BUG_ON(seq != REQ_FSEQ_PREFLUSH && seq != REQ_FSEQ_POSTFLUSH);
-@@ -278,15 +525,60 @@ static void flush_end_io(struct request *flush_rq, blk_status_t error)
+@@ -278,15 +557,60 @@ static void flush_end_io(struct request *flush_rq, blk_status_t error)
   * spin_lock_irq(fq->mq_flush_lock)
   *
   */
@@ -1872,7 +1911,7 @@ index 3f977c517960..9aa810fcab67 100644
  	if (fq->flush_pending_idx != fq->flush_running_idx || list_empty(pending))
  		return;
  
-@@ -296,6 +588,16 @@ static void blk_kick_flush(struct request_queue *q, struct blk_flush_queue *fq,
+@@ -296,6 +620,16 @@ static void blk_kick_flush(struct request_queue *q, struct blk_flush_queue *fq,
  	 * assigned to empty flushes, and we deadlock if we are expecting
  	 * other requests to make progress. Don't defer for that case.
  	 */
@@ -1889,7 +1928,13 @@ index 3f977c517960..9aa810fcab67 100644
  	if (!list_empty(&fq->flush_data_in_flight) && q->elevator &&
  	    time_before(jiffies,
  			fq->flush_pending_since + FLUSH_PENDING_TIMEOUT))
-@@ -337,6 +639,31 @@ static void blk_kick_flush(struct request_queue *q, struct blk_flush_queue *fq,
+@@ -334,9 +668,37 @@ static void blk_kick_flush(struct request_queue *q, struct blk_flush_queue *fq,
+ 	flush_rq->rq_disk = first_rq->rq_disk;
+ 	flush_rq->end_io = flush_end_io;
+ 
++	/*
++	 * 就是调用blk_mq_add_to_requeue_list(rq, add_front, true);
++	 */
  	blk_flush_queue_rq(flush_rq, false);
  }
  
@@ -1921,7 +1966,7 @@ index 3f977c517960..9aa810fcab67 100644
  static void mq_flush_data_end_io(struct request *rq, blk_status_t error)
  {
  	struct request_queue *q = rq->q;
-@@ -370,13 +697,54 @@ static void mq_flush_data_end_io(struct request *rq, blk_status_t error)
+@@ -370,13 +732,57 @@ static void mq_flush_data_end_io(struct request *rq, blk_status_t error)
   * @rq is being submitted.  Analyze what needs to be done and put it on the
   * right queue.
   */
@@ -1963,6 +2008,9 @@ index 3f977c517960..9aa810fcab67 100644
 +	 *  - REQ_FSEQ_POSTFLUSH(在数据请求之后冲刷磁盘缓存)
 +	 * 如果磁盘不支持FUA,那么可以使用REQ_FSEQ_POSTFLUSH代替
 +	 * 假定我们分析的场景中,磁盘不支持FUA,则最终我们的冲刷策略为3步都做(policy=111).
++	 *
++	 *
++	 * blk_queue_write_cache()是设置的地方, 假设xen支持wc, 不支持fua
 +	 */
  	unsigned int policy = blk_flush_policy(fflags, rq);
 +	/* 根据rq获取对应的hctx的blk_mq_hw_ctx->fq */
@@ -1976,7 +2024,7 @@ index 3f977c517960..9aa810fcab67 100644
  	/*
  	 * @policy now records what operations need to be done.  Adjust
  	 * REQ_PREFLUSH and FUA for the driver.
-@@ -398,6 +766,10 @@ void blk_insert_flush(struct request *rq)
+@@ -398,6 +804,10 @@ void blk_insert_flush(struct request *rq)
  	 * advertise a write-back cache.  In this case, simply
  	 * complete the request.
  	 */
@@ -1987,8 +2035,25 @@ index 3f977c517960..9aa810fcab67 100644
  	if (!policy) {
  		blk_mq_end_request(rq, 0);
  		return;
-@@ -422,12 +794,40 @@ void blk_insert_flush(struct request *rq)
+@@ -420,14 +830,67 @@ void blk_insert_flush(struct request *rq)
+ 	 * @rq should go through flush machinery.  Mark it part of flush
+ 	 * sequence and submit for further processing.
  	 */
++	/*
++	 * struct request *rq:
++	 *     union {
++	 *         struct {
++	 *             struct io_cq            *icq;
++	 *             void                    *priv[2];
++	 *         } elv;
++	 *
++	 *         struct {
++	 *             unsigned int            seq;
++	 *             struct list_head        list;
++	 *             rq_end_io_fn            *saved_end_io;
++	 *         } flush;
++	 *     };
++	 */
  	memset(&rq->flush, 0, sizeof(rq->flush));
  	INIT_LIST_HEAD(&rq->flush.list);
 +	/*
@@ -2001,6 +2066,8 @@ index 3f977c517960..9aa810fcab67 100644
 +	 *   - block/blk-mq-sched.c|365| <<blk_mq_sched_bypass_insert>> if (rq->rq_flags & RQF_FLUSH_SEQ) {
 +	 *   - block/blk-mq-sched.c|387| <<blk_mq_sched_insert_request>> if (!(rq->rq_flags & RQF_FLUSH_SEQ) && op_is_flush(rq->cmd_flags)) {
 +	 *   - include/linux/blkdev.h|120| <<RQF_NOMERGE_FLAGS>> (RQF_STARTED | RQF_SOFTBARRIER | RQF_FLUSH_SEQ | RQF_SPECIAL_PAYLOAD)
++	 *
++	 * request for flush sequence
 +	 */
  	rq->rq_flags |= RQF_FLUSH_SEQ;
 +	/*
@@ -2016,10 +2083,18 @@ index 3f977c517960..9aa810fcab67 100644
 +	 */
  	rq->flush.saved_end_io = rq->end_io; /* Usually NULL */
  
++	/*
++	 * 会调用blk_flush_complete_seq(rq, fq, REQ_FSEQ_DATA, error);
++	 */
  	rq->end_io = mq_flush_data_end_io;
  
  	spin_lock_irq(&fq->mq_flush_lock);
 +	/*
++	 * called by:
++	 *   - block/blk-flush.c|265| <<flush_end_io>> blk_flush_complete_seq(rq, fq, seq, error);
++	 *   - block/blk-flush.c|366| <<mq_flush_data_end_io>> blk_flush_complete_seq(rq, fq, REQ_FSEQ_DATA, error);
++	 *   - block/blk-flush.c|444| <<blk_insert_flush>> blk_flush_complete_seq(rq, fq, REQ_FSEQ_ACTIONS & ~policy, 0);
++	 *
 +	 * 参数REQ_FSEQ_ACTIONS & ~policy表示可以跳过的步骤!!!
 +	 * blk_insert_flush()初始化request的完成函数为flush_data_end_io()后,
 +	 * 调用REQ_FSEQ_ACTIONS & ~policy把可以跳过的步骤对应的位置填1,
@@ -2028,7 +2103,7 @@ index 3f977c517960..9aa810fcab67 100644
  	blk_flush_complete_seq(rq, fq, REQ_FSEQ_ACTIONS & ~policy, 0);
  	spin_unlock_irq(&fq->mq_flush_lock);
  }
-@@ -443,6 +843,31 @@ void blk_insert_flush(struct request *rq)
+@@ -443,6 +906,31 @@ void blk_insert_flush(struct request *rq)
   *    room for storing the error offset in case of a flush error, if they
   *    wish to.
   */
@@ -2060,7 +2135,18 @@ index 3f977c517960..9aa810fcab67 100644
  int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
  		sector_t *error_sector)
  {
-@@ -485,6 +910,10 @@ int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
+@@ -468,6 +956,10 @@ int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
+ 
+ 	bio = bio_alloc(gfp_mask, 0);
+ 	bio_set_dev(bio, bdev);
++	/*
++	 * REQ_FUA     : forced unit access,绕过磁盘cache,直接把数据写到磁盘介质中.
++	 * REQ_PREFLUSH: request for cache flush, 表示把磁盘cache中的data刷新到磁盘介质中,防止掉电丢失
++	 */
+ 	bio->bi_opf = REQ_OP_WRITE | REQ_PREFLUSH;
+ 
+ 	ret = submit_bio_wait(bio);
+@@ -485,6 +977,10 @@ int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
  }
  EXPORT_SYMBOL(blkdev_issue_flush);
  
@@ -2071,7 +2157,17 @@ index 3f977c517960..9aa810fcab67 100644
  struct blk_flush_queue *blk_alloc_flush_queue(struct request_queue *q,
  		int node, int cmd_size, gfp_t flags)
  {
-@@ -517,6 +946,10 @@ struct blk_flush_queue *blk_alloc_flush_queue(struct request_queue *q,
+@@ -497,6 +993,9 @@ struct blk_flush_queue *blk_alloc_flush_queue(struct request_queue *q,
+ 
+ 	spin_lock_init(&fq->mq_flush_lock);
+ 
++	/*
++	 * xen的cmd_size: sizeof(struct blkif_req)
++	 */
+ 	rq_sz = round_up(rq_sz + cmd_size, cache_line_size());
+ 	fq->flush_rq = kzalloc_node(rq_sz, flags, node);
+ 	if (!fq->flush_rq)
+@@ -517,6 +1016,10 @@ struct blk_flush_queue *blk_alloc_flush_queue(struct request_queue *q,
  	return NULL;
  }
  
@@ -10972,6 +11068,22 @@ index 7ffd719d89de..b06ec75cb24c 100644
  	major = register_blkdev(0, "virtblk");
  	if (major < 0) {
  		error = major;
+diff --git a/drivers/block/xen-blkfront.c b/drivers/block/xen-blkfront.c
+index c02be06c5299..6c96b74ebc4b 100644
+--- a/drivers/block/xen-blkfront.c
++++ b/drivers/block/xen-blkfront.c
+@@ -999,6 +999,11 @@ static int xlvbd_init_blk_queue(struct gendisk *gd, u16 sector_size,
+ 	return 0;
+ }
+ 
++/*
++ * 比如4.1的例子:
++ * [    2.513900] blkfront: xvda: flush diskcache: enabled; persistent grants: enabled; indirect descriptors: enabled;
++ * [    2.554190] blkfront: xvdb: flush diskcache: enabled; persistent grants: enabled; indirect descriptors: enabled;
++ */
+ static const char *flush_info(struct blkfront_info *info)
+ {
+ 	if (info->feature_flush && info->feature_fua)
 diff --git a/drivers/md/dm-rq.c b/drivers/md/dm-rq.c
 index 3f8577e2c13b..5307cfa24181 100644
 --- a/drivers/md/dm-rq.c
