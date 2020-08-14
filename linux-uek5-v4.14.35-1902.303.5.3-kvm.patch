@@ -1,0 +1,3089 @@
+From b9bb5fb798b9744321895b971f8b24d026d19a62 Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Thu, 13 Aug 2020 15:20:24 -0700
+Subject: [PATCH 1/1] linux-uek5-v4.14.35-1902.303.5.3-kvm
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ drivers/vhost/net.c              | 286 +++++++++++++
+ drivers/vhost/vhost.c            | 702 +++++++++++++++++++++++++++++++
+ drivers/vhost/vhost.h            | 128 ++++++
+ fs/eventfd.c                     |  67 +++
+ include/linux/irq.h              |  13 +
+ include/linux/ptr_ring.h         | 286 +++++++++++++
+ include/linux/skb_array.h        | 153 ++++++-
+ include/uapi/linux/virtio_ring.h |  10 +
+ kernel/irq/chip.c                |  13 +
+ kernel/irq/spurious.c            |   3 +
+ virt/kvm/eventfd.c               |  64 +++
+ 11 files changed, 1724 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/vhost/net.c b/drivers/vhost/net.c
+index baea42621146..5c3df373ebd6 100644
+--- a/drivers/vhost/net.c
++++ b/drivers/vhost/net.c
+@@ -87,6 +87,11 @@ struct vhost_net_ubuf_ref {
+ 	struct vhost_virtqueue *vq;
+ };
+ 
++/*
++ * 在以下使用VHOST_RX_BATCH=64:
++ *   - drivers/vhost/net.c|162| <<vhost_net_buf_produce>> VHOST_RX_BATCH);
++ *   - drivers/vhost/net.c|925| <<vhost_net_open>> queue = kmalloc_array(VHOST_RX_BATCH, sizeof(struct sk_buff *),
++ */
+ #define VHOST_RX_BATCH 64
+ struct vhost_net_buf {
+ 	struct sk_buff **queue;
+@@ -96,18 +101,66 @@ struct vhost_net_buf {
+ 
+ struct vhost_net_virtqueue {
+ 	struct vhost_virtqueue vq;
++	/*
++	 * 在以下使用vhost_net_virtqueue->vhost_hlen:
++	 *   - drivers/vhost/net.c|293| <<vhost_net_vq_reset>> n->vqs[i].vhost_hlen = 0;
++	 *   - drivers/vhost/net.c|502| <<handle_tx>> hdr_size = nvq->vhost_hlen;
++	 *   - drivers/vhost/net.c|801| <<handle_rx>> vhost_hlen = nvq->vhost_hlen;
++	 *   - drivers/vhost/net.c|984| <<vhost_net_open>> n->vqs[i].vhost_hlen = 0;
++	 *   - drivers/vhost/net.c|1304| <<vhost_net_set_features>> n->vqs[i].vhost_hlen = vhost_hlen;
++	 */
+ 	size_t vhost_hlen;
++	/*
++	 * 在以下使用vhost_net_virtqueue->sock_hlen:
++	 *   - drivers/vhost/net.c|294| <<vhost_net_vq_reset>> n->vqs[i].sock_hlen = 0;
++	 *   - drivers/vhost/net.c|802| <<handle_rx>> sock_hlen = nvq->sock_hlen;
++	 *   - drivers/vhost/net.c|985| <<vhost_net_open>> n->vqs[i].sock_hlen = 0;
++	 *   - drivers/vhost/net.c|1305| <<vhost_net_set_features>> n->vqs[i].sock_hlen = sock_hlen;
++	 */
+ 	size_t sock_hlen;
+ 	/* vhost zerocopy support fields below: */
+ 	/* last used idx for outstanding DMA zerocopy buffers */
++	/*
++	 * 在以下使用vhost_net_virtqueue->upend_idx:
++	 *   - drivers/vhost/net.c|291| <<vhost_net_vq_reset>> n->vqs[i].upend_idx = 0;
++	 *   - drivers/vhost/net.c|342| <<vhost_zerocopy_signal_used>> for (i = nvq->done_idx; i != nvq->upend_idx; i = (i + 1) % UIO_MAXIOV) {
++	 *   - drivers/vhost/net.c|466| <<vhost_exceeds_maxpend>> return (nvq->upend_idx + vq->num - VHOST_MAX_PEND) % UIO_MAXIOV
++	 *   - drivers/vhost/net.c|549| <<handle_tx>> && (nvq->upend_idx + 1) % UIO_MAXIOV !=
++	 *   - drivers/vhost/net.c|556| <<handle_tx>> ubuf = nvq->ubuf_info + nvq->upend_idx;
++	 *   - drivers/vhost/net.c|558| <<handle_tx>> vq->heads[nvq->upend_idx].id = cpu_to_vhost32(vq, head);
++	 *   - drivers/vhost/net.c|559| <<handle_tx>> vq->heads[nvq->upend_idx].len = VHOST_DMA_IN_PROGRESS;
++	 *   - drivers/vhost/net.c|562| <<handle_tx>> ubuf->desc = nvq->upend_idx;
++	 *   - drivers/vhost/net.c|568| <<handle_tx>> nvq->upend_idx = (nvq->upend_idx + 1) % UIO_MAXIOV;
++	 *   - drivers/vhost/net.c|588| <<handle_tx>> nvq->upend_idx = ((unsigned )nvq->upend_idx - 1)
++	 *   - drivers/vhost/net.c|982| <<vhost_net_open>> n->vqs[i].upend_idx = 0;
++	 */
+ 	int upend_idx;
+ 	/* first used idx for DMA done zerocopy buffers */
++	/*
++	 * 在以下使用vhost_net_virtqueue->done_idx:
++	 *   - drivers/vhost/net.c|290| <<vhost_net_vq_reset>> n->vqs[i].done_idx = 0;
++	 *   - drivers/vhost/net.c|342| <<vhost_zerocopy_signal_used>> for (i = nvq->done_idx; i != nvq->upend_idx; i = (i + 1) % UIO_MAXIOV) {
++	 *   - drivers/vhost/net.c|352| <<vhost_zerocopy_signal_used>> add = min(UIO_MAXIOV - nvq->done_idx, j);
++	 *   - drivers/vhost/net.c|354| <<vhost_zerocopy_signal_used>> &vq->heads[nvq->done_idx], add);
++	 *   - drivers/vhost/net.c|355| <<vhost_zerocopy_signal_used>> nvq->done_idx = (nvq->done_idx + add) % UIO_MAXIOV;
++	 *   - drivers/vhost/net.c|467| <<vhost_exceeds_maxpend>> == nvq->done_idx;
++	 *   - drivers/vhost/net.c|983| <<vhost_net_open>> n->vqs[i].done_idx = 0;
++	 */
+ 	int done_idx;
+ 	/* an array of userspace buffers info */
+ 	struct ubuf_info *ubuf_info;
+ 	/* Reference counting for outstanding ubufs.
+ 	 * Protected by vq mutex. Writers must also take device mutex. */
+ 	struct vhost_net_ubuf_ref *ubufs;
++	/*
++	 * 在以下使用vhost_net_virtqueue->rx_array:
++	 *   - drivers/vhost/net.c|171| <<vhost_net_buf_produce>> rxq->tail = skb_array_consume_batched(nvq->rx_array, rxq->queue,
++	 *   - drivers/vhost/net.c|180| <<vhost_net_buf_unproduce>> if (nvq->rx_array && !vhost_net_buf_is_empty(rxq)) {
++	 *   - drivers/vhost/net.c|181| <<vhost_net_buf_unproduce>> skb_array_unconsume(nvq->rx_array, rxq->queue + rxq->head,
++	 *   - drivers/vhost/net.c|617| <<peek_head_len>> if (rvq->rx_array)
++	 *   - drivers/vhost/net.c|829| <<handle_rx>> if (nvq->rx_array)
++	 *   - drivers/vhost/net.c|1191| <<vhost_net_set_backend>> nvq->rx_array = get_tap_skb_array(fd);
++	 */
+ 	struct skb_array *rx_array;
+ 	struct vhost_net_buf rxq;
+ };
+@@ -121,6 +174,13 @@ struct vhost_net {
+ 	unsigned tx_packets;
+ 	/* Number of times zerocopy TX recently failed.
+ 	 * Protected by tx vq lock. */
++	/*
++	 * 在以下使用vhost_net->tx_zcopy_err:
++	 *   - drivers/vhost/net.c|306| <<vhost_net_tx_packet>> net->tx_zcopy_err = 0;
++	 *   - drivers/vhost/net.c|311| <<vhost_net_tx_err>> ++net->tx_zcopy_err;
++	 *   - drivers/vhost/net.c|320| <<vhost_net_tx_select_zcopy>> net->tx_packets / 64 >= net->tx_zcopy_err;
++	 *   - drivers/vhost/net.c|1203| <<vhost_net_set_backend>> n->tx_zcopy_err = 0
++	 */
+ 	unsigned tx_zcopy_err;
+ 	/* Flush in progress. Protected by tx vq lock. */
+ 	bool tx_flush;
+@@ -128,6 +188,10 @@ struct vhost_net {
+ 
+ static unsigned vhost_net_zcopy_mask __read_mostly;
+ 
++/*
++ * 如果vhost_net_buf->tail != vhost_net_buf->head, 返回vhost_net_buf->queue[rxq->head]
++ * 否则返回NULL
++ */
+ static void *vhost_net_buf_get_ptr(struct vhost_net_buf *rxq)
+ {
+ 	if (rxq->tail != rxq->head)
+@@ -136,37 +200,98 @@ static void *vhost_net_buf_get_ptr(struct vhost_net_buf *rxq)
+ 		return NULL;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vhost/net.c|240| <<vhost_net_buf_unproduce>> vhost_net_buf_get_size(rxq));
++ *
++ * 返回rxq->tail - rxq->head
++ */
+ static int vhost_net_buf_get_size(struct vhost_net_buf *rxq)
+ {
+ 	return rxq->tail - rxq->head;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vhost/net.c|238| <<vhost_net_buf_unproduce>> if (nvq->rx_array && !vhost_net_buf_is_empty(rxq)) {
++ *   - drivers/vhost/net.c|253| <<vhost_net_buf_peek>> if (!vhost_net_buf_is_empty(rxq))
++ *
++ * 返回rxq->tail == rxq->head
++ */
+ static int vhost_net_buf_is_empty(struct vhost_net_buf *rxq)
+ {
+ 	return rxq->tail == rxq->head;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vhost/net.c|892| <<handle_rx>> msg.msg_control = vhost_net_buf_consume(&nvq->rxq);
++ *
++ * 核心思想是返回rxq->queue[rxq->head], 增加rxq->head
++ */
+ static void *vhost_net_buf_consume(struct vhost_net_buf *rxq)
+ {
++	/*
++	 * 如果rxq->tail != rxq->head, 返回rxq->queue[rxq->head]
++	 * 否则返回NULL
++	 */
+ 	void *ret = vhost_net_buf_get_ptr(rxq);
+ 	++rxq->head;
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vhost/net.c|256| <<vhost_net_buf_peek>> if (!vhost_net_buf_produce(nvq))
++ *
++ * 把nvq->rx_array的ptr_ring的数据放入rxq->queue, 最多VHOST_RX_BATCH=64个
++ * 最后更新并返回的rxq->tail是从ptr_ring放入参数array的数目
++ */
+ static int vhost_net_buf_produce(struct vhost_net_virtqueue *nvq)
+ {
+ 	struct vhost_net_buf *rxq = &nvq->rxq;
+ 
+ 	rxq->head = 0;
++	/*
++	 * struct vhost_net_virtqueue *nvq:
++	 *  -> struct skb_array *rx_array; --->
++	 *      -> struct ptr_ring ring;
++	 *  -> struct vhost_net_buf rxq;
++	 *      -> struct sk_buff **queue; --->
++	 *      -> int tail;
++	 *      -> int head;
++	 *
++	 * 在以下使用VHOST_RX_BATCH=64:
++	 *   - drivers/vhost/net.c|162| <<vhost_net_buf_produce>> VHOST_RX_BATCH);
++	 *   - drivers/vhost/net.c|925| <<vhost_net_open>> queue = kmalloc_array(VHOST_RX_BATCH, sizeof(struct sk_buff *),
++	 *
++	 * 把nvq->rx_array的ptr_ring的数据放入rxq->queue, 最多VHOST_RX_BATCH=64个
++	 *
++	 * 返回值是从ptr_ring放入参数array的数目 (最大是最后一个参数)
++	 */
+ 	rxq->tail = skb_array_consume_batched(nvq->rx_array, rxq->queue,
+ 					      VHOST_RX_BATCH);
+ 	return rxq->tail;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vhost/net.c|1071| <<vhost_net_stop_vq>> vhost_net_buf_unproduce(nvq);
++ *   - drivers/vhost/net.c|1251| <<vhost_net_set_backend>> vhost_net_buf_unproduce(nvq);
++ */
+ static void vhost_net_buf_unproduce(struct vhost_net_virtqueue *nvq)
+ {
+ 	struct vhost_net_buf *rxq = &nvq->rxq;
+ 
++	/*
++	 * struct vhost_net_virtqueue *nvq:
++	 *  -> struct skb_array *rx_array; --->
++	 *      -> struct ptr_ring ring;
++	 *  -> struct vhost_net_buf rxq;
++	 *      -> struct sk_buff **queue; --->
++	 *      -> int tail;
++	 *      -> int head;
++	 */
+ 	if (nvq->rx_array && !vhost_net_buf_is_empty(rxq)) {
+ 		skb_array_unconsume(nvq->rx_array, rxq->queue + rxq->head,
+ 				    vhost_net_buf_get_size(rxq));
+@@ -174,20 +299,44 @@ static void vhost_net_buf_unproduce(struct vhost_net_virtqueue *nvq)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vhost/net.c|618| <<peek_head_len>> return vhost_net_buf_peek(rvq);
++ *
++ * 如果vhost_net_buf中不是empty的, 就立刻返回vhost_net_buf->queue[vhost_net_buf->head]的skb->len
++ * 否则先从tap/tun的skb_array中取一些放入vhost_net_buf再返回skb->len
++ */
+ static int vhost_net_buf_peek(struct vhost_net_virtqueue *nvq)
+ {
+ 	struct vhost_net_buf *rxq = &nvq->rxq;
+ 
++	/*
++	 * 返回rxq->tail == rxq->head
++	 */
+ 	if (!vhost_net_buf_is_empty(rxq))
+ 		goto out;
+ 
++	/*
++	 * 把nvq->rx_array的ptr_ring的数据放入rxq->queue, 最多VHOST_RX_BATCH=64个
++	 * 最后更新并返回的rxq->tail是从ptr_ring放入参数array的数目
++	 */
+ 	if (!vhost_net_buf_produce(nvq))
+ 		return 0;
+ 
+ out:
++	/*
++	 * vhost_net_buf_get_ptr():
++	 * 如果vhost_net_buf->tail != vhost_net_buf->head, 返回vhost_net_buf->queue[rxq->head]
++	 * 否则返回NULL
++	 */
+ 	return __skb_array_len_with_tag(vhost_net_buf_get_ptr(rxq));
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vhost/net.c|280| <<vhost_net_vq_reset>> vhost_net_buf_init(&n->vqs[i].rxq);
++ *   - drivers/vhost/net.c|946| <<vhost_net_open>> vhost_net_buf_init(&n->vqs[i].rxq);
++ */
+ static void vhost_net_buf_init(struct vhost_net_buf *rxq)
+ {
+ 	rxq->head = rxq->tail = 0;
+@@ -382,6 +531,12 @@ static bool vhost_can_busy_poll(struct vhost_dev *dev,
+ 	       !vhost_has_work(dev);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vhost/net.c|772| <<handle_rx>> vhost_net_disable_vq(net, vq);
++ *   - drivers/vhost/net.c|967| <<vhost_net_stop_vq>> vhost_net_disable_vq(n, vq);
++ *   - drivers/vhost/net.c|1147| <<vhost_net_set_backend>> vhost_net_disable_vq(n, vq);
++ */
+ static void vhost_net_disable_vq(struct vhost_net *n,
+ 				 struct vhost_virtqueue *vq)
+ {
+@@ -393,6 +548,12 @@ static void vhost_net_disable_vq(struct vhost_net *n,
+ 	vhost_poll_stop(poll);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vhost/net.c|866| <<handle_rx>> vhost_net_enable_vq(net, vq);
++ *   - drivers/vhost/net.c|1155| <<vhost_net_set_backend>> r = vhost_net_enable_vq(n, vq);
++ *   - drivers/vhost/net.c|1186| <<vhost_net_set_backend>> vhost_net_enable_vq(n, vq);
++ */
+ static int vhost_net_enable_vq(struct vhost_net *n,
+ 				struct vhost_virtqueue *vq)
+ {
+@@ -581,16 +742,45 @@ static void handle_tx(struct vhost_net *net)
+ 	mutex_unlock(&vq->mutex);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vhost/net.c|743| <<vhost_net_rx_peek_head_len>> int len = peek_head_len(rvq, sk);
++ *   - drivers/vhost/net.c|769| <<vhost_net_rx_peek_head_len>> len = peek_head_len(rvq, sk);
++ *
++ * 如果sock支持skb_array:
++ *     如果vhost_net_buf中不是empty的, 就立刻返回vhost_net_buf->queue[vhost_net_buf->head]的skb->len
++ *     否则先从tap/tun的skb_array中取一些放入vhost_net_buf再返回skb->len
++ * 如果sock不支持skb_array:
++ *     从sk->sk_receive_queue取skb ... ...
++ */
+ static int peek_head_len(struct vhost_net_virtqueue *rvq, struct sock *sk)
+ {
+ 	struct sk_buff *head;
+ 	int len = 0;
+ 	unsigned long flags;
+ 
++	/*
++	 * 在以下使用vhost_net_virtqueue->rx_array:
++	 *   - drivers/vhost/net.c|1191| <<vhost_net_set_backend>> nvq->rx_array = get_tap_skb_array(fd);
++	 * 在以下使用vhost_net_virtqueue->rx_array:
++	 *   - drivers/vhost/net.c|171| <<vhost_net_buf_produce>> rxq->tail = skb_array_consume_batched(nvq->rx_array, rxq->queue,
++	 *   - drivers/vhost/net.c|180| <<vhost_net_buf_unproduce>> if (nvq->rx_array && !vhost_net_buf_is_empty(rxq)) {
++	 *   - drivers/vhost/net.c|181| <<vhost_net_buf_unproduce>> skb_array_unconsume(nvq->rx_array, rxq->queue + rxq->head,
++	 *   - drivers/vhost/net.c|617| <<peek_head_len>> if (rvq->rx_array)
++	 *   - drivers/vhost/net.c|829| <<handle_rx>> if (nvq->rx_array)
++	 *
++	 *
++	 * 关于vhost_net_buf_peek():
++	 * 如果vhost_net_buf中不是empty的, 就立刻返回vhost_net_buf->queue[vhost_net_buf->head]的skb->len
++	 * 否则先从tap/tun的skb_array中取一些放入vhost_net_buf再返回skb->len
++	 */
+ 	if (rvq->rx_array)
+ 		return vhost_net_buf_peek(rvq);
+ 
+ 	spin_lock_irqsave(&sk->sk_receive_queue.lock, flags);
++	/*
++	 * struct sk_buff *head;
++	 */
+ 	head = skb_peek(&sk->sk_receive_queue);
+ 	if (likely(head)) {
+ 		len = head->len;
+@@ -602,6 +792,10 @@ static int peek_head_len(struct vhost_net_virtqueue *rvq, struct sock *sk)
+ 	return len;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vhost/net.c|754| <<vhost_net_rx_peek_head_len>> !sk_has_rx_data(sk) &&
++ */
+ static int sk_has_rx_data(struct sock *sk)
+ {
+ 	struct socket *sock = sk->sk_socket;
+@@ -612,12 +806,30 @@ static int sk_has_rx_data(struct sock *sk)
+ 	return skb_queue_empty(&sk->sk_receive_queue);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vhost/net.c|903| <<handle_rx>> while ((sock_len = vhost_net_rx_peek_head_len(net, sock->sk))) {
++ *
++ * 核心思想!!
++ * 如果sock支持skb_array:
++ *     如果vhost_net_buf中不是empty的, 就立刻返回vhost_net_buf->queue[vhost_net_buf->head]的skb->len
++ *     否则先从tap/tun的skb_array中取一些放入vhost_net_buf再返回skb->len
++ * 如果sock不支持skb_array:
++ *     从sk->sk_receive_queue取skb ... ...
++ */
+ static int vhost_net_rx_peek_head_len(struct vhost_net *net, struct sock *sk)
+ {
+ 	struct vhost_net_virtqueue *rvq = &net->vqs[VHOST_NET_VQ_RX];
+ 	struct vhost_net_virtqueue *nvq = &net->vqs[VHOST_NET_VQ_TX];
+ 	struct vhost_virtqueue *vq = &nvq->vq;
+ 	unsigned long uninitialized_var(endtime);
++	/*
++	 * 如果sock支持skb_array:
++	 *     如果vhost_net_buf中不是empty的, 就立刻返回vhost_net_buf->queue[vhost_net_buf->head]的skb->len
++	 *     否则先从tap/tun的skb_array中取一些放入vhost_net_buf再返回skb->len
++	 * 如果sock不支持skb_array:
++	 *     从sk->sk_receive_queue取skb ... ...
++	 */
+ 	int len = peek_head_len(rvq, sk);
+ 
+ 	if (!len && vq->busyloop_timeout) {
+@@ -644,6 +856,13 @@ static int vhost_net_rx_peek_head_len(struct vhost_net *net, struct sock *sk)
+ 
+ 		mutex_unlock(&vq->mutex);
+ 
++		/*
++		 * 如果sock支持skb_array:
++		 *     如果vhost_net_buf中不是empty的, 就立刻返回vhost_net_buf->queue[vhost_net_buf->head]的skb->len
++		 *     否则先从tap/tun的skb_array中取一些放入vhost_net_buf再返回skb->len
++		 * 如果sock不支持skb_array:
++		 *     从sk->sk_receive_queue取skb ... ...
++		 */
+ 		len = peek_head_len(rvq, sk);
+ 	}
+ 
+@@ -660,6 +879,14 @@ static int vhost_net_rx_peek_head_len(struct vhost_net *net, struct sock *sk)
+  * @quota       - headcount quota, 1 for big buffer
+  *	returns number of buffer heads allocated, negative on error
+  */
++/*
++ * called by:
++ *   - drivers/vhost/net.c|906| <<handle_rx>> headcount = get_rx_bufs(vq, vq->heads, vhost_len,
++ *
++ * 1019                 headcount = get_rx_bufs(vq, vq->heads, vhost_len,
++ * 1020                                         &in, vq_log, &log,
++ * 1021                                         likely(mergeable) ? UIO_MAXIOV : 1);
++ */
+ static int get_rx_bufs(struct vhost_virtqueue *vq,
+ 		       struct vring_used_elem *heads,
+ 		       int datalen,
+@@ -683,6 +910,13 @@ static int get_rx_bufs(struct vhost_virtqueue *vq,
+ 			r = -ENOBUFS;
+ 			goto err;
+ 		}
++		/*
++		 * struct vhost_virtqueue *vq:
++		 *   -> struct iovec iov[UIO_MAXIOV];
++		 *   -> struct vring_used_elem *heads;
++		 *
++		 * seg一开始初始化的时候是0
++		 */
+ 		r = vhost_get_vq_desc(vq, vq->iov + seg,
+ 				      ARRAY_SIZE(vq->iov) - seg, &out,
+ 				      &in, log, log_num);
+@@ -704,6 +938,9 @@ static int get_rx_bufs(struct vhost_virtqueue *vq,
+ 			nlogs += *log_num;
+ 			log += *log_num;
+ 		}
++		/*
++		 * 函数一开始的时候headcount是0
++		 */
+ 		heads[headcount].id = cpu_to_vhost32(vq, d);
+ 		len = iov_length(vq->iov + seg, in);
+ 		heads[headcount].len = cpu_to_vhost32(vq, len);
+@@ -729,6 +966,11 @@ static int get_rx_bufs(struct vhost_virtqueue *vq,
+ 
+ /* Expects to be always run from workqueue - which acts as
+  * read-size critical section for our kind of RCU. */
++/*
++ * called by:
++ *   - drivers/vhost/net.c|881| <<handle_rx_kick>> handle_rx(net);
++ *   - drivers/vhost/net.c|895| <<handle_rx_net>> handle_rx(net);
++ */
+ static void handle_rx(struct vhost_net *net)
+ {
+ 	struct vhost_net_virtqueue *nvq = &net->vqs[VHOST_NET_VQ_RX];
+@@ -773,9 +1015,21 @@ static void handle_rx(struct vhost_net *net)
+ 		vq->log : NULL;
+ 	mergeable = vhost_has_feature(vq, VIRTIO_NET_F_MRG_RXBUF);
+ 
++	/*
++	 * vhost_net_rx_peek_head_len()核心思想!!
++	 * 如果sock支持skb_array:
++	 *     如果vhost_net_buf中不是empty的, 就立刻返回vhost_net_buf->queue[vhost_net_buf->head]的skb->len
++	 *     否则先从tap/tun的skb_array中取一些放入vhost_net_buf再返回skb->len
++	 * 如果sock不支持skb_array:
++	 *     从sk->sk_receive_queue取skb ... ...
++	 */
+ 	while ((sock_len = vhost_net_rx_peek_head_len(net, sock->sk))) {
+ 		sock_len += sock_hlen;
+ 		vhost_len = sock_len + vhost_hlen;
++		/*
++		 * struct vhost_virtqueue *vq = &nvq->vq;
++		 *   -> struct vring_used_elem *heads;
++		 */
+ 		headcount = get_rx_bufs(vq, vq->heads, vhost_len,
+ 					&in, vq_log, &log,
+ 					likely(mergeable) ? UIO_MAXIOV : 1);
+@@ -794,6 +1048,9 @@ static void handle_rx(struct vhost_net *net)
+ 			 * they refilled. */
+ 			goto out;
+ 		}
++		/*
++		 * 核心思想是返回rxq->queue[rxq->head], 增加rxq->head
++		 */
+ 		if (nvq->rx_array)
+ 			msg.msg_control = vhost_net_buf_consume(&nvq->rxq);
+ 		/* On overrun, truncate and discard */
+@@ -813,6 +1070,9 @@ static void handle_rx(struct vhost_net *net)
+ 			 */
+ 			iov_iter_advance(&msg.msg_iter, vhost_hlen);
+ 		}
++		/*
++		 * 对于macvlan/macvtap是tap_recvmsg
++		 */
+ 		err = sock->ops->recvmsg(sock, &msg,
+ 					 sock_len, MSG_DONTWAIT | MSG_TRUNC);
+ 		/* Userspace might have consumed the packet meanwhile:
+@@ -895,6 +1155,11 @@ static void handle_rx_net(struct vhost_work *work)
+ 	handle_rx(net);
+ }
+ 
++/*
++ * 真中有用的:
++ *   - handle_tx_kick()
++ *   - handle_rx_net()
++ */
+ static int vhost_net_open(struct inode *inode, struct file *f)
+ {
+ 	struct vhost_net *n;
+@@ -912,6 +1177,11 @@ static int vhost_net_open(struct inode *inode, struct file *f)
+ 		return -ENOMEM;
+ 	}
+ 
++	/*
++	 * 在以下使用VHOST_RX_BATCH=64:
++	 *   - drivers/vhost/net.c|162| <<vhost_net_buf_produce>> VHOST_RX_BATCH);
++	 *   - drivers/vhost/net.c|925| <<vhost_net_open>> queue = kmalloc_array(VHOST_RX_BATCH, sizeof(struct sk_buff *),
++	 */
+ 	queue = kmalloc_array(VHOST_RX_BATCH, sizeof(struct sk_buff *),
+ 			      GFP_KERNEL);
+ 	if (!queue) {
+@@ -919,6 +1189,14 @@ static int vhost_net_open(struct inode *inode, struct file *f)
+ 		kvfree(n);
+ 		return -ENOMEM;
+ 	}
++	/*
++	 * struct vhost_net *n:
++	 *  -> struct vhost_dev dev;
++	 *  -> struct vhost_net_virtqueue vqs[VHOST_NET_VQ_MAX];
++	 *      -> struct vhost_virtqueue vq;
++	 *          -> struct vhost_poll poll;
++	 *  -> struct vhost_poll poll[VHOST_NET_VQ_MAX];
++	 */
+ 	n->vqs[VHOST_NET_VQ_RX].rxq.queue = queue;
+ 
+ 	dev = &n->dev;
+@@ -1041,6 +1319,10 @@ static struct socket *get_raw_socket(int fd)
+ 	return ERR_PTR(r);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vhost/net.c|1325| <<vhost_net_set_backend>> nvq->rx_array = get_tap_skb_array(fd);
++ */
+ static struct skb_array *get_tap_skb_array(int fd)
+ {
+ 	struct skb_array *array;
+@@ -1216,6 +1498,10 @@ static long vhost_net_reset_owner(struct vhost_net *n)
+ 	return err;
+ }
+ 
++/*
++ * 处理VHOST_SET_FEATURES:
++ *   - drivers/vhost/net.c|1318| <<vhost_net_ioctl>> return vhost_net_set_features(n, features);
++ */
+ static int vhost_net_set_features(struct vhost_net *n, u64 features)
+ {
+ 	size_t vhost_hlen, sock_hlen, hdr_len;
+diff --git a/drivers/vhost/vhost.c b/drivers/vhost/vhost.c
+index a59fefc6e5ea..8b5313104071 100644
+--- a/drivers/vhost/vhost.c
++++ b/drivers/vhost/vhost.c
+@@ -34,10 +34,44 @@
+ 
+ #include "vhost.h"
+ 
++/*
++ * [0] eventfd_signal
++ * [0] __kvm_io_bus_write
++ * [0] kvm_io_bus_write
++ * [0] kernel_pio
++ * [0] emulator_pio_out_emulated
++ * [0] kvm_fast_pio
++ * [0] handle_io
++ * [0] __dta_vmx_handle_exit_439
++ * [0] __dta_vcpu_enter_guest_1347
++ * [0] kvm_arch_vcpu_ioctl_run
++ * [0] __dta_kvm_vcpu_ioctl_639
++ * [0] do_vfs_ioctl
++ * [0] sys_ioctl
++ * [0] do_syscall_64
++ * [0] entry_SYSCALL_64_after_hwframe
++ *
++ * [0] eventfd_signal
++ * [0] vhost_add_used_and_signal_n
++ * [0] handle_rx
++ * [0] handle_rx_net
++ * [0] vhost_worker
++ * [0] kthread
++ * [0] ret_from_fork
++ */
++
++/*
++ * 在以下使用max_mem_regions:
++ *   - drivers/vhost/vhost.c|1333| <<vhost_set_memory>> if (mem.nregions > max_mem_regions)
++ */
+ static ushort max_mem_regions = 64;
+ module_param(max_mem_regions, ushort, 0444);
+ MODULE_PARM_DESC(max_mem_regions,
+ 	"Maximum number of memory regions in memory map. (default: 64)");
++/*
++ * 在以下使用max_iotlb_entries:
++ *   - drivers/vhost/vhost.c|958| <<vhost_new_umem_range>> if (umem->numem == max_iotlb_entries) {
++ */
+ static int max_iotlb_entries = 2048;
+ module_param(max_iotlb_entries, int, 0444);
+ MODULE_PARM_DESC(max_iotlb_entries,
+@@ -47,7 +81,25 @@ enum {
+ 	VHOST_MEMORY_F_LOG = 0x1,
+ };
+ 
++/*
++ * last_avail_idx表示前端处理到avail ring的哪个元素了
++ * ++之后表示下次待处理的avail ring的哪个元素
++ * 并将这个信息放入了used ring的最后一个元素
++ * 前端驱动通过读取used ring的最后一个元素就知道后端处理到哪里了
++ */
++
++/*
++ * called by:
++ *   - drivers/vhost/vhost.c|2328| <<vhost_notify>> if (vhost_get_avail(vq, event, vhost_used_event(vq))) {
++ */
+ #define vhost_used_event(vq) ((__virtio16 __user *)&vq->avail->ring[vq->num])
++/*
++ * called by:
++ *   - drivers/vhost/vhost.c|1799| <<vhost_update_avail_event>> vhost_avail_event(vq)))
++ *   - drivers/vhost/vhost.c|1806| <<vhost_update_avail_event>> used = vhost_avail_event(vq);
++ *   - drivers/vhost/vhost.c|1809| <<vhost_update_avail_event>> sizeof *vhost_avail_event(vq));
++ *   - drivers/vhost/vhost.c|2426| <<vhost_enable_notify>> vhost_avail_event(vq), r);
++ */
+ #define vhost_avail_event(vq) ((__virtio16 __user *)&vq->used->ring[vq->num])
+ 
+ INTERVAL_TREE_DEFINE(struct vhost_umem_node,
+@@ -70,6 +122,10 @@ static void vhost_enable_cross_endian_little(struct vhost_virtqueue *vq)
+ 	vq->user_be = false;
+ }
+ 
++/*
++ * 处理VHOST_SET_VRING_ENDIAN:
++ *   - drivers/vhost/vhost.c|1566| <<vhost_vring_ioctl>> r = vhost_set_vring_endian(vq, argp);
++ */
+ static long vhost_set_vring_endian(struct vhost_virtqueue *vq, int __user *argp)
+ {
+ 	struct vhost_vring_state s;
+@@ -92,6 +148,10 @@ static long vhost_set_vring_endian(struct vhost_virtqueue *vq, int __user *argp)
+ 	return 0;
+ }
+ 
++/*
++ * 处理VHOST_GET_VRING_ENDIAN:
++ *   - drivers/vhost/vhost.c|1569| <<vhost_vring_ioctl>> r = vhost_get_vring_endian(vq, idx, argp);
++ */
+ static long vhost_get_vring_endian(struct vhost_virtqueue *vq, u32 idx,
+ 				   int __user *argp)
+ {
+@@ -138,6 +198,10 @@ static void vhost_init_is_le(struct vhost_virtqueue *vq)
+ }
+ #endif /* CONFIG_VHOST_CROSS_ENDIAN_LEGACY */
+ 
++/*
++ * called by:
++ *   - drivers/vhost/vhost.c|338| <<vhost_vq_reset>> vhost_reset_is_le(vq);
++ */
+ static void vhost_reset_is_le(struct vhost_virtqueue *vq)
+ {
+ 	vhost_init_is_le(vq);
+@@ -145,9 +209,19 @@ static void vhost_reset_is_le(struct vhost_virtqueue *vq)
+ 
+ struct vhost_flush_struct {
+ 	struct vhost_work work;
++	/*
++	 * 在以下使用vhost_flush_struct->wait_event:
++	 *   - drivers/vhost/vhost.c|191| <<vhost_flush_work>> complete(&s->wait_event);
++	 *   - drivers/vhost/vhost.c|378| <<vhost_work_flush>> init_completion(&flush.wait_event);
++	 *   - drivers/vhost/vhost.c|382| <<vhost_work_flush>> wait_for_completion(&flush.wait_event);
++	 */
+ 	struct completion wait_event;
+ };
+ 
++/*
++ * 在以下使用vhost_flush_work():
++ *   - drivers/vhost/vhost.c|253| <<vhost_work_flush>> vhost_work_init(&flush.work, vhost_flush_work);
++ */
+ static void vhost_flush_work(struct vhost_work *work)
+ {
+ 	struct vhost_flush_struct *s;
+@@ -156,16 +230,123 @@ static void vhost_flush_work(struct vhost_work *work)
+ 	complete(&s->wait_event);
+ }
+ 
++/*
++ * [0] vhost_poll_func
++ * [0] vhost_poll_start.part.19
++ * [0] vhost_poll_start
++ * [0] vhost_net_enable_vq
++ * [0] handle_rx
++ * [0] handle_rx_net
++ * [0] vhost_worker
++ * [0] kthread
++ * [0] ret_from_fork
++ *
++ * 在以下使用vhost_poll_func():
++ *   - drivers/vhost/vhost.c|232| <<vhost_poll_init>> init_poll_funcptr(&poll->table, vhost_poll_func);
++ *
++ * 这个函数被配置给了poll_table->_qproc
++ * socket和eventfd的poll会调用poll_wait()-->调用poll_table->_qproc=vhost_poll_func()
++ *
++ * 把&poll->wait加入到wqh
++ *
++ * 对于socket: 把n->poll->wait加入到socket的wqh
++ * 对于eventfd, 把vhost_virtqueue->poll->wait加入到socket的wqh
++ *
++ *
++ * file->poll()的时候调用这个函数
++ */
+ static void vhost_poll_func(struct file *file, wait_queue_head_t *wqh,
+ 			    poll_table *pt, unsigned long unused)
+ {
+ 	struct vhost_poll *poll;
+ 
++	/*
++	 * 在以下使用vhost_poll->table:
++	 *   - drivers/vhost/vhost.c|260| <<vhost_poll_func>> poll = container_of(pt, struct vhost_poll, table);
++	 *   - drivers/vhost/vhost.c|399| <<vhost_poll_init>> init_poll_funcptr(&poll->table, vhost_poll_func);
++	 *   - drivers/vhost/vhost.c|458| <<vhost_poll_start>> mask = file->f_op->poll(file, &poll->table);
++	 */
+ 	poll = container_of(pt, struct vhost_poll, table);
+ 	poll->wqh = wqh;
++	/*
++	 * 对于socket: 把n->poll->wait加入到socket的wqh, wait的func是vhost_poll_wakeup()
++	 * 对于eventfd, 把vhost_virtqueue->poll->wait加入到eventfd的wqh, wait的func是vhost_poll_wakeup()
++	 *
++	 * 所以对于socket和eventfd, 唤醒的waitqueue的func都是vhost_poll_wakeup()
++	 *
++	 * 把poll->work (vhost_work)挂到poll->dev (vhost_dev)上然后唤醒vhost_dev的内核线程
++	 *
++	 * socket的入口: tun_net_xmit()-->sock_def_readable()
++	 * eventfd的入口: handle_ept_misconfig()-->kvm_io_bus_write()-->eventfd_signal()
++	 *
++	 * struct vhost_poll {
++	 *     poll_table                table;
++	 *     wait_queue_head_t        *wqh;
++	 *     wait_queue_entry_t              wait;
++	 *     struct vhost_work         work;
++	 *     unsigned long             mask;
++	 *     struct vhost_dev         *dev;
++	 * };
++	 *
++	 * 把entry的&poll->wait加入head的wqh
++	 */
+ 	add_wait_queue(wqh, &poll->wait);
+ }
+ 
++/*
++ * vhost_poll_wakeup()的例子:
++ * [0] vhost_poll_wakeup
++ * [0] __wake_up_common_lock
++ * [0] __wake_up_sync_key
++ * [0] sock_def_readable
++ * [0] __dta_tun_net_xmit_80
++ * [0] dev_hard_start_xmit
++ * [0] sch_direct_xmit
++ * [0] __dev_queue_xmit
++ * [0] dev_queue_xmit
++ * [0] br_dev_queue_push_xmit
++ * [0] br_forward_finish
++ * [0] __br_forward
++ * [0] deliver_clone
++ * [0] br_flood
++ * [0] br_handle_frame_finish
++ * [0] br_handle_frame
++ * [0] __netif_receive_skb_core
++ * [0] __netif_receive_skb
++ * [0] netif_receive_skb_internal
++ * [0] napi_gro_receive
++ * [0] ixgbe_clean_rx_irq
++ * [0] ixgbe_poll
++ * [0] net_rx_action
++ * [0] __do_softirq
++ * [0] irq_exit
++ * [0] do_IRQ
++ * [0] ret_from_intr
++ * [0] cpuidle_enter_state
++ * [0] cpuidle_enter
++ * [0] call_cpuidle
++ * [0] do_idle
++ * [0] cpu_startup_entry
++ * [0] start_secondary
++ * [0] secondary_startup_64
++ *
++ * 在以下使用vhost_poll_wakeup():
++ *   - drivers/vhost/vhost.c|231| <<vhost_poll_init>> init_waitqueue_func_entry(&poll->wait, vhost_poll_wakeup);
++ *   - drivers/vhost/vhost.c|253| <<vhost_poll_start>> vhost_poll_wakeup(&poll->wait, 0, 0, (void *)mask);
++ *
++ * 对于socket: 把n->poll->wait加入到socket的wqh, wait的func是vhost_poll_wakeup()
++ * 对于eventfd, 把vhost_virtqueue->poll->wait加入到eventfd的wqh, wait的func是vhost_poll_wakeup()
++ *
++ * 所以对于socket和eventfd, 唤醒的waitqueue的func都是vhost_poll_wakeup()
++ *
++ * 把poll->work (vhost_work)挂到poll->dev (vhost_dev)上然后唤醒vhost_dev的内核线程
++ *
++ * socket的入口: tun_net_xmit()-->sock_def_readable()
++ * eventfd的入口: handle_ept_misconfig()-->kvm_io_bus_write()-->eventfd_signal()
++ *
++ * 
++ * 作为wait entry的handler在poll被唤醒的时候调用
++ */
+ static int vhost_poll_wakeup(wait_queue_entry_t *wait, unsigned mode, int sync,
+ 			     void *key)
+ {
+@@ -174,10 +355,22 @@ static int vhost_poll_wakeup(wait_queue_entry_t *wait, unsigned mode, int sync,
+ 	if (!((unsigned long)key & poll->mask))
+ 		return 0;
+ 
++	/*
++	 * 把vhost_work挂到vhost_dev上然后唤醒内核线程
++	 */
+ 	vhost_poll_queue(poll);
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vhost/scsi.c|1645| <<vhost_scsi_open>> vhost_work_init(&vs->vs_completion_work, vhost_scsi_complete_cmd_work);
++ *   - drivers/vhost/scsi.c|1646| <<vhost_scsi_open>> vhost_work_init(&vs->vs_event_work, vhost_scsi_evt_work);
++ *   - drivers/vhost/vhost.c|237| <<vhost_poll_init>> vhost_work_init(&poll->work, fn);
++ *   - drivers/vhost/vhost.c|280| <<vhost_work_flush>> vhost_work_init(&flush.work, vhost_flush_work);
++ *   - drivers/vhost/vhost.c|517| <<vhost_attach_cgroups>> vhost_work_init(&attach.work, vhost_attach_cgroups_work);
++ *   - drivers/vhost/vsock.c|539| <<vhost_vsock_dev_open>> vhost_work_init(&vsock->send_pkt_work, vhost_transport_send_pkt_work);
++ */
+ void vhost_work_init(struct vhost_work *work, vhost_work_fn_t fn)
+ {
+ 	clear_bit(VHOST_WORK_QUEUED, &work->flags);
+@@ -187,21 +380,78 @@ void vhost_work_init(struct vhost_work *work, vhost_work_fn_t fn)
+ EXPORT_SYMBOL_GPL(vhost_work_init);
+ 
+ /* Init poll structure */
++/*
++ * called by:
++ *   - vhost_net_open(), 初始化n->poll
++ *   - vhost_net_open(), 初始化n->poll
++ *   - vhost_dev_init(), 初始化vhost_virtqueue->poll
++ *
++ * called by:
++ *   - drivers/vhost/net.c|950| <<vhost_net_open>> vhost_poll_init(n->poll + VHOST_NET_VQ_TX, handle_tx_net, POLLOUT, dev);
++ *   - drivers/vhost/net.c|951| <<vhost_net_open>> vhost_poll_init(n->poll + VHOST_NET_VQ_RX, handle_rx_net, POLLIN, dev);
++ *   - drivers/vhost/vhost.c|529| <<vhost_dev_init>> vhost_poll_init(&vq->poll, vq->handle_kick,
++ */
+ void vhost_poll_init(struct vhost_poll *poll, vhost_work_fn_t fn,
+ 		     unsigned long mask, struct vhost_dev *dev)
+ {
++	/*
++	 * 把vhost_poll->wait的handler设置成vhost_poll_wakeup
++	 * 这样当vhost_poll在fd上被唤醒的时候就调用vhost_poll_wakeup()
++	 */
+ 	init_waitqueue_func_entry(&poll->wait, vhost_poll_wakeup);
++	/*
++	 * 这个函数被配置给了poll_table->_qproc
++	 * socket和eventfd的poll会调用poll_wait()-->调用poll_table->_qproc=vhost_poll_func()
++	 *
++	 * 把&poll->wait加入到wqh
++	 *
++	 * 对于socket: 把n->poll->wait加入到socket的wqh
++	 * 对于eventfd, 把vhost_virtqueue->poll->wait加入到socket的wqh
++	 *
++	 *
++	 * 在以下使用vhost_poll->table:
++	 *   - drivers/vhost/vhost.c|260| <<vhost_poll_func>> poll = container_of(pt, struct vhost_poll, table);
++	 *   - drivers/vhost/vhost.c|399| <<vhost_poll_init>> init_poll_funcptr(&poll->table, vhost_poll_func);
++	 *   - drivers/vhost/vhost.c|458| <<vhost_poll_start>> mask = file->f_op->poll(file, &poll->table);
++	 */
+ 	init_poll_funcptr(&poll->table, vhost_poll_func);
+ 	poll->mask = mask;
+ 	poll->dev = dev;
++	/*
++	 * 在以下使用vhost_poll->wqh:
++	 *   - drivers/vhost/vhost.c|261| <<vhost_poll_func>> poll->wqh = wqh;
++	 *   - drivers/vhost/vhost.c|274| <<vhost_poll_func>> add_wait_queue(wqh, &poll->wait);
++	 *   - drivers/vhost/vhost.c|376| <<vhost_poll_init>> poll->wqh = NULL;
++	 *   - drivers/vhost/vhost.c|400| <<vhost_poll_start>> if (poll->wqh)
++	 *   - drivers/vhost/vhost.c|439| <<vhost_poll_stop>> if (poll->wqh) {
++	 *   - drivers/vhost/vhost.c|440| <<vhost_poll_stop>> remove_wait_queue(poll->wqh, &poll->wait);
++	 *   - drivers/vhost/vhost.c|441| <<vhost_poll_stop>> poll->wqh = NULL
++	 */
+ 	poll->wqh = NULL;
+ 
++	/*
++	 * fn可能是:
++	 *   - handle_tx_net()
++	 *   - handle_rx_net()
++	 *   - vq->handle_kick
++	 */
+ 	vhost_work_init(&poll->work, fn);
+ }
+ EXPORT_SYMBOL_GPL(vhost_poll_init);
+ 
+ /* Start polling a file. We add ourselves to file's wait queue. The caller must
+  * keep a reference to a file until after vhost_poll_stop is called. */
++/*
++ * called by:
++ *   - drivers/vhost/net.c|408| <<vhost_net_enable_vq>> return vhost_poll_start(poll, sock->file);
++ *   - drivers/vhost/vhost.c|1669| <<vhost_vring_ioctl>> r = vhost_poll_start(&vq->poll, vq->kick);
++ *
++ * - vhost_net_enable_vq()  ---> poll在sock->file
++ *   这里poll是n->poll, 是handle_rx_net()
++ *
++ * - vhost_vring_ioctl():VHOST_SET_VRING_KICK  --->设置host notifier, poll在eventfd
++ *   这里poll是vhost_virtqueue->poll, 是handle_tx_kick()
++ */
+ int vhost_poll_start(struct vhost_poll *poll, struct file *file)
+ {
+ 	unsigned long mask;
+@@ -210,6 +460,25 @@ int vhost_poll_start(struct vhost_poll *poll, struct file *file)
+ 	if (poll->wqh)
+ 		return 0;
+ 
++	/*
++	 * socket : tun_chr_poll() --> poll_wait()
++	 * eventfd: eventfd_poll() --> poll_wait()
++	 *
++	 * poll_wait()就是调用poll_table->_qproc=vhost_poll_func()
++	 *
++	 * vhost_poll_func()把&poll->wait加入到fd的wqh
++	 *
++	 * 对于socket: 把n->poll->wait加入到socket的wqh, wait的func是vhost_poll_wakeup()
++	 * 对于eventfd, 把vhost_virtqueue->poll->wait加入到eventfd的wqh, wait的func是vhost_poll_wakeup()
++	 *
++	 * 所以到时候waitqueue唤醒的时候都是调用vhost_poll_wakeup()
++	 *
++	 *
++	 * 在以下使用vhost_poll->table:
++	 *   - drivers/vhost/vhost.c|260| <<vhost_poll_func>> poll = container_of(pt, struct vhost_poll, table);
++	 *   - drivers/vhost/vhost.c|399| <<vhost_poll_init>> init_poll_funcptr(&poll->table, vhost_poll_func);
++	 *   - drivers/vhost/vhost.c|458| <<vhost_poll_start>> mask = file->f_op->poll(file, &poll->table);
++	 */
+ 	mask = file->f_op->poll(file, &poll->table);
+ 	if (mask)
+ 		vhost_poll_wakeup(&poll->wait, 0, 0, (void *)mask);
+@@ -224,8 +493,25 @@ EXPORT_SYMBOL_GPL(vhost_poll_start);
+ 
+ /* Stop polling a file. After this function returns, it becomes safe to drop the
+  * file reference. You must also flush afterwards. */
++/*
++ * called by:
++ *   - drivers/vhost/net.c|393| <<vhost_net_disable_vq>> vhost_poll_stop(poll);
++ *   - drivers/vhost/vhost.c|273| <<vhost_poll_start>> vhost_poll_stop(poll);
++ *   - drivers/vhost/vhost.c|649| <<vhost_dev_stop>> vhost_poll_stop(&dev->vqs[i]->poll);
++ *   - drivers/vhost/vhost.c|1661| <<vhost_vring_ioctl>> vhost_poll_stop(&vq->poll);
++ */
+ void vhost_poll_stop(struct vhost_poll *poll)
+ {
++	/*
++	 * struct vhost_poll {
++	 *     poll_table                table;
++	 *     wait_queue_head_t        *wqh;
++	 *     wait_queue_entry_t              wait;
++	 *     struct vhost_work         work;
++	 *     unsigned long             mask;
++	 *     struct vhost_dev         *dev;
++	 * };
++	 */
+ 	if (poll->wqh) {
+ 		remove_wait_queue(poll->wqh, &poll->wait);
+ 		poll->wqh = NULL;
+@@ -233,6 +519,14 @@ void vhost_poll_stop(struct vhost_poll *poll)
+ }
+ EXPORT_SYMBOL_GPL(vhost_poll_stop);
+ 
++/*
++ * called by:
++ *   - drivers/vhost/scsi.c|1396| <<vhost_scsi_flush>> vhost_work_flush(&vs->dev, &vs->vs_completion_work);
++ *   - drivers/vhost/scsi.c|1397| <<vhost_scsi_flush>> vhost_work_flush(&vs->dev, &vs->vs_event_work);
++ *   - drivers/vhost/vhost.c|310| <<vhost_poll_flush>> vhost_work_flush(poll->dev, &poll->work);
++ *   - drivers/vhost/vhost.c|564| <<vhost_attach_cgroups>> vhost_work_flush(dev, &attach.work);
++ *   - drivers/vhost/vsock.c|554| <<vhost_vsock_flush>> vhost_work_flush(&vsock->dev, &vsock->send_pkt_work);
++ */
+ void vhost_work_flush(struct vhost_dev *dev, struct vhost_work *work)
+ {
+ 	struct vhost_flush_struct flush;
+@@ -249,12 +543,111 @@ EXPORT_SYMBOL_GPL(vhost_work_flush);
+ 
+ /* Flush any work that has been scheduled. When calling this, don't hold any
+  * locks that are also used by the callback. */
++/*
++ * called by:
++ *   - drivers/vhost/net.c|983| <<vhost_net_flush_vq>> vhost_poll_flush(n->poll + index);
++ *   - drivers/vhost/net.c|984| <<vhost_net_flush_vq>> vhost_poll_flush(&n->vqs[index].vq.poll);
++ *   - drivers/vhost/scsi.c|1373| <<vhost_scsi_flush_vq>> vhost_poll_flush(&vs->vqs[index].vq.poll);
++ *   - drivers/vhost/test.c|145| <<vhost_test_flush_vq>> vhost_poll_flush(&n->vqs[index].poll);
++ *   - drivers/vhost/vhost.c|650| <<vhost_dev_stop>> vhost_poll_flush(&dev->vqs[i]->poll);
++ *   - drivers/vhost/vhost.c|1674| <<vhost_vring_ioctl>> vhost_poll_flush(&vq->poll);
++ *   - drivers/vhost/vsock.c|553| <<vhost_vsock_flush>> vhost_poll_flush(&vsock->vqs[i].poll);
++ * 
++ * 测试的没找到调用
++ */
+ void vhost_poll_flush(struct vhost_poll *poll)
+ {
+ 	vhost_work_flush(poll->dev, &poll->work);
+ }
+ EXPORT_SYMBOL_GPL(vhost_poll_flush);
+ 
++/*
++ * [0] vhost_work_queue
++ * [0] vhost_zerocopy_callback
++ * [0] skb_release_data
++ * [0] skb_release_all
++ * [0] napi_consume_skb
++ * [0] ixgbe_poll
++ * [0] net_rx_action
++ * [0] __do_softirq
++ * [0] irq_exit
++ * [0] do_IRQ
++ * [0] ret_from_intr
++ * [0] cpuidle_enter_state
++ * [0] cpuidle_enter
++ * [0] call_cpuidle
++ * [0] do_idle
++ * [0] cpu_startup_entry
++ * [0] start_secondary
++ * [0] secondary_startup_64
++ *
++ * [0] vhost_work_queue
++ * [0] __wake_up_common
++ * [0] __wake_up_locked_key
++ * [0] eventfd_signal
++ * [0] ioeventfd_write
++ * [0] __kvm_io_bus_write
++ * [0] kvm_io_bus_write
++ * [0] kernel_pio
++ * [0] emulator_pio_out_emulated
++ * [0] kvm_fast_pio
++ * [0] handle_io
++ * [0] __dta_vmx_handle_exit_439
++ * [0] __dta_vcpu_enter_guest_1347
++ * [0] kvm_arch_vcpu_ioctl_run
++ * [0] __dta_kvm_vcpu_ioctl_639
++ * [0] do_vfs_ioctl
++ * [0] sys_ioctl
++ * [0] do_syscall_64
++ * [0] entry_SYSCALL_64_after_hwframe
++ *
++ * [0] vhost_work_queue
++ * [0] __wake_up_common
++ * [0] __wake_up_common_lock
++ * [0] __wake_up_sync_key
++ * [0] sock_def_readable
++ * [0] __dta_tun_net_xmit_80
++ * [0] dev_hard_start_xmit
++ * [0] sch_direct_xmit
++ * [0] __dev_queue_xmit
++ * [0] dev_queue_xmit
++ * [0] br_dev_queue_push_xmit
++ * [0] br_forward_finish
++ * [0] __br_forward
++ * [0] deliver_clone
++ * [0] br_flood
++ * [0] br_handle_frame_finish
++ * [0] br_handle_frame
++ * [0] __netif_receive_skb_core
++ * [0] __netif_receive_skb
++ * [0] netif_receive_skb_internal
++ * [0] napi_gro_receive
++ * [0] ixgbe_clean_rx_irq
++ * [0] ixgbe_poll
++ * [0] net_rx_action
++ * [0] __do_softirq
++ * [0] irq_exit
++ * [0] do_IRQ
++ * [0] ret_from_intr
++ * [0] cpuidle_enter_state
++ * [0] cpuidle_enter
++ * [0] call_cpuidle
++ * [0] do_idle
++ * [0] cpu_startup_entry
++ * [0] start_secondary
++ * [0] secondary_startup_64
++ *
++ * called by:
++ *   - drivers/vhost/scsi.c|381| <<vhost_scsi_complete_cmd>> vhost_work_queue(&vs->dev, &vs->vs_completion_work);
++ *   - drivers/vhost/scsi.c|1343| <<vhost_scsi_send_evt>> vhost_work_queue(&vs->dev, &vs->vs_event_work);
++ *   - drivers/vhost/vhost.c|282| <<vhost_work_flush>> vhost_work_queue(dev, &flush.work);
++ *   - drivers/vhost/vhost.c|321| <<vhost_poll_queue>> vhost_work_queue(poll->dev, &poll->work);
++ *   - drivers/vhost/vhost.c|518| <<vhost_attach_cgroups>> vhost_work_queue(dev, &attach.work);
++ *   - drivers/vhost/vhost.h|42| <<vhost_attach_cgroups>> void vhost_work_queue(struct vhost_dev *dev, struct vhost_work *work);
++ *   - drivers/vhost/vsock.c|223| <<vhost_transport_send_pkt>> vhost_work_queue(&vsock->dev, &vsock->send_pkt_work);
++ *
++ * 把vhost_work挂到vhost_dev上然后唤醒内核线程
++ */
+ void vhost_work_queue(struct vhost_dev *dev, struct vhost_work *work)
+ {
+ 	if (!dev->worker)
+@@ -265,6 +658,14 @@ void vhost_work_queue(struct vhost_dev *dev, struct vhost_work *work)
+ 		 * sure it was not in the list.
+ 		 * test_and_set_bit() implies a memory barrier.
+ 		 */
++		/*
++		 * 在以下使用vhost_dev->work_list:
++		 *   - drivers/vhost/vhost.c|585| <<vhost_work_queue>> llist_add(&work->node, &dev->work_list);
++		 *   - drivers/vhost/vhost.c|598| <<vhost_has_work>> return !llist_empty(&dev->work_list);
++		 *   - drivers/vhost/vhost.c|691| <<vhost_worker>> node = llist_del_all(&dev->work_list);
++		 *   - drivers/vhost/vhost.c|767| <<vhost_dev_init>> init_llist_head(&dev->work_list);
++		 *   - drivers/vhost/vhost.c|983| <<vhost_dev_cleanup>> WARN_ON(!llist_empty(&dev->work_list));
++		 */
+ 		llist_add(&work->node, &dev->work_list);
+ 		wake_up_process(dev->worker);
+ 	}
+@@ -272,14 +673,34 @@ void vhost_work_queue(struct vhost_dev *dev, struct vhost_work *work)
+ EXPORT_SYMBOL_GPL(vhost_work_queue);
+ 
+ /* A lockless hint for busy polling code to exit the loop */
++/*
++ * called by:
++ *   - drivers/vhost/net.c|382| <<vhost_can_busy_poll>> !vhost_has_work(dev);
++ */
+ bool vhost_has_work(struct vhost_dev *dev)
+ {
+ 	return !llist_empty(&dev->work_list);
+ }
+ EXPORT_SYMBOL_GPL(vhost_has_work);
+ 
++/*
++ * called by:
++ *   - drivers/vhost/net.c|366| <<vhost_zerocopy_callback>> vhost_poll_queue(&vq->poll);
++ *   - drivers/vhost/net.c|576| <<handle_tx>> vhost_poll_queue(&vq->poll);
++ *   - drivers/vhost/net.c|639| <<vhost_net_rx_peek_head_len>> vhost_poll_queue(&vq->poll);
++ *   - drivers/vhost/net.c|642| <<vhost_net_rx_peek_head_len>> vhost_poll_queue(&vq->poll);
++ *   - drivers/vhost/net.c|862| <<handle_rx>> vhost_poll_queue(&vq->poll);
++ *   - drivers/vhost/test.c|85| <<handle_vq>> vhost_poll_queue(&vq->poll);
++ *   - drivers/vhost/vhost.c|215| <<vhost_poll_wakeup>> vhost_poll_queue(poll);
++ *   - drivers/vhost/vhost.c|1025| <<vhost_iotlb_notify_vq>> vhost_poll_queue(&node->vq->poll);
++ *   - drivers/vhost/vsock.c|186| <<vhost_transport_do_send_pkt>> vhost_poll_queue(&tx_vq->poll);
++ *   - drivers/vhost/vsock.c|266| <<vhost_transport_cancel_pkt>> vhost_poll_queue(&tx_vq->poll);
++ *
++ * 把poll->work (vhost_work)挂到poll->dev (vhost_dev)上然后唤醒vhost_dev的内核线程
++ */
+ void vhost_poll_queue(struct vhost_poll *poll)
+ {
++	/* 把poll->work (vhost_work)挂到poll->dev (vhost_dev)上然后唤醒vhost_dev的内核线程 */
+ 	vhost_work_queue(poll->dev, &poll->work);
+ }
+ EXPORT_SYMBOL_GPL(vhost_poll_queue);
+@@ -332,6 +753,10 @@ static void vhost_vq_reset(struct vhost_dev *dev,
+ 	__vhost_vq_meta_reset(vq);
+ }
+ 
++/*
++ * 在以下创建kthread的时候使用:
++ *   - drivers/vhost/vhost.c|843| <<vhost_dev_set_owner>> worker = kthread_create(vhost_worker, dev, "vhost-%d", current->pid);
++ */
+ static int vhost_worker(void *data)
+ {
+ 	struct vhost_dev *dev = data;
+@@ -351,6 +776,14 @@ static int vhost_worker(void *data)
+ 			break;
+ 		}
+ 
++		/*
++		 * 在以下使用vhost_dev->work_list:
++		 *   - drivers/vhost/vhost.c|585| <<vhost_work_queue>> llist_add(&work->node, &dev->work_list);
++		 *   - drivers/vhost/vhost.c|598| <<vhost_has_work>> return !llist_empty(&dev->work_list);
++		 *   - drivers/vhost/vhost.c|691| <<vhost_worker>> node = llist_del_all(&dev->work_list);
++		 *   - drivers/vhost/vhost.c|767| <<vhost_dev_init>> init_llist_head(&dev->work_list);
++		 *   - drivers/vhost/vhost.c|983| <<vhost_dev_cleanup>> WARN_ON(!llist_empty(&dev->work_list));
++		 */
+ 		node = llist_del_all(&dev->work_list);
+ 		if (!node)
+ 			schedule();
+@@ -412,6 +845,13 @@ static void vhost_dev_free_iovecs(struct vhost_dev *dev)
+ 		vhost_vq_free_iovecs(dev->vqs[i]);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vhost/net.c|948| <<vhost_net_open>> vhost_dev_init(dev, vqs, VHOST_NET_VQ_MAX);
++ *   - drivers/vhost/scsi.c|1659| <<vhost_scsi_open>> vhost_dev_init(&vs->dev, vqs, VHOST_SCSI_MAX_VQ);
++ *   - drivers/vhost/test.c|119| <<vhost_test_open>> vhost_dev_init(dev, vqs, VHOST_TEST_VQ_MAX);
++ *   - drivers/vhost/vsock.c|534| <<vhost_vsock_dev_open>> vhost_dev_init(&vsock->dev, vqs, ARRAY_SIZE(vsock->vqs));
++ */
+ void vhost_dev_init(struct vhost_dev *dev,
+ 		    struct vhost_virtqueue **vqs, int nvqs)
+ {
+@@ -427,6 +867,14 @@ void vhost_dev_init(struct vhost_dev *dev,
+ 	dev->iotlb = NULL;
+ 	dev->mm = NULL;
+ 	dev->worker = NULL;
++	/*
++	 * 在以下使用vhost_dev->work_list:
++	 *   - drivers/vhost/vhost.c|585| <<vhost_work_queue>> llist_add(&work->node, &dev->work_list);
++	 *   - drivers/vhost/vhost.c|598| <<vhost_has_work>> return !llist_empty(&dev->work_list);
++	 *   - drivers/vhost/vhost.c|691| <<vhost_worker>> node = llist_del_all(&dev->work_list);
++	 *   - drivers/vhost/vhost.c|767| <<vhost_dev_init>> init_llist_head(&dev->work_list);
++	 *   - drivers/vhost/vhost.c|983| <<vhost_dev_cleanup>> WARN_ON(!llist_empty(&dev->work_list));
++	 */
+ 	init_llist_head(&dev->work_list);
+ 	init_waitqueue_head(&dev->wait);
+ 	INIT_LIST_HEAD(&dev->read_list);
+@@ -442,6 +890,9 @@ void vhost_dev_init(struct vhost_dev *dev,
+ 		vq->dev = dev;
+ 		mutex_init(&vq->mutex);
+ 		vhost_vq_reset(dev, vq);
++		/*
++		 * 下面是POLLIN, 不是POLLOUT
++		 */
+ 		if (vq->handle_kick)
+ 			vhost_poll_init(&vq->poll, vq->handle_kick,
+ 					POLLIN, dev);
+@@ -643,6 +1094,14 @@ void vhost_dev_cleanup(struct vhost_dev *dev, bool locked)
+ 	dev->iotlb = NULL;
+ 	vhost_clear_msg(dev);
+ 	wake_up_interruptible_poll(&dev->wait, POLLIN | POLLRDNORM);
++	/*
++	 * 在以下使用vhost_dev->work_list:
++	 *   - drivers/vhost/vhost.c|585| <<vhost_work_queue>> llist_add(&work->node, &dev->work_list);
++	 *   - drivers/vhost/vhost.c|598| <<vhost_has_work>> return !llist_empty(&dev->work_list);
++	 *   - drivers/vhost/vhost.c|691| <<vhost_worker>> node = llist_del_all(&dev->work_list);
++	 *   - drivers/vhost/vhost.c|767| <<vhost_dev_init>> init_llist_head(&dev->work_list);
++	 *   - drivers/vhost/vhost.c|983| <<vhost_dev_cleanup>> WARN_ON(!llist_empty(&dev->work_list));
++	 */
+ 	WARN_ON(!llist_empty(&dev->work_list));
+ 	if (dev->worker) {
+ 		kthread_stop(dev->worker);
+@@ -741,6 +1200,10 @@ static int memory_access_ok(struct vhost_dev *d, struct vhost_umem *umem,
+ static int translate_desc(struct vhost_virtqueue *vq, u64 addr, u32 len,
+ 			  struct iovec iov[], int iov_size, int access);
+ 
++/*
++ * called by:
++ *   - drivers/vhost/vhost.c|2220| <<__vhost_add_used_n>> } else if (vhost_copy_to_user(vq, used, heads, count * sizeof *used)) {
++ */
+ static int vhost_copy_to_user(struct vhost_virtqueue *vq, void __user *to,
+ 			      const void *from, unsigned size)
+ {
+@@ -859,6 +1322,16 @@ static inline void __user *__vhost_get_user(struct vhost_virtqueue *vq,
+ 	return __vhost_get_user_slow(vq, addr, size, type);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vhost/vhost.c|1762| <<vhost_update_used_flags>> if (vhost_put_user(vq, cpu_to_vhost16(vq, vq->used_flags),
++ *   - drivers/vhost/vhost.c|1781| <<vhost_update_avail_event>> if (vhost_put_user(vq, cpu_to_vhost16(vq, vq->avail_idx),
++ *   - drivers/vhost/vhost.c|2195| <<__vhost_add_used_n>> if (vhost_put_user(vq, heads[0].id, &used->id)) {
++ *   - drivers/vhost/vhost.c|2199| <<__vhost_add_used_n>> if (vhost_put_user(vq, heads[0].len, &used->len)) {
++ *   - drivers/vhost/vhost.c|2252| <<vhost_add_used_n>> if (vhost_put_user(vq, cpu_to_vhost16(vq, vq->last_used_idx),
++ *
++ * 把第二参数x给第三个参数的ptr
++ */
+ #define vhost_put_user(vq, x, ptr)		\
+ ({ \
+ 	int ret = -EFAULT; \
+@@ -876,6 +1349,13 @@ static inline void __user *__vhost_get_user(struct vhost_virtqueue *vq,
+ 	ret; \
+ })
+ 
++/*
++ * called by:
++ *   - drivers/vhost/vhost.c|898| <<vhost_get_avail>> vhost_get_user(vq, x, ptr, VHOST_ADDR_AVAIL)
++ *   - drivers/vhost/vhost.c|901| <<vhost_get_used>> vhost_get_user(vq, x, ptr, VHOST_ADDR_USED)
++ *
++ * 把ptr的内容读入x
++ */
+ #define vhost_get_user(vq, x, ptr, type)		\
+ ({ \
+ 	int ret; \
+@@ -1209,6 +1689,11 @@ static int iotlb_access_ok(struct vhost_virtqueue *vq,
+ 	return true;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vhost/net.c|470| <<handle_tx>> if (!vq_iotlb_prefetch(vq))
++ *   - drivers/vhost/net.c|763| <<handle_rx>> if (!vq_iotlb_prefetch(vq))
++ */
+ int vq_iotlb_prefetch(struct vhost_virtqueue *vq)
+ {
+ 	size_t s = vhost_has_feature(vq, VIRTIO_RING_F_EVENT_IDX) ? 2 : 0;
+@@ -1751,6 +2236,12 @@ int vhost_log_write(struct vhost_virtqueue *vq, struct vhost_log *log,
+ }
+ EXPORT_SYMBOL_GPL(vhost_log_write);
+ 
++/*
++ * called by:
++ *   - drivers/vhost/vhost.c|2290| <<vhost_vq_init_access>> r = vhost_update_used_flags(vq);
++ *   - drivers/vhost/vhost.c|2981| <<vhost_enable_notify>> r = vhost_update_used_flags(vq);
++ *   - drivers/vhost/vhost.c|3028| <<vhost_disable_notify>> r = vhost_update_used_flags(vq);
++ */
+ static int vhost_update_used_flags(struct vhost_virtqueue *vq)
+ {
+ 	void __user *used;
+@@ -1771,6 +2262,10 @@ static int vhost_update_used_flags(struct vhost_virtqueue *vq)
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vhost/vhost.c|2988| <<vhost_enable_notify>> r = vhost_update_avail_event(vq, vq->avail_idx);
++ */
+ static int vhost_update_avail_event(struct vhost_virtqueue *vq, u16 avail_event)
+ {
+ 	if (vhost_put_user(vq, cpu_to_vhost16(vq, vq->avail_idx),
+@@ -1826,6 +2321,19 @@ int vhost_vq_init_access(struct vhost_virtqueue *vq)
+ }
+ EXPORT_SYMBOL_GPL(vhost_vq_init_access);
+ 
++/*
++ * called by:
++ *   - drivers/vhost/vhost.c|1228| <<vhost_copy_to_user>> ret = translate_desc(vq, (u64)(uintptr_t)to, size, vq->iotlb_iov,
++ *   - drivers/vhost/vhost.c|1263| <<vhost_copy_from_user>> ret = translate_desc(vq, (u64)(uintptr_t)from, size, vq->iotlb_iov,
++ *   - drivers/vhost/vhost.c|1288| <<__vhost_get_user_slow>> ret = translate_desc(vq, (u64)(uintptr_t)addr, size, vq->iotlb_iov,
++ *   - drivers/vhost/vhost.c|2404| <<get_indirect>> ret = translate_desc(vq, vhost64_to_cpu(vq, indirect->addr), len, vq->indirect,
++ *   - drivers/vhost/vhost.c|2450| <<get_indirect>> ret = translate_desc(vq, vhost64_to_cpu(vq, desc.addr),
++ *   - drivers/vhost/vhost.c|2592| <<vhost_get_vq_desc>> ret = translate_desc(vq, vhost64_to_cpu(vq, desc.addr),
++ *
++ * 把desc中的地址转换成qemu userspace的地址存放在iov中
++ *
++ * iov_size是从iov开始剩下可用的iov
++ */
+ static int translate_desc(struct vhost_virtqueue *vq, u64 addr, u32 len,
+ 			  struct iovec iov[], int iov_size, int access)
+ {
+@@ -2001,6 +2509,17 @@ static int get_indirect(struct vhost_virtqueue *vq,
+  * This function returns the descriptor number found, or vq->num (which is
+  * never a valid descriptor number) if none was found.  A negative code is
+  * returned on error. */
++/*
++ * called by:
++ *   - drivers/vhost/net.c|578| <<vhost_net_tx_get_vq_desc>> int r = vhost_get_vq_desc(vq, vq->iov, ARRAY_SIZE(vq->iov),
++ *   - drivers/vhost/net.c|588| <<vhost_net_tx_get_vq_desc>> r = vhost_get_vq_desc(vq, vq->iov, ARRAY_SIZE(vq->iov),
++ *   - drivers/vhost/net.c|909| <<get_rx_bufs>> r = vhost_get_vq_desc(vq, vq->iov + seg,
++ *   - drivers/vhost/scsi.c|472| <<vhost_scsi_do_evt_work>> head = vhost_get_vq_desc(vq, vq->iov,
++ *   - drivers/vhost/scsi.c|851| <<vhost_scsi_get_desc>> vc->head = vhost_get_vq_desc(vq, vq->iov,
++ *   - drivers/vhost/test.c|56| <<handle_vq>> head = vhost_get_vq_desc(vq, vq->iov,
++ *   - drivers/vhost/vsock.c|112| <<vhost_transport_do_send_pkt>> head = vhost_get_vq_desc(vq, vq->iov, ARRAY_SIZE(vq->iov),
++ *   - drivers/vhost/vsock.c|374| <<vhost_vsock_handle_tx_kick>> head = vhost_get_vq_desc(vq, vq->iov, ARRAY_SIZE(vq->iov),
++ */
+ int vhost_get_vq_desc(struct vhost_virtqueue *vq,
+ 		      struct iovec iov[], unsigned int iov_size,
+ 		      unsigned int *out_num, unsigned int *in_num,
+@@ -2022,6 +2541,9 @@ int vhost_get_vq_desc(struct vhost_virtqueue *vq,
+ 				&vq->avail->idx);
+ 			return -EFAULT;
+ 		}
++		/*
++		 * !!!! 更新了vq->avail_idx!!!
++		 */
+ 		vq->avail_idx = vhost16_to_cpu(vq, avail_idx);
+ 
+ 		if (unlikely((u16)(vq->avail_idx - last_avail_idx) > vq->num)) {
+@@ -2080,6 +2602,9 @@ int vhost_get_vq_desc(struct vhost_virtqueue *vq,
+ 			       i, vq->num, head);
+ 			return -EINVAL;
+ 		}
++		/*
++		 * struct vring_desc desc;
++		 */
+ 		ret = vhost_copy_from_user(vq, &desc, vq->desc + i,
+ 					   sizeof desc);
+ 		if (unlikely(ret)) {
+@@ -2104,6 +2629,11 @@ int vhost_get_vq_desc(struct vhost_virtqueue *vq,
+ 			access = VHOST_ACCESS_WO;
+ 		else
+ 			access = VHOST_ACCESS_RO;
++		/*
++		 * 把desc中的地址转换成qemu userspace的地址存放在iov中
++		 *
++		 * iov_size是从iov开始剩下可用的iov
++		 */
+ 		ret = translate_desc(vq, vhost64_to_cpu(vq, desc.addr),
+ 				     vhost32_to_cpu(vq, desc.len), iov + iov_count,
+ 				     iov_size - iov_count, access);
+@@ -2135,6 +2665,33 @@ int vhost_get_vq_desc(struct vhost_virtqueue *vq,
+ 	} while ((i = next_desc(vq, &desc)) != -1);
+ 
+ 	/* On success, increment avail index. */
++	/*
++	 * 在以下调用vhost_avail_event():
++	 *   - drivers/vhost/vhost.c|1799| <<vhost_update_avail_event>> vhost_avail_event(vq)))
++	 *   - drivers/vhost/vhost.c|1806| <<vhost_update_avail_event>> used = vhost_avail_event(vq);
++	 *   - drivers/vhost/vhost.c|1809| <<vhost_update_avail_event>> sizeof *vhost_avail_event(vq));
++	 *   - drivers/vhost/vhost.c|2426| <<vhost_enable_notify>> vhost_avail_event(vq), r);
++	 *
++	 * 在以下修改vhost_virtqueue->avail_idx:
++	 *   - drivers/vhost/vhost.c|311| <<vhost_vq_reset>> vq->avail_idx = 0;
++	 *   - drivers/vhost/vhost.c|1415| <<vhost_vring_ioctl>> vq->avail_idx = vq->last_avail_idx;
++	 *   - drivers/vhost/vhost.c|2030| <<vhost_get_vq_desc>> vq->avail_idx = vhost16_to_cpu(vq, avail_idx);
++	 *   - drivers/vhost/vhost.c|2330| <<vhost_vq_avail_empty>> vq->avail_idx = vhost16_to_cpu(vq, avail_idx);
++	 *
++	 * 在以下使用vhost_virtqueue->last_avail_idx:
++	 *   - drivers/vhost/vhost.c|310| <<vhost_vq_reset>> vq->last_avail_idx = 0;
++	 *   - drivers/vhost/vhost.c|1413| <<vhost_vring_ioctl>> vq->last_avail_idx = s.num;
++	 *   - drivers/vhost/vhost.c|1415| <<vhost_vring_ioctl>> vq->avail_idx = vq->last_avail_idx;
++	 *   - drivers/vhost/vhost.c|1419| <<vhost_vring_ioctl>> s.num = vq->last_avail_idx;
++	 *   - drivers/vhost/vhost.c|2022| <<vhost_get_vq_desc>> last_avail_idx = vq->last_avail_idx;
++	 *   - drivers/vhost/vhost.c|2024| <<vhost_get_vq_desc>> if (vq->avail_idx == vq->last_avail_idx) {
++	 *   - drivers/vhost/vhost.c|2041| <<vhost_get_vq_desc>> if (vq->avail_idx == last_avail_idx)
++	 *   - drivers/vhost/vhost.c|2143| <<vhost_get_vq_desc>> vq->last_avail_idx++;
++	 *   - drivers/vhost/vhost.c|2155| <<vhost_discard_vq_desc>> vq->last_avail_idx -= n;
++	 *   - drivers/vhost/vhost.c|2263| <<vhost_notify>> unlikely(vq->avail_idx == vq->last_avail_idx))
++	 *   - drivers/vhost/vhost.c|2324| <<vhost_vq_avail_empty>> if (vq->avail_idx != vq->last_avail_idx)
++	 *   - drivers/vhost/vhost.c|2332| <<vhost_vq_avail_empty>> return vq->avail_idx == vq->last_avail_idx;
++	 */
+ 	vq->last_avail_idx++;
+ 
+ 	/* Assume notifications from guest are disabled at this point,
+@@ -2145,6 +2702,13 @@ int vhost_get_vq_desc(struct vhost_virtqueue *vq,
+ EXPORT_SYMBOL_GPL(vhost_get_vq_desc);
+ 
+ /* Reverse the effect of vhost_get_vq_desc. Useful for error handling. */
++/*
++ * called by:
++ *   - drivers/vhost/net.c|725| <<handle_tx>> vhost_discard_vq_desc(vq, 1);
++ *   - drivers/vhost/net.c|963| <<get_rx_bufs>> vhost_discard_vq_desc(vq, headcount);
++ *   - drivers/vhost/net.c|1084| <<handle_rx>> vhost_discard_vq_desc(vq, headcount);
++ *   - drivers/vhost/net.c|1108| <<handle_rx>> vhost_discard_vq_desc(vq, headcount);
++ */
+ void vhost_discard_vq_desc(struct vhost_virtqueue *vq, int n)
+ {
+ 	vq->last_avail_idx -= n;
+@@ -2153,6 +2717,13 @@ EXPORT_SYMBOL_GPL(vhost_discard_vq_desc);
+ 
+ /* After we've used one of their buffers, we tell them about it.  We'll then
+  * want to notify the guest, using eventfd. */
++/*
++ * called by:
++ *   - drivers/vhost/scsi.c|562| <<vhost_scsi_complete_cmd_work>> vhost_add_used(cmd->tvc_vq, cmd->tvc_vq_desc, 0);
++ *   - drivers/vhost/vhost.c|2303| <<vhost_add_used_and_signal>> vhost_add_used(vq, head, len);
++ *   - drivers/vhost/vsock.c|159| <<vhost_transport_do_send_pkt>> vhost_add_used(vq, head, sizeof(pkt->hdr) + pkt->len);
++ *   - drivers/vhost/vsock.c|404| <<vhost_vsock_handle_tx_kick>> vhost_add_used(vq, head, sizeof(pkt->hdr) + len);
++ */
+ int vhost_add_used(struct vhost_virtqueue *vq, unsigned int head, int len)
+ {
+ 	struct vring_used_elem heads = {
+@@ -2164,6 +2735,11 @@ int vhost_add_used(struct vhost_virtqueue *vq, unsigned int head, int len)
+ }
+ EXPORT_SYMBOL_GPL(vhost_add_used);
+ 
++/*
++ * called by:
++ *   - drivers/vhost/vhost.c|2225| <<vhost_add_used_n>> r = __vhost_add_used_n(vq, heads, n);
++ *   - drivers/vhost/vhost.c|2231| <<vhost_add_used_n>> r = __vhost_add_used_n(vq, heads, count);
++ */
+ static int __vhost_add_used_n(struct vhost_virtqueue *vq,
+ 			    struct vring_used_elem *heads,
+ 			    unsigned count)
+@@ -2173,6 +2749,17 @@ static int __vhost_add_used_n(struct vhost_virtqueue *vq,
+ 	int start;
+ 
+ 	start = vq->last_used_idx & (vq->num - 1);
++	/*
++	 * struct vhost_virtqueue *vq:
++	 *  -> struct vring_used __user *used;
++	 *      -> __virtio16 flags;  
++	 *      -> __virtio16 idx;
++	 *      -> struct vring_used_elem ring[];
++	 *          -> // Index of start of used descriptor chain.
++	 *             __virtio32 id;
++	 *          -> // Total length of the descriptor chain which was used (written to)
++	 *             __virtio32 len;
++	 */
+ 	used = vq->used->ring + start;
+ 	if (count == 1) {
+ 		if (vhost_put_user(vq, heads[0].id, &used->id)) {
+@@ -2197,11 +2784,28 @@ static int __vhost_add_used_n(struct vhost_virtqueue *vq,
+ 			  count * sizeof *used);
+ 	}
+ 	old = vq->last_used_idx;
++	/*
++	 * 这里更新了vq->last_used_idx
++	 */
+ 	new = (vq->last_used_idx += count);
+ 	/* If the driver never bothers to signal in a very long while,
+ 	 * used index might wrap around. If that happens, invalidate
+ 	 * signalled_used index we stored. TODO: make sure driver
+ 	 * signals at least once in 2^16 and remove this. */
++	/*
++	 * 在以下使用vhost_virtqueue->signalled_used:
++	 *   - drivers/vhost/vhost.c|313| <<vhost_vq_reset>> vq->signalled_used = 0;
++	 *   - drivers/vhost/vhost.c|2239| <<__vhost_add_used_n>> if (unlikely((u16)(new - vq->signalled_used) < (u16)(new - old)))
++	 *   - drivers/vhost/vhost.c|2320| <<vhost_notify>> old = vq->signalled_used;
++	 *   - drivers/vhost/vhost.c|2322| <<vhost_notify>> new = vq->signalled_used = vq->last_used_idx;
++	 *
++	 * 在以下使用vhost_virtqueue->signalled_used_valid:
++	 *   - drivers/vhost/vhost.c|314| <<vhost_vq_reset>> vq->signalled_used_valid = false;
++	 *   - drivers/vhost/vhost.c|1830| <<vhost_vq_init_access>> vq->signalled_used_valid = false;
++	 *   - drivers/vhost/vhost.c|2240| <<__vhost_add_used_n>> vq->signalled_used_valid = false;
++	 *   - drivers/vhost/vhost.c|2321| <<vhost_notify>> v = vq->signalled_used_valid;
++	 *   - drivers/vhost/vhost.c|2323| <<vhost_notify>> vq->signalled_used_valid = true;
++	 */
+ 	if (unlikely((u16)(new - vq->signalled_used) < (u16)(new - old)))
+ 		vq->signalled_used_valid = false;
+ 	return 0;
+@@ -2209,11 +2813,28 @@ static int __vhost_add_used_n(struct vhost_virtqueue *vq,
+ 
+ /* After we've used one of their buffers, we tell them about it.  We'll then
+  * want to notify the guest, using eventfd. */
++/*
++ * called by:
++ *   - drivers/vhost/vhost.c|2168| <<vhost_add_used>> return vhost_add_used_n(vq, &heads, 1);
++ *   - drivers/vhost/vhost.c|2313| <<vhost_add_used_and_signal_n>> vhost_add_used_n(vq, heads, count);
++ */
+ int vhost_add_used_n(struct vhost_virtqueue *vq, struct vring_used_elem *heads,
+ 		     unsigned count)
+ {
+ 	int start, n, r;
+ 
++	/*
++	 * 在以下修改vhost_virtqueue->last_used_idx:
++	 *   - drivers/vhost/vhost.c|312| <<vhost_vq_reset>> vq->last_used_idx = 0;
++	 *   - drivers/vhost/vhost.c|1825| <<vhost_vq_init_access>> vq->last_used_idx = vhost16_to_cpu(vq, last_used_idx);
++	 *   - drivers/vhost/vhost.c|2205| <<__vhost_add_used_n>> new = (vq->last_used_idx += count);
++	 * 在以下使用vhost_virtqueue->last_used_idx:
++	 *   - drivers/vhost/vhost.c|2180| <<__vhost_add_used_n>> start = vq->last_used_idx & (vq->num - 1);
++	 *   - drivers/vhost/vhost.c|2204| <<__vhost_add_used_n>> old = vq->last_used_idx;
++	 *   - drivers/vhost/vhost.c|2222| <<vhost_add_used_n>> start = vq->last_used_idx & (vq->num - 1);
++	 *   - drivers/vhost/vhost.c|2235| <<vhost_add_used_n>> if (vhost_put_user(vq, cpu_to_vhost16(vq, vq->last_used_idx),
++	 *   - drivers/vhost/vhost.c|2276| <<vhost_notify>> new = vq->signalled_used = vq->last_used_idx;
++	 */
+ 	start = vq->last_used_idx & (vq->num - 1);
+ 	n = vq->num - start;
+ 	if (n < count) {
+@@ -2244,6 +2865,10 @@ int vhost_add_used_n(struct vhost_virtqueue *vq, struct vring_used_elem *heads,
+ }
+ EXPORT_SYMBOL_GPL(vhost_add_used_n);
+ 
++/*
++ * called by:
++ *   - drivers/vhost/vhost.c|2348| <<vhost_signal>> if (vq->call_ctx && vhost_notify(dev, vq))
++ */
+ static bool vhost_notify(struct vhost_dev *dev, struct vhost_virtqueue *vq)
+ {
+ 	__u16 old, new;
+@@ -2254,10 +2879,17 @@ static bool vhost_notify(struct vhost_dev *dev, struct vhost_virtqueue *vq)
+ 	 * interrupts. */
+ 	smp_mb();
+ 
++	/*
++	 * VIRTIO_F_NOTIFY_ON_EMPTY有一些不支持
++	 */
+ 	if (vhost_has_feature(vq, VIRTIO_F_NOTIFY_ON_EMPTY) &&
+ 	    unlikely(vq->avail_idx == vq->last_avail_idx))
+ 		return true;
+ 
++	/*
++	 * 大部分支持VIRTIO_RING_F_EVENT_IDX
++	 * VIRTIO_RING_F_EVENT_IDX = 29
++	 */
+ 	if (!vhost_has_feature(vq, VIRTIO_RING_F_EVENT_IDX)) {
+ 		__virtio16 flags;
+ 		if (vhost_get_avail(vq, flags, &vq->avail->flags)) {
+@@ -2267,21 +2899,54 @@ static bool vhost_notify(struct vhost_dev *dev, struct vhost_virtqueue *vq)
+ 		return !(flags & cpu_to_vhost16(vq, VRING_AVAIL_F_NO_INTERRUPT));
+ 	}
+ 	old = vq->signalled_used;
++	/*
++	 * 在以下使用vhost_virtqueue->signalled_used_valid:
++	 *   - drivers/vhost/vhost.c|314| <<vhost_vq_reset>> vq->signalled_used_valid = false;
++	 *   - drivers/vhost/vhost.c|1830| <<vhost_vq_init_access>> vq->signalled_used_valid = false;
++	 *   - drivers/vhost/vhost.c|2240| <<__vhost_add_used_n>> vq->signalled_used_valid = false;
++	 *   - drivers/vhost/vhost.c|2321| <<vhost_notify>> v = vq->signalled_used_valid;
++	 *   - drivers/vhost/vhost.c|2323| <<vhost_notify>> vq->signalled_used_valid = true;
++	 */
+ 	v = vq->signalled_used_valid;
++	/*
++	 * 在以下使用vhost_virtqueue->signalled_used:
++	 *   - drivers/vhost/vhost.c|313| <<vhost_vq_reset>> vq->signalled_used = 0;
++	 *   - drivers/vhost/vhost.c|2239| <<__vhost_add_used_n>> if (unlikely((u16)(new - vq->signalled_used) < (u16)(new - old)))
++	 *   - drivers/vhost/vhost.c|2320| <<vhost_notify>> old = vq->signalled_used;
++	 *   - drivers/vhost/vhost.c|2322| <<vhost_notify>> new = vq->signalled_used = vq->last_used_idx;
++	 */
+ 	new = vq->signalled_used = vq->last_used_idx;
+ 	vq->signalled_used_valid = true;
+ 
+ 	if (unlikely(!v))
+ 		return true;
+ 
++	/*
++	 * vhost_used_event():
++	 * 返回((__virtio16 __user *)&vq->avail->ring[vq->num])
++	 */
+ 	if (vhost_get_avail(vq, event, vhost_used_event(vq))) {
+ 		vq_err(vq, "Failed to get used event idx");
+ 		return true;
+ 	}
++	/*
++	 * vring_need_event():
++	 * return (__u16)(new_idx - event_idx - 1) < (__u16)(new_idx - old);
++	 */
+ 	return vring_need_event(vhost16_to_cpu(vq, event), new, old);
+ }
+ 
+ /* This actually signals the guest, using eventfd. */
++/*
++ * called by:
++ *   - drivers/vhost/scsi.c|575| <<vhost_scsi_complete_cmd_work>> vhost_signal(&vs->dev, &vs->vqs[vq].vq);
++ *   - drivers/vhost/vhost.c|2897| <<vhost_signal>> void vhost_signal(struct vhost_dev *dev, struct vhost_virtqueue *vq)
++ *   - drivers/vhost/vhost.c|2911| <<vhost_add_used_and_signal>> vhost_signal(dev, vq);
++ *   - drivers/vhost/vhost.c|2926| <<vhost_add_used_and_signal_n>> vhost_signal(dev, vq);
++ *   - drivers/vhost/vhost.h|333| <<vhost_add_used_and_signal_n>> void vhost_signal(struct vhost_dev *, struct vhost_virtqueue *);
++ *   - drivers/vhost/vsock.c|180| <<vhost_transport_do_send_pkt>> vhost_signal(&vsock->dev, vq);
++ *   - drivers/vhost/vsock.c|410| <<vhost_vsock_handle_tx_kick>> vhost_signal(&vsock->dev, vq);
++ */
+ void vhost_signal(struct vhost_dev *dev, struct vhost_virtqueue *vq)
+ {
+ 	/* Signal the Guest tell them we used something up. */
+@@ -2301,6 +2966,11 @@ void vhost_add_used_and_signal(struct vhost_dev *dev,
+ EXPORT_SYMBOL_GPL(vhost_add_used_and_signal);
+ 
+ /* multi-buffer version of vhost_add_used_and_signal */
++/*
++ * called by:
++ *   - drivers/vhost/net.c|338| <<vhost_zerocopy_signal_used>> vhost_add_used_and_signal_n(vq->dev, vq,
++ *   - drivers/vhost/net.c|856| <<handle_rx>> vhost_add_used_and_signal_n(&net->dev, vq, vq->heads,
++ */
+ void vhost_add_used_and_signal_n(struct vhost_dev *dev,
+ 				 struct vhost_virtqueue *vq,
+ 				 struct vring_used_elem *heads, unsigned count)
+@@ -2329,11 +2999,33 @@ bool vhost_vq_avail_empty(struct vhost_dev *dev, struct vhost_virtqueue *vq)
+ EXPORT_SYMBOL_GPL(vhost_vq_avail_empty);
+ 
+ /* OK, now we need to know about added descriptors. */
++/*
++ * called by:
++ *   - drivers/vhost/net.c|658| <<handle_tx>> if (unlikely(vhost_enable_notify(&net->dev, vq))) {
++ *   - drivers/vhost/net.c|852| <<vhost_net_rx_peek_head_len>> else if (unlikely(vhost_enable_notify(&net->dev, vq))) {
++ *   - drivers/vhost/net.c|1041| <<handle_rx>> if (unlikely(vhost_enable_notify(&net->dev, vq))) {
++ *   - drivers/vhost/scsi.c|480| <<vhost_scsi_do_evt_work>> if (vhost_enable_notify(&vs->dev, vq))
++ *   - drivers/vhost/scsi.c|864| <<vhost_scsi_get_desc>> if (unlikely(vhost_enable_notify(&vs->dev, vq))) {
++ *   - drivers/vhost/test.c|65| <<handle_vq>> if (unlikely(vhost_enable_notify(&n->dev, vq))) {
++ *   - drivers/vhost/vsock.c|103| <<vhost_transport_do_send_pkt>> vhost_enable_notify(&vsock->dev, vq);
++ *   - drivers/vhost/vsock.c|129| <<vhost_transport_do_send_pkt>> if (unlikely(vhost_enable_notify(&vsock->dev, vq))) {
++ *   - drivers/vhost/vsock.c|380| <<vhost_vsock_handle_tx_kick>> if (unlikely(vhost_enable_notify(&vsock->dev, vq))) {
++ */
+ bool vhost_enable_notify(struct vhost_dev *dev, struct vhost_virtqueue *vq)
+ {
+ 	__virtio16 avail_idx;
+ 	int r;
+ 
++	/*
++	 * 在以下使用VRING_USED_F_NO_NOTIFY:
++	 *   - drivers/vhost/vhost.c|2142| <<vhost_get_vq_desc>> BUG_ON(!(vq->used_flags & VRING_USED_F_NO_NOTIFY));
++	 *   - drivers/vhost/vhost.c|2337| <<vhost_enable_notify>> if (!(vq->used_flags & VRING_USED_F_NO_NOTIFY))
++	 *   - drivers/vhost/vhost.c|2339| <<vhost_enable_notify>> vq->used_flags &= ~VRING_USED_F_NO_NOTIFY;
++	 *   - drivers/vhost/vhost.c|2374| <<vhost_disable_notify>> if (vq->used_flags & VRING_USED_F_NO_NOTIFY)
++	 *   - drivers/vhost/vhost.c|2376| <<vhost_disable_notify>> vq->used_flags |= VRING_USED_F_NO_NOTIFY;
++	 *   - drivers/vhost/vringh.c|544| <<__vringh_notify_disable>> VRING_USED_F_NO_NOTIFY)) {
++	 *   - drivers/virtio/virtio_ring.c|578| <<virtqueue_kick_prepare>> needs_kick = !(vq->vring.used->flags & cpu_to_virtio16(_vq->vdev, VRING_USED_F_NO_NOTIFY));
++	 */
+ 	if (!(vq->used_flags & VRING_USED_F_NO_NOTIFY))
+ 		return false;
+ 	vq->used_flags &= ~VRING_USED_F_NO_NOTIFY;
+@@ -2371,6 +3063,16 @@ void vhost_disable_notify(struct vhost_dev *dev, struct vhost_virtqueue *vq)
+ {
+ 	int r;
+ 
++	/*
++	 * 在以下使用VRING_USED_F_NO_NOTIFY:
++	 *   - drivers/vhost/vhost.c|2142| <<vhost_get_vq_desc>> BUG_ON(!(vq->used_flags & VRING_USED_F_NO_NOTIFY));
++	 *   - drivers/vhost/vhost.c|2337| <<vhost_enable_notify>> if (!(vq->used_flags & VRING_USED_F_NO_NOTIFY))
++	 *   - drivers/vhost/vhost.c|2339| <<vhost_enable_notify>> vq->used_flags &= ~VRING_USED_F_NO_NOTIFY;
++	 *   - drivers/vhost/vhost.c|2374| <<vhost_disable_notify>> if (vq->used_flags & VRING_USED_F_NO_NOTIFY)
++	 *   - drivers/vhost/vhost.c|2376| <<vhost_disable_notify>> vq->used_flags |= VRING_USED_F_NO_NOTIFY;
++	 *   - drivers/vhost/vringh.c|544| <<__vringh_notify_disable>> VRING_USED_F_NO_NOTIFY)) {
++	 *   - drivers/virtio/virtio_ring.c|578| <<virtqueue_kick_prepare>> needs_kick = !(vq->vring.used->flags & cpu_to_virtio16(_vq->vdev, VRING_USED_F_NO_NOTIFY));
++	 */
+ 	if (vq->used_flags & VRING_USED_F_NO_NOTIFY)
+ 		return;
+ 	vq->used_flags |= VRING_USED_F_NO_NOTIFY;
+diff --git a/drivers/vhost/vhost.h b/drivers/vhost/vhost.h
+index 79c6e7a60a5e..5f91e962b618 100644
+--- a/drivers/vhost/vhost.h
++++ b/drivers/vhost/vhost.h
+@@ -30,8 +30,32 @@ struct vhost_work {
+ /* Poll a file (eventfd or socket) */
+ /* Note: there's nothing vhost specific about this structure. */
+ struct vhost_poll {
++	/*
++	 * 在以下使用vhost_poll->table:
++	 *   - drivers/vhost/vhost.c|260| <<vhost_poll_func>> poll = container_of(pt, struct vhost_poll, table);
++	 *   - drivers/vhost/vhost.c|399| <<vhost_poll_init>> init_poll_funcptr(&poll->table, vhost_poll_func);
++	 *   - drivers/vhost/vhost.c|458| <<vhost_poll_start>> mask = file->f_op->poll(file, &poll->table);
++	 */
+ 	poll_table                table;
++	/*
++	 * 在以下使用vhost_poll->wqh:
++	 *   - drivers/vhost/vhost.c|261| <<vhost_poll_func>> poll->wqh = wqh;
++	 *   - drivers/vhost/vhost.c|274| <<vhost_poll_func>> add_wait_queue(wqh, &poll->wait);
++	 *   - drivers/vhost/vhost.c|376| <<vhost_poll_init>> poll->wqh = NULL;
++	 *   - drivers/vhost/vhost.c|400| <<vhost_poll_start>> if (poll->wqh)
++	 *   - drivers/vhost/vhost.c|439| <<vhost_poll_stop>> if (poll->wqh) {
++	 *   - drivers/vhost/vhost.c|440| <<vhost_poll_stop>> remove_wait_queue(poll->wqh, &poll->wait);
++	 *   - drivers/vhost/vhost.c|441| <<vhost_poll_stop>> poll->wqh = NULL;
++	 */
+ 	wait_queue_head_t        *wqh;
++	/*
++	 * struct wait_queue_entry {
++	 *     unsigned int            flags;
++	 *     void                    *private;
++	 *     wait_queue_func_t       func;
++	 *     struct list_head        entry;
++	 * };
++	 */
+ 	wait_queue_entry_t              wait;
+ 	struct vhost_work	  work;
+ 	unsigned long		  mask;
+@@ -98,7 +122,27 @@ struct vhost_virtqueue {
+ 	struct file *kick;
+ 	struct file *call;
+ 	struct file *error;
++	/*
++	 * 在以下使用vhost_virtqueue->call_ctx:
++	 *   - drivers/vhost/vhost.c|335| <<vhost_vq_reset>> vq->call_ctx = NULL;
++	 *   - drivers/vhost/vhost.c|637| <<vhost_dev_cleanup>> if (dev->vqs[i]->call_ctx)
++	 *   - drivers/vhost/vhost.c|638| <<vhost_dev_cleanup>> eventfd_ctx_put(dev->vqs[i]->call_ctx);
++	 *   - drivers/vhost/vhost.c|1539| <<vhost_vring_ioctl>> ctx = vq->call_ctx;
++	 *   - drivers/vhost/vhost.c|1541| <<vhost_vring_ioctl(VHOST_SET_VRING_CALL)>> vq->call_ctx = eventfp ?
++	 *   - drivers/vhost/vhost.c|2395| <<vhost_signal>> if (vq->call_ctx && vhost_notify(dev, vq))
++	 *   - drivers/vhost/vhost.c|2396| <<vhost_signal>> eventfd_signal(vq->call_ctx, 1);
++	 */
+ 	struct eventfd_ctx *call_ctx;
++	/*
++	 * 在以下使用vhost_virtqueue->error_ctx:
++	 *   - drivers/vhost/vhost.c|332| <<vhost_vq_reset>> vq->error_ctx = NULL;
++	 *   - drivers/vhost/vhost.c|631| <<vhost_dev_cleanup>> if (dev->vqs[i]->error_ctx)
++	 *   - drivers/vhost/vhost.c|632| <<vhost_dev_cleanup>> eventfd_ctx_put(dev->vqs[i]->error_ctx);
++	 *   - drivers/vhost/vhost.c|1559| <<vhost_vring_ioctl>> ctx = vq->error_ctx;
++	 *   -  drivers/vhost/vhost.c|1560| <<vhost_vring_ioctl>> vq->error_ctx = eventfp ?
++	 *   - drivers/vhost/vhost.h|299| <<vq_err>> if ((vq)->error_ctx) \
++	 *   - drivers/vhost/vhost.h|300| <<vq_err>> eventfd_signal((vq)->error_ctx, 1);\
++	 */
+ 	struct eventfd_ctx *error_ctx;
+ 	struct eventfd_ctx *log_ctx;
+ 
+@@ -108,21 +152,81 @@ struct vhost_virtqueue {
+ 	vhost_work_fn_t handle_kick;
+ 
+ 	/* Last available index we saw. */
++	/*
++	 * 在以下使用vhost_virtqueue->last_avail_idx:
++	 *   - drivers/vhost/vhost.c|310| <<vhost_vq_reset>> vq->last_avail_idx = 0;
++	 *   - drivers/vhost/vhost.c|1413| <<vhost_vring_ioctl>> vq->last_avail_idx = s.num;
++	 *   - drivers/vhost/vhost.c|1415| <<vhost_vring_ioctl>> vq->avail_idx = vq->last_avail_idx;
++	 *   - drivers/vhost/vhost.c|1419| <<vhost_vring_ioctl>> s.num = vq->last_avail_idx;
++	 *   - drivers/vhost/vhost.c|2022| <<vhost_get_vq_desc>> last_avail_idx = vq->last_avail_idx;
++	 *   - drivers/vhost/vhost.c|2024| <<vhost_get_vq_desc>> if (vq->avail_idx == vq->last_avail_idx) {
++	 *   - drivers/vhost/vhost.c|2041| <<vhost_get_vq_desc>> if (vq->avail_idx == last_avail_idx)
++	 *   - drivers/vhost/vhost.c|2143| <<vhost_get_vq_desc>> vq->last_avail_idx++;
++	 *   - drivers/vhost/vhost.c|2155| <<vhost_discard_vq_desc>> vq->last_avail_idx -= n;
++	 *   - drivers/vhost/vhost.c|2263| <<vhost_notify>> unlikely(vq->avail_idx == vq->last_avail_idx))
++	 *   - drivers/vhost/vhost.c|2324| <<vhost_vq_avail_empty>> if (vq->avail_idx != vq->last_avail_idx)
++	 *   - drivers/vhost/vhost.c|2332| <<vhost_vq_avail_empty>> return vq->avail_idx == vq->last_avail_idx;
++	 */
+ 	u16 last_avail_idx;
+ 
+ 	/* Caches available index value from user. */
++	/*
++	 * 在以下修改vhost_virtqueue->avail_idx:
++	 *   - drivers/vhost/vhost.c|311| <<vhost_vq_reset>> vq->avail_idx = 0;
++	 *   - drivers/vhost/vhost.c|1415| <<vhost_vring_ioctl>> vq->avail_idx = vq->last_avail_idx;
++	 *   - drivers/vhost/vhost.c|2030| <<vhost_get_vq_desc>> vq->avail_idx = vhost16_to_cpu(vq, avail_idx);
++	 *   - drivers/vhost/vhost.c|2330| <<vhost_vq_avail_empty>> vq->avail_idx = vhost16_to_cpu(vq, avail_idx);
++	 * 在以下使用vhost_virtqueue->avail_idx:
++	 *   - drivers/vhost/vhost.c|1781| <<vhost_update_avail_event>> if (vhost_put_user(vq, cpu_to_vhost16(vq, vq->avail_idx),
++	 *   - drivers/vhost/vhost.c|2024| <<vhost_get_vq_desc>> if (vq->avail_idx == vq->last_avail_idx) {
++	 *   - drivers/vhost/vhost.c|2032| <<vhost_get_vq_desc>> if (unlikely((u16)(vq->avail_idx - last_avail_idx) > vq->num)) {
++	 *   - drivers/vhost/vhost.c|2034| <<vhost_get_vq_desc>> last_avail_idx, vq->avail_idx);
++	 *   - drivers/vhost/vhost.c|2041| <<vhost_get_vq_desc>> if (vq->avail_idx == last_avail_idx)
++	 *   - drivers/vhost/vhost.c|2263| <<vhost_notify>> unlikely(vq->avail_idx == vq->last_avail_idx))
++	 *   - drivers/vhost/vhost.c|2324| <<vhost_vq_avail_empty>> if (vq->avail_idx != vq->last_avail_idx)
++	 *   - drivers/vhost/vhost.c|2332| <<vhost_vq_avail_empty>> return vq->avail_idx == vq->last_avail_idx;
++	 *   - drivers/vhost/vhost.c|2363| <<vhost_enable_notify>> r = vhost_update_avail_event(vq, vq->avail_idx);
++	 *   - drivers/vhost/vhost.c|2380| <<vhost_enable_notify>> return vhost16_to_cpu(vq, avail_idx) != vq->avail_idx;
++	 */
+ 	u16 avail_idx;
+ 
+ 	/* Last index we used. */
++	/*
++	 * 在以下修改vhost_virtqueue->last_used_idx:
++	 *   - drivers/vhost/vhost.c|312| <<vhost_vq_reset>> vq->last_used_idx = 0;
++	 *   - drivers/vhost/vhost.c|1825| <<vhost_vq_init_access>> vq->last_used_idx = vhost16_to_cpu(vq, last_used_idx);
++	 *   - drivers/vhost/vhost.c|2205| <<__vhost_add_used_n>> new = (vq->last_used_idx += count);
++	 * 在以下使用vhost_virtqueue->last_used_idx:
++	 *   - drivers/vhost/vhost.c|2180| <<__vhost_add_used_n>> start = vq->last_used_idx & (vq->num - 1);
++	 *   - drivers/vhost/vhost.c|2204| <<__vhost_add_used_n>> old = vq->last_used_idx;
++	 *   - drivers/vhost/vhost.c|2222| <<vhost_add_used_n>> start = vq->last_used_idx & (vq->num - 1);
++	 *   - drivers/vhost/vhost.c|2235| <<vhost_add_used_n>> if (vhost_put_user(vq, cpu_to_vhost16(vq, vq->last_used_idx),
++	 *   - drivers/vhost/vhost.c|2276| <<vhost_notify>> new = vq->signalled_used = vq->last_used_idx;
++	 */
+ 	u16 last_used_idx;
+ 
+ 	/* Used flags */
+ 	u16 used_flags;
+ 
+ 	/* Last used index value we have signalled on */
++	/*
++	 * 在以下使用vhost_virtqueue->signalled_used:
++	 *   - drivers/vhost/vhost.c|313| <<vhost_vq_reset>> vq->signalled_used = 0;
++	 *   - drivers/vhost/vhost.c|2239| <<__vhost_add_used_n>> if (unlikely((u16)(new - vq->signalled_used) < (u16)(new - old)))
++	 *   - drivers/vhost/vhost.c|2320| <<vhost_notify>> old = vq->signalled_used;
++	 *   - drivers/vhost/vhost.c|2322| <<vhost_notify>> new = vq->signalled_used = vq->last_used_idx;
++	 */
+ 	u16 signalled_used;
+ 
+ 	/* Last used index value we have signalled on */
++	/*
++	 * 在以下使用vhost_virtqueue->signalled_used_valid:
++	 *   - drivers/vhost/vhost.c|314| <<vhost_vq_reset>> vq->signalled_used_valid = false;
++	 *   - drivers/vhost/vhost.c|1830| <<vhost_vq_init_access>> vq->signalled_used_valid = false;
++	 *   - drivers/vhost/vhost.c|2240| <<__vhost_add_used_n>> vq->signalled_used_valid = false;
++	 *   - drivers/vhost/vhost.c|2321| <<vhost_notify>> v = vq->signalled_used_valid;
++	 *   - drivers/vhost/vhost.c|2323| <<vhost_notify>> vq->signalled_used_valid = true;
++	 */
+ 	bool signalled_used_valid;
+ 
+ 	/* Log writes to used structure. */
+@@ -137,6 +241,15 @@ struct vhost_virtqueue {
+ 	struct vhost_umem *umem;
+ 	struct vhost_umem *iotlb;
+ 	void *private_data;
++	/*
++	 * 在以下使用vhost_virtqueue->acked_features:
++	 *   - drivers/vhost/net.c|1259| <<vhost_net_set_features>> n->vqs[i].vq.acked_features = features;
++	 *   - drivers/vhost/scsi.c|1621| <<vhost_scsi_set_features>> vq->acked_features = features;
++	 *   - drivers/vhost/test.c|254| <<vhost_test_set_features>> vq->acked_features = features;
++	 *   - drivers/vhost/vhost.c|319| <<vhost_vq_reset>> vq->acked_features = 0;
++	 *   - drivers/vhost/vhost.h|245| <<vhost_has_feature>> return vq->acked_features & (1ULL << bit);
++	 *   - drivers/vhost/vsock.c|661| <<vhost_vsock_set_features>> vq->acked_features = features;
++	 */
+ 	u64 acked_features;
+ 	/* Log write descriptors */
+ 	void __user *log_base;
+@@ -165,12 +278,27 @@ struct vhost_dev {
+ 	int nvqs;
+ 	struct file *log_file;
+ 	struct eventfd_ctx *log_ctx;
++	/*
++	 * 在以下使用vhost_dev->work_list:
++	 *   - drivers/vhost/vhost.c|585| <<vhost_work_queue>> llist_add(&work->node, &dev->work_list);
++	 *   - drivers/vhost/vhost.c|598| <<vhost_has_work>> return !llist_empty(&dev->work_list);
++	 *   - drivers/vhost/vhost.c|691| <<vhost_worker>> node = llist_del_all(&dev->work_list);
++	 *   - drivers/vhost/vhost.c|767| <<vhost_dev_init>> init_llist_head(&dev->work_list);
++	 *   - drivers/vhost/vhost.c|983| <<vhost_dev_cleanup>> WARN_ON(!llist_empty(&dev->work_list));
++	 */
+ 	struct llist_head work_list;
+ 	struct task_struct *worker;
+ 	struct vhost_umem *umem;
+ 	struct vhost_umem *iotlb;
+ 	spinlock_t iotlb_lock;
+ 	struct list_head read_list;
++	/*
++	 * 在以下使用vhost_dev->pending_list:
++	 *   - drivers/vhost/vhost.c|770| <<vhost_dev_init>> INIT_LIST_HEAD(&dev->pending_list);
++	 *   - drivers/vhost/vhost.c|943| <<vhost_clear_msg>> list_for_each_entry_safe(node, n, &dev->pending_list, node) {
++	 *   - drivers/vhost/vhost.c|1319| <<vhost_iotlb_notify_vq>> list_for_each_entry_safe(node, n, &d->pending_list, node) {
++	 *   - drivers/vhost/vhost.c|1481| <<vhost_chr_read_iter>> vhost_enqueue_msg(dev, &dev->pending_list, node);
++	 */
+ 	struct list_head pending_list;
+ 	wait_queue_head_t wait;
+ };
+diff --git a/fs/eventfd.c b/fs/eventfd.c
+index 2fb4eadaa118..623f1cfe22fb 100644
+--- a/fs/eventfd.c
++++ b/fs/eventfd.c
+@@ -51,6 +51,31 @@ struct eventfd_ctx {
+  * Returns the amount by which the counter was incremented.  This will be less
+  * than @n if the counter has overflowed.
+  */
++/*
++ * [0] eventfd_signal
++ * [0] __kvm_io_bus_write
++ * [0] kvm_io_bus_write
++ * [0] kernel_pio
++ * [0] emulator_pio_out_emulated
++ * [0] kvm_fast_pio
++ * [0] handle_io
++ * [0] __dta_vmx_handle_exit_439
++ * [0] __dta_vcpu_enter_guest_1347
++ * [0] kvm_arch_vcpu_ioctl_run
++ * [0] __dta_kvm_vcpu_ioctl_639
++ * [0] do_vfs_ioctl
++ * [0] sys_ioctl
++ * [0] do_syscall_64
++ * [0] entry_SYSCALL_64_after_hwframe
++ *
++ * [0] eventfd_signal
++ * [0] vhost_add_used_and_signal_n
++ * [0] handle_rx
++ * [0] handle_rx_net
++ * [0] vhost_worker
++ * [0] kthread
++ * [0] ret_from_fork
++ */
+ __u64 eventfd_signal(struct eventfd_ctx *ctx, __u64 n)
+ {
+ 	unsigned long flags;
+@@ -59,6 +84,18 @@ __u64 eventfd_signal(struct eventfd_ctx *ctx, __u64 n)
+ 	if (ULLONG_MAX - ctx->count < n)
+ 		n = ULLONG_MAX - ctx->count;
+ 	ctx->count += n;
++	/*
++	 * struct eventfd_ctx *ctx:
++	 *   -> wait_queue_head_t wqh;
++	 *
++	 * 对于vhost rx, 会唤醒wait_queue_entry->func = irqfd_wakeup()
++	 * struct wait_queue_entry {
++	 *     unsigned int            flags;
++	 *     void                    *private;
++	 *     wait_queue_func_t       func;
++	 *     struct list_head        entry;
++	 * };
++	 */
+ 	if (waitqueue_active(&ctx->wqh))
+ 		wake_up_locked_poll(&ctx->wqh, POLLIN);
+ 	spin_unlock_irqrestore(&ctx->wqh.lock, flags);
+@@ -67,6 +104,11 @@ __u64 eventfd_signal(struct eventfd_ctx *ctx, __u64 n)
+ }
+ EXPORT_SYMBOL_GPL(eventfd_signal);
+ 
++/*
++ * called by:
++ *   - fs/eventfd.c|104| <<eventfd_free>> eventfd_free_ctx(ctx);
++ *   - fs/eventfd.c|503| <<eventfd_file_create>> eventfd_free_ctx(ctx);
++ */
+ static void eventfd_free_ctx(struct eventfd_ctx *ctx)
+ {
+ 	kfree(ctx);
+@@ -191,6 +233,17 @@ static void eventfd_ctx_do_read(struct eventfd_ctx *ctx, __u64 *cnt)
+  * This is used to atomically remove a wait queue entry from the eventfd wait
+  * queue head, and read/reset the counter value.
+  */
++/*
++ * [0] eventfd_ctx_remove_wait_queue
++ * [0] process_one_work
++ * [0] worker_thread
++ * [0] kthread
++ * [0] ret_from_fork
++ *
++ * called by:
++ *   - drivers/vfio/virqfd.c|94| <<virqfd_shutdown>> eventfd_ctx_remove_wait_queue(virqfd->eventfd, &virqfd->wait, &cnt);
++ *   - virt/kvm/eventfd.c|132| <<irqfd_shutdown>> eventfd_ctx_remove_wait_queue(irqfd->eventfd, &irqfd->wait, &cnt);
++ */
+ int eventfd_ctx_remove_wait_queue(struct eventfd_ctx *ctx, wait_queue_entry_t *wait,
+ 				  __u64 *cnt)
+ {
+@@ -403,6 +456,16 @@ EXPORT_SYMBOL_GPL(eventfd_ctx_fdget);
+  *
+  * -EINVAL   : The @fd file descriptor is not an eventfd file.
+  */
++/*
++ * called by:
++ *   - drivers/vfio/virqfd.c|138| <<vfio_virqfd_enable>> ctx = eventfd_ctx_fileget(irqfd.file);
++ *   - drivers/vhost/vhost.c|1990| <<vhost_vring_ioctl>> eventfd_ctx_fileget(eventfp) : NULL;
++ *   - drivers/vhost/vhost.c|2009| <<vhost_vring_ioctl>> eventfd_ctx_fileget(eventfp) : NULL;
++ *   - drivers/vhost/vhost.c|2142| <<vhost_dev_ioctl>> eventfd_ctx_fileget(eventfp) : NULL;
++ *   - fs/eventfd.c|416| <<eventfd_ctx_fdget>> ctx = eventfd_ctx_fileget(f.file);
++ *   - mm/memcontrol.c|3801| <<memcg_write_event_control>> event->eventfd = eventfd_ctx_fileget(efile.file);
++ *   - virt/kvm/eventfd.c|317| <<kvm_irqfd_assign>> eventfd = eventfd_ctx_fileget(f.file);
++ */
+ struct eventfd_ctx *eventfd_ctx_fileget(struct file *file)
+ {
+ 	if (file->f_op != &eventfd_fops)
+@@ -426,6 +489,10 @@ EXPORT_SYMBOL_GPL(eventfd_ctx_fileget);
+  * can be avoided.
+  * Returns an eventfd file pointer, or a proper error pointer.
+  */
++/*
++ * called by:
++ *   - fs/eventfd.c|493| <<SYSCALL_DEFINE2(eventfd2)>> file = eventfd_file_create(count, flags);
++ */
+ struct file *eventfd_file_create(unsigned int count, int flags)
+ {
+ 	struct file *file;
+diff --git a/include/linux/irq.h b/include/linux/irq.h
+index 3705b8a87795..d309dc9fbbef 100644
+--- a/include/linux/irq.h
++++ b/include/linux/irq.h
+@@ -225,6 +225,19 @@ enum {
+ 	IRQD_MOVE_PCNTXT		= (1 << 15),
+ 	IRQD_IRQ_DISABLED		= (1 << 16),
+ 	IRQD_IRQ_MASKED			= (1 << 17),
++	/*
++	 * 在以下使用IRQD_IRQ_INPROGRESS:
++	 *   - kernel/irq/debugfs.c|103| <<global>> BIT_MASK_DESCR(IRQD_IRQ_INPROGRESS),
++	 *   - include/linux/irq.h|327| <<irqd_irq_inprogress>> return __irqd_to_state(d) & IRQD_IRQ_INPROGRESS;
++	 *   - kernel/irq/chip.c|473| <<handle_nested_irq>> irqd_set(&desc->irq_data, IRQD_IRQ_INPROGRESS);
++	 *   - kernel/irq/chip.c|484| <<handle_nested_irq>> irqd_clear(&desc->irq_data, IRQD_IRQ_INPROGRESS);
++	 *   - kernel/irq/chip.c|500| <<irq_may_run>> unsigned int mask = IRQD_IRQ_INPROGRESS | IRQD_WAKEUP_ARMED;
++	 *   - kernel/irq/chip.c|586| <<handle_untracked_irq>> irqd_set(&desc->irq_data, IRQD_IRQ_INPROGRESS);
++	 *   - kernel/irq/chip.c|592| <<handle_untracked_irq>> irqd_clear(&desc->irq_data, IRQD_IRQ_INPROGRESS);
++	 *   - kernel/irq/handle.c|201| <<handle_irq_event>> irqd_set(&desc->irq_data, IRQD_IRQ_INPROGRESS);
++	 *   - kernel/irq/handle.c|207| <<handle_irq_event>> irqd_clear(&desc->irq_data, IRQD_IRQ_INPROGRESS);
++	 *   - kernel/irq/manage.c|1380| <<__setup_irq>> irqd_clear(&desc->irq_data, IRQD_IRQ_INPROGRESS);
++	 */
+ 	IRQD_IRQ_INPROGRESS		= (1 << 18),
+ 	IRQD_WAKEUP_ARMED		= (1 << 19),
+ 	IRQD_FORWARDED_TO_VCPU		= (1 << 20),
+diff --git a/include/linux/ptr_ring.h b/include/linux/ptr_ring.h
+index dc396196585a..db0e68ea1f59 100644
+--- a/include/linux/ptr_ring.h
++++ b/include/linux/ptr_ring.h
+@@ -32,9 +32,50 @@
+ #endif
+ 
+ struct ptr_ring {
++	/*
++	 * 在以下修改ptr_ring->producer:
++	 *   - include/linux/ptr_ring.h|116| <<__ptr_ring_produce>> r->queue[r->producer++] = ptr;
++	 *   - include/linux/ptr_ring.h|118| <<__ptr_ring_produce>> r->producer = 0;
++	 *   - include/linux/ptr_ring.h|549| <<ptr_ring_init>> r->producer = r->consumer_head = r->consumer_tail = 0;
++	 *   - include/linux/ptr_ring.h|637| <<__ptr_ring_swap_queue>> r->producer = producer;
++	 * 在以下使用ptr_ring->producer:
++	 *   - include/linux/ptr_ring.h|54| <<__ptr_ring_full>> return r->queue[r->producer];
++	 *   - include/linux/ptr_ring.h|109| <<__ptr_ring_produce>> if (unlikely(!r->size) || r->queue[r->producer])
++	 *   - include/linux/ptr_ring.h|117| <<__ptr_ring_produce>> if (unlikely(r->producer >= r->size))
++	 */
+ 	int producer ____cacheline_aligned_in_smp;
+ 	spinlock_t producer_lock;
++	/*
++	 * 在以下修改ptr_ring->consumer_head:
++	 *   - include/linux/ptr_ring.h|256| <<__ptr_ring_discard_one>> int head = r->consumer_head++;
++	 *   - include/linux/ptr_ring.h|275| <<__ptr_ring_discard_one>> r->consumer_head = 0;
++	 *   - include/linux/ptr_ring.h|638| <<__ptr_ring_swap_queue>> r->consumer_head = 0;
++	 * 在以下使用ptr_ring->consumer_head:
++	 *   - include/linux/ptr_ring.h|185| <<__ptr_ring_peek>> return r->queue[r->consumer_head];
++	 *   - include/linux/ptr_ring.h|263| <<__ptr_ring_discard_one>> if (unlikely(r->consumer_head - r->consumer_tail >= r->batch ||
++	 *   - include/linux/ptr_ring.h|264| <<__ptr_ring_discard_one>> r->consumer_head >= r->size)) {
++	 *   - include/linux/ptr_ring.h|272| <<__ptr_ring_discard_one>> r->consumer_tail = r->consumer_head;
++	 *   - include/linux/ptr_ring.h|274| <<__ptr_ring_discard_one>> if (unlikely(r->consumer_head >= r->size)) {
++	 *   - include/linux/ptr_ring.h|549| <<ptr_ring_init>> r->producer = r->consumer_head = r->consumer_tail = 0;
++	 *   - include/linux/ptr_ring.h|586| <<ptr_ring_unconsume>> head = r->consumer_head - 1;
++	 *   - include/linux/ptr_ring.h|589| <<ptr_ring_unconsume>> r->consumer_tail = r->consumer_head;
++	 *   - include/linux/ptr_ring.h|596| <<ptr_ring_unconsume>> head = r->consumer_head - 1;
++	 *   - include/linux/ptr_ring.h|604| <<ptr_ring_unconsume>> r->consumer_tail = r->consumer_head = head;
++	 */
+ 	int consumer_head ____cacheline_aligned_in_smp; /* next valid entry */
++	/*
++	 * 在以下修改ptr->consumer_tail:
++	 *   - include/linux/ptr_ring.h|272| <<__ptr_ring_discard_one>> r->consumer_tail = r->consumer_head;
++	 *   - include/linux/ptr_ring.h|276| <<__ptr_ring_discard_one>> r->consumer_tail = 0;
++	 *   - include/linux/ptr_ring.h|549| <<ptr_ring_init>> r->producer = r->consumer_head = r->consumer_tail = 0;
++	 *   - include/linux/ptr_ring.h|589| <<ptr_ring_unconsume>> r->consumer_tail = r->consumer_head;
++	 *   - include/linux/ptr_ring.h|604| <<ptr_ring_unconsume>> r->consumer_tail = r->consumer_head = head;
++	 *   - include/linux/ptr_ring.h|639| <<__ptr_ring_swap_queue>> r->consumer_tail = 0;
++	 * 在以下使用ptr->consumer_tail:
++	 *   - include/linux/ptr_ring.h|263| <<__ptr_ring_discard_one>> if (unlikely(r->consumer_head - r->consumer_tail >= r->batch ||
++	 *   - include/linux/ptr_ring.h|270| <<__ptr_ring_discard_one>> while (likely(head >= r->consumer_tail))
++	 *   - include/linux/ptr_ring.h|587| <<ptr_ring_unconsume>> while (likely(head >= r->consumer_tail))
++	 */
+ 	int consumer_tail; /* next entry to invalidate */
+ 	spinlock_t consumer_lock;
+ 	/* Shared consumer/producer data */
+@@ -49,11 +90,29 @@ struct ptr_ring {
+  * producer_lock - see e.g. ptr_ring_full.  Otherwise, if callers don't hold
+  * producer_lock, the next call to __ptr_ring_produce may fail.
+  */
++/*
++ * calld by:
++ *   - include/linux/ptr_ring.h|62| <<ptr_ring_full>> ret = __ptr_ring_full(r);
++ *   - include/linux/ptr_ring.h|73| <<ptr_ring_full_irq>> ret = __ptr_ring_full(r);
++ *   - include/linux/ptr_ring.h|85| <<ptr_ring_full_any>> ret = __ptr_ring_full(r);
++ *   - include/linux/ptr_ring.h|96| <<ptr_ring_full_bh>> ret = __ptr_ring_full(r);
++ *   - include/linux/skb_array.h|38| <<__skb_array_full>> return __ptr_ring_full(&a->ring);
++ *   - tools/virtio/ringtest/ptr_ring.c|152| <<get_buf>> if (tailcnt == headcnt || __ptr_ring_full(&array))
++ *   - tools/virtio/ringtest/ptr_ring.c|164| <<used_empty>> return (tailcnt == headcnt || __ptr_ring_full(&array));
++ *
++ * 返回ptr_ring->queue[ptr_ring->producer]
++ */
+ static inline bool __ptr_ring_full(struct ptr_ring *r)
+ {
+ 	return r->queue[r->producer];
+ }
+ 
++/*
++ * called by:
++ *   - include/linux/skb_array.h|43| <<skb_array_full>> return ptr_ring_full(&a->ring);
++ *
++ * 返回ptr_ring->queue[ptr_ring->producer]
++ */
+ static inline bool ptr_ring_full(struct ptr_ring *r)
+ {
+ 	bool ret;
+@@ -65,6 +124,9 @@ static inline bool ptr_ring_full(struct ptr_ring *r)
+ 	return ret;
+ }
+ 
++/*
++ * 没人调用
++ */
+ static inline bool ptr_ring_full_irq(struct ptr_ring *r)
+ {
+ 	bool ret;
+@@ -76,6 +138,9 @@ static inline bool ptr_ring_full_irq(struct ptr_ring *r)
+ 	return ret;
+ }
+ 
++/*
++ * 没人调用
++ */
+ static inline bool ptr_ring_full_any(struct ptr_ring *r)
+ {
+ 	unsigned long flags;
+@@ -88,6 +153,9 @@ static inline bool ptr_ring_full_any(struct ptr_ring *r)
+ 	return ret;
+ }
+ 
++/*
++ * 没人调用
++ */
+ static inline bool ptr_ring_full_bh(struct ptr_ring *r)
+ {
+ 	bool ret;
+@@ -104,8 +172,19 @@ static inline bool ptr_ring_full_bh(struct ptr_ring *r)
+  * Callers are responsible for making sure pointer that is being queued
+  * points to a valid data.
+  */
++/*
++ * called by:
++ *   - include/linux/ptr_ring.h|132| <<ptr_ring_produce>> ret = __ptr_ring_produce(r, ptr);
++ *   - include/linux/ptr_ring.h|143| <<ptr_ring_produce_irq>> ret = __ptr_ring_produce(r, ptr);
++ *   - include/linux/ptr_ring.h|155| <<ptr_ring_produce_any>> ret = __ptr_ring_produce(r, ptr);
++ *   - include/linux/ptr_ring.h|166| <<ptr_ring_produce_bh>> ret = __ptr_ring_produce(r, ptr);
++ *   - tools/virtio/ringtest/ptr_ring.c|133| <<add_inbuf>> ret = __ptr_ring_produce(&array, buf);
++ *
++ * 核心思想是ptr_ring->queue[ptr_ring->producer++] = ptr;
++ */
+ static inline int __ptr_ring_produce(struct ptr_ring *r, void *ptr)
+ {
++	/* 确认是不是满了或者没初始化 */
+ 	if (unlikely(!r->size) || r->queue[r->producer])
+ 		return -ENOSPC;
+ 
+@@ -124,6 +203,12 @@ static inline int __ptr_ring_produce(struct ptr_ring *r, void *ptr)
+  * consume in interrupt or BH context, you must disable interrupts/BH when
+  * calling this.
+  */
++/*
++ * called by:
++ *   - include/linux/skb_array.h|48| <<skb_array_produce>> return ptr_ring_produce(&a->ring, skb);
++ *
++ * 核心思想是ptr_ring->queue[ptr_ring->producer++] = ptr;
++ */
+ static inline int ptr_ring_produce(struct ptr_ring *r, void *ptr)
+ {
+ 	int ret;
+@@ -135,6 +220,12 @@ static inline int ptr_ring_produce(struct ptr_ring *r, void *ptr)
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - include/linux/skb_array.h|53| <<skb_array_produce_irq>> return ptr_ring_produce_irq(&a->ring, skb);
++ *
++ * 核心思想是ptr_ring->queue[ptr_ring->producer++] = ptr;
++ */
+ static inline int ptr_ring_produce_irq(struct ptr_ring *r, void *ptr)
+ {
+ 	int ret;
+@@ -146,6 +237,12 @@ static inline int ptr_ring_produce_irq(struct ptr_ring *r, void *ptr)
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - include/linux/skb_array.h|63| <<skb_array_produce_any>> return ptr_ring_produce_any(&a->ring, skb);
++ *
++ * 核心思想是ptr_ring->queue[ptr_ring->producer++] = ptr;
++ */
+ static inline int ptr_ring_produce_any(struct ptr_ring *r, void *ptr)
+ {
+ 	unsigned long flags;
+@@ -158,6 +255,12 @@ static inline int ptr_ring_produce_any(struct ptr_ring *r, void *ptr)
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - include/linux/skb_array.h|58| <<skb_array_produce_bh>> return ptr_ring_produce_bh(&a->ring, skb);
++ *
++ * 核心思想是ptr_ring->queue[ptr_ring->producer++] = ptr;
++ */
+ static inline int ptr_ring_produce_bh(struct ptr_ring *r, void *ptr)
+ {
+ 	int ret;
+@@ -175,8 +278,21 @@ static inline int ptr_ring_produce_bh(struct ptr_ring *r, void *ptr)
+  * If ring is never resized, and if the pointer is merely
+  * tested, there's no need to take the lock - see e.g.  __ptr_ring_empty.
+  */
++/*
++ * called by:
++ *   - include/linux/ptr_ring.h|195| <<__ptr_ring_empty>> return !__ptr_ring_peek(r);
++ *   - include/linux/ptr_ring.h|284| <<__ptr_ring_consume>> ptr = __ptr_ring_peek(r);
++ *   - include/linux/ptr_ring.h|448| <<__PTR_RING_PEEK_CALL>> #define __PTR_RING_PEEK_CALL(r, f) ((f)(__ptr_ring_peek(r)))
++ *   - include/linux/skb_array.h|72| <<__skb_array_empty>> return !__ptr_ring_peek(&a->ring);
++ *
++ * 核心思想是返回ptr_ring->queue[ptr_ring->consumer_head];
++ */
+ static inline void *__ptr_ring_peek(struct ptr_ring *r)
+ {
++	/*
++	 * struct ptr_ring *r:
++	 *  -> void **queue;
++	 */
+ 	if (likely(r->size))
+ 		return r->queue[r->consumer_head];
+ 	return NULL;
+@@ -186,11 +302,27 @@ static inline void *__ptr_ring_peek(struct ptr_ring *r)
+  * for example cpu_relax(). Callers must take consumer_lock
+  * if the ring is ever resized - see e.g. ptr_ring_empty.
+  */
++/*
++ * called by:
++ *   - include/linux/ptr_ring.h|203| <<ptr_ring_empty>> ret = __ptr_ring_empty(r);
++ *   - include/linux/ptr_ring.h|214| <<ptr_ring_empty_irq>> ret = __ptr_ring_empty(r);
++ *   - include/linux/ptr_ring.h|226| <<ptr_ring_empty_any>> ret = __ptr_ring_empty(r);
++ *   - include/linux/ptr_ring.h|237| <<ptr_ring_empty_bh>> ret = __ptr_ring_empty(r);
++ *   - tools/virtio/ringtest/ptr_ring.c|195| <<avail_empty>> return __ptr_ring_empty(&array);
++ *
++ * 核心思想是判断ptr_ring->queue[ptr_ring->consumer_head]是否有值, 没有则为empty
++ */
+ static inline bool __ptr_ring_empty(struct ptr_ring *r)
+ {
+ 	return !__ptr_ring_peek(r);
+ }
+ 
++/*
++ * called by:
++ *   - include/linux/skb_array.h|77| <<skb_array_empty>> return ptr_ring_empty(&a->ring);
++ *
++ * 核心思想是判断ptr_ring->queue[ptr_ring->consumer_head]是否有值, 没有则为empty
++ */
+ static inline bool ptr_ring_empty(struct ptr_ring *r)
+ {
+ 	bool ret;
+@@ -202,6 +334,12 @@ static inline bool ptr_ring_empty(struct ptr_ring *r)
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - include/linux/skb_array.h|87| <<skb_array_empty_irq>> return ptr_ring_empty_irq(&a->ring);
++ *
++ * 核心思想是判断ptr_ring->queue[ptr_ring->consumer_head]是否有值, 没有则为empty
++ */
+ static inline bool ptr_ring_empty_irq(struct ptr_ring *r)
+ {
+ 	bool ret;
+@@ -213,6 +351,12 @@ static inline bool ptr_ring_empty_irq(struct ptr_ring *r)
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - include/linux/skb_array.h|92| <<skb_array_empty_any>> return ptr_ring_empty_any(&a->ring);
++ *
++ * 核心思想是判断ptr_ring->queue[ptr_ring->consumer_head]是否有值, 没有则为empty
++ */
+ static inline bool ptr_ring_empty_any(struct ptr_ring *r)
+ {
+ 	unsigned long flags;
+@@ -225,6 +369,12 @@ static inline bool ptr_ring_empty_any(struct ptr_ring *r)
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - include/linux/skb_array.h|82| <<skb_array_empty_bh>> return ptr_ring_empty_bh(&a->ring);
++ *
++ * 核心思想是判断ptr_ring->queue[ptr_ring->consumer_head]是否有值, 没有则为empty
++ */
+ static inline bool ptr_ring_empty_bh(struct ptr_ring *r)
+ {
+ 	bool ret;
+@@ -237,6 +387,10 @@ static inline bool ptr_ring_empty_bh(struct ptr_ring *r)
+ }
+ 
+ /* Must only be called after __ptr_ring_peek returned !NULL */
++/*
++ * called by:
++ *   - include/linux/ptr_ring.h|286| <<__ptr_ring_consume>> __ptr_ring_discard_one(r);
++ */
+ static inline void __ptr_ring_discard_one(struct ptr_ring *r)
+ {
+ 	/* Fundamentally, what we want to do is update consumer
+@@ -273,10 +427,23 @@ static inline void __ptr_ring_discard_one(struct ptr_ring *r)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - include/linux/ptr_ring.h|301| <<__ptr_ring_consume_batched>> ptr = __ptr_ring_consume(r);
++ *   - include/linux/ptr_ring.h|320| <<ptr_ring_consume>> ptr = __ptr_ring_consume(r);
++ *   - include/linux/ptr_ring.h|335| <<ptr_ring_consume_irq>> ptr = __ptr_ring_consume(r);
++ *   - include/linux/ptr_ring.h|351| <<ptr_ring_consume_any>> ptr = __ptr_ring_consume(r);
++ *   - include/linux/ptr_ring.h|366| <<ptr_ring_consume_bh>> ptr = __ptr_ring_consume(r);
++ *   - include/linux/ptr_ring.h|628| <<__ptr_ring_swap_queue>> while ((ptr = __ptr_ring_consume(r)))
++ *   - tools/virtio/ringtest/ptr_ring.c|202| <<use_buf>> ptr = __ptr_ring_consume(&array);
++ */
+ static inline void *__ptr_ring_consume(struct ptr_ring *r)
+ {
+ 	void *ptr;
+ 
++	/*
++	 * 核心思想是返回ptr_ring->queue[ptr_ring->consumer_head];
++	 */
+ 	ptr = __ptr_ring_peek(r);
+ 	if (ptr)
+ 		__ptr_ring_discard_one(r);
+@@ -287,6 +454,15 @@ static inline void *__ptr_ring_consume(struct ptr_ring *r)
+ 	return ptr;
+ }
+ 
++/*
++ * called by:
++ *   - include/linux/ptr_ring.h|382| <<ptr_ring_consume_batched>> ret = __ptr_ring_consume_batched(r, array, n);
++ *   - include/linux/ptr_ring.h|398| <<ptr_ring_consume_batched_irq>> ret = __ptr_ring_consume_batched(r, array, n);
++ *   - include/linux/ptr_ring.h|415| <<ptr_ring_consume_batched_any>> ret = __ptr_ring_consume_batched(r, array, n);
++ *   - include/linux/ptr_ring.h|431| <<ptr_ring_consume_batched_bh>> ret = __ptr_ring_consume_batched(r, array, n);
++ *
++ * 返回的是从ptr_ring放入参数array的数目 (最大是最后一个参数)
++ */
+ static inline int __ptr_ring_consume_batched(struct ptr_ring *r,
+ 					     void **array, int n)
+ {
+@@ -308,6 +484,11 @@ static inline int __ptr_ring_consume_batched(struct ptr_ring *r,
+  * call this in interrupt or BH context, you must disable interrupts/BH when
+  * producing.
+  */
++/*
++ * called by:
++ *   - include/linux/ptr_ring.h|743| <<ptr_ring_cleanup>> while ((ptr = ptr_ring_consume(r)))
++ *   - include/linux/skb_array.h|97| <<skb_array_consume>> return ptr_ring_consume(&a->ring);
++ */
+ static inline void *ptr_ring_consume(struct ptr_ring *r)
+ {
+ 	void *ptr;
+@@ -319,6 +500,10 @@ static inline void *ptr_ring_consume(struct ptr_ring *r)
+ 	return ptr;
+ }
+ 
++/*
++ * called by:
++ *   - include/linux/skb_array.h|108| <<skb_array_consume_irq>> return ptr_ring_consume_irq(&a->ring);
++ */
+ static inline void *ptr_ring_consume_irq(struct ptr_ring *r)
+ {
+ 	void *ptr;
+@@ -330,6 +515,10 @@ static inline void *ptr_ring_consume_irq(struct ptr_ring *r)
+ 	return ptr;
+ }
+ 
++/*
++ * called by:
++ *   - include/linux/skb_array.h|119| <<skb_array_consume_any>> return ptr_ring_consume_any(&a->ring);
++ */
+ static inline void *ptr_ring_consume_any(struct ptr_ring *r)
+ {
+ 	unsigned long flags;
+@@ -342,6 +531,10 @@ static inline void *ptr_ring_consume_any(struct ptr_ring *r)
+ 	return ptr;
+ }
+ 
++/*
++ * called by:
++ *   - include/linux/skb_array.h|131| <<skb_array_consume_bh>> return ptr_ring_consume_bh(&a->ring);
++ */
+ static inline void *ptr_ring_consume_bh(struct ptr_ring *r)
+ {
+ 	void *ptr;
+@@ -353,6 +546,12 @@ static inline void *ptr_ring_consume_bh(struct ptr_ring *r)
+ 	return ptr;
+ }
+ 
++/*
++ * called by:
++ *   - include/linux/skb_array.h|103| <<skb_array_consume_batched>> return ptr_ring_consume_batched(&a->ring, (void **)array, n);
++ *
++ * 返回的是从ptr_ring放入参数array的数目 (最大是最后一个参数)
++ */
+ static inline int ptr_ring_consume_batched(struct ptr_ring *r,
+ 					   void **array, int n)
+ {
+@@ -365,6 +564,12 @@ static inline int ptr_ring_consume_batched(struct ptr_ring *r,
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - include/linux/skb_array.h|114| <<skb_array_consume_batched_irq>> return ptr_ring_consume_batched_irq(&a->ring, (void **)array, n);
++ *
++ * 返回的是从ptr_ring放入参数array的数目 (最大是最后一个参数)
++ */
+ static inline int ptr_ring_consume_batched_irq(struct ptr_ring *r,
+ 					       void **array, int n)
+ {
+@@ -377,6 +582,12 @@ static inline int ptr_ring_consume_batched_irq(struct ptr_ring *r,
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - include/linux/skb_array.h|125| <<skb_array_consume_batched_any>> return ptr_ring_consume_batched_any(&a->ring, (void **)array, n);
++ *
++ * 返回的是从ptr_ring放入参数array的数目 (最大是最后一个参数)
++ */
+ static inline int ptr_ring_consume_batched_any(struct ptr_ring *r,
+ 					       void **array, int n)
+ {
+@@ -390,6 +601,12 @@ static inline int ptr_ring_consume_batched_any(struct ptr_ring *r,
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - include/linux/skb_array.h|137| <<skb_array_consume_batched_bh>> return ptr_ring_consume_batched_bh(&a->ring, (void **)array, n);
++ *
++ * 返回的是从ptr_ring放入参数array的数目 (最大是最后一个参数)
++ */
+ static inline int ptr_ring_consume_batched_bh(struct ptr_ring *r,
+ 					      void **array, int n)
+ {
+@@ -406,8 +623,21 @@ static inline int ptr_ring_consume_batched_bh(struct ptr_ring *r,
+  * Function must return a value.
+  * Callers must take consumer_lock.
+  */
++/*
++ * called by:
++ *   - include/linux/ptr_ring.h|419| <<PTR_RING_PEEK_CALL>> __PTR_RING_PEEK_CALL_v = __PTR_RING_PEEK_CALL(r, f); \
++ *   - include/linux/ptr_ring.h|428| <<PTR_RING_PEEK_CALL_IRQ>> __PTR_RING_PEEK_CALL_v = __PTR_RING_PEEK_CALL(r, f); \
++ *   - include/linux/ptr_ring.h|437| <<PTR_RING_PEEK_CALL_BH>> __PTR_RING_PEEK_CALL_v = __PTR_RING_PEEK_CALL(r, f); \
++ *   - include/linux/ptr_ring.h|447| <<PTR_RING_PEEK_CALL_ANY>> __PTR_RING_PEEK_CALL_v = __PTR_RING_PEEK_CALL(r, f); \
++ *
++ * 核心思想是返回ptr_ring->queue[ptr_ring->consumer_head]作为参数被f调用
++ */
+ #define __PTR_RING_PEEK_CALL(r, f) ((f)(__ptr_ring_peek(r)))
+ 
++/*
++ * called by:
++ *   - include/linux/skb_array.h|156| <<skb_array_peek_len>> return PTR_RING_PEEK_CALL(&a->ring, __skb_array_len_with_tag);
++ */
+ #define PTR_RING_PEEK_CALL(r, f) ({ \
+ 	typeof((f)(NULL)) __PTR_RING_PEEK_CALL_v; \
+ 	\
+@@ -417,6 +647,10 @@ static inline int ptr_ring_consume_batched_bh(struct ptr_ring *r,
+ 	__PTR_RING_PEEK_CALL_v; \
+ })
+ 
++/*
++ * called by:
++ *   - include/linux/skb_array.h|161| <<skb_array_peek_len_irq>> return PTR_RING_PEEK_CALL_IRQ(&a->ring, __skb_array_len_with_tag);
++ */
+ #define PTR_RING_PEEK_CALL_IRQ(r, f) ({ \
+ 	typeof((f)(NULL)) __PTR_RING_PEEK_CALL_v; \
+ 	\
+@@ -426,6 +660,10 @@ static inline int ptr_ring_consume_batched_bh(struct ptr_ring *r,
+ 	__PTR_RING_PEEK_CALL_v; \
+ })
+ 
++/*
++ * called by:
++ *   - include/linux/skb_array.h|166| <<skb_array_peek_len_bh>> return PTR_RING_PEEK_CALL_BH(&a->ring, __skb_array_len_with_tag);
++ */
+ #define PTR_RING_PEEK_CALL_BH(r, f) ({ \
+ 	typeof((f)(NULL)) __PTR_RING_PEEK_CALL_v; \
+ 	\
+@@ -435,6 +673,10 @@ static inline int ptr_ring_consume_batched_bh(struct ptr_ring *r,
+ 	__PTR_RING_PEEK_CALL_v; \
+ })
+ 
++/*
++ * called by:
++ *   - include/linux/skb_array.h|171| <<skb_array_peek_len_any>> return PTR_RING_PEEK_CALL_ANY(&a->ring, __skb_array_len_with_tag);
++ */
+ #define PTR_RING_PEEK_CALL_ANY(r, f) ({ \
+ 	typeof((f)(NULL)) __PTR_RING_PEEK_CALL_v; \
+ 	unsigned long __PTR_RING_PEEK_CALL_f;\
+@@ -448,6 +690,17 @@ static inline int ptr_ring_consume_batched_bh(struct ptr_ring *r,
+ /* Not all gfp_t flags (besides GFP_KERNEL) are allowed. See
+  * documentation for vmalloc for which of them are legal.
+  */
++/*
++ * called by:
++ *   - include/linux/ptr_ring.h|482| <<ptr_ring_init>> r->queue = __ptr_ring_init_queue_alloc(size, gfp);
++ *   - include/linux/ptr_ring.h|585| <<ptr_ring_resize>> void **queue = __ptr_ring_init_queue_alloc(size, gfp);
++ *   - include/linux/ptr_ring.h|624| <<ptr_ring_resize_multiple>> queues[i] = __ptr_ring_init_queue_alloc(size, gfp);
++ *
++ * 一个例子:
++ * skb_array_init()
++ *  -> ptr_ring_init()
++ *      -> __ptr_ring_init_queue_alloc()
++ */
+ static inline void **__ptr_ring_init_queue_alloc(unsigned int size, gfp_t gfp)
+ {
+ 	if (size > KMALLOC_MAX_SIZE / sizeof(void *))
+@@ -455,6 +708,11 @@ static inline void **__ptr_ring_init_queue_alloc(unsigned int size, gfp_t gfp)
+ 	return kvmalloc_array(size, sizeof(void *), gfp | __GFP_ZERO);
+ }
+ 
++/*
++ * called by:
++ *   - include/linux/ptr_ring.h|486| <<ptr_ring_init>> __ptr_ring_set_size(r, size);
++ *   - include/linux/ptr_ring.h|565| <<__ptr_ring_swap_queue>> __ptr_ring_set_size(r, size);
++ */
+ static inline void __ptr_ring_set_size(struct ptr_ring *r, int size)
+ {
+ 	r->size = size;
+@@ -468,6 +726,11 @@ static inline void __ptr_ring_set_size(struct ptr_ring *r, int size)
+ 		r->batch = 1;
+ }
+ 
++/*
++ * called by:
++ *   - include/linux/skb_array.h|176| <<skb_array_init>> return ptr_ring_init(&a->ring, size, gfp);
++ *   - tools/virtio/ringtest/ptr_ring.c|121| <<alloc_ring>> int ret = ptr_ring_init(&array, ring_size, 0);
++ */
+ static inline int ptr_ring_init(struct ptr_ring *r, int size, gfp_t gfp)
+ {
+ 	r->queue = __ptr_ring_init_queue_alloc(size, gfp);
+@@ -492,6 +755,12 @@ static inline int ptr_ring_init(struct ptr_ring *r, int size, gfp_t gfp)
+  * In particular if you consume ring in interrupt or BH context, you must
+  * disable interrupts/BH when doing so.
+  */
++/*
++ * called by:
++ *   - include/linux/skb_array.h|192| <<skb_array_unconsume>> ptr_ring_unconsume(&a->ring, (void **)skbs, n, __skb_array_destroy_skb);
++ *
++ * 把数据归还给ptr_ring->queue[]
++ */
+ static inline void ptr_ring_unconsume(struct ptr_ring *r, void **batch, int n,
+ 				      void (*destroy)(void *))
+ {
+@@ -537,6 +806,11 @@ static inline void ptr_ring_unconsume(struct ptr_ring *r, void **batch, int n,
+ 	spin_unlock_irqrestore(&r->consumer_lock, flags);
+ }
+ 
++/*
++ * called by:
++ *   - include/linux/ptr_ring.h|594| <<ptr_ring_resize>> old = __ptr_ring_swap_queue(r, queue, size, gfp, destroy);
++ *   - include/linux/ptr_ring.h|632| <<ptr_ring_resize_multiple>> queues[i] = __ptr_ring_swap_queue(rings[i], queues[i],
++ */
+ static inline void **__ptr_ring_swap_queue(struct ptr_ring *r, void **queue,
+ 					   int size, gfp_t gfp,
+ 					   void (*destroy)(void *))
+@@ -569,6 +843,10 @@ static inline void **__ptr_ring_swap_queue(struct ptr_ring *r, void **queue,
+  * In particular if you consume ring in interrupt or BH context, you must
+  * disable interrupts/BH when doing so.
+  */
++/*
++ * called by:
++ *   - include/linux/skb_array.h|197| <<skb_array_resize>> return ptr_ring_resize(&a->ring, size, gfp, __skb_array_destroy_skb);
++ */
+ static inline int ptr_ring_resize(struct ptr_ring *r, int size, gfp_t gfp,
+ 				  void (*destroy)(void *))
+ {
+@@ -598,6 +876,10 @@ static inline int ptr_ring_resize(struct ptr_ring *r, int size, gfp_t gfp,
+  * In particular if you consume ring in interrupt or BH context, you must
+  * disable interrupts/BH when doing so.
+  */
++/*
++ * called by:
++ *   - include/linux/skb_array.h|205| <<skb_array_resize_multiple>> return ptr_ring_resize_multiple((struct ptr_ring **)rings,
++ */
+ static inline int ptr_ring_resize_multiple(struct ptr_ring **rings,
+ 					   unsigned int nrings,
+ 					   int size,
+@@ -643,6 +925,10 @@ static inline int ptr_ring_resize_multiple(struct ptr_ring **rings,
+ 	return -ENOMEM;
+ }
+ 
++/*
++ * called by:
++ *   - include/linux/skb_array.h|212| <<skb_array_cleanup>> ptr_ring_cleanup(&a->ring, __skb_array_destroy_skb);
++ */
+ static inline void ptr_ring_cleanup(struct ptr_ring *r, void (*destroy)(void *))
+ {
+ 	void *ptr;
+diff --git a/include/linux/skb_array.h b/include/linux/skb_array.h
+index 8621ffdeecbf..bc52152b3513 100644
+--- a/include/linux/skb_array.h
++++ b/include/linux/skb_array.h
+@@ -33,31 +33,62 @@ struct skb_array {
+ /* Might be slightly faster than skb_array_full below, but callers invoking
+  * this in a loop must use a compiler barrier, for example cpu_relax().
+  */
++/*
++ * called by:
++ *   - drivers/net/tap.c|333| <<tap_handle_frame>> if (__skb_array_full(&q->skb_array))
++ *
++ * 返回skb_array->ring->queue[skb_array->ring->producer]
++ */
+ static inline bool __skb_array_full(struct skb_array *a)
+ {
++	/* 返回ptr_ring->queue[ptr_ring->producer] */
+ 	return __ptr_ring_full(&a->ring);
+ }
+ 
++/*
++ * 返回skb_array->ring->queue[skb_array->ring->producer]
++ *
++ * 没人调用
++ */
+ static inline bool skb_array_full(struct skb_array *a)
+ {
+ 	return ptr_ring_full(&a->ring);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/tap.c|351| <<tap_handle_frame>> if (skb_array_produce(&q->skb_array, skb))
++ *   - drivers/net/tap.c|361| <<tap_handle_frame>> if (skb_array_produce(&q->skb_array, segs)) {
++ *   - drivers/net/tap.c|378| <<tap_handle_frame>> if (skb_array_produce(&q->skb_array, skb))
++ *   - drivers/net/tun.c|916| <<tun_net_xmit>> if (skb_array_produce(&tfile->tx_array, skb))
++ *
++ * 核心思想是skb_array->ring->queue[skb_array->ring->producer++] = skb
++ */
+ static inline int skb_array_produce(struct skb_array *a, struct sk_buff *skb)
+ {
++	/* 核心思想是skb_array->ring->queue[skb_array->ring->producer++] = skb; */
+ 	return ptr_ring_produce(&a->ring, skb);
+ }
+ 
++/*
++ * 没人调用
++ */
+ static inline int skb_array_produce_irq(struct skb_array *a, struct sk_buff *skb)
+ {
+ 	return ptr_ring_produce_irq(&a->ring, skb);
+ }
+ 
++/*
++ * 没人调用
++ */
+ static inline int skb_array_produce_bh(struct skb_array *a, struct sk_buff *skb)
+ {
+ 	return ptr_ring_produce_bh(&a->ring, skb);
+ }
+ 
++/*
++ * 没人调用
++ */
+ static inline int skb_array_produce_any(struct skb_array *a, struct sk_buff *skb)
+ {
+ 	return ptr_ring_produce_any(&a->ring, skb);
+@@ -67,81 +98,147 @@ static inline int skb_array_produce_any(struct skb_array *a, struct sk_buff *skb
+  * array is never resized. Also, callers invoking this in a loop must take care
+  * to use a compiler barrier, for example cpu_relax().
+  */
++/*
++ * 没人调用
++ */
+ static inline bool __skb_array_empty(struct skb_array *a)
+ {
+ 	return !__ptr_ring_peek(&a->ring);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/tap.c|586| <<tap_poll>> if (!skb_array_empty(&q->skb_array))
++ *   - drivers/net/tun.c|1164| <<tun_chr_poll>> if (!skb_array_empty(&tfile->tx_array))
++ *
++ * 核心思想是判断skb_array->ring->queue[skb_array->ring->consumer_head]是否有值, 没有则为empty
++ */
+ static inline bool skb_array_empty(struct skb_array *a)
+ {
++	/* 核心思想是判断skb_array->ring->queue[skb_array->ring->consumer_head]是否有值, 没有则为empty */
+ 	return ptr_ring_empty(&a->ring);
+ }
+ 
++/*
++ * 没人调用
++ */
+ static inline bool skb_array_empty_bh(struct skb_array *a)
+ {
+ 	return ptr_ring_empty_bh(&a->ring);
+ }
+ 
++/*
++ * 没人调用
++ */
+ static inline bool skb_array_empty_irq(struct skb_array *a)
+ {
+ 	return ptr_ring_empty_irq(&a->ring);
+ }
+ 
++/*
++ * 没人调用
++ */
+ static inline bool skb_array_empty_any(struct skb_array *a)
+ {
+ 	return ptr_ring_empty_any(&a->ring);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/tap.c|850| <<tap_do_read>> skb = skb_array_consume(&q->skb_array);
++ *   - drivers/net/tun.c|530| <<tun_queue_purge>> while ((skb = skb_array_consume(&tfile->tx_array)) != NULL)
++ *   - drivers/net/tun.c|1704| <<tun_ring_recv>> skb = skb_array_consume(&tfile->tx_array);
++ *   - drivers/net/tun.c|1716| <<tun_ring_recv>> skb = skb_array_consume(&tfile->tx_array);
++ *
++ * 这里就consume一个, 返回的是被consume的地址
++ */
+ static inline struct sk_buff *skb_array_consume(struct skb_array *a)
+ {
+ 	return ptr_ring_consume(&a->ring);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vhost/net.c|269| <<vhost_net_buf_produce>> rxq->tail = skb_array_consume_batched(nvq->rx_array, rxq->queue,
++ *
++ * 返回值是从ptr_ring放入参数array的数目 (最大是最后一个参数)
++ */
+ static inline int skb_array_consume_batched(struct skb_array *a,
+ 					    struct sk_buff **array, int n)
+ {
++	/*
++	 * 返回的是从ptr_ring放入参数array的数目 (最大是最后一个参数)
++	 */
+ 	return ptr_ring_consume_batched(&a->ring, (void **)array, n);
+ }
+ 
++/*
++ * 没人调用
++ */
+ static inline struct sk_buff *skb_array_consume_irq(struct skb_array *a)
+ {
+ 	return ptr_ring_consume_irq(&a->ring);
+ }
+ 
++/*
++ * 没人调用
++ */
+ static inline int skb_array_consume_batched_irq(struct skb_array *a,
+ 						struct sk_buff **array, int n)
+ {
+ 	return ptr_ring_consume_batched_irq(&a->ring, (void **)array, n);
+ }
+ 
++/*
++ * 没人调用
++ */
+ static inline struct sk_buff *skb_array_consume_any(struct skb_array *a)
+ {
+ 	return ptr_ring_consume_any(&a->ring);
+ }
+ 
++/*
++ * 没人调用
++ */
+ static inline int skb_array_consume_batched_any(struct skb_array *a,
+ 						struct sk_buff **array, int n)
+ {
+ 	return ptr_ring_consume_batched_any(&a->ring, (void **)array, n);
+ }
+ 
+-
++/*
++ * 没人调用
++ */
+ static inline struct sk_buff *skb_array_consume_bh(struct skb_array *a)
+ {
+ 	return ptr_ring_consume_bh(&a->ring);
+ }
+ 
++/*
++ * 没人调用
++ */
+ static inline int skb_array_consume_batched_bh(struct skb_array *a,
+ 					       struct sk_buff **array, int n)
+ {
+ 	return ptr_ring_consume_batched_bh(&a->ring, (void **)array, n);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vhost/net.c|320| <<vhost_net_buf_peek>> return __skb_array_len_with_tag(vhost_net_buf_get_ptr(rxq));
++ *   - include/linux/skb_array.h|168| <<skb_array_peek_len>> return PTR_RING_PEEK_CALL(&a->ring, __skb_array_len_with_tag);
++ *   - include/linux/skb_array.h|173| <<skb_array_peek_len_irq>> return PTR_RING_PEEK_CALL_IRQ(&a->ring, __skb_array_len_with_tag);
++ *   - include/linux/skb_array.h|178| <<skb_array_peek_len_bh>> return PTR_RING_PEEK_CALL_BH(&a->ring, __skb_array_len_with_tag);
++ *   - include/linux/skb_array.h|183| <<skb_array_peek_len_any>> return PTR_RING_PEEK_CALL_ANY(&a->ring, __skb_array_len_with_tag);
++ */
+ static inline int __skb_array_len_with_tag(struct sk_buff *skb)
+ {
+ 	if (likely(skb)) {
+ 		int len = skb->len;
+ 
++		/*
++		 * 返回((__skb)->vlan_tci & VLAN_TAG_PRESENT)
++		 */
+ 		if (skb_vlan_tag_present(skb))
+ 			len += VLAN_HLEN;
+ 
+@@ -151,47 +248,96 @@ static inline int __skb_array_len_with_tag(struct sk_buff *skb)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/tap.c|1182| <<tap_peek_len>> return skb_array_peek_len(&q->skb_array);
++ *   - drivers/net/tun.c|1912| <<tun_peek_len>> ret = skb_array_peek_len(&tfile->tx_array);
++ *
++ * 核心思想是返回skb_array->ring->queue[skb_array->ring->consumer_head]作为参数被__skb_array_len_with_tag()调用
++ */
+ static inline int skb_array_peek_len(struct skb_array *a)
+ {
++	/*
++	 * 核心思想是返回skb_array->ring->queue[skb_array->ring->consumer_head]作为参数被__skb_array_len_with_tag()调用
++	 */
+ 	return PTR_RING_PEEK_CALL(&a->ring, __skb_array_len_with_tag);
+ }
+ 
++/*
++ * 没人调用
++ */
+ static inline int skb_array_peek_len_irq(struct skb_array *a)
+ {
+ 	return PTR_RING_PEEK_CALL_IRQ(&a->ring, __skb_array_len_with_tag);
+ }
+ 
++/*
++ * 没人调用
++ */
+ static inline int skb_array_peek_len_bh(struct skb_array *a)
+ {
+ 	return PTR_RING_PEEK_CALL_BH(&a->ring, __skb_array_len_with_tag);
+ }
+ 
++/*
++ * 没人调用
++ */
+ static inline int skb_array_peek_len_any(struct skb_array *a)
+ {
+ 	return PTR_RING_PEEK_CALL_ANY(&a->ring, __skb_array_len_with_tag);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/tap.c|520| <<tap_open>> if (skb_array_init(&q->skb_array, tap->dev->tx_queue_len, GFP_KERNEL)) {
++ *   - drivers/net/tun.c|2617| <<tun_chr_open>> if (skb_array_init(&tfile->tx_array, 0, GFP_KERNEL)) {
++ */
+ static inline int skb_array_init(struct skb_array *a, int size, gfp_t gfp)
+ {
+ 	return ptr_ring_init(&a->ring, size, gfp);
+ }
+ 
++/*
++ * 在以下使用__skb_array_destroy_skb():
++ *   - include/linux/skb_array.h|192| <<skb_array_unconsume>> ptr_ring_unconsume(&a->ring, (void **)skbs, n, __skb_array_destroy_skb);
++ *   - include/linux/skb_array.h|197| <<skb_array_resize>> return ptr_ring_resize(&a->ring, size, gfp, __skb_array_destroy_skb);
++ *   - include/linux/skb_array.h|207| <<skb_array_resize_multiple>> __skb_array_destroy_skb);
++ *   - include/linux/skb_array.h|212| <<skb_array_cleanup>> ptr_ring_cleanup(&a->ring, __skb_array_destroy_skb);
++ */
+ static void __skb_array_destroy_skb(void *ptr)
+ {
+ 	kfree_skb(ptr);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vhost/net.c|293| <<vhost_net_buf_unproduce>> skb_array_unconsume(nvq->rx_array, rxq->queue + rxq->head,
++ *
++ * 把数据归还给skb_array->ring->queue[]
++ */
+ static inline void skb_array_unconsume(struct skb_array *a,
+ 				       struct sk_buff **skbs, int n)
+ {
++	/*
++	 * 把数据归还给ptr_ring->queue[]
++	 */
+ 	ptr_ring_unconsume(&a->ring, (void **)skbs, n, __skb_array_destroy_skb);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/tun.c|668| <<tun_attach>> skb_array_resize(&tfile->tx_array, dev->tx_queue_len, GFP_KERNEL)) {
++ */
+ static inline int skb_array_resize(struct skb_array *a, int size, gfp_t gfp)
+ {
+ 	return ptr_ring_resize(&a->ring, size, gfp, __skb_array_destroy_skb);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/tap.c|1236| <<tap_queue_resize>> ret = skb_array_resize_multiple(arrays, n,
++ *   - drivers/net/tun.c|2803| <<tun_queue_resize>> ret = skb_array_resize_multiple(arrays, n,
++ */
+ static inline int skb_array_resize_multiple(struct skb_array **rings,
+ 					    int nrings, unsigned int size,
+ 					    gfp_t gfp)
+@@ -202,6 +348,11 @@ static inline int skb_array_resize_multiple(struct skb_array **rings,
+ 					__skb_array_destroy_skb);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/tap.c|500| <<tap_sock_destruct>> skb_array_cleanup(&q->skb_array);
++ *   - drivers/net/tun.c|578| <<__tun_detach>> skb_array_cleanup(&tfile->tx_array);
++ */
+ static inline void skb_array_cleanup(struct skb_array *a)
+ {
+ 	ptr_ring_cleanup(&a->ring, __skb_array_destroy_skb);
+diff --git a/include/uapi/linux/virtio_ring.h b/include/uapi/linux/virtio_ring.h
+index 6d5d5faa989b..989296b50850 100644
+--- a/include/uapi/linux/virtio_ring.h
++++ b/include/uapi/linux/virtio_ring.h
+@@ -47,6 +47,16 @@
+ /* The Host uses this in used->flags to advise the Guest: don't kick me when
+  * you add a buffer.  It's unreliable, so it's simply an optimization.  Guest
+  * will still kick if it's out of buffers. */
++/*
++ * 在以下使用VRING_USED_F_NO_NOTIFY:
++ *   - drivers/vhost/vhost.c|2142| <<vhost_get_vq_desc>> BUG_ON(!(vq->used_flags & VRING_USED_F_NO_NOTIFY));
++ *   - drivers/vhost/vhost.c|2337| <<vhost_enable_notify>> if (!(vq->used_flags & VRING_USED_F_NO_NOTIFY))
++ *   - drivers/vhost/vhost.c|2339| <<vhost_enable_notify>> vq->used_flags &= ~VRING_USED_F_NO_NOTIFY;
++ *   - drivers/vhost/vhost.c|2374| <<vhost_disable_notify>> if (vq->used_flags & VRING_USED_F_NO_NOTIFY)
++ *   - drivers/vhost/vhost.c|2376| <<vhost_disable_notify>> vq->used_flags |= VRING_USED_F_NO_NOTIFY;
++ *   - drivers/vhost/vringh.c|544| <<__vringh_notify_disable>> VRING_USED_F_NO_NOTIFY)) {
++ *   - drivers/virtio/virtio_ring.c|578| <<virtqueue_kick_prepare>> needs_kick = !(vq->vring.used->flags & cpu_to_virtio16(_vq->vdev, VRING_USED_F_NO_NOTIFY));
++ */
+ #define VRING_USED_F_NO_NOTIFY	1
+ /* The Guest uses this in avail->flags to advise the Host: don't interrupt me
+  * when you consume a buffer.  It's unreliable, so it's simply an
+diff --git a/kernel/irq/chip.c b/kernel/irq/chip.c
+index 043bfc35b353..180b7373960d 100644
+--- a/kernel/irq/chip.c
++++ b/kernel/irq/chip.c
+@@ -497,6 +497,19 @@ static bool irq_check_poll(struct irq_desc *desc)
+ 
+ static bool irq_may_run(struct irq_desc *desc)
+ {
++	/*
++	 * 在以下使用IRQD_IRQ_INPROGRESS:
++	 *   - kernel/irq/debugfs.c|103| <<global>> BIT_MASK_DESCR(IRQD_IRQ_INPROGRESS),
++	 *   - include/linux/irq.h|327| <<irqd_irq_inprogress>> return __irqd_to_state(d) & IRQD_IRQ_INPROGRESS;
++	 *   - kernel/irq/chip.c|473| <<handle_nested_irq>> irqd_set(&desc->irq_data, IRQD_IRQ_INPROGRESS);
++	 *   - kernel/irq/chip.c|484| <<handle_nested_irq>> irqd_clear(&desc->irq_data, IRQD_IRQ_INPROGRESS);
++	 *   - kernel/irq/chip.c|500| <<irq_may_run>> unsigned int mask = IRQD_IRQ_INPROGRESS | IRQD_WAKEUP_ARMED;
++	 *   - kernel/irq/chip.c|586| <<handle_untracked_irq>> irqd_set(&desc->irq_data, IRQD_IRQ_INPROGRESS);
++	 *   - kernel/irq/chip.c|592| <<handle_untracked_irq>> irqd_clear(&desc->irq_data, IRQD_IRQ_INPROGRESS);
++	 *   - kernel/irq/handle.c|201| <<handle_irq_event>> irqd_set(&desc->irq_data, IRQD_IRQ_INPROGRESS);
++	 *   - kernel/irq/handle.c|207| <<handle_irq_event>> irqd_clear(&desc->irq_data, IRQD_IRQ_INPROGRESS);
++	 *   - kernel/irq/manage.c|1380| <<__setup_irq>> irqd_clear(&desc->irq_data, IRQD_IRQ_INPROGRESS);
++	 */
+ 	unsigned int mask = IRQD_IRQ_INPROGRESS | IRQD_WAKEUP_ARMED;
+ 
+ 	/*
+diff --git a/kernel/irq/spurious.c b/kernel/irq/spurious.c
+index 987d7bca4864..92d012459037 100644
+--- a/kernel/irq/spurious.c
++++ b/kernel/irq/spurious.c
+@@ -94,6 +94,9 @@ static int try_one_irq(struct irq_desc *desc, bool force)
+ 		goto out;
+ 
+ 	/* Already running on another processor */
++	/*
++	 * 查看__irqd_to_state(d) & IRQD_IRQ_INPROGRESS;
++	 */
+ 	if (irqd_irq_inprogress(&desc->irq_data)) {
+ 		/*
+ 		 * Already running: If it is shared get the other
+diff --git a/virt/kvm/eventfd.c b/virt/kvm/eventfd.c
+index e4d90224507a..3fa04c176e34 100644
+--- a/virt/kvm/eventfd.c
++++ b/virt/kvm/eventfd.c
+@@ -114,6 +114,15 @@ irqfd_resampler_shutdown(struct kvm_kernel_irqfd *irqfd)
+ /*
+  * Race-free decouple logic (ordering is critical)
+  */
++/*
++ * [0] irqfd_shutdown
++ * [0] worker_thread
++ * [0] kthread
++ * [0] ret_from_fork
++ *
++ * called by:
++ *   - virt/kvm/eventfd.c|308| <<kvm_irqfd_assign>> INIT_WORK(&irqfd->shutdown, irqfd_shutdown);
++ */
+ static void
+ irqfd_shutdown(struct work_struct *work)
+ {
+@@ -165,6 +174,20 @@ irqfd_is_active(struct kvm_kernel_irqfd *irqfd)
+  *
+  * assumes kvm->irqfds.lock is held
+  */
++/*
++ * [0] irqfd_deactivate
++ * [0] kvm_irqfd
++ * [0] kvm_vm_ioctl
++ * [0] do_vfs_ioctl
++ * [0] sys_ioctl
++ * [0] do_syscall_64
++ * [0] entry_SYSCALL_64_after_hwframe
++ *
++ * called by:
++ *   - virt/kvm/eventfd.c|253| <<irqfd_wakeup>> irqfd_deactivate(irqfd);
++ *   - virt/kvm/eventfd.c|577| <<kvm_irqfd_deassign>> irqfd_deactivate(irqfd);
++ *   - virt/kvm/eventfd.c|622| <<kvm_irqfd_release>> irqfd_deactivate(irqfd);
++ */
+ static void
+ irqfd_deactivate(struct kvm_kernel_irqfd *irqfd)
+ {
+@@ -172,6 +195,9 @@ irqfd_deactivate(struct kvm_kernel_irqfd *irqfd)
+ 
+ 	list_del_init(&irqfd->list);
+ 
++	/*
++	 * irqfd_shutdown()
++	 */
+ 	queue_work(irqfd_cleanup_wq, &irqfd->shutdown);
+ }
+ 
+@@ -187,6 +213,10 @@ int __attribute__((weak)) kvm_arch_set_irq_inatomic(
+ /*
+  * Called with wqh->lock held and interrupts disabled
+  */
++/*
++ * 在以下使用irqfd_wakeup():
++ *   - virt/kvm/eventfd.c|381| <<kvm_irqfd_assign>> init_waitqueue_func_entry(&irqfd->wait, irqfd_wakeup);
++ */
+ static int
+ irqfd_wakeup(wait_queue_entry_t *wait, unsigned mode, int sync, void *key)
+ {
+@@ -284,6 +314,10 @@ int  __attribute__((weak)) kvm_arch_update_irqfd_routing(
+ }
+ #endif
+ 
++/*
++ * called by:
++ *   - virt/kvm/eventfd.c|607| <<kvm_irqfd>> return kvm_irqfd_assign(kvm, args);
++ */
+ static int
+ kvm_irqfd_assign(struct kvm *kvm, struct kvm_irqfd *args)
+ {
+@@ -525,12 +559,25 @@ kvm_eventfd_init(struct kvm *kvm)
+ /*
+  * shutdown any irqfd's that match fd+gsi
+  */
++/*
++ * called by:
++ *   - virt/kvm/eventfd.c|579| <<kvm_irqfd>> return kvm_irqfd_deassign(kvm, args);
++ */
+ static int
+ kvm_irqfd_deassign(struct kvm *kvm, struct kvm_irqfd *args)
+ {
+ 	struct kvm_kernel_irqfd *irqfd, *tmp;
+ 	struct eventfd_ctx *eventfd;
+ 
++	/*
++	 * struct kvm_irqfd {
++	 *     __u32 fd;
++	 *     __u32 gsi;
++	 *     __u32 flags;
++	 *     __u32 resamplefd;
++	 *     __u8  pad[16];
++	 * };
++	 */
+ 	eventfd = eventfd_ctx_fdget(args->fd);
+ 	if (IS_ERR(eventfd))
+ 		return PTR_ERR(eventfd);
+@@ -565,9 +612,22 @@ kvm_irqfd_deassign(struct kvm *kvm, struct kvm_irqfd *args)
+ 	return 0;
+ }
+ 
++/*
++ * 处理KVM_IRQFD:
++ *   - virt/kvm/kvm_main.c|3212| <<kvm_vm_ioctl(KVM_IRQFD)>> r = kvm_irqfd(kvm, &data);
++ */
+ int
+ kvm_irqfd(struct kvm *kvm, struct kvm_irqfd *args)
+ {
++	/*
++	 * struct kvm_irqfd {
++	 *     __u32 fd;
++	 *     __u32 gsi;
++	 *     __u32 flags;
++	 *     __u32 resamplefd;
++	 *      __u8  pad[16];
++	 * };
++	 */
+ 	if (args->flags & ~(KVM_IRQFD_FLAG_DEASSIGN | KVM_IRQFD_FLAG_RESAMPLE))
+ 		return -EINVAL;
+ 
+@@ -581,6 +641,10 @@ kvm_irqfd(struct kvm *kvm, struct kvm_irqfd *args)
+  * This function is called as the kvm VM fd is being released. Shutdown all
+  * irqfds that still remain open
+  */
++/*
++ * called by:
++ *   - virt/kvm/kvm_main.c|811| <<kvm_vm_release>> kvm_irqfd_release(kvm);
++ */
+ void
+ kvm_irqfd_release(struct kvm *kvm)
+ {
+-- 
+2.17.1
+

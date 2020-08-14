@@ -1,25 +1,57 @@
-From be2a1441b0219ffe283a10087fe4fdf14a4e834c Mon Sep 17 00:00:00 2001
+From 96e4014acdf532853d1218599400af6e81c316f5 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Thu, 23 Jul 2020 14:35:41 -0700
+Date: Fri, 14 Aug 2020 13:58:42 -0700
 Subject: [PATCH 1/1] linux-2.6.32-754.30.2
 
 linux-2.6.32-754.30.2
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
- drivers/net/virtio_net.c     | 185 ++++++++++++++++++
+ drivers/net/virtio_net.c     | 265 ++++++++++++++++++++++
  drivers/virtio/virtio.c      |   3 +
- drivers/virtio/virtio_ring.c | 350 +++++++++++++++++++++++++++++++++++
- include/linux/virtio.h       |  11 ++
+ drivers/virtio/virtio_ring.c | 428 +++++++++++++++++++++++++++++++++++
+ include/linux/irq.h          |  57 +++++
+ include/linux/netdevice.h    |  19 ++
+ include/linux/virtio.h       |  11 +
  include/linux/virtio_pci.h   |   6 +
- include/linux/virtio_ring.h  | 105 +++++++++++
- 6 files changed, 660 insertions(+)
+ include/linux/virtio_ring.h  | 105 +++++++++
+ kernel/irq/chip.c            |  15 ++
+ kernel/irq/spurious.c        |   9 +
+ net/core/dev.c               |  14 ++
+ 11 files changed, 932 insertions(+)
 
 diff --git a/drivers/net/virtio_net.c b/drivers/net/virtio_net.c
-index a887b152..2c49fb43 100644
+index a887b152..b02c006a 100644
 --- a/drivers/net/virtio_net.c
 +++ b/drivers/net/virtio_net.c
-@@ -105,12 +105,37 @@ struct virtnet_info
+@@ -74,6 +74,26 @@ struct receive_queue {
+ 	struct napi_struct napi;
+ 
+ 	/* Number of input buffers, and max we've ever had. */
++	/*
++	 * 使用receive_queue->max的地方:
++	 *   - drivers/net/virtio_net.c|625| <<try_fill_recv>> if (unlikely(rq->num > rq->max))
++	 *   - drivers/net/virtio_net.c|626| <<try_fill_recv>> rq->max = rq->num;
++	 *   - drivers/net/virtio_net.c|697| <<virtnet_poll>> if (rq->num < rq->max / 2) {
++	 *
++	 *
++	 * 在以下修改receive_queue->num:
++	 *   - drivers/net/virtio_net.c|442| <<receive_mergeable>> --rq->num;
++	 *   - drivers/net/virtio_net.c|457| <<receive_mergeable>> --rq->num;
++	 *   - drivers/net/virtio_net.c|691| <<try_fill_recv>> ++rq->num;
++	 *   - drivers/net/virtio_net.c|787| <<virtnet_poll>> --rq->num;
++	 *   - drivers/net/virtio_net.c|1570| <<free_unused_bufs>> --vi->rq[i].num;
++	 * 在以下使用receive_queue->num:
++	 *   - drivers/net/virtio_net.c|699| <<try_fill_recv>> if (unlikely(rq->num > rq->max))
++	 *   - drivers/net/virtio_net.c|700| <<try_fill_recv>> rq->max = rq->num;
++	 *   - drivers/net/virtio_net.c|797| <<virtnet_poll>> if (rq->num < rq->max / 2) {
++	 *   - drivers/net/virtio_net.c|1572| <<free_unused_bufs>> BUG_ON(vi->rq[i].num != 0);
++	 *   - drivers/net/virtio_net.c|1864| <<virtnet_probe>> if (vi->rq[i].num == 0) {
++	 */
+ 	unsigned int num, max;
+ 
+ 	/* Chain pages by the private ptr. */
+@@ -105,12 +125,37 @@ struct virtnet_info
  	u16 max_queue_pairs;
  
  	/* # of queue pairs currently used by the driver */
@@ -57,7 +89,27 @@ index a887b152..2c49fb43 100644
  	bool mergeable_rx_bufs;
  
  	/* Has control virtqueue */
-@@ -182,8 +207,14 @@ static int rxq2vq(int rxq)
+@@ -123,6 +168,19 @@ struct virtnet_info
+ 	struct virtnet_stats __percpu *stats;
+ 
+ 	/* Work struct for refilling if we run low on memory. */
++	/*
++	 * drivers/net/virtio_net.c|742| <<refill_work>> container_of(work, struct virtnet_info, refill.work);
++ 60 drivers/net/virtio_net.c|757| <<refill_work>> schedule_delayed_work(&vi->refill, HZ/2);
++ 61 drivers/net/virtio_net.c|799| <<virtnet_poll>> queue_delayed_work(vi->st_wq, &vi->refill, 0);
++ 62 drivers/net/virtio_net.c|826| <<virtnet_open>> schedule_delayed_work(&vi->refill, 0);
++ 63 drivers/net/virtio_net.c|1162| <<virtnet_set_queues>> schedule_delayed_work(&vi->refill, 0);
++ 64 drivers/net/virtio_net.c|1174| <<virtnet_close>> cancel_delayed_work_sync(&vi->refill);
++ 65 drivers/net/virtio_net.c|1672| <<virtnet_alloc_queues>> INIT_DELAYED_WORK(&vi->refill, refill_work);
++ 66 drivers/net/virtio_net.c|1805| <<virtnet_probe>> INIT_DELAYED_WORK(&vi->refill, refill_work);
++ 67 drivers/net/virtio_net.c|1897| <<virtnet_probe>> cancel_delayed_work_sync(&vi->refill);
++ 68 drivers/net/virtio_net.c|1963| <<virtnet_freeze>> cancel_delayed_work_sync(&vi->refill);
++	 *   - drivers/net/virtio_net.c|1995| <<virtnet_restore>> queue_delayed_work(vi->st_wq, &vi->refill, 0);
++	 */
+ 	struct delayed_work refill;
+ 
+ 	/* Work struct for config space updates */
+@@ -182,8 +240,14 @@ static int rxq2vq(int rxq)
  	return rxq * 2;
  }
  
@@ -72,7 +124,7 @@ index a887b152..2c49fb43 100644
  	return (struct skb_vnet_hdr *)skb->cb;
  }
  
-@@ -191,6 +222,19 @@ static inline struct skb_vnet_hdr *skb_vnet_hdr(struct sk_buff *skb)
+@@ -191,6 +255,19 @@ static inline struct skb_vnet_hdr *skb_vnet_hdr(struct sk_buff *skb)
   * private is used to chain pages for big packets, put the whole
   * most recent used list in the beginning for reuse
   */
@@ -92,7 +144,7 @@ index a887b152..2c49fb43 100644
  static void give_pages(struct receive_queue *rq, struct page *page)
  {
  	struct page *end;
-@@ -201,8 +245,19 @@ static void give_pages(struct receive_queue *rq, struct page *page)
+@@ -201,8 +278,19 @@ static void give_pages(struct receive_queue *rq, struct page *page)
  	rq->pages = page;
  }
  
@@ -112,7 +164,7 @@ index a887b152..2c49fb43 100644
  	struct page *p = rq->pages;
  
  	if (p) {
-@@ -214,6 +269,10 @@ static struct page *get_a_page(struct receive_queue *rq, gfp_t gfp_mask)
+@@ -214,6 +302,10 @@ static struct page *get_a_page(struct receive_queue *rq, gfp_t gfp_mask)
  	return p;
  }
  
@@ -123,7 +175,7 @@ index a887b152..2c49fb43 100644
  static void skb_xmit_done(struct virtqueue *vq)
  {
  	struct virtnet_info *vi = vq->vdev->priv;
-@@ -225,6 +284,11 @@ static void skb_xmit_done(struct virtqueue *vq)
+@@ -225,6 +317,11 @@ static void skb_xmit_done(struct virtqueue *vq)
  	netif_wake_subqueue(vi->dev, vq2txq(vq));
  }
  
@@ -135,7 +187,7 @@ index a887b152..2c49fb43 100644
  static void set_skb_frag(struct sk_buff *skb, struct page *page,
  			 unsigned int offset, unsigned int *len)
  {
-@@ -244,6 +308,14 @@ static void set_skb_frag(struct sk_buff *skb, struct page *page,
+@@ -244,6 +341,14 @@ static void set_skb_frag(struct sk_buff *skb, struct page *page,
  }
  
  /* Called from bottom half context */
@@ -150,7 +202,7 @@ index a887b152..2c49fb43 100644
  static struct sk_buff *page_to_skb(struct receive_queue *rq,
  				   struct page *page, unsigned int len)
  {
-@@ -262,6 +334,9 @@ static struct sk_buff *page_to_skb(struct receive_queue *rq,
+@@ -262,6 +367,9 @@ static struct sk_buff *page_to_skb(struct receive_queue *rq,
  
  	skb_reserve(skb, NET_IP_ALIGN);
  
@@ -160,7 +212,7 @@ index a887b152..2c49fb43 100644
  	hdr = skb_vnet_hdr(skb);
  
  	if (vi->mergeable_rx_bufs) {
-@@ -326,6 +401,10 @@ err:
+@@ -326,6 +434,10 @@ err:
  	return NULL;
  }
  
@@ -171,7 +223,7 @@ index a887b152..2c49fb43 100644
  static struct sk_buff *receive_mergeable(struct net_device *dev,
  					 struct receive_queue *rq,
  					 void *buf,
-@@ -383,6 +462,10 @@ err_buf:
+@@ -383,6 +495,10 @@ err_buf:
  	return NULL;
  }
  
@@ -182,7 +234,7 @@ index a887b152..2c49fb43 100644
  static void receive_buf(struct receive_queue *rq, void *buf, unsigned int len)
  {
  	struct virtnet_info *vi = rq->vq->vdev->priv;
-@@ -547,6 +630,10 @@ static int add_recvbuf_big(struct receive_queue *rq, gfp_t gfp)
+@@ -547,6 +663,10 @@ static int add_recvbuf_big(struct receive_queue *rq, gfp_t gfp)
  	return err;
  }
  
@@ -193,7 +245,7 @@ index a887b152..2c49fb43 100644
  static int add_recvbuf_mergeable(struct receive_queue *rq, gfp_t gfp)
  {
  	struct page *page;
-@@ -556,6 +643,10 @@ static int add_recvbuf_mergeable(struct receive_queue *rq, gfp_t gfp)
+@@ -556,6 +676,10 @@ static int add_recvbuf_mergeable(struct receive_queue *rq, gfp_t gfp)
  	if (!page)
  		return -ENOMEM;
  
@@ -204,7 +256,7 @@ index a887b152..2c49fb43 100644
  	sg_init_one(rq->sg, page_address(page), PAGE_SIZE);
  
  	err = virtqueue_add_buf(rq->vq, rq->sg, 0, 1, page);
-@@ -572,6 +663,14 @@ static int add_recvbuf_mergeable(struct receive_queue *rq, gfp_t gfp)
+@@ -572,6 +696,14 @@ static int add_recvbuf_mergeable(struct receive_queue *rq, gfp_t gfp)
   * before we're receiving packets, or from refill_work which is
   * careful to disable receiving (using napi_disable).
   */
@@ -219,8 +271,24 @@ index a887b152..2c49fb43 100644
  static bool try_fill_recv(struct receive_queue *rq, gfp_t gfp)
  {
  	struct virtnet_info *vi = rq->vq->vdev->priv;
-@@ -591,6 +690,12 @@ static bool try_fill_recv(struct receive_queue *rq, gfp_t gfp)
+@@ -589,8 +721,28 @@ static bool try_fill_recv(struct receive_queue *rq, gfp_t gfp)
+ 		oom = err == -ENOMEM;
+ 		if (err < 0)
  			break;
++		/*
++		 * 在以下修改receive_queue->num:
++		 *   - drivers/net/virtio_net.c|442| <<receive_mergeable>> --rq->num;
++		 *   - drivers/net/virtio_net.c|457| <<receive_mergeable>> --rq->num;
++		 *   - drivers/net/virtio_net.c|691| <<try_fill_recv>> ++rq->num;
++		 *   - drivers/net/virtio_net.c|787| <<virtnet_poll>> --rq->num;
++		 *   - drivers/net/virtio_net.c|1570| <<free_unused_bufs>> --vi->rq[i].num;
++		 * 在以下使用receive_queue->num:
++		 *   - drivers/net/virtio_net.c|699| <<try_fill_recv>> if (unlikely(rq->num > rq->max))
++		 *   - drivers/net/virtio_net.c|700| <<try_fill_recv>> rq->max = rq->num;
++		 *   - drivers/net/virtio_net.c|797| <<virtnet_poll>> if (rq->num < rq->max / 2) {
++		 *   - drivers/net/virtio_net.c|1572| <<free_unused_bufs>> BUG_ON(vi->rq[i].num != 0);
++		 *   - drivers/net/virtio_net.c|1864| <<virtnet_probe>> if (vi->rq[i].num == 0) {
++		 */
  		++rq->num;
  	} while (err > 0);
 +	/*
@@ -232,7 +300,7 @@ index a887b152..2c49fb43 100644
  	if (unlikely(rq->num > rq->max))
  		rq->max = rq->num;
  	virtqueue_kick(rq->vq);
-@@ -609,6 +714,12 @@ static void skb_recv_done(struct virtqueue *rvq)
+@@ -609,6 +761,12 @@ static void skb_recv_done(struct virtqueue *rvq)
  	}
  }
  
@@ -245,7 +313,19 @@ index a887b152..2c49fb43 100644
  static void virtnet_napi_enable(struct receive_queue *rq)
  {
  	napi_enable(&rq->napi);
-@@ -647,6 +758,10 @@ static void refill_work(struct work_struct *work)
+@@ -625,6 +783,11 @@ static void virtnet_napi_enable(struct receive_queue *rq)
+ 	}
+ }
+ 
++/*
++ * 在以下使用refill_work():
++ *   - drivers/net/virtio_net.c|1672| <<virtnet_alloc_queues>> INIT_DELAYED_WORK(&vi->refill, refill_work);
++ *   - drivers/net/virtio_net.c|1805| <<virtnet_probe>> INIT_DELAYED_WORK(&vi->refill, refill_work);
++ */
+ static void refill_work(struct work_struct *work)
+ {
+ 	struct virtnet_info *vi =
+@@ -647,6 +810,10 @@ static void refill_work(struct work_struct *work)
  	}
  }
  
@@ -256,7 +336,37 @@ index a887b152..2c49fb43 100644
  static int virtnet_poll(struct napi_struct *napi, int budget)
  {
  	struct receive_queue *rq =
-@@ -663,6 +778,12 @@ again:
+@@ -656,13 +823,42 @@ static int virtnet_poll(struct napi_struct *napi, int budget)
+ 	unsigned int r, len, received = 0;
+ 
+ again:
++	/*
++	 * 这里有两种情况 ...
++	 * 1. received < budget
++	 * 2. received >= budget
++	 */
+ 	while (received < budget &&
+ 	       (buf = virtqueue_get_buf(rq->vq, &len)) != NULL) {
+ 		receive_buf(rq, buf, len);
++		/*
++		 * 在以下修改receive_queue->num:
++		 *   - drivers/net/virtio_net.c|442| <<receive_mergeable>> --rq->num;
++		 *   - drivers/net/virtio_net.c|457| <<receive_mergeable>> --rq->num;
++		 *   - drivers/net/virtio_net.c|691| <<try_fill_recv>> ++rq->num;
++		 *   - drivers/net/virtio_net.c|787| <<virtnet_poll>> --rq->num;
++		 *   - drivers/net/virtio_net.c|1570| <<free_unused_bufs>> --vi->rq[i].num;
++		 * 在以下使用receive_queue->num:
++		 *   - drivers/net/virtio_net.c|699| <<try_fill_recv>> if (unlikely(rq->num > rq->max))
++		 *   - drivers/net/virtio_net.c|700| <<try_fill_recv>> rq->max = rq->num;
++		 *   - drivers/net/virtio_net.c|797| <<virtnet_poll>> if (rq->num < rq->max / 2) {
++		 *   - drivers/net/virtio_net.c|1572| <<free_unused_bufs>> BUG_ON(vi->rq[i].num != 0);
++		 *   - drivers/net/virtio_net.c|1864| <<virtnet_probe>> if (vi->rq[i].num == 0) {
++		 *
++		 * 比如:
++		 *   num = 213,
++		 *   max = 256, 
++		 */
+ 		--rq->num;
  		received++;
  	}
  
@@ -269,7 +379,7 @@ index a887b152..2c49fb43 100644
  	if (rq->num < rq->max / 2) {
  		if (!try_fill_recv(rq, GFP_ATOMIC))
  			queue_delayed_work(vi->st_wq, &vi->refill, 0);
-@@ -699,6 +820,11 @@ static int virtnet_open(struct net_device *dev)
+@@ -699,6 +895,11 @@ static int virtnet_open(struct net_device *dev)
  	return 0;
  }
  
@@ -281,7 +391,7 @@ index a887b152..2c49fb43 100644
  static unsigned int free_old_xmit_skbs(struct send_queue *sq)
  {
  	struct sk_buff *skb;
-@@ -722,8 +848,17 @@ static unsigned int free_old_xmit_skbs(struct send_queue *sq)
+@@ -722,8 +923,17 @@ static unsigned int free_old_xmit_skbs(struct send_queue *sq)
  
  static int xmit_skb(struct send_queue *sq, struct sk_buff *skb)
  {
@@ -299,7 +409,7 @@ index a887b152..2c49fb43 100644
  	struct virtnet_info *vi = sq->vq->vdev->priv;
  
  	pr_debug("%s: xmit %p %pM\n", vi->dev->name, skb, dest);
-@@ -758,12 +893,32 @@ static int xmit_skb(struct send_queue *sq, struct sk_buff *skb)
+@@ -758,12 +968,32 @@ static int xmit_skb(struct send_queue *sq, struct sk_buff *skb)
  	hdr->mhdr.num_buffers = 0;
  
  	/* Encode metadata header at front. */
@@ -332,7 +442,7 @@ index a887b152..2c49fb43 100644
  	return virtqueue_add_buf(sq->vq, sq->sg, hdr->num_sg,
  				 0, skb);
  }
-@@ -838,6 +993,17 @@ static void virtnet_netpoll(struct net_device *dev)
+@@ -838,6 +1068,17 @@ static void virtnet_netpoll(struct net_device *dev)
   * supported by the hypervisor, as indicated by feature bits, should
   * never fail unless improperly formated.
   */
@@ -350,7 +460,7 @@ index a887b152..2c49fb43 100644
  static bool virtnet_send_command(struct virtnet_info *vi, u8 class, u8 cmd,
  				 struct scatterlist *data, int out, int in)
  {
-@@ -957,6 +1123,11 @@ static void virtnet_ack_link_announce(struct virtnet_info *vi)
+@@ -957,6 +1198,11 @@ static void virtnet_ack_link_announce(struct virtnet_info *vi)
  	rtnl_unlock();
  }
  
@@ -362,7 +472,19 @@ index a887b152..2c49fb43 100644
  static int virtnet_set_queues(struct virtnet_info *vi, u16 queue_pairs)
  {
  	struct scatterlist sg;
-@@ -1632,6 +1803,20 @@ static int virtnet_probe(struct virtio_device *vdev)
+@@ -1362,6 +1608,11 @@ static void free_receive_bufs(struct virtnet_info *vi)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/virtio_net.c|1860| <<virtnet_probe>> free_unused_bufs(vi);
++ *   - drivers/net/virtio_net.c|1910| <<remove_vq_common>> free_unused_bufs(vi);
++ */
+ static void free_unused_bufs(struct virtnet_info *vi)
+ {
+ 	void *buf;
+@@ -1632,6 +1883,20 @@ static int virtnet_probe(struct virtio_device *vdev)
  	    || virtio_has_feature(vdev, VIRTIO_NET_F_GUEST_ECN))
  		vi->big_packets = true;
  
@@ -398,10 +520,10 @@ index a64a087b..5ab9827d 100644
  	__ATTR_RO(device),
  	__ATTR_RO(vendor),
 diff --git a/drivers/virtio/virtio_ring.c b/drivers/virtio/virtio_ring.c
-index 6de0ffae..22a01324 100644
+index 6de0ffae..916ab9bb 100644
 --- a/drivers/virtio/virtio_ring.c
 +++ b/drivers/virtio/virtio_ring.c
-@@ -80,16 +80,57 @@ struct vring_virtqueue
+@@ -80,19 +80,74 @@ struct vring_virtqueue
  	bool broken;
  
  	/* Host supports indirect buffers */
@@ -459,7 +581,24 @@ index 6de0ffae..22a01324 100644
  	unsigned int num_added;
  
  	/* Last used index we've seen. */
-@@ -113,6 +154,10 @@ struct vring_virtqueue
++	/*
++	 * 在以下修改vring_virtqueue->last_used_idx:
++	 *   - drivers/virtio/virtio_ring.c|636| <<virtqueue_get_buf>> vq->last_used_idx++;
++	 *   - drivers/virtio/virtio_ring.c|910| <<vring_new_virtqueue>> vq->last_used_idx = 0;
++	 * 在以下使用vring_virtqueue->last_used_idx:
++	 *   - drivers/virtio/virtio_ring.c|576| <<more_used>> return vq->last_used_idx != vq->vring.used->idx;
++	 *   - drivers/virtio/virtio_ring.c|621| <<virtqueue_get_buf>> i = vq->vring.used->ring[vq->last_used_idx%vq->vring.num].id;
++	 *   - drivers/virtio/virtio_ring.c|622| <<virtqueue_get_buf>> *len = vq->vring.used->ring[vq->last_used_idx%vq->vring.num].len;
++	 *   - drivers/virtio/virtio_ring.c|641| <<virtqueue_get_buf>> vring_used_event(&vq->vring) = vq->last_used_idx;
++	 *   - drivers/virtio/virtio_ring.c|726| <<virtqueue_enable_cb_prepare>> vring_used_event(&vq->vring) = last_used_idx = vq->last_used_idx;
++	 *   - drivers/virtio/virtio_ring.c|795| <<virtqueue_enable_cb_delayed>> bufs = (u16)(vq->vring.avail->idx - vq->last_used_idx) * 3 / 4;
++	 *   - drivers/virtio/virtio_ring.c|796| <<virtqueue_enable_cb_delayed>> vring_used_event(&vq->vring) = vq->last_used_idx + bufs;
++	 *   - drivers/virtio/virtio_ring.c|798| <<virtqueue_enable_cb_delayed>> if (unlikely((u16)(vq->vring.used->idx - vq->last_used_idx) > bufs)) {
++	 */
+ 	u16 last_used_idx;
+ 
+ 	/* How to notify other side. FIXME: commonalize hcalls! */
+@@ -113,6 +168,10 @@ struct vring_virtqueue
  #define to_vvq(_vq) container_of(_vq, struct vring_virtqueue, vq)
  
  /* Set up an indirect table of descriptors and add it to the queue. */
@@ -470,7 +609,7 @@ index 6de0ffae..22a01324 100644
  static int vring_add_indirect(struct vring_virtqueue *vq,
  			      struct scatterlist sg[],
  			      unsigned int out,
-@@ -147,6 +192,24 @@ static int vring_add_indirect(struct vring_virtqueue *vq,
+@@ -147,6 +206,24 @@ static int vring_add_indirect(struct vring_virtqueue *vq,
  	desc[i-1].next = 0;
  
  	/* We're about to use a buffer */
@@ -495,7 +634,7 @@ index 6de0ffae..22a01324 100644
  	vq->num_free--;
  
  	/* Use a single buffer which doesn't continue */
-@@ -156,11 +219,32 @@ static int vring_add_indirect(struct vring_virtqueue *vq,
+@@ -156,11 +233,32 @@ static int vring_add_indirect(struct vring_virtqueue *vq,
  	vq->vring.desc[head].len = i * sizeof(struct vring_desc);
  
  	/* Update free pointer */
@@ -528,7 +667,7 @@ index 6de0ffae..22a01324 100644
  int virtqueue_get_queue_index(struct virtqueue *_vq)
  {
  	struct vring_virtqueue *vq = to_vvq(_vq);
-@@ -168,12 +252,34 @@ int virtqueue_get_queue_index(struct virtqueue *_vq)
+@@ -168,12 +266,34 @@ int virtqueue_get_queue_index(struct virtqueue *_vq)
  }
  EXPORT_SYMBOL_GPL(virtqueue_get_queue_index);
  
@@ -563,7 +702,7 @@ index 6de0ffae..22a01324 100644
  	struct vring_virtqueue *vq = to_vvq(_vq);
  	unsigned int i, avail, head, uninitialized_var(prev);
  
-@@ -183,7 +289,16 @@ int virtqueue_add_buf(struct virtqueue *_vq,
+@@ -183,7 +303,16 @@ int virtqueue_add_buf(struct virtqueue *_vq,
  
  	/* If the host supports indirect descriptor tables, and we have multiple
  	 * buffers, then go indirect. FIXME: tune this threshold */
@@ -580,8 +719,47 @@ index 6de0ffae..22a01324 100644
  		head = vring_add_indirect(vq, sg, out, in);
  		if (head != vq->vring.num)
  			goto add_head;
-@@ -207,6 +322,19 @@ int virtqueue_add_buf(struct virtqueue *_vq,
+@@ -192,6 +321,21 @@ int virtqueue_add_buf(struct virtqueue *_vq,
+ 	BUG_ON(out + in > vq->vring.num);
+ 	BUG_ON(out + in == 0);
+ 
++	/*
++	 * 在以下修改vring_virtqueue->num_free:
++	 *   - drivers/virtio/virtio_ring.c|150| <<vring_add_indirect>> vq->num_free--;
++	 *   - drivers/virtio/virtio_ring.c|227| <<virtqueue_add_buf>> vq->num_free -= out + in;
++	 *   - drivers/virtio/virtio_ring.c|346| <<detach_buf>> vq->num_free++;
++	 *   - drivers/virtio/virtio_ring.c|352| <<detach_buf>> vq->num_free++;
++	 *   - drivers/virtio/virtio_ring.c|603| <<vring_new_virtqueue>> vq->num_free = num;
++	 * 在以下使用vring_virtqueue->num_free:
++	 *   - drivers/virtio/virtio_ring.c|205| <<virtqueue_add_buf>> if (vq->indirect && (out + in) > 1 && vq->num_free) {
++	 *   - drivers/virtio/virtio_ring.c|214| <<virtqueue_add_buf>> if (vq->num_free < out + in) {
++	 *   - drivers/virtio/virtio_ring.c|216| <<virtqueue_add_buf>> out + in, vq->num_free);
++	 *   - drivers/virtio/virtio_ring.c|264| <<virtqueue_add_buf>> return vq->num_free ? vq->vring.num : 0;
++	 *   - drivers/virtio/virtio_ring.c|265| <<virtqueue_add_buf>> return vq->num_free;
++	 *   - drivers/virtio/virtio_ring.c|532| <<virtqueue_detach_unused_buf>> BUG_ON(vq->num_free != vq->vring.num);
++	 */
+ 	if (vq->num_free < out + in) {
+ 		pr_debug("Can't add buf len %i - avail = %i\n",
+ 			 out + in, vq->num_free);
+@@ -205,8 +349,36 @@ int virtqueue_add_buf(struct virtqueue *_vq,
+ 	}
+ 
  	/* We're about to use some buffers from the free list. */
++	/*
++	 * 在以下修改vring_virtqueue->num_free:
++	 *   - drivers/virtio/virtio_ring.c|150| <<vring_add_indirect>> vq->num_free--;
++	 *   - drivers/virtio/virtio_ring.c|227| <<virtqueue_add_buf>> vq->num_free -= out + in;
++	 *   - drivers/virtio/virtio_ring.c|346| <<detach_buf>> vq->num_free++;
++	 *   - drivers/virtio/virtio_ring.c|352| <<detach_buf>> vq->num_free++;
++	 *   - drivers/virtio/virtio_ring.c|603| <<vring_new_virtqueue>> vq->num_free = num;
++	 * 在以下使用vring_virtqueue->num_free:
++	 *   - drivers/virtio/virtio_ring.c|205| <<virtqueue_add_buf>> if (vq->indirect && (out + in) > 1 && vq->num_free) {
++	 *   - drivers/virtio/virtio_ring.c|214| <<virtqueue_add_buf>> if (vq->num_free < out + in) {
++	 *   - drivers/virtio/virtio_ring.c|216| <<virtqueue_add_buf>> out + in, vq->num_free);
++	 *   - drivers/virtio/virtio_ring.c|264| <<virtqueue_add_buf>> return vq->num_free ? vq->vring.num : 0;
++	 *   - drivers/virtio/virtio_ring.c|265| <<virtqueue_add_buf>> return vq->num_free;
++	 *   - drivers/virtio/virtio_ring.c|532| <<virtqueue_detach_unused_buf>> BUG_ON(vq->num_free != vq->vring.num);
++	 */
  	vq->num_free -= out + in;
  
 +	/*
@@ -600,7 +778,7 @@ index 6de0ffae..22a01324 100644
  	head = vq->free_head;
  	for (i = vq->free_head; out; i = vq->vring.desc[i].next, out--) {
  		vq->vring.desc[i].flags = VRING_DESC_F_NEXT;
-@@ -234,6 +362,21 @@ add_head:
+@@ -234,6 +406,21 @@ add_head:
  
  	/* Put entry in available array (but don't update avail->idx until they
  	 * do sync).  FIXME: avoid modulus here? */
@@ -622,7 +800,7 @@ index 6de0ffae..22a01324 100644
  	avail = (vq->vring.avail->idx + vq->num_added++) % vq->vring.num;
  	vq->vring.avail->ring[avail] = head;
  
-@@ -241,12 +384,37 @@ add_head:
+@@ -241,12 +428,37 @@ add_head:
  	END_USE(vq);
  
  	/* If we're indirect, we can fit many (assuming not OOM). */
@@ -660,7 +838,7 @@ index 6de0ffae..22a01324 100644
  bool virtqueue_kick_prepare(struct virtqueue *_vq)
  {
  	struct vring_virtqueue *vq = to_vvq(_vq);
-@@ -265,7 +433,18 @@ bool virtqueue_kick_prepare(struct virtqueue *_vq)
+@@ -265,7 +477,18 @@ bool virtqueue_kick_prepare(struct virtqueue *_vq)
  	/* Need to update avail index before checking if we should notify */
  	virtio_mb();
  
@@ -679,7 +857,7 @@ index 6de0ffae..22a01324 100644
  		needs_kick = vring_need_event(vring_avail_event(&vq->vring),
  					      new, old);
  	} else {
-@@ -282,6 +461,11 @@ EXPORT_SYMBOL_GPL(virtqueue_kick_prepare);
+@@ -282,6 +505,11 @@ EXPORT_SYMBOL_GPL(virtqueue_kick_prepare);
   *
   * This does not need to be serialized.
   */
@@ -691,7 +869,7 @@ index 6de0ffae..22a01324 100644
  void virtqueue_notify(struct virtqueue *_vq)
  {
  	struct vring_virtqueue *vq = to_vvq(_vq);
-@@ -301,6 +485,22 @@ EXPORT_SYMBOL_GPL(virtqueue_notify);
+@@ -301,6 +529,22 @@ EXPORT_SYMBOL_GPL(virtqueue_notify);
   * Caller must ensure we don't call this with other virtqueue
   * operations at the same time (except where noted).
   */
@@ -714,7 +892,7 @@ index 6de0ffae..22a01324 100644
  void virtqueue_kick(struct virtqueue *vq)
  {
  	if (virtqueue_kick_prepare(vq))
-@@ -308,6 +508,11 @@ void virtqueue_kick(struct virtqueue *vq)
+@@ -308,6 +552,11 @@ void virtqueue_kick(struct virtqueue *vq)
  }
  EXPORT_SYMBOL_GPL(virtqueue_kick);
  
@@ -726,7 +904,16 @@ index 6de0ffae..22a01324 100644
  static void detach_buf(struct vring_virtqueue *vq, unsigned int head)
  {
  	unsigned int i;
-@@ -328,16 +533,69 @@ static void detach_buf(struct vring_virtqueue *vq, unsigned int head)
+@@ -322,22 +571,78 @@ static void detach_buf(struct vring_virtqueue *vq, unsigned int head)
+ 	if (vq->vring.desc[i].flags & VRING_DESC_F_INDIRECT)
+ 		kfree(phys_to_virt(vq->vring.desc[i].addr));
+ 
++	/*
++	 * centos上rx的flags都是2
++	 */
+ 	while (vq->vring.desc[i].flags & VRING_DESC_F_NEXT) {
+ 		i = vq->vring.desc[i].next;
+ 		vq->num_free++;
  	}
  
  	vq->vring.desc[i].next = vq->free_head;
@@ -796,7 +983,28 @@ index 6de0ffae..22a01324 100644
  void *virtqueue_get_buf(struct virtqueue *_vq, unsigned int *len)
  {
  	struct vring_virtqueue *vq = to_vvq(_vq);
-@@ -389,10 +647,33 @@ void *virtqueue_get_buf(struct virtqueue *_vq, unsigned int *len)
+@@ -375,6 +680,20 @@ void *virtqueue_get_buf(struct virtqueue *_vq, unsigned int *len)
+ 	/* detach_buf clears data, so grab it now. */
+ 	ret = vq->data[i];
+ 	detach_buf(vq, i);
++	/*
++	 * 在以下修改vring_virtqueue->last_used_idx:
++	 *   - drivers/virtio/virtio_ring.c|636| <<virtqueue_get_buf>> vq->last_used_idx++;
++	 *   - drivers/virtio/virtio_ring.c|910| <<vring_new_virtqueue>> vq->last_used_idx = 0;
++	 * 在以下使用vring_virtqueue->last_used_idx:
++	 *   - drivers/virtio/virtio_ring.c|576| <<more_used>> return vq->last_used_idx != vq->vring.used->idx;
++	 *   - drivers/virtio/virtio_ring.c|621| <<virtqueue_get_buf>> i = vq->vring.used->ring[vq->last_used_idx%vq->vring.num].id;
++	 *   - drivers/virtio/virtio_ring.c|622| <<virtqueue_get_buf>> *len = vq->vring.used->ring[vq->last_used_idx%vq->vring.num].len;
++	 *   - drivers/virtio/virtio_ring.c|641| <<virtqueue_get_buf>> vring_used_event(&vq->vring) = vq->last_used_idx;
++	 *   - drivers/virtio/virtio_ring.c|726| <<virtqueue_enable_cb_prepare>> vring_used_event(&vq->vring) = last_used_idx = vq->last_used_idx;
++	 *   - drivers/virtio/virtio_ring.c|795| <<virtqueue_enable_cb_delayed>> bufs = (u16)(vq->vring.avail->idx - vq->last_used_idx) * 3 / 4;
++	 *   - drivers/virtio/virtio_ring.c|796| <<virtqueue_enable_cb_delayed>> vring_used_event(&vq->vring) = vq->last_used_idx + bufs;
++	 *   - drivers/virtio/virtio_ring.c|798| <<virtqueue_enable_cb_delayed>> if (unlikely((u16)(vq->vring.used->idx - vq->last_used_idx) > bufs)) {
++	 */
+ 	vq->last_used_idx++;
+ 	/* If we expect an interrupt for the next entry, tell host
+ 	 * by writing event index and flush out the write before
+@@ -389,10 +708,35 @@ void *virtqueue_get_buf(struct virtqueue *_vq, unsigned int *len)
  }
  EXPORT_SYMBOL_GPL(virtqueue_get_buf);
  
@@ -826,11 +1034,13 @@ index 6de0ffae..22a01324 100644
 +	 *   - drivers/virtio/virtio_ring.c|570| <<virtqueue_enable_cb_prepare>> vq->vring.avail->flags &= ~VRING_AVAIL_F_NO_INTERRUPT;
 +	 *   - drivers/virtio/virtio_ring.c|625| <<virtqueue_enable_cb_delayed>> vq->vring.avail->flags &= ~VRING_AVAIL_F_NO_INTERRUPT;
 +	 *   - drivers/virtio/virtio_ring.c|739| <<vring_new_virtqueue>> vq->vring.avail->flags |= VRING_AVAIL_F_NO_INTERRUPT;
++	 *
++	 * vhost有VIRTIO_RING_F_EVENT_IDX就不会依赖VRING_AVAIL_F_NO_INTERRUPT
 +	 */
  	vq->vring.avail->flags |= VRING_AVAIL_F_NO_INTERRUPT;
  }
  EXPORT_SYMBOL_GPL(virtqueue_disable_cb);
-@@ -409,6 +690,11 @@ EXPORT_SYMBOL_GPL(virtqueue_disable_cb);
+@@ -409,6 +753,11 @@ EXPORT_SYMBOL_GPL(virtqueue_disable_cb);
   * Caller must ensure we don't call this with other virtqueue
   * operations at the same time (except where noted).
   */
@@ -842,7 +1052,30 @@ index 6de0ffae..22a01324 100644
  unsigned virtqueue_enable_cb_prepare(struct virtqueue *_vq)
  {
  	struct vring_virtqueue *vq = to_vvq(_vq);
-@@ -437,6 +723,11 @@ EXPORT_SYMBOL_GPL(virtqueue_enable_cb_prepare);
+@@ -421,7 +770,22 @@ unsigned virtqueue_enable_cb_prepare(struct virtqueue *_vq)
+ 	/* Depending on the VIRTIO_RING_F_EVENT_IDX feature, we need to
+ 	 * either clear the flags bit or point the event index at the next
+ 	 * entry. Always do both to keep code simple. */
++	/*
++	 * 在以下使用VRING_AVAIL_F_NO_INTERRUPT:
++	 *   - drivers/vhost/vhost.c|1467| <<vhost_notify>> return !(flags & VRING_AVAIL_F_NO_INTERRUPT);
++	 *   - drivers/virtio/virtio_ring.c|528| <<virtqueue_get_buf>> if (!(vq->vring.avail->flags & VRING_AVAIL_F_NO_INTERRUPT)) {
++	 *   - drivers/virtio/virtio_ring.c|542| <<virtqueue_disable_cb>> vq->vring.avail->flags |= VRING_AVAIL_F_NO_INTERRUPT;
++	 *   - drivers/virtio/virtio_ring.c|570| <<virtqueue_enable_cb_prepare>> vq->vring.avail->flags &= ~VRING_AVAIL_F_NO_INTERRUPT;
++	 *   - drivers/virtio/virtio_ring.c|625| <<virtqueue_enable_cb_delayed>> vq->vring.avail->flags &= ~VRING_AVAIL_F_NO_INTERRUPT;
++	 *   - drivers/virtio/virtio_ring.c|739| <<vring_new_virtqueue>> vq->vring.avail->flags |= VRING_AVAIL_F_NO_INTERRUPT;
++	 */
+ 	vq->vring.avail->flags &= ~VRING_AVAIL_F_NO_INTERRUPT;
++	/*
++	 * called by:
++	 *   - drivers/virtio/virtio_ring.c|529| <<virtqueue_get_buf>> vring_used_event(&vq->vring) = vq->last_used_idx;
++	 *   - drivers/virtio/virtio_ring.c|571| <<virtqueue_enable_cb_prepare>> vring_used_event(&vq->vring) = last_used_idx = vq->last_used_idx;
++	 *   - drivers/virtio/virtio_ring.c|628| <<virtqueue_enable_cb_delayed>> vring_used_event(&vq->vring) = vq->last_used_idx + bufs;
++	 */
+ 	vring_used_event(&vq->vring) = last_used_idx = vq->last_used_idx;
+ 	END_USE(vq);
+ 	return last_used_idx;
+@@ -437,6 +801,11 @@ EXPORT_SYMBOL_GPL(virtqueue_enable_cb_prepare);
   *
   * This does not need to be serialized.
   */
@@ -854,7 +1087,7 @@ index 6de0ffae..22a01324 100644
  bool virtqueue_poll(struct virtqueue *_vq, unsigned last_used_idx)
  {
  	struct vring_virtqueue *vq = to_vvq(_vq);
-@@ -457,6 +748,10 @@ EXPORT_SYMBOL_GPL(virtqueue_poll);
+@@ -457,6 +826,10 @@ EXPORT_SYMBOL_GPL(virtqueue_poll);
   * Caller must ensure we don't call this with other virtqueue
   * operations at the same time (except where noted).
   */
@@ -865,7 +1098,7 @@ index 6de0ffae..22a01324 100644
  bool virtqueue_enable_cb(struct virtqueue *_vq)
  {
  	unsigned last_used_idx = virtqueue_enable_cb_prepare(_vq);
-@@ -464,6 +759,10 @@ bool virtqueue_enable_cb(struct virtqueue *_vq)
+@@ -464,6 +837,10 @@ bool virtqueue_enable_cb(struct virtqueue *_vq)
  }
  EXPORT_SYMBOL_GPL(virtqueue_enable_cb);
  
@@ -876,7 +1109,7 @@ index 6de0ffae..22a01324 100644
  bool virtqueue_enable_cb_delayed(struct virtqueue *_vq)
  {
  	struct vring_virtqueue *vq = to_vvq(_vq);
-@@ -491,6 +790,15 @@ bool virtqueue_enable_cb_delayed(struct virtqueue *_vq)
+@@ -491,6 +868,15 @@ bool virtqueue_enable_cb_delayed(struct virtqueue *_vq)
  }
  EXPORT_SYMBOL_GPL(virtqueue_enable_cb_delayed);
  
@@ -892,7 +1125,7 @@ index 6de0ffae..22a01324 100644
  void *virtqueue_detach_unused_buf(struct virtqueue *_vq)
  {
  	struct vring_virtqueue *vq = to_vvq(_vq);
-@@ -517,6 +825,13 @@ void *virtqueue_detach_unused_buf(struct virtqueue *_vq)
+@@ -517,6 +903,13 @@ void *virtqueue_detach_unused_buf(struct virtqueue *_vq)
  }
  EXPORT_SYMBOL_GPL(virtqueue_detach_unused_buf);
  
@@ -906,7 +1139,7 @@ index 6de0ffae..22a01324 100644
  irqreturn_t vring_interrupt(int irq, void *_vq)
  {
  	struct vring_virtqueue *vq = to_vvq(_vq);
-@@ -537,6 +852,12 @@ irqreturn_t vring_interrupt(int irq, void *_vq)
+@@ -537,6 +930,12 @@ irqreturn_t vring_interrupt(int irq, void *_vq)
  }
  EXPORT_SYMBOL_GPL(vring_interrupt);
  
@@ -919,7 +1152,7 @@ index 6de0ffae..22a01324 100644
  struct virtqueue *vring_new_virtqueue(unsigned int index,
  				      unsigned int num,
  				      unsigned int vring_align,
-@@ -559,6 +880,12 @@ struct virtqueue *vring_new_virtqueue(unsigned int index,
+@@ -559,6 +958,12 @@ struct virtqueue *vring_new_virtqueue(unsigned int index,
  	if (!vq)
  		return NULL;
  
@@ -932,7 +1165,7 @@ index 6de0ffae..22a01324 100644
  	vring_init(&vq->vring, num, pages, vring_align);
  	vq->vq.callback = callback;
  	vq->vq.vdev = vdev;
-@@ -577,6 +904,15 @@ struct virtqueue *vring_new_virtqueue(unsigned int index,
+@@ -577,6 +982,15 @@ struct virtqueue *vring_new_virtqueue(unsigned int index,
  	vq->event = virtio_has_feature(vdev, VIRTIO_RING_F_EVENT_IDX);
  
  	/* No callback?  Tell other side not to bother us. */
@@ -948,7 +1181,7 @@ index 6de0ffae..22a01324 100644
  	if (!callback)
  		vq->vring.avail->flags |= VRING_AVAIL_F_NO_INTERRUPT;
  
-@@ -593,6 +929,14 @@ struct virtqueue *vring_new_virtqueue(unsigned int index,
+@@ -593,6 +1007,14 @@ struct virtqueue *vring_new_virtqueue(unsigned int index,
  }
  EXPORT_SYMBOL_GPL(vring_new_virtqueue);
  
@@ -963,7 +1196,7 @@ index 6de0ffae..22a01324 100644
  void vring_del_virtqueue(struct virtqueue *vq)
  {
  	list_del(&vq->list);
-@@ -601,6 +945,12 @@ void vring_del_virtqueue(struct virtqueue *vq)
+@@ -601,6 +1023,12 @@ void vring_del_virtqueue(struct virtqueue *vq)
  EXPORT_SYMBOL_GPL(vring_del_virtqueue);
  
  /* Manipulates transport-specific feature bits. */
@@ -976,6 +1209,117 @@ index 6de0ffae..22a01324 100644
  void vring_transport_features(struct virtio_device *vdev)
  {
  	unsigned int i;
+diff --git a/include/linux/irq.h b/include/linux/irq.h
+index 621fd755..15d21204 100644
+--- a/include/linux/irq.h
++++ b/include/linux/irq.h
+@@ -50,8 +50,62 @@ typedef	void (*irq_flow_handler_t)(unsigned int irq,
+ #define IRQ_TYPE_PROBE		0x00000010	/* Probing in progress */
+ 
+ /* Internal flags */
++/*
++ * x86下修改IRQ_INPROGRESS的地方:
++ *   - arch/x86/kernel/visws_quirks.c|461| <<startup_cobalt_irq>> desc->status &= ~(IRQ_DISABLED | IRQ_INPROGRESS | IRQ_WAITING);
++ *   - kernel/irq/chip.c|394| <<handle_nested_irq>> desc->status |= IRQ_INPROGRESS;
++ *   - kernel/irq/chip.c|402| <<handle_nested_irq>> desc->status &= ~IRQ_INPROGRESS;
++ *   - kernel/irq/chip.c|438| <<handle_simple_irq>> desc->status |= IRQ_INPROGRESS;
++ *   - kernel/irq/chip.c|446| <<handle_simple_irq>> desc->status &= ~IRQ_INPROGRESS;
++ *   - kernel/irq/chip.c|483| <<handle_level_irq>> desc->status |= IRQ_INPROGRESS;
++ *   - kernel/irq/chip.c|491| <<handle_level_irq>> desc->status &= ~IRQ_INPROGRESS;
++ *   - kernel/irq/chip.c|538| <<handle_fasteoi_irq>> desc->status |= IRQ_INPROGRESS;
++ *   - kernel/irq/chip.c|547| <<handle_fasteoi_irq>> desc->status &= ~IRQ_INPROGRESS;
++ *   - kernel/irq/chip.c|595| <<handle_edge_irq>> desc->status |= IRQ_INPROGRESS;
++ *   - kernel/irq/chip.c|627| <<handle_edge_irq>> desc->status &= ~IRQ_INPROGRESS;
++ *   - kernel/irq/handle.c|494| <<__do_IRQ>> status |= IRQ_INPROGRESS;
++ *   - kernel/irq/handle.c|531| <<__do_IRQ>> desc->status &= ~IRQ_INPROGRESS;
++ *   - kernel/irq/manage.c|836| <<__setup_irq>> IRQ_INPROGRESS | IRQ_SPURIOUS_DISABLED);
++ *   - kernel/irq/spurious.c|44| <<try_one_irq>> desc->status |= IRQ_INPROGRESS;
++ *   - kernel/irq/spurious.c|76| <<try_one_irq>> desc->status &= ~IRQ_INPROGRESS;
++ * x86下使用IRQ_INPROGRESS的地方:
++ *   - arch/x86/kernel/visws_quirks.c|460| <<startup_cobalt_irq>> if ((desc->status & (IRQ_DISABLED | IRQ_INPROGRESS | IRQ_WAITING)))
++ *   - arch/x86/kernel/visws_quirks.c|483| <<end_cobalt_irq>> if (!(desc->status & (IRQ_DISABLED | IRQ_INPROGRESS)))
++ *   - kernel/irq/chip.c|429| <<handle_simple_irq>> if (unlikely(desc->status & IRQ_INPROGRESS))
++ *   - kernel/irq/chip.c|470| <<handle_level_irq>> if (unlikely(desc->status & IRQ_INPROGRESS))
++ *   - kernel/irq/chip.c|520| <<handle_fasteoi_irq>> if (unlikely(desc->status & IRQ_INPROGRESS))
++ *   - kernel/irq/chip.c|582| <<handle_edge_irq>> if (unlikely((desc->status & (IRQ_INPROGRESS | IRQ_DISABLED)) ||
++ *   - kernel/irq/handle.c|491| <<__do_IRQ>> if (likely(!(status & (IRQ_DISABLED | IRQ_INPROGRESS)))) {
++ *   - kernel/irq/internals.h|82| <<print_irq_desc>> P(IRQ_INPROGRESS);
++ *   - kernel/irq/manage.c|45| <<synchronize_irq>> while (desc->status & IRQ_INPROGRESS)
++ *   - kernel/irq/manage.c|54| <<synchronize_irq>> } while (status & IRQ_INPROGRESS);
++ *   - kernel/irq/spurious.c|33| <<try_one_irq>> if (desc->status & IRQ_INPROGRESS) {
++ */
+ #define IRQ_INPROGRESS		0x00000100	/* IRQ handler active - do not enter! */
+ #define IRQ_DISABLED		0x00000200	/* IRQ disabled - do not enter! */
++/*
++ * x86在以下使用IRQ_PENDING:
++ *   - kernel/irq/autoprobe.c|80| <<probe_irq_on>> desc->status |= IRQ_PENDING;
++ *   - kernel/irq/chip.c|532| <<handle_fasteoi_irq>> desc->status |= IRQ_PENDING;
++ *   - kernel/irq/chip.c|539| <<handle_fasteoi_irq>> desc->status &= ~IRQ_PENDING;
++ *   - kernel/irq/chip.c|584| <<handle_edge_irq>> desc->status |= (IRQ_PENDING | IRQ_MASKED);
++ *   - kernel/irq/chip.c|612| <<handle_edge_irq>> (IRQ_PENDING | IRQ_MASKED | IRQ_DISABLED)) ==
++ *   - kernel/irq/chip.c|613| <<handle_edge_irq>> (IRQ_PENDING | IRQ_MASKED))) {
++ *   - kernel/irq/chip.c|618| <<handle_edge_irq>> desc->status &= ~IRQ_PENDING;
++ *   - kernel/irq/chip.c|625| <<handle_edge_irq>> } while ((desc->status & (IRQ_PENDING | IRQ_DISABLED)) == IRQ_PENDING);
++ *   - kernel/irq/handle.c|484| <<__do_IRQ>> status |= IRQ_PENDING;
++ *   - kernel/irq/handle.c|493| <<__do_IRQ>> status &= ~IRQ_PENDING;
++ *   - kernel/irq/handle.c|527| <<__do_IRQ>> if (likely(!(desc->status & IRQ_PENDING)))
++ *   - kernel/irq/handle.c|529| <<__do_IRQ>> desc->status &= ~IRQ_PENDING;
++ *   - kernel/irq/internals.h|84| <<print_irq_desc>> P(IRQ_PENDING);
++ *   - kernel/irq/manage.c|660| <<irq_thread>> desc->status |= IRQ_PENDING;
++ *   - kernel/irq/pm.c|75| <<check_wakeup_irqs>> if ((desc->status & IRQ_WAKEUP) && (desc->status & IRQ_PENDING))
++ *   - kernel/irq/resend.c|70| <<check_irq_resend>> if ((status & (IRQ_LEVEL | IRQ_PENDING | IRQ_REPLAY)) == IRQ_PENDING) {
++ *   - kernel/irq/resend.c|71| <<check_irq_resend>> desc->status = (status & ~IRQ_PENDING) | IRQ_REPLAY;
++ *   - kernel/irq/spurious.c|39| <<try_one_irq>> desc->status |= IRQ_PENDING;
++ *   - kernel/irq/spurious.c|66| <<try_one_irq>> while ((desc->status & IRQ_PENDING) && action) {
++ *   - kernel/irq/spurious.c|74| <<try_one_irq>> desc->status &= ~IRQ_PENDING;
++ */
+ #define IRQ_PENDING		0x00000400	/* IRQ pending - replay on enable */
+ #define IRQ_REPLAY		0x00000800	/* IRQ has been replayed but not acked yet */
+ #define IRQ_AUTODETECT		0x00001000	/* IRQ is being autodetected */
+@@ -318,6 +372,9 @@ static inline void generic_handle_irq_desc(unsigned int irq, struct irq_desc *de
+ #ifdef CONFIG_GENERIC_HARDIRQS_NO__DO_IRQ
+ 	desc->handle_irq(irq, desc);
+ #else
++	/*
++	 * handle_edge_irq()
++	 */
+ 	if (likely(desc->handle_irq))
+ 		desc->handle_irq(irq, desc);
+ 	else
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 3b8c627c..6181f2cf 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -376,10 +376,29 @@ struct napi_struct {
+ 
+ enum
+ {
++	/*
++	 * 在以下使用NAPI_STATE_SCHED:
++	 *   - drivers/net/cxgb3/sge.c|2470| <<napi_is_scheduled>> return test_bit(NAPI_STATE_SCHED, &napi->state);
++	 *   - include/linux/netdevice.h|474| <<napi_schedule_prep>> !test_and_set_bit(NAPI_STATE_SCHED, &n->state);
++	 *   - include/linux/netdevice.h|563| <<napi_enable>> BUG_ON(!test_bit(NAPI_STATE_SCHED, &n->state));
++	 *   - include/linux/netdevice.h|565| <<napi_enable>> clear_bit(NAPI_STATE_SCHED, &n->state);
++	 *   - include/linux/netdevice.h|580| <<napi_synchronize>> while (test_bit(NAPI_STATE_SCHED, &n->state))
++	 *   - net/core/dev.c|3907| <<__napi_complete>> BUG_ON(!test_bit(NAPI_STATE_SCHED, &n->state));
++	 *   - net/core/dev.c|3911| <<__napi_complete>> clear_bit(NAPI_STATE_SCHED, &n->state);
++	 *   - net/core/dev.c|4045| <<__netif_napi_add>> set_bit(NAPI_STATE_SCHED, &napi->state);
++	 *   - net/core/dev.c|4066| <<napi_disable>> while (test_and_set_bit(NAPI_STATE_SCHED, &n->state))
++	 *   - net/core/dev.c|4157| <<net_rx_action>> if (test_bit(NAPI_STATE_SCHED, &n->state)) {
++	 *   - net/core/netpoll.c|137| <<poll_one_napi>> if (!test_bit(NAPI_STATE_SCHED, &napi->state))
++	 */
+ 	NAPI_STATE_SCHED,	/* Poll is scheduled */
+ 	NAPI_STATE_DISABLE,	/* Disable pending */
+ 	NAPI_STATE_NPSVC,	/* Netpoll - don't dequeue from poll_list */
+ 	NAPI_STATE_HASHED,	/* In NAPI hash */
++	/*
++	 * 在以下使用NAPI_STATE_EXT:
++	 *   - include/linux/netdevice.h|374| <<NAPI_STRUCT_HAS>> (test_bit(NAPI_STATE_EXT, &__n->state) && \
++	 *   - net/core/dev.c|4023| <<__netif_napi_add>> set_bit(NAPI_STATE_EXT, &napi->state);
++	 */
+ 	NAPI_STATE_EXT,		/* Extended napi_struct */
+ };
+ 
 diff --git a/include/linux/virtio.h b/include/linux/virtio.h
 index 7fcf33a9..386286e8 100644
 --- a/include/linux/virtio.h
@@ -1177,6 +1521,97 @@ index e86e134f..1d73d435 100644
  static inline int vring_need_event(__u16 event_idx, __u16 new_idx, __u16 old)
  {
  	/* Note: Xen has similar logic for notification hold-off
+diff --git a/kernel/irq/chip.c b/kernel/irq/chip.c
+index cc97927c..d511c52b 100644
+--- a/kernel/irq/chip.c
++++ b/kernel/irq/chip.c
+@@ -350,12 +350,24 @@ void irq_chip_set_defaults(struct irq_chip *chip)
+ 		chip->end = dummy_irq_chip.end;
+ }
+ 
++/*
++ * called by:
++ *   - kernel/irq/chip.c|462| <<handle_level_irq>> mask_ack_irq(desc, irq);
++ *   - kernel/irq/chip.c|579| <<handle_edge_irq>> mask_ack_irq(desc, irq);
++ *   - kernel/irq/chip.c|685| <<__set_irq_handler>> mask_ack_irq(desc, irq);
++ */
+ static inline void mask_ack_irq(struct irq_desc *desc, int irq)
+ {
+ 	if (desc->chip->mask_ack)
+ 		desc->chip->mask_ack(irq);
+ 	else {
++		/*
++		 * mask_msi_irq()
++		 */
+ 		desc->chip->mask(irq);
++		/*
++		 * ack_apic_edge()
++		 */
+ 		if (desc->chip->ack)
+ 			desc->chip->ack(irq);
+ 	}
+@@ -582,6 +594,9 @@ handle_edge_irq(unsigned int irq, struct irq_desc *desc)
+ 	kstat_incr_irqs_this_cpu(irq, desc);
+ 
+ 	/* Start handling the irq */
++	/*
++	 * ack_apic_edge()
++	 */
+ 	if (desc->chip->ack)
+ 		desc->chip->ack(irq);
+ 
+diff --git a/kernel/irq/spurious.c b/kernel/irq/spurious.c
+index bd7273e6..c966a5c8 100644
+--- a/kernel/irq/spurious.c
++++ b/kernel/irq/spurious.c
+@@ -23,6 +23,11 @@ static DEFINE_TIMER(poll_spurious_irq_timer, poll_spurious_irqs, 0, 0);
+ /*
+  * Recovery handler for misrouted interrupts.
+  */
++/*
++ * called by:
++ *   - kernel/irq/spurious.c|100| <<misrouted_irq>> if (try_one_irq(i, desc))
++ *   - kernel/irq/spurious.c|125| <<poll_all_shared_irqs>> try_one_irq(i, desc);
++ */
+ static int try_one_irq(int irq, struct irq_desc *desc)
+ {
+ 	struct irqaction *action;
+@@ -85,6 +90,10 @@ static int try_one_irq(int irq, struct irq_desc *desc)
+ 	return ok;
+ }
+ 
++/*
++ * called by:
++ *   - kernel/irq/spurious.c|248| <<note_interrupt>> int ok = misrouted_irq(irq);
++ */
+ static int misrouted_irq(int irq)
+ {
+ 	struct irq_desc *desc;
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 5f75a7d0..06df4761 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -4154,6 +4154,20 @@ static void net_rx_action(struct softirq_action *h)
+ 		 * accidently calling ->poll() when NAPI is not scheduled.
+ 		 */
+ 		work = 0;
++		/*
++		 * 在以下使用NAPI_STATE_SCHED:
++		 *   - drivers/net/cxgb3/sge.c|2470| <<napi_is_scheduled>> return test_bit(NAPI_STATE_SCHED, &napi->state);
++		 *   - include/linux/netdevice.h|474| <<napi_schedule_prep>> !test_and_set_bit(NAPI_STATE_SCHED, &n->state);
++		 *   - include/linux/netdevice.h|563| <<napi_enable>> BUG_ON(!test_bit(NAPI_STATE_SCHED, &n->state));
++		 *   - include/linux/netdevice.h|565| <<napi_enable>> clear_bit(NAPI_STATE_SCHED, &n->state);
++		 *   - include/linux/netdevice.h|580| <<napi_synchronize>> while (test_bit(NAPI_STATE_SCHED, &n->state))
++		 *   - net/core/dev.c|3907| <<__napi_complete>> BUG_ON(!test_bit(NAPI_STATE_SCHED, &n->state));
++		 *   - net/core/dev.c|3911| <<__napi_complete>> clear_bit(NAPI_STATE_SCHED, &n->state);
++		 *   - net/core/dev.c|4045| <<__netif_napi_add>> set_bit(NAPI_STATE_SCHED, &napi->state);
++		 *   - net/core/dev.c|4066| <<napi_disable>> while (test_and_set_bit(NAPI_STATE_SCHED, &n->state))
++		 *   - net/core/dev.c|4157| <<net_rx_action>> if (test_bit(NAPI_STATE_SCHED, &n->state)) {
++		 *   - net/core/netpoll.c|137| <<poll_one_napi>> if (!test_bit(NAPI_STATE_SCHED, &napi->state))
++		 */
+ 		if (test_bit(NAPI_STATE_SCHED, &n->state)) {
+ 			work = n->poll(n, weight);
+ 			trace_napi_poll(n);
 -- 
 2.17.1
 
