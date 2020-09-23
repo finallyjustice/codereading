@@ -1,6 +1,6 @@
-From 6546bf6ba52c60f2604d4a6efee1f9ef3cae3b73 Mon Sep 17 00:00:00 2001
+From f0e6f8e1742663dcaf45469622e179c74397e98f Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Tue, 22 Sep 2020 23:45:49 -0700
+Date: Wed, 23 Sep 2020 13:21:22 -0700
 Subject: [PATCH 1/1] linux-uek5-v4.14.35-1902.303.5.3-kvm
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
@@ -12,7 +12,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  arch/x86/kernel/reboot.c           |    5 +
  arch/x86/kvm/kvm_cache_regs.h      |   47 +
  arch/x86/kvm/mmu.c                 |   79 ++
- arch/x86/kvm/vmx.c                 | 1106 ++++++++++++++++++++++
+ arch/x86/kvm/vmx.c                 | 1184 ++++++++++++++++++++++++
  arch/x86/kvm/x86.c                 |   29 +
  arch/x86/kvm/x86.h                 |   12 +
  drivers/acpi/osl.c                 |   56 ++
@@ -42,7 +42,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  lib/nmi_backtrace.c                |    8 +
  virt/kvm/eventfd.c                 |  157 ++++
  virt/kvm/kvm_main.c                |   94 ++
- 37 files changed, 4586 insertions(+), 1 deletion(-)
+ 37 files changed, 4664 insertions(+), 1 deletion(-)
 
 diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
 index f1ad9c115d79..a06c3f2b0420 100644
@@ -358,14 +358,34 @@ index d3626520bb7b..15bf0c980819 100644
  {
  	if (reset_roots) {
 diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
-index 18331ebf892f..c443f39e016a 100644
+index 18331ebf892f..78cc07ab66e7 100644
 --- a/arch/x86/kvm/vmx.c
 +++ b/arch/x86/kvm/vmx.c
-@@ -62,6 +62,26 @@
+@@ -62,6 +62,94 @@
  #include "pmu.h"
  #include "vmx_evmcs.h"
  
 +/*
++ * 有一个结构是struct vmcs.
++ *
++ * struct vmcs {
++ *     struct vmcs_hdr hdr;
++ *     u32 abort;
++ *     char data[0];
++ * };
++ *
++ * 在alloc_vmcs_cpu()分配的时候是:
++ *
++ * pages = __alloc_pages_node(node, GFP_KERNEL, vmcs_config.order);
++ *
++ *
++ * loaded_vmcs points to the VMCS currently used in this vcpu. For a
++ * non-nested (L1) guest, it always points to vmcs01. For a nested
++ * guest (L2), it points to a different VMCS.  loaded_cpu_state points
++ * to the VMCS whose state is loaded into the CPU registers that only
++ * need to be switched when transitioning to/from the kernel; a NULL
++ * value indicates that host state is loaded.
++ *
 + * struct vcpu_vmx:
 + *  -> struct kvm_vcpu vcpu;
 + *  -> u8 fail;
@@ -383,12 +403,60 @@ index 18331ebf892f..c443f39e016a 100644
 + *          -> struct vmcs *vmcs;
 + *          -> struct vmcs *shadow_vmcs;
 + *          -> int cpu;
++ *
++ * ----------------------------------------
++ *
++ * prepare_vmcs02 is called when the L1 guest hypervisor runs its nested
++ * L2 guest. L1 has a vmcs for L2 (vmcs12), and this function "merges" it
++ * with L0's requirements for its guest (a.k.a. vmcs01), so we can run the L2
++ * guest in a way that will both be appropriate to L1's requests, and our
++ * needs. In addition to modifying the active vmcs (which is vmcs02), this
++ * function also has additional necessary side-effects, like setting various
++ * vcpu->arch fields.
++ *
++ * 假设是L1中要vmresume.
++ *
++ * 1. 为从L0进入L2做准备.
++ *
++ * handle_vmresume()
++ * -> nested_vmx_run(vcpu, false);
++ *
++ * copy_shadow_to_vmcs12(vmx)会把vmx->vmcs01.shadow_vmcs(类型vmcs)的数据同
++ * 步到vmx->nested.cached_vmcs12(类型vmcs12) 这里的shadow vmcs是L1中用来支
++ * 持L2的vmcs.
++ * 
++ * Copy the writable VMCS shadow fields back to the VMCS12, in case
++ * they have been modified by the L1 guest. Note that the "read-only"
++ * VM-exit information fields are actually writable if the vCPU is
++ * configured to support "VMWRITE to any supported field in the VMCS."
++ *
++ *
++ * enter_vmx_non_root_mode()
++ * -> enter_guest_mode(vcpu) --> 为vcpu->arch.hflags设置HF_GUEST_MASK
++ * -> vmx_switch_vmcs(vcpu, &vmx->nested.vmcs02); --> 把vmx->loaded_vmcs设置成参数的vmx->nested.vmcs02
++ * -> prepare_vmcs02()
++ *
++ * prepare_vmcs02 is called when the L1 guest hypervisor runs its nested
++ * L2 guest. L1 has a vmcs for L2 (vmcs12), and this function "merges" it
++ * with L0's requirements for its guest (a.k.a. vmcs01), so we can run the L2
++ * guest in a way that will both be appropriate to L1's requests, and our
++ * needs. In addition to modifying the active vmcs (which is vmcs02), this
++ * function also has additional necessary side-effects, like setting various
++ * vcpu->arch fields.
++ *
++ * 2. 从L0进入L2.
++ *
++ * vmx_vcpu_run()
++ * -> copy_vmcs12_to_shadow() --> 把vmx->nested.cached_vmcs12(类型vmcs12)给同步到vmx->vmcs01.shadow_vmcs(类型vmcs)
++ *                                这里为了在L1修改针对L2的vmcs时不用trap到L0了
++ * -> vmx->__launched = vmx->loaded_vmcs->launched;
++ * -> 进入guest mode (直接vmcs02的L2)
 + */
 +
  #define __ex(x) __kvm_handle_fault_on_reboot(x)
  #define __ex_clear(x, reg) \
  	____kvm_handle_fault_on_reboot(x, "xor " reg " , " reg)
-@@ -362,6 +382,14 @@ struct kvm_vmx {
+@@ -362,6 +450,14 @@ struct kvm_vmx {
  
  struct vmcs_hdr {
  	u32 revision_id:31;
@@ -403,7 +471,7 @@ index 18331ebf892f..c443f39e016a 100644
  	u32 shadow_vmcs:1;
  };
  
-@@ -395,16 +423,55 @@ struct vmcs_host_state {
+@@ -395,16 +491,55 @@ struct vmcs_host_state {
   */
  struct loaded_vmcs {
  	struct vmcs *vmcs;
@@ -459,7 +527,7 @@ index 18331ebf892f..c443f39e016a 100644
  	struct list_head loaded_vmcss_on_cpu_link;
  	struct vmcs_host_state host_state;
  };
-@@ -811,34 +878,110 @@ struct nested_vmx_msrs {
+@@ -811,34 +946,110 @@ struct nested_vmx_msrs {
   */
  struct nested_vmx {
  	/* Has the level1 guest done vmxon? */
@@ -570,7 +638,7 @@ index 18331ebf892f..c443f39e016a 100644
  	bool nested_run_pending;
  
  	struct loaded_vmcs vmcs02;
-@@ -992,8 +1135,33 @@ struct vcpu_vmx {
+@@ -992,8 +1203,33 @@ struct vcpu_vmx {
  	 * value indicates that host state is loaded.
  	 */
  	struct loaded_vmcs    vmcs01;
@@ -604,7 +672,7 @@ index 18331ebf892f..c443f39e016a 100644
  	bool                  __launched; /* temporary, used in vmx_vcpu_run */
  	struct msr_autoload {
  		struct vmx_msrs guest;
-@@ -1015,6 +1183,19 @@ struct vcpu_vmx {
+@@ -1015,6 +1251,19 @@ struct vcpu_vmx {
  		} seg[8];
  	} segment_cache;
  	int vpid;
@@ -624,7 +692,7 @@ index 18331ebf892f..c443f39e016a 100644
  	bool emulation_required;
  
  	u32 exit_reason;
-@@ -1268,13 +1449,41 @@ static inline short vmcs_field_to_offset(unsigned long field)
+@@ -1268,13 +1517,41 @@ static inline short vmcs_field_to_offset(unsigned long field)
  	return offset;
  }
  
@@ -666,7 +734,7 @@ index 18331ebf892f..c443f39e016a 100644
  	return to_vmx(vcpu)->nested.cached_shadow_vmcs12;
  }
  
-@@ -1341,6 +1550,43 @@ static bool cpu_has_load_perf_global_ctrl;
+@@ -1341,6 +1618,43 @@ static bool cpu_has_load_perf_global_ctrl;
  static DECLARE_BITMAP(vmx_vpid_bitmap, VMX_NR_VPIDS);
  static DEFINE_SPINLOCK(vmx_vpid_lock);
  
@@ -710,7 +778,7 @@ index 18331ebf892f..c443f39e016a 100644
  static struct vmcs_config {
  	int size;
  	int order;
-@@ -2178,6 +2424,14 @@ static inline void loaded_vmcs_init(struct loaded_vmcs *loaded_vmcs)
+@@ -2178,6 +2492,14 @@ static inline void loaded_vmcs_init(struct loaded_vmcs *loaded_vmcs)
  	loaded_vmcs->launched = 0;
  }
  
@@ -725,7 +793,7 @@ index 18331ebf892f..c443f39e016a 100644
  static void vmcs_load(struct vmcs *vmcs)
  {
  	u64 phys_addr = __pa(vmcs);
-@@ -2186,6 +2440,18 @@ static void vmcs_load(struct vmcs *vmcs)
+@@ -2186,6 +2508,18 @@ static void vmcs_load(struct vmcs *vmcs)
  	if (static_branch_unlikely(&enable_evmcs))
  		return evmcs_load(phys_addr);
  
@@ -744,7 +812,7 @@ index 18331ebf892f..c443f39e016a 100644
  	asm volatile (__ex(ASM_VMX_VMPTRLD_RAX) CC_SET(na)
  		      : CC_OUT(na) (error) : "a"(&phys_addr), "m"(phys_addr)
  		      : "memory");
-@@ -3048,6 +3314,10 @@ static void vmx_write_guest_kernel_gs_base(struct vcpu_vmx *vmx, u64 data)
+@@ -3048,6 +3382,10 @@ static void vmx_write_guest_kernel_gs_base(struct vcpu_vmx *vmx, u64 data)
  }
  #endif
  
@@ -755,7 +823,7 @@ index 18331ebf892f..c443f39e016a 100644
  static void vmx_vcpu_pi_load(struct kvm_vcpu *vcpu, int cpu)
  {
  	struct pi_desc *pi_desc = vcpu_to_pi_desc(vcpu);
-@@ -3114,8 +3384,18 @@ static void decache_tsc_multiplier(struct vcpu_vmx *vmx)
+@@ -3114,8 +3452,18 @@ static void decache_tsc_multiplier(struct vcpu_vmx *vmx)
   * Switches to specified vcpu, until a matching vcpu_put(), but assumes
   * vcpu mutex is already taken.
   */
@@ -774,7 +842,7 @@ index 18331ebf892f..c443f39e016a 100644
  	struct vcpu_vmx *vmx = to_vmx(vcpu);
  	bool already_loaded = vmx->loaded_vmcs->cpu == cpu;
  
-@@ -4220,6 +4500,17 @@ static void vmx_leave_nested(struct kvm_vcpu *vcpu);
+@@ -4220,6 +4568,17 @@ static void vmx_leave_nested(struct kvm_vcpu *vcpu);
   * Returns 0 on success, non-0 otherwise.
   * Assumes vcpu_load() was already called.
   */
@@ -792,7 +860,7 @@ index 18331ebf892f..c443f39e016a 100644
  static int vmx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
  {
  	struct vcpu_vmx *vmx = to_vmx(vcpu);
-@@ -4775,24 +5066,96 @@ static __init int setup_vmcs_config(struct vmcs_config *vmcs_conf)
+@@ -4775,24 +5134,96 @@ static __init int setup_vmcs_config(struct vmcs_config *vmcs_conf)
  	return 0;
  }
  
@@ -889,7 +957,7 @@ index 18331ebf892f..c443f39e016a 100644
  	if (shadow)
  		vmcs->hdr.shadow_vmcs = 1;
  	return vmcs;
-@@ -4818,11 +5181,21 @@ static void free_loaded_vmcs(struct loaded_vmcs *loaded_vmcs)
+@@ -4818,11 +5249,21 @@ static void free_loaded_vmcs(struct loaded_vmcs *loaded_vmcs)
  	WARN_ON(loaded_vmcs->shadow_vmcs != NULL);
  }
  
@@ -911,7 +979,7 @@ index 18331ebf892f..c443f39e016a 100644
  static int alloc_loaded_vmcs(struct loaded_vmcs *loaded_vmcs)
  {
  	loaded_vmcs->vmcs = alloc_vmcs(false);
-@@ -4952,6 +5325,10 @@ static void init_vmcs_shadow_fields(void)
+@@ -4952,6 +5393,10 @@ static void init_vmcs_shadow_fields(void)
  	max_shadow_read_write_fields = j;
  }
  
@@ -922,7 +990,7 @@ index 18331ebf892f..c443f39e016a 100644
  static __init int alloc_kvm_area(void)
  {
  	int cpu;
-@@ -7234,6 +7611,25 @@ static int handle_triple_fault(struct kvm_vcpu *vcpu)
+@@ -7234,6 +7679,25 @@ static int handle_triple_fault(struct kvm_vcpu *vcpu)
  	return 0;
  }
  
@@ -948,7 +1016,7 @@ index 18331ebf892f..c443f39e016a 100644
  static int handle_io(struct kvm_vcpu *vcpu)
  {
  	unsigned long exit_qualification;
-@@ -8153,6 +8549,19 @@ static int handle_monitor(struct kvm_vcpu *vcpu)
+@@ -8153,6 +8617,19 @@ static int handle_monitor(struct kvm_vcpu *vcpu)
   * set the success or error code of an emulated VMX instruction, as specified
   * by Vol 2B, VMX Instruction Reference, "Conventions".
   */
@@ -968,7 +1036,7 @@ index 18331ebf892f..c443f39e016a 100644
  static void nested_vmx_succeed(struct kvm_vcpu *vcpu)
  {
  	vmx_set_rflags(vcpu, vmx_get_rflags(vcpu)
-@@ -8168,6 +8577,27 @@ static void nested_vmx_failInvalid(struct kvm_vcpu *vcpu)
+@@ -8168,6 +8645,27 @@ static void nested_vmx_failInvalid(struct kvm_vcpu *vcpu)
  			| X86_EFLAGS_CF);
  }
  
@@ -996,7 +1064,7 @@ index 18331ebf892f..c443f39e016a 100644
  static void nested_vmx_failValid(struct kvm_vcpu *vcpu,
  					u32 vm_instruction_error)
  {
-@@ -8328,9 +8758,18 @@ static int nested_vmx_get_vmptr(struct kvm_vcpu *vcpu, gpa_t *vmpointer)
+@@ -8328,9 +8826,18 @@ static int nested_vmx_get_vmptr(struct kvm_vcpu *vcpu, gpa_t *vmpointer)
   * VMCS, unless such a shadow VMCS already exists. The newly allocated
   * VMCS is also VMCLEARed, so that it is ready for use.
   */
@@ -1015,7 +1083,7 @@ index 18331ebf892f..c443f39e016a 100644
  	struct loaded_vmcs *loaded_vmcs = vmx->loaded_vmcs;
  
  	/*
-@@ -8341,6 +8780,26 @@ static struct vmcs *alloc_shadow_vmcs(struct kvm_vcpu *vcpu)
+@@ -8341,6 +8848,26 @@ static struct vmcs *alloc_shadow_vmcs(struct kvm_vcpu *vcpu)
  	 */
  	WARN_ON(loaded_vmcs == &vmx->vmcs01 && loaded_vmcs->shadow_vmcs);
  
@@ -1042,7 +1110,7 @@ index 18331ebf892f..c443f39e016a 100644
  	if (!loaded_vmcs->shadow_vmcs) {
  		loaded_vmcs->shadow_vmcs = alloc_vmcs(true);
  		if (loaded_vmcs->shadow_vmcs)
-@@ -8349,6 +8808,19 @@ static struct vmcs *alloc_shadow_vmcs(struct kvm_vcpu *vcpu)
+@@ -8349,6 +8876,19 @@ static struct vmcs *alloc_shadow_vmcs(struct kvm_vcpu *vcpu)
  	return loaded_vmcs->shadow_vmcs;
  }
  
@@ -1062,7 +1130,7 @@ index 18331ebf892f..c443f39e016a 100644
  static int enter_vmx_operation(struct kvm_vcpu *vcpu)
  {
  	struct vcpu_vmx *vmx = to_vmx(vcpu);
-@@ -8375,6 +8847,14 @@ static int enter_vmx_operation(struct kvm_vcpu *vcpu)
+@@ -8375,6 +8915,14 @@ static int enter_vmx_operation(struct kvm_vcpu *vcpu)
  
  	vmx->nested.vpid02 = allocate_vpid();
  
@@ -1077,7 +1145,7 @@ index 18331ebf892f..c443f39e016a 100644
  	vmx->nested.vmxon = true;
  	return 0;
  
-@@ -8469,7 +8949,28 @@ static int handle_vmon(struct kvm_vcpu *vcpu)
+@@ -8469,7 +9017,28 @@ static int handle_vmon(struct kvm_vcpu *vcpu)
  	kunmap(page);
  	kvm_release_page_clean(page);
  
@@ -1106,7 +1174,7 @@ index 18331ebf892f..c443f39e016a 100644
  	ret = enter_vmx_operation(vcpu);
  	if (ret)
  		return ret;
-@@ -8500,16 +9001,33 @@ static int nested_vmx_check_permission(struct kvm_vcpu *vcpu)
+@@ -8500,16 +9069,33 @@ static int nested_vmx_check_permission(struct kvm_vcpu *vcpu)
  	return 1;
  }
  
@@ -1140,7 +1208,7 @@ index 18331ebf892f..c443f39e016a 100644
  	if (vmx->nested.current_vmptr == -1ull)
  		return;
  
-@@ -8517,6 +9035,16 @@ static inline void nested_release_vmcs12(struct kvm_vcpu *vcpu)
+@@ -8517,6 +9103,16 @@ static inline void nested_release_vmcs12(struct kvm_vcpu *vcpu)
  		/* copy to memory all shadowed fields in case
  		   they were modified */
  		copy_shadow_to_vmcs12(vmx);
@@ -1157,7 +1225,7 @@ index 18331ebf892f..c443f39e016a 100644
  		vmx->nested.sync_shadow_vmcs = false;
  		vmx_disable_shadow_vmcs(vmx);
  	}
-@@ -8536,6 +9064,12 @@ static inline void nested_release_vmcs12(struct kvm_vcpu *vcpu)
+@@ -8536,6 +9132,12 @@ static inline void nested_release_vmcs12(struct kvm_vcpu *vcpu)
   * Free whatever needs to be freed from vmx->nested when L1 goes down, or
   * just stops using VMX.
   */
@@ -1170,7 +1238,7 @@ index 18331ebf892f..c443f39e016a 100644
  static void free_nested(struct kvm_vcpu *vcpu)
  {
  	struct vcpu_vmx *vmx = to_vmx(vcpu);
-@@ -8553,6 +9087,21 @@ static void free_nested(struct kvm_vcpu *vcpu)
+@@ -8553,6 +9155,21 @@ static void free_nested(struct kvm_vcpu *vcpu)
  		vmx_disable_shadow_vmcs(vmx);
  		vmcs_clear(vmx->vmcs01.shadow_vmcs);
  		free_vmcs(vmx->vmcs01.shadow_vmcs);
@@ -1192,7 +1260,7 @@ index 18331ebf892f..c443f39e016a 100644
  		vmx->vmcs01.shadow_vmcs = NULL;
  	}
  	kfree(vmx->nested.cached_vmcs12);
-@@ -8583,6 +9132,12 @@ static int handle_vmoff(struct kvm_vcpu *vcpu)
+@@ -8583,6 +9200,12 @@ static int handle_vmoff(struct kvm_vcpu *vcpu)
  {
  	if (!nested_vmx_check_permission(vcpu))
  		return 1;
@@ -1205,7 +1273,7 @@ index 18331ebf892f..c443f39e016a 100644
  	free_nested(vcpu);
  	nested_vmx_succeed(vcpu);
  	return kvm_skip_emulated_instruction(vcpu);
-@@ -8611,6 +9166,17 @@ static int handle_vmclear(struct kvm_vcpu *vcpu)
+@@ -8611,6 +9234,17 @@ static int handle_vmclear(struct kvm_vcpu *vcpu)
  		return kvm_skip_emulated_instruction(vcpu);
  	}
  
@@ -1223,7 +1291,7 @@ index 18331ebf892f..c443f39e016a 100644
  	if (vmptr == vmx->nested.current_vmptr)
  		nested_release_vmcs12(vcpu);
  
-@@ -8708,6 +9274,15 @@ static inline int vmcs12_write_any(struct vmcs12 *vmcs12,
+@@ -8708,6 +9342,15 @@ static inline int vmcs12_write_any(struct vmcs12 *vmcs12,
   * VM-exit information fields are actually writable if the vCPU is
   * configured to support "VMWRITE to any supported field in the VMCS."
   */
@@ -1239,7 +1307,7 @@ index 18331ebf892f..c443f39e016a 100644
  static void copy_shadow_to_vmcs12(struct vcpu_vmx *vmx)
  {
  	const u16 *fields[] = {
-@@ -8721,6 +9296,12 @@ static void copy_shadow_to_vmcs12(struct vcpu_vmx *vmx)
+@@ -8721,6 +9364,12 @@ static void copy_shadow_to_vmcs12(struct vcpu_vmx *vmx)
  	int i, q;
  	unsigned long field;
  	u64 field_value;
@@ -1252,7 +1320,7 @@ index 18331ebf892f..c443f39e016a 100644
  	struct vmcs *shadow_vmcs = vmx->vmcs01.shadow_vmcs;
  
  	preempt_disable();
-@@ -8731,6 +9312,14 @@ static void copy_shadow_to_vmcs12(struct vcpu_vmx *vmx)
+@@ -8731,6 +9380,14 @@ static void copy_shadow_to_vmcs12(struct vcpu_vmx *vmx)
  		for (i = 0; i < max_fields[q]; i++) {
  			field = fields[q][i];
  			field_value = __vmcs_readl(field);
@@ -1267,7 +1335,7 @@ index 18331ebf892f..c443f39e016a 100644
  			vmcs12_write_any(get_vmcs12(&vmx->vcpu), field, field_value);
  		}
  		/*
-@@ -8746,6 +9335,12 @@ static void copy_shadow_to_vmcs12(struct vcpu_vmx *vmx)
+@@ -8746,6 +9403,13 @@ static void copy_shadow_to_vmcs12(struct vcpu_vmx *vmx)
  	preempt_enable();
  }
  
@@ -1276,11 +1344,12 @@ index 18331ebf892f..c443f39e016a 100644
 + *   - arch/x86/kvm/vmx.c|10825| <<vmx_vcpu_run>> copy_vmcs12_to_shadow(vmx);
 + *
 + * 把vmx->nested.cached_vmcs12(类型vmcs12)给同步到vmx->vmcs01.shadow_vmcs(类型vmcs)
++ * 这里为了在L1修改针对L2的vmcs时不用trap到L0了
 + */
  static void copy_vmcs12_to_shadow(struct vcpu_vmx *vmx)
  {
  	const u16 *fields[] = {
-@@ -8759,6 +9354,32 @@ static void copy_vmcs12_to_shadow(struct vcpu_vmx *vmx)
+@@ -8759,6 +9423,32 @@ static void copy_vmcs12_to_shadow(struct vcpu_vmx *vmx)
  	int i, q;
  	unsigned long field;
  	u64 field_value = 0;
@@ -1313,7 +1382,7 @@ index 18331ebf892f..c443f39e016a 100644
  	struct vmcs *shadow_vmcs = vmx->vmcs01.shadow_vmcs;
  
  	vmcs_load(shadow_vmcs);
-@@ -8766,6 +9387,14 @@ static void copy_vmcs12_to_shadow(struct vcpu_vmx *vmx)
+@@ -8766,6 +9456,14 @@ static void copy_vmcs12_to_shadow(struct vcpu_vmx *vmx)
  	for (q = 0; q < ARRAY_SIZE(fields); q++) {
  		for (i = 0; i < max_fields[q]; i++) {
  			field = fields[q][i];
@@ -1328,7 +1397,7 @@ index 18331ebf892f..c443f39e016a 100644
  			vmcs12_read_any(get_vmcs12(&vmx->vcpu), field, &field_value);
  			__vmcs_writel(field, field_value);
  		}
-@@ -8804,6 +9433,14 @@ static int handle_vmread(struct kvm_vcpu *vcpu)
+@@ -8804,6 +9502,14 @@ static int handle_vmread(struct kvm_vcpu *vcpu)
  	if (!nested_vmx_check_vmcs12(vcpu))
  		return kvm_skip_emulated_instruction(vcpu);
  
@@ -1343,7 +1412,7 @@ index 18331ebf892f..c443f39e016a 100644
  	if (!is_guest_mode(vcpu))
  		vmcs12 = get_vmcs12(vcpu);
  	else {
-@@ -8815,6 +9452,14 @@ static int handle_vmread(struct kvm_vcpu *vcpu)
+@@ -8815,6 +9521,14 @@ static int handle_vmread(struct kvm_vcpu *vcpu)
  			nested_vmx_failInvalid(vcpu);
  			return kvm_skip_emulated_instruction(vcpu);
  		}
@@ -1358,7 +1427,7 @@ index 18331ebf892f..c443f39e016a 100644
  		vmcs12 = get_shadow_vmcs12(vcpu);
  	}
  
-@@ -8942,14 +9587,47 @@ static int handle_vmwrite(struct kvm_vcpu *vcpu)
+@@ -8942,14 +9656,47 @@ static int handle_vmwrite(struct kvm_vcpu *vcpu)
  	return kvm_skip_emulated_instruction(vcpu);
  }
  
@@ -1406,7 +1475,7 @@ index 18331ebf892f..c443f39e016a 100644
  		vmx->nested.sync_shadow_vmcs = true;
  	}
  	vmx->nested.dirty_vmcs12 = true;
-@@ -8972,11 +9650,28 @@ static int handle_vmptrld(struct kvm_vcpu *vcpu)
+@@ -8972,11 +9719,28 @@ static int handle_vmptrld(struct kvm_vcpu *vcpu)
  		return kvm_skip_emulated_instruction(vcpu);
  	}
  
@@ -1435,7 +1504,7 @@ index 18331ebf892f..c443f39e016a 100644
  	if (vmx->nested.current_vmptr != vmptr) {
  		struct vmcs12 *new_vmcs12;
  		struct page *page;
-@@ -9002,10 +9697,29 @@ static int handle_vmptrld(struct kvm_vcpu *vcpu)
+@@ -9002,10 +9766,29 @@ static int handle_vmptrld(struct kvm_vcpu *vcpu)
  		 * Load VMCS12 from guest memory since it is not already
  		 * cached.
  		 */
@@ -1465,7 +1534,7 @@ index 18331ebf892f..c443f39e016a 100644
  		set_current_vmptr(vmx, vmptr);
  	}
  
-@@ -10143,6 +10857,12 @@ static void dump_vmcs(void)
+@@ -10143,6 +10926,12 @@ static void dump_vmcs(void)
   * The guest has exited.  See if we can fix it or if we need userspace
   * assistance.
   */
@@ -1478,7 +1547,7 @@ index 18331ebf892f..c443f39e016a 100644
  static int vmx_handle_exit(struct kvm_vcpu *vcpu)
  {
  	struct vcpu_vmx *vmx = to_vmx(vcpu);
-@@ -10593,6 +11313,10 @@ static bool vmx_xsaves_supported(void)
+@@ -10593,6 +11382,10 @@ static bool vmx_xsaves_supported(void)
  		SECONDARY_EXEC_XSAVES;
  }
  
@@ -1489,7 +1558,7 @@ index 18331ebf892f..c443f39e016a 100644
  static void vmx_recover_nmi_blocking(struct vcpu_vmx *vmx)
  {
  	u32 exit_intr_info;
-@@ -10734,6 +11458,10 @@ static void vmx_arm_hv_timer(struct vcpu_vmx *vmx, u32 val)
+@@ -10734,6 +11527,10 @@ static void vmx_arm_hv_timer(struct vcpu_vmx *vmx, u32 val)
  	vmx->loaded_vmcs->hv_timer_armed = true;
  }
  
@@ -1500,7 +1569,7 @@ index 18331ebf892f..c443f39e016a 100644
  static void vmx_update_hv_timer(struct kvm_vcpu *vcpu)
  {
  	struct vcpu_vmx *vmx = to_vmx(vcpu);
-@@ -10764,18 +11492,54 @@ static void vmx_update_hv_timer(struct kvm_vcpu *vcpu)
+@@ -10764,18 +11561,54 @@ static void vmx_update_hv_timer(struct kvm_vcpu *vcpu)
  	vmx->loaded_vmcs->hv_timer_armed = false;
  }
  
@@ -1555,7 +1624,7 @@ index 18331ebf892f..c443f39e016a 100644
  	if (vmx->emulation_required)
  		return;
  
-@@ -10784,8 +11548,34 @@ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
+@@ -10784,8 +11617,35 @@ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
  		vmcs_write32(PLE_WINDOW, vmx->ple_window);
  	}
  
@@ -1574,6 +1643,7 @@ index 18331ebf892f..c443f39e016a 100644
 +	 *      -> bool sync_shadow_vmcs;
 +	 *
 +	 * 把vmx->nested.cached_vmcs12(类型vmcs12)给同步到vmx->vmcs01.shadow_vmcs(类型vmcs)
++	 * 这里为了在L1修改针对L2的vmcs时不用trap到L0了
 +	 */
  	if (vmx->nested.sync_shadow_vmcs) {
  		copy_vmcs12_to_shadow(vmx);
@@ -1590,7 +1660,7 @@ index 18331ebf892f..c443f39e016a 100644
  		vmx->nested.sync_shadow_vmcs = false;
  	}
  
-@@ -10829,8 +11619,27 @@ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
+@@ -10829,8 +11689,27 @@ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
  	 * is no need to worry about the conditional branch over the wrmsr
  	 * being speculatively taken.
  	 */
@@ -1618,7 +1688,7 @@ index 18331ebf892f..c443f39e016a 100644
  	vmx->__launched = vmx->loaded_vmcs->launched;
  
  	evmcs_rsp = static_branch_unlikely(&enable_evmcs) ?
-@@ -10989,6 +11798,14 @@ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
+@@ -10989,6 +11868,14 @@ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
  			vmx->spec_ctrl = native_read_msr(MSR_IA32_SPEC_CTRL);
  	}
  
@@ -1633,7 +1703,7 @@ index 18331ebf892f..c443f39e016a 100644
  	x86_spec_ctrl_restore_host(vmx->spec_ctrl, 0);
  
  	/* All fields are clean at this point */
-@@ -11039,6 +11856,13 @@ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
+@@ -11039,6 +11926,13 @@ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
  	if (vmx->fail || (vmx->exit_reason & VMX_EXIT_REASONS_FAILED_VMENTRY))
  		return;
  
@@ -1647,7 +1717,7 @@ index 18331ebf892f..c443f39e016a 100644
  	vmx->loaded_vmcs->launched = 1;
  	vmx->idt_vectoring_info = vmcs_read32(IDT_VECTORING_INFO_FIELD);
  
-@@ -11059,6 +11883,38 @@ static void vmx_vm_free(struct kvm *kvm)
+@@ -11059,6 +11953,38 @@ static void vmx_vm_free(struct kvm *kvm)
  	vfree(to_kvm_vmx(kvm));
  }
  
@@ -1686,7 +1756,7 @@ index 18331ebf892f..c443f39e016a 100644
  static void vmx_switch_vmcs(struct kvm_vcpu *vcpu, struct loaded_vmcs *vmcs)
  {
  	struct vcpu_vmx *vmx = to_vmx(vcpu);
-@@ -11069,6 +11925,21 @@ static void vmx_switch_vmcs(struct kvm_vcpu *vcpu, struct loaded_vmcs *vmcs)
+@@ -11069,6 +11995,21 @@ static void vmx_switch_vmcs(struct kvm_vcpu *vcpu, struct loaded_vmcs *vmcs)
  
  	cpu = get_cpu();
  	vmx_vcpu_put(vcpu);
@@ -1708,7 +1778,7 @@ index 18331ebf892f..c443f39e016a 100644
  	vmx->loaded_vmcs = vmcs;
  	vmx_vcpu_load(vcpu, cpu);
  	put_cpu();
-@@ -11078,14 +11949,31 @@ static void vmx_switch_vmcs(struct kvm_vcpu *vcpu, struct loaded_vmcs *vmcs)
+@@ -11078,14 +12019,31 @@ static void vmx_switch_vmcs(struct kvm_vcpu *vcpu, struct loaded_vmcs *vmcs)
   * Ensure that the current vmcs of the logical processor is the
   * vmcs01 of the vcpu before calling free_nested().
   */
@@ -1740,7 +1810,7 @@ index 18331ebf892f..c443f39e016a 100644
  static void vmx_free_vcpu(struct kvm_vcpu *vcpu)
  {
  	struct vcpu_vmx *vmx = to_vmx(vcpu);
-@@ -11101,6 +11989,14 @@ static void vmx_free_vcpu(struct kvm_vcpu *vcpu)
+@@ -11101,6 +12059,14 @@ static void vmx_free_vcpu(struct kvm_vcpu *vcpu)
  	kmem_cache_free(kvm_vcpu_cache, vmx);
  }
  
@@ -1755,7 +1825,7 @@ index 18331ebf892f..c443f39e016a 100644
  static struct kvm_vcpu *vmx_create_vcpu(struct kvm *kvm, unsigned int id)
  {
  	int err;
-@@ -11151,6 +12047,21 @@ static struct kvm_vcpu *vmx_create_vcpu(struct kvm *kvm, unsigned int id)
+@@ -11151,6 +12117,21 @@ static struct kvm_vcpu *vmx_create_vcpu(struct kvm *kvm, unsigned int id)
  	vmx_disable_intercept_for_msr(msr_bitmap, MSR_IA32_SYSENTER_EIP, MSR_TYPE_RW);
  	vmx->msr_bitmap_mode = 0;
  
@@ -1777,7 +1847,22 @@ index 18331ebf892f..c443f39e016a 100644
  	vmx->loaded_vmcs = &vmx->vmcs01;
  	cpu = get_cpu();
  	vmx_vcpu_load(&vmx->vcpu, cpu);
-@@ -12074,6 +12985,16 @@ static int nested_vmx_load_cr3(struct kvm_vcpu *vcpu, unsigned long cr3, bool ne
+@@ -11761,6 +12742,14 @@ static void nested_cache_shadow_vmcs12(struct kvm_vcpu *vcpu,
+ 	    vmcs12->vmcs_link_pointer == -1ull)
+ 		return;
+ 
++	/*
++	 * 返回to_vmx(vcpu)->nested.cached_shadow_vmcs12;
++	 *
++	 * struct vcpu_vmx:
++	 *  -> struct nested_vmx nested;
++	 *      -> struct vmcs12 *cached_vmcs12;
++	 *      -> struct vmcs12 *cached_shadow_vmcs12;
++	 */
+ 	shadow = get_shadow_vmcs12(vcpu);
+ 	page = kvm_vcpu_gpa_to_page(vcpu, vmcs12->vmcs_link_pointer);
+ 
+@@ -12074,6 +13063,16 @@ static int nested_vmx_load_cr3(struct kvm_vcpu *vcpu, unsigned long cr3, bool ne
  	return 0;
  }
  
@@ -1794,7 +1879,7 @@ index 18331ebf892f..c443f39e016a 100644
  static void prepare_vmcs02_full(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12)
  {
  	struct vcpu_vmx *vmx = to_vmx(vcpu);
-@@ -12210,6 +13131,15 @@ static void prepare_vmcs02_full(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12)
+@@ -12210,6 +13209,15 @@ static void prepare_vmcs02_full(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12)
   * Returns 0 on success, 1 on failure. Invalid state exit qualification code
   * is assigned to entry_failure_code on failure.
   */
@@ -1810,7 +1895,7 @@ index 18331ebf892f..c443f39e016a 100644
  static int prepare_vmcs02(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12,
  			  u32 *entry_failure_code)
  {
-@@ -12718,6 +13648,12 @@ static int check_vmentry_postreqs(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12,
+@@ -12718,6 +13726,12 @@ static int check_vmentry_postreqs(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12,
   * If exit_qual is NULL, this is being called from state restore (either RSM
   * or KVM_SET_NESTED_STATE).  Otherwise it's called from vmlaunch/vmresume.
   */
@@ -1823,7 +1908,7 @@ index 18331ebf892f..c443f39e016a 100644
  static int enter_vmx_non_root_mode(struct kvm_vcpu *vcpu, u32 *exit_qual)
  {
  	struct vcpu_vmx *vmx = to_vmx(vcpu);
-@@ -12732,6 +13668,13 @@ static int enter_vmx_non_root_mode(struct kvm_vcpu *vcpu, u32 *exit_qual)
+@@ -12732,6 +13746,13 @@ static int enter_vmx_non_root_mode(struct kvm_vcpu *vcpu, u32 *exit_qual)
  	if (likely(!evaluate_pending_interrupts) && kvm_vcpu_apicv_active(vcpu))
  		evaluate_pending_interrupts |= vmx_has_apicv_interrupt(vcpu);
  
@@ -1837,7 +1922,7 @@ index 18331ebf892f..c443f39e016a 100644
  	enter_guest_mode(vcpu);
  
  	if (!(vmcs12->vm_entry_controls & VM_ENTRY_LOAD_DEBUG_CONTROLS))
-@@ -12740,6 +13683,32 @@ static int enter_vmx_non_root_mode(struct kvm_vcpu *vcpu, u32 *exit_qual)
+@@ -12740,6 +13761,32 @@ static int enter_vmx_non_root_mode(struct kvm_vcpu *vcpu, u32 *exit_qual)
  		!(vmcs12->vm_entry_controls & VM_ENTRY_LOAD_BNDCFGS))
  		vmx->nested.vmcs01_guest_bndcfgs = vmcs_read64(GUEST_BNDCFGS);
  
@@ -1870,7 +1955,7 @@ index 18331ebf892f..c443f39e016a 100644
  	vmx_switch_vmcs(vcpu, &vmx->nested.vmcs02);
  	vmx_segment_cache_clear(vmx);
  
-@@ -12747,6 +13716,17 @@ static int enter_vmx_non_root_mode(struct kvm_vcpu *vcpu, u32 *exit_qual)
+@@ -12747,6 +13794,17 @@ static int enter_vmx_non_root_mode(struct kvm_vcpu *vcpu, u32 *exit_qual)
  		vcpu->arch.tsc_offset += vmcs12->tsc_offset;
  
  	r = EXIT_REASON_INVALID_STATE;
@@ -1888,7 +1973,7 @@ index 18331ebf892f..c443f39e016a 100644
  	if (prepare_vmcs02(vcpu, vmcs12, from_vmentry ? exit_qual : &dummy_exit_qual))
  		goto fail;
  
-@@ -12798,7 +13778,22 @@ static int enter_vmx_non_root_mode(struct kvm_vcpu *vcpu, u32 *exit_qual)
+@@ -12798,7 +13856,22 @@ static int enter_vmx_non_root_mode(struct kvm_vcpu *vcpu, u32 *exit_qual)
  fail:
  	if (vmcs12->cpu_based_vm_exec_control & CPU_BASED_USE_TSC_OFFSETING)
  		vcpu->arch.tsc_offset -= vmcs12->tsc_offset;
@@ -1911,7 +1996,7 @@ index 18331ebf892f..c443f39e016a 100644
  	vmx_switch_vmcs(vcpu, &vmx->vmcs01);
  	return r;
  }
-@@ -12807,6 +13802,32 @@ static int enter_vmx_non_root_mode(struct kvm_vcpu *vcpu, u32 *exit_qual)
+@@ -12807,6 +13880,32 @@ static int enter_vmx_non_root_mode(struct kvm_vcpu *vcpu, u32 *exit_qual)
   * nested_vmx_run() handles a nested entry, i.e., a VMLAUNCH or VMRESUME on L1
   * for running an L2 nested guest.
   */
@@ -1944,7 +2029,7 @@ index 18331ebf892f..c443f39e016a 100644
  static int nested_vmx_run(struct kvm_vcpu *vcpu, bool launch)
  {
  	struct vmcs12 *vmcs12;
-@@ -12821,6 +13842,14 @@ static int nested_vmx_run(struct kvm_vcpu *vcpu, bool launch)
+@@ -12821,6 +13920,14 @@ static int nested_vmx_run(struct kvm_vcpu *vcpu, bool launch)
  	if (!nested_vmx_check_vmcs12(vcpu))
  		goto out;
  
@@ -1959,7 +2044,7 @@ index 18331ebf892f..c443f39e016a 100644
  	vmcs12 = get_vmcs12(vcpu);
  
  	/*
-@@ -12834,6 +13863,15 @@ static int nested_vmx_run(struct kvm_vcpu *vcpu, bool launch)
+@@ -12834,6 +13941,15 @@ static int nested_vmx_run(struct kvm_vcpu *vcpu, bool launch)
  		goto out;
  	}
  
@@ -1975,7 +2060,7 @@ index 18331ebf892f..c443f39e016a 100644
  	if (enable_shadow_vmcs)
  		copy_shadow_to_vmcs12(vmx);
  
-@@ -12887,6 +13925,31 @@ static int nested_vmx_run(struct kvm_vcpu *vcpu, bool launch)
+@@ -12887,6 +14003,31 @@ static int nested_vmx_run(struct kvm_vcpu *vcpu, bool launch)
  	 * the nested entry.
  	 */
  
@@ -2007,7 +2092,7 @@ index 18331ebf892f..c443f39e016a 100644
  	vmx->nested.nested_run_pending = 1;
  	ret = enter_vmx_non_root_mode(vcpu, &exit_qual);
  	if (ret) {
-@@ -13394,6 +14457,19 @@ static void load_vmcs12_host_state(struct kvm_vcpu *vcpu,
+@@ -13394,6 +14535,19 @@ static void load_vmcs12_host_state(struct kvm_vcpu *vcpu,
   * and modify vmcs12 to make it see what it would expect to see there if
   * L2 was its real guest. Must only be called when in L2 (is_guest_mode())
   */
@@ -2027,7 +2112,7 @@ index 18331ebf892f..c443f39e016a 100644
  static void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 exit_reason,
  			      u32 exit_intr_info,
  			      unsigned long exit_qualification)
-@@ -13440,6 +14516,10 @@ static void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 exit_reason,
+@@ -13440,6 +14594,10 @@ static void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 exit_reason,
  			nested_vmx_abort(vcpu, VMX_ABORT_SAVE_GUEST_MSR_FAIL);
  	}
  
@@ -2038,7 +2123,7 @@ index 18331ebf892f..c443f39e016a 100644
  	vmx_switch_vmcs(vcpu, &vmx->vmcs01);
  	vm_entry_controls_reset_shadow(vmx);
  	vm_exit_controls_reset_shadow(vmx);
-@@ -13487,6 +14567,16 @@ static void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 exit_reason,
+@@ -13487,6 +14645,16 @@ static void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 exit_reason,
  	 */
  	kvm_make_request(KVM_REQ_APIC_PAGE_RELOAD, vcpu);
  
@@ -2055,7 +2140,7 @@ index 18331ebf892f..c443f39e016a 100644
  	if (enable_shadow_vmcs && exit_reason != -1)
  		vmx->nested.sync_shadow_vmcs = true;
  
-@@ -13547,6 +14637,12 @@ static void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 exit_reason,
+@@ -13547,6 +14715,12 @@ static void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 exit_reason,
  /*
   * Forcibly leave nested mode in order to be able to reset the VCPU later on.
   */
@@ -2068,7 +2153,7 @@ index 18331ebf892f..c443f39e016a 100644
  static void vmx_leave_nested(struct kvm_vcpu *vcpu)
  {
  	if (is_guest_mode(vcpu)) {
-@@ -14142,6 +15238,12 @@ static int vmx_get_nested_state(struct kvm_vcpu *vcpu,
+@@ -14142,6 +15316,12 @@ static int vmx_get_nested_state(struct kvm_vcpu *vcpu,
  	return kvm_state.size;
  }
  
@@ -2081,7 +2166,7 @@ index 18331ebf892f..c443f39e016a 100644
  static int vmx_set_nested_state(struct kvm_vcpu *vcpu,
  				struct kvm_nested_state __user *user_kvm_nested_state,
  				struct kvm_nested_state *kvm_state)
-@@ -14452,6 +15554,10 @@ static void vmx_exit(void)
+@@ -14452,6 +15632,10 @@ static void vmx_exit(void)
  }
  module_exit(vmx_exit);
  
