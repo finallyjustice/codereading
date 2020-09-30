@@ -1,0 +1,245 @@
+这是一个mtree的例子.
+
+(qemu) info mtree
+address-space: memory
+  0000000000000000-ffffffffffffffff (prio 0, i/o): system
+    0000000000000000-00000000bb7fffff (prio 0, i/o): alias ram-below-4g @pc.ram 0000000000000000-00000000bb7fffff
+    0000000000000000-ffffffffffffffff (prio -1, i/o): pci
+      00000000000a0000-00000000000affff (prio 2, i/o): alias vga.chain4 @vga.vram 0000000000000000-000000000000ffff
+      00000000000a0000-00000000000bffff (prio 1, i/o): vga-lowmem
+      00000000000c0000-00000000000dffff (prio 1, rom): pc.rom
+      00000000000e0000-00000000000fffff (prio 1, i/o): alias isa-bios @pc.bios 0000000000020000-000000000003ffff
+      00000000fd000000-00000000fdffffff (prio 1, ram): vga.vram
+      00000000fe000000-00000000fe1fffff (prio 1, i/o): alias pci_bridge_pref_mem @pci_bridge_pci 00000000fe000000-00000000fe1fffff
+      00000000fe800000-00000000fe9fffff (prio 1, i/o): alias pci_bridge_mem @pci_bridge_pci 00000000fe800000-00000000fe9fffff
+... ...
+memory-region: pci_bridge_pci
+  0000000000000000-ffffffffffffffff (prio 0, i/o): pci_bridge_pci
+    00000000fe000000-00000000fe003fff (prio 1, i/o): virtio-pci
+      00000000fe000000-00000000fe000fff (prio 0, i/o): virtio-pci-common
+      00000000fe001000-00000000fe001fff (prio 0, i/o): virtio-pci-isr
+      00000000fe002000-00000000fe002fff (prio 0, i/o): virtio-pci-device
+      00000000fe003000-00000000fe003fff (prio 0, i/o): virtio-pci-notify
+    00000000fe800000-00000000fe800fff (prio 1, i/o): vhost-scsi-pci-msix
+      00000000fe800000-00000000fe80003f (prio 0, i/o): msix-table
+      00000000fe800800-00000000fe800807 (prio 0, i/o): msix-pba
+
+
+创建i440fx的VM的时候调用pc_init1(). pc_init1()又调用了i440fx_init()
+
+pci_bus = i440fx_init(host_type,
+                      pci_type,
+                      &i440fx_state, &piix3_devfn, &isa_bus, pcms->gsi,
+                      system_memory, system_io, machine->ram_size,
+                      pcms->below_4g_mem_size,
+                      pcms->above_4g_mem_size,
+                      pci_memory, ram_memory);
+
+在调用的参数中:
+
+system_memory: address space "memory"下的 root MemoryRegion "system"
+pci_memory: "system"下的一个subregion "pci"
+
+
+i440fx_init()调用pci_root_bus_new()为host bridge创建一个root pci bus. 会设置PCIBus->address_space_mem = pci_address_space.
+
+b = pci_root_bus_new(dev, NULL, pci_address_space,
+                     address_space_io, 0, TYPE_PCI_BUS);
+
+再通过调用pc_pci_as_mapping_init()把f->pci_address_space("pci")设置为f->system_memory("system")的subregion.
+
+pc_pci_as_mapping_init(OBJECT(f), f->system_memory,
+                       f->pci_address_space);
+
+
+
+创建pci-bridge设置的时候会调用:
+
+pci_bridge_dev_realize()
+-> pci_bridge_initfn(dev, TYPE_PCI_BUS);
+
+pci_bridge_initfn()会调用qbus_create_inplace()创建一条secondary pci bus.
+
+qbus_create_inplace(sec_bus, sizeof(br->sec_bus), typename, DEVICE(dev),
+                    br->bus_name);
+
+
+pci_bridge_initfn()还会用以下函数创建MemoryRegion "pci_bridge_pci".
+
+sec_bus->address_space_mem = &br->address_space_mem;
+memory_region_init(&br->address_space_mem, OBJECT(br), "pci_bridge_pci", UINT64_MAX);
+r->windows = pci_bridge_region_init(br);
+
+
+pci_bridge_region_init()会调用pci_bridge_init_alias()把"pci_bridge_pref_mem"这个MemoryRegion作为指向"pci_bridge_pci"的alias. 这个"pci_bridge_pref_mem"被插入到parent->address_space_mem("pci" MemoryRegion)作为subregion.
+
+此处parent->address_space_mem是pci-bridge所属的pci bus的MemoryRegion, 也就是root bus的"pci".
+
+pci_bridge_init_alias(br, &w->alias_pref_mem,
+                      PCI_BASE_ADDRESS_MEM_PREFETCH,
+                      "pci_bridge_pref_mem",
+                      &br->address_space_mem,
+                      parent->address_space_mem,
+                      cmd & PCI_COMMAND_MEMORY);
+
+
+
+当初始化一个在pci-bridge上的virtio设备的时候(比如vhost-scsi), 会为pci bar创建一个"virtio-pci"的MemoryRegion, 挂载为"pci_bridge_pci"的一个subregion. "virtio-pci-notify"是"virtio-pci"的一个subregion.
+
+memory-region: pci_bridge_pci
+  0000000000000000-ffffffffffffffff (prio 0, i/o): pci_bridge_pci
+    00000000fe000000-00000000fe003fff (prio 1, i/o): virtio-pci
+      00000000fe000000-00000000fe000fff (prio 0, i/o): virtio-pci-common
+      00000000fe001000-00000000fe001fff (prio 0, i/o): virtio-pci-isr
+      00000000fe002000-00000000fe002fff (prio 0, i/o): virtio-pci-device
+      00000000fe003000-00000000fe003fff (prio 0, i/o): virtio-pci-notify
+    00000000fe800000-00000000fe800fff (prio 1, i/o): vhost-scsi-pci-msix
+      00000000fe800000-00000000fe80003f (prio 0, i/o): msix-table
+      00000000fe800800-00000000fe800807 (prio 0, i/o): msix-pba
+
+
+"virtio-pci-notify"这个MemoryRegion就是用来当作doorbell的. 最后所有的Memory Topology会被render成一个flagview.
+
+(qemu) info mtree -f
+... ...
+FlatView #1
+ AS "memory", root: system
+ AS "cpu-memory-0", root: system
+ AS "cpu-memory-1", root: system
+ AS "cpu-memory-2", root: system
+ AS "cpu-memory-3", root: system
+ AS "e1000", root: bus master container
+ AS "piix3-ide", root: bus master container
+ AS "pci-bridge", root: bus master container
+ AS "vhost-scsi-pci", root: bus master container
+ Root memory region: system
+  0000000000000000-000000000009ffff (prio 0, ram): pc.ram
+  00000000000a0000-00000000000affff (prio 1, ram): vga.vram
+  00000000000b0000-00000000000bffff (prio 1, i/o): vga-lowmem @0000000000010000
+  00000000000c0000-00000000000c9fff (prio 0, rom): pc.ram @00000000000c0000
+  00000000000ca000-00000000000ccfff (prio 0, ram): pc.ram @00000000000ca000
+  00000000000cd000-00000000000e7fff (prio 0, rom): pc.ram @00000000000cd000
+  00000000000e8000-00000000000effff (prio 0, ram): pc.ram @00000000000e8000
+  00000000000f0000-00000000000fffff (prio 0, rom): pc.ram @00000000000f0000
+  0000000000100000-00000000bb7fffff (prio 0, ram): pc.ram @0000000000100000
+  00000000fd000000-00000000fdffffff (prio 1, ram): vga.vram
+  00000000fe000000-00000000fe000fff (prio 0, i/o): virtio-pci-common
+  00000000fe001000-00000000fe001fff (prio 0, i/o): virtio-pci-isr
+  00000000fe002000-00000000fe002fff (prio 0, i/o): virtio-pci-device
+  00000000fe003000-00000000fe003fff (prio 0, i/o): virtio-pci-notify
+  00000000fe800000-00000000fe80003f (prio 0, i/o): msix-table
+  00000000fe800800-00000000fe800807 (prio 0, i/o): msix-pba
+  00000000fea40000-00000000fea5ffff (prio 1, i/o): e1000-mmio
+  00000000fea70400-00000000fea7041f (prio 0, i/o): vga ioports remapped
+  00000000fea70500-00000000fea70515 (prio 0, i/o): bochs dispi interface
+  00000000fea70600-00000000fea70607 (prio 0, i/o): qemu extended regs
+  00000000fea71000-00000000fea7109f (prio 0, i/o): shpc-mmio
+  00000000fec00000-00000000fec00fff (prio 0, i/o): kvm-ioapic
+  00000000fed00000-00000000fed003ff (prio 0, i/o): hpet
+  00000000fee00000-00000000feefffff (prio 4096, i/o): kvm-apic-msi
+  00000000fffc0000-00000000ffffffff (prio 0, rom): pc.bios
+
+
+生成FlatView的时候, 因为"virtio-pci-modern"这个MemoryRegion有ioeventfds, 所以memory_region_transaction_commit()会通过address_space_update_ioeventfds()调用address_space_add_del_ioeventfds().
+
+最终kvm_mem_ioeventfd_add()会被触发让kernel创建对应的ioeventfd.
+
+(gdb) bt
+#0  kvm_mem_ioeventfd_add (listener=0x555556843260, section=0x7fffeec13490, match_data=false, data=1, e=0x7fffec8480f8) at /home/zhang/kvm/qemu-3.0.0/accel/kvm/kvm-all.c:816
+#1  0x0000555555863789 in address_space_add_del_ioeventfds (as=0x5555566f7e80 <address_space_memory>, fds_new=0x7fffe006ded0, fds_new_nb=3, fds_old=0x0, fds_old_nb=0)
+                                                            at /home/zhang/kvm/qemu-3.0.0/memory.c:812
+#2  0x0000555555863a7a in address_space_update_ioeventfds (as=0x5555566f7e80 <address_space_memory>) at /home/zhang/kvm/qemu-3.0.0/memory.c:862
+#3  0x00005555558644d1 in memory_region_transaction_commit () at /home/zhang/kvm/qemu-3.0.0/memory.c:1058
+#4  0x0000555555b1c42b in pci_bridge_update_mappings (br=0x5555579d7450) at hw/pci/pci_bridge.c:245
+#5  0x0000555555b1c535 in pci_bridge_write_config (d=0x5555579d7450, address=4, val=259, len=2) at hw/pci/pci_bridge.c:270
+#6  0x0000555555b0ce5b in pci_bridge_dev_write_config (d=0x5555579d7450, address=4, val=259, len=2) at hw/pci-bridge/pci_bridge_dev.c:138
+#7  0x0000555555b21b45 in pci_host_config_write_common (pci_dev=0x5555579d7450, addr=4, limit=256, val=259, len=2) at hw/pci/pci_host.c:66
+#8  0x0000555555b21c6a in pci_data_write (s=0x555556a2bac0, addr=2147491844, val=259, len=2) at hw/pci/pci_host.c:100
+#9  0x0000555555b21d96 in pci_host_data_write (opaque=0x555556a29ff0, addr=0, val=259, len=2) at hw/pci/pci_host.c:153
+#10 0x000055555586265a in memory_region_write_accessor (mr=0x555556a2a3f0, addr=0, value=0x7fffeec137e8, size=2, shift=0, mask=65535, attrs=...) at /home/zhang/kvm/qemu-3.0.0/memory.c:527
+#11 0x000055555586286f in access_with_adjusted_size (addr=0, value=0x7fffeec137e8, size=2, access_size_min=1, access_size_max=4, access_fn=0x555555862570 <memory_region_write_accessor>,
+                                                     mr=0x555556a2a3f0, attrs=...) at /home/zhang/kvm/qemu-3.0.0/memory.c:594
+#12 0x000055555586552a in memory_region_dispatch_write (mr=0x555556a2a3f0, addr=0, data=259, size=2, attrs=...) at /home/zhang/kvm/qemu-3.0.0/memory.c:1473
+#13 0x0000555555801906 in flatview_write_continue (fv=0x7fffe0205600, addr=3324, attrs=..., buf=0x7ffff7ff3000 "\003\001", len=2, addr1=0, l=2, mr=0x555556a2a3f0)
+                                                   at /home/zhang/kvm/qemu-3.0.0/exec.c:3255
+#14 0x0000555555801a50 in flatview_write (fv=0x7fffe0205600, addr=3324, attrs=..., buf=0x7ffff7ff3000 "\003\001", len=2) at /home/zhang/kvm/qemu-3.0.0/exec.c:3294
+#15 0x0000555555801d56 in address_space_write (as=0x5555566f7e20 <address_space_io>, addr=3324, attrs=..., buf=0x7ffff7ff3000 "\003\001", len=2) at /home/zhang/kvm/qemu-3.0.0/exec.c:3384
+#16 0x0000555555801da7 in address_space_rw (as=0x5555566f7e20 <address_space_io>, addr=3324, attrs=..., buf=0x7ffff7ff3000 "\003\001", len=2, is_write=true) at /home/zhang/kvm/qemu-3.0.0/exec.c:3395
+#17 0x000055555588014a in kvm_handle_io (port=3324, attrs=..., data=0x7ffff7ff3000, direction=1, size=2, count=1) at /home/zhang/kvm/qemu-3.0.0/accel/kvm/kvm-all.c:1729
+#18 0x0000555555880871 in kvm_cpu_exec (cpu=0x555556871db0) at /home/zhang/kvm/qemu-3.0.0/accel/kvm/kvm-all.c:1969
+#19 0x0000555555847c09 in qemu_kvm_cpu_thread_fn (arg=0x555556871db0) at /home/zhang/kvm/qemu-3.0.0/cpus.c:1215
+#20 0x0000555555d74429 in qemu_thread_start (args=0x555556893d10) at util/qemu-thread-posix.c:504
+#21 0x00007ffff5709ea5 in start_thread () from /lib64/libpthread.so.0
+#22 0x00007ffff54328cd in clone () from /lib64/libc.so.6
+
+
+当在VM中的kernel module写入以下的时候:
+
+pci_write_config_dword(dev, PCI_PREF_BASE_UPPER32, 0xffffffff);
+
+memory_region_transaction_commit()在重新生成topology和FlatView的时候就看不到virtio的了.
+
+FlatView #3
+133  AS "memory", root: system
+134  AS "cpu-memory-0", root: system
+135  AS "cpu-memory-1", root: system
+136  AS "cpu-memory-2", root: system
+137  AS "cpu-memory-3", root: system
+138  AS "e1000", root: bus master container
+139  AS "piix3-ide", root: bus master container
+140  AS "pci-bridge", root: bus master container
+141  AS "vhost-scsi-pci", root: bus master container
+142  Root memory region: system
+143   0000000000000000-000000000009ffff (prio 0, ram): pc.ram
+144   00000000000a0000-00000000000affff (prio 1, ram): vga.vram
+145   00000000000b0000-00000000000bffff (prio 1, i/o): vga-lowmem @0000000000010000
+146   00000000000c0000-00000000000c9fff (prio 0, rom): pc.ram @00000000000c0000
+147   00000000000ca000-00000000000ccfff (prio 0, ram): pc.ram @00000000000ca000
+148   00000000000cd000-00000000000e7fff (prio 0, rom): pc.ram @00000000000cd000
+149   00000000000e8000-00000000000effff (prio 0, ram): pc.ram @00000000000e8000
+150   00000000000f0000-00000000000fffff (prio 0, rom): pc.ram @00000000000f0000
+151   0000000000100000-00000000bb7fffff (prio 0, ram): pc.ram @0000000000100000
+152   00000000fd000000-00000000fdffffff (prio 1, ram): vga.vram
+153   00000000fe800000-00000000fe80003f (prio 0, i/o): msix-table
+154   00000000fe800800-00000000fe800807 (prio 0, i/o): msix-pba
+155   00000000fea40000-00000000fea5ffff (prio 1, i/o): e1000-mmio
+156   00000000fea70400-00000000fea7041f (prio 0, i/o): vga ioports remapped
+157   00000000fea70500-00000000fea70515 (prio 0, i/o): bochs dispi interface
+158   00000000fea70600-00000000fea70607 (prio 0, i/o): qemu extended regs
+159   00000000fea71000-00000000fea7109f (prio 0, i/o): shpc-mmio
+160   00000000fec00000-00000000fec00fff (prio 0, i/o): kvm-ioapic
+161   00000000fed00000-00000000fed003ff (prio 0, i/o): hpet
+162   00000000fee00000-00000000feefffff (prio 4096, i/o): kvm-apic-msi
+163   00000000fffc0000-00000000ffffffff (prio 0, rom): pc.bios
+
+
+关于virtio的ioeventfd都被删除了.
+
+(gdb) bt
+#0  kvm_mem_ioeventfd_del (listener=0x5557ff393260, section=0x7f244fffe490, match_data=false, data=1, e=0x7f24542480f8) at /home/zhang/kvm/qemu-3.0.0/accel/kvm/kvm-all.c:834
+#1  0x00005557fc6b45d8 in address_space_add_del_ioeventfds (as=0x5557fd548e80 <address_space_memory>, fds_new=0x0, fds_new_nb=0, fds_old=0x7f244806def0, fds_old_nb=3)
+                                                            at /home/zhang/kvm/qemu-3.0.0/memory.c:799
+#2  0x00005557fc6b4a7a in address_space_update_ioeventfds (as=0x5557fd548e80 <address_space_memory>) at /home/zhang/kvm/qemu-3.0.0/memory.c:862
+#3  0x00005557fc6b54d1 in memory_region_transaction_commit () at /home/zhang/kvm/qemu-3.0.0/memory.c:1058
+#4  0x00005557fc96d42b in pci_bridge_update_mappings (br=0x555800527450) at hw/pci/pci_bridge.c:245
+#5  0x00005557fc96d535 in pci_bridge_write_config (d=0x555800527450, address=40, val=4294967295, len=4) at hw/pci/pci_bridge.c:270
+#6  0x00005557fc95de5b in pci_bridge_dev_write_config (d=0x555800527450, address=40, val=4294967295, len=4) at hw/pci-bridge/pci_bridge_dev.c:138
+#7  0x00005557fc972b45 in pci_host_config_write_common (pci_dev=0x555800527450, addr=40, limit=256, val=4294967295, len=4) at hw/pci/pci_host.c:66
+#8  0x00005557fc972c6a in pci_data_write (s=0x5557ff57bac0, addr=2147491880, val=4294967295, len=4) at hw/pci/pci_host.c:100
+#9  0x00005557fc972d96 in pci_host_data_write (opaque=0x5557ff579ff0, addr=0, val=4294967295, len=4) at hw/pci/pci_host.c:153
+#10 0x00005557fc6b365a in memory_region_write_accessor (mr=0x5557ff57a3f0, addr=0, value=0x7f244fffe7e8, size=4, shift=0, mask=4294967295, attrs=...) at /home/zhang/kvm/qemu-3.0.0/memory.c:527
+#11 0x00005557fc6b386f in access_with_adjusted_size (addr=0, value=0x7f244fffe7e8, size=4, access_size_min=1, access_size_max=4, access_fn=0x5557fc6b3570 <memory_region_write_accessor>,
+                                                     mr=0x5557ff57a3f0, attrs=...) at /home/zhang/kvm/qemu-3.0.0/memory.c:594
+#12 0x00005557fc6b652a in memory_region_dispatch_write (mr=0x5557ff57a3f0, addr=0, data=4294967295, size=4, attrs=...) at /home/zhang/kvm/qemu-3.0.0/memory.c:1473
+#13 0x00005557fc652906 in flatview_write_continue (fv=0x7f2448073410, addr=3324, attrs=..., buf=0x7f245e1e9000 "\377\377\377\377", len=4, addr1=0, l=4, mr=0x5557ff57a3f0)
+                                                   at /home/zhang/kvm/qemu-3.0.0/exec.c:3255
+#14 0x00005557fc652a50 in flatview_write (fv=0x7f2448073410, addr=3324, attrs=..., buf=0x7f245e1e9000 "\377\377\377\377", len=4) at /home/zhang/kvm/qemu-3.0.0/exec.c:3294
+#15 0x00005557fc652d56 in address_space_write (as=0x5557fd548e20 <address_space_io>, addr=3324, attrs=..., buf=0x7f245e1e9000 "\377\377\377\377", len=4) at /home/zhang/kvm/qemu-3.0.0/exec.c:3384
+#16 0x00005557fc652da7 in address_space_rw (as=0x5557fd548e20 <address_space_io>, addr=3324, attrs=..., buf=0x7f245e1e9000 "\377\377\377\377", len=4, is_write=true)
+                                            at /home/zhang/kvm/qemu-3.0.0/exec.c:3395
+#17 0x00005557fc6d114a in kvm_handle_io (port=3324, attrs=..., data=0x7f245e1e9000, direction=1, size=4, count=1) at /home/zhang/kvm/qemu-3.0.0/accel/kvm/kvm-all.c:1729
+#18 0x00005557fc6d1871 in kvm_cpu_exec (cpu=0x5557ff410360) at /home/zhang/kvm/qemu-3.0.0/accel/kvm/kvm-all.c:1969
+#19 0x00005557fc698c09 in qemu_kvm_cpu_thread_fn (arg=0x5557ff410360) at /home/zhang/kvm/qemu-3.0.0/cpus.c:1215
+#20 0x00005557fcbc5429 in qemu_thread_start (args=0x5557ff431fc0) at util/qemu-thread-posix.c:504
+#21 0x00007f245b8fdea5 in start_thread () from /lib64/libpthread.so.0
+#22 0x00007f245b6268cd in clone () from /lib64/libc.so.6
