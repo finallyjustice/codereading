@@ -1,14 +1,24 @@
-From ee9ec0a938c8a9ae600eac7f3211f8ef9f2ac953 Mon Sep 17 00:00:00 2001
-From: Dongli Zhang <dongli.zhang@oracle.com>
-Date: Mon, 26 Oct 2020 09:27:00 -0700
+From a61d859b31a273a38bd71080f8399a1a2709ee2a Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Tue, 3 Nov 2020 17:34:39 -0800
 Subject: [PATCH 1/1] linux uek5 v4.14.35-2025.401.4
 
-Signed-off-by: Dongli Zhang <dongli.zhang@oracle.com>
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
- drivers/net/tap.c            |  11 ++++
- drivers/net/virtio_net.c     | 113 +++++++++++++++++++++++++++++++++++
- drivers/virtio/virtio_ring.c |   5 ++
- 3 files changed, 129 insertions(+)
+ drivers/net/tap.c            |  11 +
+ drivers/net/virtio_net.c     | 600 +++++++++++++++++++++++++++++++++++
+ drivers/virtio/virtio_ring.c |  37 +++
+ include/linux/gfp.h          |  22 ++
+ include/linux/mm_types.h     |  11 +
+ include/linux/page_ref.h     |   3 +
+ include/linux/skbuff.h       |  87 +++++
+ include/linux/virtio_net.h   |  16 +
+ include/net/sock.h           |  18 ++
+ mm/page_alloc.c              |  78 +++++
+ net/core/dev.c               |  44 +++
+ net/core/skbuff.c            |  66 ++++
+ net/core/sock.c              |  60 ++++
+ 13 files changed, 1053 insertions(+)
 
 diff --git a/drivers/net/tap.c b/drivers/net/tap.c
 index 773a3fea8f0e..1325058cc2d5 100644
@@ -47,10 +57,164 @@ index 773a3fea8f0e..1325058cc2d5 100644
  	if (!tap)
  		return RX_HANDLER_PASS;
 diff --git a/drivers/net/virtio_net.c b/drivers/net/virtio_net.c
-index 9a91ce8037c3..6daedf160fc7 100644
+index 9a91ce8037c3..a1d1a3f458bd 100644
 --- a/drivers/net/virtio_net.c
 +++ b/drivers/net/virtio_net.c
-@@ -171,21 +171,74 @@ struct virtnet_info {
+@@ -36,6 +36,7 @@
+ #include <net/xdp.h>
+ #include <net/net_failover.h>
+ 
++/* 默认64 */
+ static int napi_weight = NAPI_POLL_WEIGHT;
+ module_param(napi_weight, int, 0444);
+ 
+@@ -45,9 +46,29 @@ module_param(gso, bool, 0444);
+ module_param(napi_tx, bool, 0644);
+ 
+ /* FIXME: MTU in config. */
++/*
++ * 在以下使用GOOD_PACKET_LEN:
++ *   - drivers/net/virtio_net.c|644| <<receive_small>> unsigned int buflen = SKB_DATA_ALIGN(GOOD_PACKET_LEN + headroom) +
++ *   - drivers/net/virtio_net.c|673| <<receive_small>> buflen = SKB_DATA_ALIGN(GOOD_PACKET_LEN + headroom) +
++ *   - drivers/net/virtio_net.c|1086| <<add_recvbuf_small>> int len = vi->hdr_len + VIRTNET_RX_PAD + GOOD_PACKET_LEN + xdp_headroom;
++ *   - drivers/net/virtio_net.c|1098| <<add_recvbuf_small>> vi->hdr_len + GOOD_PACKET_LEN);
++ *   - drivers/net/virtio_net.c|2670| <<mergeable_min_buf_len>> (unsigned int )GOOD_PACKET_LEN);
++ */
+ #define GOOD_PACKET_LEN (ETH_HLEN + VLAN_HLEN + ETH_DATA_LEN)
++/*
++ * 在以下使用GOOD_COPY_LEN:
++ *   - drivers/net/virtio_net.c|435| <<page_to_skb>> skb = napi_alloc_skb(&rq->napi, GOOD_COPY_LEN);
++ */
+ #define GOOD_COPY_LEN	128
+ 
++/*
++ * 在以下使用VIRTNET_RX_PAD:
++ *   - drivers/net/virtio_net.c|642| <<receive_small>> unsigned int header_offset = VIRTNET_RX_PAD + xdp_headroom;
++ *   - drivers/net/virtio_net.c|671| <<receive_small>> header_offset = VIRTNET_RX_PAD + xdp_headroom;
++ *   - drivers/net/virtio_net.c|686| <<receive_small>> xdp.data_hard_start = buf + VIRTNET_RX_PAD + vi->hdr_len;
++ *   - drivers/net/virtio_net.c|1086| <<add_recvbuf_small>> int len = vi->hdr_len + VIRTNET_RX_PAD + GOOD_PACKET_LEN + xdp_headroom;
++ *   - drivers/net/virtio_net.c|1097| <<add_recvbuf_small>> sg_init_one(rq->sg, buf + VIRTNET_RX_PAD + xdp_headroom,
++ */
+ #define VIRTNET_RX_PAD (NET_IP_ALIGN + NET_SKB_PAD)
+ 
+ /* Amount of XDP headroom to prepend to packets for use by xdp_adjust_head */
+@@ -58,10 +79,34 @@ module_param(napi_tx, bool, 0644);
+  * at once, the weight is chosen so that the EWMA will be insensitive to short-
+  * term, transient changes in packet size.
+  */
++/*
++ * Exponentially weighted moving average (EWMA)
++ *
++ * This implements a fixed-precision EWMA algorithm, with both the
++ * precision and fall-off coefficient determined at compile-time
++ * and built into the generated helper funtions.
++ *
++ * The first argument to the macro is the name that will be used
++ * for the struct and helper functions.
++ *
++ * The second argument, the precision, expresses how many bits are
++ * used for the fractional part of the fixed-precision values.
++ *
++ * The third argument, the weight reciprocal, determines how the
++ * new values will be weighed vs. the old state, new values will
++ * get weight 1/weight_rcp and old values 1-1/weight_rcp. Note
++ * that this parameter must be a power of two for efficiency.
++ */
+ DECLARE_EWMA(pkt_len, 0, 64)
+ 
+ #define VIRTNET_DRIVER_VERSION "1.0.0"
+ 
++/*
++ * 在以下使用guest_offloads[]:
++ *   - drivers/net/virtio_net.c|3126| <<virtnet_probe>> for (i = 0; i < ARRAY_SIZE(guest_offloads); i++)
++ *   - drivers/net/virtio_net.c|3127| <<virtnet_probe>> if (virtio_has_feature(vi->vdev, guest_offloads[i]))
++ *   - drivers/net/virtio_net.c|3128| <<virtnet_probe>> set_bit(guest_offloads[i], &vi->guest_offloads);
++ */
+ static const unsigned long guest_offloads[] = {
+ 	VIRTIO_NET_F_GUEST_TSO4,
+ 	VIRTIO_NET_F_GUEST_TSO6,
+@@ -77,12 +122,22 @@ struct virtnet_stat_desc {
+ 
+ struct virtnet_sq_stats {
+ 	struct u64_stats_sync syncp;
++	/*
++	 * 在以下使用virtnet_sq_stats->packets:
++	 *   - drivers/net/virtio_net.c|1378| <<free_old_xmit_skbs>> sq->stats.packets += packets;
++	 *   - drivers/net/virtio_net.c|1708| <<virtnet_stats>> tpackets = sq->stats.packets;
++	 */
+ 	u64 packets;
+ 	u64 bytes;
+ };
+ 
+ struct virtnet_rq_stats {
+ 	struct u64_stats_sync syncp;
++	/*
++	 * 在以下使用virtnet_rq_stats->packets:
++	 *   - drivers/net/virtio_net.c|1348| <<virtnet_receive>> rq->stats.packets += received;
++	 *   - drivers/net/virtio_net.c|1714| <<virtnet_stats>> rpackets = rq->stats.packets;
++	 */
+ 	u64 packets;
+ 	u64 bytes;
+ };
+@@ -100,7 +155,21 @@ static const struct virtnet_stat_desc virtnet_rq_stats_desc[] = {
+ 	{ "bytes",	VIRTNET_RQ_STAT(bytes) },
+ };
+ 
++/*
++ * 在以下使用VIRTNET_SQ_STATS_LEN:
++ *   - drivers/net/virtio_net.c|2128| <<virtnet_get_strings>> for (j = 0; j < VIRTNET_SQ_STATS_LEN; j++) {
++ *   - drivers/net/virtio_net.c|2145| <<virtnet_get_sset_count>> VIRTNET_SQ_STATS_LEN);
++ *   - drivers/net/virtio_net.c|2187| <<virtnet_get_ethtool_stats>> for (j = 0; j < VIRTNET_SQ_STATS_LEN; j++) {
++ *   - drivers/net/virtio_net.c|2192| <<virtnet_get_ethtool_stats>> idx += VIRTNET_SQ_STATS_LEN;
++ */
+ #define VIRTNET_SQ_STATS_LEN	ARRAY_SIZE(virtnet_sq_stats_desc)
++/*
++ * 在以下使用VIRTNET_RQ_STATS_LEN:
++ *   - drivers/net/virtio_net.c|2120| <<virtnet_get_strings>> for (j = 0; j < VIRTNET_RQ_STATS_LEN; j++) {
++ *   - drivers/net/virtio_net.c|2144| <<virtnet_get_sset_count>> return vi->curr_queue_pairs * (VIRTNET_RQ_STATS_LEN +
++ *   - drivers/net/virtio_net.c|2173| <<virtnet_get_ethtool_stats>> for (j = 0; j < VIRTNET_RQ_STATS_LEN; j++) {
++ *   - drivers/net/virtio_net.c|2178| <<virtnet_get_ethtool_stats>> idx += VIRTNET_RQ_STATS_LEN;
++ */
+ #define VIRTNET_RQ_STATS_LEN	ARRAY_SIZE(virtnet_rq_stats_desc)
+ 
+ /* Internal representation of a send virtqueue */
+@@ -134,6 +203,14 @@ struct receive_queue {
+ 	struct page *pages;
+ 
+ 	/* Average packet length for mergeable receive buffers. */
++	/*
++	 * 在以下使用receive_queue->mrg_avg_pkt_len:
++	 *   - drivers/net/virtio_net.c|983| <<receive_mergeable>> ewma_pkt_len_add(&rq->mrg_avg_pkt_len, len);
++	 *   - drivers/net/virtio_net.c|1096| <<receive_mergeable>> ewma_pkt_len_add(&rq->mrg_avg_pkt_len, head_skb->len);
++	 *   - drivers/net/virtio_net.c|1331| <<add_recvbuf_mergeable>> len = get_mergeable_buf_len(rq, &rq->mrg_avg_pkt_len, room);
++	 *   - drivers/net/virtio_net.c|2961| <<virtnet_alloc_queues>> ewma_pkt_len_init(&vi->rq[i].mrg_avg_pkt_len);
++	 *   - drivers/net/virtio_net.c|3014| <<mergeable_rx_buffer_size_show>> avg = &vi->rq[queue_index].mrg_avg_pkt_len;
++	 */
+ 	struct ewma_pkt_len mrg_avg_pkt_len;
+ 
+ 	/* Page frag for packet buffer allocation. */
+@@ -143,6 +220,13 @@ struct receive_queue {
+ 	struct scatterlist sg[MAX_SKB_FRAGS + 2];
+ 
+ 	/* Min single buffer size for mergeable buffers case. */
++	/*
++	 * 在以下使用receive_queue->min_buf_len:
++	 *   - drivers/net/virtio_net.c|1319| <<get_mergeable_buf_len>> rq->min_buf_len, PAGE_SIZE - hdr_len);
++	 *   - drivers/net/virtio_net.c|2893| <<mergeable_min_buf_len>> unsigned int min_buf_len = DIV_ROUND_UP(buf_len, rq_size);
++	 *   - drivers/net/virtio_net.c|2895| <<mergeable_min_buf_len>> return max(max(min_buf_len, hdr_len) - hdr_len,
++	 *   - drivers/net/virtio_net.c|2964| <<virtnet_find_vqs>> vi->rq[i].min_buf_len = mergeable_min_buf_len(vi, vi->rq[i].vq);
++	 */
+ 	unsigned int min_buf_len;
+ 
+ 	/* Name of this receive queue: input.$index */
+@@ -166,38 +250,127 @@ struct virtnet_info {
+ 	struct virtio_device *vdev;
+ 	struct virtqueue *cvq;
+ 	struct net_device *dev;
++	/* 数组, 每一个元素都是struct, 不是指针 */
+ 	struct send_queue *sq;
++	/* 数组, 每一个元素都是struct, 不是指针 */
+ 	struct receive_queue *rq;
  	unsigned int status;
  
  	/* Max # of queue pairs supported by the device */
@@ -125,7 +289,53 @@ index 9a91ce8037c3..6daedf160fc7 100644
  	bool has_cvq;
  
  	/* Host can handle any s/g split between our header and packet data */
-@@ -216,6 +269,13 @@ struct virtnet_info {
++	/*
++	 * 在以下设置virtnet_info->any_header_sg:
++	 *   - drivers/net/virtio_net.c|1738| <<xmit_skb>> can_push = vi->any_header_sg &&
++	 *   - drivers/net/virtio_net.c|2594| <<virtnet_xdp_set>> if (vi->mergeable_rx_bufs && !vi->any_header_sg) {
++	 *   - drivers/net/virtio_net.c|3242| <<virtnet_probe>> vi->any_header_sg = true;
++	 *   - drivers/net/virtio_net.c|3268| <<virtnet_probe>> if (vi->any_header_sg)
++	 */
+ 	bool any_header_sg;
+ 
+ 	/* Packet virtio header size */
++	/*
++	 * 在以下设置virtnen_info->hdr_len:
++	 *   - drivers/net/virtio_net.c|3236| <<virtnet_probe>> vi->hdr_len = sizeof(struct virtio_net_hdr_mrg_rxbuf);
++	 *   - drivers/net/virtio_net.c|3238| <<virtnet_probe>> vi->hdr_len = sizeof(struct virtio_net_hdr);
++	 */
+ 	u8 hdr_len;
+ 
+ 	/* Work struct for refilling if we run low on memory. */
++	/*
++	 * 在以下使用virtnet_info->refill (函数是refill_work()):
++	 *   - drivers/net/virtio_net.c|1325| <<refill_work>> container_of(work, struct virtnet_info, refill.work);
++	 *   - drivers/net/virtio_net.c|1340| <<refill_work>> schedule_delayed_work(&vi->refill, HZ/2);
++	 *   - drivers/net/virtio_net.c|1383| <<virtnet_receive>> schedule_delayed_work(&vi->refill, 0);
++	 *   - drivers/net/virtio_net.c|1506| <<virtnet_open>> schedule_delayed_work(&vi->refill, 0);
++	 *   - drivers/net/virtio_net.c|1828| <<_virtnet_set_queues>> schedule_delayed_work(&vi->refill, 0);
++	 *   - drivers/net/virtio_net.c|1850| <<virtnet_close>> cancel_delayed_work_sync(&vi->refill);
++	 *   - drivers/net/virtio_net.c|2316| <<virtnet_freeze_down>> cancel_delayed_work_sync(&vi->refill);
++	 *   - drivers/net/virtio_net.c|2342| <<virtnet_restore_up>> schedule_delayed_work(&vi->refill, 0);
++	 *   - drivers/net/virtio_net.c|2802| <<virtnet_alloc_queues>> INIT_DELAYED_WORK(&vi->refill, refill_work);
++	 *   - drivers/net/virtio_net.c|3142| <<virtnet_probe>> cancel_delayed_work_sync(&vi->refill);
++	 */
+ 	struct delayed_work refill;
+ 
+ 	/* Work struct for config space updates */
++	/*
++	 * 在以下使用virtnet_info->config_work:
++	 *   - drivers/net/virtio_net.c|2601| <<virtnet_freeze_down>> flush_work(&vi->config_work);
++	 *   - drivers/net/virtio_net.c|2849| <<virtnet_config_changed_work>> container_of(work, struct virtnet_info, config_work);
++	 *   - drivers/net/virtio_net.c|2883| <<virtnet_config_changed>> schedule_work(&vi->config_work);
++	 *   - drivers/net/virtio_net.c|3330| <<virtnet_probe>> INIT_WORK(&vi->config_work, virtnet_config_changed_work);
++	 *   - drivers/net/virtio_net.c|3426| <<virtnet_probe>> schedule_work(&vi->config_work);
++	 *   - drivers/net/virtio_net.c|3478| <<virtnet_remove>> flush_work(&vi->config_work);
++	 */
+ 	struct work_struct config_work;
+ 
+ 	/* Does the affinity hint is set for virtqueues? */
+@@ -216,10 +389,22 @@ struct virtnet_info {
  	unsigned long guest_offloads;
  
  	/* failover when STANDBY feature enabled */
@@ -139,7 +349,96 @@ index 9a91ce8037c3..6daedf160fc7 100644
  	struct failover *failover;
  };
  
-@@ -293,6 +353,11 @@ static void virtqueue_napi_schedule(struct napi_struct *napi,
+ struct padded_vnet_hdr {
++	/*
++	 * struct virtio_net_hdr_mrg_rxbuf hdr:
++	 *   -> struct virtio_net_hdr hdr;
++	 *   -> __virtio16 num_buffers; // Number of merged rx buffers
++	 */
+ 	struct virtio_net_hdr_mrg_rxbuf hdr;
+ 	/*
+ 	 * hdr is in a separate sg buffer, and data sg buffer shares same page
+@@ -252,6 +437,15 @@ static int rxq2vq(int rxq)
+ 	return rxq * 2;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/virtio_net.c|504| <<page_to_skb>> hdr = skb_vnet_hdr(skb);
++ *   - drivers/net/virtio_net.c|798| <<receive_small>> memcpy(skb_vnet_hdr(skb), buf, vi->hdr_len);
++ *   - drivers/net/virtio_net.c|1106| <<receive_buf>> hdr = skb_vnet_hdr(skb);
++ *   - drivers/net/virtio_net.c|1602| <<xmit_skb>> hdr = skb_vnet_hdr(skb);
++ *
++ * 返回skb->cb
++ */
+ static inline struct virtio_net_hdr_mrg_rxbuf *skb_vnet_hdr(struct sk_buff *skb)
+ {
+ 	return (struct virtio_net_hdr_mrg_rxbuf *)skb->cb;
+@@ -261,6 +455,20 @@ static inline struct virtio_net_hdr_mrg_rxbuf *skb_vnet_hdr(struct sk_buff *skb)
+  * private is used to chain pages for big packets, put the whole
+  * most recent used list in the beginning for reuse
+  */
++/*
++ * called by:
++ *   - drivers/net/virtio_net.c|557| <<page_to_skb>> give_pages(rq, page);
++ *   - drivers/net/virtio_net.c|829| <<receive_big>> give_pages(rq, page);
++ *   - drivers/net/virtio_net.c|1074| <<receive_buf>> give_pages(rq, buf);
++ *   - drivers/net/virtio_net.c|1184| <<add_recvbuf_big>> give_pages(rq, list);
++ *   - drivers/net/virtio_net.c|1196| <<add_recvbuf_big>> give_pages(rq, list);
++ *   - drivers/net/virtio_net.c|1214| <<add_recvbuf_big>> give_pages(rq, first);
++ *   - drivers/net/virtio_net.c|2703| <<free_unused_bufs>> give_pages(&vi->rq[i], buf);
++ *
++ * private is used to chain pages for big packets, put the whole
++ * most recent used list in the beginning for reuse
++ * 把page(可能是由page->private串起来多个page)放入receive_queue->pages的头部
++ */
+ static void give_pages(struct receive_queue *rq, struct page *page)
+ {
+ 	struct page *end;
+@@ -271,6 +479,16 @@ static void give_pages(struct receive_queue *rq, struct page *page)
+ 	rq->pages = page;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/virtio_net.c|1181| <<add_recvbuf_big>> first = get_a_page(rq, gfp);
++ *   - drivers/net/virtio_net.c|1194| <<add_recvbuf_big>> first = get_a_page(rq, gfp);
++ *   - drivers/net/virtio_net.c|2657| <<_free_receive_bufs>> __free_pages(get_a_page(&vi->rq[i], GFP_KERNEL), 0);
++ *
++ * private is used to chain pages for big packets, put the whole
++ * most recent used list in the beginning for reuse
++ * 从receive_queue->pages链表取出一个page, 没有就alloc_page()
++ */
+ static struct page *get_a_page(struct receive_queue *rq, gfp_t gfp_mask)
+ {
+ 	struct page *p = rq->pages;
+@@ -284,15 +502,37 @@ static struct page *get_a_page(struct receive_queue *rq, gfp_t gfp_mask)
+ 	return p;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/virtio_net.c|382| <<virtqueue_napi_complete>> virtqueue_napi_schedule(napi, vq);
++ *   - drivers/net/virtio_net.c|397| <<skb_xmit_done>> virtqueue_napi_schedule(napi, vq);
++ *   - drivers/net/virtio_net.c|1255| <<skb_recv_done>> virtqueue_napi_schedule(&rq->napi, rvq);
++ *   - drivers/net/virtio_net.c|1267| <<virtnet_napi_enable>> virtqueue_napi_schedule(napi, vq);
++ */
+ static void virtqueue_napi_schedule(struct napi_struct *napi,
+ 				    struct virtqueue *vq)
+ {
++	/*
++	 * Test if NAPI routine is already running, and if not mark
++	 * it as running.  This is used as a condition variable
++	 * insure only one NAPI poll instance runs.  We also make
++	 * sure there is no pending NAPI disable.
++	 */
+ 	if (napi_schedule_prep(napi)) {
+ 		virtqueue_disable_cb(vq);
++		/*
++		 * The entry's receive function will be scheduled to run.
++		 * Consider using __napi_schedule_irqoff() if hard irqs are masked.
++		 */
+ 		__napi_schedule(napi);
  	}
  }
  
@@ -151,7 +450,146 @@ index 9a91ce8037c3..6daedf160fc7 100644
  static void virtqueue_napi_complete(struct napi_struct *napi,
  				    struct virtqueue *vq, int processed)
  {
-@@ -687,6 +752,10 @@ static struct sk_buff *receive_big(struct net_device *dev,
+@@ -300,6 +540,10 @@ static void virtqueue_napi_complete(struct napi_struct *napi,
+ 
+ 	opaque = virtqueue_enable_cb_prepare(vq);
+ 	if (napi_complete_done(napi, processed)) {
++		/*
++		 * query pending used buffers
++		 * Returns "true" if there are pending used buffers in the queue.
++		 */
+ 		if (unlikely(virtqueue_poll(vq, opaque)))
+ 			virtqueue_napi_schedule(napi, vq);
+ 	} else {
+@@ -307,6 +551,10 @@ static void virtqueue_napi_complete(struct napi_struct *napi,
+ 	}
+ }
+ 
++/*
++ * 在以下使用skb_xmit_done():
++ *   - drivers/net/virtio_net.c|2781| <<virtnet_find_vqs>> callbacks[txq2vq(i)] = skb_xmit_done;
++ */
+ static void skb_xmit_done(struct virtqueue *vq)
+ {
+ 	struct virtnet_info *vi = vq->vdev->priv;
+@@ -323,23 +571,42 @@ static void skb_xmit_done(struct virtqueue *vq)
+ }
+ 
+ #define MRG_CTX_HEADER_SHIFT 22
++/*
++ * called by:
++ *   - drivers/net/virtio_net.c|1434| <<add_recvbuf_mergeable>> ctx = mergeable_len_to_ctx(len, headroom);
++ */
+ static void *mergeable_len_to_ctx(unsigned int truesize,
+ 				  unsigned int headroom)
+ {
+ 	return (void *)(unsigned long)((headroom << MRG_CTX_HEADER_SHIFT) | truesize);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/virtio_net.c|961| <<receive_mergeable>> unsigned int headroom = mergeable_ctx_to_headroom(ctx);
++ */
+ static unsigned int mergeable_ctx_to_headroom(void *mrg_ctx)
+ {
+ 	return (unsigned long)mrg_ctx >> MRG_CTX_HEADER_SHIFT;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/virtio_net.c|1070| <<receive_mergeable>> truesize = mergeable_ctx_to_truesize(ctx);
++ *   - drivers/net/virtio_net.c|1104| <<receive_mergeable>> truesize = mergeable_ctx_to_truesize(ctx);
++ */
+ static unsigned int mergeable_ctx_to_truesize(void *mrg_ctx)
+ {
+ 	return (unsigned long)mrg_ctx & ((1 << MRG_CTX_HEADER_SHIFT) - 1);
+ }
+ 
+ /* Called from bottom half context */
++/*
++ * called by:
++ *   - drivers/net/virtio_net.c|819| <<receive_big>> struct sk_buff *skb = page_to_skb(vi, rq, page, 0, len,
++ *   - drivers/net/virtio_net.c|917| <<receive_mergeable>> head_skb = page_to_skb(vi, rq, xdp_page,
++ *   - drivers/net/virtio_net.c|969| <<receive_mergeable>> head_skb = page_to_skb(vi, rq, page, offset, len, truesize, !xdp_prog);
++ */
+ static struct sk_buff *page_to_skb(struct virtnet_info *vi,
+ 				   struct receive_queue *rq,
+ 				   struct page *page, unsigned int offset,
+@@ -354,12 +621,31 @@ static struct sk_buff *page_to_skb(struct virtnet_info *vi,
+ 	p = page_address(page) + offset;
+ 
+ 	/* copy small packet so we can reuse these pages for small data */
++	/*
++	 * Allocate a new sk_buff for use in NAPI receive.  This buffer will
++	 * attempt to allocate the head from a special reserved region used
++	 * only for NAPI Rx allocation.  By doing this we can save several
++	 * CPU cycles by avoiding having to disable and re-enable IRQs.
++	 */
+ 	skb = napi_alloc_skb(&rq->napi, GOOD_COPY_LEN);
+ 	if (unlikely(!skb))
+ 		return NULL;
+ 
++	/*
++	 * struct virtio_net_hdr_mrg_rxbuf {
++	 *     struct virtio_net_hdr hdr;
++	 *     __virtio16 num_buffers; // Number of merged rx buffers
++	 * };
++	 *
++	 * 返回skb->cb = struct virtio_net_hdr_mrg_rxbuf
++	 */
+ 	hdr = skb_vnet_hdr(skb);
+ 
++	/*
++	 * 在以下设置virtnen_info->hdr_len:
++	 *   - drivers/net/virtio_net.c|3236| <<virtnet_probe>> vi->hdr_len = sizeof(struct virtio_net_hdr_mrg_rxbuf);
++	 *   - drivers/net/virtio_net.c|3238| <<virtnet_probe>> vi->hdr_len = sizeof(struct virtio_net_hdr);
++	 */
+ 	hdr_len = vi->hdr_len;
+ 	if (vi->mergeable_rx_bufs)
+ 		hdr_padded_len = sizeof(*hdr);
+@@ -374,6 +660,10 @@ static struct sk_buff *page_to_skb(struct virtnet_info *vi,
+ 	p += hdr_padded_len;
+ 
+ 	copy = len;
++	/*
++	 * skb_tailroom():
++	 * Return the number of bytes of free space at the tail of an sk_buff
++	 */
+ 	if (copy > skb_tailroom(skb))
+ 		copy = skb_tailroom(skb);
+ 	skb_put_data(skb, p, copy);
+@@ -381,6 +671,9 @@ static struct sk_buff *page_to_skb(struct virtnet_info *vi,
+ 	len -= copy;
+ 	offset += copy;
+ 
++	/*
++	 * mergeable_rx_bufs大部分是true
++	 */
+ 	if (vi->mergeable_rx_bufs) {
+ 		if (len)
+ 			skb_add_rx_frag(skb, 0, page, offset, len, truesize);
+@@ -482,6 +775,7 @@ static int virtnet_xdp_xmit(struct net_device *dev, struct xdp_buff *xdp)
+ 	return 0;
+ }
+ 
++/* 没有设置vi->xdp_queue_pairs就返回 0 */
+ static unsigned int virtnet_get_headroom(struct virtnet_info *vi)
+ {
+ 	return vi->xdp_queue_pairs ? VIRTIO_XDP_HEADROOM : 0;
+@@ -673,6 +967,12 @@ static struct sk_buff *receive_big(struct net_device *dev,
+ 				   unsigned int len)
+ {
+ 	struct page *page = buf;
++	/*
++	 * called by:
++	 *   - drivers/net/virtio_net.c|819| <<receive_big>> struct sk_buff *skb = page_to_skb(vi, rq, page, 0, len,
++	 *   - drivers/net/virtio_net.c|917| <<receive_mergeable>> head_skb = page_to_skb(vi, rq, xdp_page,
++	 *   - drivers/net/virtio_net.c|969| <<receive_mergeable>> head_skb = page_to_skb(vi, rq, page, offset, len, truesize, !xdp_prog);
++	 */
+ 	struct sk_buff *skb = page_to_skb(vi, rq, page, 0, len,
+ 					  PAGE_SIZE, true);
+ 
+@@ -687,6 +987,10 @@ static struct sk_buff *receive_big(struct net_device *dev,
  	return NULL;
  }
  
@@ -162,7 +600,93 @@ index 9a91ce8037c3..6daedf160fc7 100644
  static struct sk_buff *receive_mergeable(struct net_device *dev,
  					 struct virtnet_info *vi,
  					 struct receive_queue *rq,
-@@ -902,6 +971,11 @@ static struct sk_buff *receive_mergeable(struct net_device *dev,
+@@ -695,6 +999,12 @@ static struct sk_buff *receive_mergeable(struct net_device *dev,
+ 					 unsigned int len,
+ 					 bool *xdp_xmit)
+ {
++	/*
++	 * struct virtio_net_hdr_mrg_rxbuf {
++	 *     struct virtio_net_hdr hdr;
++	 *     __virtio16 num_buffers; // Number of merged rx buffers
++	 * };
++	 */
+ 	struct virtio_net_hdr_mrg_rxbuf *hdr = buf;
+ 	u16 num_buf = virtio16_to_cpu(vi->vdev, hdr->num_buffers);
+ 	struct page *page = virt_to_head_page(buf);
+@@ -702,6 +1012,9 @@ static struct sk_buff *receive_mergeable(struct net_device *dev,
+ 	struct sk_buff *head_skb, *curr_skb;
+ 	struct bpf_prog *xdp_prog;
+ 	unsigned int truesize;
++	/*
++	 * 对于非xdp的应该就是0吧
++	 */
+ 	unsigned int headroom = mergeable_ctx_to_headroom(ctx);
+ 	bool sent;
+ 	int err;
+@@ -811,6 +1124,9 @@ static struct sk_buff *receive_mergeable(struct net_device *dev,
+ 	}
+ 	rcu_read_unlock();
+ 
++	/*
++	 * 当时为这个buf分配的size
++	 */
+ 	truesize = mergeable_ctx_to_truesize(ctx);
+ 	if (unlikely(len > truesize)) {
+ 		pr_debug("%s: rx error: len %u exceeds truesize %lu\n",
+@@ -819,6 +1135,12 @@ static struct sk_buff *receive_mergeable(struct net_device *dev,
+ 		goto err_skb;
+ 	}
+ 
++	/*
++	 * 在以下调用page_to_skb():
++	 *   - drivers/net/virtio_net.c|819| <<receive_big>> struct sk_buff *skb = page_to_skb(vi, rq, page, 0, len,
++	 *   - drivers/net/virtio_net.c|917| <<receive_mergeable>> head_skb = page_to_skb(vi, rq, xdp_page,
++	 *   - drivers/net/virtio_net.c|969| <<receive_mergeable>> head_skb = page_to_skb(vi, rq, page, offset, len, truesize, !xdp_prog);
++	 */
+ 	head_skb = page_to_skb(vi, rq, page, offset, len, truesize, !xdp_prog);
+ 	curr_skb = head_skb;
+ 
+@@ -827,6 +1149,11 @@ static struct sk_buff *receive_mergeable(struct net_device *dev,
+ 	while (--num_buf) {
+ 		int num_skb_frags;
+ 
++		/*
++		 * get the next used buffer
++		 * Caller must ensure we don't call this with other virtqueue
++		 * operations at the same time (except where noted).
++		 */
+ 		buf = virtqueue_get_buf_ctx(rq->vq, &len, &ctx);
+ 		if (unlikely(!buf)) {
+ 			pr_debug("%s: rx error: %d buffers out of %d missing\n",
+@@ -872,11 +1199,27 @@ static struct sk_buff *receive_mergeable(struct net_device *dev,
+ 			skb_coalesce_rx_frag(curr_skb, num_skb_frags - 1,
+ 					     len, truesize);
+ 		} else {
++			/*
++			 * skb_add_rx_frag()
++			 * -> skb_fill_page_desc()
++			 *    -> __skb_fill_page_desc()
++			 *         page = compound_head(page);
++			 *         if (page_is_pfmemalloc(page))
++			 *             skb->pfmemalloc = true;
++			 */
+ 			skb_add_rx_frag(curr_skb, num_skb_frags, page,
+ 					offset, len, truesize);
+ 		}
+ 	}
+ 
++	/*
++	 * 在以下使用receive_queue->mrg_avg_pkt_len:
++	 *   - drivers/net/virtio_net.c|983| <<receive_mergeable>> ewma_pkt_len_add(&rq->mrg_avg_pkt_len, len);
++	 *   - drivers/net/virtio_net.c|1096| <<receive_mergeable>> ewma_pkt_len_add(&rq->mrg_avg_pkt_len, head_skb->len);
++	 *   - drivers/net/virtio_net.c|1331| <<add_recvbuf_mergeable>> len = get_mergeable_buf_len(rq, &rq->mrg_avg_pkt_len, room);
++	 *   - drivers/net/virtio_net.c|2961| <<virtnet_alloc_queues>> ewma_pkt_len_init(&vi->rq[i].mrg_avg_pkt_len);
++	 *   - drivers/net/virtio_net.c|3014| <<mergeable_rx_buffer_size_show>> avg = &vi->rq[queue_index].mrg_avg_pkt_len;
++	 */
+ 	ewma_pkt_len_add(&rq->mrg_avg_pkt_len, head_skb->len);
+ 	return head_skb;
+ 
+@@ -902,6 +1245,11 @@ static struct sk_buff *receive_mergeable(struct net_device *dev,
  	return NULL;
  }
  
@@ -174,7 +698,33 @@ index 9a91ce8037c3..6daedf160fc7 100644
  static int receive_buf(struct virtnet_info *vi, struct receive_queue *rq,
  		       void *buf, unsigned int len, void **ctx, bool *xdp_xmit)
  {
-@@ -923,6 +997,21 @@ static int receive_buf(struct virtnet_info *vi, struct receive_queue *rq,
+@@ -910,12 +1258,25 @@ static int receive_buf(struct virtnet_info *vi, struct receive_queue *rq,
+ 	struct virtio_net_hdr_mrg_rxbuf *hdr;
+ 	int ret;
+ 
++	/*
++	 * 在以下设置virtnen_info->hdr_len:
++	 *   - drivers/net/virtio_net.c|3236| <<virtnet_probe>> vi->hdr_len = sizeof(struct virtio_net_hdr_mrg_rxbuf);
++	 *   - drivers/net/virtio_net.c|3238| <<virtnet_probe>> vi->hdr_len = sizeof(struct virtio_net_hdr);
++	 */
+ 	if (unlikely(len < vi->hdr_len + ETH_HLEN)) {
+ 		pr_debug("%s: short packet %i\n", dev->name, len);
++		/*
++		 * !!! 这里会增加dev->stats.rx_length_errors++
++		 */
+ 		dev->stats.rx_length_errors++;
+ 		if (vi->mergeable_rx_bufs) {
+ 			put_page(virt_to_head_page(buf));
+ 		} else if (vi->big_packets) {
++			/*
++			 * private is used to chain pages for big packets, put the whole
++			 * most recent used list in the beginning for reuse
++			 * 把page(可能是由page->private串起来多个page)放入receive_queue->pages的头部
++			 */
+ 			give_pages(rq, buf);
+ 		} else {
+ 			put_page(virt_to_head_page(buf));
+@@ -923,6 +1284,21 @@ static int receive_buf(struct virtnet_info *vi, struct receive_queue *rq,
  		return 0;
  	}
  
@@ -196,7 +746,34 @@ index 9a91ce8037c3..6daedf160fc7 100644
  	if (vi->mergeable_rx_bufs)
  		skb = receive_mergeable(dev, vi, rq, buf, ctx, len, xdp_xmit);
  	else if (vi->big_packets)
-@@ -956,6 +1045,11 @@ static int receive_buf(struct virtnet_info *vi, struct receive_queue *rq,
+@@ -933,10 +1309,16 @@ static int receive_buf(struct virtnet_info *vi, struct receive_queue *rq,
+ 	if (unlikely(!skb))
+ 		return 0;
+ 
++	/*
++	 * 返回skb->cb
++	 */
+ 	hdr = skb_vnet_hdr(skb);
+ 
+ 	ret = skb->len;
+ 
++	/*
++	 * VIRTIO_NET_HDR_F_DATA_VALID表示Csum is valid
++	 */
+ 	if (hdr->hdr.flags & VIRTIO_NET_HDR_F_DATA_VALID)
+ 		skb->ip_summed = CHECKSUM_UNNECESSARY;
+ 
+@@ -948,6 +1330,9 @@ static int receive_buf(struct virtnet_info *vi, struct receive_queue *rq,
+ 		goto frame_err;
+ 	}
+ 
++	/*
++	 * eth_type_trans(): determine the packet's protocol ID.
++	 */
+ 	skb->protocol = eth_type_trans(skb, dev);
+ 	pr_debug("Receiving skb proto 0x%04x len %i type %i\n",
+ 		 ntohs(skb->protocol), skb->len, skb->pkt_type);
+@@ -956,6 +1341,11 @@ static int receive_buf(struct virtnet_info *vi, struct receive_queue *rq,
  	return ret;
  
  frame_err:
@@ -208,7 +785,112 @@ index 9a91ce8037c3..6daedf160fc7 100644
  	dev->stats.rx_frame_errors++;
  	dev_kfree_skb(skb);
  	return 0;
-@@ -1107,6 +1201,13 @@ static int add_recvbuf_mergeable(struct virtnet_info *vi,
+@@ -966,6 +1356,10 @@ static int receive_buf(struct virtnet_info *vi, struct receive_queue *rq,
+  * not need to use  mergeable_len_to_ctx here - it is enough
+  * to store the headroom as the context ignoring the truesize.
+  */
++/*
++ * called by:
++ *   - drivers/net/virtio_net.c|1358| <<try_fill_recv>> err = add_recvbuf_small(vi, rq, gfp);
++ */
+ static int add_recvbuf_small(struct virtnet_info *vi, struct receive_queue *rq,
+ 			     gfp_t gfp)
+ {
+@@ -992,6 +1386,10 @@ static int add_recvbuf_small(struct virtnet_info *vi, struct receive_queue *rq,
+ 	return err;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/virtio_net.c|1366| <<try_fill_recv>> err = add_recvbuf_big(vi, rq, gfp);
++ */
+ static int add_recvbuf_big(struct virtnet_info *vi, struct receive_queue *rq,
+ 			   gfp_t gfp)
+ {
+@@ -1041,6 +1439,11 @@ static int add_recvbuf_big(struct virtnet_info *vi, struct receive_queue *rq,
+ 	return err;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/virtio_net.c|1391| <<add_recvbuf_mergeable>> len = get_mergeable_buf_len(rq, &rq->mrg_avg_pkt_len, room);
++ *   - drivers/net/virtio_net.c|3102| <<mergeable_rx_buffer_size_show>> get_mergeable_buf_len(&vi->rq[queue_index], avg,
++ */
+ static unsigned int get_mergeable_buf_len(struct receive_queue *rq,
+ 					  struct ewma_pkt_len *avg_pkt_len,
+ 					  unsigned int room)
+@@ -1057,12 +1460,23 @@ static unsigned int get_mergeable_buf_len(struct receive_queue *rq,
+ 	return ALIGN(len, L1_CACHE_BYTES);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/virtio_net.c|1459| <<try_fill_recv>> err = add_recvbuf_mergeable(vi, rq, gfp);
++ *
++ * 实际就往virtio ring buffer加了一个entry
++ * entry代表的内存由rq->mrg_avg_pkt_len来计算
++ */
+ static int add_recvbuf_mergeable(struct virtnet_info *vi,
+ 				 struct receive_queue *rq, gfp_t gfp)
+ {
+ 	struct page_frag *alloc_frag = &rq->alloc_frag;
++	/* 没有设置vi->xdp_queue_pairs就返回 0 */
+ 	unsigned int headroom = virtnet_get_headroom(vi);
+ 	unsigned int tailroom = headroom ? sizeof(struct skb_shared_info) : 0;
++	/*
++	 * 没有xdp就是0吧
++	 */
+ 	unsigned int room = SKB_DATA_ALIGN(headroom + tailroom);
+ 	char *buf;
+ 	void *ctx;
+@@ -1073,10 +1487,26 @@ static int add_recvbuf_mergeable(struct virtnet_info *vi,
+ 	 * means rx frags coalescing won't work, but consider we've
+ 	 * disabled GSO for XDP, it won't be a big issue.
+ 	 */
++	/*
++	 * 在以下使用receive_queue->mrg_avg_pkt_len:
++	 *   - drivers/net/virtio_net.c|983| <<receive_mergeable>> ewma_pkt_len_add(&rq->mrg_avg_pkt_len, len);
++	 *   - drivers/net/virtio_net.c|1096| <<receive_mergeable>> ewma_pkt_len_add(&rq->mrg_avg_pkt_len, head_skb->len);
++	 *   - drivers/net/virtio_net.c|1331| <<add_recvbuf_mergeable>> len = get_mergeable_buf_len(rq, &rq->mrg_avg_pkt_len, room);
++	 *   - drivers/net/virtio_net.c|2961| <<virtnet_alloc_queues>> ewma_pkt_len_init(&vi->rq[i].mrg_avg_pkt_len);
++	 *   - drivers/net/virtio_net.c|3014| <<mergeable_rx_buffer_size_show>> avg = &vi->rq[queue_index].mrg_avg_pkt_len;
++	 *
++	 * 核心思想是计算一个长度
++	 */
+ 	len = get_mergeable_buf_len(rq, &rq->mrg_avg_pkt_len, room);
+ 	if (unlikely(!skb_page_frag_refill(len + room, alloc_frag, gfp)))
+ 		return -ENOMEM;
+ 
++	/*
++	 * struct page_frag::
++	 *  -> struct page *page;
++	 *  -> __u32 offset;
++	 *  -> __u32 size;
++	 */
+ 	buf = (char *)page_address(alloc_frag->page) + alloc_frag->offset;
+ 	buf += headroom; /* advance address leaving hole at front of pkt */
+ 	get_page(alloc_frag->page);
+@@ -1091,8 +1521,19 @@ static int add_recvbuf_mergeable(struct virtnet_info *vi,
+ 		alloc_frag->offset += hole;
+ 	}
+ 
++	/*
++	 * struct receive_queue:
++	 *  -> struct scatterlist sg[MAX_SKB_FRAGS + 2];
++	 *
++	 * Initialize a single entry sg list --> 重点是single
++	 */
+ 	sg_init_one(rq->sg, buf, len);
+ 	ctx = mergeable_len_to_ctx(len, headroom);
++	/*
++	 * expose input buffers to other end
++	 * Caller must ensure we don't call this with other virtqueue operations
++	 * at the same time (except where noted).
++	 */
+ 	err = virtqueue_add_inbuf_ctx(rq->vq, rq->sg, 1, buf, ctx, gfp);
+ 	if (err < 0)
+ 		put_page(virt_to_head_page(buf));
+@@ -1107,6 +1548,13 @@ static int add_recvbuf_mergeable(struct virtnet_info *vi,
   * before we're receiving packets, or from refill_work which is
   * careful to disable receiving (using napi_disable).
   */
@@ -222,7 +904,113 @@ index 9a91ce8037c3..6daedf160fc7 100644
  static bool try_fill_recv(struct virtnet_info *vi, struct receive_queue *rq,
  			  gfp_t gfp)
  {
-@@ -1197,12 +1298,20 @@ static void refill_work(struct work_struct *work)
+@@ -1114,7 +1562,30 @@ static bool try_fill_recv(struct virtnet_info *vi, struct receive_queue *rq,
+ 	bool oom;
+ 
+ 	gfp |= __GFP_COLD;
++	/*
++	 * 这里是一个循环
++	 */
+ 	do {
++		/*
++		 * 在以下使用virtnet_info->mergeable_rx_bufs:
++		 *   - drivers/net/virtio_net.c|364| <<page_to_skb>> if (vi->mergeable_rx_bufs)
++		 *   - drivers/net/virtio_net.c|384| <<page_to_skb>> if (vi->mergeable_rx_bufs) {
++		 *   - drivers/net/virtio_net.c|916| <<receive_buf>> if (vi->mergeable_rx_bufs) {
++		 *   - drivers/net/virtio_net.c|926| <<receive_buf>> if (vi->mergeable_rx_bufs)
++		 *   - drivers/net/virtio_net.c|1118| <<try_fill_recv>> if (vi->mergeable_rx_bufs)
++		 *   - drivers/net/virtio_net.c|1209| <<virtnet_receive>> if (!vi->big_packets || vi->mergeable_rx_bufs) {
++		 *   - drivers/net/virtio_net.c|1394| <<xmit_skb>> if (vi->mergeable_rx_bufs)
++		 *   - drivers/net/virtio_net.c|2227| <<virtnet_xdp_set>> if (vi->mergeable_rx_bufs && !vi->any_header_sg) {
++		 *   - drivers/net/virtio_net.c|2477| <<free_unused_bufs>> if (vi->mergeable_rx_bufs) {
++		 *   - drivers/net/virtio_net.c|2541| <<virtnet_find_vqs>> if (!vi->big_packets || vi->mergeable_rx_bufs) {
++		 *   - drivers/net/virtio_net.c|2848| <<virtnet_probe>> vi->mergeable_rx_bufs = true;
++		 *   - drivers/net/virtio_net.c|2900| <<virtnet_probe>> if (vi->mergeable_rx_bufs)
++		 *
++		 *
++		 * add_recvbuf_mergeable():
++		 * 实际就往virtio ring buffer加了一个entry
++		 * entry代表的内存由rq->mrg_avg_pkt_len来计算
++		 */
+ 		if (vi->mergeable_rx_bufs)
+ 			err = add_recvbuf_mergeable(vi, rq, gfp);
+ 		else if (vi->big_packets)
+@@ -1125,6 +1596,11 @@ static bool try_fill_recv(struct virtnet_info *vi, struct receive_queue *rq,
+ 		oom = err == -ENOMEM;
+ 		if (err)
+ 			break;
++		/*
++		 * 这里一直分配直到rq->vq->num_free为0
++		 * 这里只是num_free减少的一个例子:
++		 *   - drivers/virtio/virtio_ring.c|383| <<virtqueue_add>> vq->vq.num_free -= descs_used;
++		 */
+ 	} while (rq->vq->num_free);
+ 	virtqueue_kick(rq->vq);
+ 	return !oom;
+@@ -1138,6 +1614,15 @@ static void skb_recv_done(struct virtqueue *rvq)
+ 	virtqueue_napi_schedule(&rq->napi, rvq);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/virtio_net.c|1414| <<virtnet_napi_tx_enable>> return virtnet_napi_enable(vq, napi);
++ *   - drivers/net/virtio_net.c|1435| <<refill_work>> virtnet_napi_enable(rq->vq, &rq->napi);
++ *   - drivers/net/virtio_net.c|1613| <<virtnet_open>> virtnet_napi_enable(vi->rq[i].vq, &vi->rq[i].napi);
++ *   - drivers/net/virtio_net.c|2446| <<virtnet_restore_up>> virtnet_napi_enable(vi->rq[i].vq, &vi->rq[i].napi);
++ *   - drivers/net/virtio_net.c|2568| <<virtnet_xdp_set>> virtnet_napi_enable(vi->rq[i].vq, &vi->rq[i].napi);
++ *   - drivers/net/virtio_net.c|2579| <<virtnet_xdp_set>> virtnet_napi_enable(vi->rq[i].vq, &vi->rq[i].napi);
++ */
+ static void virtnet_napi_enable(struct virtqueue *vq, struct napi_struct *napi)
+ {
+ 	napi_enable(napi);
+@@ -1151,6 +1636,13 @@ static void virtnet_napi_enable(struct virtqueue *vq, struct napi_struct *napi)
+ 	local_bh_enable();
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/virtio_net.c|1614| <<virtnet_open>> virtnet_napi_tx_enable(vi, vi->sq[i].vq, &vi->sq[i].napi);
++ *   - drivers/net/virtio_net.c|2447| <<virtnet_restore_up>> virtnet_napi_tx_enable(vi, vi->sq[i].vq,
++ *   - drivers/net/virtio_net.c|2569| <<virtnet_xdp_set>> virtnet_napi_tx_enable(vi, vi->sq[i].vq,
++ *   - drivers/net/virtio_net.c|2580| <<virtnet_xdp_set>> virtnet_napi_tx_enable(vi, vi->sq[i].vq,
++ */
+ static void virtnet_napi_tx_enable(struct virtnet_info *vi,
+ 				   struct virtqueue *vq,
+ 				   struct napi_struct *napi)
+@@ -1175,6 +1667,22 @@ static void virtnet_napi_tx_disable(struct napi_struct *napi)
+ 		napi_disable(napi);
+ }
+ 
++/*
++ * 在以下使用virtnet_info->refill (函数是refill_work()):
++ *   - drivers/net/virtio_net.c|1325| <<refill_work>> container_of(work, struct virtnet_info, refill.work);
++ *   - drivers/net/virtio_net.c|1340| <<refill_work>> schedule_delayed_work(&vi->refill, HZ/2);
++ *   - drivers/net/virtio_net.c|1383| <<virtnet_receive>> schedule_delayed_work(&vi->refill, 0);
++ *   - drivers/net/virtio_net.c|1506| <<virtnet_open>> schedule_delayed_work(&vi->refill, 0);
++ *   - drivers/net/virtio_net.c|1828| <<_virtnet_set_queues>> schedule_delayed_work(&vi->refill, 0);
++ *   - drivers/net/virtio_net.c|1850| <<virtnet_close>> cancel_delayed_work_sync(&vi->refill);
++ *   - drivers/net/virtio_net.c|2316| <<virtnet_freeze_down>> cancel_delayed_work_sync(&vi->refill);
++ *   - drivers/net/virtio_net.c|2342| <<virtnet_restore_up>> schedule_delayed_work(&vi->refill, 0);
++ *   - drivers/net/virtio_net.c|2802| <<virtnet_alloc_queues>> INIT_DELAYED_WORK(&vi->refill, refill_work);
++ *   - drivers/net/virtio_net.c|3142| <<virtnet_probe>> cancel_delayed_work_sync(&vi->refill);
++ *
++ * 在以下使用refill_work():
++ *   - drivers/net/virtio_net.c|3038| <<virtnet_alloc_queues>> INIT_DELAYED_WORK(&vi->refill, refill_work);
++ */
+ static void refill_work(struct work_struct *work)
+ {
+ 	struct virtnet_info *vi =
+@@ -1186,6 +1694,9 @@ static void refill_work(struct work_struct *work)
+ 		struct receive_queue *rq = &vi->rq[i];
+ 
+ 		napi_disable(&rq->napi);
++		/*
++		 * Returns false if we couldn't fill entirely (OOM).
++		 */
+ 		still_empty = !try_fill_recv(vi, rq, GFP_KERNEL);
+ 		virtnet_napi_enable(rq->vq, &rq->napi);
+ 
+@@ -1197,12 +1708,20 @@ static void refill_work(struct work_struct *work)
  	}
  }
  
@@ -243,7 +1031,61 @@ index 9a91ce8037c3..6daedf160fc7 100644
  	if (!vi->big_packets || vi->mergeable_rx_bufs) {
  		void *ctx;
  
-@@ -1289,6 +1398,10 @@ static void virtnet_poll_cleantx(struct receive_queue *rq)
+@@ -1220,11 +1739,28 @@ static int virtnet_receive(struct receive_queue *rq, int budget, bool *xdp_xmit)
+ 	}
+ 
+ 	if (rq->vq->num_free > virtqueue_get_vring_size(rq->vq) / 2) {
++		/*
++		 * Returns false if we couldn't fill entirely (OOM).
++		 *
++		 * Normally run in the receive path, but can also be run from ndo_open
++		 * before we're receiving packets, or from refill_work which is
++		 * careful to disable receiving (using napi_disable).
++		 */
+ 		if (!try_fill_recv(vi, rq, GFP_ATOMIC))
+ 			schedule_delayed_work(&vi->refill, 0);
+ 	}
+ 
+ 	u64_stats_update_begin(&rq->stats.syncp);
++	/*
++	 * 在以下使用virtnet_rq_stats->packets:
++	 *   - drivers/net/virtio_net.c|1348| <<virtnet_receive>> rq->stats.packets += received;
++	 *   - drivers/net/virtio_net.c|1714| <<virtnet_stats>> rpackets = rq->stats.packets;
++	 *
++	 * struct receive_queue *rq:
++	 *  -> struct virtnet_rq_stats stats;
++	 *      -> u64 packets;
++	 *      -> u64 bytes;
++	 */
+ 	rq->stats.bytes += bytes;
+ 	rq->stats.packets += received;
+ 	u64_stats_update_end(&rq->stats.syncp);
+@@ -1232,6 +1768,13 @@ static int virtnet_receive(struct receive_queue *rq, int budget, bool *xdp_xmit)
+ 	return received;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/virtio_net.c|1558| <<virtnet_poll_cleantx>> free_old_xmit_skbs(sq);
++ *   - drivers/net/virtio_net.c|1635| <<virtnet_poll_tx>> free_old_xmit_skbs(sq);
++ *   - drivers/net/virtio_net.c|1704| <<start_xmit>> free_old_xmit_skbs(sq);
++ *   - drivers/net/virtio_net.c|1747| <<start_xmit>> free_old_xmit_skbs(sq);
++ */
+ static void free_old_xmit_skbs(struct send_queue *sq)
+ {
+ 	struct sk_buff *skb;
+@@ -1270,6 +1813,10 @@ static bool is_xdp_raw_buffer_queue(struct virtnet_info *vi, int q)
+ 		return false;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/virtio_net.c|1439| <<virtnet_poll>> virtnet_poll_cleantx(rq);
++ */
+ static void virtnet_poll_cleantx(struct receive_queue *rq)
+ {
+ 	struct virtnet_info *vi = rq->vq->vdev->priv;
+@@ -1289,13 +1836,24 @@ static void virtnet_poll_cleantx(struct receive_queue *rq)
  		netif_tx_wake_queue(txq);
  }
  
@@ -253,12 +1095,150 @@ index 9a91ce8037c3..6daedf160fc7 100644
 + */
  static int virtnet_poll(struct napi_struct *napi, int budget)
  {
++	/*
++	 * struct receive_queue:
++	 *  - struct napi_struct napi;
++	 */
  	struct receive_queue *rq =
+ 		container_of(napi, struct receive_queue, napi);
+ 	unsigned int received;
+ 	bool xdp_xmit = false;
+ 
++	/*
++	 * 只在此处调用
++	 */
+ 	virtnet_poll_cleantx(rq);
+ 
+ 	received = virtnet_receive(rq, budget, &xdp_xmit);
+@@ -1369,6 +1927,13 @@ static int xmit_skb(struct send_queue *sq, struct sk_buff *skb)
+ 
+ 	pr_debug("%s: xmit %p %pM\n", vi->dev->name, skb, dest);
+ 
++	/*
++	 * 在以下设置virtnet_info->any_header_sg:
++	 *   - drivers/net/virtio_net.c|1738| <<xmit_skb>> can_push = vi->any_header_sg &&
++	 *   - drivers/net/virtio_net.c|2594| <<virtnet_xdp_set>> if (vi->mergeable_rx_bufs && !vi->any_header_sg) {
++	 *   - drivers/net/virtio_net.c|3242| <<virtnet_probe>> vi->any_header_sg = true;
++	 *   - drivers/net/virtio_net.c|3268| <<virtnet_probe>> if (vi->any_header_sg)
++	 */
+ 	can_push = vi->any_header_sg &&
+ 		!((unsigned long)skb->data & (__alignof__(*hdr) - 1)) &&
+ 		!skb_header_cloned(skb) && skb_headroom(skb) >= hdr_len;
+@@ -1788,6 +2353,13 @@ static void virtnet_clean_affinity(struct virtnet_info *vi, long hcpu)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/virtio_net.c|2386| <<virtnet_cpu_online>> virtnet_set_affinity(vi);
++ *   - drivers/net/virtio_net.c|2394| <<virtnet_cpu_dead>> virtnet_set_affinity(vi);
++ *   - drivers/net/virtio_net.c|2485| <<virtnet_set_channels>> virtnet_set_affinity(vi);
++ *   - drivers/net/virtio_net.c|3243| <<init_vqs>> virtnet_set_affinity(vi);
++ */
+ static void virtnet_set_affinity(struct virtnet_info *vi)
+ {
+ 	int i;
+@@ -1972,6 +2544,14 @@ static void virtnet_get_ethtool_stats(struct net_device *dev,
+ 	const u8 *stats_base;
+ 	size_t offset;
+ 
++	/*
++	 * struct receive_queue:
++	 *  -> struct virtnet_rq_stats stats;
++	 *      -> struct u64_stats_sync syncp;
++	 *      -> u64 packets;
++	 *      -> u64 bytes;
++	 */
++
+ 	for (i = 0; i < vi->curr_queue_pairs; i++) {
+ 		struct receive_queue *rq = &vi->rq[i];
+ 
+@@ -2337,6 +2917,10 @@ static int virtnet_get_phys_port_name(struct net_device *dev, char *buf,
+ 	return 0;
+ }
+ 
++/*
++ * 在以下使用virtnet_netdev:
++ *   - drivers/net/virtio_net.c|3097| <<virtnet_probe>> dev->netdev_ops = &virtnet_netdev;
++ */
+ static const struct net_device_ops virtnet_netdev = {
+ 	.ndo_open            = virtnet_open,
+ 	.ndo_stop   	     = virtnet_close,
+@@ -2390,6 +2974,9 @@ static void virtnet_config_changed_work(struct work_struct *work)
+ 	}
+ }
+ 
++/*
++ * struct virtio_driver virtio_net_driver.config_changed = virtnet_config_changed()
++ */
+ static void virtnet_config_changed(struct virtio_device *vdev)
+ {
+ 	struct virtnet_info *vi = vdev->priv;
+@@ -2417,6 +3004,10 @@ static void virtnet_free_queues(struct virtnet_info *vi)
+ 	kfree(vi->ctrl);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/virtio_net.c|2815| <<free_receive_bufs>> _free_receive_bufs(vi);
++ */
+ static void _free_receive_bufs(struct virtnet_info *vi)
+ {
+ 	struct bpf_prog *old_prog;
+@@ -2433,6 +3024,10 @@ static void _free_receive_bufs(struct virtnet_info *vi)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/virtio_net.c|3346| <<remove_vq_common>> free_receive_bufs(vi);
++ */
+ static void free_receive_bufs(struct virtnet_info *vi)
+ {
+ 	rtnl_lock();
+@@ -2440,6 +3035,11 @@ static void free_receive_bufs(struct virtnet_info *vi)
+ 	rtnl_unlock();
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/virtio_net.c|3271| <<virtnet_probe>> free_receive_page_frags(vi);
++ *   - drivers/net/virtio_net.c|3287| <<remove_vq_common>> free_receive_page_frags(vi);
++ */
+ static void free_receive_page_frags(struct virtnet_info *vi)
+ {
+ 	int i;
 diff --git a/drivers/virtio/virtio_ring.c b/drivers/virtio/virtio_ring.c
-index b82bb0b08161..dcf22a82ff31 100644
+index b82bb0b08161..ced2e680b4b0 100644
 --- a/drivers/virtio/virtio_ring.c
 +++ b/drivers/virtio/virtio_ring.c
-@@ -675,6 +675,11 @@ static void detach_buf(struct vring_virtqueue *vq, unsigned int head,
+@@ -527,6 +527,11 @@ EXPORT_SYMBOL_GPL(virtqueue_add_inbuf);
+  *
+  * Returns zero or a negative error (ie. ENOSPC, ENOMEM, EIO).
+  */
++/*
++ * called by:
++ *   - drivers/net/virtio_net.c|1286| <<add_recvbuf_small>> err = virtqueue_add_inbuf_ctx(rq->vq, rq->sg, 1, buf, ctx, gfp);
++ *   - drivers/net/virtio_net.c|1440| <<add_recvbuf_mergeable>> err = virtqueue_add_inbuf_ctx(rq->vq, rq->sg, 1, buf, ctx, gfp);
++ */
+ int virtqueue_add_inbuf_ctx(struct virtqueue *vq,
+ 			struct scatterlist *sg, unsigned int num,
+ 			void *data,
+@@ -548,6 +553,13 @@ EXPORT_SYMBOL_GPL(virtqueue_add_inbuf_ctx);
+  * This is sometimes useful because the virtqueue_kick_prepare() needs
+  * to be serialized, but the actual virtqueue_notify() call does not.
+  */
++/*
++ * called by:
++ *   - drivers/block/virtio_blk.c|301| <<virtio_queue_rq>> if (bd->last && virtqueue_kick_prepare(vblk->vqs[qid].vq))
++ *   - drivers/rpmsg/virtio_rpmsg_bus.c|973| <<rpmsg_probe>> notify = virtqueue_kick_prepare(vrp->rvq);
++ *   - drivers/scsi/virtio_scsi.c|476| <<virtscsi_kick_cmd>> needs_kick = virtqueue_kick_prepare(vq->vq);
++ *   - drivers/virtio/virtio_ring.c|623| <<virtqueue_kick>> if (virtqueue_kick_prepare(vq))
++ */
+ bool virtqueue_kick_prepare(struct virtqueue *_vq)
+ {
+ 	struct vring_virtqueue *vq = to_vvq(_vq);
+@@ -675,6 +687,11 @@ static void detach_buf(struct vring_virtqueue *vq, unsigned int head,
  	}
  }
  
@@ -270,6 +1250,745 @@ index b82bb0b08161..dcf22a82ff31 100644
  static inline bool more_used(const struct vring_virtqueue *vq)
  {
  	return vq->last_used_idx != virtio16_to_cpu(vq->vq.vdev, vq->vring.used->idx);
+@@ -696,6 +713,12 @@ static inline bool more_used(const struct vring_virtqueue *vq)
+  * Returns NULL if there are no used buffers, or the "data" token
+  * handed to virtqueue_add_*().
+  */
++/*
++ * called by:
++ *   - drivers/net/virtio_net.c|1105| <<receive_mergeable>> buf = virtqueue_get_buf_ctx(rq->vq, &len, &ctx);
++ *   - drivers/net/virtio_net.c|1645| <<virtnet_receive>> (buf = virtqueue_get_buf_ctx(rq->vq, &len, &ctx))) {
++ *   - drivers/virtio/virtio_ring.c|776| <<virtqueue_get_buf>> return virtqueue_get_buf_ctx(_vq, len, NULL);
++ */
+ void *virtqueue_get_buf_ctx(struct virtqueue *_vq, unsigned int *len,
+ 			    void **ctx)
+ {
+@@ -773,6 +796,12 @@ void virtqueue_disable_cb(struct virtqueue *_vq)
+ 	struct vring_virtqueue *vq = to_vvq(_vq);
+ 
+ 	if (!(vq->avail_flags_shadow & VRING_AVAIL_F_NO_INTERRUPT)) {
++		/*
++		 * 以下是VRING_AVAIL_F_NO_INTERRUPT的注释
++		 * The Guest uses this in avail->flags to advise the Host: don't interrupt me
++		 * when you consume a buffer.  It's unreliable, so it's simply an
++		 * optimization.
++		 */
+ 		vq->avail_flags_shadow |= VRING_AVAIL_F_NO_INTERRUPT;
+ 		if (!vq->event)
+ 			vq->vring.avail->flags = cpu_to_virtio16(_vq->vdev, vq->avail_flags_shadow);
+@@ -825,6 +854,14 @@ EXPORT_SYMBOL_GPL(virtqueue_enable_cb_prepare);
+  *
+  * This does not need to be serialized.
+  */
++/*
++ * called by:
++ *   - drivers/net/virtio_net.c|446| <<virtqueue_napi_complete>> if (unlikely(virtqueue_poll(vq, opaque)))
++ *   - drivers/virtio/virtio_ring.c|856| <<virtqueue_enable_cb>> return !virtqueue_poll(_vq, last_used_idx);
++ *
++ * query pending used buffers
++ * Returns "true" if there are pending used buffers in the queue.
++ */
+ bool virtqueue_poll(struct virtqueue *_vq, unsigned last_used_idx)
+ {
+ 	struct vring_virtqueue *vq = to_vvq(_vq);
+diff --git a/include/linux/gfp.h b/include/linux/gfp.h
+index 79d3dab45ceb..41d2862d039b 100644
+--- a/include/linux/gfp.h
++++ b/include/linux/gfp.h
+@@ -111,6 +111,28 @@ struct vm_area_struct;
+  */
+ #define __GFP_ATOMIC	((__force gfp_t)___GFP_ATOMIC)
+ #define __GFP_HIGH	((__force gfp_t)___GFP_HIGH)
++/*
++ * 在以下使用__GFP_MEMALLOC:
++ *   - drivers/block/nbd.c|413| <<sock_xmit>> sock->sk->sk_allocation = GFP_NOIO | __GFP_MEMALLOC;
++ *   - drivers/net/ethernet/mellanox/mlx4/en_rx.c|560| <<mlx4_en_refill_rx_buffers>> __GFP_MEMALLOC))
++ *   - include/linux/gfp.h|335| <<gfpflags_normal_context>> return (gfp_flags & (__GFP_DIRECT_RECLAIM | __GFP_MEMALLOC)) ==
++ *   - include/linux/skbuff.h|2794| <<__dev_alloc_pages>> gfp_mask |= __GFP_COLD | __GFP_COMP | __GFP_MEMALLOC;
++ *   - include/net/sock.h|842| <<sk_gfp_mask>> return gfp_mask | (sk->sk_allocation & __GFP_MEMALLOC);
++ *   - include/trace/events/mmflags.h|43| <<__def_gfpflag_names>> {(unsigned long )__GFP_MEMALLOC, "__GFP_MEMALLOC"}, \
++ *   - mm/internal.h|27| <<GFP_RECLAIM_MASK>> __GFP_NORETRY|__GFP_MEMALLOC|__GFP_NOMEMALLOC|\
++ *   - mm/page_alloc.c|3759| <<__gfp_pfmemalloc_flags>> if (gfp_mask & __GFP_MEMALLOC)
++ *   - net/core/skbuff.c|190| <<__alloc_skb>> gfp_mask |= __GFP_MEMALLOC;
++ *   - net/core/skbuff.c|413| <<__netdev_alloc_skb>> gfp_mask |= __GFP_MEMALLOC;
++ *   - net/core/skbuff.c|480| <<__napi_alloc_skb>> gfp_mask |= __GFP_MEMALLOC;
++ *   - net/core/skbuff.c|1288| <<skb_clone>> gfp_mask |= __GFP_MEMALLOC;
++ *   - net/core/skbuff.c|1469| <<pskb_expand_head>> gfp_mask |= __GFP_MEMALLOC;
++ *   - net/core/skbuff.c|5292| <<pskb_carve_inside_header>> gfp_mask |= __GFP_MEMALLOC;
++ *   - net/core/skbuff.c|5416| <<pskb_carve_inside_nonlinear>> gfp_mask |= __GFP_MEMALLOC;
++ *   - net/core/sock.c|365| <<sk_set_memalloc>> sk->sk_allocation |= __GFP_MEMALLOC;
++ *   - net/core/sock.c|373| <<sk_clear_memalloc>> sk->sk_allocation &= ~__GFP_MEMALLOC;
++ *   - net/sunrpc/sched.c|922| <<rpc_malloc>> gfp = __GFP_MEMALLOC | GFP_NOWAIT | __GFP_NOWARN;
++ *   - net/sunrpc/xprtrdma/transport.c|649| <<xprt_rdma_allocate>> flags = __GFP_MEMALLOC | GFP_NOWAIT | __GFP_NOWARN;
++ */
+ #define __GFP_MEMALLOC	((__force gfp_t)___GFP_MEMALLOC)
+ #define __GFP_NOMEMALLOC ((__force gfp_t)___GFP_NOMEMALLOC)
+ 
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index f338dcf38795..3f1ee5e2ee0c 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -227,6 +227,10 @@ struct page {
+ #endif
+ ;
+ 
++/*
++ * PAGE_FRAG_CACHE_MAX_SIZE = 0x0000000000008000
++ * PAGE_MASK = 0xfffffffffffff000
++ */
+ #define PAGE_FRAG_CACHE_MAX_SIZE	__ALIGN_MASK(32768, ~PAGE_MASK)
+ #define PAGE_FRAG_CACHE_MAX_ORDER	get_order(PAGE_FRAG_CACHE_MAX_SIZE)
+ 
+@@ -241,6 +245,13 @@ struct page_frag_cache {
+ 	/* we maintain a pagecount bias, so that we dont dirty cache line
+ 	 * containing page->_refcount every time we allocate a fragment.
+ 	 */
++	/*
++	 * mm/page_alloc.c在以下使用page_frag_cache->pagecnt_bias:
++	 *   - mm/page_alloc.c|4392| <<page_frag_alloc>> nc->pagecnt_bias = PAGE_FRAG_CACHE_MAX_SIZE + 1;
++	 *   - mm/page_alloc.c|4400| <<page_frag_alloc>> if (!page_ref_sub_and_test(page, nc->pagecnt_bias))
++	 *   - mm/page_alloc.c|4411| <<page_frag_alloc>> nc->pagecnt_bias = PAGE_FRAG_CACHE_MAX_SIZE + 1;
++	 *   - mm/page_alloc.c|4415| <<page_frag_alloc>> nc->pagecnt_bias--;
++	 */
+ 	unsigned int		pagecnt_bias;
+ 	bool pfmemalloc;
+ };
+diff --git a/include/linux/page_ref.h b/include/linux/page_ref.h
+index 760d74a0e9a9..a9299dcc49ce 100644
+--- a/include/linux/page_ref.h
++++ b/include/linux/page_ref.h
+@@ -118,6 +118,9 @@ static inline void page_ref_dec(struct page *page)
+ 
+ static inline int page_ref_sub_and_test(struct page *page, int nr)
+ {
++	/*
++	 * atomic_sub_and_test()函数用于对atomic_t变量做减法,并检查结果是否为零.
++	 */
+ 	int ret = atomic_sub_and_test(nr, &page->_refcount);
+ 
+ 	if (page_ref_tracepoint_active(__tracepoint_page_ref_mod_and_test))
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index 3d97d909580d..0be297428d41 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -752,6 +752,20 @@ struct sk_buff {
+ 
+ 	__u8			__pkt_type_offset[0];
+ 	__u8			pkt_type:3;
++	/*
++	 * 在以下修改skb->pfmemalloc:
++	 *   - include/linux/skbuff.h|1986| <<__skb_fill_page_desc>> skb->pfmemalloc = true; 
++	 *   - include/linux/skbuff.h|2831| <<skb_propagate_pfmemalloc>> skb->pfmemalloc = true;
++	 *   - net/core/skbuff.c|223| <<__alloc_skb>> skb->pfmemalloc = pfmemalloc;
++	 *   - net/core/skbuff.c|317| <<build_skb>> skb->pfmemalloc = 1;
++	 *   - net/core/skbuff.c|434| <<__netdev_alloc_skb>> skb->pfmemalloc = 1;
++	 *   - net/core/skbuff.c|494| <<__napi_alloc_skb>> skb->pfmemalloc = 1;
++	 *   - net/ipv4/tcp_output.c|1049| <<__tcp_transmit_skb>> skb->pfmemalloc = 0;
++	 *
++	 * 在以下使用skb->pfmemalloc:
++	 *   - include/linux/skbuff.h|864| <<skb_pfmemalloc>> return unlikely(skb->pfmemalloc);
++	 *   - net/core/dev.c|5118| <<napi_reuse_skb>> if (unlikely(skb->pfmemalloc)) {
++	 */
+ 	__u8			pfmemalloc:1;
+ 	__u8			ignore_df:1;
+ 
+@@ -2684,6 +2698,43 @@ static inline struct sk_buff *netdev_alloc_skb_ip_align(struct net_device *dev,
+ 	return __netdev_alloc_skb_ip_align(dev, length, GFP_ATOMIC);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/ethernet/aurora/nb8800.c|219| <<nb8800_alloc_rx>> skb_free_frag(data);
++ *   - drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c|679| <<bnx2x_frag_free>> skb_free_frag(data);
++ *   - drivers/net/ethernet/broadcom/tg3.c|6622| <<tg3_frag_free>> skb_free_frag(data);
++ *   - drivers/net/ethernet/freescale/dpaa/dpaa_eth.c|1650| <<dpaa_cleanup_tx_fd>> skb_free_frag(phys_to_virt(addr));
++ *   - drivers/net/ethernet/freescale/dpaa/dpaa_eth.c|1711| <<contig_fd_to_skb>> skb_free_frag(vaddr);
++ *   - drivers/net/ethernet/freescale/dpaa/dpaa_eth.c|1810| <<sg_fd_to_skb>> skb_free_frag(vaddr);
++ *   - drivers/net/ethernet/freescale/dpaa/dpaa_eth.c|1827| <<sg_fd_to_skb>> skb_free_frag(sg_vaddr);
++ *   - drivers/net/ethernet/freescale/dpaa/dpaa_eth.c|1838| <<sg_fd_to_skb>> skb_free_frag(vaddr);
++ *   - drivers/net/ethernet/freescale/dpaa/dpaa_eth.c|2002| <<skb_to_sg_fd>> skb_free_frag(sgt_buf);
++ *   - drivers/net/ethernet/freescale/dpaa/dpaa_eth.c|2555| <<dpaa_bp_free_pf>> skb_free_frag(phys_to_virt(addr));
++ *   - drivers/net/ethernet/hisilicon/hip04_eth.c|804| <<hip04_free_ring>> skb_free_frag(priv->rx_buf[i]);
++ *   - drivers/net/ethernet/intel/e1000/e1000_main.c|2095| <<e1000_clean_rx_ring>> skb_free_frag(buffer_info->rxbuf.data);
++ *   - drivers/net/ethernet/intel/e1000/e1000_main.c|4595| <<e1000_alloc_rx_buffers>> skb_free_frag(olddata);
++ *   - drivers/net/ethernet/intel/e1000/e1000_main.c|4602| <<e1000_alloc_rx_buffers>> skb_free_frag(data);
++ *   - drivers/net/ethernet/intel/e1000/e1000_main.c|4603| <<e1000_alloc_rx_buffers>> skb_free_frag(olddata);
++ *   - drivers/net/ethernet/intel/e1000/e1000_main.c|4609| <<e1000_alloc_rx_buffers>> skb_free_frag(olddata);
++ *   - drivers/net/ethernet/intel/e1000/e1000_main.c|4616| <<e1000_alloc_rx_buffers>> skb_free_frag(data);
++ *   - drivers/net/ethernet/intel/e1000/e1000_main.c|4638| <<e1000_alloc_rx_buffers>> skb_free_frag(data);
++ *   - drivers/net/ethernet/marvell/mvneta.c|1832| <<mvneta_frag_free>> skb_free_frag(data);
++ *   - drivers/net/ethernet/marvell/mvpp2.c|3771| <<mvpp2_frag_free>> skb_free_frag(data);
++ *   - drivers/net/ethernet/mediatek/mtk_eth_soc.c|1018| <<mtk_poll_rx>> skb_free_frag(new_data);
++ *   - drivers/net/ethernet/mediatek/mtk_eth_soc.c|1026| <<mtk_poll_rx>> skb_free_frag(new_data);
++ *   - drivers/net/ethernet/mediatek/mtk_eth_soc.c|1372| <<mtk_rx_clean>> skb_free_frag(ring->data[i]);
++ *   - drivers/net/ethernet/netronome/nfp/nfp_net_common.c|1183| <<nfp_net_free_frag>> skb_free_frag(frag);
++ *   - drivers/net/ethernet/ti/netcp_core.c|587| <<netcp_frag_free>> skb_free_frag(ptr);
++ *   - drivers/staging/fsl-dpaa2/ethernet/dpaa2-eth.c|115| <<free_rx_fd>> skb_free_frag(sg_vaddr);
++ *   - drivers/staging/fsl-dpaa2/ethernet/dpaa2-eth.c|121| <<free_rx_fd>> skb_free_frag(vaddr);
++ *   - drivers/staging/fsl-dpaa2/ethernet/dpaa2-eth.c|257| <<dpaa2_eth_rx>> skb_free_frag(vaddr);
++ *   - drivers/staging/fsl-dpaa2/ethernet/dpaa2-eth.c|778| <<add_bufs>> skb_free_frag(buf);
++ *   - drivers/staging/fsl-dpaa2/ethernet/dpaa2-eth.c|840| <<drain_bufs>> skb_free_frag(vaddr);
++ *   - net/core/hwbm.c|20| <<hwbm_buf_free>> skb_free_frag(buf);
++ *   - net/core/skbuff.c|428| <<__netdev_alloc_skb>> skb_free_frag(data);
++ *   - net/core/skbuff.c|488| <<__napi_alloc_skb>> skb_free_frag(data);
++ *   - net/core/skbuff.c|560| <<skb_free_head>> skb_free_frag(head);
++ */
+ static inline void skb_free_frag(void *addr)
+ {
+ 	page_frag_free(addr);
+@@ -2692,6 +2743,38 @@ static inline void skb_free_frag(void *addr)
+ void *napi_alloc_frag(unsigned int fragsz);
+ struct sk_buff *__napi_alloc_skb(struct napi_struct *napi,
+ 				 unsigned int length, gfp_t gfp_mask);
++/*
++ * called by:
++ *   - drivers/net/ethernet/amd/xgbe/xgbe-drv.c|2512| <<xgbe_create_skb>> skb = napi_alloc_skb(napi, rdata->rx.hdr.dma_len);
++ *   - drivers/net/ethernet/aurora/nb8800.c|245| <<nb8800_receive>> skb = napi_alloc_skb(&priv->napi, size);
++ *   - drivers/net/ethernet/broadcom/b44.c|839| <<b44_rx>> copy_skb = napi_alloc_skb(&bp->napi, len);
++ *   - drivers/net/ethernet/broadcom/bcm63xx_enet.c|388| <<bcm_enet_receive_queue>> nskb = napi_alloc_skb(&priv->napi, len);
++ *   - drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c|1032| <<bnx2x_rx_int>> skb = napi_alloc_skb(&fp->napi, len);
++ *   - drivers/net/ethernet/broadcom/bnxt/bnxt.c|950| <<bnxt_rx_page_skb>> skb = napi_alloc_skb(&rxr->bnapi->napi, payload);
++ *   - drivers/net/ethernet/broadcom/bnxt/bnxt.c|1097| <<bnxt_copy_skb>> skb = napi_alloc_skb(&bnapi->napi, len);
++ *   - drivers/net/ethernet/chelsio/cxgb/sge.c|1048| <<get_packet>> skb = napi_alloc_skb(&adapter->napi, len);
++ *   - drivers/net/ethernet/hisilicon/hns/hns_enet.c|669| <<hns_nic_poll_rx_skb>> skb = *out_skb = napi_alloc_skb(&ring_data->napi,
++ *   - drivers/net/ethernet/hisilicon/hns3/hns3pf/hns3_enet.c|1986| <<hns3_handle_rx_bd>> skb = *out_skb = napi_alloc_skb(&ring->tqp_vector->napi,
++ *   - drivers/net/ethernet/intel/e1000/e1000_main.c|4109| <<e1000_alloc_rx_skb>> struct sk_buff *skb = napi_alloc_skb(&adapter->napi, bufsz);
++ *   - drivers/net/ethernet/intel/e1000e/netdev.c|1003| <<e1000_clean_rx_irq>> napi_alloc_skb(&adapter->napi, length);
++ *   - drivers/net/ethernet/intel/fm10k/fm10k_main.c|322| <<fm10k_fetch_rx_buffer>> skb = napi_alloc_skb(&rx_ring->q_vector->napi,
++ *   - drivers/net/ethernet/intel/igb/igb_main.c|7213| <<igb_construct_skb>> skb = napi_alloc_skb(&rx_ring->q_vector->napi, IGB_RX_HDR_LEN);
++ *   - drivers/net/ethernet/intel/igc/igc_main.c|1144| <<igc_construct_skb>> skb = napi_alloc_skb(&rx_ring->q_vector->napi, IGC_RX_HDR_LEN);
++ *   - drivers/net/ethernet/intel/ixgb/ixgb_main.c|1927| <<ixgb_check_copybreak>> new_skb = napi_alloc_skb(napi, length);
++ *   - drivers/net/ethernet/intel/ixgbe/ixgbe_main.c|2127| <<ixgbe_construct_skb>> skb = napi_alloc_skb(&rx_ring->q_vector->napi, IXGBE_RX_HDR_SIZE);
++ *   - drivers/net/ethernet/mellanox/mlx5/core/en_rx.c|1075| <<mlx5e_handle_rx_cqe_mpwrq>> skb = napi_alloc_skb(rq->cq.napi,
++ *   - drivers/net/ethernet/realtek/8139cp.c|510| <<cp_rx_poll>> new_skb = napi_alloc_skb(napi, buflen);
++ *   - drivers/net/ethernet/realtek/8139too.c|2040| <<rtl8139_rx>> skb = napi_alloc_skb(&tp->napi, pkt_size);
++ *   - drivers/net/ethernet/realtek/r8169.c|7390| <<rtl8169_try_rx_copy>> skb = napi_alloc_skb(&tp->napi, pkt_size);
++ *   - drivers/net/ethernet/synopsys/dwc-xlgmac-net.c|997| <<xlgmac_create_skb>> skb = napi_alloc_skb(napi, desc_data->rx.hdr.dma_len);
++ *   - drivers/net/fjes/fjes_main.c|1153| <<fjes_poll>> skb = napi_alloc_skb(napi, frame_len);
++ *   - drivers/net/hyperv/netvsc_drv.c|785| <<netvsc_alloc_recv_skb>> skb = napi_alloc_skb(napi, nvchan->rsc.pktlen);
++ *   - drivers/net/usb/r8152.c|1939| <<rx_bottom>> skb = napi_alloc_skb(napi, pkt_len);
++ *   - drivers/net/virtio_net.c|555| <<page_to_skb>> skb = napi_alloc_skb(&rq->napi, GOOD_COPY_LEN);
++ *   - drivers/target/iscsi/cxgbit/cxgbit_main.c|318| <<cxgbit_lro_init_skb>> skb = napi_alloc_skb(napi, LRO_SKB_MAX_HEADROOM);
++ *   - drivers/target/iscsi/cxgbit/cxgbit_main.c|479| <<cxgbit_uld_lro_rx_handler>> skb = napi_alloc_skb(napi, len);
++ *   - net/core/dev.c|5145| <<napi_get_frags>> skb = napi_alloc_skb(napi, GRO_MAX_HEAD);
++ */
+ static inline struct sk_buff *napi_alloc_skb(struct napi_struct *napi,
+ 					     unsigned int length)
+ {
+@@ -2755,6 +2838,9 @@ static inline struct page *dev_alloc_page(void)
+  *	@page: The page that was allocated from skb_alloc_page
+  *	@skb: The skb that may need pfmemalloc set
+  */
++/*
++ * 没人调用这个函数
++ */
+ static inline void skb_propagate_pfmemalloc(struct page *page,
+ 					     struct sk_buff *skb)
+ {
+@@ -3056,6 +3142,7 @@ static inline int skb_add_data(struct sk_buff *skb,
+ static inline bool skb_can_coalesce(struct sk_buff *skb, int i,
+ 				    const struct page *page, int off)
+ {
++	/* SKBTX_DEV_ZEROCOPY */
+ 	if (skb_zcopy(skb))
+ 		return false;
+ 	if (i) {
+diff --git a/include/linux/virtio_net.h b/include/linux/virtio_net.h
+index a16e0bdf7751..6d47ca0ba900 100644
+--- a/include/linux/virtio_net.h
++++ b/include/linux/virtio_net.h
+@@ -25,6 +25,14 @@ static inline int virtio_net_hdr_set_proto(struct sk_buff *skb,
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/tap.c|723| <<tap_get_user>> err = virtio_net_hdr_to_skb(skb, &vnet_hdr,
++ *   - drivers/net/tun.c|1505| <<tun_get_user>> if (virtio_net_hdr_to_skb(skb, &gso, tun_is_little_endian(tun))) {
++ *   - drivers/net/virtio_net.c|1244| <<receive_buf>> if (virtio_net_hdr_to_skb(skb, &hdr->hdr,
++ *   - net/packet/af_packet.c|2808| <<tpacket_snd>> if (virtio_net_hdr_to_skb(skb, vnet_hdr, vio_le())) {
++ *   - net/packet/af_packet.c|3008| <<packet_snd>> err = virtio_net_hdr_to_skb(skb, &vnet_hdr, vio_le());
++ */
+ static inline int virtio_net_hdr_to_skb(struct sk_buff *skb,
+ 					const struct virtio_net_hdr *hdr,
+ 					bool little_endian)
+@@ -122,6 +130,14 @@ static inline int virtio_net_hdr_to_skb(struct sk_buff *skb,
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/tap.c|798| <<tap_put_user>> if (virtio_net_hdr_from_skb(skb, &vnet_hdr,
++ *   - drivers/net/tun.c|1656| <<tun_put_user>> if (virtio_net_hdr_from_skb(skb, &gso,
++ *   - drivers/net/virtio_net.c|1856| <<xmit_skb>> if (virtio_net_hdr_from_skb(skb, &hdr->hdr,
++ *   - net/packet/af_packet.c|2057| <<packet_rcv_vnet>> if (virtio_net_hdr_from_skb(skb, &vnet_hdr, vio_le(), true, 0))
++ *   - net/packet/af_packet.c|2320| <<tpacket_rcv>> virtio_net_hdr_from_skb(skb, h.raw + macoff -
++ */
+ static inline int virtio_net_hdr_from_skb(const struct sk_buff *skb,
+ 					  struct virtio_net_hdr *hdr,
+ 					  bool little_endian,
+diff --git a/include/net/sock.h b/include/net/sock.h
+index ec4308db8491..dfeadc17af57 100644
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -818,8 +818,26 @@ static inline bool sock_flag(const struct sock *sk, enum sock_flags flag)
+ 
+ #ifdef CONFIG_NET
+ extern struct static_key memalloc_socks;
++/*
++ * 在以下调用sk_memalloc_socks():
++ *   - include/net/sock.h|926| <<sk_backlog_rcv>> if (sk_memalloc_socks() && skb_pfmemalloc(skb))
++ *   - mm/slab.c|1432| <<kmem_getpages>> if (sk_memalloc_socks() && page_is_pfmemalloc(page))
++ *   - mm/slab.c|2910| <<get_first_slab>> if (sk_memalloc_socks())
++ *   - mm/slab.c|3027| <<cache_alloc_refill>> if (sk_memalloc_socks()) {
++ *   - mm/slab.c|3519| <<___cache_free>> if (sk_memalloc_socks()) {
++ *   - net/core/dev.c|4599| <<__netif_receive_skb>> if (sk_memalloc_socks() && skb_pfmemalloc(skb)) {
++ *   - net/core/skbuff.c|189| <<__alloc_skb>> if (sk_memalloc_socks() && (flags & SKB_ALLOC_RX))
++ *   - net/core/skbuff.c|412| <<__netdev_alloc_skb>> if (sk_memalloc_socks())
++ *   - net/core/skbuff.c|479| <<__napi_alloc_skb>> if (sk_memalloc_socks())
++ */
+ static inline int sk_memalloc_socks(void)
+ {
++	/*
++	 * 在以下使用memalloc_socks:
++	 *   - include/net/sock.h|823| <<sk_memalloc_socks>> return static_key_false(&memalloc_socks);
++	 *   - net/core/sock.c|339| <<sk_set_memalloc>> static_key_slow_inc(&memalloc_socks);
++	 *   - net/core/sock.c|347| <<sk_clear_memalloc>> static_key_slow_dec(&memalloc_socks);
++	 */
+ 	return static_key_false(&memalloc_socks);
+ }
+ #else
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 489f5be10121..41796ccd4072 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -4329,6 +4329,10 @@ EXPORT_SYMBOL(free_pages);
+  * drivers to provide a backing region of memory for use as either an
+  * sk_buff->head, or to be used in the "frags" portion of skb_shared_info.
+  */
++/*
++ * called by:
++ *   - mm/page_alloc.c|4377| <<page_frag_alloc>> page = __page_frag_cache_refill(nc, gfp_mask);
++ */
+ static struct page *__page_frag_cache_refill(struct page_frag_cache *nc,
+ 					     gfp_t gfp_mask)
+ {
+@@ -4350,6 +4354,19 @@ static struct page *__page_frag_cache_refill(struct page_frag_cache *nc,
+ 	return page;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/ethernet/intel/i40e/i40e_txrx.c|1409| <<i40e_clean_rx_ring>> __page_frag_cache_drain(rx_bi->page, rx_bi->pagecnt_bias);
++ *   - drivers/net/ethernet/intel/i40e/i40e_txrx.c|2150| <<i40e_put_rx_buffer>> __page_frag_cache_drain(rx_buffer->page,
++ *   - drivers/net/ethernet/intel/iavf/iavf_txrx.c|692| <<iavf_clean_rx_ring>> __page_frag_cache_drain(rx_bi->page, rx_bi->pagecnt_bias);
++ *   - drivers/net/ethernet/intel/iavf/iavf_txrx.c|1413| <<iavf_put_rx_buffer>> __page_frag_cache_drain(rx_buffer->page,
++ *   - drivers/net/ethernet/intel/igb/igb_main.c|4044| <<igb_clean_rx_ring>> __page_frag_cache_drain(buffer_info->page,
++ *   - drivers/net/ethernet/intel/igb/igb_main.c|7481| <<igb_put_rx_buffer>> __page_frag_cache_drain(rx_buffer->page,
++ *   - drivers/net/ethernet/intel/igc/igc_main.c|352| <<igc_clean_rx_ring>> __page_frag_cache_drain(buffer_info->page,
++ *   - drivers/net/ethernet/intel/igc/igc_main.c|1317| <<igc_put_rx_buffer>> __page_frag_cache_drain(rx_buffer->page,
++ *   - drivers/net/ethernet/intel/ixgbe/ixgbe_main.c|2097| <<ixgbe_put_rx_buffer>> __page_frag_cache_drain(rx_buffer->page,
++ *   - drivers/net/ethernet/intel/ixgbe/ixgbe_main.c|5237| <<ixgbe_clean_rx_ring>> __page_frag_cache_drain(rx_buffer->page,
++ */
+ void __page_frag_cache_drain(struct page *page, unsigned int count)
+ {
+ 	VM_BUG_ON_PAGE(page_ref_count(page) == 0, page);
+@@ -4365,9 +4382,24 @@ void __page_frag_cache_drain(struct page *page, unsigned int count)
+ }
+ EXPORT_SYMBOL(__page_frag_cache_drain);
+ 
++/*
++ * called by:
++ *   - net/core/skbuff.c|342| <<__netdev_alloc_frag>> data = page_frag_alloc(nc, fragsz, gfp_mask);
++ *   - net/core/skbuff.c|366| <<__napi_alloc_frag>> return page_frag_alloc(&nc->page, fragsz, gfp_mask);
++ *   - net/core/skbuff.c|418| <<__netdev_alloc_skb>> data = page_frag_alloc(nc, len, gfp_mask);
++ *   - net/core/skbuff.c|482| <<__napi_alloc_skb>> data = page_frag_alloc(&nc->page, len, gfp_mask);
++ */
+ void *page_frag_alloc(struct page_frag_cache *nc,
+ 		      unsigned int fragsz, gfp_t gfp_mask)
+ {
++	/*
++	 * struct page_frag_cache *nc:
++	 *  -> void * va;
++	 *  -> __u16 offset;
++	 *  -> __u16 size;
++	 *  -> unsigned int pagecnt_bias;
++	 *  -> bool pfmemalloc;
++	 */
+ 	unsigned int size = PAGE_SIZE;
+ 	struct page *page;
+ 	int offset;
+@@ -4385,10 +4417,24 @@ void *page_frag_alloc(struct page_frag_cache *nc,
+ 		/* Even if we own the page, we do not use atomic_set().
+ 		 * This would break get_page_unless_zero() users.
+ 		 */
++		/*
++		 * 初始化的时候page的refcount是32769
++		 */
+ 		page_ref_add(page, PAGE_FRAG_CACHE_MAX_SIZE);
+ 
+ 		/* reset page count bias and offset to start of new frag */
+ 		nc->pfmemalloc = page_is_pfmemalloc(page);
++		/*
++		 * mm/page_alloc.c在以下使用page_frag_cache->pagecnt_bias:
++		 *   - mm/page_alloc.c|4392| <<page_frag_alloc>> nc->pagecnt_bias = PAGE_FRAG_CACHE_MAX_SIZE + 1;
++		 *   - mm/page_alloc.c|4400| <<page_frag_alloc>> if (!page_ref_sub_and_test(page, nc->pagecnt_bias))
++		 *   - mm/page_alloc.c|4411| <<page_frag_alloc>> nc->pagecnt_bias = PAGE_FRAG_CACHE_MAX_SIZE + 1;
++		 *   - mm/page_alloc.c|4415| <<page_frag_alloc>> nc->pagecnt_bias--;
++		 *
++		 * PAGE_FRAG_CACHE_MAX_SIZE = 0x0000000000008000 = 32768
++		 *
++		 * 所以nc->pagecnt_bias初始化是32769
++		 */
+ 		nc->pagecnt_bias = PAGE_FRAG_CACHE_MAX_SIZE + 1;
+ 		nc->offset = size;
+ 	}
+@@ -4397,6 +4443,9 @@ void *page_frag_alloc(struct page_frag_cache *nc,
+ 	if (unlikely(offset < 0)) {
+ 		page = virt_to_page(nc->va);
+ 
++		/*
++		 * 做减法,并检查结果是否为零.
++		 */
+ 		if (!page_ref_sub_and_test(page, nc->pagecnt_bias))
+ 			goto refill;
+ 
+@@ -4412,6 +4461,13 @@ void *page_frag_alloc(struct page_frag_cache *nc,
+ 		offset = size - fragsz;
+ 	}
+ 
++	/*
++	 * mm/page_alloc.c在以下使用page_frag_cache->pagecnt_bias:
++	 *   - mm/page_alloc.c|4392| <<page_frag_alloc>> nc->pagecnt_bias = PAGE_FRAG_CACHE_MAX_SIZE + 1;
++	 *   - mm/page_alloc.c|4400| <<page_frag_alloc>> if (!page_ref_sub_and_test(page, nc->pagecnt_bias))
++	 *   - mm/page_alloc.c|4411| <<page_frag_alloc>> nc->pagecnt_bias = PAGE_FRAG_CACHE_MAX_SIZE + 1;
++	 *   - mm/page_alloc.c|4415| <<page_frag_alloc>> nc->pagecnt_bias--;
++	 */
+ 	nc->pagecnt_bias--;
+ 	nc->offset = offset;
+ 
+@@ -4422,10 +4478,32 @@ EXPORT_SYMBOL(page_frag_alloc);
+ /*
+  * Frees a page fragment allocated out of either a compound or order 0 page.
+  */
++/*
++ * [0] page_frag_free
++ * [0] consume_skb
++ * [0] arp_process
++ * [0] __netif_receive_skb_list_core
++ * [0] netif_receive_skb_list_internal
++ * [0] gro_normal_list
++ * [0] napi_gro_receive
++ * [0] receive_buf
++ * [0] virtnet_poll
++ * [0] net_rx_action
++ *
++ * called by:
++ *   - drivers/net/ethernet/intel/ixgbe/ixgbe_main.c|1187| <<ixgbe_clean_tx_irq>> page_frag_free(tx_buffer->data);
++ *   - drivers/net/ethernet/intel/ixgbe/ixgbe_main.c|5725| <<ixgbe_clean_tx_ring>> page_frag_free(tx_buffer->data);
++ *   - include/linux/skbuff.h|2689| <<skb_free_frag>> page_frag_free(addr);
++ */
+ void page_frag_free(void *addr)
+ {
+ 	struct page *page = virt_to_head_page(addr);
+ 
++	/*
++	 * Drop a ref, return true if the refcount fell to zero (the page has no users)
++	 *
++	 * 减少page->_refcount
++	 */
+ 	if (unlikely(put_page_testzero(page)))
+ 		__free_pages_ok(page, compound_order(page));
+ }
+diff --git a/net/core/dev.c b/net/core/dev.c
+index d76e46c3f99d..5558e02e7ba8 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -161,6 +161,17 @@ static DEFINE_SPINLOCK(ptype_lock);
+ static DEFINE_SPINLOCK(offload_lock);
+ struct list_head ptype_base[PTYPE_HASH_SIZE] __read_mostly;
+ struct list_head ptype_all __read_mostly;	/* Taps */
++/*
++ * 在以下使用offload_base:
++ *   - net/core/dev.c|490| <<dev_add_offload>> list_for_each_entry(elem, &offload_base, list) {
++ *   - net/core/dev.c|514| <<__dev_remove_offload>> struct list_head *head = &offload_base;
++ *   - net/core/dev.c|2788| <<skb_mac_gso_segment>> list_for_each_entry_rcu(ptype, &offload_base, list) {
++ *   - net/core/dev.c|4779| <<napi_gro_complete>> struct list_head *head = &offload_base;
++ *   - net/core/dev.c|4913| <<dev_gro_receive>> struct list_head *head = &offload_base;
++ *   - net/core/dev.c|5022| <<gro_find_receive_by_type>> struct list_head *offload_head = &offload_base;
++ *   - net/core/dev.c|5036| <<gro_find_complete_by_type>> struct list_head *offload_head = &offload_base;
++ *   - net/core/dev.c|8899| <<net_dev_init>> INIT_LIST_HEAD(&offload_base);
++ */
+ static struct list_head offload_base __read_mostly;
+ 
+ static int netif_rx_internal(struct sk_buff *skb);
+@@ -4576,6 +4587,11 @@ static int __netif_receive_skb_core(struct sk_buff *skb, bool pfmemalloc)
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - net/core/dev.c|4684| <<netif_receive_skb_internal>> ret = __netif_receive_skb(skb);
++ *   - net/core/dev.c|5295| <<process_backlog>> __netif_receive_skb(skb);
++ */
+ static int __netif_receive_skb(struct sk_buff *skb)
+ {
+ 	int ret;
+@@ -4635,6 +4651,13 @@ static int generic_xdp_install(struct net_device *dev, struct netdev_xdp *xdp)
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - net/core/dev.c|4710| <<netif_receive_skb>> return netif_receive_skb_internal(skb);
++ *   - net/core/dev.c|4794| <<napi_gro_complete>> return netif_receive_skb_internal(skb);
++ *   - net/core/dev.c|5047| <<napi_skb_finish>> if (netif_receive_skb_internal(skb))
++ *   - net/core/dev.c|5130| <<napi_frags_finish>> if (ret == GRO_NORMAL && netif_receive_skb_internal(skb))
++ */
+ static int netif_receive_skb_internal(struct sk_buff *skb)
+ {
+ 	int ret;
+@@ -4898,6 +4921,17 @@ static enum gro_result dev_gro_receive(struct napi_struct *napi, struct sk_buff
+ 	struct sk_buff **pp = NULL;
+ 	struct packet_offload *ptype;
+ 	__be16 type = skb->protocol;
++	/*
++	 * 在以下使用offload_base:
++	 *   - net/core/dev.c|490| <<dev_add_offload>> list_for_each_entry(elem, &offload_base, list) {
++	 *   - net/core/dev.c|514| <<__dev_remove_offload>> struct list_head *head = &offload_base;
++	 *   - net/core/dev.c|2788| <<skb_mac_gso_segment>> list_for_each_entry_rcu(ptype, &offload_base, list) {
++	 *   - net/core/dev.c|4779| <<napi_gro_complete>> struct list_head *head = &offload_base;
++	 *   - net/core/dev.c|4913| <<dev_gro_receive>> struct list_head *head = &offload_base;
++	 *   - net/core/dev.c|5022| <<gro_find_receive_by_type>> struct list_head *offload_head = &offload_base;
++	 *   - net/core/dev.c|5036| <<gro_find_complete_by_type>> struct list_head *offload_head = &offload_base;
++	 *   - net/core/dev.c|8899| <<net_dev_init>> INIT_LIST_HEAD(&offload_base);
++	 */
+ 	struct list_head *head = &offload_base;
+ 	int same_flow;
+ 	enum gro_result ret;
+@@ -5079,6 +5113,12 @@ gro_result_t napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb)
+ }
+ EXPORT_SYMBOL(napi_gro_receive);
+ 
++/*
++ * called by:
++ *   - net/core/dev.c|5169| <<napi_frags_finish>> napi_reuse_skb(napi, skb);
++ *   - net/core/dev.c|5176| <<napi_frags_finish>> napi_reuse_skb(napi, skb);
++ *   - net/core/dev.c|5207| <<napi_frags_skb>> napi_reuse_skb(napi, skb);
++ */
+ static void napi_reuse_skb(struct napi_struct *napi, struct sk_buff *skb)
+ {
+ 	if (unlikely(skb->pfmemalloc)) {
+@@ -5118,6 +5158,10 @@ struct sk_buff *napi_get_frags(struct napi_struct *napi)
+ }
+ EXPORT_SYMBOL(napi_get_frags);
+ 
++/*
++ * called by:
++ *   - net/core/dev.c|5243| <<napi_gro_frags>> return napi_frags_finish(napi, skb, dev_gro_receive(napi, skb));
++ */
+ static gro_result_t napi_frags_finish(struct napi_struct *napi,
+ 				      struct sk_buff *skb,
+ 				      gro_result_t ret)
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index b491ac3fe6ab..8064d6b7802e 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -409,6 +409,28 @@ struct sk_buff *__netdev_alloc_skb(struct net_device *dev, unsigned int len,
+ 	len += SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+ 	len = SKB_DATA_ALIGN(len);
+ 
++	/*
++	 * 在以下使用__GFP_MEMALLOC:
++	 *   - drivers/block/nbd.c|413| <<sock_xmit>> sock->sk->sk_allocation = GFP_NOIO | __GFP_MEMALLOC;
++	 *   - drivers/net/ethernet/mellanox/mlx4/en_rx.c|560| <<mlx4_en_refill_rx_buffers>> __GFP_MEMALLOC))
++	 *   - include/linux/gfp.h|335| <<gfpflags_normal_context>> return (gfp_flags & (__GFP_DIRECT_RECLAIM | __GFP_MEMALLOC)) ==
++	 *   - include/linux/skbuff.h|2794| <<__dev_alloc_pages>> gfp_mask |= __GFP_COLD | __GFP_COMP | __GFP_MEMALLOC;
++	 *   - include/net/sock.h|842| <<sk_gfp_mask>> return gfp_mask | (sk->sk_allocation & __GFP_MEMALLOC);
++	 *   - include/trace/events/mmflags.h|43| <<__def_gfpflag_names>> {(unsigned long )__GFP_MEMALLOC, "__GFP_MEMALLOC"}, \
++	 *   - mm/internal.h|27| <<GFP_RECLAIM_MASK>> __GFP_NORETRY|__GFP_MEMALLOC|__GFP_NOMEMALLOC|\
++	 *   - mm/page_alloc.c|3759| <<__gfp_pfmemalloc_flags>> if (gfp_mask & __GFP_MEMALLOC)
++	 *   - net/core/skbuff.c|190| <<__alloc_skb>> gfp_mask |= __GFP_MEMALLOC;
++	 *   - net/core/skbuff.c|413| <<__netdev_alloc_skb>> gfp_mask |= __GFP_MEMALLOC;
++	 *   - net/core/skbuff.c|480| <<__napi_alloc_skb>> gfp_mask |= __GFP_MEMALLOC;
++	 *   - net/core/skbuff.c|1288| <<skb_clone>> gfp_mask |= __GFP_MEMALLOC;
++	 *   - net/core/skbuff.c|1469| <<pskb_expand_head>> gfp_mask |= __GFP_MEMALLOC;
++	 *   - net/core/skbuff.c|5292| <<pskb_carve_inside_header>> gfp_mask |= __GFP_MEMALLOC;
++	 *   - net/core/skbuff.c|5416| <<pskb_carve_inside_nonlinear>> gfp_mask |= __GFP_MEMALLOC;
++	 *   - net/core/sock.c|365| <<sk_set_memalloc>> sk->sk_allocation |= __GFP_MEMALLOC;
++	 *   - net/core/sock.c|373| <<sk_clear_memalloc>> sk->sk_allocation &= ~__GFP_MEMALLOC;
++	 *   - net/sunrpc/sched.c|922| <<rpc_malloc>> gfp = __GFP_MEMALLOC | GFP_NOWAIT | __GFP_NOWARN;
++	 *   - net/sunrpc/xprtrdma/transport.c|649| <<xprt_rdma_allocate>> flags = __GFP_MEMALLOC | GFP_NOWAIT | __GFP_NOWARN;
++	 */
+ 	if (sk_memalloc_socks())
+ 		gfp_mask |= __GFP_MEMALLOC;
+ 
+@@ -476,6 +498,28 @@ struct sk_buff *__napi_alloc_skb(struct napi_struct *napi, unsigned int len,
+ 	len += SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+ 	len = SKB_DATA_ALIGN(len);
+ 
++	/*
++	 * 在以下使用__GFP_MEMALLOC:
++	 *   - drivers/block/nbd.c|413| <<sock_xmit>> sock->sk->sk_allocation = GFP_NOIO | __GFP_MEMALLOC;
++	 *   - drivers/net/ethernet/mellanox/mlx4/en_rx.c|560| <<mlx4_en_refill_rx_buffers>> __GFP_MEMALLOC))
++	 *   - include/linux/gfp.h|335| <<gfpflags_normal_context>> return (gfp_flags & (__GFP_DIRECT_RECLAIM | __GFP_MEMALLOC)) ==
++	 *   - include/linux/skbuff.h|2794| <<__dev_alloc_pages>> gfp_mask |= __GFP_COLD | __GFP_COMP | __GFP_MEMALLOC;
++	 *   - include/net/sock.h|842| <<sk_gfp_mask>> return gfp_mask | (sk->sk_allocation & __GFP_MEMALLOC);
++	 *   - include/trace/events/mmflags.h|43| <<__def_gfpflag_names>> {(unsigned long )__GFP_MEMALLOC, "__GFP_MEMALLOC"}, \
++	 *   - mm/internal.h|27| <<GFP_RECLAIM_MASK>> __GFP_NORETRY|__GFP_MEMALLOC|__GFP_NOMEMALLOC|\
++	 *   - mm/page_alloc.c|3759| <<__gfp_pfmemalloc_flags>> if (gfp_mask & __GFP_MEMALLOC)
++	 *   - net/core/skbuff.c|190| <<__alloc_skb>> gfp_mask |= __GFP_MEMALLOC;
++	 *   - net/core/skbuff.c|413| <<__netdev_alloc_skb>> gfp_mask |= __GFP_MEMALLOC;
++	 *   - net/core/skbuff.c|480| <<__napi_alloc_skb>> gfp_mask |= __GFP_MEMALLOC;
++	 *   - net/core/skbuff.c|1288| <<skb_clone>> gfp_mask |= __GFP_MEMALLOC;
++	 *   - net/core/skbuff.c|1469| <<pskb_expand_head>> gfp_mask |= __GFP_MEMALLOC;
++	 *   - net/core/skbuff.c|5292| <<pskb_carve_inside_header>> gfp_mask |= __GFP_MEMALLOC;
++	 *   - net/core/skbuff.c|5416| <<pskb_carve_inside_nonlinear>> gfp_mask |= __GFP_MEMALLOC;
++	 *   - net/core/sock.c|365| <<sk_set_memalloc>> sk->sk_allocation |= __GFP_MEMALLOC;
++	 *   - net/core/sock.c|373| <<sk_clear_memalloc>> sk->sk_allocation &= ~__GFP_MEMALLOC;
++	 *   - net/sunrpc/sched.c|922| <<rpc_malloc>> gfp = __GFP_MEMALLOC | GFP_NOWAIT | __GFP_NOWARN;
++	 *   - net/sunrpc/xprtrdma/transport.c|649| <<xprt_rdma_allocate>> flags = __GFP_MEMALLOC | GFP_NOWAIT | __GFP_NOWARN;
++	 */
+ 	if (sk_memalloc_socks())
+ 		gfp_mask |= __GFP_MEMALLOC;
+ 
+@@ -490,6 +534,20 @@ struct sk_buff *__napi_alloc_skb(struct napi_struct *napi, unsigned int len,
+ 	}
+ 
+ 	/* use OR instead of assignment to avoid clearing of bits in mask */
++	/*
++	 * 在以下修改skb->pfmemalloc:
++	 *   - include/linux/skbuff.h|1986| <<__skb_fill_page_desc>> skb->pfmemalloc = true;
++	 *   - include/linux/skbuff.h|2831| <<skb_propagate_pfmemalloc>> skb->pfmemalloc = true;
++	 *   - net/core/skbuff.c|223| <<__alloc_skb>> skb->pfmemalloc = pfmemalloc;
++	 *   - net/core/skbuff.c|317| <<build_skb>> skb->pfmemalloc = 1;
++	 *   - net/core/skbuff.c|434| <<__netdev_alloc_skb>> skb->pfmemalloc = 1;
++	 *   - net/core/skbuff.c|494| <<__napi_alloc_skb>> skb->pfmemalloc = 1;
++	 *   - net/ipv4/tcp_output.c|1049| <<__tcp_transmit_skb>> skb->pfmemalloc = 0;
++	 *
++	 * 在以下使用skb->pfmemalloc:
++	 *   - include/linux/skbuff.h|864| <<skb_pfmemalloc>> return unlikely(skb->pfmemalloc);
++	 *   - net/core/dev.c|5118| <<napi_reuse_skb>> if (unlikely(skb->pfmemalloc)) {
++	 */
+ 	if (nc->page.pfmemalloc)
+ 		skb->pfmemalloc = 1;
+ 	skb->head_frag = 1;
+@@ -503,6 +561,14 @@ struct sk_buff *__napi_alloc_skb(struct napi_struct *napi, unsigned int len,
+ }
+ EXPORT_SYMBOL(__napi_alloc_skb);
+ 
++/*
++ * skb_add_rx_frag()
++ * -> skb_fill_page_desc()
++ *    -> __skb_fill_page_desc()
++ *         page = compound_head(page);
++ *         if (page_is_pfmemalloc(page))
++ *             skb->pfmemalloc = true;
++ */
+ void skb_add_rx_frag(struct sk_buff *skb, int i, struct page *page, int off,
+ 		     int size, unsigned int truesize)
+ {
+diff --git a/net/core/sock.c b/net/core/sock.c
+index 29709af4f34d..c8467b293890 100644
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -321,6 +321,12 @@ EXPORT_SYMBOL(sysctl_optmem_max);
+ 
+ int sysctl_tstamp_allow_data __read_mostly = 1;
+ 
++/*
++ * 在以下使用memalloc_socks:
++ *   - include/net/sock.h|823| <<sk_memalloc_socks>> return static_key_false(&memalloc_socks);
++ *   - net/core/sock.c|339| <<sk_set_memalloc>> static_key_slow_inc(&memalloc_socks);
++ *   - net/core/sock.c|347| <<sk_clear_memalloc>> static_key_slow_dec(&memalloc_socks);
++ */
+ struct static_key memalloc_socks = STATIC_KEY_INIT_FALSE;
+ EXPORT_SYMBOL_GPL(memalloc_socks);
+ 
+@@ -332,6 +338,27 @@ EXPORT_SYMBOL_GPL(memalloc_socks);
+  * It's the responsibility of the admin to adjust min_free_kbytes
+  * to meet the requirements
+  */
++/*
++ * [0] sk_set_memalloc
++ * [0] iscsi_sw_tcp_conn_bind [iscsi_tcp]
++ * [0] iscsi_if_recv_msg [scsi_transport_iscsi]
++ * [0] iscsi_if_rx [scsi_transport_iscsi]
++ * [0] netlink_unicast
++ * [0] netlink_sendmsg
++ * [0] sock_sendmsg
++ * [0] ___sys_sendmsg
++ * [0] __sys_sendmsg
++ * [0] SyS_sendmsg
++ * [0] do_syscall_64
++ * [0] entry_SYSCALL_64_after_hwframe
++ *
++ * called by:
++ *   - drivers/block/nbd.c|1024| <<nbd_reconnect_socket>> sk_set_memalloc(sock->sk);
++ *   - drivers/block/nbd.c|1218| <<nbd_start_device>> sk_set_memalloc(config->socks[i]->sock->sk);
++ *   - drivers/scsi/iscsi_tcp.c|698| <<iscsi_sw_tcp_conn_bind>> sk_set_memalloc(sk);
++ *   - net/sunrpc/xprtsock.c|2116| <<xs_set_memalloc>> sk_set_memalloc(transport->inet);
++ *   - net/sunrpc/xprtsock.c|2136| <<xs_enable_swap>> sk_set_memalloc(xs->inet);
++ */
+ void sk_set_memalloc(struct sock *sk)
+ {
+ 	sock_set_flag(sk, SOCK_MEMALLOC);
+@@ -2174,6 +2201,12 @@ static void sk_leave_memory_pressure(struct sock *sk)
+ }
+ 
+ /* On 32bit arches, an skb frag is limited to 2^15 */
++/*
++ * 在以下使用SKB_FRAG_PAGE_ORDER:
++ *   - net/core/sock.c|2202| <<skb_page_frag_refill>> if (SKB_FRAG_PAGE_ORDER) {
++ *   - net/core/sock.c|2207| <<skb_page_frag_refill>> SKB_FRAG_PAGE_ORDER);
++ *   - net/core/sock.c|2209| <<skb_page_frag_refill>> pfrag->size = PAGE_SIZE << SKB_FRAG_PAGE_ORDER;
++ */
+ #define SKB_FRAG_PAGE_ORDER	get_order(32768)
+ 
+ /**
+@@ -2186,8 +2219,25 @@ static void sk_leave_memory_pressure(struct sock *sk)
+  * no guarantee that allocations succeed. Therefore, @sz MUST be
+  * less or equal than PAGE_SIZE.
+  */
++/*
++ * called by:
++ *   - drivers/net/tun.c|1296| <<tun_build_skb>> if (unlikely(!skb_page_frag_refill(buflen, alloc_frag, GFP_KERNEL)))
++ *   - drivers/net/virtio_net.c|1241| <<add_recvbuf_small>> if (unlikely(!skb_page_frag_refill(len, alloc_frag, gfp)))
++ *   - drivers/net/virtio_net.c|1355| <<add_recvbuf_mergeable>> if (unlikely(!skb_page_frag_refill(len + room, alloc_frag, gfp)))
++ *   - net/core/sock.c|2230| <<sk_page_frag_refill>> if (likely(skb_page_frag_refill(32U, pfrag, sk->sk_allocation)))
++ *   - net/ipv4/esp4.c|307| <<esp_output_head>> if (unlikely(!skb_page_frag_refill(allocsize, pfrag, GFP_ATOMIC))) {
++ *   - net/ipv4/esp4.c|422| <<esp_output_tail>> if (unlikely(!skb_page_frag_refill(allocsize, pfrag, GFP_ATOMIC))) {
++ *   - net/ipv6/esp6.c|265| <<esp6_output_head>> if (unlikely(!skb_page_frag_refill(allocsize, pfrag, GFP_ATOMIC))) {
++ *   - nett/ipv6/esp6.c|376| <<esp6_output_tail>> if (unlikely(!skb_page_frag_refill(allocsize, pfrag, GFP_ATOMIC))) {
++ */
+ bool skb_page_frag_refill(unsigned int sz, struct page_frag *pfrag, gfp_t gfp)
+ {
++	/*
++	 * struct page_frag *pfrag:
++	 *  -> struct page *page;
++	 *  -> __u32 offset;
++	 *  -> __u32 size;
++	 */
+ 	if (pfrag->page) {
+ 		if (page_ref_count(pfrag->page) == 1) {
+ 			pfrag->offset = 0;
+@@ -2219,6 +2269,16 @@ bool skb_page_frag_refill(unsigned int sz, struct page_frag *pfrag, gfp_t gfp)
+ }
+ EXPORT_SYMBOL(skb_page_frag_refill);
+ 
++/*
++ * called by:
++ *   - net/ipv4/ip_output.c|1080| <<global>> if (!sk_page_frag_refill(sk, pfrag)) {
++ *   - net/ipv6/ip6_output.c|1603| <<global>> if (!sk_page_frag_refill(sk, pfrag)) {
++ *   - net/core/skbuff.c|2114| <<linear_to_page>> if (!sk_page_frag_refill(sk, pfrag))
++ *   - net/core/skbuff.c|3414| <<skb_append_datato_frags>> if (!sk_page_frag_refill(sk, pfrag))
++ *   - net/ipv4/tcp.c|1344| <<tcp_sendmsg_locked>> if (!sk_page_frag_refill(sk, pfrag))
++ *   - net/kcm/kcmsock.c|960| <<kcm_sendmsg>> if (!sk_page_frag_refill(sk, pfrag))
++ *   - net/tls/tls_sw.c|104| <<alloc_sg>> if (!sk_page_frag_refill(sk, pfrag)) {
++ */
+ bool sk_page_frag_refill(struct sock *sk, struct page_frag *pfrag)
+ {
+ 	if (likely(skb_page_frag_refill(32U, pfrag, sk->sk_allocation)))
 -- 
 2.17.1
 
