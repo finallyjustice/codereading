@@ -1,17 +1,24 @@
-From 898f75beba56ecd95398905596656c72cdec765d Mon Sep 17 00:00:00 2001
+From 631dd0ae4be4a77339be3cc608358e0bf8f0173b Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Fri, 4 Dec 2020 09:38:17 -0800
+Date: Wed, 9 Dec 2020 14:26:15 -0800
 Subject: [PATCH 1/1] linux uek4 xen
 
 v4.1.12-124.26.12
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
- arch/x86/xen/spinlock.c           |  25 +++
- drivers/xen/xenbus/xenbus.h       |  24 +++
- drivers/xen/xenbus/xenbus_comms.c | 185 +++++++++++++++++++++
- drivers/xen/xenbus/xenbus_xs.c    | 261 ++++++++++++++++++++++++++++++
- 4 files changed, 495 insertions(+)
+ arch/x86/xen/spinlock.c             |  25 +++
+ drivers/net/xen-netback/common.h    |  47 +++++
+ drivers/net/xen-netback/interface.c |  22 +++
+ drivers/net/xen-netback/rx.c        | 101 +++++++++++
+ drivers/net/xen-netback/xenbus.c    |  12 ++
+ drivers/xen/xenbus/xenbus.h         |  24 +++
+ drivers/xen/xenbus/xenbus_comms.c   | 185 ++++++++++++++++++++
+ drivers/xen/xenbus/xenbus_xs.c      | 261 ++++++++++++++++++++++++++++
+ net/bridge/br_forward.c             |   6 +
+ net/bridge/br_stp.c                 |  69 ++++++++
+ net/bridge/br_stp_if.c              |  11 ++
+ 11 files changed, 763 insertions(+)
 
 diff --git a/arch/x86/xen/spinlock.c b/arch/x86/xen/spinlock.c
 index 956374c1edbc..c36ec8b9fee8 100644
@@ -65,6 +72,362 @@ index 956374c1edbc..c36ec8b9fee8 100644
  void __init xen_init_spinlocks(void)
  {
  
+diff --git a/drivers/net/xen-netback/common.h b/drivers/net/xen-netback/common.h
+index 7c4d2e133411..6e051c89034a 100644
+--- a/drivers/net/xen-netback/common.h
++++ b/drivers/net/xen-netback/common.h
+@@ -204,6 +204,21 @@ struct xenvif_queue { /* Per-queue data for xenvif */
+ 	/* Only used when feature-split-event-channels = 1 */
+ 	char rx_irq_name[IRQ_NAME_SIZE]; /* DEVNAME-qN-rx */
+ 	struct xen_netif_rx_back_ring rx;
++	/*
++	 * 在以下使用xenvif->rx_queue:
++	 *   - drivers/net/xen-netback/interface.c|499| <<xenvif_init_queue>> skb_queue_head_init(&queue->rx_queue);
++	 *   - drivers/net/xen-netback/rx.c|70| <<xenvif_rx_queue_slots_available>> skb = skb_peek(&queue->rx_queue);
++	 *   - drivers/net/xen-netback/rx.c|81| <<xenvif_rx_queue_tail>> spin_lock_irqsave(&queue->rx_queue.lock, flags);
++	 *   - drivers/net/xen-netback/rx.c|83| <<xenvif_rx_queue_tail>> __skb_queue_tail(&queue->rx_queue, skb);
++	 *   - drivers/net/xen-netback/rx.c|92| <<xenvif_rx_queue_tail>> spin_unlock_irqrestore(&queue->rx_queue.lock, flags);
++	 *   - drivers/net/xen-netback/rx.c|99| <<xenvif_rx_dequeue>> spin_lock_irq(&queue->rx_queue.lock);
++	 *   - drivers/net/xen-netback/rx.c|101| <<xenvif_rx_dequeue>> skb = __skb_dequeue(&queue->rx_queue);
++	 *   - drivers/net/xen-netback/rx.c|112| <<xenvif_rx_dequeue>> spin_unlock_irq(&queue->rx_queue.lock);
++	 *   - drivers/net/xen-netback/rx.c|130| <<xenvif_rx_queue_drop_expired>> skb = skb_peek(&queue->rx_queue);
++	 *   - drivers/net/xen-netback/rx.c|515| <<xenvif_rx_queue_timeout>> skb = skb_peek(&queue->rx_queue);
++	 *   - drivers/net/xen-netback/rx.c|644| <<xenvif_kthread_guest_rx>> if (!skb_queue_empty(&queue->rx_queue))
++	 *   - drivers/net/xen-netback/xenbus.c|123| <<xenvif_read_io_ring>> skb_queue_len(&queue->rx_queue),
++	 */
+ 	struct sk_buff_head rx_queue;
+ 	/* This prevents from have guestrx thread and ndo_start_xmit to race
+ 	 * over response creation.
+@@ -213,6 +228,14 @@ struct xenvif_queue { /* Per-queue data for xenvif */
+ 	unsigned int rx_queue_max;
+ 	unsigned int rx_queue_len;
+ 	unsigned long last_rx_time;
++	/*
++	 * 在以下使用xenvif_queue->stalled:
++	 *   - drivers/net/xen-netback/interface.c|602| <<xenvif_connect>> queue->stalled = true;
++	 *   - drivers/net/xen-netback/rx.c|484| <<xenvif_rx_queue_stalled>> return !queue->stalled &&
++	 *   - drivers/net/xen-netback/rx.c|497| <<xenvif_rx_queue_ready>> return queue->stalled && prod - cons >= 1;
++	 *   - drivers/net/xen-netback/rx.c|557| <<xenvif_queue_carrier_off>> queue->stalled = true;
++	 *   - drivers/net/xen-netback/rx.c|573| <<xenvif_queue_carrier_on>> queue->stalled = false;
++	 */
+ 	bool stalled;
+ 
+ 	struct xenvif_copy_state rx_copy;
+@@ -265,14 +288,38 @@ struct xenvif {
+ 	/* Is this interface disabled? True when backend discovers
+ 	 * frontend is rogue.
+ 	 */
++	/*
++	 * 在以下使用xenvif->disabled:
++	 *   - drivers/net/xen-netback/interface.c|82| <<xenvif_schedulable>> !vif->disabled;
++	 *   - drivers/net/xen-netback/interface.c|105| <<xenvif_poll>> if (unlikely(queue->vif->disabled)) {
++	 *   - drivers/net/xen-netback/interface.c|442| <<xenvif_alloc>> vif->disabled = false;
++	 *   - drivers/net/xen-netback/netback.c|230| <<xenvif_fatal_tx_err>> vif->disabled = true;
++	 *   - drivers/net/xen-netback/rx.c|511| <<xenvif_have_rx_work>> queue->vif->disabled;
++	 *   - drivers/net/xen-netback/rx.c|643| <<xenvif_kthread_guest_rx>> if (unlikely(vif->disabled && queue->id == 0)) {
++	 */
+ 	bool disabled;
+ 	unsigned long status;
+ 	unsigned long drain_timeout;
++	/*
++	 * 在以下使用xenvif->stall_timeout:
++	 *   - drivers/net/xen-netback/interface.c|444| <<xenvif_alloc>> vif->stall_timeout = msecs_to_jiffies(rx_stall_timeout_msecs);
++	 *   - drivers/net/xen-netback/rx.c|487| <<xenvif_rx_queue_stalled>> queue->last_rx_time + queue->vif->stall_timeout);
++	 *   - drivers/net/xen-netback/rx.c|503| <<xenvif_have_rx_work>> (queue->vif->stall_timeout &&
++	 *   - drivers/net/xen-netback/rx.c|589| <<xenvif_kthread_guest_rx>> if (!vif->stall_timeout)
++	 *   - drivers/net/xen-netback/rx.c|617| <<xenvif_kthread_guest_rx>> if (vif->stall_timeout) {
++	 *   - drivers/net/xen-netback/xenbus.c|1098| <<read_xenbus_vif_flags>> be->vif->stall_timeout = 0;
++	 */
+ 	unsigned long stall_timeout;
+ 
+ 	/* Queues */
+ 	struct xenvif_queue *queues;
+ 	unsigned int num_queues; /* active queues, resource allocated */
++	/*
++	 * 在以下使用xenvif->stalled_queues:
++	 *   - drivers/net/xen-netback/rx.c|561| <<xenvif_queue_carrier_off>> if (vif->stalled_queues++ == 0) {
++	 *   - drivers/net/xen-netback/rx.c|577| <<xenvif_queue_carrier_on>> if (--vif->stalled_queues == 0) {
++	 *   - drivers/net/xen-netback/xenbus.c|892| <<connect>> be->vif->stalled_queues = requested_num_queues;
++	 */
+ 	unsigned int stalled_queues;
+ 
+ 	struct xenbus_watch credit_watch;
+diff --git a/drivers/net/xen-netback/interface.c b/drivers/net/xen-netback/interface.c
+index 432a965242da..8c523e6091d4 100644
+--- a/drivers/net/xen-netback/interface.c
++++ b/drivers/net/xen-netback/interface.c
+@@ -102,6 +102,15 @@ static int xenvif_poll(struct napi_struct *napi, int budget)
+ 	 * for this vif to deschedule it from NAPI. But this interface
+ 	 * will be turned off in thread context later.
+ 	 */
++	/*
++	 * 在以下使用xenvif->disabled:
++	 *   - drivers/net/xen-netback/interface.c|82| <<xenvif_schedulable>> !vif->disabled;
++	 *   - drivers/net/xen-netback/interface.c|105| <<xenvif_poll>> if (unlikely(queue->vif->disabled)) {
++	 *   - drivers/net/xen-netback/interface.c|442| <<xenvif_alloc>> vif->disabled = false;
++	 *   - drivers/net/xen-netback/netback.c|230| <<xenvif_fatal_tx_err>> vif->disabled = true;
++	 *   - drivers/net/xen-netback/rx.c|511| <<xenvif_have_rx_work>> queue->vif->disabled;
++	 *   - drivers/net/xen-netback/rx.c|643| <<xenvif_kthread_guest_rx>> if (unlikely(vif->disabled && queue->id == 0)) {
++	 */
+ 	if (unlikely(queue->vif->disabled)) {
+ 		napi_complete(napi);
+ 		return 0;
+@@ -238,6 +247,11 @@ out:
+ 	return &vif->dev->stats;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/interface.c|277| <<xenvif_open>> xenvif_up(vif);
++ *   - drivers/net/xen-netback/interface.c|548| <<xenvif_carrier_on>> xenvif_up(vif);
++ */
+ static void xenvif_up(struct xenvif *vif)
+ {
+ 	struct xenvif_queue *queue = NULL;
+@@ -533,6 +547,10 @@ int xenvif_init_queue(struct xenvif_queue *queue)
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/xenbus.c|949| <<connect>> xenvif_carrier_on(be->vif);
++ */
+ void xenvif_carrier_on(struct xenvif *vif)
+ {
+ 	rtnl_lock();
+@@ -545,6 +563,10 @@ void xenvif_carrier_on(struct xenvif *vif)
+ 	rtnl_unlock();
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/xenbus.c|1029| <<connect_rings>> err = xenvif_connect(queue, tx_ring_ref, rx_ring_ref,
++ */
+ int xenvif_connect(struct xenvif_queue *queue, unsigned long tx_ring_ref,
+ 		   unsigned long rx_ring_ref, unsigned int tx_evtchn,
+ 		   unsigned int rx_evtchn)
+diff --git a/drivers/net/xen-netback/rx.c b/drivers/net/xen-netback/rx.c
+index 0841cc8d99e1..88ace6022e93 100644
+--- a/drivers/net/xen-netback/rx.c
++++ b/drivers/net/xen-netback/rx.c
+@@ -74,6 +74,10 @@ static bool xenvif_rx_queue_slots_available(struct xenvif_queue *queue)
+ 	return xenvif_rx_ring_slots_available(queue, skb);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/interface.c|195| <<xenvif_start_xmit>> xenvif_rx_queue_tail(queue, skb);
++ */
+ void xenvif_rx_queue_tail(struct xenvif_queue *queue, struct sk_buff *skb)
+ {
+ 	unsigned long flags;
+@@ -487,6 +491,11 @@ static bool xenvif_rx_queue_stalled(struct xenvif_queue *queue)
+ 			   queue->last_rx_time + queue->vif->stall_timeout);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|509| <<xenvif_have_rx_work>> xenvif_rx_queue_ready(queue))) ||
++ *   - drivers/net/xen-netback/rx.c|682| <<xenvif_kthread_guest_rx>> else if (xenvif_rx_queue_ready(queue))
++ */
+ static bool xenvif_rx_queue_ready(struct xenvif_queue *queue)
+ {
+ 	RING_IDX prod, cons;
+@@ -494,11 +503,28 @@ static bool xenvif_rx_queue_ready(struct xenvif_queue *queue)
+ 	prod = queue->rx.sring->req_prod;
+ 	cons = queue->rx.req_cons;
+ 
++	/*
++	 * 在以下使用xenvif_queue->stalled:
++	 *   - drivers/net/xen-netback/interface.c|602| <<xenvif_connect>> queue->stalled = true;
++	 *   - drivers/net/xen-netback/rx.c|484| <<xenvif_rx_queue_stalled>> return !queue->stalled &&
++	 *   - drivers/net/xen-netback/rx.c|497| <<xenvif_rx_queue_ready>> return queue->stalled && prod - cons >= 1;
++	 *   - drivers/net/xen-netback/rx.c|557| <<xenvif_queue_carrier_off>> queue->stalled = true;
++	 *   - drivers/net/xen-netback/rx.c|573| <<xenvif_queue_carrier_on>> queue->stalled = false;
++	 */
+ 	return queue->stalled && prod - cons >= 1;
+ }
+ 
+ static bool xenvif_have_rx_work(struct xenvif_queue *queue)
+ {
++	/*
++	 * 在以下使用xenvif->disabled:
++	 *   - drivers/net/xen-netback/interface.c|82| <<xenvif_schedulable>> !vif->disabled;
++	 *   - drivers/net/xen-netback/interface.c|105| <<xenvif_poll>> if (unlikely(queue->vif->disabled)) {
++	 *   - drivers/net/xen-netback/interface.c|442| <<xenvif_alloc>> vif->disabled = false;
++	 *   - drivers/net/xen-netback/netback.c|230| <<xenvif_fatal_tx_err>> vif->disabled = true;
++	 *   - drivers/net/xen-netback/rx.c|511| <<xenvif_have_rx_work>> queue->vif->disabled;
++	 *   - drivers/net/xen-netback/rx.c|643| <<xenvif_kthread_guest_rx>> if (unlikely(vif->disabled && queue->id == 0)) {
++	 */
+ 	return xenvif_rx_queue_slots_available(queue) ||
+ 		(queue->vif->stall_timeout &&
+ 		 (xenvif_rx_queue_stalled(queue) ||
+@@ -550,6 +576,10 @@ static void xenvif_wait_for_rx_work(struct xenvif_queue *queue)
+ 	finish_wait(&queue->wq, &wait);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|619| <<xenvif_kthread_guest_rx>> xenvif_queue_carrier_off(queue);
++ */
+ static void xenvif_queue_carrier_off(struct xenvif_queue *queue)
+ {
+ 	struct xenvif *vif = queue->vif;
+@@ -558,6 +588,12 @@ static void xenvif_queue_carrier_off(struct xenvif_queue *queue)
+ 
+ 	/* At least one queue has stalled? Disable the carrier. */
+ 	spin_lock(&vif->lock);
++	/*
++	 * 在以下使用xenvif->stalled_queues:
++	 *   - drivers/net/xen-netback/rx.c|561| <<xenvif_queue_carrier_off>> if (vif->stalled_queues++ == 0) {
++	 *   - drivers/net/xen-netback/rx.c|577| <<xenvif_queue_carrier_on>> if (--vif->stalled_queues == 0) {
++	 *   - drivers/net/xen-netback/xenbus.c|892| <<connect>> be->vif->stalled_queues = requested_num_queues;
++	 */
+ 	if (vif->stalled_queues++ == 0) {
+ 		netdev_info(vif->dev, "Guest Rx stalled");
+ 		netif_carrier_off(vif->dev);
+@@ -565,6 +601,28 @@ static void xenvif_queue_carrier_off(struct xenvif_queue *queue)
+ 	spin_unlock(&vif->lock);
+ }
+ 
++/*
++ * 似乎最终会导致
++ * [0] br_make_forwarding
++ * [0] br_stp_enable_port
++ * [0] br_port_carrier_check
++ * [0] br_device_event
++ * [0] notifier_call_chain
++ * [0] raw_notifier_call_chain
++ * [0] call_netdevice_notifiers_info
++ * [0] netdev_state_change
++ * [0] linkwatch_do_dev
++ * [0] __linkwatch_run_queue
++ * [0] linkwatch_event
++ * [0] process_one_work
++ * [0] worker_thread
++ * [0] kthread
++ * [0] ret_from_fork
++ *
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|590| <<xenvif_kthread_guest_rx>> xenvif_queue_carrier_on(queue);
++ *   - drivers/net/xen-netback/rx.c|621| <<xenvif_kthread_guest_rx>> xenvif_queue_carrier_on(queue);
++ */
+ static void xenvif_queue_carrier_on(struct xenvif_queue *queue)
+ {
+ 	struct xenvif *vif = queue->vif;
+@@ -574,6 +632,12 @@ static void xenvif_queue_carrier_on(struct xenvif_queue *queue)
+ 
+ 	/* All queues are ready? Enable the carrier. */
+ 	spin_lock(&vif->lock);
++	/*
++	 * 在以下使用xenvif->stalled_queues:
++	 *   - drivers/net/xen-netback/rx.c|561| <<xenvif_queue_carrier_off>> if (vif->stalled_queues++ == 0) {
++	 *   - drivers/net/xen-netback/rx.c|577| <<xenvif_queue_carrier_on>> if (--vif->stalled_queues == 0) {
++	 *   - drivers/net/xen-netback/xenbus.c|892| <<connect>> be->vif->stalled_queues = requested_num_queues;
++	 */
+ 	if (--vif->stalled_queues == 0) {
+ 		netdev_info(vif->dev, "Guest Rx ready");
+ 		netif_carrier_on(vif->dev);
+@@ -581,11 +645,24 @@ static void xenvif_queue_carrier_on(struct xenvif_queue *queue)
+ 	spin_unlock(&vif->lock);
+ }
+ 
++/*
++ * 在以下使用xenvif_kthread_guest_rx():
++ *   - drivers/net/xen-netback/interface.c|604| <<xenvif_connect>> task = kthread_create(xenvif_kthread_guest_rx,
++ */
+ int xenvif_kthread_guest_rx(void *data)
+ {
+ 	struct xenvif_queue *queue = data;
+ 	struct xenvif *vif = queue->vif;
+ 
++	/*
++	 * 在以下使用xenvif->stall_timeout:
++	 *   - drivers/net/xen-netback/interface.c|444| <<xenvif_alloc>> vif->stall_timeout = msecs_to_jiffies(rx_stall_timeout_msecs);
++	 *   - drivers/net/xen-netback/rx.c|487| <<xenvif_rx_queue_stalled>> queue->last_rx_time + queue->vif->stall_timeout);
++	 *   - drivers/net/xen-netback/rx.c|503| <<xenvif_have_rx_work>> (queue->vif->stall_timeout &&
++	 *   - drivers/net/xen-netback/rx.c|589| <<xenvif_kthread_guest_rx>> if (!vif->stall_timeout)
++	 *   - drivers/net/xen-netback/rx.c|617| <<xenvif_kthread_guest_rx>> if (vif->stall_timeout) {
++	 *   - drivers/net/xen-netback/xenbus.c|1098| <<read_xenbus_vif_flags>> be->vif->stall_timeout = 0;
++	 */
+ 	if (!vif->stall_timeout)
+ 		xenvif_queue_carrier_on(queue);
+ 
+@@ -607,6 +684,21 @@ int xenvif_kthread_guest_rx(void *data)
+ 			break;
+ 		}
+ 
++		/*
++		 * 在以下使用xenvif->rx_queue:
++		 *   - drivers/net/xen-netback/interface.c|499| <<xenvif_init_queue>> skb_queue_head_init(&queue->rx_queue);
++		 *   - drivers/net/xen-netback/rx.c|70| <<xenvif_rx_queue_slots_available>> skb = skb_peek(&queue->rx_queue);
++		 *   - drivers/net/xen-netback/rx.c|81| <<xenvif_rx_queue_tail>> spin_lock_irqsave(&queue->rx_queue.lock, flags);
++		 *   - drivers/net/xen-netback/rx.c|83| <<xenvif_rx_queue_tail>> __skb_queue_tail(&queue->rx_queue, skb);
++		 *   - drivers/net/xen-netback/rx.c|92| <<xenvif_rx_queue_tail>> spin_unlock_irqrestore(&queue->rx_queue.lock, flags);
++		 *   - drivers/net/xen-netback/rx.c|99| <<xenvif_rx_dequeue>> spin_lock_irq(&queue->rx_queue.lock);
++		 *   - drivers/net/xen-netback/rx.c|101| <<xenvif_rx_dequeue>> skb = __skb_dequeue(&queue->rx_queue);
++		 *   - drivers/net/xen-netback/rx.c|112| <<xenvif_rx_dequeue>> spin_unlock_irq(&queue->rx_queue.lock);
++		 *   - drivers/net/xen-netback/rx.c|130| <<xenvif_rx_queue_drop_expired>> skb = skb_peek(&queue->rx_queue);
++		 *   - drivers/net/xen-netback/rx.c|515| <<xenvif_rx_queue_timeout>> skb = skb_peek(&queue->rx_queue);
++		 *   - drivers/net/xen-netback/rx.c|644| <<xenvif_kthread_guest_rx>> if (!skb_queue_empty(&queue->rx_queue))
++		 *   - drivers/net/xen-netback/xenbus.c|123| <<xenvif_read_io_ring>> skb_queue_len(&queue->rx_queue),
++		 */
+ 		if (!skb_queue_empty(&queue->rx_queue))
+ 			xenvif_rx_action(queue);
+ 
+@@ -614,6 +706,15 @@ int xenvif_kthread_guest_rx(void *data)
+ 		 * while it's probably not responsive, drop the
+ 		 * carrier so packets are dropped earlier.
+ 		 */
++		/*
++		 * 在以下使用xenvif->stall_timeout:
++		 *   - drivers/net/xen-netback/interface.c|444| <<xenvif_alloc>> vif->stall_timeout = msecs_to_jiffies(rx_stall_timeout_msecs);
++		 *   - drivers/net/xen-netback/rx.c|487| <<xenvif_rx_queue_stalled>> queue->last_rx_time + queue->vif->stall_timeout);
++		 *   - drivers/net/xen-netback/rx.c|503| <<xenvif_have_rx_work>> (queue->vif->stall_timeout &&
++		 *   - drivers/net/xen-netback/rx.c|589| <<xenvif_kthread_guest_rx>> if (!vif->stall_timeout)
++		 *   - drivers/net/xen-netback/rx.c|617| <<xenvif_kthread_guest_rx>> if (vif->stall_timeout) {
++		 *   - drivers/net/xen-netback/xenbus.c|1098| <<read_xenbus_vif_flags>> be->vif->stall_timeout = 0;
++		 */
+ 		if (vif->stall_timeout) {
+ 			if (xenvif_rx_queue_stalled(queue))
+ 				xenvif_queue_carrier_off(queue);
+diff --git a/drivers/net/xen-netback/xenbus.c b/drivers/net/xen-netback/xenbus.c
+index fd098d362b03..4a1b392d23d0 100644
+--- a/drivers/net/xen-netback/xenbus.c
++++ b/drivers/net/xen-netback/xenbus.c
+@@ -469,6 +469,10 @@ static void backend_disconnect(struct backend_info *be)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/xenbus.c|548| <<set_backend_state>> backend_connect(be);
++ */
+ static void backend_connect(struct backend_info *be)
+ {
+ 	if (be->vif)
+@@ -846,6 +850,10 @@ static void hotplug_status_changed(struct xenbus_watch *watch,
+ 	kfree(str);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/xenbus.c|475| <<backend_connect>> connect(be);
++ */
+ static void connect(struct backend_info *be)
+ {
+ 	int err;
+@@ -961,6 +969,10 @@ err:
+ }
+ 
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/xenbus.c|917| <<connect>> err = connect_rings(be, queue);
++ */
+ static int connect_rings(struct backend_info *be, struct xenvif_queue *queue)
+ {
+ 	struct xenbus_device *dev = be->dev;
 diff --git a/drivers/xen/xenbus/xenbus.h b/drivers/xen/xenbus/xenbus.h
 index 092981171df1..292029c54225 100644
 --- a/drivers/xen/xenbus/xenbus.h
@@ -855,6 +1218,139 @@ index b8657ef0a3c3..6f0a15d36c51 100644
  	list_for_each_entry(req, &xb_write_list, list)
  		wake_up(&req->wq);
  	mutex_unlock(&xb_write_mutex);
+diff --git a/net/bridge/br_forward.c b/net/bridge/br_forward.c
+index 0ff6e1bbca91..5328c0097dda 100644
+--- a/net/bridge/br_forward.c
++++ b/net/bridge/br_forward.c
+@@ -27,6 +27,12 @@ static int deliver_clone(const struct net_bridge_port *prev,
+ 					       struct sk_buff *skb));
+ 
+ /* Don't forward packets to originating port or forwarding disabled */
++/*
++ * called by:
++ *   - net/bridge/br_forward.c|110| <<br_deliver>> if (to && should_deliver(to, skb)) {
++ *   - net/bridge/br_forward.c|122| <<br_forward>> if (should_deliver(to, skb)) {
++ *   - net/bridge/br_forward.c|159| <<maybe_deliver>> if (!should_deliver(p, skb))
++ */
+ static inline int should_deliver(const struct net_bridge_port *p,
+ 				 const struct sk_buff *skb)
+ {
+diff --git a/net/bridge/br_stp.c b/net/bridge/br_stp.c
+index fb3ebe615513..4c0021057d6b 100644
+--- a/net/bridge/br_stp.c
++++ b/net/bridge/br_stp.c
+@@ -408,6 +408,62 @@ static void br_make_blocking(struct net_bridge_port *p)
+ }
+ 
+ /* called under bridge lock */
++/*
++ * [0] br_make_forwarding
++ * [0] br_stp_enable_port
++ * [0] br_device_event
++ * [0] notifier_call_chain
++ * [0] raw_notifier_call_chain
++ * [0] call_netdevice_notifiers_info
++ * [0] __dev_notify_flags
++ * [0] dev_change_flags
++ * [0] do_setlink
++ * [0] rtnl_newlink
++ * [0] rtnetlink_rcv_msg
++ * [0] netlink_rcv_skb
++ * [0] rtnetlink_rcv
++ * [0] netlink_unicast
++ * [0] netlink_sendmsg
++ * [0] sock_sendmsg
++ * [0] ___sys_sendmsg
++ * [0] __sys_sendmsg
++ * [0] SyS_sendmsg
++ * [0] system_call_fastpath
++ *
++ * [0] br_make_forwarding
++ * [0] br_stp_disable_port
++ * [0] br_device_event
++ * [0] notifier_call_chain
++ * [0] raw_notifier_call_chain
++ * [0] call_netdevice_notifiers_info
++ * [0] dev_close_many
++ * [0] rollback_registered_many
++ * [0] rollback_registered
++ * [0] unregister_netdevice_queue
++ * [0] __tun_detach
++ * [0] tun_chr_close
++ * [0] __fput
++ * [0] ____fput
++ * [0] task_work_run
++ * [0] do_notify_resume
++ * [0] int_signal
++ *
++ * [0] br_make_forwarding
++ * [0] br_stp_enable_port
++ * [0] br_port_carrier_check
++ * [0] br_device_event
++ * [0] notifier_call_chain
++ * [0] raw_notifier_call_chain
++ * [0] call_netdevice_notifiers_info
++ * [0] netdev_state_change
++ * [0] linkwatch_do_dev
++ * [0] __linkwatch_run_queue
++ * [0] linkwatch_event
++ * [0] process_one_work
++ * [0] worker_thread
++ * [0] kthread
++ * [0] ret_from_fork
++ */
+ static void br_make_forwarding(struct net_bridge_port *p)
+ {
+ 	struct net_bridge *br = p->br;
+@@ -433,6 +489,19 @@ static void br_make_forwarding(struct net_bridge_port *p)
+ }
+ 
+ /* called under bridge lock */
++/*
++ * called by:
++ *   - net/bridge/br_netlink.c|532| <<br_set_port_state>> br_port_state_selection(p->br);
++ *   - net/bridge/br_stp.c|491| <<br_received_config_bpdu>> br_port_state_selection(br);
++ *   - net/bridge/br_stp_if.c|90| <<br_stp_enable_port>> br_port_state_selection(p->br);
++ *   - net/bridge/br_stp_if.c|119| <<br_stp_disable_port>> br_port_state_selection(br);
++ *   - net/bridge/br_stp_if.c|151| <<br_stp_start>> br_port_state_selection(br);
++ *   - net/bridge/br_stp_if.c|169| <<br_stp_stop>> br_port_state_selection(br);
++ *   - net/bridge/br_stp_if.c|215| <<br_stp_change_bridge_id>> br_port_state_selection(br);
++ *   - net/bridge/br_stp_if.c|270| <<br_stp_set_bridge_priority>> br_port_state_selection(br);
++ *   - net/bridge/br_stp_if.c|293| <<br_stp_set_port_priority>> br_port_state_selection(p->br);
++ *   - net/bridge/br_stp_if.c|309| <<br_stp_set_path_cost>> br_port_state_selection(p->br);
++ */
+ void br_port_state_selection(struct net_bridge *br)
+ {
+ 	struct net_bridge_port *p;
+diff --git a/net/bridge/br_stp_if.c b/net/bridge/br_stp_if.c
+index ce658abdc2c8..eb9988336244 100644
+--- a/net/bridge/br_stp_if.c
++++ b/net/bridge/br_stp_if.c
+@@ -84,6 +84,13 @@ void br_stp_disable_bridge(struct net_bridge *br)
+ }
+ 
+ /* called under bridge lock */
++/*
++ * called by:
++ *   - net/bridge/br.c|87| <<br_device_event>> br_stp_enable_port(p);
++ *   - net/bridge/br_if.c|80| <<br_port_carrier_check>> br_stp_enable_port(p);
++ *   - net/bridge/br_if.c|518| <<br_add_if>> br_stp_enable_port(p);
++ *   - net/bridge/br_stp_if.c|58| <<br_stp_enable_bridge>> br_stp_enable_port(p);
++ */
+ void br_stp_enable_port(struct net_bridge_port *p)
+ {
+ 	br_init_port(p);
+@@ -173,6 +180,10 @@ static void br_stp_stop(struct net_bridge *br)
+ 	br->stp_enabled = BR_NO_STP;
+ }
+ 
++/*
++ * called by:
++ *   - net/bridge/br_stp_if.c|125| <<br_stp_start>> static void br_stp_start(struct net_bridge *br)
++ */
+ void br_stp_set_enabled(struct net_bridge *br, unsigned long val)
+ {
+ 	ASSERT_RTNL();
 -- 
 2.17.1
 
