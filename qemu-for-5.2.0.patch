@@ -1,0 +1,272 @@
+From 6a9b9d8c2bfaea23964dfc209dafbfb8abc66277 Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Tue, 22 Dec 2020 12:10:07 -0800
+Subject: [PATCH 1/1] qemu for 5.2.0
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ chardev/char-fe.c          | 20 +++++++++++++
+ chardev/char-socket.c      | 32 +++++++++++++++++++++
+ monitor/misc.c             | 59 ++++++++++++++++++++++++++++++++++++++
+ monitor/monitor-internal.h | 14 +++++++++
+ target/i386/helper.c       | 10 +++++++
+ target/i386/kvm.c          |  4 +++
+ 6 files changed, 139 insertions(+)
+
+diff --git a/chardev/char-fe.c b/chardev/char-fe.c
+index 474715c5a..95bf751df 100644
+--- a/chardev/char-fe.c
++++ b/chardev/char-fe.c
+@@ -110,6 +110,16 @@ int qemu_chr_fe_ioctl(CharBackend *be, int cmd, void *arg)
+     return res;
+ }
+ 
++/*
++ * called by:
++ *   - hw/display/vhost-user-gpu.c|209| <<vhost_user_gpu_handle_display>> int fd = qemu_chr_fe_get_msgfd(&g->vhost_chr);
++ *   - hw/misc/ivshmem.c|599| <<ivshmem_read>> fd = qemu_chr_fe_get_msgfd(&s->server_chr);
++ *   - hw/misc/ivshmem.c|626| <<ivshmem_recv_msg>> *pfd = qemu_chr_fe_get_msgfd(&s->server_chr);
++ *   - hw/virtio/vhost-user.c|1681| <<vhost_user_postcopy_advise>> ufd = qemu_chr_fe_get_msgfd(chr);
++ *   - hw/virtio/vhost-user.c|2278| <<vhost_user_get_inflight_fd>> fd = qemu_chr_fe_get_msgfd(chr);
++ *   - monitor/misc.c|1233| <<qmp_getfd>> fd = qemu_chr_fe_get_msgfd(&cur_mon->chr);
++ *   - monitor/misc.c|1372| <<qmp_add_fd>> fd = qemu_chr_fe_get_msgfd(&mon->chr);
++ */
+ int qemu_chr_fe_get_msgfd(CharBackend *be)
+ {
+     Chardev *s = be->chr;
+@@ -123,6 +133,13 @@ int qemu_chr_fe_get_msgfd(CharBackend *be)
+     return res;
+ }
+ 
++/*
++ * called by:
++ *   - chardev/char-fe.c|127| <<qemu_chr_fe_get_msgfd>> int res = (qemu_chr_fe_get_msgfds(be, &fd, 1) == 1) ? fd : -1;
++ *   - tests/qtest/vhost-user-test.c|381| <<chr_read>> s->fds_num = qemu_chr_fe_get_msgfds(chr, s->fds,
++ *   - tests/qtest/vhost-user-test.c|391| <<chr_read>> qemu_chr_fe_get_msgfds(chr, &fd, 1);
++ *   - tests/qtest/vhost-user-test.c|405| <<chr_read>> qemu_chr_fe_get_msgfds(chr, &s->log_fd, 1);
++ */
+ int qemu_chr_fe_get_msgfds(CharBackend *be, int *fds, int len)
+ {
+     Chardev *s = be->chr;
+@@ -131,6 +148,9 @@ int qemu_chr_fe_get_msgfds(CharBackend *be, int *fds, int len)
+         return -1;
+     }
+ 
++    /*
++     * 似乎目前只能是tcp_get_msgfds()或者NULL
++     */
+     return CHARDEV_GET_CLASS(s)->get_msgfds ?
+         CHARDEV_GET_CLASS(s)->get_msgfds(s, fds, len) : -1;
+ }
+diff --git a/chardev/char-socket.c b/chardev/char-socket.c
+index 213a4c8dd..01e031968 100644
+--- a/chardev/char-socket.c
++++ b/chardev/char-socket.c
+@@ -66,7 +66,34 @@ struct SocketChardev {
+     int max_size;
+     int do_telnetopt;
+     int do_nodelay;
++    /*
++     * 在以下使用SocketChadev->read_msgfds:
++     *   - chardev/char-socket.c|301| <<tcp_get_msgfds>> memcpy(fds, s->read_msgfds, to_copy * sizeof(int ));
++     *   - chardev/char-socket.c|305| <<tcp_get_msgfds>> close(s->read_msgfds[i]);
++     *   - chardev/char-socket.c|308| <<tcp_get_msgfds>> g_free(s->read_msgfds);
++     *   - chardev/char-socket.c|309| <<tcp_get_msgfds>> s->read_msgfds = 0;
++     *   - chardev/char-socket.c|375| <<tcp_chr_recv>> close(s->read_msgfds[i]);
++     *   - chardev/char-socket.c|379| <<tcp_chr_recv>> g_free(s->read_msgfds);
++     *   - chardev/char-socket.c|382| <<tcp_chr_recv>> s->read_msgfds = msgfds;
++     *   - chardev/char-socket.c|387| <<tcp_chr_recv>> int fd = s->read_msgfds[i];
++     *   - chardev/char-socket.c|425| <<tcp_chr_free_connection>> close(s->read_msgfds[i]);
++     *   - chardev/char-socket.c|427| <<tcp_chr_free_connection>> g_free(s->read_msgfds);
++     *   - chardev/char-socket.c|428| <<tcp_chr_free_connection>> s->read_msgfds = NULL;
++     */
+     int *read_msgfds;
++    /*
++     * 在以下使用SocketChardev->read_msgfds_num:
++     *   - chardev/char-socket.c|281| <<tcp_get_msgfds>> int to_copy = (s->read_msgfds_num < num) ? s->read_msgfds_num : num;
++     *   - chardev/char-socket.c|291| <<tcp_get_msgfds>> for (i = to_copy; i < s->read_msgfds_num; i++) {
++     *   - chardev/char-socket.c|297| <<tcp_get_msgfds>> s->read_msgfds_num = 0;
++     *   - chardev/char-socket.c|356| <<tcp_chr_recv>> for (i = 0; i < s->read_msgfds_num; i++) {
++     *   - chardev/char-socket.c|360| <<tcp_chr_recv>> if (s->read_msgfds_num) {
++     *   - chardev/char-socket.c|365| <<tcp_chr_recv>> s->read_msgfds_num = msgfds_num;
++     *   - chardev/char-socket.c|368| <<tcp_chr_recv>> for (i = 0; i < s->read_msgfds_num; i++) {
++     *   - chardev/char-socket.c|405| <<tcp_chr_free_connection>> if (s->read_msgfds_num) {
++     *   - chardev/char-socket.c|406| <<tcp_chr_free_connection>> for (i = 0; i < s->read_msgfds_num; i++) {
++     *   - chardev/char-socket.c|411| <<tcp_chr_free_connection>> s->read_msgfds_num = 0;
++     */
+     size_t read_msgfds_num;
+     int *write_msgfds;
+     size_t write_msgfds_num;
+@@ -325,6 +352,11 @@ static int tcp_set_msgfds(Chardev *chr, int *fds, int num)
+     return 0;
+ }
+ 
++/*
++ * called by:
++ *   - chardev/char-socket.c|536| <<tcp_chr_read>> size = tcp_chr_recv(chr, (void *)buf, len);
++ *   - chardev/char-socket.c|571| <<tcp_chr_sync_read>> size = tcp_chr_recv(chr, (void *) buf, len);
++ */
+ static ssize_t tcp_chr_recv(Chardev *chr, char *buf, size_t len)
+ {
+     SocketChardev *s = SOCKET_CHARDEV(chr);
+diff --git a/monitor/misc.c b/monitor/misc.c
+index 398211a03..bbcd7f4e5 100644
+--- a/monitor/misc.c
++++ b/monitor/misc.c
+@@ -1224,12 +1224,49 @@ static void hmp_acl_remove(Monitor *mon, const QDict *qdict)
+     }
+ }
+ 
++/*
++ * (gdb) bt
++ * #0  0x000055e0a0cc780f in qmp_getfd (fdname=0x55e0a2e32590 "vhost-scsi-test", errp=0x7ffea965a210) at ../monitor/misc.c:1228
++ * #1  0x000055e0a0f49676 in qmp_marshal_getfd (args=0x7fc3180037d0, ret=0x7fc32917fd88, errp=0x7fc32917fd80) at qapi/qapi-commands-misc.c:334
++ * #2  0x000055e0a0fd22bc in do_qmp_dispatch_bh (opaque=0x7fc32917fe20) at ../qapi/qmp-dispatch.c:110
++ * #3  0x000055e0a0fbd1b1 in aio_bh_call (bh=0x55e0a2e53530) at ../util/async.c:136
++ * #4  0x000055e0a0fbd2bb in aio_bh_poll (ctx=0x55e0a2099640) at ../util/async.c:164
++ * #5  0x000055e0a0f9605e in aio_dispatch (ctx=0x55e0a2099640) at ../util/aio-posix.c:381
++ * #6  0x000055e0a0fbd6ee in aio_ctx_dispatch (source=0x55e0a2099640, callback=0x0, user_data=0x0) at ../util/async.c:306
++ * #7  0x00007fc3285f7099 in g_main_context_dispatch () at /lib/../lib64/libglib-2.0.so.0
++ * #8  0x000055e0a0fb92be in glib_pollfds_poll () at ../util/main-loop.c:221
++ * #9  0x000055e0a0fb9338 in os_host_main_loop_wait (timeout=0) at ../util/main-loop.c:244
++ * #10 0x000055e0a0fb9440 in main_loop_wait (nonblocking=0) at ../util/main-loop.c:520
++ * #11 0x000055e0a0cd72cb in qemu_main_loop () at ../softmmu/vl.c:1678#12 0x000055e0a095db32 in main (argc=22, argv=0x7ffea965a5b8, envp=0x7ffea965a670) at ../softmmu/main.c:50
++ *
++ * (gdb) bt
++ * #0  0x0000555555b7380f in qmp_getfd (fdname=0x55555737db60 "hello", errp=0x7fffffffcb28) at ../monitor/misc.c:1228
++ * #1  0x0000555555a688b1 in hmp_getfd (mon=0x555556ab80f0, qdict=0x5555570a3a00) at ../monitor/hmp-cmds.c:1691
++ * #2  0x0000555555940606 in handle_hmp_command (mon=0x555556ab80f0, cmdline=0x555556adc5a6 "hello") at ../monitor/hmp.c:1100
++ * #3  0x000055555593dd99 in monitor_command_cb (opaque=0x555556ab80f0, cmdline=0x555556adc5a0 "getfd hello", readline_opaque=0x0) at ../monitor/hmp.c:47
++ * #4  0x0000555555e5a417 in readline_handle_byte (rs=0x555556adc5a0, ch=10) at ../util/readline.c:408
++ * #5  0x0000555555941156 in monitor_read (opaque=0x555556ab80f0, buf=0x7fffffffcd60 "\n", size=1) at ../monitor/hmp.c:1340
++ * #6  0x0000555555d8fabe in qemu_chr_be_write_impl (s=0x555556aaf530, buf=0x7fffffffcd60 "\n", len=1) at ../chardev/char.c:201
++ * #7  0x0000555555d8fb25 in qemu_chr_be_write (s=0x555556aaf530, buf=0x7fffffffcd60 "\n", len=1) at ../chardev/char.c:213
++ * #8  0x0000555555d8b38c in fd_chr_read (chan=0x555556aaf640, cond=G_IO_IN, opaque=0x555556aaf530) at ../chardev/char-fd.c:68
++ * #9  0x0000555555d88fd4 in qio_channel_fd_source_dispatch (source=0x55555737da00, callback=0x555555d8b262 <fd_chr_read>, user_data=0x555556aaf530) at ../io/channel-watch.c:84
++ * #10 0x00007ffff7447099 in g_main_context_dispatch () at /lib/../lib64/libglib-2.0.so.0
++ * #11 0x0000555555e65297 in glib_pollfds_poll () at ../util/main-loop.c:221
++ * #12 0x0000555555e65311 in os_host_main_loop_wait (timeout=499000000) at ../util/main-loop.c:244
++ * #13 0x0000555555e65419 in main_loop_wait (nonblocking=0) at ../util/main-loop.c:520
++ * #14 0x0000555555b832cb in qemu_main_loop () at ../softmmu/vl.c:1678
++ * #15 0x0000555555809b32 in main (argc=20, argv=0x7fffffffe008, envp=0x7fffffffe0b0) at ../softmmu/main.c:50
++ */
+ void qmp_getfd(const char *fdname, Error **errp)
+ {
+     Monitor *cur_mon = monitor_cur();
+     mon_fd_t *monfd;
+     int fd, tmp_fd;
+ 
++    /*
++     * struct Monitor:
++     * -> CharBackend chr;
++     */
+     fd = qemu_chr_fe_get_msgfd(&cur_mon->chr);
+     if (fd == -1) {
+         error_setg(errp, QERR_FD_NOT_SUPPLIED);
+@@ -1260,6 +1297,20 @@ void qmp_getfd(const char *fdname, Error **errp)
+     monfd->name = g_strdup(fdname);
+     monfd->fd = fd;
+ 
++    /*
++     * 在以下使用Monitor->fds:
++     *   - monitor/misc.c|1247| <<qmp_getfd>> QLIST_FOREACH(monfd, &cur_mon->fds, next) {
++     *   - monitor/misc.c|1263| <<qmp_getfd>> QLIST_INSERT_HEAD(&cur_mon->fds, monfd, next);
++     *   - monitor/misc.c|1273| <<qmp_closefd>> QLIST_FOREACH(monfd, &cur_mon->fds, next) {
++     *   - monitor/misc.c|1297| <<monitor_get_fd>> QLIST_FOREACH(monfd, &mon->fds, next) {
++     *   - monitor/misc.c|1323| <<monitor_fdset_cleanup>> QLIST_FOREACH_SAFE(mon_fdset_fd, &mon_fdset->fds, next, mon_fdset_fd_next) {
++     *   - monitor/misc.c|1334| <<monitor_fdset_cleanup>> if (QLIST_EMPTY(&mon_fdset->fds) && QLIST_EMPTY(&mon_fdset->dup_fds)) {
++     *   - monitor/misc.c|1388| <<qmp_remove_fd>> QLIST_FOREACH(mon_fdset_fd, &mon_fdset->fds, next) {
++     *   - monitor/misc.c|1430| <<qmp_query_fdsets>> QLIST_FOREACH(mon_fdset_fd, &mon_fdset->fds, next) {
++     *   - monitor/misc.c|1447| <<qmp_query_fdsets>> fdset_info->value->fds = fdsetfd_list;
++     *   - monitor/misc.c|1529| <<monitor_fdset_add_fd>> QLIST_INSERT_HEAD(&mon_fdset->fds, mon_fdset_fd, next);
++     *   - monitor/misc.c|1557| <<monitor_fdset_dup_fd_add>> QLIST_FOREACH(mon_fdset_fd, &mon_fdset->fds, next) {
++     */
+     QLIST_INSERT_HEAD(&cur_mon->fds, monfd, next);
+ }
+ 
+@@ -1289,6 +1340,14 @@ void qmp_closefd(const char *fdname, Error **errp)
+     error_setg(errp, QERR_FD_NOT_FOUND, fdname);
+ }
+ 
++/*
++ * called by:
++ *   - dump/dump.c|1989| <<qmp_dump_guest_memory>> fd = monitor_get_fd(monitor_cur(), p, errp);
++ *   - migration/fd.c|29| <<fd_start_outgoing_migration>> int fd = monitor_get_fd(monitor_cur(), fdname, errp);
++ *   - monitor/misc.c|1646| <<monitor_fd_param>> fd = monitor_get_fd(mon, fdname, &local_err);
++ *   - monitor/qmp-cmds.c|331| <<qmp_add_client>> fd = monitor_get_fd(monitor_cur(), fdname, errp);
++ *   - util/qemu-sockets.c|1128| <<socket_get_fd>> fd = monitor_get_fd(cur_mon, fdstr, errp);
++ */
+ int monitor_get_fd(Monitor *mon, const char *fdname, Error **errp)
+ {
+     mon_fd_t *monfd;
+diff --git a/monitor/monitor-internal.h b/monitor/monitor-internal.h
+index a6131554d..45ce089a3 100644
+--- a/monitor/monitor-internal.h
++++ b/monitor/monitor-internal.h
+@@ -104,6 +104,20 @@ struct Monitor {
+     /*
+      * Members that are protected by the per-monitor lock
+      */
++    /*
++     * 在以下使用Monitor->fds:
++     *   - monitor/misc.c|1247| <<qmp_getfd>> QLIST_FOREACH(monfd, &cur_mon->fds, next) {
++     *   - monitor/misc.c|1263| <<qmp_getfd>> QLIST_INSERT_HEAD(&cur_mon->fds, monfd, next);
++     *   - monitor/misc.c|1273| <<qmp_closefd>> QLIST_FOREACH(monfd, &cur_mon->fds, next) {
++     *   - monitor/misc.c|1297| <<monitor_get_fd>> QLIST_FOREACH(monfd, &mon->fds, next) {
++     *   - monitor/misc.c|1323| <<monitor_fdset_cleanup>> QLIST_FOREACH_SAFE(mon_fdset_fd, &mon_fdset->fds, next, mon_fdset_fd_next) {
++     *   - monitor/misc.c|1334| <<monitor_fdset_cleanup>> if (QLIST_EMPTY(&mon_fdset->fds) && QLIST_EMPTY(&mon_fdset->dup_fds)) {
++     *   - monitor/misc.c|1388| <<qmp_remove_fd>> QLIST_FOREACH(mon_fdset_fd, &mon_fdset->fds, next) {
++     *   - monitor/misc.c|1430| <<qmp_query_fdsets>> QLIST_FOREACH(mon_fdset_fd, &mon_fdset->fds, next) {
++     *   - monitor/misc.c|1447| <<qmp_query_fdsets>> fdset_info->value->fds = fdsetfd_list;
++     *   - monitor/misc.c|1529| <<monitor_fdset_add_fd>> QLIST_INSERT_HEAD(&mon_fdset->fds, mon_fdset_fd, next);
++     *   - monitor/misc.c|1557| <<monitor_fdset_dup_fd_add>> QLIST_FOREACH(mon_fdset_fd, &mon_fdset->fds, next) {
++     */
+     QLIST_HEAD(, mon_fd_t) fds;
+     QString *outbuf;
+     guint out_watch;
+diff --git a/target/i386/helper.c b/target/i386/helper.c
+index 034f46bcc..0354439f8 100644
+--- a/target/i386/helper.c
++++ b/target/i386/helper.c
+@@ -861,6 +861,11 @@ static void emit_guest_memory_failure(MemoryFailureAction action, bool ar,
+                                    &mff);
+ }
+ 
++/*
++ * 在以下使用do_inject_x86_mce():
++ *   - target/i386/helper.c|988| <<cpu_x86_inject_mce>> run_on_cpu(cs, do_inject_x86_mce, RUN_ON_CPU_HOST_PTR(&params));
++ *   - target/i386/helper.c|1001| <<cpu_x86_inject_mce>> run_on_cpu(other_cs, do_inject_x86_mce, RUN_ON_CPU_HOST_PTR(&params));
++ */
+ static void do_inject_x86_mce(CPUState *cs, run_on_cpu_data data)
+ {
+     MCEInjectionParams *params = data.host_ptr;
+@@ -950,6 +955,11 @@ static void do_inject_x86_mce(CPUState *cs, run_on_cpu_data data)
+     emit_guest_memory_failure(MEMORY_FAILURE_ACTION_INJECT, ar, recursive);
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/kvm.c|544| <<kvm_mce_inject>> cpu_x86_inject_mce(NULL, cpu, 9, status, mcg_status, paddr,
++ *   - target/i386/monitor.c|599| <<hmp_mce>> cpu_x86_inject_mce(mon, cpu, bank, status, mcg_status, addr, misc,
++ */
+ void cpu_x86_inject_mce(Monitor *mon, X86CPU *cpu, int bank,
+                         uint64_t status, uint64_t mcg_status, uint64_t addr,
+                         uint64_t misc, int flags)
+diff --git a/target/i386/kvm.c b/target/i386/kvm.c
+index a2934dda0..fe310c274 100644
+--- a/target/i386/kvm.c
++++ b/target/i386/kvm.c
+@@ -514,6 +514,10 @@ static int kvm_get_mce_cap_supported(KVMState *s, uint64_t *mce_cap,
+     return -ENOSYS;
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/kvm.c|582| <<kvm_arch_on_sigbus_vcpu>> kvm_mce_inject(cpu, paddr, code);
++ */
+ static void kvm_mce_inject(X86CPU *cpu, hwaddr paddr, int code)
+ {
+     CPUState *cs = CPU(cpu);
+-- 
+2.17.1
+
