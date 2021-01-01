@@ -1,13 +1,184 @@
-From 7a15387a7935aee8f5860e31d79872016ae58741 Mon Sep 17 00:00:00 2001
+From 5ac680a5931ad2200f18cdf3d63d7f8a429f4447 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Tue, 22 Dec 2020 11:11:07 -0800
+Date: Fri, 1 Jan 2021 10:32:04 -0800
 Subject: [PATCH 1/1] linux v5.10
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
- drivers/xen/mcelog.c | 15 +++++++++++++++
- 1 file changed, 15 insertions(+)
+ block/blk-mq-tag.h     | 59 ++++++++++++++++++++++++++++++++++++++++++
+ block/blk-mq.c         | 19 ++++++++++++++
+ block/blk-mq.h         | 12 +++++++++
+ drivers/xen/mcelog.c   | 15 +++++++++++
+ include/linux/blk-mq.h | 31 ++++++++++++++++++++++
+ 5 files changed, 136 insertions(+)
 
+diff --git a/block/blk-mq-tag.h b/block/blk-mq-tag.h
+index 7d3e6b333a4a..b31d4938060b 100644
+--- a/block/blk-mq-tag.h
++++ b/block/blk-mq-tag.h
+@@ -9,6 +9,13 @@ struct blk_mq_tags {
+ 	unsigned int nr_tags;
+ 	unsigned int nr_reserved_tags;
+ 
++	/*
++	 * 在以下使用blk_mq_tags->active_queues:
++	 *   - block/blk-mq-debugfs.c|453| <<blk_mq_debugfs_tags_show>> atomic_read(&tags->active_queues));
++	 *   - block/blk-mq-tag.c|36| <<__blk_mq_tag_busy>> atomic_inc(&hctx->tags->active_queues);
++	 *   - block/blk-mq-tag.c|70| <<__blk_mq_tag_idle>> atomic_dec(&tags->active_queues);
++	 *   - block/blk-mq.h|312| <<hctx_may_queue>> users = atomic_read(&hctx->tags->active_queues);
++	 */
+ 	atomic_t active_queues;
+ 
+ 	struct sbitmap_queue *bitmap_tags;
+@@ -63,22 +70,74 @@ enum {
+ extern bool __blk_mq_tag_busy(struct blk_mq_hw_ctx *);
+ extern void __blk_mq_tag_idle(struct blk_mq_hw_ctx *);
+ 
++/*
++ * called by:
++ *   - block/blk-mq.c|376| <<__blk_mq_alloc_request>> blk_mq_tag_busy(data->hctx);
++ *   - block/blk-mq.c|472| <<blk_mq_alloc_request_hctx>> blk_mq_tag_busy(data.hctx);
++ *   - block/blk-mq.c|1103| <<__blk_mq_get_driver_tag>> blk_mq_tag_busy(rq->mq_hctx);
++ */
+ static inline bool blk_mq_tag_busy(struct blk_mq_hw_ctx *hctx)
+ {
++	/*
++	 * 在以下设置BLK_MQ_F_TAG_QUEUE_SHARED:
++	 *   - block/blk-mq.c|2677| <<blk_mq_alloc_hctx>> hctx->flags = set->flags & ~BLK_MQ_F_TAG_QUEUE_SHARED;
++	 *   - block/blk-mq.c|2897| <<queue_set_hctx_shared>> hctx->flags |= BLK_MQ_F_TAG_QUEUE_SHARED;
++	 *   - block/blk-mq.c|2899| <<queue_set_hctx_shared>> hctx->flags &= ~BLK_MQ_F_TAG_QUEUE_SHARED;
++	 *   - block/blk-mq.c|2925| <<blk_mq_del_queue_tag_set>> set->flags &= ~BLK_MQ_F_TAG_QUEUE_SHARED;
++	 *   - block/blk-mq.c|2943| <<blk_mq_add_queue_tag_set>> set->flags |= BLK_MQ_F_TAG_QUEUE_SHARED;
++	 * 在以下使用BLK_MQ_F_TAG_QUEUE_SHARED:
++	 *   - block/blk-mq-tag.h|81| <<blk_mq_tag_busy>> if (!(hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED))
++	 *   - block/blk-mq-tag.h|94| <<blk_mq_tag_idle>> if (!(hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED))
++	 *   - block/blk-mq.c|1128| <<blk_mq_get_driver_tag>> if ((hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED) &&
++	 *   - block/blk-mq.c|1172| <<blk_mq_mark_tag_wait>> if (!(hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED)) {
++	 *   - block/blk-mq.c|1429| <<blk_mq_dispatch_rq_list>> (hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED);
++	 *   - block/blk-mq.c|2942| <<blk_mq_add_queue_tag_set>> !(set->flags & BLK_MQ_F_TAG_QUEUE_SHARED)) {
++	 *   - block/blk-mq.c|2947| <<blk_mq_add_queue_tag_set>> if (set->flags & BLK_MQ_F_TAG_QUEUE_SHARED)
++	 *   - block/blk-mq.h|293| <<hctx_may_queue>> if (!hctx || !(hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED))
++	 *   - drivers/block/rnbd/rnbd-clt.c|1172| <<setup_mq_tags>> BLK_MQ_F_TAG_QUEUE_SHARED;
++	 */
+ 	if (!(hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED))
+ 		return false;
+ 
+ 	return __blk_mq_tag_busy(hctx);
+ }
+ 
++/*
++ * called by:
++ *   - block/blk-mq.c|1009| <<blk_mq_timeout_work>> blk_mq_tag_idle(hctx);
++ *   - block/blk-mq.c|2580| <<blk_mq_exit_hctx>> blk_mq_tag_idle(hctx);
++ */
+ static inline void blk_mq_tag_idle(struct blk_mq_hw_ctx *hctx)
+ {
++	/*
++	 * 在以下设置BLK_MQ_F_TAG_QUEUE_SHARED:
++	 *   - block/blk-mq.c|2677| <<blk_mq_alloc_hctx>> hctx->flags = set->flags & ~BLK_MQ_F_TAG_QUEUE_SHARED;
++	 *   - block/blk-mq.c|2897| <<queue_set_hctx_shared>> hctx->flags |= BLK_MQ_F_TAG_QUEUE_SHARED;
++	 *   - block/blk-mq.c|2899| <<queue_set_hctx_shared>> hctx->flags &= ~BLK_MQ_F_TAG_QUEUE_SHARED;
++	 *   - block/blk-mq.c|2925| <<blk_mq_del_queue_tag_set>> set->flags &= ~BLK_MQ_F_TAG_QUEUE_SHARED;
++	 *   - block/blk-mq.c|2943| <<blk_mq_add_queue_tag_set>> set->flags |= BLK_MQ_F_TAG_QUEUE_SHARED;
++	 * 在以下使用BLK_MQ_F_TAG_QUEUE_SHARED:
++	 *   - block/blk-mq-tag.h|81| <<blk_mq_tag_busy>> if (!(hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED))
++	 *   - block/blk-mq-tag.h|94| <<blk_mq_tag_idle>> if (!(hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED))
++	 *   - block/blk-mq.c|1128| <<blk_mq_get_driver_tag>> if ((hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED) &&
++	 *   - block/blk-mq.c|1172| <<blk_mq_mark_tag_wait>> if (!(hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED)) {
++	 *   - block/blk-mq.c|1429| <<blk_mq_dispatch_rq_list>> (hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED);
++	 *   - block/blk-mq.c|2942| <<blk_mq_add_queue_tag_set>> !(set->flags & BLK_MQ_F_TAG_QUEUE_SHARED)) {
++	 *   - block/blk-mq.c|2947| <<blk_mq_add_queue_tag_set>> if (set->flags & BLK_MQ_F_TAG_QUEUE_SHARED)
++	 *   - block/blk-mq.h|293| <<hctx_may_queue>> if (!hctx || !(hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED))
++	 *   - drivers/block/rnbd/rnbd-clt.c|1172| <<setup_mq_tags>> BLK_MQ_F_TAG_QUEUE_SHARED;
++	 */
+ 	if (!(hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED))
+ 		return;
+ 
+ 	__blk_mq_tag_idle(hctx);
+ }
+ 
++/*
++ * called by:
++ *   - block/blk-mq-tag.c|184| <<blk_mq_put_tag>> if (!blk_mq_tag_is_reserved(tags, tag)) {
++ *   - block/blk-mq.c|1105| <<__blk_mq_get_driver_tag>> if (blk_mq_tag_is_reserved(rq->mq_hctx->sched_tags, rq->internal_tag)) {
++ */
+ static inline bool blk_mq_tag_is_reserved(struct blk_mq_tags *tags,
+ 					  unsigned int tag)
+ {
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 55bcee5dc032..8abe775ada71 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -2887,6 +2887,13 @@ static void blk_mq_map_swqueue(struct request_queue *q)
+  * Caller needs to ensure that we're either frozen/quiesced, or that
+  * the queue isn't live yet.
+  */
++/*
++ * called by:
++ *   - block/blk-mq.c|2912| <<blk_mq_update_tag_set_shared>> queue_set_hctx_shared(q, shared);
++ *   - block/blk-mq.c|2948| <<blk_mq_add_queue_tag_set>> queue_set_hctx_shared(q, true);
++ *
++ * 对于request_queue的每一个hctx->flags, 设置或者取消BLK_MQ_F_TAG_QUEUE_SHARED
++ */
+ static void queue_set_hctx_shared(struct request_queue *q, bool shared)
+ {
+ 	struct blk_mq_hw_ctx *hctx;
+@@ -2900,6 +2907,11 @@ static void queue_set_hctx_shared(struct request_queue *q, bool shared)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - block/blk-mq.c|2932| <<blk_mq_del_queue_tag_set>> blk_mq_update_tag_set_shared(set, false);
++ *   - block/blk-mq.c|2950| <<blk_mq_add_queue_tag_set>> blk_mq_update_tag_set_shared(set, true);
++ */
+ static void blk_mq_update_tag_set_shared(struct blk_mq_tag_set *set,
+ 					 bool shared)
+ {
+@@ -2909,6 +2921,9 @@ static void blk_mq_update_tag_set_shared(struct blk_mq_tag_set *set,
+ 
+ 	list_for_each_entry(q, &set->tag_list, tag_set_list) {
+ 		blk_mq_freeze_queue(q);
++		/*
++		 * 对于request_queue的每一个hctx->flags, 设置或者取消BLK_MQ_F_TAG_QUEUE_SHARED
++		 */
+ 		queue_set_hctx_shared(q, shared);
+ 		blk_mq_unfreeze_queue(q);
+ 	}
+@@ -2930,6 +2945,10 @@ static void blk_mq_del_queue_tag_set(struct request_queue *q)
+ 	INIT_LIST_HEAD(&q->tag_set_list);
+ }
+ 
++/*
++ * called by:
++ *   - block/blk-mq.c|3239| <<blk_mq_init_allocated_queue>> blk_mq_add_queue_tag_set(set, q);
++ */
+ static void blk_mq_add_queue_tag_set(struct blk_mq_tag_set *set,
+ 				     struct request_queue *q)
+ {
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index a52703c98b77..0415dbdc56a4 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -159,6 +159,18 @@ struct blk_mq_alloc_data {
+ 	struct blk_mq_hw_ctx *hctx;
+ };
+ 
++/*
++ * called by:
++ *   - block/blk-mq-tag.c|26| <<__blk_mq_tag_busy>> if (blk_mq_is_sbitmap_shared(hctx->flags)) {
++ *   - block/blk-mq-tag.c|62| <<__blk_mq_tag_idle>> if (blk_mq_is_sbitmap_shared(hctx->flags)) {
++ *   - block/blk-mq.c|3471| <<blk_mq_alloc_tag_set>> if (blk_mq_is_sbitmap_shared(set->flags)) {
++ *   - block/blk-mq.c|3506| <<blk_mq_free_tag_set>> if (blk_mq_is_sbitmap_shared(set->flags))
++ *   - block/blk-mq.c|3545| <<blk_mq_update_nr_requests>> if (!ret && blk_mq_is_sbitmap_shared(set->flags))
++ *   - block/blk-mq.h|204| <<__blk_mq_inc_active_requests>> if (blk_mq_is_sbitmap_shared(hctx->flags))
++ *   - block/blk-mq.h|212| <<__blk_mq_dec_active_requests>> if (blk_mq_is_sbitmap_shared(hctx->flags))
++ *   - block/blk-mq.h|220| <<__blk_mq_active_requests>> if (blk_mq_is_sbitmap_shared(hctx->flags))
++ *   - block/blk-mq.h|302| <<hctx_may_queue>> if (blk_mq_is_sbitmap_shared(hctx->flags)) {
++ */
+ static inline bool blk_mq_is_sbitmap_shared(unsigned int flags)
+ {
+ 	return flags & BLK_MQ_F_TAG_HCTX_SHARED;
 diff --git a/drivers/xen/mcelog.c b/drivers/xen/mcelog.c
 index e9ac3b8c4167..1afc5d4a31ed 100644
 --- a/drivers/xen/mcelog.c
@@ -48,6 +219,54 @@ index e9ac3b8c4167..1afc5d4a31ed 100644
  	schedule_work(&xen_mce_work);
  	return IRQ_HANDLED;
  }
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index 794b2a33a2c3..3efed3578d3a 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -390,12 +390,43 @@ struct blk_mq_ops {
+ 
+ enum {
+ 	BLK_MQ_F_SHOULD_MERGE	= 1 << 0,
++	/*
++	 * 在以下设置BLK_MQ_F_TAG_QUEUE_SHARED:
++	 *   - block/blk-mq.c|2677| <<blk_mq_alloc_hctx>> hctx->flags = set->flags & ~BLK_MQ_F_TAG_QUEUE_SHARED;
++	 *   - block/blk-mq.c|2897| <<queue_set_hctx_shared>> hctx->flags |= BLK_MQ_F_TAG_QUEUE_SHARED;
++	 *   - block/blk-mq.c|2899| <<queue_set_hctx_shared>> hctx->flags &= ~BLK_MQ_F_TAG_QUEUE_SHARED;
++	 *   - block/blk-mq.c|2925| <<blk_mq_del_queue_tag_set>> set->flags &= ~BLK_MQ_F_TAG_QUEUE_SHARED;
++	 *   - block/blk-mq.c|2943| <<blk_mq_add_queue_tag_set>> set->flags |= BLK_MQ_F_TAG_QUEUE_SHARED;
++	 * 在以下使用BLK_MQ_F_TAG_QUEUE_SHARED:
++	 *   - block/blk-mq-tag.h|81| <<blk_mq_tag_busy>> if (!(hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED))
++	 *   - block/blk-mq-tag.h|94| <<blk_mq_tag_idle>> if (!(hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED))
++	 *   - block/blk-mq.c|1128| <<blk_mq_get_driver_tag>> if ((hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED) &&
++	 *   - block/blk-mq.c|1172| <<blk_mq_mark_tag_wait>> if (!(hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED)) {
++	 *   - block/blk-mq.c|1429| <<blk_mq_dispatch_rq_list>> (hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED);
++	 *   - block/blk-mq.c|2942| <<blk_mq_add_queue_tag_set>> !(set->flags & BLK_MQ_F_TAG_QUEUE_SHARED)) {
++	 *   - block/blk-mq.c|2947| <<blk_mq_add_queue_tag_set>> if (set->flags & BLK_MQ_F_TAG_QUEUE_SHARED)
++	 *   - block/blk-mq.h|293| <<hctx_may_queue>> if (!hctx || !(hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED))
++	 *   - drivers/block/rnbd/rnbd-clt.c|1172| <<setup_mq_tags>> BLK_MQ_F_TAG_QUEUE_SHARED;
++	 */
+ 	BLK_MQ_F_TAG_QUEUE_SHARED = 1 << 1,
+ 	/*
+ 	 * Set when this device requires underlying blk-mq device for
+ 	 * completing IO:
+ 	 */
+ 	BLK_MQ_F_STACKING	= 1 << 2,
++	/*
++	 * 在以下设置BLK_MQ_F_TAG_HCTX_SHARED:
++	 *   - block/blk-mq-tag.c|555| <<blk_mq_tag_update_depth>> unsigned int flags = set->flags & ~BLK_MQ_F_TAG_HCTX_SHARED;
++	 *   - drivers/block/null_blk_main.c|1714| <<null_init_tag_set>> set->flags |= BLK_MQ_F_TAG_HCTX_SHARED;
++	 *   - drivers/scsi/scsi_lib.c|1915| <<scsi_mq_setup_tags>> tag_set->flags |= BLK_MQ_F_TAG_HCTX_SHARED;
++	 * 在以下使用BLK_MQ_F_TAG_HCTX_SHARED:
++	 *   - block/blk-mq-sched.c|510| <<blk_mq_sched_free_tags>> unsigned int flags = set->flags & ~BLK_MQ_F_TAG_HCTX_SHARED;
++	 *   - block/blk-mq-sched.c|525| <<blk_mq_sched_alloc_tags>> unsigned int flags = set->flags & ~BLK_MQ_F_TAG_HCTX_SHARED;
++	 *   - block/blk-mq-sched.c|548| <<blk_mq_sched_tags_teardown>> unsigned int flags = hctx->flags & ~BLK_MQ_F_TAG_HCTX_SHARED;
++	 *   - block/blk-mq-tag.c|520| <<blk_mq_init_tags>> if (flags & BLK_MQ_F_TAG_HCTX_SHARED)
++	 *   - block/blk-mq-tag.c|532| <<blk_mq_free_tags>> if (!(flags & BLK_MQ_F_TAG_HCTX_SHARED)) {
++	 *   - block/blk-mq.h|164| <<blk_mq_is_sbitmap_shared>> return flags & BLK_MQ_F_TAG_HCTX_SHARED;
++	 */
+ 	BLK_MQ_F_TAG_HCTX_SHARED = 1 << 3,
+ 	BLK_MQ_F_BLOCKING	= 1 << 5,
+ 	BLK_MQ_F_NO_SCHED	= 1 << 6,
 -- 
 2.17.1
 
