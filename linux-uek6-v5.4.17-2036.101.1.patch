@@ -1,37 +1,970 @@
-From b7e4a27066517aceb557abf2ef308974621d7a24 Mon Sep 17 00:00:00 2001
+From eb8d8b59956871b5ae081378133f568047395c50 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Tue, 1 Dec 2020 19:43:41 -0800
+Date: Mon, 11 Jan 2021 08:36:51 -0800
 Subject: [PATCH 1/1] linux uek6 v5.4.17-2036.101.1
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
- drivers/infiniband/core/cm.c          |   6 ++
- drivers/infiniband/sw/rxe/rxe_net.c   |  55 ++++++++++
- drivers/infiniband/sw/rxe/rxe_verbs.c |  34 ++++++
- drivers/scsi/iscsi_tcp.c              | 105 +++++++++++++++++++
+ arch/x86/kvm/irq.c                    |  10 +
+ arch/x86/kvm/lapic.c                  | 410 ++++++++++++++++++++++++++
+ arch/x86/kvm/lapic.h                  | 115 ++++++++
+ arch/x86/kvm/vmx/vmx.c                |   4 +
+ arch/x86/kvm/vmx/vmx.h                |   8 +
+ arch/x86/kvm/x86.c                    |  21 ++
+ drivers/infiniband/core/cm.c          |   6 +
+ drivers/infiniband/sw/rxe/rxe_net.c   |  55 ++++
+ drivers/infiniband/sw/rxe/rxe_verbs.c |  34 +++
+ drivers/scsi/iscsi_tcp.c              | 105 +++++++
  drivers/scsi/libiscsi.c               |   4 +
- drivers/scsi/scsi_transport_iscsi.c   |  10 ++
- net/rds/af_rds.c                      |  49 +++++++++
- net/rds/bind.c                        |   6 ++
- net/rds/connection.c                  | 143 ++++++++++++++++++++++++++
- net/rds/ib.c                          |  10 ++
- net/rds/ib.h                          |  21 ++++
- net/rds/ib_cm.c                       |  94 +++++++++++++++++
+ drivers/scsi/scsi_transport_iscsi.c   |  10 +
+ include/linux/kvm_host.h              |   4 +
+ net/rds/af_rds.c                      |  49 +++
+ net/rds/bind.c                        |   6 +
+ net/rds/connection.c                  | 143 +++++++++
+ net/rds/ib.c                          |  10 +
+ net/rds/ib.h                          |  21 ++
+ net/rds/ib_cm.c                       |  94 ++++++
  net/rds/ib_rdma.c                     |   4 +
- net/rds/ib_recv.c                     |  46 +++++++++
- net/rds/ib_ring.c                     |  13 +++
- net/rds/ib_send.c                     |  44 ++++++++
+ net/rds/ib_recv.c                     |  46 +++
+ net/rds/ib_ring.c                     |  13 +
+ net/rds/ib_send.c                     |  44 +++
  net/rds/ib_stats.c                    |   3 +
  net/rds/info.c                        |   4 +
- net/rds/rdma.c                        |   6 ++
- net/rds/rdma_transport.c              |   6 ++
- net/rds/rds.h                         |  30 ++++++
- net/rds/recv.c                        |  62 +++++++++++
- net/rds/send.c                        |  90 ++++++++++++++++
+ net/rds/rdma.c                        |   6 +
+ net/rds/rdma_transport.c              |   6 +
+ net/rds/rds.h                         |  30 ++
+ net/rds/recv.c                        |  62 ++++
+ net/rds/send.c                        |  90 ++++++
  net/rds/threads.c                     |   4 +
- net/rds/transport.c                   |  14 +++
- 25 files changed, 863 insertions(+)
+ net/rds/transport.c                   |  14 +
+ 32 files changed, 1435 insertions(+)
 
+diff --git a/arch/x86/kvm/irq.c b/arch/x86/kvm/irq.c
+index e330e7d125f7..98ae80007141 100644
+--- a/arch/x86/kvm/irq.c
++++ b/arch/x86/kvm/irq.c
+@@ -148,6 +148,16 @@ int kvm_cpu_get_interrupt(struct kvm_vcpu *v)
+ }
+ EXPORT_SYMBOL_GPL(kvm_cpu_get_interrupt);
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|8509| <<vcpu_run>> kvm_inject_pending_timer_irqs(vcpu);
++ *
++ * vcpu_run():
++ *   kvm_clear_request(KVM_REQ_PENDING_TIMER, vcpu);
++ *   if (kvm_cpu_has_pending_timer(vcpu))
++ *       kvm_inject_pending_timer_irqs(vcpu);
++ *       -> kvm_inject_apic_timer_irqs()
++ */
+ void kvm_inject_pending_timer_irqs(struct kvm_vcpu *vcpu)
+ {
+ 	if (lapic_in_kernel(vcpu))
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 2c4daaf6c551..2e0a5c8c1552 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -57,12 +57,30 @@
+ #define APIC_VERSION			(0x14UL | ((KVM_APIC_LVT_NUM - 1) << 16))
+ #define LAPIC_MMIO_LENGTH		(1 << 12)
+ /* followed define is not in apicdef.h */
++/*
++ * 在以下使用MAX_APIC_VECTOR:
++ *   - arch/x86/kvm/lapic.c|371| <<find_highest_vector>> for (vec = MAX_APIC_VECTOR - APIC_VECTORS_PER_REG;
++ *   - arch/x86/kvm/lapic.c|387| <<count_vectors>> for (vec = 0; vec < MAX_APIC_VECTOR; vec += APIC_VECTORS_PER_REG) {
++ *   - arch/x86/kvm/lapic.c|492| <<apic_set_isr>> BUG_ON(apic->isr_count > MAX_APIC_VECTOR);
++ */
+ #define MAX_APIC_VECTOR			256
++/*
++ * 在以下使用APIC_VECTORS_PER_REG:
++ *   - arch/x86/kvm/lapic.c|371| <<find_highest_vector>> for (vec = MAX_APIC_VECTOR - APIC_VECTORS_PER_REG;
++ *   - arch/x86/kvm/lapic.c|372| <<find_highest_vector>> vec >= 0; vec -= APIC_VECTORS_PER_REG) {
++ *   - arch/x86/kvm/lapic.c|387| <<count_vectors>> for (vec = 0; vec < MAX_APIC_VECTOR; vec += APIC_VECTORS_PER_REG) {
++ */
+ #define APIC_VECTORS_PER_REG		32
+ 
+ #define APIC_BROADCAST			0xFF
+ #define X2APIC_BROADCAST		0xFFFFFFFFul
+ 
++/*
++ * 在以下使用lapic_timer_advance_dynamic:
++ *   - arch/x86/kvm/lapic.c|1571| <<__kvm_wait_lapic_expire>> if (lapic_timer_advance_dynamic)
++ *   - arch/x86/kvm/lapic.c|2368| <<kvm_create_lapic>> lapic_timer_advance_dynamic = true;
++ *   - arch/x86/kvm/lapic.c|2371| <<kvm_create_lapic>> lapic_timer_advance_dynamic = false;
++ */
+ static bool lapic_timer_advance_dynamic __read_mostly;
+ #define LAPIC_TIMER_ADVANCE_ADJUST_MIN	100	/* clock cycles */
+ #define LAPIC_TIMER_ADVANCE_ADJUST_MAX	10000	/* clock cycles */
+@@ -94,9 +112,49 @@ static inline int __apic_test_and_clear_vector(int vec, void *bitmap)
+ 	return __test_and_clear_bit(VEC_POS(vec), (bitmap) + REG_POS(vec));
+ }
+ 
++/*
++ * crash> apic_hw_disabled
++ * apic_hw_disabled = $4 = {
++ *   key = {
++ *     enabled = {
++ *       counter = 0
++ *   },
++ *
++ * 在以下使用apic_hw_disabled:
++ *   - arch/x86/kvm/lapic.c|2067| <<kvm_free_lapic>> static_key_slow_dec_deferred(&apic_hw_disabled);
++ *   - arch/x86/kvm/lapic.c|2144| <<kvm_lapic_set_base>> static_key_slow_dec_deferred(&apic_hw_disabled);
++ *   - arch/x86/kvm/lapic.c|2146| <<kvm_lapic_set_base>> static_key_slow_inc(&apic_hw_disabled.key);
++ *   - arch/x86/kvm/lapic.c|2766| <<kvm_lapic_init>> jump_label_rate_limit(&apic_hw_disabled, HZ);
++ *   - arch/x86/kvm/lapic.c|2772| <<kvm_lapic_exit>> static_key_deferred_flush(&apic_hw_disabled);
++ *   - arch/x86/kvm/lapic.h|177| <<kvm_apic_hw_enabled>> if (static_key_false(&apic_hw_disabled.key))
++ */
+ struct static_key_deferred apic_hw_disabled __read_mostly;
++/*
++ * crash> apic_sw_disabled
++ * apic_sw_disabled = $5 = {
++ *   key = {
++ *     enabled = {
++ *       counter = 0
++ *   },
++ *
++ * 在以下使用apic_sw_disabled:
++ *   - arch/x86/kvm/lapic.c|261| <<apic_set_spiv>> static_key_slow_dec_deferred(&apic_sw_disabled);
++ *   - arch/x86/kvm/lapic.c|263| <<apic_set_spiv>> static_key_slow_inc(&apic_sw_disabled.key);
++ *   - arch/x86/kvm/lapic.c|2070| <<kvm_free_lapic>> static_key_slow_dec_deferred(&apic_sw_disabled);
++ *   - arch/x86/kvm/lapic.c|2341| <<kvm_create_lapic>> static_key_slow_inc(&apic_sw_disabled.key);
++ *   - arch/x86/kvm/lapic.c|2767| <<kvm_lapic_init>> jump_label_rate_limit(&apic_sw_disabled, HZ);
++ *   - arch/x86/kvm/lapic.c|2773| <<kvm_lapic_exit>> static_key_deferred_flush(&apic_sw_disabled);
++ *   - arch/x86/kvm/lapic.h|186| <<kvm_apic_sw_enabled>> if (static_key_false(&apic_sw_disabled.key))
++ */
+ struct static_key_deferred apic_sw_disabled __read_mostly;
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|1104| <<__apic_accept_irq>> if (unlikely(!apic_enabled(apic)))
++ *   - arch/x86/kvm/lapic.c|2486| <<apic_has_pending_timer>> if (apic_enabled(apic) && apic_lvt_enabled(apic, APIC_LVTT))
++ *
++ * kvm_apic_sw_enabled()和kvm_apic_ww_enabled()同时返回true
++ */
+ static inline int apic_enabled(struct kvm_lapic *apic)
+ {
+ 	return kvm_apic_sw_enabled(apic) &&	kvm_apic_hw_enabled(apic);
+@@ -114,14 +172,35 @@ static inline u32 kvm_x2apic_id(struct kvm_lapic *apic)
+ 	return apic->vcpu->vcpu_id;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|176| <<kvm_use_posted_timer_interrupt>> return kvm_can_post_timer_interrupt(vcpu) && vcpu->mode == IN_GUEST_MODE;
++ *   - arch/x86/kvm/lapic.c|2801| <<__kvm_migrate_apic_timer>> kvm_can_post_timer_interrupt(vcpu))
++ *   - arch/x86/kvm/vmx/vmx.c|7277| <<vmx_set_hv_timer>> kvm_can_post_timer_interrupt(vcpu))
++ */
+ bool kvm_can_post_timer_interrupt(struct kvm_vcpu *vcpu)
+ {
++	/*
++	 * 在以下使用pi_inject_timer:
++	 *   - arch/x86/kvm/x86.c|162| <<global>> module_param(pi_inject_timer, bint, S_IRUGO | S_IWUSR);
++	 *   - arch/x86/kvm/lapic.c|119| <<kvm_can_post_timer_interrupt>> return pi_inject_timer && kvm_vcpu_apicv_active(vcpu);
++	 *   - arch/x86/kvm/x86.c|7352| <<kvm_arch_init>> if (pi_inject_timer == -1)
++	 *   - arch/x86/kvm/x86.c|7353| <<kvm_arch_init>> pi_inject_timer = housekeeping_enabled(HK_FLAG_TIMER);
++	 */
+ 	return pi_inject_timer && kvm_vcpu_apicv_active(vcpu);
+ }
+ EXPORT_SYMBOL_GPL(kvm_can_post_timer_interrupt);
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|1701| <<apic_timer_expired>> if (kvm_use_posted_timer_interrupt(apic->vcpu)) {
++ */
+ static bool kvm_use_posted_timer_interrupt(struct kvm_vcpu *vcpu)
+ {
++	/*
++	 * 一个设置IN_GUEST_MODE的例子:
++	 *   - arch/x86/kvm/x86.c|8298| <<vcpu_enter_guest>> vcpu->mode = IN_GUEST_MODE;
++	 */
+ 	return kvm_can_post_timer_interrupt(vcpu) && vcpu->mode == IN_GUEST_MODE;
+ }
+ 
+@@ -255,8 +334,25 @@ static inline void apic_set_spiv(struct kvm_lapic *apic, u32 val)
+ 
+ 	kvm_lapic_set_reg(apic, APIC_SPIV, val);
+ 
++	/*
++	 * 在以下使用kvm_lapic->sw_enabled:
++	 *   - arch/x86/kvm/lapic.c|302| <<apic_set_spiv>> if (enabled != apic->sw_enabled) {
++	 *   - arch/x86/kvm/lapic.c|303| <<apic_set_spiv>> apic->sw_enabled = enabled;\
++	 *   - arch/x86/kvm/lapic.c|2262| <<kvm_free_lapic>> if (!apic->sw_enabled)
++	 *   - arch/x86/kvm/lapic.h|237| <<kvm_apic_sw_enabled>> return apic->sw_enabled;
++	 */
+ 	if (enabled != apic->sw_enabled) {
+ 		apic->sw_enabled = enabled;
++		/*
++		 * 在以下使用apic_sw_disabled:
++		 *   - arch/x86/kvm/lapic.c|261| <<apic_set_spiv>> static_key_slow_dec_deferred(&apic_sw_disabled);
++		 *   - arch/x86/kvm/lapic.c|263| <<apic_set_spiv>> static_key_slow_inc(&apic_sw_disabled.key);
++		 *   - arch/x86/kvm/lapic.c|2070| <<kvm_free_lapic>> static_key_slow_dec_deferred(&apic_sw_disabled);
++		 *   - arch/x86/kvm/lapic.c|2341| <<kvm_create_lapic>> static_key_slow_inc(&apic_sw_disabled.key);
++		 *   - arch/x86/kvm/lapic.c|2767| <<kvm_lapic_init>> jump_label_rate_limit(&apic_sw_disabled, HZ);
++		 *   - arch/x86/kvm/lapic.c|2773| <<kvm_lapic_exit>> static_key_deferred_flush(&apic_sw_disabled);
++		 *   - arch/x86/kvm/lapic.h|186| <<kvm_apic_sw_enabled>> if (static_key_false(&apic_sw_disabled.key))
++		 */
+ 		if (enabled)
+ 			static_key_slow_dec_deferred(&apic_sw_disabled);
+ 		else
+@@ -304,8 +400,24 @@ static inline int apic_lvt_vector(struct kvm_lapic *apic, int lvt_type)
+ 	return kvm_lapic_get_reg(apic, lvt_type) & APIC_VECTOR_MASK;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|1543| <<kvm_apic_inject_pending_timer_irqs>> if (apic_lvtt_oneshot(apic)) {
++ *   - arch/x86/kvm/lapic.c|1681| <<start_sw_period>> if (apic_lvtt_oneshot(apic))
++ *   - arch/x86/kvm/lapic.c|1761| <<start_sw_timer>> if (apic_lvtt_period(apic) || apic_lvtt_oneshot(apic))
++ *   - arch/x86/kvm/lapic.c|1832| <<start_apic_timer>> if ((apic_lvtt_period(apic) || apic_lvtt_oneshot(apic))
++ *   - arch/x86/kvm/lapic.c|2090| <<kvm_set_lapic_tscdeadline_msr>> if (!kvm_apic_present(vcpu) || apic_lvtt_oneshot(apic) ||
++ */
+ static inline int apic_lvtt_oneshot(struct kvm_lapic *apic)
+ {
++	/*
++	 * 在以下使用kvm_timer->timer_mode:
++	 *   - arch/x86/kvm/lapic.c|355| <<apic_lvtt_oneshot>> return apic->lapic_timer.timer_mode == APIC_LVT_TIMER_ONESHOT;
++	 *   - arch/x86/kvm/lapic.c|360| <<apic_lvtt_period>> return apic->lapic_timer.timer_mode == APIC_LVT_TIMER_PERIODIC;
++	 *   - arch/x86/kvm/lapic.c|365| <<apic_lvtt_tscdeadline>> return apic->lapic_timer.timer_mode == APIC_LVT_TIMER_TSCDEADLINE;
++	 *   - arch/x86/kvm/lapic.c|1470| <<apic_update_lvtt>> if (apic->lapic_timer.timer_mode != timer_mode) {
++	 *   - arch/x86/kvm/lapic.c|1478| <<apic_update_lvtt>> apic->lapic_timer.timer_mode = timer_mode;
++	 */
+ 	return apic->lapic_timer.timer_mode == APIC_LVT_TIMER_ONESHOT;
+ }
+ 
+@@ -1023,6 +1135,11 @@ bool kvm_intr_is_single_vcpu_fast(struct kvm *kvm, struct kvm_lapic_irq *irq,
+  * Add a pending IRQ into lapic.
+  * Return 1 if successfully added and 0 if discarded.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|642| <<kvm_apic_set_irq>> return __apic_accept_irq(apic, irq->delivery_mode, irq->vector,
++ *   - arch/x86/kvm/lapic.c|2525| <<kvm_apic_local_deliver>> return __apic_accept_irq(apic, mode, vector, 1, trig_mode,
++ */
+ static int __apic_accept_irq(struct kvm_lapic *apic, int delivery_mode,
+ 			     int vector, int level, int trig_mode,
+ 			     struct dest_map *dest_map)
+@@ -1291,6 +1408,11 @@ static u32 __apic_read(struct kvm_lapic *apic, unsigned int offset)
+ 	return val;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|1428| <<apic_mmio_read>> struct kvm_lapic *apic = to_lapic(this);
++ *   - arch/x86/kvm/lapic.c|2077| <<apic_mmio_write>> struct kvm_lapic *apic = to_lapic(this);
++ */
+ static inline struct kvm_lapic *to_lapic(struct kvm_io_device *dev)
+ {
+ 	return container_of(dev, struct kvm_lapic, dev);
+@@ -1416,11 +1538,26 @@ static void limit_periodic_timer_frequency(struct kvm_lapic *apic)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   -  arch/x86/kvm/lapic.c|1951| <<kvm_lapic_reg_write>> apic_update_lvtt(apic);
++ *   - arch/x86/kvm/lapic.c|1996| <<kvm_lapic_reg_write>> apic_update_lvtt(apic);
++ *   - arch/x86/kvm/lapic.c|2238| <<kvm_lapic_reset>> apic_update_lvtt(apic);
++ *   - arch/x86/kvm/lapic.c|2514| <<kvm_apic_set_state>> apic_update_lvtt(apic);
++ */
+ static void apic_update_lvtt(struct kvm_lapic *apic)
+ {
+ 	u32 timer_mode = kvm_lapic_get_reg(apic, APIC_LVTT) &
+ 			apic->lapic_timer.timer_mode_mask;
+ 
++	/*
++	 * 在以下使用kvm_timer->timer_mode:
++	 *   - arch/x86/kvm/lapic.c|355| <<apic_lvtt_oneshot>> return apic->lapic_timer.timer_mode == APIC_LVT_TIMER_ONESHOT;
++	 *   - arch/x86/kvm/lapic.c|360| <<apic_lvtt_period>> return apic->lapic_timer.timer_mode == APIC_LVT_TIMER_PERIODIC;
++	 *   - arch/x86/kvm/lapic.c|365| <<apic_lvtt_tscdeadline>> return apic->lapic_timer.timer_mode == APIC_LVT_TIMER_TSCDEADLINE;
++	 *   - arch/x86/kvm/lapic.c|1470| <<apic_update_lvtt>> if (apic->lapic_timer.timer_mode != timer_mode) {
++	 *   - arch/x86/kvm/lapic.c|1478| <<apic_update_lvtt>> apic->lapic_timer.timer_mode = timer_mode;
++	 */
+ 	if (apic->lapic_timer.timer_mode != timer_mode) {
+ 		if (apic_lvtt_tscdeadline(apic) != (timer_mode ==
+ 				APIC_LVT_TIMER_TSCDEADLINE)) {
+@@ -1533,6 +1670,20 @@ void kvm_wait_lapic_expire(struct kvm_vcpu *vcpu)
+ }
+ EXPORT_SYMBOL_GPL(kvm_wait_lapic_expire);
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|1675| <<apic_timer_expired>> kvm_apic_inject_pending_timer_irqs(apic);
++ *   - arch/x86/kvm/lapic.c|2620| <<kvm_inject_apic_timer_irqs>> kvm_apic_inject_pending_timer_irqs(apic);
++ *
++ * vcpu_run():
++ *   kvm_clear_request(KVM_REQ_PENDING_TIMER, vcpu);
++ *   if (kvm_cpu_has_pending_timer(vcpu))
++ *       kvm_inject_pending_timer_irqs(vcpu);
++ *       -> kvm_inject_apic_timer_irqs()
++ *          -> kvm_apic_inject_pending_timer_irqs()
++ *             -> kvm_apic_local_deliver(apic, APIC_LVTT);
++ *          -> atomic_set(&apic->lapic_timer.pending, 0);
++ */
+ static void kvm_apic_inject_pending_timer_irqs(struct kvm_lapic *apic)
+ {
+ 	struct kvm_timer *ktimer = &apic->lapic_timer;
+@@ -1546,6 +1697,38 @@ static void kvm_apic_inject_pending_timer_irqs(struct kvm_lapic *apic)
+ 	}
+ }
+ 
++/*
++ * [0] apic_timer_expired
++ * [0] vmx_handle_exit
++ * [0] vcpu_enter_guest
++ * [0] kvm_arch_vcpu_ioctl_run
++ * [0] kvm_vcpu_ioctl
++ * [0] do_vfs_ioctl
++ * [0] ksys_ioctl
++ * [0] __x64_sys_ioctl
++ * [0] do_syscall_64
++ * [0] entry_SYSCALL_64_after_hwframe
++ *
++ * [0] apic_timer_expired
++ * [0] __hrtimer_run_queues
++ * [0] hrtimer_interrupt
++ * [0] smp_apic_timer_interrupt
++ * [0] apic_timer_interrupt
++ * [0] cpuidle_enter_state
++ * [0] cpuidle_enter
++ * [0] call_cpuidle
++ * [0] do_idle
++ * [0] cpu_startup_entry
++ * [0] start_secondary
++ * [0] secondary_startup_64
++ *
++ * called by:
++ *   - arch/x86/kvm/lapic.c|1679| <<start_sw_tscdeadline>> apic_timer_expired(apic);
++ *   - arch/x86/kvm/lapic.c|1763| <<start_sw_period>> apic_timer_expired(apic);
++ *   - arch/x86/kvm/lapic.c|1829| <<start_hv_timer>> apic_timer_expired(apic);
++ *   - arch/x86/kvm/lapic.c|1892| <<kvm_lapic_expired_hv_timer>> apic_timer_expired(apic);
++ *   - arch/x86/kvm/lapic.c|2416| <<apic_timer_fn>> apic_timer_expired(apic);
++ */
+ static void apic_timer_expired(struct kvm_lapic *apic)
+ {
+ 	struct kvm_vcpu *vcpu = apic->vcpu;
+@@ -1554,6 +1737,18 @@ static void apic_timer_expired(struct kvm_lapic *apic)
+ 	if (atomic_read(&apic->lapic_timer.pending))
+ 		return;
+ 
++	/*
++	 * 主要在以下使用kvm_timer:
++	 *   - arch/x86/kvm/lapic.c|1637| <<apic_timer_expired>> if (apic_lvtt_tscdeadline(apic) || ktimer->hv_timer_in_use)
++	 *   - arch/x86/kvm/lapic.c|1781| <<kvm_lapic_hv_timer_in_use>> return vcpu->arch.apic->lapic_timer.hv_timer_in_use;
++	 *   - arch/x86/kvm/lapic.c|1788| <<cancel_hv_timer>> WARN_ON(!apic->lapic_timer.hv_timer_in_use);
++	 *   - arch/x86/kvm/lapic.c|1790| <<cancel_hv_timer>> apic->lapic_timer.hv_timer_in_use = false;
++	 *   - arch/x86/kvm/lapic.c|1813| <<start_hv_timer>> ktimer->hv_timer_in_use = true;
++	 *   - arch/x86/kvm/lapic.c|1834| <<start_hv_timer>> trace_kvm_hv_timer_state(vcpu->vcpu_id, ktimer->hv_timer_in_use);
++	 *   - arch/x86/kvm/lapic.c|1849| <<start_sw_timer>> if (apic->lapic_timer.hv_timer_in_use)
++	 *   - arch/x86/kvm/lapic.c|1888| <<kvm_lapic_expired_hv_timer>> if (!apic->lapic_timer.hv_timer_in_use)
++	 *   - arch/x86/kvm/lapic.c|1915| <<kvm_lapic_switch_to_sw_timer>> if (apic->lapic_timer.hv_timer_in_use)
++	 */
+ 	if (apic_lvtt_tscdeadline(apic) || ktimer->hv_timer_in_use)
+ 		ktimer->expired_tscdeadline = ktimer->tscdeadline;
+ 
+@@ -1669,6 +1864,10 @@ static void advance_periodic_target_expiration(struct kvm_lapic *apic)
+ 		nsec_to_cycles(apic->vcpu, delta);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|1846| <<start_sw_timer>> start_sw_period(apic);
++ */
+ static void start_sw_period(struct kvm_lapic *apic)
+ {
+ 	if (!apic->lapic_timer.period)
+@@ -1706,6 +1905,12 @@ static void cancel_hv_timer(struct kvm_lapic *apic)
+ 	apic->lapic_timer.hv_timer_in_use = false;
+ }
+ 
++/*
++ * EXIT_REASON_PREEMPTION_TIMER-->handle_preemption_timer()
++ *
++ * called by:
++ *   - arch/x86/kvm/lapic.c|1850| <<restart_apic_timer>> if (!start_hv_timer(apic))
++ */
+ static bool start_hv_timer(struct kvm_lapic *apic)
+ {
+ 	struct kvm_timer *ktimer = &apic->lapic_timer;
+@@ -1748,6 +1953,21 @@ static bool start_hv_timer(struct kvm_lapic *apic)
+ 	return true;
+ }
+ 
++/*
++ * start_sw_timer
++ * vmx_pre_block
++ * kvm_arch_vcpu_ioctl_run
++ * kvm_vcpu_ioctl
++ * do_vfs_ioctl
++ * ksys_ioctl
++ * __x64_sys_ioctl
++ * do_syscall_64
++ * entry_SYSCALL_64_after_hwframe
++ *
++ * called by;
++ *   - arch/x86/kvm/lapic.c|1860| <<restart_apic_timer>> start_sw_timer(apic);
++ *   - arch/x86/kvm/lapic.c|1899| <<kvm_lapic_switch_to_sw_timer>> start_sw_timer(apic);
++ */
+ static void start_sw_timer(struct kvm_lapic *apic)
+ {
+ 	struct kvm_timer *ktimer = &apic->lapic_timer;
+@@ -1765,6 +1985,41 @@ static void start_sw_timer(struct kvm_lapic *apic)
+ 	trace_kvm_hv_timer_state(apic->vcpu->vcpu_id, false);
+ }
+ 
++/*
++ * [0] restart_apic_timer
++ * [0] vmx_post_block
++ * [0] kvm_arch_vcpu_ioctl_run
++ * [0] kvm_vcpu_ioctl
++ * [0] do_vfs_ioctl
++ * [0] ksys_ioctl
++ * [0] __x64_sys_ioctl
++ * [0] do_syscall_64
++ * [0] entry_SYSCALL_64_after_hwframe
++ *
++ * [0] restart_apic_timer
++ * [0] kvm_lapic_reg_write
++ * [0] kvm_x2apic_msr_write
++ * [0] kvm_set_msr_common
++ * [0] vmx_set_msr
++ * [0] __kvm_set_msr
++ * [0] kvm_emulate_wrmsr
++ * [0] vmx_handle_exit
++ * [0] vcpu_enter_guest
++ * [0] kvm_arch_vcpu_ioctl_run
++ * [0] kvm_vcpu_ioctl
++ * [0] do_vfs_ioctl
++ * [0] ksys_ioctl
++ * [0] __x64_sys_ioctl
++ * [0] do_syscall_64
++ * [0] entry_SYSCALL_64_after_hwframe
++ *
++ * called by:
++ *   - arch/x86/kvm/lapic.c|1879| <<kvm_lapic_expired_hv_timer>> restart_apic_timer(apic);
++ *   - arch/x86/kvm/lapic.c|1888| <<kvm_lapic_switch_to_hv_timer>> restart_apic_timer(vcpu->arch.apic);
++ *   - arch/x86/kvm/lapic.c|1909| <<kvm_lapic_restart_hv_timer>> restart_apic_timer(apic);
++ *   - arch/x86/kvm/lapic.c|1926| <<start_apic_timer>> restart_apic_timer(apic);
++ *   - arch/x86/kvm/lapic.c|2061| <<kvm_lapic_reg_write>> restart_apic_timer(apic);
++ */
+ static void restart_apic_timer(struct kvm_lapic *apic)
+ {
+ 	preempt_disable();
+@@ -1778,6 +2033,24 @@ static void restart_apic_timer(struct kvm_lapic *apic)
+ 	preempt_enable();
+ }
+ 
++/*
++ * [0] kvm_lapic_expired_hv_timer
++ * [0] vcpu_enter_guest
++ * [0] kvm_arch_vcpu_ioctl_run
++ * [0] kvm_vcpu_ioctl
++ * [0] do_vfs_ioctl
++ * [0] ksys_ioctl
++ * [0] __x64_sys_ioctl
++ * [0] do_syscall_64
++ * [0] entry_SYSCALL_64_after_hwframe
++ *
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|5570| <<handle_preemption_timer>> kvm_lapic_expired_hv_timer(vcpu);
++ *
++ * EXIT_REASON_PREEMPTION_TIMER
++ * ->handle_preemption_timer()
++ *   -> kvm_lapic_expired_hv_timer()
++ */
+ void kvm_lapic_expired_hv_timer(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_lapic *apic = vcpu->arch.apic;
+@@ -1825,6 +2098,12 @@ void kvm_lapic_restart_hv_timer(struct kvm_vcpu *vcpu)
+ 	restart_apic_timer(apic);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|2043| <<kvm_lapic_reg_write>> start_apic_timer(apic);
++ *   - arch/x86/kvm/lapic.c|2180| <<kvm_set_lapic_tscdeadline_msr>> start_apic_timer(apic);
++ *   - arch/x86/kvm/lapic.c|2605| <<kvm_apic_set_state>> start_apic_timer(apic);
++ */
+ static void start_apic_timer(struct kvm_lapic *apic)
+ {
+ 	atomic_set(&apic->lapic_timer.pending, 0);
+@@ -2113,6 +2392,13 @@ u64 kvm_lapic_get_cr8(struct kvm_vcpu *vcpu)
+ 	return (tpr & 0xf0) >> 4;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|2259| <<kvm_lapic_reset>> kvm_lapic_set_base(vcpu, APIC_DEFAULT_PHYS_BASE |
++ *   - arch/x86/kvm/lapic.c|2294| <<kvm_lapic_reset>> kvm_lapic_set_base(vcpu,
++ *   - arch/x86/kvm/lapic.c|2561| <<kvm_apic_set_state>> kvm_lapic_set_base(vcpu, vcpu->arch.apic_base);
++ *   - arch/x86/kvm/x86.c|375| <<kvm_set_apic_base>> kvm_lapic_set_base(vcpu, msr_info->data);
++ */
+ void kvm_lapic_set_base(struct kvm_vcpu *vcpu, u64 value)
+ {
+ 	u64 old_value = vcpu->arch.apic_base;
+@@ -2169,6 +2455,29 @@ void kvm_apic_update_apicv(struct kvm_vcpu *vcpu)
+ }
+ EXPORT_SYMBOL_GPL(kvm_apic_update_apicv);
+ 
++/*
++ * [0] kvm_lapic_reset
++ * [0] kvm_arch_vcpu_setup
++ * [0] kvm_vm_ioctl
++ * [0] do_vfs_ioctl
++ * [0] ksys_ioctl
++ * [0] __x64_sys_ioctl
++ * [0] do_syscall_64
++ * [0] entry_SYSCALL_64_after_hwframe
++ *
++ * [0] kvm_lapic_reset
++ * [0] kvm_apic_accept_events
++ * [0] kvm_arch_vcpu_ioctl_run
++ * [0] kvm_vcpu_ioctl
++ * [0] do_vfs_ioctl
++ * [0] ksys_ioctl
++ * [0] __x64_sys_ioctl
++ * [0] do_syscall_64
++ * [0] entry_SYSCALL_64_after_hwframe
++ *
++ * called by:
++ *   - arch/x86/kvm/x86.c|9320| <<kvm_vcpu_reset>> kvm_lapic_reset(vcpu, init_event);
++ */
+ void kvm_lapic_reset(struct kvm_vcpu *vcpu, bool init_event)
+ {
+ 	struct kvm_lapic *apic = vcpu->arch.apic;
+@@ -2189,6 +2498,13 @@ void kvm_lapic_reset(struct kvm_vcpu *vcpu, bool init_event)
+ 
+ 	for (i = 0; i < KVM_APIC_LVT_NUM; i++)
+ 		kvm_lapic_set_reg(apic, APIC_LVTT + 0x10 * i, APIC_LVT_MASKED);
++	/*
++	 * 在以下调用apic_update_lvtt():
++	 *   -  arch/x86/kvm/lapic.c|1951| <<kvm_lapic_reg_write>> apic_update_lvtt(apic);
++	 *   - arch/x86/kvm/lapic.c|1996| <<kvm_lapic_reg_write>> apic_update_lvtt(apic);
++	 *   - arch/x86/kvm/lapic.c|2238| <<kvm_lapic_reset>> apic_update_lvtt(apic);
++	 *   - arch/x86/kvm/lapic.c|2514| <<kvm_apic_set_state>> apic_update_lvtt(apic);
++	 */
+ 	apic_update_lvtt(apic);
+ 	if (kvm_vcpu_is_reset_bsp(vcpu) &&
+ 	    kvm_check_has_quirk(vcpu->kvm, KVM_X86_QUIRK_LINT0_REENABLED))
+@@ -2241,6 +2557,10 @@ static bool lapic_is_periodic(struct kvm_lapic *apic)
+ 	return apic_lvtt_period(apic);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/irq.c|25| <<kvm_cpu_has_pending_timer>> return apic_has_pending_timer(vcpu);
++ */
+ int apic_has_pending_timer(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_lapic *apic = vcpu->arch.apic;
+@@ -2251,6 +2571,22 @@ int apic_has_pending_timer(struct kvm_vcpu *vcpu)
+ 	return 0;
+ }
+ 
++/*
++ * kvm_apic_local_deliver
++ * kvm_inject_pending_timer_irqs
++ * kvm_arch_vcpu_ioctl_run
++ * kvm_vcpu_ioctl
++ * do_vfs_ioctl
++ * ksys_ioctl
++ * __x64_sys_ioctl
++ * do_syscall_64
++ * entry_SYSCALL_64_after_hwframe
++ *
++ * called by:
++ *   - arch/x86/kvm/lapic.c|1649| <<kvm_apic_inject_pending_timer_irqs>> kvm_apic_local_deliver(apic, APIC_LVTT);
++ *   - arch/x86/kvm/lapic.c|2536| <<kvm_apic_nmi_wd_deliver>> kvm_apic_local_deliver(apic, APIC_LVT0);
++ *   - arch/x86/kvm/pmu.c|337| <<kvm_pmu_deliver_pmi>> kvm_apic_local_deliver(vcpu->arch.apic, APIC_LVTPC);
++ */
+ int kvm_apic_local_deliver(struct kvm_lapic *apic, int lvt_type)
+ {
+ 	u32 reg = kvm_lapic_get_reg(apic, lvt_type);
+@@ -2279,11 +2615,23 @@ static const struct kvm_io_device_ops apic_mmio_ops = {
+ 	.write    = apic_mmio_write,
+ };
+ 
++/*
++ * 在以下使用apic_timer_fn():
++ *   - arch/x86/kvm/lapic.c|2365| <<kvm_create_lapic>> apic->lapic_timer.timer.function = apic_timer_fn;
++ */
+ static enum hrtimer_restart apic_timer_fn(struct hrtimer *data)
+ {
+ 	struct kvm_timer *ktimer = container_of(data, struct kvm_timer, timer);
+ 	struct kvm_lapic *apic = container_of(ktimer, struct kvm_lapic, lapic_timer);
+ 
++	/*
++	 * 在以下调用apic_timer_expired():
++	 *   - arch/x86/kvm/lapic.c|1679| <<start_sw_tscdeadline>> apic_timer_expired(apic);
++	 *   - arch/x86/kvm/lapic.c|1763| <<start_sw_period>> apic_timer_expired(apic);
++	 *   - arch/x86/kvm/lapic.c|1829| <<start_hv_timer>> apic_timer_expired(apic);
++	 *   - arch/x86/kvm/lapic.c|1892| <<kvm_lapic_expired_hv_timer>> apic_timer_expired(apic);
++	 *   - arch/x86/kvm/lapic.c|2416| <<apic_timer_fn>> apic_timer_expired(apic);
++	 */
+ 	apic_timer_expired(apic);
+ 
+ 	if (lapic_is_periodic(apic)) {
+@@ -2294,6 +2642,10 @@ static enum hrtimer_restart apic_timer_fn(struct hrtimer *data)
+ 		return HRTIMER_NORESTART;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|9574| <<kvm_arch_vcpu_init>> r = kvm_create_lapic(vcpu, lapic_timer_advance_ns);
++ */
+ int kvm_create_lapic(struct kvm_vcpu *vcpu, int timer_advance_ns)
+ {
+ 	struct kvm_lapic *apic;
+@@ -2304,6 +2656,14 @@ int kvm_create_lapic(struct kvm_vcpu *vcpu, int timer_advance_ns)
+ 	if (!apic)
+ 		goto nomem;
+ 
++	/*
++	 * struct kvm_vcpu *vcpu:
++	 * -> struct kvm_vcpu_arch arch;
++	 *    -> u64 apic_base;
++	 *    -> struct kvm_lapic *apic;
++	 *       -> void *regs;
++	 *       -> gpa_t vapic_addr;
++	 */
+ 	vcpu->arch.apic = apic;
+ 
+ 	apic->regs = (void *)get_zeroed_page(GFP_KERNEL_ACCOUNT);
+@@ -2319,6 +2679,12 @@ int kvm_create_lapic(struct kvm_vcpu *vcpu, int timer_advance_ns)
+ 	apic->lapic_timer.timer.function = apic_timer_fn;
+ 	if (timer_advance_ns == -1) {
+ 		apic->lapic_timer.timer_advance_ns = LAPIC_TIMER_ADVANCE_NS_INIT;
++		/*
++		 * 在以下使用lapic_timer_advance_dynamic:
++		 *   - arch/x86/kvm/lapic.c|1571| <<__kvm_wait_lapic_expire>> if (lapic_timer_advance_dynamic)
++		 *   - arch/x86/kvm/lapic.c|2368| <<kvm_create_lapic>> lapic_timer_advance_dynamic = true;
++		 *   - arch/x86/kvm/lapic.c|2371| <<kvm_create_lapic>> lapic_timer_advance_dynamic = false;
++		 */
+ 		lapic_timer_advance_dynamic = true;
+ 	} else {
+ 		apic->lapic_timer.timer_advance_ns = timer_advance_ns;
+@@ -2330,6 +2696,16 @@ int kvm_create_lapic(struct kvm_vcpu *vcpu, int timer_advance_ns)
+ 	 * thinking that APIC state has changed.
+ 	 */
+ 	vcpu->arch.apic_base = MSR_IA32_APICBASE_ENABLE;
++	/*
++	 * 在以下使用apic_sw_disabled:
++	 *   - arch/x86/kvm/lapic.c|261| <<apic_set_spiv>> static_key_slow_dec_deferred(&apic_sw_disabled);
++	 *   - arch/x86/kvm/lapic.c|263| <<apic_set_spiv>> static_key_slow_inc(&apic_sw_disabled.key);
++	 *   - arch/x86/kvm/lapic.c|2070| <<kvm_free_lapic>> static_key_slow_dec_deferred(&apic_sw_disabled);
++	 *   - arch/x86/kvm/lapic.c|2341| <<kvm_create_lapic>> static_key_slow_inc(&apic_sw_disabled.key);
++	 *   - arch/x86/kvm/lapic.c|2767| <<kvm_lapic_init>> jump_label_rate_limit(&apic_sw_disabled, HZ);
++	 *   - arch/x86/kvm/lapic.c|2773| <<kvm_lapic_exit>> static_key_deferred_flush(&apic_sw_disabled);
++	 *   - arch/x86/kvm/lapic.h|186| <<kvm_apic_sw_enabled>> if (static_key_false(&apic_sw_disabled.key))
++	 */
+ 	static_key_slow_inc(&apic_sw_disabled.key); /* sw disabled at reset */
+ 	kvm_iodevice_init(&apic->dev, &apic_mmio_ops);
+ 
+@@ -2366,6 +2742,27 @@ int kvm_apic_accept_pic_intr(struct kvm_vcpu *vcpu)
+ 	return r;
+ }
+ 
++/*
++ * kvm_inject_apic_timer_irqs
++ * kvm_arch_vcpu_ioctl_run
++ * kvm_vcpu_ioctl
++ * do_vfs_ioctl
++ * ksys_ioctl
++ * __x64_sys_ioctl
++ * do_syscall_64
++ * entry_SYSCALL_64_after_hwframe
++ *
++ * called by:
++ *   - arch/x86/kvm/irq.c|154| <<kvm_inject_pending_timer_irqs>> kvm_inject_apic_timer_irqs(vcpu);
++ *
++ * vcpu_run():
++ *   kvm_clear_request(KVM_REQ_PENDING_TIMER, vcpu);
++ *   if (kvm_cpu_has_pending_timer(vcpu))
++ *       kvm_inject_pending_timer_irqs(vcpu);
++ *       -> kvm_inject_apic_timer_irqs()
++ *          -> kvm_apic_inject_pending_timer_irqs()
++ *          -> atomic_set(&apic->lapic_timer.pending, 0);
++ */
+ void kvm_inject_apic_timer_irqs(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_lapic *apic = vcpu->arch.apic;
+@@ -2752,9 +3149,22 @@ void kvm_apic_accept_events(struct kvm_vcpu *vcpu)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|7358| <<kvm_arch_init>> kvm_lapic_init();
++ */
+ void kvm_lapic_init(void)
+ {
+ 	/* do not patch jump label more than once per second */
++	/*
++	 * 在以下使用apic_hw_disabled:
++	 *   - arch/x86/kvm/lapic.c|2067| <<kvm_free_lapic>> static_key_slow_dec_deferred(&apic_hw_disabled);
++	 *   - arch/x86/kvm/lapic.c|2144| <<kvm_lapic_set_base>> static_key_slow_dec_deferred(&apic_hw_disabled);
++	 *   - arch/x86/kvm/lapic.c|2146| <<kvm_lapic_set_base>> static_key_slow_inc(&apic_hw_disabled.key);
++	 *   - arch/x86/kvm/lapic.c|2766| <<kvm_lapic_init>> jump_label_rate_limit(&apic_hw_disabled, HZ);
++	 *   - arch/x86/kvm/lapic.c|2772| <<kvm_lapic_exit>> static_key_deferred_flush(&apic_hw_disabled);
++	 *   - arch/x86/kvm/lapic.h|177| <<kvm_apic_hw_enabled>> if (static_key_false(&apic_hw_disabled.key))
++	 */
+ 	jump_label_rate_limit(&apic_hw_disabled, HZ);
+ 	jump_label_rate_limit(&apic_sw_disabled, HZ);
+ }
+diff --git a/arch/x86/kvm/lapic.h b/arch/x86/kvm/lapic.h
+index e800cced3c47..3a078eeaa722 100644
+--- a/arch/x86/kvm/lapic.h
++++ b/arch/x86/kvm/lapic.h
+@@ -28,22 +28,77 @@ struct kvm_timer {
+ 	struct hrtimer timer;
+ 	s64 period; 				/* unit: ns */
+ 	ktime_t target_expiration;
++	/*
++	 * 在以下使用kvm_timer->timer_mode:
++	 *   - arch/x86/kvm/lapic.c|355| <<apic_lvtt_oneshot>> return apic->lapic_timer.timer_mode == APIC_LVT_TIMER_ONESHOT;
++	 *   - arch/x86/kvm/lapic.c|360| <<apic_lvtt_period>> return apic->lapic_timer.timer_mode == APIC_LVT_TIMER_PERIODIC;
++	 *   - arch/x86/kvm/lapic.c|365| <<apic_lvtt_tscdeadline>> return apic->lapic_timer.timer_mode == APIC_LVT_TIMER_TSCDEADLINE;
++	 *   - arch/x86/kvm/lapic.c|1470| <<apic_update_lvtt>> if (apic->lapic_timer.timer_mode != timer_mode) {
++	 *   - arch/x86/kvm/lapic.c|1478| <<apic_update_lvtt>> apic->lapic_timer.timer_mode = timer_mode;
++	 */
+ 	u32 timer_mode;
+ 	u32 timer_mode_mask;
++	/*
++	 * 在以下使用kvm_timer->tscdeadline:
++	 *   - arch/x86/kvm/lapic.c|1567| <<apic_update_lvtt>> apic->lapic_timer.tscdeadline = 0;
++	 *   - arch/x86/kvm/lapic.c|1693| <<kvm_apic_inject_pending_timer_irqs>> ktimer->tscdeadline = 0;
++	 *   - arch/x86/kvm/lapic.c|1695| <<kvm_apic_inject_pending_timer_irqs>> ktimer->tscdeadline = 0;
++	 *   - arch/x86/kvm/lapic.c|1753| <<apic_timer_expired>> ktimer->expired_tscdeadline = ktimer->tscdeadline;
++	 *   - arch/x86/kvm/lapic.c|1769| <<start_sw_tscdeadline>> u64 guest_tsc, tscdeadline = ktimer->tscdeadline;
++	 *   - arch/x86/kvm/lapic.c|1777| <<start_sw_tscdeadline>> if (unlikely(!tscdeadline || !this_tsc_khz))
++	 *   - arch/x86/kvm/lapic.c|1785| <<start_sw_tscdeadline>> ns = (tscdeadline - guest_tsc) * 1000000ULL;
++	 *   - arch/x86/kvm/lapic.c|1788| <<start_sw_tscdeadline>> if (likely(tscdeadline > guest_tsc) &&
++	 *   - arch/x86/kvm/lapic.c|1817| <<update_target_expiration>> apic->lapic_timer.tscdeadline +=
++	 *   - arch/x86/kvm/lapic.c|1833| <<set_target_expiration>> apic->lapic_timer.tscdeadline = 0;
++	 *   - arch/x86/kvm/lapic.c|1839| <<set_target_expiration>> apic->lapic_timer.tscdeadline = kvm_read_l1_tsc(apic->vcpu, tscl) +
++	 *   - arch/x86/kvm/lapic.c|1863| <<advance_periodic_target_expiration>> apic->lapic_timer.tscdeadline = kvm_read_l1_tsc(apic->vcpu, tscl) +
++	 *   - arch/x86/kvm/lapic.c|1924| <<start_hv_timer>> if (!ktimer->tscdeadline)
++	 *   - arch/x86/kvm/lapic.c|1927| <<start_hv_timer>> if (kvm_x86_ops->set_hv_timer(vcpu, ktimer->tscdeadline, &expired))
++	 *   - arch/x86/kvm/lapic.c|2362| <<kvm_get_lapic_tscdeadline_msr>> return apic->lapic_timer.tscdeadline;
++	 *   - arch/x86/kvm/lapic.c|2374| <<kvm_set_lapic_tscdeadline_msr>> apic->lapic_timer.tscdeadline = data;
++	 */
+ 	u64 tscdeadline;
+ 	u64 expired_tscdeadline;
+ 	u32 timer_advance_ns;
+ 	s64 advance_expire_delta;
+ 	atomic_t pending;			/* accumulated triggered timers */
++	/*
++	 * 主要在以下使用kvm_timer:
++	 *   - arch/x86/kvm/lapic.c|1637| <<apic_timer_expired>> if (apic_lvtt_tscdeadline(apic) || ktimer->hv_timer_in_use)
++	 *   - arch/x86/kvm/lapic.c|1781| <<kvm_lapic_hv_timer_in_use>> return vcpu->arch.apic->lapic_timer.hv_timer_in_use;
++	 *   - arch/x86/kvm/lapic.c|1788| <<cancel_hv_timer>> WARN_ON(!apic->lapic_timer.hv_timer_in_use);
++	 *   - arch/x86/kvm/lapic.c|1790| <<cancel_hv_timer>> apic->lapic_timer.hv_timer_in_use = false;
++	 *   - arch/x86/kvm/lapic.c|1813| <<start_hv_timer>> ktimer->hv_timer_in_use = true;
++	 *   - arch/x86/kvm/lapic.c|1834| <<start_hv_timer>> trace_kvm_hv_timer_state(vcpu->vcpu_id, ktimer->hv_timer_in_use);
++	 *   - arch/x86/kvm/lapic.c|1849| <<start_sw_timer>> if (apic->lapic_timer.hv_timer_in_use)
++	 *   - arch/x86/kvm/lapic.c|1888| <<kvm_lapic_expired_hv_timer>> if (!apic->lapic_timer.hv_timer_in_use)
++	 *   - arch/x86/kvm/lapic.c|1915| <<kvm_lapic_switch_to_sw_timer>> if (apic->lapic_timer.hv_timer_in_use)
++	 */
+ 	bool hv_timer_in_use;
+ };
+ 
+ struct kvm_lapic {
++	/*
++	 * 在以下使用kvm_lapic->base_address:
++	 *   - arch/x86/kvm/lapic.c|1421| <<apic_mmio_in_range>> return addr >= apic->base_address &&
++	 *   - arch/x86/kvm/lapic.c|1422| <<apic_mmio_in_range>> addr < apic->base_address + LAPIC_MMIO_LENGTH;
++	 *   - arch/x86/kvm/lapic.c|1429| <<apic_mmio_read>> u32 offset = address - apic->base_address;
++	 *   - arch/x86/kvm/lapic.c|2078| <<apic_mmio_write>> unsigned int offset = address - apic->base_address;
++	 *   - arch/x86/kvm/lapic.c|2235| <<kvm_lapic_set_base>> apic->base_address = apic->vcpu->arch.apic_base &
++	 *   - arch/x86/kvm/lapic.c|2239| <<kvm_lapic_set_base>> apic->base_address != APIC_DEFAULT_PHYS_BASE)
++	 */
+ 	unsigned long base_address;
+ 	struct kvm_io_device dev;
+ 	struct kvm_timer lapic_timer;
+ 	u32 divide_count;
+ 	struct kvm_vcpu *vcpu;
++	/*
++	 * 在以下使用kvm_lapic->sw_enabled:
++	 *   - arch/x86/kvm/lapic.c|302| <<apic_set_spiv>> if (enabled != apic->sw_enabled) {
++	 *   - arch/x86/kvm/lapic.c|303| <<apic_set_spiv>> apic->sw_enabled = enabled;\
++	 *   - arch/x86/kvm/lapic.c|2262| <<kvm_free_lapic>> if (!apic->sw_enabled)
++	 *   - arch/x86/kvm/lapic.h|237| <<kvm_apic_sw_enabled>> return apic->sw_enabled;
++	 */
+ 	bool sw_enabled;
+ 	bool irr_pending;
+ 	bool lvt0_in_nmi_mode;
+@@ -163,6 +218,18 @@ static inline void kvm_lapic_set_reg(struct kvm_lapic *apic, int reg_off, u32 va
+ 
+ extern struct static_key kvm_no_apic_vcpu;
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|139| <<apic_enabled>> return kvm_apic_sw_enabled(apic) && kvm_apic_hw_enabled(apic);
++ *   - arch/x86/kvm/lapic.c|1434| <<apic_mmio_read>> if (!kvm_apic_hw_enabled(apic) || apic_x2apic_mode(apic)) {
++ *   - arch/x86/kvm/lapic.c|1522| <<lapic_timer_int_injected>> if (kvm_apic_hw_enabled(apic)) {
++ *   - arch/x86/kvm/lapic.c|2084| <<apic_mmio_write>> if (!kvm_apic_hw_enabled(apic) || apic_x2apic_mode(apic)) {
++ *   - arch/x86/kvm/lapic.c|2356| <<kvm_apic_local_deliver>> if (kvm_apic_hw_enabled(apic) && !(reg & APIC_LVT_MASKED)) {
++ *   - arch/x86/kvm/lapic.c|2478| <<kvm_apic_has_interrupt>> if (!kvm_apic_hw_enabled(apic))
++ *   - arch/x86/kvm/lapic.c|2490| <<kvm_apic_accept_pic_intr>> if (!kvm_apic_hw_enabled(vcpu->arch.apic))
++ *   - arch/x86/kvm/lapic.h|201| <<kvm_apic_present>> return lapic_in_kernel(vcpu) && kvm_apic_hw_enabled(vcpu->arch.apic);
++ *   - arch/x86/kvm/x86.c|8076| <<vcpu_load_eoi_exitmap>> if (!kvm_apic_hw_enabled(vcpu->arch.apic))
++ */
+ static inline bool lapic_in_kernel(struct kvm_vcpu *vcpu)
+ {
+ 	if (static_key_false(&kvm_no_apic_vcpu))
+@@ -170,10 +237,49 @@ static inline bool lapic_in_kernel(struct kvm_vcpu *vcpu)
+ 	return true;
+ }
+ 
++/*
++ * 在以下使用apic_hw_disabled:
++ *   - arch/x86/kvm/lapic.c|2067| <<kvm_free_lapic>> static_key_slow_dec_deferred(&apic_hw_disabled);
++ *   - arch/x86/kvm/lapic.c|2144| <<kvm_lapic_set_base>> static_key_slow_dec_deferred(&apic_hw_disabled);
++ *   - arch/x86/kvm/lapic.c|2146| <<kvm_lapic_set_base>> static_key_slow_inc(&apic_hw_disabled.key);
++ *   - arch/x86/kvm/lapic.c|2766| <<kvm_lapic_init>> jump_label_rate_limit(&apic_hw_disabled, HZ);
++ *   - arch/x86/kvm/lapic.c|2772| <<kvm_lapic_exit>> static_key_deferred_flush(&apic_hw_disabled);
++ *   - arch/x86/kvm/lapic.h|177| <<kvm_apic_hw_enabled>> if (static_key_false(&apic_hw_disabled.key))
++ */
+ extern struct static_key_deferred apic_hw_disabled;
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|139| <<apic_enabled>> return kvm_apic_sw_enabled(apic) && kvm_apic_hw_enabled(apic);
++ *   - arch/x86/kvm/lapic.c|1439| <<apic_mmio_read>> if (!kvm_apic_hw_enabled(apic) || apic_x2apic_mode(apic)) {
++ *   - arch/x86/kvm/lapic.c|1527| <<lapic_timer_int_injected>> if (kvm_apic_hw_enabled(apic)) {
++ *   - arch/x86/kvm/lapic.c|2206| <<apic_mmio_write>> if (!kvm_apic_hw_enabled(apic) || apic_x2apic_mode(apic)) {
++ *   - arch/x86/kvm/lapic.c|2497| <<kvm_apic_local_deliver>> if (kvm_apic_hw_enabled(apic) && !(reg & APIC_LVT_MASKED)) {
++ *   - arch/x86/kvm/lapic.c|2627| <<kvm_apic_has_interrupt>> if (!kvm_apic_hw_enabled(apic))
++ *   - arch/x86/kvm/lapic.c|2639| <<kvm_apic_accept_pic_intr>> if (!kvm_apic_hw_enabled(vcpu->arch.apic))
++ *   - arch/x86/kvm/lapic.h|243| <<kvm_apic_present>> return lapic_in_kernel(vcpu) && kvm_apic_hw_enabled(vcpu->arch.apic);
++ *   - arch/x86/kvm/x86.c|8076| <<vcpu_load_eoi_exitmap>> if (!kvm_apic_hw_enabled(vcpu->arch.apic))
++ */
+ static inline int kvm_apic_hw_enabled(struct kvm_lapic *apic)
+ {
++	/*
++	 * crash> apic_hw_disabled
++	 * apic_hw_disabled = $4 = {
++	 *   key = {
++	 *     enabled = {
++	 *       counter = 0
++	 *   },
++	 *
++	 * 在以下使用apic_hw_disabled:
++	 *   - arch/x86/kvm/lapic.c|2067| <<kvm_free_lapic>> static_key_slow_dec_deferred(&apic_hw_disabled);
++	 *   - arch/x86/kvm/lapic.c|2144| <<kvm_lapic_set_base>> static_key_slow_dec_deferred(&apic_hw_disabled);
++	 *   - arch/x86/kvm/lapic.c|2146| <<kvm_lapic_set_base>> static_key_slow_inc(&apic_hw_disabled.key);
++	 *   - arch/x86/kvm/lapic.c|2766| <<kvm_lapic_init>> jump_label_rate_limit(&apic_hw_disabled, HZ);
++	 *   - arch/x86/kvm/lapic.c|2772| <<kvm_lapic_exit>> static_key_deferred_flush(&apic_hw_disabled);
++	 *   - arch/x86/kvm/lapic.h|177| <<kvm_apic_hw_enabled>> if (static_key_false(&apic_hw_disabled.key))
++	 *
++	 * apic_base = 0xfee00c00 -> MSR_IA32_APICBASE_ENABLE is set!!!
++	 */
+ 	if (static_key_false(&apic_hw_disabled.key))
+ 		return apic->vcpu->arch.apic_base & MSR_IA32_APICBASE_ENABLE;
+ 	return MSR_IA32_APICBASE_ENABLE;
+@@ -181,6 +287,15 @@ static inline int kvm_apic_hw_enabled(struct kvm_lapic *apic)
+ 
+ extern struct static_key_deferred apic_sw_disabled;
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/irq_comm.c|78| <<kvm_irq_delivery_to_apic>> } else if (kvm_apic_sw_enabled(vcpu->arch.apic)) {
++ *   - arch/x86/kvm/lapic.c|139| <<apic_enabled>> return kvm_apic_sw_enabled(apic) && kvm_apic_hw_enabled(apic);
++ *   - arch/x86/kvm/lapic.c|263| <<recalculate_apic_map>> if (!kvm_apic_sw_enabled(apic))
++ *   - arch/x86/kvm/lapic.c|2014| <<kvm_lapic_reg_write>> if (!kvm_apic_sw_enabled(apic))
++ *   - arch/x86/kvm/lapic.c|2025| <<kvm_lapic_reg_write>> if (!kvm_apic_sw_enabled(apic))
++ *   - arch/x86/kvm/lapic.h|206| <<kvm_lapic_enabled>> return kvm_apic_present(vcpu) && kvm_apic_sw_enabled(vcpu->arch.apic);
++ */
+ static inline bool kvm_apic_sw_enabled(struct kvm_lapic *apic)
+ {
+ 	if (static_key_false(&apic_sw_disabled.key))
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index a4564713a470..844cb6695fda 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -6511,6 +6511,10 @@ static void atomic_switch_perf_msrs(struct vcpu_vmx *vmx)
+ 					msrs[i].host, false);
+ }
+ 
++/*
++ * 在以下使用vmx_update_hv_timer() --> enable_preemption_timer为true的情况:
++ *   - arch/x86/kvm/vmx/vmx.c|6605| <<vmx_vcpu_run>> vmx_update_hv_timer(vcpu);
++ */
+ static void vmx_update_hv_timer(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+diff --git a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
+index 299640a78208..09acf2e2543b 100644
+--- a/arch/x86/kvm/vmx/vmx.h
++++ b/arch/x86/kvm/vmx/vmx.h
+@@ -260,6 +260,14 @@ struct vcpu_vmx {
+ 	unsigned int ple_window;
+ 	bool ple_window_dirty;
+ 
++	/*
++	 * 在以下设置vcpu_vmx->req_immediate_exit:
++	 *   - arch/x86/kvm/vmx/vmx.c|1138| <<vmx_prepare_switch_to_guest>> vmx->req_immediate_exit = false;
++	 *   - arch/x86/kvm/vmx/vmx.c|7161| <<vmx_request_immediate_exit>> to_vmx(vcpu)->req_immediate_exit = true;
++	 * 在以下使用vcpu_vmx->req_immediate_exit:
++	 *   - arch/x86/kvm/vmx/vmx.c|5568| <<handle_preemption_timer>> if (!vmx->req_immediate_exit &&
++	 *   - arch/x86/kvm/vmx/vmx.c|6520| <<vmx_update_hv_timer>> if (vmx->req_immediate_exit) {
++	 */
+ 	bool req_immediate_exit;
+ 
+ 	/* Support for PML */
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 74f19e21350f..c75e18e4f33e 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -145,6 +145,11 @@ module_param(tsc_tolerance_ppm, uint, S_IRUGO | S_IWUSR);
+  * advancement entirely.  Any other value is used as-is and disables adaptive
+  * tuning, i.e. allows priveleged userspace to set an exact advancement time.
+  */
++/*
++ * 在以下使用lapic_timer_advance_ns:
++ *   - arch/x86/kvm/x86.c|149| <<global>> module_param(lapic_timer_advance_ns, int , S_IRUGO | S_IWUSR);
++ *   - arch/x86/kvm/x86.c|9574| <<kvm_arch_vcpu_init>> r = kvm_create_lapic(vcpu, lapic_timer_advance_ns);
++ */
+ static int __read_mostly lapic_timer_advance_ns = -1;
+ module_param(lapic_timer_advance_ns, int, S_IRUGO | S_IWUSR);
+ 
+@@ -158,6 +163,13 @@ EXPORT_SYMBOL_GPL(enable_vmware_backdoor);
+ static bool __read_mostly force_emulation_prefix = false;
+ module_param(force_emulation_prefix, bool, S_IRUGO);
+ 
++/*
++ * 在以下使用pi_inject_timer:
++ *   - arch/x86/kvm/x86.c|162| <<global>> module_param(pi_inject_timer, bint, S_IRUGO | S_IWUSR);
++ *   - arch/x86/kvm/lapic.c|119| <<kvm_can_post_timer_interrupt>> return pi_inject_timer && kvm_vcpu_apicv_active(vcpu);
++ *   - arch/x86/kvm/x86.c|7352| <<kvm_arch_init>> if (pi_inject_timer == -1)
++ *   - arch/x86/kvm/x86.c|7353| <<kvm_arch_init>> pi_inject_timer = housekeeping_enabled(HK_FLAG_TIMER);
++ */
+ int __read_mostly pi_inject_timer = -1;
+ module_param(pi_inject_timer, bint, S_IRUGO | S_IWUSR);
+ 
+@@ -1702,6 +1714,10 @@ static void update_pvclock_gtod(struct timekeeper *tk)
+ }
+ #endif
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|1709| <<apic_timer_expired>> kvm_set_pending_timer(vcpu);
++ */
+ void kvm_set_pending_timer(struct kvm_vcpu *vcpu)
+ {
+ 	kvm_make_request(KVM_REQ_PENDING_TIMER, vcpu);
+@@ -9564,6 +9580,11 @@ int kvm_arch_vcpu_init(struct kvm_vcpu *vcpu)
+ 		goto fail_free_pio_data;
+ 
+ 	if (irqchip_in_kernel(vcpu->kvm)) {
++		/*
++		 * 在以下使用lapic_timer_advance_ns:
++		 *   - arch/x86/kvm/x86.c|149| <<global>> module_param(lapic_timer_advance_ns, int , S_IRUGO | S_IWUSR);
++		 *   - arch/x86/kvm/x86.c|9574| <<kvm_arch_vcpu_init>> r = kvm_create_lapic(vcpu, lapic_timer_advance_ns);
++		 */
+ 		r = kvm_create_lapic(vcpu, lapic_timer_advance_ns);
+ 		if (r < 0)
+ 			goto fail_mmu_destroy;
 diff --git a/drivers/infiniband/core/cm.c b/drivers/infiniband/core/cm.c
 index 54507569475a..744a2a23f1d9 100644
 --- a/drivers/infiniband/core/cm.c
@@ -354,6 +1287,21 @@ index 5de8ced5169e..d3904d76cd3d 100644
  void iscsi_dbg_trace(void (*trace)(struct device *dev, struct va_format *),
  		     struct device *dev, const char *fmt, ...)
  {
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 07bc7dbba047..998b4219435c 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -219,6 +219,10 @@ int kvm_async_pf_wakeup_all(struct kvm_vcpu *vcpu);
+ 
+ enum {
+ 	OUTSIDE_GUEST_MODE,
++	/*
++	 * 一个设置IN_GUEST_MODE的例子:
++	 *   - arch/x86/kvm/x86.c|8298| <<vcpu_enter_guest>> vcpu->mode = IN_GUEST_MODE;
++	 */
+ 	IN_GUEST_MODE,
+ 	EXITING_GUEST_MODE,
+ 	READING_SHADOW_PAGE_TABLES,
 diff --git a/net/rds/af_rds.c b/net/rds/af_rds.c
 index af4481d6386c..da830ea964fa 100644
 --- a/net/rds/af_rds.c
