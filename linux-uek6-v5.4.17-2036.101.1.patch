@@ -1,23 +1,25 @@
-From 54780be23b145172230162c8a9a3d7c298686930 Mon Sep 17 00:00:00 2001
+From 87804c2f2cbdc1c6fd664e251c96e37200828145 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Thu, 21 Jan 2021 10:39:05 -0800
+Date: Wed, 27 Jan 2021 21:47:33 -0800
 Subject: [PATCH 1/1] linux uek6 v5.4.17-2036.101.1
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
+ arch/x86/include/asm/irq_vectors.h    |  17 +
+ arch/x86/kernel/irq.c                 |   7 +
  arch/x86/kvm/irq.c                    |  10 +
- arch/x86/kvm/lapic.c                  | 678 ++++++++++++++++++++++++++
+ arch/x86/kvm/lapic.c                  | 696 ++++++++++++++++++++++++++
  arch/x86/kvm/lapic.h                  | 115 +++++
- arch/x86/kvm/vmx/vmx.c                |  26 +
- arch/x86/kvm/vmx/vmx.h                |   8 +
- arch/x86/kvm/x86.c                    |  38 ++
+ arch/x86/kvm/vmx/vmx.c                | 173 +++++++
+ arch/x86/kvm/vmx/vmx.h                |  64 +++
+ arch/x86/kvm/x86.c                    |  46 ++
  drivers/infiniband/core/cm.c          |   6 +
- drivers/infiniband/sw/rxe/rxe_net.c   |  55 +++
+ drivers/infiniband/sw/rxe/rxe_net.c   |  55 ++
  drivers/infiniband/sw/rxe/rxe_verbs.c |  34 ++
  drivers/scsi/iscsi_tcp.c              | 105 ++++
  drivers/scsi/libiscsi.c               |   4 +
  drivers/scsi/scsi_transport_iscsi.c   |  10 +
- include/linux/kvm_host.h              |   4 +
+ include/linux/kvm_host.h              |  38 ++
  include/uapi/linux/kvm.h              |   7 +
  net/rds/af_rds.c                      |  49 ++
  net/rds/bind.c                        |   6 +
@@ -38,8 +40,63 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  net/rds/send.c                        |  90 ++++
  net/rds/threads.c                     |   4 +
  net/rds/transport.c                   |  14 +
- 33 files changed, 1749 insertions(+)
+ virt/kvm/kvm_main.c                   |  56 +++
+ 36 files changed, 2092 insertions(+)
 
+diff --git a/arch/x86/include/asm/irq_vectors.h b/arch/x86/include/asm/irq_vectors.h
+index 889f8b1b5b7f..f0941450699c 100644
+--- a/arch/x86/include/asm/irq_vectors.h
++++ b/arch/x86/include/asm/irq_vectors.h
+@@ -92,7 +92,24 @@
+ 
+ /* Vector for KVM to deliver posted interrupt IPI */
+ #ifdef CONFIG_HAVE_KVM
++/*
++ * 在以下使用POSTED_INTR_VECTOR:
++ *   - arch/x86/kernel/idt.c|135| <<global>> INTG(POSTED_INTR_VECTOR, kvm_posted_intr_ipi),
++ *   - arch/x86/include/asm/entry_arch.h|22| <<BUILD_INTERRUPT>> BUILD_INTERRUPT(kvm_posted_intr_ipi, POSTED_INTR_VECTOR)
++ *   - arch/x86/kvm/vmx/vmx.c|3823| <<kvm_vcpu_trigger_posted_interrupt>> int pi_vec = nested ? POSTED_INTR_NESTED_VECTOR : POSTED_INTR_VECTOR;
++ *   - arch/x86/kvm/vmx/vmx.c|4241| <<vmx_vcpu_setup>> vmcs_write16(POSTED_INTR_NV, POSTED_INTR_VECTOR);
++ *   - arch/x86/kvm/vmx/vmx.c|6850| <<vmx_create_vcpu>> vmx->pi_desc.nv = POSTED_INTR_VECTOR;
++ *   - arch/x86/kvm/vmx/vmx.c|7415| <<__pi_post_block>> new.nv = POSTED_INTR_VECTOR;
++ */
+ #define POSTED_INTR_VECTOR		0xf2
++/*
++ * 在以下使用POSTED_INTR_WAKEUP_VECTOR:
++ *   - arch/x86/kernel/idt.c|136| <<global>> INTG(POSTED_INTR_WAKEUP_VECTOR, kvm_posted_intr_wakeup_ipi),
++ *   - arch/x86/include/asm/entry_arch.h|23| <<BUILD_INTERRUPT>> BUILD_INTERRUPT(kvm_posted_intr_wakeup_ipi, POSTED_INTR_WAKEUP_VECTOR)
++ *   - arch/x86/kvm/vmx/vmx.c|1275| <<vmx_vcpu_pi_load>> if (pi_desc->nv == POSTED_INTR_WAKEUP_VECTOR || vcpu->cpu == cpu) {
++ *   - arch/x86/kvm/vmx/vmx.c|7404| <<__pi_post_block>> WARN(old.nv != POSTED_INTR_WAKEUP_VECTOR,
++ *   - arch/x86/kvm/vmx/vmx.c|7489| <<pi_pre_block>> new.nv = POSTED_INTR_WAKEUP_VECTOR;
++ */
+ #define POSTED_INTR_WAKEUP_VECTOR	0xf1
+ #define POSTED_INTR_NESTED_VECTOR	0xf0
+ #endif
+diff --git a/arch/x86/kernel/irq.c b/arch/x86/kernel/irq.c
+index 21efee32e2b1..0fa9b53ac96b 100644
+--- a/arch/x86/kernel/irq.c
++++ b/arch/x86/kernel/irq.c
+@@ -291,6 +291,10 @@ __visible void __irq_entry smp_x86_platform_ipi(struct pt_regs *regs)
+ static void dummy_handler(void) {}
+ static void (*kvm_posted_intr_wakeup_handler)(void) = dummy_handler;
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|7840| <<hardware_setup>> kvm_set_posted_intr_wakeup_handler(wakeup_handler);
++ */
+ void kvm_set_posted_intr_wakeup_handler(void (*handler)(void))
+ {
+ 	if (handler)
+@@ -322,6 +326,9 @@ __visible void smp_kvm_posted_intr_wakeup_ipi(struct pt_regs *regs)
+ 
+ 	entering_ack_irq();
+ 	inc_irq_stat(kvm_posted_intr_wakeup_ipis);
++	/*
++	 * 比如wakeup_handler()
++	 */
+ 	kvm_posted_intr_wakeup_handler();
+ 	exiting_irq();
+ 	set_irq_regs(old_regs);
 diff --git a/arch/x86/kvm/irq.c b/arch/x86/kvm/irq.c
 index e330e7d125f7..98ae80007141 100644
 --- a/arch/x86/kvm/irq.c
@@ -62,10 +119,32 @@ index e330e7d125f7..98ae80007141 100644
  {
  	if (lapic_in_kernel(vcpu))
 diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
-index 2c4daaf6c551..a9c4252959b2 100644
+index 2c4daaf6c551..fc29ad84c388 100644
 --- a/arch/x86/kvm/lapic.c
 +++ b/arch/x86/kvm/lapic.c
-@@ -57,12 +57,30 @@
+@@ -53,16 +53,52 @@
+ #define PRIu64 "u"
+ #define PRIo64 "o"
+ 
++/*
++ * https://kernelgo.org/interrupt-remapping.html
++ *
++ * https://kernelgo.org/vtd_interrupt_remapping_code_analysis.html
++ *
++ * https://kernelgo.org/posted-interrupt.html
++ *
++ * https://kernelgo.org/vtd-posted-interrupt-code-analysis.html
++ */
++
++/*
++ * 当一个设备被直通给虚拟机后,虚拟机初始化的过程中VMM会设置好此设备的MSI/MSI-X中断
++ * 对应的IRTE并标志IM位为1b,标志这是一个Posted Interrupt.当直通设备投递一个中断后,
++ * 硬件首先会去查询irq对应的IRTE并从IRTE中提取记录的Posted Interrupt Descriptor
++ * 地址和vector信息,然后更新PIR域和ON域并且将vector信息写入到VCPU的vAPIC Page中,
++ * 直接给处于None Root模式的VCPU注入一个中断,整个过程不需要VMM的介入从而十分高效.
++ */
++
+ /* 14 is the version for Xeon and Pentium 8.4.8*/
  #define APIC_VERSION			(0x14UL | ((KVM_APIC_LVT_NUM - 1) << 16))
  #define LAPIC_MMIO_LENGTH		(1 << 12)
  /* followed define is not in apicdef.h */
@@ -96,7 +175,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  static bool lapic_timer_advance_dynamic __read_mostly;
  #define LAPIC_TIMER_ADVANCE_ADJUST_MIN	100	/* clock cycles */
  #define LAPIC_TIMER_ADVANCE_ADJUST_MAX	10000	/* clock cycles */
-@@ -71,11 +89,29 @@ static bool lapic_timer_advance_dynamic __read_mostly;
+@@ -71,11 +107,29 @@ static bool lapic_timer_advance_dynamic __read_mostly;
  /* step-by-step approximation to mitigate fluctuation */
  #define LAPIC_TIMER_ADVANCE_ADJUST_STEP 8
  
@@ -126,7 +205,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  bool kvm_apic_pending_eoi(struct kvm_vcpu *vcpu, int vector)
  {
  	struct kvm_lapic *apic = vcpu->arch.apic;
-@@ -84,19 +120,67 @@ bool kvm_apic_pending_eoi(struct kvm_vcpu *vcpu, int vector)
+@@ -84,19 +138,67 @@ bool kvm_apic_pending_eoi(struct kvm_vcpu *vcpu, int vector)
  		apic_test_vector(vector, apic->regs + APIC_IRR);
  }
  
@@ -194,7 +273,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  static inline int apic_enabled(struct kvm_lapic *apic)
  {
  	return kvm_apic_sw_enabled(apic) &&	kvm_apic_hw_enabled(apic);
-@@ -109,22 +193,57 @@ static inline int apic_enabled(struct kvm_lapic *apic)
+@@ -109,22 +211,57 @@ static inline int apic_enabled(struct kvm_lapic *apic)
  	(LVT_MASK | APIC_MODE_MASK | APIC_INPUT_POLARITY | \
  	 APIC_LVT_REMOTE_IRR | APIC_LVT_LEVEL_TRIGGER)
  
@@ -252,7 +331,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  static inline bool kvm_apic_map_get_logical_dest(struct kvm_apic_map *map,
  		u32 dest_id, struct kvm_lapic ***cluster, u16 *mask) {
  	switch (map->mode) {
-@@ -169,6 +288,16 @@ static void kvm_apic_map_free(struct rcu_head *rcu)
+@@ -169,6 +306,16 @@ static void kvm_apic_map_free(struct rcu_head *rcu)
  	kvfree(map);
  }
  
@@ -269,7 +348,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  static void recalculate_apic_map(struct kvm *kvm)
  {
  	struct kvm_apic_map *new, *old = NULL;
-@@ -255,8 +384,25 @@ static inline void apic_set_spiv(struct kvm_lapic *apic, u32 val)
+@@ -255,8 +402,25 @@ static inline void apic_set_spiv(struct kvm_lapic *apic, u32 val)
  
  	kvm_lapic_set_reg(apic, APIC_SPIV, val);
  
@@ -295,7 +374,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  		if (enabled)
  			static_key_slow_dec_deferred(&apic_sw_disabled);
  		else
-@@ -294,6 +440,10 @@ static inline void kvm_apic_set_x2apic_id(struct kvm_lapic *apic, u32 id)
+@@ -294,6 +458,10 @@ static inline void kvm_apic_set_x2apic_id(struct kvm_lapic *apic, u32 id)
  	recalculate_apic_map(apic->vcpu->kvm);
  }
  
@@ -306,7 +385,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  static inline int apic_lvt_enabled(struct kvm_lapic *apic, int lvt_type)
  {
  	return !(kvm_lapic_get_reg(apic, lvt_type) & APIC_LVT_MASKED);
-@@ -304,8 +454,24 @@ static inline int apic_lvt_vector(struct kvm_lapic *apic, int lvt_type)
+@@ -304,8 +472,24 @@ static inline int apic_lvt_vector(struct kvm_lapic *apic, int lvt_type)
  	return kvm_lapic_get_reg(apic, lvt_type) & APIC_VECTOR_MASK;
  }
  
@@ -331,7 +410,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  	return apic->lapic_timer.timer_mode == APIC_LVT_TIMER_ONESHOT;
  }
  
-@@ -324,6 +490,13 @@ static inline int apic_lvt_nmi_mode(u32 lvt_val)
+@@ -324,6 +508,13 @@ static inline int apic_lvt_nmi_mode(u32 lvt_val)
  	return (lvt_val & (APIC_MODE_MASK | APIC_LVT_MASKED)) == APIC_DM_NMI;
  }
  
@@ -345,7 +424,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  void kvm_apic_set_version(struct kvm_vcpu *vcpu)
  {
  	struct kvm_lapic *apic = vcpu->arch.apic;
-@@ -355,6 +528,11 @@ static const unsigned int apic_lvt_mask[KVM_APIC_LVT_NUM] = {
+@@ -355,6 +546,11 @@ static const unsigned int apic_lvt_mask[KVM_APIC_LVT_NUM] = {
  	LVT_MASK		/* LVTERR */
  };
  
@@ -357,7 +436,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  static int find_highest_vector(void *bitmap)
  {
  	int vec;
-@@ -414,6 +592,33 @@ bool __kvm_apic_update_irr(u32 *pir, void *regs, int *max_irr)
+@@ -414,6 +610,33 @@ bool __kvm_apic_update_irr(u32 *pir, void *regs, int *max_irr)
  }
  EXPORT_SYMBOL_GPL(__kvm_apic_update_irr);
  
@@ -391,7 +470,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  bool kvm_apic_update_irr(struct kvm_vcpu *vcpu, u32 *pir, int *max_irr)
  {
  	struct kvm_lapic *apic = vcpu->arch.apic;
-@@ -463,6 +668,10 @@ static inline void apic_clear_irr(int vec, struct kvm_lapic *apic)
+@@ -463,6 +686,10 @@ static inline void apic_clear_irr(int vec, struct kvm_lapic *apic)
  	}
  }
  
@@ -402,7 +481,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  static inline void apic_set_isr(int vec, struct kvm_lapic *apic)
  {
  	struct kvm_vcpu *vcpu;
-@@ -535,6 +744,12 @@ static inline void apic_clear_isr(int vec, struct kvm_lapic *apic)
+@@ -535,6 +762,12 @@ static inline void apic_clear_isr(int vec, struct kvm_lapic *apic)
  	}
  }
  
@@ -415,7 +494,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  int kvm_lapic_find_highest_irr(struct kvm_vcpu *vcpu)
  {
  	/* This may race with setting of irr in __apic_accept_irq() and
-@@ -550,6 +765,17 @@ static int __apic_accept_irq(struct kvm_lapic *apic, int delivery_mode,
+@@ -550,6 +783,17 @@ static int __apic_accept_irq(struct kvm_lapic *apic, int delivery_mode,
  			     int vector, int level, int trig_mode,
  			     struct dest_map *dest_map);
  
@@ -433,7 +512,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  int kvm_apic_set_irq(struct kvm_vcpu *vcpu, struct kvm_lapic_irq *irq,
  		     struct dest_map *dest_map)
  {
-@@ -1023,6 +1249,11 @@ bool kvm_intr_is_single_vcpu_fast(struct kvm *kvm, struct kvm_lapic_irq *irq,
+@@ -1023,6 +1267,11 @@ bool kvm_intr_is_single_vcpu_fast(struct kvm *kvm, struct kvm_lapic_irq *irq,
   * Add a pending IRQ into lapic.
   * Return 1 if successfully added and 0 if discarded.
   */
@@ -445,7 +524,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  static int __apic_accept_irq(struct kvm_lapic *apic, int delivery_mode,
  			     int vector, int level, int trig_mode,
  			     struct dest_map *dest_map)
-@@ -1158,6 +1389,38 @@ static void kvm_ioapic_send_eoi(struct kvm_lapic *apic, int vector)
+@@ -1158,6 +1407,38 @@ static void kvm_ioapic_send_eoi(struct kvm_lapic *apic, int vector)
  	kvm_ioapic_update_eoi(apic->vcpu, vector, trigger_mode);
  }
  
@@ -484,7 +563,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  static int apic_set_eoi(struct kvm_lapic *apic)
  {
  	int vector = apic_find_highest_isr(apic);
-@@ -1291,6 +1554,11 @@ static u32 __apic_read(struct kvm_lapic *apic, unsigned int offset)
+@@ -1291,6 +1572,11 @@ static u32 __apic_read(struct kvm_lapic *apic, unsigned int offset)
  	return val;
  }
  
@@ -496,7 +575,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  static inline struct kvm_lapic *to_lapic(struct kvm_io_device *dev)
  {
  	return container_of(dev, struct kvm_lapic, dev);
-@@ -1416,11 +1684,26 @@ static void limit_periodic_timer_frequency(struct kvm_lapic *apic)
+@@ -1416,11 +1702,26 @@ static void limit_periodic_timer_frequency(struct kvm_lapic *apic)
  	}
  }
  
@@ -523,7 +602,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  	if (apic->lapic_timer.timer_mode != timer_mode) {
  		if (apic_lvtt_tscdeadline(apic) != (timer_mode ==
  				APIC_LVT_TIMER_TSCDEADLINE)) {
-@@ -1533,6 +1816,20 @@ void kvm_wait_lapic_expire(struct kvm_vcpu *vcpu)
+@@ -1533,6 +1834,20 @@ void kvm_wait_lapic_expire(struct kvm_vcpu *vcpu)
  }
  EXPORT_SYMBOL_GPL(kvm_wait_lapic_expire);
  
@@ -544,7 +623,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  static void kvm_apic_inject_pending_timer_irqs(struct kvm_lapic *apic)
  {
  	struct kvm_timer *ktimer = &apic->lapic_timer;
-@@ -1546,6 +1843,38 @@ static void kvm_apic_inject_pending_timer_irqs(struct kvm_lapic *apic)
+@@ -1546,6 +1861,38 @@ static void kvm_apic_inject_pending_timer_irqs(struct kvm_lapic *apic)
  	}
  }
  
@@ -583,7 +662,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  static void apic_timer_expired(struct kvm_lapic *apic)
  {
  	struct kvm_vcpu *vcpu = apic->vcpu;
-@@ -1554,6 +1883,18 @@ static void apic_timer_expired(struct kvm_lapic *apic)
+@@ -1554,6 +1901,18 @@ static void apic_timer_expired(struct kvm_lapic *apic)
  	if (atomic_read(&apic->lapic_timer.pending))
  		return;
  
@@ -602,7 +681,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  	if (apic_lvtt_tscdeadline(apic) || ktimer->hv_timer_in_use)
  		ktimer->expired_tscdeadline = ktimer->tscdeadline;
  
-@@ -1568,6 +1909,10 @@ static void apic_timer_expired(struct kvm_lapic *apic)
+@@ -1568,6 +1927,10 @@ static void apic_timer_expired(struct kvm_lapic *apic)
  	kvm_set_pending_timer(vcpu);
  }
  
@@ -613,7 +692,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  static void start_sw_tscdeadline(struct kvm_lapic *apic)
  {
  	struct kvm_timer *ktimer = &apic->lapic_timer;
-@@ -1669,6 +2014,10 @@ static void advance_periodic_target_expiration(struct kvm_lapic *apic)
+@@ -1669,6 +2032,10 @@ static void advance_periodic_target_expiration(struct kvm_lapic *apic)
  		nsec_to_cycles(apic->vcpu, delta);
  }
  
@@ -624,7 +703,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  static void start_sw_period(struct kvm_lapic *apic)
  {
  	if (!apic->lapic_timer.period)
-@@ -1703,9 +2052,27 @@ static void cancel_hv_timer(struct kvm_lapic *apic)
+@@ -1703,9 +2070,27 @@ static void cancel_hv_timer(struct kvm_lapic *apic)
  	WARN_ON(preemptible());
  	WARN_ON(!apic->lapic_timer.hv_timer_in_use);
  	kvm_x86_ops->cancel_hv_timer(apic->vcpu);
@@ -652,7 +731,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  static bool start_hv_timer(struct kvm_lapic *apic)
  {
  	struct kvm_timer *ktimer = &apic->lapic_timer;
-@@ -1719,9 +2086,24 @@ static bool start_hv_timer(struct kvm_lapic *apic)
+@@ -1719,9 +2104,24 @@ static bool start_hv_timer(struct kvm_lapic *apic)
  	if (!ktimer->tscdeadline)
  		return false;
  
@@ -677,7 +756,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  	ktimer->hv_timer_in_use = true;
  	hrtimer_cancel(&ktimer->timer);
  
-@@ -1748,11 +2130,31 @@ static bool start_hv_timer(struct kvm_lapic *apic)
+@@ -1748,11 +2148,31 @@ static bool start_hv_timer(struct kvm_lapic *apic)
  	return true;
  }
  
@@ -709,7 +788,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  	if (apic->lapic_timer.hv_timer_in_use)
  		cancel_hv_timer(apic);
  	if (!apic_lvtt_period(apic) && atomic_read(&ktimer->pending))
-@@ -1765,6 +2167,41 @@ static void start_sw_timer(struct kvm_lapic *apic)
+@@ -1765,6 +2185,41 @@ static void start_sw_timer(struct kvm_lapic *apic)
  	trace_kvm_hv_timer_state(apic->vcpu->vcpu_id, false);
  }
  
@@ -751,7 +830,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  static void restart_apic_timer(struct kvm_lapic *apic)
  {
  	preempt_disable();
-@@ -1778,12 +2215,42 @@ static void restart_apic_timer(struct kvm_lapic *apic)
+@@ -1778,12 +2233,42 @@ static void restart_apic_timer(struct kvm_lapic *apic)
  	preempt_enable();
  }
  
@@ -794,7 +873,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  	if (!apic->lapic_timer.hv_timer_in_use)
  		goto out;
  	WARN_ON(swait_active(&vcpu->wq));
-@@ -1799,18 +2266,67 @@ void kvm_lapic_expired_hv_timer(struct kvm_vcpu *vcpu)
+@@ -1799,18 +2284,67 @@ void kvm_lapic_expired_hv_timer(struct kvm_vcpu *vcpu)
  }
  EXPORT_SYMBOL_GPL(kvm_lapic_expired_hv_timer);
  
@@ -862,7 +941,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  	if (apic->lapic_timer.hv_timer_in_use)
  		start_sw_timer(apic);
  	preempt_enable();
-@@ -1825,6 +2341,12 @@ void kvm_lapic_restart_hv_timer(struct kvm_vcpu *vcpu)
+@@ -1825,6 +2359,12 @@ void kvm_lapic_restart_hv_timer(struct kvm_vcpu *vcpu)
  	restart_apic_timer(apic);
  }
  
@@ -875,7 +954,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  static void start_apic_timer(struct kvm_lapic *apic)
  {
  	atomic_set(&apic->lapic_timer.pending, 0);
-@@ -2113,6 +2635,13 @@ u64 kvm_lapic_get_cr8(struct kvm_vcpu *vcpu)
+@@ -2113,6 +2653,13 @@ u64 kvm_lapic_get_cr8(struct kvm_vcpu *vcpu)
  	return (tpr & 0xf0) >> 4;
  }
  
@@ -889,7 +968,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  void kvm_lapic_set_base(struct kvm_vcpu *vcpu, u64 value)
  {
  	u64 old_value = vcpu->arch.apic_base;
-@@ -2169,6 +2698,29 @@ void kvm_apic_update_apicv(struct kvm_vcpu *vcpu)
+@@ -2169,6 +2716,29 @@ void kvm_apic_update_apicv(struct kvm_vcpu *vcpu)
  }
  EXPORT_SYMBOL_GPL(kvm_apic_update_apicv);
  
@@ -919,7 +998,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  void kvm_lapic_reset(struct kvm_vcpu *vcpu, bool init_event)
  {
  	struct kvm_lapic *apic = vcpu->arch.apic;
-@@ -2189,6 +2741,13 @@ void kvm_lapic_reset(struct kvm_vcpu *vcpu, bool init_event)
+@@ -2189,6 +2759,13 @@ void kvm_lapic_reset(struct kvm_vcpu *vcpu, bool init_event)
  
  	for (i = 0; i < KVM_APIC_LVT_NUM; i++)
  		kvm_lapic_set_reg(apic, APIC_LVTT + 0x10 * i, APIC_LVT_MASKED);
@@ -933,7 +1012,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  	apic_update_lvtt(apic);
  	if (kvm_vcpu_is_reset_bsp(vcpu) &&
  	    kvm_check_has_quirk(vcpu->kvm, KVM_X86_QUIRK_LINT0_REENABLED))
-@@ -2241,6 +2800,10 @@ static bool lapic_is_periodic(struct kvm_lapic *apic)
+@@ -2241,6 +2818,10 @@ static bool lapic_is_periodic(struct kvm_lapic *apic)
  	return apic_lvtt_period(apic);
  }
  
@@ -944,7 +1023,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  int apic_has_pending_timer(struct kvm_vcpu *vcpu)
  {
  	struct kvm_lapic *apic = vcpu->arch.apic;
-@@ -2251,6 +2814,22 @@ int apic_has_pending_timer(struct kvm_vcpu *vcpu)
+@@ -2251,6 +2832,22 @@ int apic_has_pending_timer(struct kvm_vcpu *vcpu)
  	return 0;
  }
  
@@ -967,7 +1046,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  int kvm_apic_local_deliver(struct kvm_lapic *apic, int lvt_type)
  {
  	u32 reg = kvm_lapic_get_reg(apic, lvt_type);
-@@ -2279,11 +2858,23 @@ static const struct kvm_io_device_ops apic_mmio_ops = {
+@@ -2279,11 +2876,23 @@ static const struct kvm_io_device_ops apic_mmio_ops = {
  	.write    = apic_mmio_write,
  };
  
@@ -991,7 +1070,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  	apic_timer_expired(apic);
  
  	if (lapic_is_periodic(apic)) {
-@@ -2294,6 +2885,10 @@ static enum hrtimer_restart apic_timer_fn(struct hrtimer *data)
+@@ -2294,6 +2903,10 @@ static enum hrtimer_restart apic_timer_fn(struct hrtimer *data)
  		return HRTIMER_NORESTART;
  }
  
@@ -1002,7 +1081,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  int kvm_create_lapic(struct kvm_vcpu *vcpu, int timer_advance_ns)
  {
  	struct kvm_lapic *apic;
-@@ -2304,6 +2899,14 @@ int kvm_create_lapic(struct kvm_vcpu *vcpu, int timer_advance_ns)
+@@ -2304,6 +2917,14 @@ int kvm_create_lapic(struct kvm_vcpu *vcpu, int timer_advance_ns)
  	if (!apic)
  		goto nomem;
  
@@ -1017,7 +1096,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  	vcpu->arch.apic = apic;
  
  	apic->regs = (void *)get_zeroed_page(GFP_KERNEL_ACCOUNT);
-@@ -2319,6 +2922,12 @@ int kvm_create_lapic(struct kvm_vcpu *vcpu, int timer_advance_ns)
+@@ -2319,6 +2940,12 @@ int kvm_create_lapic(struct kvm_vcpu *vcpu, int timer_advance_ns)
  	apic->lapic_timer.timer.function = apic_timer_fn;
  	if (timer_advance_ns == -1) {
  		apic->lapic_timer.timer_advance_ns = LAPIC_TIMER_ADVANCE_NS_INIT;
@@ -1030,7 +1109,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  		lapic_timer_advance_dynamic = true;
  	} else {
  		apic->lapic_timer.timer_advance_ns = timer_advance_ns;
-@@ -2330,6 +2939,16 @@ int kvm_create_lapic(struct kvm_vcpu *vcpu, int timer_advance_ns)
+@@ -2330,6 +2957,16 @@ int kvm_create_lapic(struct kvm_vcpu *vcpu, int timer_advance_ns)
  	 * thinking that APIC state has changed.
  	 */
  	vcpu->arch.apic_base = MSR_IA32_APICBASE_ENABLE;
@@ -1047,7 +1126,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  	static_key_slow_inc(&apic_sw_disabled.key); /* sw disabled at reset */
  	kvm_iodevice_init(&apic->dev, &apic_mmio_ops);
  
-@@ -2366,6 +2985,27 @@ int kvm_apic_accept_pic_intr(struct kvm_vcpu *vcpu)
+@@ -2366,6 +3003,27 @@ int kvm_apic_accept_pic_intr(struct kvm_vcpu *vcpu)
  	return r;
  }
  
@@ -1075,7 +1154,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  void kvm_inject_apic_timer_irqs(struct kvm_vcpu *vcpu)
  {
  	struct kvm_lapic *apic = vcpu->arch.apic;
-@@ -2507,6 +3147,10 @@ void __kvm_migrate_apic_timer(struct kvm_vcpu *vcpu)
+@@ -2507,6 +3165,10 @@ void __kvm_migrate_apic_timer(struct kvm_vcpu *vcpu)
   * last entry. If yes, set EOI on guests's behalf.
   * Clear PV EOI in guest memory in any case.
   */
@@ -1086,7 +1165,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  static void apic_sync_pv_eoi_from_guest(struct kvm_vcpu *vcpu,
  					struct kvm_lapic *apic)
  {
-@@ -2537,6 +3181,11 @@ static void apic_sync_pv_eoi_from_guest(struct kvm_vcpu *vcpu,
+@@ -2537,6 +3199,11 @@ static void apic_sync_pv_eoi_from_guest(struct kvm_vcpu *vcpu,
  	trace_kvm_pv_eoi(apic, vector);
  }
  
@@ -1098,7 +1177,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  void kvm_lapic_sync_from_vapic(struct kvm_vcpu *vcpu)
  {
  	u32 data;
-@@ -2689,6 +3338,12 @@ int kvm_hv_vapic_msr_read(struct kvm_vcpu *vcpu, u32 reg, u64 *data)
+@@ -2689,6 +3356,12 @@ int kvm_hv_vapic_msr_read(struct kvm_vcpu *vcpu, u32 reg, u64 *data)
  	return 0;
  }
  
@@ -1111,7 +1190,7 @@ index 2c4daaf6c551..a9c4252959b2 100644
  int kvm_lapic_enable_pv_eoi(struct kvm_vcpu *vcpu, u64 data, unsigned long len)
  {
  	u64 addr = data & ~KVM_MSR_ENABLED;
-@@ -2752,10 +3407,33 @@ void kvm_apic_accept_events(struct kvm_vcpu *vcpu)
+@@ -2752,10 +3425,33 @@ void kvm_apic_accept_events(struct kvm_vcpu *vcpu)
  	}
  }
  
@@ -1313,10 +1392,177 @@ index e800cced3c47..c6fadff82ffa 100644
  {
  	if (static_key_false(&apic_sw_disabled.key))
 diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
-index a4564713a470..10670b144c98 100644
+index a4564713a470..3177f05fc73d 100644
 --- a/arch/x86/kvm/vmx/vmx.c
 +++ b/arch/x86/kvm/vmx/vmx.c
-@@ -6511,6 +6511,10 @@ static void atomic_switch_perf_msrs(struct vcpu_vmx *vmx)
+@@ -404,6 +404,12 @@ static DEFINE_PER_CPU(struct list_head, loaded_vmcss_on_cpu);
+  * We maintian a per-CPU linked-list of vCPU, so in wakeup_handler() we
+  * can find which vCPU should be waken up.
+  */
++/*
++ * 在以下使用blocked_vcpu_on_cpu:
++ *   - arch/x86/kvm/vmx/vmx.c|5390| <<wakeup_handler>> list_for_each_entry(vcpu, &per_cpu(blocked_vcpu_on_cpu, cpu),
++ *   - arch/x86/kvm/vmx/vmx.c|7477| <<pi_pre_block>> list_add_tail(&vcpu->blocked_vcpu_list, &per_cpu(blocked_vcpu_on_cpu, vcpu->pre_pcpu));
++ *   - arch/x86/kvm/vmx/vmx.c|8168| <<vmx_init>> INIT_LIST_HEAD(&per_cpu(blocked_vcpu_on_cpu, cpu));
++ */
+ static DEFINE_PER_CPU(struct list_head, blocked_vcpu_on_cpu);
+ static DEFINE_PER_CPU(spinlock_t, blocked_vcpu_on_cpu_lock);
+ 
+@@ -1250,6 +1256,37 @@ static void vmx_write_guest_kernel_gs_base(struct vcpu_vmx *vmx, u64 data)
+ }
+ #endif
+ 
++/*
++ * vmx_vcpu_pi_load
++ * vmx_vcpu_load
++ * kvm_sched_in
++ * __fire_sched_in_preempt_notifiers
++ * finish_task_switch
++ * __schedule
++ * schedule
++ * kvm_vcpu_block
++ * kvm_arch_vcpu_ioctl_run
++ * kvm_vcpu_ioctl
++ * do_vfs_ioctl
++ * ksys_ioctl
++ * __x64_sys_ioctl
++ * do_syscall_64
++ * entry_SYSCALL_64_after_hwframe
++ *
++ * vmx_vcpu_pi_load
++ * vmx_vcpu_load
++ * vcpu_load
++ * kvm_arch_vcpu_ioctl_run
++ * kvm_vcpu_ioctl
++ * do_vfs_ioctl
++ * ksys_ioctl
++ * __x64_sys_ioctl
++ * do_syscall_64
++ * entry_SYSCALL_64_after_hwframe
++ *
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|1397| <<vmx_vcpu_load>> vmx_vcpu_pi_load(vcpu, cpu);
++ */
+ static void vmx_vcpu_pi_load(struct kvm_vcpu *vcpu, int cpu)
+ {
+ 	struct pi_desc *pi_desc = vcpu_to_pi_desc(vcpu);
+@@ -1393,6 +1430,36 @@ void vmx_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+ 	vmx->host_debugctlmsr = get_debugctlmsr();
+ }
+ 
++/*
++ * vmx_vcpu_pi_put
++ * kvm_arch_vcpu_put
++ * kvm_sched_out
++ * __fire_sched_out_preempt_notifiers
++ * __schedule
++ * schedule
++ * kvm_vcpu_block
++ * kvm_arch_vcpu_ioctl_run
++ * kvm_vcpu_ioctl
++ * do_vfs_ioctl
++ * ksys_ioctl
++ * __x64_sys_ioctl
++ * do_syscall_64
++ * entry_SYSCALL_64_after_hwframe
++ *
++ * vmx_vcpu_pi_put
++ * kvm_arch_vcpu_put
++ * vcpu_put
++ * kvm_arch_vcpu_ioctl_run
++ * kvm_vcpu_ioctl
++ * do_vfs_ioctl
++ * ksys_ioctl
++ * __x64_sys_ioctl
++ * do_syscall_64
++ * entry_SYSCALL_64_after_hwframe
++ *
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|1418| <<vmx_vcpu_put>> vmx_vcpu_pi_put(vcpu);
++ */
+ static void vmx_vcpu_pi_put(struct kvm_vcpu *vcpu)
+ {
+ 	struct pi_desc *pi_desc = vcpu_to_pi_desc(vcpu);
+@@ -1407,6 +1474,13 @@ static void vmx_vcpu_pi_put(struct kvm_vcpu *vcpu)
+ 		pi_set_sn(pi_desc);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|3649| <<kvm_arch_vcpu_put>> kvm_x86_ops->vcpu_put(vcpu);
++ *   - arch/x86/kvm/vmx/vmx.c|6883| <<vmx_create_vcpu>> vmx_vcpu_put(&vmx->vcpu);
++ *
++ * struct kvm_x86_ops vmx_x86_ops.vcpu_put = vmx_vcpu_put()
++ */
+ static void vmx_vcpu_put(struct kvm_vcpu *vcpu)
+ {
+ 	vmx_vcpu_pi_put(vcpu);
+@@ -3816,6 +3890,11 @@ static bool vmx_guest_apic_has_interrupt(struct kvm_vcpu *vcpu)
+ 	return ((rvi & 0xf0) > (vppr & 0xf0));
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|3872| <<vmx_deliver_nested_posted_interrupt>> if (!kvm_vcpu_trigger_posted_interrupt(vcpu, true))
++ *   - arch/x86/kvm/vmx/vmx.c|3904| <<vmx_deliver_posted_interrupt>> if (!kvm_vcpu_trigger_posted_interrupt(vcpu, false))
++ */
+ static inline bool kvm_vcpu_trigger_posted_interrupt(struct kvm_vcpu *vcpu,
+ 						     bool nested)
+ {
+@@ -3882,6 +3961,12 @@ static int vmx_deliver_nested_posted_interrupt(struct kvm_vcpu *vcpu,
+  * 2. If target vcpu isn't running(root mode), kick it to pick up the
+  * interrupt from PIR in next vmentry.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|1302| <<__apic_accept_irq>> if (kvm_x86_ops->deliver_posted_interrupt(vcpu, vector)) {
++ *
++ * struct kvm_x86_ops vmx_x86_ops.deliver_posted_interrupt = vmx_deliver_posted_interrupt()
++ */
+ static int vmx_deliver_posted_interrupt(struct kvm_vcpu *vcpu, int vector)
+ {
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+@@ -5357,6 +5442,16 @@ static void shrink_ple_window(struct kvm_vcpu *vcpu)
+ 	}
+ }
+ 
++/*
++ * ANV事件通知的目的是: 当vCPU被抢占或者处于Post Block阶段,这个时候vCPU是处于
++ * Runnable状态(已经被调度器选中,但还没进入非根模式enter_guest),这个时候如果收
++ * 到直通设备中断,那么就需要ANV事件来告知一下,这样在vCPU进入非根模式下能够立刻
++ * 处理这个中断.
++ *
++ * WNV事件通知的目的是:当vCPU被Block出来的时候会进入休眠状态,没有特殊事件不会被
++ * 调度器调度,那么这时候来中断了就用WNV来通知一下,将vCPU唤醒进来参与调度,让vCPU
++ * 及时处理中断.
++ */
+ /*
+  * Handler for POSTED_INTERRUPT_WAKEUP_VECTOR.
+  */
+@@ -5366,10 +5461,22 @@ static void wakeup_handler(void)
+ 	int cpu = smp_processor_id();
+ 
+ 	spin_lock(&per_cpu(blocked_vcpu_on_cpu_lock, cpu));
++	/*
++	 * 在以下使用kvm_vcpu->blocked_vcpu_list:
++	 *   - arch/x86/kvm/vmx/vmx.c|5391| <<wakeup_handler>> list_for_each_entry(vcpu, &per_cpu(blocked_vcpu_on_cpu, cpu), blocked_vcpu_list) {
++	 *   - arch/x86/kvm/vmx/vmx.c|7437| <<__pi_post_block>> list_del(&vcpu->blocked_vcpu_list);
++	 *   - arch/x86/kvm/vmx/vmx.c|7476| <<pi_pre_block>> list_add_tail(&vcpu->blocked_vcpu_list, &per_cpu(blocked_vcpu_on_cpu, vcpu->pre_pcpu));
++	 *   - virt/kvm/kvm_main.c|338| <<kvm_vcpu_init>> INIT_LIST_HEAD(&vcpu->blocked_vcpu_list)
++	 */
+ 	list_for_each_entry(vcpu, &per_cpu(blocked_vcpu_on_cpu, cpu),
+ 			blocked_vcpu_list) {
+ 		struct pi_desc *pi_desc = vcpu_to_pi_desc(vcpu);
+ 
++		/*
++		 * Outstanding Notification(ON),由硬件来自动更新,用来表示是否有中断请求pending.
++		 * 当此位为0时,硬件通过修改其为1来产生一个通知事件告知中断请求到来.
++		 * 接收这个通知事件的实体(处理器或者软件)在处理这个posted interrupt时后必须将其清零.
++		 */
+ 		if (pi_test_on(pi_desc) == 1)
+ 			kvm_vcpu_kick(vcpu);
+ 	}
+@@ -6511,6 +6618,10 @@ static void atomic_switch_perf_msrs(struct vcpu_vmx *vmx)
  					msrs[i].host, false);
  }
  
@@ -1327,11 +1573,79 @@ index a4564713a470..10670b144c98 100644
  static void vmx_update_hv_timer(struct kvm_vcpu *vcpu)
  {
  	struct vcpu_vmx *vmx = to_vmx(vcpu);
-@@ -7480,6 +7484,17 @@ static int pi_pre_block(struct kvm_vcpu *vcpu)
+@@ -7404,6 +7515,13 @@ static void __pi_post_block(struct kvm_vcpu *vcpu)
+ 
+ 	if (!WARN_ON_ONCE(vcpu->pre_pcpu == -1)) {
+ 		spin_lock(&per_cpu(blocked_vcpu_on_cpu_lock, vcpu->pre_pcpu));
++		/*
++		 * 在以下使用kvm_vcpu->blocked_vcpu_list:
++		 *   - arch/x86/kvm/vmx/vmx.c|5391| <<wakeup_handler>> list_for_each_entry(vcpu, &per_cpu(blocked_vcpu_on_cpu, cpu), blocked_vcpu_list) {
++		 *   - arch/x86/kvm/vmx/vmx.c|7437| <<__pi_post_block>> list_del(&vcpu->blocked_vcpu_list);
++		 *   - arch/x86/kvm/vmx/vmx.c|7476| <<pi_pre_block>> list_add_tail(&vcpu->blocked_vcpu_list, &per_cpu(blocked_vcpu_on_cpu, vcpu->pre_pcpu));
++		 *   - virt/kvm/kvm_main.c|338| <<kvm_vcpu_init>> INIT_LIST_HEAD(&vcpu->blocked_vcpu_list)
++		 */
+ 		list_del(&vcpu->blocked_vcpu_list);
+ 		spin_unlock(&per_cpu(blocked_vcpu_on_cpu_lock, vcpu->pre_pcpu));
+ 		vcpu->pre_pcpu = -1;
+@@ -7423,6 +7541,16 @@ static void __pi_post_block(struct kvm_vcpu *vcpu)
+  *   this case, return 1, otherwise, return 0.
+  *
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|7500| <<vmx_pre_block>> if (pi_pre_block(vcpu))
++ *
++ * kvm_arch_vcpu_ioctl_run()
++ * -> vcpu_run()
++ *    -> vcpu_block()
++ *       -> kvm_x86_ops->pre_block() = vmx_pre_block()
++ *          -> pi_pre_block()
++ */
+ static int pi_pre_block(struct kvm_vcpu *vcpu)
+ {
+ 	unsigned int dest;
+@@ -7439,6 +7567,13 @@ static int pi_pre_block(struct kvm_vcpu *vcpu)
+ 	if (!WARN_ON_ONCE(vcpu->pre_pcpu != -1)) {
+ 		vcpu->pre_pcpu = vcpu->cpu;
+ 		spin_lock(&per_cpu(blocked_vcpu_on_cpu_lock, vcpu->pre_pcpu));
++		/*
++		 * 在以下使用kvm_vcpu->blocked_vcpu_list:
++		 *   - arch/x86/kvm/vmx/vmx.c|5391| <<wakeup_handler>> list_for_each_entry(vcpu, &per_cpu(blocked_vcpu_on_cpu, cpu), blocked_vcpu_list) {
++		 *   - arch/x86/kvm/vmx/vmx.c|7437| <<__pi_post_block>> list_del(&vcpu->blocked_vcpu_list);
++		 *   - arch/x86/kvm/vmx/vmx.c|7476| <<pi_pre_block>> list_add_tail(&vcpu->blocked_vcpu_list, &per_cpu(blocked_vcpu_on_cpu, vcpu->pre_pcpu));
++		 *   - virt/kvm/kvm_main.c|338| <<kvm_vcpu_init>> INIT_LIST_HEAD(&vcpu->blocked_vcpu_list)
++		 */
+ 		list_add_tail(&vcpu->blocked_vcpu_list,
+ 			      &per_cpu(blocked_vcpu_on_cpu,
+ 				       vcpu->pre_pcpu));
+@@ -7467,6 +7602,14 @@ static int pi_pre_block(struct kvm_vcpu *vcpu)
+ 		else
+ 			new.ndst = (dest << 8) & 0xFF00;
+ 
++		/*
++		 * 在以下使用pi_desc->control.nv:
++		 *   - arch/x86/kvm/vmx/vmx.c|1312| <<vmx_vcpu_pi_load>> if (pi_desc->nv == POSTED_INTR_WAKEUP_VECTOR || vcpu->cpu == cpu) {
++		 *   - arch/x86/kvm/vmx/vmx.c|6947| <<vmx_create_vcpu>> vmx->pi_desc.nv = POSTED_INTR_VECTOR;
++		 *   - arch/x86/kvm/vmx/vmx.c|7501| <<__pi_post_block>> WARN(old.nv != POSTED_INTR_WAKEUP_VECTOR,
++		 *   - arch/x86/kvm/vmx/vmx.c|7512| <<__pi_post_block>> new.nv = POSTED_INTR_VECTOR;
++		 *   - arch/x86/kvm/vmx/vmx.c|7606| <<pi_pre_block>> new.nv = POSTED_INTR_WAKEUP_VECTOR;
++		 */
+ 		/* set 'NV' to 'wakeup vector' */
+ 		new.nv = POSTED_INTR_WAKEUP_VECTOR;
+ 	} while (cmpxchg64(&pi_desc->control, old.control,
+@@ -7480,6 +7623,25 @@ static int pi_pre_block(struct kvm_vcpu *vcpu)
  	return (vcpu->pre_pcpu == -1);
  }
  
 +/*
++ * vmx_pre_block
++ * kvm_vcpu_ioctl
++ * do_vfs_ioctl
++ * ksys_ioctl
++ * __x64_sys_ioctl
++ * do_syscall_64
++ * entry_SYSCALL_64_after_hwframe
++ *
 + * called by:
 + *   - arch/x86/kvm/x86.c|8453| <<vcpu_block>> (!kvm_x86_ops->pre_block || kvm_x86_ops->pre_block(vcpu) == 0)) {
 + *
@@ -1345,7 +1659,7 @@ index a4564713a470..10670b144c98 100644
  static int vmx_pre_block(struct kvm_vcpu *vcpu)
  {
  	if (pi_pre_block(vcpu))
-@@ -7502,6 +7517,17 @@ static void pi_post_block(struct kvm_vcpu *vcpu)
+@@ -7502,6 +7664,17 @@ static void pi_post_block(struct kvm_vcpu *vcpu)
  	local_irq_enable();
  }
  
@@ -1364,10 +1678,35 @@ index a4564713a470..10670b144c98 100644
  {
  	if (kvm_x86_ops->set_hv_timer)
 diff --git a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
-index 299640a78208..09acf2e2543b 100644
+index 299640a78208..66a453bd84f2 100644
 --- a/arch/x86/kvm/vmx/vmx.h
 +++ b/arch/x86/kvm/vmx/vmx.h
-@@ -260,6 +260,14 @@ struct vcpu_vmx {
+@@ -49,10 +49,24 @@ struct pi_desc {
+ 		struct {
+ 				/* bit 256 - Outstanding Notification */
+ 			u16	on	: 1,
++				/*
++				 * 在以下使用pi_desc->control.sn(应该还更多):
++				 *   - arch/x86/kvm/vmx/vmx.c|1297| <<vmx_vcpu_pi_load>> new.sn = 0;
++				 *   - arch/x86/kvm/vmx/vmx.c|6880| <<vmx_create_vcpu>> vmx->pi_desc.sn = 1;
++				 *   - arch/x86/kvm/vmx/vmx.c|7518| <<pi_pre_block>> WARN((pi_desc->sn == 1),
++				 */
+ 				/* bit 257 - Suppress Notification */
+ 				sn	: 1,
+ 				/* bit 271:258 - Reserved */
+ 				rsvd_1	: 14;
++			/*
++			 * 在以下使用pi_desc->control.nv:
++			 *   - arch/x86/kvm/vmx/vmx.c|1312| <<vmx_vcpu_pi_load>> if (pi_desc->nv == POSTED_INTR_WAKEUP_VECTOR || vcpu->cpu == cpu) {
++			 *   - arch/x86/kvm/vmx/vmx.c|6947| <<vmx_create_vcpu>> vmx->pi_desc.nv = POSTED_INTR_VECTOR;
++			 *   - arch/x86/kvm/vmx/vmx.c|7501| <<__pi_post_block>> WARN(old.nv != POSTED_INTR_WAKEUP_VECTOR,
++			 *   - arch/x86/kvm/vmx/vmx.c|7512| <<__pi_post_block>> new.nv = POSTED_INTR_VECTOR;
++			 *   - arch/x86/kvm/vmx/vmx.c|7606| <<pi_pre_block>> new.nv = POSTED_INTR_WAKEUP_VECTOR;
++			 */
+ 				/* bit 279:272 - Notification Vector */
+ 			u8	nv;
+ 				/* bit 287:280 - Reserved */
+@@ -260,6 +274,14 @@ struct vcpu_vmx {
  	unsigned int ple_window;
  	bool ple_window_dirty;
  
@@ -1382,8 +1721,90 @@ index 299640a78208..09acf2e2543b 100644
  	bool req_immediate_exit;
  
  	/* Support for PML */
+@@ -338,6 +360,12 @@ void pt_update_intercept_for_msr(struct vcpu_vmx *vmx);
+ void vmx_update_host_rsp(struct vcpu_vmx *vmx, unsigned long host_rsp);
+ 
+ #define POSTED_INTR_ON  0
++/*
++ * 在以下使用POSTED_INTR_SN:
++ *   - arch/x86/kvm/vmx/vmx.h|375| <<pi_set_sn>> set_bit(POSTED_INTR_SN,
++ *   - arch/x86/kvm/vmx/vmx.h|393| <<pi_clear_sn>> clear_bit(POSTED_INTR_SN,
++ *   - arch/x86/kvm/vmx/vmx.h|423| <<pi_test_sn>> return test_bit(POSTED_INTR_SN,
++ */
+ #define POSTED_INTR_SN  1
+ 
+ static inline bool pi_test_and_set_on(struct pi_desc *pi_desc)
+@@ -362,6 +390,10 @@ static inline bool pi_is_pir_empty(struct pi_desc *pi_desc)
+ 	return bitmap_empty((unsigned long *)pi_desc->pir, NR_VECTORS);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|1413| <<vmx_vcpu_pi_put>> pi_set_sn(pi_desc);
++ */
+ static inline void pi_set_sn(struct pi_desc *pi_desc)
+ {
+ 	set_bit(POSTED_INTR_SN,
+@@ -380,18 +412,40 @@ static inline void pi_clear_on(struct pi_desc *pi_desc)
+ 		(unsigned long *)&pi_desc->control);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|1282| <<vmx_vcpu_pi_load>> pi_clear_sn(pi_desc);
++ */
+ static inline void pi_clear_sn(struct pi_desc *pi_desc)
+ {
+ 	clear_bit(POSTED_INTR_SN,
+ 		(unsigned long *)&pi_desc->control);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|5373| <<wakeup_handler>> if (pi_test_on(pi_desc) == 1)
++ *   - arch/x86/kvm/vmx/vmx.c|6220| <<vmx_sync_pir_to_irr>> if (pi_test_on(&vmx->pi_desc)) {
++ *   - arch/x86/kvm/vmx/vmx.c|6255| <<vmx_dy_apicv_has_pending_interrupt>> return pi_test_on(pi_desc) ||
++ *   - arch/x86/kvm/vmx/vmx.c|7480| <<pi_pre_block>> if (pi_test_on(pi_desc) == 1)
++ *
++ * Outstanding Notification(ON),由硬件来自动更新,用来表示是否有中断请求pending.
++ * 当此位为0时,硬件通过修改其为1来产生一个通知事件告知中断请求到来.
++ * 接收这个通知事件的实体(处理器或者软件)在处理这个posted interrupt时后必须将其清零.
++ */
+ static inline int pi_test_on(struct pi_desc *pi_desc)
+ {
+ 	return test_bit(POSTED_INTR_ON,
+ 			(unsigned long *)&pi_desc->control);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|1265| <<vmx_vcpu_pi_load>> if (!pi_test_sn(pi_desc) && vcpu->cpu == cpu)
++ *   - arch/x86/kvm/vmx/vmx.c|6256| <<vmx_dy_apicv_has_pending_interrupt>> (pi_test_sn(pi_desc) && !pi_is_pir_empty(pi_desc));
++ *
++ * Suppress Notification(SN),表示non-urgent中断请求的通知事件是否要被supressed(抑制).
++ */
+ static inline int pi_test_sn(struct pi_desc *pi_desc)
+ {
+ 	return test_bit(POSTED_INTR_SN,
+@@ -469,6 +523,16 @@ static inline struct vcpu_vmx *to_vmx(struct kvm_vcpu *vcpu)
+ 	return container_of(vcpu, struct vcpu_vmx, vcpu);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|1255| <<vmx_vcpu_pi_load>> struct pi_desc *pi_desc = vcpu_to_pi_desc(vcpu);
++ *   - arch/x86/kvm/vmx/vmx.c|1398| <<vmx_vcpu_pi_put>> struct pi_desc *pi_desc = vcpu_to_pi_desc(vcpu);
++ *   - arch/x86/kvm/vmx/vmx.c|5371| <<wakeup_handler>> struct pi_desc *pi_desc = vcpu_to_pi_desc(vcpu);
++ *   - arch/x86/kvm/vmx/vmx.c|6253| <<vmx_dy_apicv_has_pending_interrupt>> struct pi_desc *pi_desc = vcpu_to_pi_desc(vcpu);
++ *   - arch/x86/kvm/vmx/vmx.c|7388| <<__pi_post_block>> struct pi_desc *pi_desc = vcpu_to_pi_desc(vcpu);
++ *   - arch/x86/kvm/vmx/vmx.c|7434| <<pi_pre_block>> struct pi_desc *pi_desc = vcpu_to_pi_desc(vcpu);
++ *   - arch/x86/kvm/vmx/vmx.c|7609| <<vmx_update_pi_irte>> vcpu_info.pi_desc_addr = __pa(vcpu_to_pi_desc(vcpu));
++ */
+ static inline struct pi_desc *vcpu_to_pi_desc(struct kvm_vcpu *vcpu)
+ {
+ 	return &(to_vmx(vcpu)->pi_desc);
 diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
-index 74f19e21350f..aa18b6002e0b 100644
+index 74f19e21350f..9dc8e40a4478 100644
 --- a/arch/x86/kvm/x86.c
 +++ b/arch/x86/kvm/x86.c
 @@ -145,6 +145,11 @@ module_param(tsc_tolerance_ppm, uint, S_IRUGO | S_IWUSR);
@@ -1423,7 +1844,29 @@ index 74f19e21350f..aa18b6002e0b 100644
  void kvm_set_pending_timer(struct kvm_vcpu *vcpu)
  {
  	kvm_make_request(KVM_REQ_PENDING_TIMER, vcpu);
-@@ -8431,6 +8447,14 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+@@ -3606,6 +3622,11 @@ static void kvm_steal_time_set_preempted(struct kvm_vcpu *vcpu)
+ 	kvm_unmap_gfn(vcpu, &map, &vcpu->arch.st.cache, true, true);
+ }
+ 
++/*
++ * x86下的调用:
++ *   - virt/kvm/kvm_main.c|208| <<vcpu_put>> kvm_arch_vcpu_put(vcpu);
++ *   - virt/kvm/kvm_main.c|4405| <<kvm_sched_out>> kvm_arch_vcpu_put(vcpu);
++ */
+ void kvm_arch_vcpu_put(struct kvm_vcpu *vcpu)
+ {
+ 	int idx;
+@@ -8282,6 +8303,9 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 	 * IPI are then delayed after guest entry, which ensures that they
+ 	 * result in virtual interrupt delivery.
+ 	 */
++	/*
++	 * 这里有关于posted interrupt的!!!
++	 */
+ 	local_irq_disable();
+ 	vcpu->mode = IN_GUEST_MODE;
+ 
+@@ -8431,6 +8455,14 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
  	return r;
  }
  
@@ -1438,7 +1881,7 @@ index 74f19e21350f..aa18b6002e0b 100644
  static inline int vcpu_block(struct kvm *kvm, struct kvm_vcpu *vcpu)
  {
  	if (!kvm_arch_vcpu_runnable(vcpu) &&
-@@ -8465,6 +8489,11 @@ static inline int vcpu_block(struct kvm *kvm, struct kvm_vcpu *vcpu)
+@@ -8465,6 +8497,11 @@ static inline int vcpu_block(struct kvm *kvm, struct kvm_vcpu *vcpu)
  	return 1;
  }
  
@@ -1450,7 +1893,7 @@ index 74f19e21350f..aa18b6002e0b 100644
  static inline bool kvm_vcpu_running(struct kvm_vcpu *vcpu)
  {
  	if (is_guest_mode(vcpu) && kvm_x86_ops->check_nested_events)
-@@ -8474,6 +8503,10 @@ static inline bool kvm_vcpu_running(struct kvm_vcpu *vcpu)
+@@ -8474,6 +8511,10 @@ static inline bool kvm_vcpu_running(struct kvm_vcpu *vcpu)
  		!vcpu->arch.apf.halted);
  }
  
@@ -1461,7 +1904,7 @@ index 74f19e21350f..aa18b6002e0b 100644
  static int vcpu_run(struct kvm_vcpu *vcpu)
  {
  	int r;
-@@ -9564,6 +9597,11 @@ int kvm_arch_vcpu_init(struct kvm_vcpu *vcpu)
+@@ -9564,6 +9605,11 @@ int kvm_arch_vcpu_init(struct kvm_vcpu *vcpu)
  		goto fail_free_pio_data;
  
  	if (irqchip_in_kernel(vcpu->kvm)) {
@@ -1796,20 +2239,70 @@ index 5de8ced5169e..d3904d76cd3d 100644
  		     struct device *dev, const char *fmt, ...)
  {
 diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
-index 07bc7dbba047..998b4219435c 100644
+index 07bc7dbba047..165fa44958b8 100644
 --- a/include/linux/kvm_host.h
 +++ b/include/linux/kvm_host.h
-@@ -219,6 +219,10 @@ int kvm_async_pf_wakeup_all(struct kvm_vcpu *vcpu);
+@@ -218,8 +218,32 @@ int kvm_async_pf_wakeup_all(struct kvm_vcpu *vcpu);
+ #endif
  
  enum {
++	/*
++	 * x86下使用OUTSIDE_GUEST_MODE的例子:
++	 *   - arch/x86/kvm/mmu.c|1057| <<walk_shadow_page_lockless_end>> smp_store_release(&vcpu->mode, OUTSIDE_GUEST_MODE);
++	 *   - arch/x86/kvm/x86.c|8334| <<vcpu_enter_guest>> vcpu->mode = OUTSIDE_GUEST_MODE;
++	 *   - arch/x86/kvm/x86.c|8397| <<vcpu_enter_guest>> vcpu->mode = OUTSIDE_GUEST_MODE;
++	 *   - virt/kvm/arm/arm.c|765| <<kvm_arch_vcpu_ioctl_run>> vcpu->mode = OUTSIDE_GUEST_MODE;
++	 *   - virt/kvm/arm/arm.c|792| <<kvm_arch_vcpu_ioctl_run>> vcpu->mode = OUTSIDE_GUEST_MODE;
++	 *   - virt/kvm/kvm_main.c|269| <<kvm_request_needs_ipi>> return mode != OUTSIDE_GUEST_MODE;
++	 */
  	OUTSIDE_GUEST_MODE,
 +	/*
 +	 * 一个设置IN_GUEST_MODE的例子:
 +	 *   - arch/x86/kvm/x86.c|8298| <<vcpu_enter_guest>> vcpu->mode = IN_GUEST_MODE;
++	 * x86在以下使用IN_GUEST_MODE:
++	 *   - arch/x86/kvm/lapic.c|247| <<kvm_use_posted_timer_interrupt>> return kvm_can_post_timer_interrupt(vcpu) && vcpu->mode == IN_GUEST_MODE;
++	 *   - arch/x86/kvm/vmx/vmx.c|3904| <<kvm_vcpu_trigger_posted_interrupt>> if (vcpu->mode == IN_GUEST_MODE) {
++	 *   - arch/x86/kvm/x86.c|10154| <<kvm_arch_vcpu_should_kick>> return kvm_vcpu_exiting_guest_mode(vcpu) == IN_GUEST_MODE;
++	 *   - include/linux/kvm_host.h|344| <<kvm_vcpu_exiting_guest_mode>> return cmpxchg(&vcpu->mode, IN_GUEST_MODE, EXITING_GUEST_MODE);
++	 *   - virt/kvm/kvm_main.c|274| <<kvm_request_needs_ipi>> return mode == IN_GUEST_MODE;
 +	 */
  	IN_GUEST_MODE,
++	/*
++	 * 在以下使用EXITING_GUEST_MODE:
++	 *   - arch/x86/kvm/x86.c|8332| <<vcpu_enter_guest>> if (vcpu->mode == EXITING_GUEST_MODE || kvm_request_pending(vcpu)
++	 *   - include/linux/kvm_host.h|344| <<kvm_vcpu_exiting_guest_mode>> return cmpxchg(&vcpu->mode, IN_GUEST_MODE, EXITING_GUEST_MODE);
++	 */
  	EXITING_GUEST_MODE,
  	READING_SHADOW_PAGE_TABLES,
+ };
+@@ -273,6 +297,13 @@ struct kvm_vcpu {
+ 	unsigned long guest_debug;
+ 
+ 	int pre_pcpu;
++	/*
++	 * 在以下使用kvm_vcpu->blocked_vcpu_list:
++	 *   - arch/x86/kvm/vmx/vmx.c|5391| <<wakeup_handler>> list_for_each_entry(vcpu, &per_cpu(blocked_vcpu_on_cpu, cpu), blocked_vcpu_list) {
++	 *   - arch/x86/kvm/vmx/vmx.c|7437| <<__pi_post_block>> list_del(&vcpu->blocked_vcpu_list);
++	 *   - arch/x86/kvm/vmx/vmx.c|7476| <<pi_pre_block>> list_add_tail(&vcpu->blocked_vcpu_list, &per_cpu(blocked_vcpu_on_cpu, vcpu->pre_pcpu));
++	 *   - virt/kvm/kvm_main.c|338| <<kvm_vcpu_init>> INIT_LIST_HEAD(&vcpu->blocked_vcpu_list)
++	 */
+ 	struct list_head blocked_vcpu_list;
+ 
+ 	struct mutex mutex;
+@@ -322,6 +353,13 @@ struct kvm_vcpu {
+ 	struct dentry *debugfs_dentry;
+ };
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|6347| <<vmx_sync_pir_to_irr>> kvm_vcpu_exiting_guest_mode(vcpu);
++ *   - arch/x86/kvm/x86.c|10154| <<kvm_arch_vcpu_should_kick>> return kvm_vcpu_exiting_guest_mode(vcpu) == IN_GUEST_MODE;
++ *   - virt/kvm/arm/arm.c|88| <<kvm_arch_vcpu_should_kick>> return kvm_vcpu_exiting_guest_mode(vcpu) == IN_GUEST_MODE;
++ *   - virt/kvm/kvm_main.c|262| <<kvm_request_needs_ipi>> int mode = kvm_vcpu_exiting_guest_mode(vcpu);
++ */
+ static inline int kvm_vcpu_exiting_guest_mode(struct kvm_vcpu *vcpu)
+ {
+ 	/*
 diff --git a/include/uapi/linux/kvm.h b/include/uapi/linux/kvm.h
 index e735bc4075dc..2b7376ed5079 100644
 --- a/include/uapi/linux/kvm.h
@@ -3042,6 +3535,101 @@ index 5454ec07fba5..7efdfd01f1ac 100644
  struct rds_transport *rds_trans_get(int t_type)
  {
  	struct rds_transport *ret = NULL;
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index d6cbfc05c51d..77a6e718dfbe 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -107,6 +107,12 @@ static atomic_t hardware_enable_failed;
+ struct kmem_cache *kvm_vcpu_cache;
+ EXPORT_SYMBOL_GPL(kvm_vcpu_cache);
+ 
++/*
++ * 在以下使用kvm_preempt_ops:
++ *   - virt/kvm/kvm_main.c|2825| <<kvm_vm_ioctl_create_vcpu>> preempt_notifier_init(&vcpu->preempt_notifier, &kvm_preempt_ops);
++ *   - virt/kvm/kvm_main.c|4485| <<kvm_init>> kvm_preempt_ops.sched_in = kvm_sched_in;
++ *   - virt/kvm/kvm_main.c|4486| <<kvm_init>> kvm_preempt_ops.sched_out = kvm_sched_out;
++ */
+ static __read_mostly struct preempt_ops kvm_preempt_ops;
+ 
+ struct dentry *kvm_debugfs_dir;
+@@ -193,6 +199,26 @@ bool kvm_is_reserved_pfn(kvm_pfn_t pfn)
+ /*
+  * Switches to specified vcpu, until a matching vcpu_put()
+  */
++/*
++ * x86在以下调用vcpu_load():
++ *   - arch/x86/kvm/vmx/nested.c|318| <<nested_vmx_free_vcpu>> vcpu_load(vcpu);
++ *   - arch/x86/kvm/x86.c|3563| <<kvm_arch_vcpu_load>> kvm_x86_ops->vcpu_load(vcpu, cpu);
++ *   - arch/x86/kvm/x86.c|4245| <<kvm_arch_vcpu_ioctl>> vcpu_load(vcpu);
++ *   - arch/x86/kvm/x86.c|8690| <<kvm_arch_vcpu_ioctl_run>> vcpu_load(vcpu);
++ *   - arch/x86/kvm/x86.c|8793| <<kvm_arch_vcpu_ioctl_get_regs>> vcpu_load(vcpu);
++ *   - arch/x86/kvm/x86.c|8833| <<kvm_arch_vcpu_ioctl_set_regs>> vcpu_load(vcpu);
++ *   - arch/x86/kvm/x86.c|8888| <<kvm_arch_vcpu_ioctl_get_sregs>> vcpu_load(vcpu);
++ *   - arch/x86/kvm/x86.c|8897| <<kvm_arch_vcpu_ioctl_get_mpstate>> vcpu_load(vcpu);
++ *   - arch/x86/kvm/x86.c|8919| <<kvm_arch_vcpu_ioctl_set_mpstate>> vcpu_load(vcpu);
++ *   - arch/x86/kvm/x86.c|9084| <<kvm_arch_vcpu_ioctl_set_sregs>> vcpu_load(vcpu);
++ *   - arch/x86/kvm/x86.c|9096| <<kvm_arch_vcpu_ioctl_set_guest_debug>> vcpu_load(vcpu);
++ *   - arch/x86/kvm/x86.c|9157| <<kvm_arch_vcpu_ioctl_translate>> vcpu_load(vcpu);
++ *   - arch/x86/kvm/x86.c|9175| <<kvm_arch_vcpu_ioctl_get_fpu>> vcpu_load(vcpu);
++ *   - arch/x86/kvm/x86.c|9195| <<kvm_arch_vcpu_ioctl_set_fpu>> vcpu_load(vcpu);
++ *   - arch/x86/kvm/x86.c|9299| <<kvm_arch_vcpu_setup>> vcpu_load(vcpu);
++ *   - arch/x86/kvm/x86.c|9315| <<kvm_arch_vcpu_postcreate>> vcpu_load(vcpu);
++ *   - arch/x86/kvm/x86.c|9730| <<kvm_unload_vcpu_mmu>> vcpu_load(vcpu);
++ */
+ void vcpu_load(struct kvm_vcpu *vcpu)
+ {
+ 	int cpu = get_cpu();
+@@ -202,6 +228,25 @@ void vcpu_load(struct kvm_vcpu *vcpu)
+ }
+ EXPORT_SYMBOL_GPL(vcpu_load);
+ 
++/*
++ * x86在以下调用vcpu_put():
++ *   - arch/x86/kvm/vmx/nested.c|322| <<nested_vmx_free_vcpu>> vcpu_put(vcpu);
++ *   - arch/x86/kvm/x86.c|4609| <<kvm_arch_vcpu_ioctl>> vcpu_put(vcpu);
++ *   - arch/x86/kvm/x86.c|8751| <<kvm_arch_vcpu_ioctl_run>> vcpu_put(vcpu);
++ *   - arch/x86/kvm/x86.c|8795| <<kvm_arch_vcpu_ioctl_get_regs>> vcpu_put(vcpu);
++ *   - arch/x86/kvm/x86.c|8835| <<kvm_arch_vcpu_ioctl_set_regs>> vcpu_put(vcpu);
++ *   - arch/x86/kvm/x86.c|8890| <<kvm_arch_vcpu_ioctl_get_sregs>> vcpu_put(vcpu);
++ *   - arch/x86/kvm/x86.c|8910| <<kvm_arch_vcpu_ioctl_get_mpstate>> vcpu_put(vcpu);
++ *   - arch/x86/kvm/x86.c|8940| <<kvm_arch_vcpu_ioctl_set_mpstate>> vcpu_put(vcpu);
++ *   - arch/x86/kvm/x86.c|9086| <<kvm_arch_vcpu_ioctl_set_sregs>> vcpu_put(vcpu);
++ *   - arch/x86/kvm/x86.c|9143| <<kvm_arch_vcpu_ioctl_set_guest_debug>> vcpu_put(vcpu);
++ *   - arch/x86/kvm/x86.c|9167| <<kvm_arch_vcpu_ioctl_translate>> vcpu_put(vcpu);
++ *   - arch/x86/kvm/x86.c|9187| <<kvm_arch_vcpu_ioctl_get_fpu>> vcpu_put(vcpu);
++ *   - arch/x86/kvm/x86.c|9208| <<kvm_arch_vcpu_ioctl_set_fpu>> vcpu_put(vcpu);
++ *   - arch/x86/kvm/x86.c|9302| <<kvm_arch_vcpu_setup>> vcpu_put(vcpu);
++ *   - arch/x86/kvm/x86.c|9320| <<kvm_arch_vcpu_postcreate>> vcpu_put(vcpu);
++ *   - arch/x86/kvm/x86.c|9732| <<kvm_unload_vcpu_mmu>> vcpu_put(vcpu);
++ */
+ void vcpu_put(struct kvm_vcpu *vcpu)
+ {
+ 	preempt_disable();
+@@ -335,6 +380,13 @@ int kvm_vcpu_init(struct kvm_vcpu *vcpu, struct kvm *kvm, unsigned id)
+ 	kvm_async_pf_vcpu_init(vcpu);
+ 
+ 	vcpu->pre_pcpu = -1;
++	/*
++	 * 在以下使用kvm_vcpu->blocked_vcpu_list:
++	 *   - arch/x86/kvm/vmx/vmx.c|5391| <<wakeup_handler>> list_for_each_entry(vcpu, &per_cpu(blocked_vcpu_on_cpu, cpu), blocked_vcpu_list) {
++	 *   - arch/x86/kvm/vmx/vmx.c|7437| <<__pi_post_block>> list_del(&vcpu->blocked_vcpu_list);
++	 *   - arch/x86/kvm/vmx/vmx.c|7476| <<pi_pre_block>> list_add_tail(&vcpu->blocked_vcpu_list, &per_cpu(blocked_vcpu_on_cpu, vcpu->pre_pcpu));
++	 *   - virt/kvm/kvm_main.c|338| <<kvm_vcpu_init>> INIT_LIST_HEAD(&vcpu->blocked_vcpu_list)
++	 */
+ 	INIT_LIST_HEAD(&vcpu->blocked_vcpu_list);
+ 
+ 	page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+@@ -4386,6 +4438,10 @@ static void kvm_sched_in(struct preempt_notifier *pn, int cpu)
+ 	kvm_arch_vcpu_load(vcpu, cpu);
+ }
+ 
++/*
++ * 在以下使用kvm_sched_out():
++ *   - virt/kvm/kvm_main.c|4486| <<kvm_init>> kvm_preempt_ops.sched_out = kvm_sched_out;
++ */
+ static void kvm_sched_out(struct preempt_notifier *pn,
+ 			  struct task_struct *next)
+ {
 -- 
 2.17.1
 
