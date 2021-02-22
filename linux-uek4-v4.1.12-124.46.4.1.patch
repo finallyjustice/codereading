@@ -1,0 +1,537 @@
+From 3e971edc86f4e2fedc72b26d3edce804be377713 Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Mon, 22 Feb 2021 14:30:10 -0800
+Subject: [PATCH 1/1] linux-uek4-v4.1.12-124.46.4.1
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ drivers/net/xen-netback/common.h    |  26 ++++
+ drivers/net/xen-netback/interface.c |  22 +++
+ drivers/net/xen-netback/rx.c        | 233 ++++++++++++++++++++++++++++
+ 3 files changed, 281 insertions(+)
+
+diff --git a/drivers/net/xen-netback/common.h b/drivers/net/xen-netback/common.h
+index fbe67967043f..dce6f41029d9 100644
+--- a/drivers/net/xen-netback/common.h
++++ b/drivers/net/xen-netback/common.h
+@@ -218,11 +218,37 @@ struct xenvif_queue { /* Per-queue data for xenvif */
+ 	/* Only used when feature-split-event-channels = 1 */
+ 	char rx_irq_name[IRQ_NAME_SIZE]; /* DEVNAME-qN-rx */
+ 	struct xen_netif_rx_back_ring rx;
++	/*
++	 * 在以下使用xenvif_queue->rx_queue:
++	 *   - drivers/net/xen-netback/interface.c|554| <<xenvif_init_queue>> skb_queue_head_init(&queue->rx_queue);
++	 *   - drivers/net/xen-netback/rx.c|89| <<xenvif_rx_queue_slots_available>> skb = skb_peek(&queue->rx_queue);
++	 *   - drivers/net/xen-netback/rx.c|100| <<xenvif_rx_queue_tail>> spin_lock_irqsave(&queue->rx_queue.lock, flags);
++	 *   - drivers/net/xen-netback/rx.c|102| <<xenvif_rx_queue_tail>> __skb_queue_tail(&queue->rx_queue, skb);
++	 *   - drivers/net/xen-netback/rx.c|111| <<xenvif_rx_queue_tail>> spin_unlock_irqrestore(&queue->rx_queue.lock, flags);
++	 *   - drivers/net/xen-netback/rx.c|119| <<xenvif_rx_dequeue>> spin_lock_irqsave(&queue->rx_queue.lock, flags);
++	 *   - drivers/net/xen-netback/rx.c|121| <<xenvif_rx_dequeue>> skb = __skb_dequeue(&queue->rx_queue);
++	 *   - drivers/net/xen-netback/rx.c|132| <<xenvif_rx_dequeue>> spin_unlock_irqrestore(&queue->rx_queue.lock, flags);
++	 *   - drivers/net/xen-netback/rx.c|150| <<xenvif_rx_queue_drop_expired>> skb = skb_peek(&queue->rx_queue);
++	 *   - drivers/net/xen-netback/rx.c|546| <<xenvif_rx_queue_timeout>> skb = skb_peek(&queue->rx_queue);
++	 *   - drivers/net/xen-netback/rx.c|650| <<xenvif_kthread_guest_rx>> if (!skb_queue_empty(&queue->rx_queue))
++	 *   - drivers/net/xen-netback/xenbus.c|123| <<xenvif_read_io_ring>> skb_queue_len(&queue->rx_queue),
++	 */
+ 	struct sk_buff_head rx_queue;
+ 	/* rx_lock is used to eliminate potential RX response race between
+ 	 * the guestrx thread and ndo_start_xmit. Also, used to enforce ordering
+ 	 * of netif_stop_queue()/netif_wake_queue() when the RX io_ring is full.
+ 	 */
++	/*
++	 * 在以下使用xenvif_queue->rx_lock:
++	 *   - drivers/net/xen-netback/interface.c|161| <<xenvif_rx_interrupt>> spin_lock(&queue->rx_lock);
++	 *   - drivers/net/xen-netback/interface.c|164| <<xenvif_rx_interrupt>> spin_unlock(&queue->rx_lock);
++	 *   - drivers/net/xen-netback/interface.c|564| <<xenvif_init_queue>> spin_lock_init(&queue->rx_lock);
++	 *   - drivers/net/xen-netback/rx.c|462| <<xenvif_rx_one_skb>> spin_lock_irqsave(&queue->rx_lock, flags);
++	 *   - drivers/net/xen-netback/rx.c|465| <<xenvif_rx_one_skb>> spin_unlock_irqrestore(&queue->rx_lock, flags);
++	 *   - drivers/net/xen-netback/rx.c|471| <<xenvif_rx_one_skb>> spin_unlock_irqrestore(&queue->rx_lock, flags);
++	 *   - drivers/net/xen-netback/rx.c|484| <<xenvif_rx_action>> spin_lock_irq(&queue->rx_lock);
++	 *   - drivers/net/xen-netback/rx.c|499| <<xenvif_rx_action>> spin_unlock_irq(&queue->rx_lock);
++	 */
+ 	spinlock_t rx_lock;
+ 
+ 	unsigned int rx_queue_max;
+diff --git a/drivers/net/xen-netback/interface.c b/drivers/net/xen-netback/interface.c
+index a945c04648eb..ba488bf69463 100644
+--- a/drivers/net/xen-netback/interface.c
++++ b/drivers/net/xen-netback/interface.c
+@@ -137,10 +137,21 @@ static int xenvif_poll(struct napi_struct *napi, int budget)
+ 	return work_done;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/interface.c|170| <<xenvif_rx_interrupt>> if (!xenvif_handle_rx_interrupt(queue)) {
++ *   - drivers/net/xen-netback/interface.c|188| <<xenvif_interrupt>> !xenvif_handle_rx_interrupt(queue))) {
++ */
+ static bool xenvif_handle_rx_interrupt(struct xenvif_queue *queue)
+ {
+ 	bool rc;
+ 
++	/*
++	 * called by:
++	 *   - drivers/net/xen-netback/interface.c|144| <<xenvif_handle_rx_interrupt>> rc = xenvif_have_rx_work(queue, false);
++	 *   - drivers/net/xen-netback/rx.c|572| <<xenvif_wait_for_rx_work>> if (xenvif_have_rx_work(queue, true))
++	 *   - drivers/net/xen-netback/rx.c|579| <<xenvif_wait_for_rx_work>> if (xenvif_have_rx_work(queue, true))
++	 */
+ 	rc = xenvif_have_rx_work(queue, false);
+ 	if (rc)
+ 		xenvif_kick_thread(queue);
+@@ -158,6 +169,17 @@ static irqreturn_t xenvif_rx_interrupt(int irq, void *dev_id)
+ 	 */
+ 	if (skip_guestrx_thread &&
+ 	    test_bit(VIF_STATUS_CONNECTED, &queue->vif->status)) {
++		/*
++		 * 在以下使用xenvif_queue->rx_lock:
++		 *   - drivers/net/xen-netback/interface.c|161| <<xenvif_rx_interrupt>> spin_lock(&queue->rx_lock);
++		 *   - drivers/net/xen-netback/interface.c|164| <<xenvif_rx_interrupt>> spin_unlock(&queue->rx_lock);
++		 *   - drivers/net/xen-netback/interface.c|564| <<xenvif_init_queue>> spin_lock_init(&queue->rx_lock);
++		 *   - drivers/net/xen-netback/rx.c|462| <<xenvif_rx_one_skb>> spin_lock_irqsave(&queue->rx_lock, flags);
++		 *   - drivers/net/xen-netback/rx.c|465| <<xenvif_rx_one_skb>> spin_unlock_irqrestore(&queue->rx_lock, flags);
++		 *   - drivers/net/xen-netback/rx.c|471| <<xenvif_rx_one_skb>> spin_unlock_irqrestore(&queue->rx_lock, flags);
++		 *   - drivers/net/xen-netback/rx.c|484| <<xenvif_rx_action>> spin_lock_irq(&queue->rx_lock);
++		 *   - drivers/net/xen-netback/rx.c|499| <<xenvif_rx_action>> spin_unlock_irq(&queue->rx_lock);
++		 */
+ 		spin_lock(&queue->rx_lock);
+ 		if (unlikely(__netif_subqueue_stopped(dev, queue->id)))
+ 			netif_wake_subqueue(dev, queue->id);
+diff --git a/drivers/net/xen-netback/rx.c b/drivers/net/xen-netback/rx.c
+index a0b4e0f58622..3507f8e69d61 100644
+--- a/drivers/net/xen-netback/rx.c
++++ b/drivers/net/xen-netback/rx.c
+@@ -33,6 +33,42 @@
+ #include <xen/xen.h>
+ #include <xen/events.h>
+ 
++/*
++ * [0] xenvif_rx_ring_slots_available
++ * [0] xenvif_rx_queue_slots_available
++ * [0] xenvif_have_rx_work
++ * [0] xenvif_interrupt
++ * [0] handle_irq_event_percpu
++ * [0] handle_irq_event
++ * [0] handle_edge_irq
++ * [0] generic_handle_irq
++ * [0] handle_irq_for_port
++ * [0] __evtchn_fifo_handle_events
++ * [0] evtchn_fifo_handle_events
++ * [0] __xen_evtchn_do_upcall
++ * [0] xen_evtchn_do_upcall
++ * [0] xen_do_hypervisor_callback
++ *
++ * xen/netback: avoid race in xenvif_rx_ring_slots_available()
++ *
++ * Since commit 23025393dbeb3b8b3 ("xen/netback: use lateeoi irq binding")
++ * xenvif_rx_ring_slots_available() is no longer called only from the rx
++ * queue kernel thread, so it needs to access the rx queue with the
++ * associated queue held.
++ *
++ * Reported-by: Igor Druzhinin <igor.druzhinin@citrix.com>
++ * Fixes: 23025393dbeb3b8b3 ("xen/netback: use lateeoi irq binding")
++ * Signed-off-by: Juergen Gross <jgross@suse.com>
++ * Acked-by: Wei Liu <wl@xen.org>
++ * Link: https://lore.kernel.org/r/20210202070938.7863-1-jgross@suse.com
++ * Signed-off-by: Jakub Kicinski <kuba@kernel.org>
++ *
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|74| <<xenvif_rx_queue_slots_available>> return xenvif_rx_ring_slots_available(queue, skb);
++ *   - drivers/net/xen-netback/rx.c|440| <<xenvif_rx_one_skb>> if (!xenvif_rx_ring_slots_available(queue, skb)) {
++ *
++ * 即将用&queue->rx_queue.lock保护queue->rx_queue
++ */
+ static bool xenvif_rx_ring_slots_available(struct xenvif_queue *queue,
+ 					   struct sk_buff *skb)
+ {
+@@ -63,17 +99,60 @@ static bool xenvif_rx_ring_slots_available(struct xenvif_queue *queue,
+ 	return false;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|488| <<xenvif_rx_action>> while (xenvif_rx_queue_slots_available(queue) &&
++ *   - drivers/net/xen-netback/rx.c|533| <<xenvif_have_rx_work>> return xenvif_rx_queue_slots_available(queue) ||
++ *
++ * 即将用&queue->rx_queue.lock保护queue->rx_queue
++ */
+ static bool xenvif_rx_queue_slots_available(struct xenvif_queue *queue)
+ {
+ 	struct sk_buff *skb;
+ 
++	/*
++	 * 在以下使用xenvif_queue->rx_queue:
++	 *   - drivers/net/xen-netback/interface.c|554| <<xenvif_init_queue>> skb_queue_head_init(&queue->rx_queue);
++	 *   - drivers/net/xen-netback/rx.c|89| <<xenvif_rx_queue_slots_available>> skb = skb_peek(&queue->rx_queue);
++	 *   - drivers/net/xen-netback/rx.c|100| <<xenvif_rx_queue_tail>> spin_lock_irqsave(&queue->rx_queue.lock, flags);
++	 *   - drivers/net/xen-netback/rx.c|102| <<xenvif_rx_queue_tail>> __skb_queue_tail(&queue->rx_queue, skb);
++	 *   - drivers/net/xen-netback/rx.c|111| <<xenvif_rx_queue_tail>> spin_unlock_irqrestore(&queue->rx_queue.lock, flags);
++	 *   - drivers/net/xen-netback/rx.c|119| <<xenvif_rx_dequeue>> spin_lock_irqsave(&queue->rx_queue.lock, flags);
++	 *   - drivers/net/xen-netback/rx.c|121| <<xenvif_rx_dequeue>> skb = __skb_dequeue(&queue->rx_queue);
++	 *   - drivers/net/xen-netback/rx.c|132| <<xenvif_rx_dequeue>> spin_unlock_irqrestore(&queue->rx_queue.lock, flags);
++	 *   - drivers/net/xen-netback/rx.c|150| <<xenvif_rx_queue_drop_expired>> skb = skb_peek(&queue->rx_queue);
++	 *   - drivers/net/xen-netback/rx.c|546| <<xenvif_rx_queue_timeout>> skb = skb_peek(&queue->rx_queue);
++	 *   - drivers/net/xen-netback/rx.c|650| <<xenvif_kthread_guest_rx>> if (!skb_queue_empty(&queue->rx_queue))
++	 *   - drivers/net/xen-netback/xenbus.c|123| <<xenvif_read_io_ring>> skb_queue_len(&queue->rx_queue),
++	 *
++	 * skb_peek - peek at the head of an &sk_buff_head
++	 *      @list_: list to peek at
++	 *
++	 *      Peek an &sk_buff. Unlike most other operations you _MUST_
++	 *      be careful with this one. A peek leaves the buffer on the
++	 *      list and someone else may run off with it. You must hold
++	 *      the appropriate locks or have a private queue to do this.
++	 *
++	 *      Returns %NULL for an empty list or a pointer to the head element.
++	 *      The reference count is not incremented and the reference is therefore
++	 *      volatile. Use with caution.
++	 */
+ 	skb = skb_peek(&queue->rx_queue);
+ 	if (!skb)
+ 		return false;
+ 
++	/*
++	 * 可以直接展开???
++	 */
+ 	return xenvif_rx_ring_slots_available(queue, skb);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/interface.c|255| <<xenvif_start_xmit>> xenvif_rx_queue_tail(queue, skb);
++ *
++ * 用&queue->rx_queue.lock保护queue->rx_queue
++ */
+ void xenvif_rx_queue_tail(struct xenvif_queue *queue, struct sk_buff *skb)
+ {
+ 	unsigned long flags;
+@@ -92,6 +171,14 @@ void xenvif_rx_queue_tail(struct xenvif_queue *queue, struct sk_buff *skb)
+ 	spin_unlock_irqrestore(&queue->rx_queue.lock, flags);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|146| <<xenvif_rx_queue_purge>> while ((skb = xenvif_rx_dequeue(queue)) != NULL)
++ *   - drivers/net/xen-netback/rx.c|160| <<xenvif_rx_queue_drop_expired>> xenvif_rx_dequeue(queue);
++ *   - drivers/net/xen-netback/rx.c|495| <<xenvif_rx_action>> skb = xenvif_rx_dequeue(queue);
++ *
++ * 用&queue->rx_queue.lock保护queue->rx_queue
++ */
+ static struct sk_buff *xenvif_rx_dequeue(struct xenvif_queue *queue)
+ {
+ 	struct sk_buff *skb;
+@@ -115,6 +202,10 @@ static struct sk_buff *xenvif_rx_dequeue(struct xenvif_queue *queue)
+ 	return skb;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|686| <<xenvif_kthread_guest_rx>> xenvif_rx_queue_purge(queue);
++ */
+ static void xenvif_rx_queue_purge(struct xenvif_queue *queue)
+ {
+ 	struct sk_buff *skb;
+@@ -123,6 +214,12 @@ static void xenvif_rx_queue_purge(struct xenvif_queue *queue)
+ 		kfree_skb(skb);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|680| <<xenvif_kthread_guest_rx>> xenvif_rx_queue_drop_expired(queue);
++ *
++ * 没有用&queue->rx_queue.lock保护queue->rx_queue
++ */
+ static void xenvif_rx_queue_drop_expired(struct xenvif_queue *queue)
+ {
+ 	struct sk_buff *skb;
+@@ -138,6 +235,12 @@ static void xenvif_rx_queue_drop_expired(struct xenvif_queue *queue)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|249| <<xenvif_rx_copy_add>> xenvif_rx_copy_flush(queue);
++ *   - drivers/net/xen-netback/rx.c|508| <<xenvif_rx_one_skb>> xenvif_rx_copy_flush(queue);
++ *   - drivers/net/xen-netback/rx.c|550| <<xenvif_rx_action>> xenvif_rx_copy_flush(queue);
++ */
+ static void xenvif_rx_copy_flush(struct xenvif_queue *queue)
+ {
+ 	unsigned int i;
+@@ -174,6 +277,10 @@ static void xenvif_rx_copy_flush(struct xenvif_queue *queue)
+ 		__skb_queue_purge(queue->rx_copy.completed);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|405| <<xenvif_rx_data_slot>> xenvif_rx_copy_add(queue, grant, req, offset, data, len);
++ */
+ static void xenvif_rx_copy_add(struct xenvif_queue *queue,
+ 			       struct xenvif_grant *grant,
+ 			       struct xen_netif_rx_request *req,
+@@ -217,6 +324,10 @@ static void xenvif_rx_copy_add(struct xenvif_queue *queue,
+ 	queue->rx_copy.num++;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|316| <<xenvif_rx_next_skb>> gso_type = xenvif_gso_type(skb);
++ */
+ static unsigned int xenvif_gso_type(struct sk_buff *skb)
+ {
+ 	if (skb_is_gso(skb)) {
+@@ -239,6 +350,10 @@ struct xenvif_pkt_state {
+ 	unsigned int slot;
+ };
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|467| <<xenvif_rx_skb>> xenvif_rx_next_skb(queue, &pkt, skb);
++ */
+ static void xenvif_rx_next_skb(struct xenvif_queue *queue,
+ 			       struct xenvif_pkt_state *pkt,
+ 			       struct sk_buff *skb)
+@@ -273,6 +388,10 @@ static void xenvif_rx_next_skb(struct xenvif_queue *queue,
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|383| <<xenvif_rx_next_chunk>> xenvif_rx_next_frag(pkt);
++ */
+ static void xenvif_rx_next_frag(struct xenvif_pkt_state *pkt)
+ {
+ 	struct sk_buff *frag_iter = pkt->frag_iter;
+@@ -291,6 +410,10 @@ static void xenvif_rx_next_frag(struct xenvif_pkt_state *pkt)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|404| <<xenvif_rx_data_slot>> xenvif_rx_next_chunk(queue, pkt, offset, &data, &len);
++ */
+ static void xenvif_rx_next_chunk(struct xenvif_queue *queue,
+ 				 struct xenvif_pkt_state *pkt,
+ 				 unsigned int offset, void **data,
+@@ -329,6 +452,10 @@ static void xenvif_rx_next_chunk(struct xenvif_queue *queue,
+ 	*len = chunk_len;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|482| <<xenvif_rx_skb>> xenvif_rx_data_slot(queue, &pkt, req, rsp);
++ */
+ static void xenvif_rx_data_slot(struct xenvif_queue *queue,
+ 				struct xenvif_pkt_state *pkt,
+ 				struct xen_netif_rx_request *req,
+@@ -379,6 +506,10 @@ static void xenvif_rx_data_slot(struct xenvif_queue *queue,
+ 	rsp->status = (s16)offset;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|480| <<xenvif_rx_skb>> xenvif_rx_extra_slot(queue, &pkt, req, rsp);
++ */
+ static void xenvif_rx_extra_slot(struct xenvif_queue *queue,
+ 				 struct xenvif_pkt_state *pkt,
+ 				 struct xen_netif_rx_request *req,
+@@ -403,6 +534,11 @@ static void xenvif_rx_extra_slot(struct xenvif_queue *queue,
+ 	BUG();
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|507| <<xenvif_rx_one_skb>> xenvif_rx_skb(queue, skb);
++ *   - drivers/net/xen-netback/rx.c|544| <<xenvif_rx_action>> xenvif_rx_skb(queue, skb);
++ */
+ void xenvif_rx_skb(struct xenvif_queue *queue, struct sk_buff *skb)
+ {
+ 	struct xenvif_pkt_state pkt;
+@@ -432,10 +568,29 @@ void xenvif_rx_skb(struct xenvif_queue *queue, struct sk_buff *skb)
+ 	queue->rx.rsp_prod_pvt = queue->rx.req_cons;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/interface.c|252| <<xenvif_start_xmit>> } else if (xenvif_rx_one_skb(queue, skb) < 0) {
++ */
+ int xenvif_rx_one_skb(struct xenvif_queue *queue, struct sk_buff *skb)
+ {
+ 	unsigned long flags;
+ 
++	/*
++	 * 在以下使用xenvif_queue->rx_lock:
++	 *   - drivers/net/xen-netback/interface.c|161| <<xenvif_rx_interrupt>> spin_lock(&queue->rx_lock);
++	 *   - drivers/net/xen-netback/interface.c|164| <<xenvif_rx_interrupt>> spin_unlock(&queue->rx_lock);
++	 *   - drivers/net/xen-netback/interface.c|564| <<xenvif_init_queue>> spin_lock_init(&queue->rx_lock);
++	 *   - drivers/net/xen-netback/rx.c|462| <<xenvif_rx_one_skb>> spin_lock_irqsave(&queue->rx_lock, flags);
++	 *   - drivers/net/xen-netback/rx.c|465| <<xenvif_rx_one_skb>> spin_unlock_irqrestore(&queue->rx_lock, flags);
++	 *   - drivers/net/xen-netback/rx.c|471| <<xenvif_rx_one_skb>> spin_unlock_irqrestore(&queue->rx_lock, flags);
++	 *   - drivers/net/xen-netback/rx.c|484| <<xenvif_rx_action>> spin_lock_irq(&queue->rx_lock);
++	 *   - drivers/net/xen-netback/rx.c|499| <<xenvif_rx_action>> spin_unlock_irq(&queue->rx_lock);
++	 *
++	 * rx_lock is used to eliminate potential RX response race between
++	 * the guestrx thread and ndo_start_xmit. Also, used to enforce ordering
++	 * of netif_stop_queue()/netif_wake_queue() when the RX io_ring is full.
++	 */
+ 	spin_lock_irqsave(&queue->rx_lock, flags);
+ 	if (!xenvif_rx_ring_slots_available(queue, skb)) {
+ 		netif_stop_subqueue(queue->vif->dev, queue->id);
+@@ -452,12 +607,27 @@ int xenvif_rx_one_skb(struct xenvif_queue *queue, struct sk_buff *skb)
+ 
+ #define RX_BATCH_SIZE 64
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|662| <<xenvif_kthread_guest_rx>> xenvif_rx_action(queue);
++ */
+ void xenvif_rx_action(struct xenvif_queue *queue)
+ {
+ 	struct sk_buff_head completed_skbs;
+ 	unsigned int work_done = 0;
+ 	struct sk_buff *skb;
+ 
++	/*
++	 * 在以下使用xenvif_queue->rx_lock:
++	 *   - drivers/net/xen-netback/interface.c|161| <<xenvif_rx_interrupt>> spin_lock(&queue->rx_lock);
++	 *   - drivers/net/xen-netback/interface.c|164| <<xenvif_rx_interrupt>> spin_unlock(&queue->rx_lock);
++	 *   - drivers/net/xen-netback/interface.c|564| <<xenvif_init_queue>> spin_lock_init(&queue->rx_lock);
++	 *   - drivers/net/xen-netback/rx.c|462| <<xenvif_rx_one_skb>> spin_lock_irqsave(&queue->rx_lock, flags);
++	 *   - drivers/net/xen-netback/rx.c|465| <<xenvif_rx_one_skb>> spin_unlock_irqrestore(&queue->rx_lock, flags);
++	 *   - drivers/net/xen-netback/rx.c|471| <<xenvif_rx_one_skb>> spin_unlock_irqrestore(&queue->rx_lock, flags);
++	 *   - drivers/net/xen-netback/rx.c|484| <<xenvif_rx_action>> spin_lock_irq(&queue->rx_lock);
++	 *   - drivers/net/xen-netback/rx.c|499| <<xenvif_rx_action>> spin_unlock_irq(&queue->rx_lock);
++	 */
+ 	spin_lock_irq(&queue->rx_lock);
+ 	__skb_queue_head_init(&completed_skbs);
+ 	queue->rx_copy.completed = &completed_skbs;
+@@ -473,9 +643,26 @@ void xenvif_rx_action(struct xenvif_queue *queue)
+ 	/* Flush any pending copies and complete all skbs. */
+ 	xenvif_rx_copy_flush(queue);
+ 	queue->rx_copy.completed = NULL;
++	/*
++	 * 在以下使用xenvif_queue->rx_lock:
++	 *   - drivers/net/xen-netback/interface.c|161| <<xenvif_rx_interrupt>> spin_lock(&queue->rx_lock);
++	 *   - drivers/net/xen-netback/interface.c|164| <<xenvif_rx_interrupt>> spin_unlock(&queue->rx_lock);
++	 *   - drivers/net/xen-netback/interface.c|564| <<xenvif_init_queue>> spin_lock_init(&queue->rx_lock);
++	 *   - drivers/net/xen-netback/rx.c|462| <<xenvif_rx_one_skb>> spin_lock_irqsave(&queue->rx_lock, flags);
++	 *   - drivers/net/xen-netback/rx.c|465| <<xenvif_rx_one_skb>> spin_unlock_irqrestore(&queue->rx_lock, flags);
++	 *   - drivers/net/xen-netback/rx.c|471| <<xenvif_rx_one_skb>> spin_unlock_irqrestore(&queue->rx_lock, flags);
++	 *   - drivers/net/xen-netback/rx.c|484| <<xenvif_rx_action>> spin_lock_irq(&queue->rx_lock);
++	 *   - drivers/net/xen-netback/rx.c|499| <<xenvif_rx_action>> spin_unlock_irq(&queue->rx_lock);
++	 */
+ 	spin_unlock_irq(&queue->rx_lock);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/interface.c|144| <<xenvif_handle_rx_interrupt>> rc = xenvif_have_rx_work(queue, false);
++ *   - drivers/net/xen-netback/rx.c|539| <<xenvif_wait_for_rx_work>> if (xenvif_have_rx_work(queue, true))
++ *   - drivers/net/xen-netback/rx.c|546| <<xenvif_wait_for_rx_work>> if (xenvif_have_rx_work(queue, true))
++ */
+ static bool xenvif_rx_queue_stalled(struct xenvif_queue *queue)
+ {
+ 	RING_IDX prod, cons;
+@@ -489,6 +676,11 @@ static bool xenvif_rx_queue_stalled(struct xenvif_queue *queue)
+ 			   queue->last_rx_time + queue->vif->stall_timeout);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|600| <<xenvif_have_rx_work>> xenvif_rx_queue_ready(queue))) ||
++ *   - drivers/net/xen-netback/rx.c|736| <<xenvif_kthread_guest_rx>> else if (xenvif_rx_queue_ready(queue))
++ */
+ static bool xenvif_rx_queue_ready(struct xenvif_queue *queue)
+ {
+ 	RING_IDX prod, cons;
+@@ -499,6 +691,17 @@ static bool xenvif_rx_queue_ready(struct xenvif_queue *queue)
+ 	return queue->stalled && prod - cons >= 1;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/interface.c|144| <<xenvif_handle_rx_interrupt>> rc = xenvif_have_rx_work(queue, false);
++ *   - drivers/net/xen-netback/rx.c|572| <<xenvif_wait_for_rx_work>> if (xenvif_have_rx_work(queue, true))
++ *   - drivers/net/xen-netback/rx.c|579| <<xenvif_wait_for_rx_work>> if (xenvif_have_rx_work(queue, true))
++ *
++ * xenvif_kthread_guest_rx()
++ * -> xenvif_wait_for_rx_work()
++ *    -> xenvif_have_rx_work()
++ *    -> xenvif_have_rx_work()
++ */
+ bool xenvif_have_rx_work(struct xenvif_queue *queue, bool test_kthread)
+ {
+ 	return xenvif_rx_queue_slots_available(queue) ||
+@@ -509,6 +712,16 @@ bool xenvif_have_rx_work(struct xenvif_queue *queue, bool test_kthread)
+ 		queue->vif->disabled;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|597| <<xenvif_wait_for_rx_work>> ret = schedule_timeout(xenvif_rx_queue_timeout(queue));
++ *
++ * xenvif_kthread_guest_rx()
++ * -> xenvif_wait_for_rx_work()
++ *    -> xenvif_rx_queue_timeout()
++ *
++ * 没有用&queue->rx_queue.lock保护queue->rx_queue
++ */
+ static long xenvif_rx_queue_timeout(struct xenvif_queue *queue)
+ {
+ 	struct sk_buff *skb;
+@@ -532,6 +745,10 @@ static long xenvif_rx_queue_timeout(struct xenvif_queue *queue)
+  * This cannot be done with wait_event_timeout() because it only
+  * calculates the timeout once.
+  */
++/*
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|629| <<xenvif_kthread_guest_rx>> xenvif_wait_for_rx_work(queue);
++ */
+ static void xenvif_wait_for_rx_work(struct xenvif_queue *queue)
+ {
+ 	DEFINE_WAIT(wait);
+@@ -557,6 +774,10 @@ static void xenvif_wait_for_rx_work(struct xenvif_queue *queue)
+ 	finish_wait(&queue->wq, &wait);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|735| <<xenvif_kthread_guest_rx>> xenvif_queue_carrier_off(queue);
++ */
+ static void xenvif_queue_carrier_off(struct xenvif_queue *queue)
+ {
+ 	struct xenvif *vif = queue->vif;
+@@ -572,6 +793,11 @@ static void xenvif_queue_carrier_off(struct xenvif_queue *queue)
+ 	spin_unlock(&vif->lock);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|706| <<xenvif_kthread_guest_rx>> xenvif_queue_carrier_on(queue);
++ *   - drivers/net/xen-netback/rx.c|737| <<xenvif_kthread_guest_rx>> xenvif_queue_carrier_on(queue);
++ */
+ static void xenvif_queue_carrier_on(struct xenvif_queue *queue)
+ {
+ 	struct xenvif *vif = queue->vif;
+@@ -588,6 +814,10 @@ static void xenvif_queue_carrier_on(struct xenvif_queue *queue)
+ 	spin_unlock(&vif->lock);
+ }
+ 
++/*
++ * 在以下使用xenvif_kthread_guest_rx():
++ *   - drivers/net/xen-netback/interface.c|664| <<xenvif_connect>> task = kthread_create(xenvif_kthread_guest_rx,
++ */
+ int xenvif_kthread_guest_rx(void *data)
+ {
+ 	struct xenvif_queue *queue = data;
+@@ -614,6 +844,9 @@ int xenvif_kthread_guest_rx(void *data)
+ 			break;
+ 		}
+ 
++		/*
++		 * 没有用&queue->rx_queue.lock保护queue->rx_queue
++		 */
+ 		if (!skb_queue_empty(&queue->rx_queue))
+ 			xenvif_rx_action(queue);
+ 
+-- 
+2.17.1
+
