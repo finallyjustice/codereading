@@ -1,25 +1,282 @@
-From 86846f21cbb7da8e7a8afd49b66c2bb203fba308 Mon Sep 17 00:00:00 2001
+From a185bf6d582ff4e7442a360eaf72d28bfda4416c Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Mon, 1 Feb 2021 09:44:39 -0800
+Date: Fri, 26 Feb 2021 10:15:51 -0800
 Subject: [PATCH 1/1] linux uek5 v4.14.35-2025.401.4
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
- drivers/net/tap.c            |  11 +
- drivers/net/virtio_net.c     | 600 +++++++++++++++++++++++++++++++++++
- drivers/virtio/virtio_ring.c |  37 +++
- include/linux/gfp.h          |  22 ++
- include/linux/mm_types.h     |  11 +
- include/linux/page_ref.h     |   3 +
- include/linux/skbuff.h       |  87 +++++
- include/linux/virtio_net.h   |  16 +
- include/net/sock.h           |  18 ++
- mm/page_alloc.c              |  78 +++++
- net/core/dev.c               |  44 +++
- net/core/skbuff.c            |  66 ++++
- net/core/sock.c              |  60 ++++
- 13 files changed, 1053 insertions(+)
+ arch/x86/include/asm/kvm_host.h |  23 ++
+ arch/x86/kvm/mmu.c              | 108 ++++++
+ drivers/net/tap.c               |  11 +
+ drivers/net/virtio_net.c        | 600 ++++++++++++++++++++++++++++++++
+ drivers/virtio/virtio_ring.c    |  37 ++
+ include/linux/gfp.h             |  22 ++
+ include/linux/mm_types.h        |  11 +
+ include/linux/page_ref.h        |   3 +
+ include/linux/skbuff.h          |  87 +++++
+ include/linux/virtio_net.h      |  16 +
+ include/net/sock.h              |  18 +
+ mm/page_alloc.c                 |  78 +++++
+ net/core/dev.c                  |  44 +++
+ net/core/skbuff.c               |  66 ++++
+ net/core/sock.c                 |  60 ++++
+ 15 files changed, 1184 insertions(+)
 
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index bdb517fbc635..d62fcf13efad 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -311,6 +311,12 @@ struct kvm_rmap_head {
+ struct kvm_mmu_page {
+ 	struct list_head link;
+ 	struct hlist_node hash_link;
++	/*
++	 * 在以下使用kvm_mmu_page->lpage_disallowed_link:
++	 *   - arch/x86/kvm/mmu.c|1233| <<account_huge_nx_page>> list_add(&sp->lpage_disallowed_link,
++	 *   - arch/x86/kvm/mmu.c|1259| <<unaccount_huge_nx_page>> list_del(&sp->lpage_disallowed_link);
++	 *   - arch/x86/kvm/mmu.c|6427| <<kvm_recover_nx_lpages>> lpage_disallowed_link);
++	 */
+ 	struct list_head lpage_disallowed_link;
+ 
+ 	bool unsync;
+@@ -851,7 +857,24 @@ struct kvm_arch {
+ 	/*
+ 	 * Hash table of struct kvm_mmu_page.
+ 	 */
++	/*
++	 * 在以下使用kvm_arch->active_mmu_pages:
++	 *    - arch/x86/kvm/mmu.c|2153| <<kvm_mmu_alloc_page>> list_add(&sp->link, &vcpu->kvm->arch.active_mmu_pages);
++	 *    - arch/x86/kvm/mmu.c|2800| <<kvm_mmu_prepare_zap_page>> list_move(&sp->link, &kvm->arch.active_mmu_pages);
++	 *    - arch/x86/kvm/mmu.c|2847| <<prepare_zap_oldest_mmu_page>> if (list_empty(&kvm->arch.active_mmu_pages))
++	 *    - arch/x86/kvm/mmu.c|2850| <<prepare_zap_oldest_mmu_page>> sp = list_last_entry(&kvm->arch.active_mmu_pages,
++	 *    - arch/x86/kvm/mmu.c|5981| <<kvm_zap_obsolete_pages>> &kvm->arch.active_mmu_pages, link) {
++	 *    - arch/x86/kvm/mmu_audit.c|92| <<walk_all_active_sps>> list_for_each_entry(sp, &kvm->arch.active_mmu_pages, link)
++	 *    - arch/x86/kvm/x86.c|9187| <<kvm_arch_init_vm>> INIT_LIST_HEAD(&kvm->arch.active_mmu_pages);
++	 */
+ 	struct list_head active_mmu_pages;
++	/*
++	 * 在以下使用kvm_arch->lpage_disallowed_mmu_pages:
++	 *   - arch/x86/kvm/mmu.c|1200| <<account_huge_nx_page>> list_add(&sp->lpage_disallowed_link, &kvm->arch.lpage_disallowed_mmu_pages);
++	 *   - arch/x86/kvm/mmu.c|6380| <<kvm_recover_nx_lpages>> while (to_zap && !list_empty(&kvm->arch.lpage_disallowed_mmu_pages)) {
++	 *   - arch/x86/kvm/mmu.c|6386| <<kvm_recover_nx_lpages>> sp = list_first_entry(&kvm->arch.lpage_disallowed_mmu_pages,
++	 *   - arch/x86/kvm/x86.c|9188| <<kvm_arch_init_vm>> INIT_LIST_HEAD(&kvm->arch.lpage_disallowed_mmu_pages);
++	 */
+ 	struct list_head lpage_disallowed_mmu_pages;
+ 	struct list_head zapped_obsolete_pages;
+ 	struct kvm_page_track_notifier_node mmu_sp_tracker;
+diff --git a/arch/x86/kvm/mmu.c b/arch/x86/kvm/mmu.c
+index fa8cd1ef963f..18b787e68776 100644
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@ -53,7 +53,32 @@
+ 
+ extern bool itlb_multihit_kvm_mitigation;
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|72| <<global>> module_param_cb(nx_huge_pages, &nx_huge_pages_ops, &nx_huge_pages, 0644);
++ *   - arch/x86/kvm/mmu.c|73| <<global>> __MODULE_PARM_TYPE(nx_huge_pages, "bool");
++ *   - arch/x86/kvm/mmu.c|378| <<is_nx_huge_page_enabled>> return READ_ONCE(nx_huge_pages);
++ *   - arch/x86/kvm/mmu.c|6175| <<__set_nx_huge_pages>> nx_huge_pages = itlb_multihit_kvm_mitigation = val;
++ *   - arch/x86/kvm/mmu.c|6183| <<set_nx_huge_pages>> bool old_val = nx_huge_pages;
++ *   - arch/x86/kvm/mmu.c|6252| <<kvm_mmu_module_init>> if (nx_huge_pages == -1)
++ *   - arch/x86/kvm/mmu.c|6348| <<set_nx_huge_pages_recovery_ratio>> if (READ_ONCE(nx_huge_pages) &&
++ *   - arch/x86/kvm/mmu.c|6406| <<get_nx_lpage_recovery_timeout>> return READ_ONCE(nx_huge_pages) && READ_ONCE(nx_huge_pages_recovery_ratio)
++ *
++ * 大部分时间是1
++ * crash> nx_huge_pages
++ * nx_huge_pages = $1 = 1
++ */
+ static int __read_mostly nx_huge_pages = -1;
++/*
++ * 在以下使用nx_huge_pages_recovery_ratio:
++ *   - arch/x86/kvm/mmu.c|75| <<global>> module_param_cb(nx_huge_pages_recovery_ratio, &nx_huge_pages_recovery_ratio_ops,
++ *   - arch/x86/kvm/mmu.c|76| <<global>> &nx_huge_pages_recovery_ratio, 0644);
++ *   - arch/x86/kvm/mmu.c|77| <<global>> __MODULE_PARM_TYPE(nx_huge_pages_recovery_ratio, "uint");
++ *   - arch/x86/kvm/mmu.c|6343| <<set_nx_huge_pages_recovery_ratio>> old_val = nx_huge_pages_recovery_ratio;
++ *   - arch/x86/kvm/mmu.c|6349| <<set_nx_huge_pages_recovery_ratio>> !old_val && nx_huge_pages_recovery_ratio) {
++ *   - arch/x86/kvm/mmu.c|6378| <<kvm_recover_nx_lpages>> ratio = READ_ONCE(nx_huge_pages_recovery_ratio);
++ *   - arch/x86/kvm/mmu.c|6406| <<get_nx_lpage_recovery_timeout>> return READ_ONCE(nx_huge_pages) && READ_ONCE(nx_huge_pages_recovery_ratio)
++ */
+ static uint __read_mostly nx_huge_pages_recovery_ratio = 60;
+ 
+ static int set_nx_huge_pages(const char *val, const struct kernel_param *kp);
+@@ -373,6 +398,14 @@ static inline bool spte_ad_need_write_protect(u64 spte)
+ 	return (spte & SPTE_SPECIAL_MASK) != SPTE_AD_ENABLED_MASK;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|3024| <<set_spte>> is_nx_huge_page_enabled()) {
++ *   - arch/x86/kvm/mmu.c|3255| <<disallowed_hugepage_adjust>> is_nx_huge_page_enabled() &&
++ *   - arch/x86/kvm/mmu.c|3609| <<nonpaging_map>> is_nx_huge_page_enabled();
++ *   - arch/x86/kvm/mmu.c|4244| <<tdp_page_fault>> is_nx_huge_page_enabled();
++ *   - arch/x86/kvm/paging_tmpl.h|757| <<FNAME(page_fault)>> is_nx_huge_page_enabled();
++ */
+ static bool is_nx_huge_page_enabled(void)
+ {
+ 	return READ_ONCE(nx_huge_pages);
+@@ -1190,6 +1223,11 @@ static void account_shadowed(struct kvm *kvm, struct kvm_mmu_page *sp)
+ 	kvm_mmu_gfn_disallow_lpage(slot, gfn);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|3303| <<__direct_map>> account_huge_nx_page(vcpu->kvm, sp);
++ *   - arch/x86/kvm/paging_tmpl.h|677| <<FNAME(fetch)>> account_huge_nx_page(vcpu->kvm, sp);
++ */
+ static void account_huge_nx_page(struct kvm *kvm, struct kvm_mmu_page *sp)
+ {
+ 	if (sp->lpage_disallowed)
+@@ -1327,6 +1365,11 @@ static int mapping_level(struct kvm_vcpu *vcpu, gfn_t large_gfn,
+ /*
+  * Returns the number of pointers in the rmap chain, not counting the new one.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|1503| <<rmap_add>> return pte_list_add(vcpu, spte, rmap_head);
++ *   - arch/x86/kvm/mmu.c|2160| <<mmu_page_add_parent_pte>> pte_list_add(vcpu, parent_pte, &sp->parent_ptes);
++ */
+ static int pte_list_add(struct kvm_vcpu *vcpu, u64 *spte,
+ 			struct kvm_rmap_head *rmap_head)
+ {
+@@ -2497,6 +2540,16 @@ static void clear_sp_write_flooding_count(u64 *spte)
+ 	__clear_sp_write_flooding_count(sp);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|3288| <<__direct_map>> sp = kvm_mmu_get_page(vcpu, base_gfn, it.addr,
++ *   - arch/x86/kvm/mmu.c|3732| <<mmu_alloc_direct_roots>> sp = kvm_mmu_get_page(vcpu, 0, 0,
++ *   - arch/x86/kvm/mmu.c|3747| <<mmu_alloc_direct_roots>> sp = kvm_mmu_get_page(vcpu, i << (30 - PAGE_SHIFT),
++ *   - arch/x86/kvm/mmu.c|3789| <<mmu_alloc_shadow_roots>> sp = kvm_mmu_get_page(vcpu, root_gfn, 0,
++ *   - arch/x86/kvm/mmu.c|3826| <<mmu_alloc_shadow_roots>> sp = kvm_mmu_get_page(vcpu, root_gfn, i << 30, PT32_ROOT_LEVEL,
++ *   - arch/x86/kvm/paging_tmpl.h|637| <<FNAME(fetch)>> sp = kvm_mmu_get_page(vcpu, table_gfn, addr, it.level-1,
++ *   - arch/x86/kvm/paging_tmpl.h|673| <<FNAME(fetch)>> sp = kvm_mmu_get_page(vcpu, base_gfn, addr,
++ */
+ static struct kvm_mmu_page *kvm_mmu_get_page(struct kvm_vcpu *vcpu,
+ 					     gfn_t gfn,
+ 					     gva_t gaddr,
+@@ -3258,6 +3311,11 @@ static void disallowed_hugepage_adjust(struct kvm_shadow_walk_iterator it,
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|3646| <<nonpaging_map>> r = __direct_map(vcpu, v, write, map_writable, level, pfn, prefault, false);
++ *   - arch/x86/kvm/mmu.c|4286| <<tdp_page_fault>> r = __direct_map(vcpu, gpa, write, map_writable, level, pfn, prefault, lpage_disallowed);
++ */
+ static int __direct_map(struct kvm_vcpu *vcpu, gpa_t gpa, int write,
+ 			int map_writable, int level, kvm_pfn_t pfn,
+ 			bool prefault, bool lpage_disallowed)
+@@ -4230,6 +4288,9 @@ static int tdp_page_fault(struct kvm_vcpu *vcpu, gva_t gpa, u32 error_code,
+ 	unsigned long mmu_seq;
+ 	int write = error_code & PFERR_WRITE_MASK;
+ 	bool map_writable;
++	/*
++	 * is_nx_huge_page_enabled()大部分时间是true
++	 */
+ 	bool lpage_disallowed = (error_code & PFERR_FETCH_MASK) &&
+ 				is_nx_huge_page_enabled();
+ 
+@@ -5119,6 +5180,10 @@ static void init_kvm_softmmu(struct kvm_vcpu *vcpu)
+ 	context->inject_page_fault = kvm_inject_page_fault;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.c|5183| <<kvm_init_mmu>> init_kvm_nested_mmu(vcpu);
++ */
+ static void init_kvm_nested_mmu(struct kvm_vcpu *vcpu)
+ {
+ 	union kvm_mmu_role new_role = kvm_calc_mmu_role_common(vcpu, false);
+@@ -6161,6 +6226,9 @@ static void __set_nx_huge_pages(bool val)
+ 	nx_huge_pages = itlb_multihit_kvm_mitigation = val;
+ }
+ 
++/*
++ * struct kernel_param_ops nx_huge_pages_ops.set = set_nx_huge_pages()
++ */
+ static int set_nx_huge_pages(const char *val, const struct kernel_param *kp)
+ {
+ 	bool old_val = nx_huge_pages;
+@@ -6315,6 +6383,9 @@ void kvm_mmu_module_exit(void)
+ 	mmu_audit_disable();
+ }
+ 
++/*
++ * struct kernel_param_ops nx_huge_pages_recovery_ratio_ops.set = set_nx_huge_pages_recovery_ratio()
++ */
+ static int set_nx_huge_pages_recovery_ratio(const char *val, const struct kernel_param *kp)
+ {
+ 	unsigned int old_val;
+@@ -6340,6 +6411,10 @@ static int set_nx_huge_pages_recovery_ratio(const char *val, const struct kernel
+ 	return err;
+ }
+ 
++/*
++ * 在以下使用kvm_recover_nx_lpages():
++ *   - arch/x86/kvm/mmu.c|6422| <<kvm_nx_lpage_recovery_worker>> kvm_recover_nx_lpages(kvm);
++ */
+ static void kvm_recover_nx_lpages(struct kvm *kvm)
+ {
+ 	int rcu_idx;
+@@ -6384,6 +6459,10 @@ static long get_nx_lpage_recovery_timeout(u64 start_time)
+ 		: MAX_SCHEDULE_TIMEOUT;
+ }
+ 
++/*
++ * 在以下使用kvm_nx_lpage_recovery_worker():
++ *   - arch/x86/kvm/mmu.c|6430| <<kvm_mmu_post_init_vm>> err = kvm_vm_create_worker_thread(kvm, kvm_nx_lpage_recovery_worker, 0,
++ */
+ static int kvm_nx_lpage_recovery_worker(struct kvm *kvm, uintptr_t data)
+ {
+ 	u64 start_time;
+@@ -6409,6 +6488,10 @@ static int kvm_nx_lpage_recovery_worker(struct kvm *kvm, uintptr_t data)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|9223| <<kvm_arch_post_init_vm>> return kvm_mmu_post_init_vm(kvm);
++ */
+ int kvm_mmu_post_init_vm(struct kvm *kvm)
+ {
+ 	int err;
+@@ -6422,8 +6505,33 @@ int kvm_mmu_post_init_vm(struct kvm *kvm)
+ 	return err;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|9329| <<kvm_arch_pre_destroy_vm>> kvm_mmu_pre_destroy_vm(kvm);
++ */
+ void kvm_mmu_pre_destroy_vm(struct kvm *kvm)
+ {
+ 	if (kvm->arch.nx_lpage_recovery_thread)
+ 		kthread_stop(kvm->arch.nx_lpage_recovery_thread);
+ }
++
++/*
++ * commit 2ff5f8b23e9a4438c3883b6bb88ad9d51aa6061b
++ * Author: Junaid Shahid <junaids@google.com>
++ * Date:   Wed Oct 30 19:06:14 2019 -0400
++ *
++ * kvm: x86: mmu: Recovery of shattered NX large pages
++ *
++ * The page table pages corresponding to broken down large pages are
++ * zapped in FIFO order, so that the large page can potentially
++ * be recovered, if it is no longer being used for execution.  This removes
++ * the performance penalty for walking deeper EPT page tables.
++ *
++ * By default, one large page will last about one hour once the guest
++ * reaches a steady state.
++ *
++ * Signed-off-by: Junaid Shahid <junaids@google.com>
++ * Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
++ *
++ * CVE: CVE-2018-12207
++ */
 diff --git a/drivers/net/tap.c b/drivers/net/tap.c
 index 773a3fea8f0e..1325058cc2d5 100644
 --- a/drivers/net/tap.c
