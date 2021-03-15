@@ -1,11 +1,12 @@
-From 0605c982e6ad67e7ab21d19b98a2655a368cf7de Mon Sep 17 00:00:00 2001
+From b8e5a31ef46b671ffe77d7b7121b777373818411 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Mon, 22 Feb 2021 13:54:14 -0800
+Date: Mon, 15 Mar 2021 09:19:57 -0700
 Subject: [PATCH 1/1] kvm for 4.18.12
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
  arch/x86/include/asm/kvm_host.h |  490 ++++
+ arch/x86/include/asm/smp.h      |    3 +
  arch/x86/kernel/apic/apic.c     |    7 +
  arch/x86/kernel/kvm.c           |    4 +
  arch/x86/kernel/kvmclock.c      |   77 +
@@ -25,16 +26,17 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  arch/x86/kvm/x86.h              |    5 +
  include/linux/cpumask.h         |   36 +
  include/linux/kvm_host.h        |   80 +
- kernel/cpu.c                    |   11 +
+ kernel/cpu.c                    |   77 +
  kernel/smp.c                    |   11 +
  mm/memory.c                     |    4 +
  mm/mmu_notifier.c               |   11 +
+ mm/slab.c                       |    4 +
  mm/vmscan.c                     |   41 +
  virt/kvm/eventfd.c              |    4 +
  virt/kvm/irqchip.c              |    4 +
  virt/kvm/kvm_main.c             |  411 +++-
  virt/kvm/vfio.c                 |   27 +
- 29 files changed, 6253 insertions(+), 4 deletions(-)
+ 31 files changed, 6326 insertions(+), 4 deletions(-)
 
 diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
 index 0722b774..eddaf82a 100644
@@ -734,6 +736,20 @@ index 0722b774..eddaf82a 100644
  #define HF_GUEST_MASK		(1 << 5) /* VCPU is in guest-mode */
  #define HF_SMM_MASK		(1 << 6)
  #define HF_SMM_INSIDE_NMI_MASK	(1 << 7)
+diff --git a/arch/x86/include/asm/smp.h b/arch/x86/include/asm/smp.h
+index 547c4fe5..0184db6c 100644
+--- a/arch/x86/include/asm/smp.h
++++ b/arch/x86/include/asm/smp.h
+@@ -93,6 +93,9 @@ static inline void smp_cpus_done(unsigned int max_cpus)
+ 
+ static inline int __cpu_up(unsigned int cpu, struct task_struct *tidle)
+ {
++	/*
++	 * native_cpu_up()
++	 */
+ 	return smp_ops.cpu_up(cpu, tidle);
+ }
+ 
 diff --git a/arch/x86/kernel/apic/apic.c b/arch/x86/kernel/apic/apic.c
 index 3b3a2d0a..c0f7ab83 100644
 --- a/arch/x86/kernel/apic/apic.c
@@ -10843,31 +10859,127 @@ index 4ee7bc54..20198245 100644
  		return 1;
  	/*
 diff --git a/kernel/cpu.c b/kernel/cpu.c
-index 517907b0..392f6b95 100644
+index 517907b0..ad19ddc2 100644
 --- a/kernel/cpu.c
 +++ b/kernel/cpu.c
-@@ -518,6 +518,10 @@ static int bringup_wait_for_ap(unsigned int cpu)
+@@ -121,6 +121,10 @@ struct cpuhp_step {
+ 	struct hlist_head	list;
+ 	bool			skip_onerr;
+ 	bool			cant_stop;
++	/*
++	 * 在以下修改cpuhp_step->multi_instance:
++	 *   - kernel/cpu.c|1551| <<cpuhp_store_callbacks>> sp->multi_instance = multi_instance;
++	 */
+ 	bool			multi_instance;
+ };
+ 
+@@ -142,6 +146,20 @@ static struct cpuhp_step *cpuhp_get_step(enum cpuhp_state state)
+  *
+  * Called from cpu hotplug and from the state register machinery.
+  */
++/*
++ * called by:
++ *   - kernel/cpu.c|558| <<undo_cpu_up>> cpuhp_invoke_callback(cpu, st->state, false, NULL, NULL);
++ *   - kernel/cpu.c|570| <<cpuhp_up_callbacks>> ret = cpuhp_invoke_callback(cpu, st->state, true, NULL, NULL);
++ *   - kernel/cpu.c|656| <<cpuhp_thread_fun>> st->result = cpuhp_invoke_callback(cpu, state, bringup, st->node, &st->last);
++ *   - kernel/cpu.c|664| <<cpuhp_thread_fun>> st->result = cpuhp_invoke_callback(cpu, state, bringup, st->node, &st->last);
++ *   - kernel/cpu.c|706| <<cpuhp_invoke_ap_callback>> return cpuhp_invoke_callback(cpu, state, bringup, node, NULL);
++ *   - kernel/cpu.c|833| <<take_cpu_down>> ret = cpuhp_invoke_callback(cpu, st->state, false, NULL, NULL);
++ *   - kernel/cpu.c|924| <<undo_cpu_down>> cpuhp_invoke_callback(cpu, st->state, true, NULL, NULL);
++ *   - kernel/cpu.c|935| <<cpuhp_down_callbacks>> ret = cpuhp_invoke_callback(cpu, st->state, false, NULL, NULL);
++ *   - kernel/cpu.c|1051| <<notify_cpu_starting>> ret = cpuhp_invoke_callback(cpu, st->state, true, NULL, NULL);
++ *   - kernel/cpu.c|1586| <<cpuhp_issue_call>> ret = cpuhp_invoke_callback(cpu, state, bringup, node, NULL);
++ *   - kernel/cpu.c|1588| <<cpuhp_issue_call>> ret = cpuhp_invoke_callback(cpu, state, bringup, node, NULL);
++ */
+ static int cpuhp_invoke_callback(unsigned int cpu, enum cpuhp_state state,
+ 				 bool bringup, struct hlist_node *node,
+ 				 struct hlist_node **lastp)
+@@ -161,8 +179,40 @@ static int cpuhp_invoke_callback(unsigned int cpu, enum cpuhp_state state,
+ 		return -EAGAIN;
+ 	}
+ 
++	/*
++	 * 在以下修改cpuhp_step->multi_instance:
++	 *   - kernel/cpu.c|1551| <<cpuhp_store_callbacks>> sp->multi_instance = multi_instance;
++	 */
+ 	if (!step->multi_instance) {
+ 		WARN_ON_ONCE(lastp && *lastp);
++		/*
++		 * cb的一些例子.
++		 * CPUHP_CREATE_THREADS=smpboot_create_threads()
++		 * CPUHP_PERF_PREPARE=perf_event_init_cpu()
++		 * CPUHP_WORKQUEUE_PREP = workqueue_prepare_cpu()
++		 * CPUHP_HRTIMERS_PREPARE = hrtimers_prepare_cpu()
++		 * CPUHP_SMPCFD_PREPARE = smpcfd_prepare_cpu()
++		 * CPUHP_RELAY_PREPARE = relay_prepare_cpu()
++		 * CPUHP_SLAB_PREPARE = slab_prepare_cpu()
++		 * CPUHP_RCUTREE_PREP = rcutree_prepare_cpu
++		 * CPUHP_TIMERS_PREPARE = timers_prepare_cpu
++		 * CPUHP_BRINGUP_CPU = bringup_cpu
++		 *
++		 * CPUHP_AP_SCHED_STARTING = sched_cpu_starting()
++		 * CPUHP_AP_SMPBOOT_THREADS = smpboot_unpark_threads()
++		 * CPUHP_AP_IRQ_AFFINITY_ONLINE = irq_affinity_online_cpu()
++		 * CPUHP_AP_PERF_ONLINE = perf_event_init_cpu()
++		 * CPUHP_AP_WORKQUEUE_ONLINE = workqueue_online_cpu()
++		 * CPUHP_AP_RCUTREE_ONLINE = rcutree_online_cpu()
++		 * CPUHP_AP_ACTIVE = sched_cpu_activate()
++		 *
++		 * struct cpuhp_step cpuhp_hp_states[CPUHP_BRINGUP_CPU] = {
++		 *     .name                   = "cpu:bringup",
++		 *     .startup.single         = bringup_cpu,
++		 *     .teardown.single        = NULL,
++		 *     .cant_stop              = true,
++		 * },
++		 */
+ 		cb = bringup ? step->startup.single : step->teardown.single;
+ 		if (!cb)
+ 			return 0;
+@@ -518,6 +568,17 @@ static int bringup_wait_for_ap(unsigned int cpu)
  	return cpuhp_kick_ap(st, st->target);
  }
  
 +/*
++ * struct cpuhp_step cpuhp_hp_states[CPUHP_BRINGUP_CPU] = {
++ *     .name                   = "cpu:bringup",
++ *     .startup.single         = bringup_cpu,
++ *     .teardown.single        = NULL,
++ *     .cant_stop              = true,
++ * },
++ *
 + * 处理CPUHP_BRINGUP_CPU:
 + *   - kernel/cpu.c|1378| <<global>> .startup.single = bringup_cpu,
 + */
  static int bringup_cpu(unsigned int cpu)
  {
  	struct task_struct *idle = idle_thread_get(cpu);
-@@ -531,6 +535,9 @@ static int bringup_cpu(unsigned int cpu)
+@@ -531,6 +592,10 @@ static int bringup_cpu(unsigned int cpu)
  	irq_lock_sparse();
  
  	/* Arch-specific enabling code. */
 +	/*
-+	 * 相当于return smp_ops.cpu_up(cpu, tidle) = native_cpu_up()
++	 * 相当于return smp_ops.cpu_up(cpu, tidle) = native_cpu_up(),
++	 * 直接调用native_cpu_up()
 +	 */
  	ret = __cpu_up(cpu, idle);
  	irq_unlock_sparse();
  	if (ret)
-@@ -2230,6 +2237,10 @@ EXPORT_SYMBOL(__cpu_present_mask);
+@@ -1118,6 +1183,14 @@ static int _cpu_up(unsigned int cpu, int tasks_frozen, enum cpuhp_state target)
+ 	 * CPUHP_BRINGUP_CPU. After that the AP hotplug thread is
+ 	 * responsible for bringing it up to the target state.
+ 	 */
++	/*
++	 * struct cpuhp_step cpuhp_hp_states[CPUHP_BRINGUP_CPU] = {
++	 *     .name                   = "cpu:bringup",
++	 *     .startup.single         = bringup_cpu,
++	 *     .teardown.single        = NULL,
++	 *     .cant_stop              = true,
++	 * },
++	 */
+ 	target = min((int)target, CPUHP_BRINGUP_CPU);
+ 	ret = cpuhp_up_callbacks(cpu, st, target);
+ out:
+@@ -2230,6 +2303,10 @@ EXPORT_SYMBOL(__cpu_present_mask);
  struct cpumask __cpu_active_mask __read_mostly;
  EXPORT_SYMBOL(__cpu_active_mask);
  
@@ -10937,6 +11049,21 @@ index eff6b88a..167924dd 100644
  int mmu_notifier_register(struct mmu_notifier *mn, struct mm_struct *mm)
  {
  	return do_mmu_notifier_register(mn, mm, 1);
+diff --git a/mm/slab.c b/mm/slab.c
+index aa76a70e..7e3143cc 100644
+--- a/mm/slab.c
++++ b/mm/slab.c
+@@ -1045,6 +1045,10 @@ static void cpuup_canceled(long cpu)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - mm/slab.c|1085| <<slab_prepare_cpu>> err = cpuup_prepare(cpu)
++ */
+ static int cpuup_prepare(long cpu)
+ {
+ 	struct kmem_cache *cachep;
 diff --git a/mm/vmscan.c b/mm/vmscan.c
 index 03822f86..332efde8 100644
 --- a/mm/vmscan.c
