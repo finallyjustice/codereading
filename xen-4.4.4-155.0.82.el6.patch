@@ -1,0 +1,854 @@
+From dbdf42982ddc4863838e489dd3cf6b85feb6a732 Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Mon, 5 Apr 2021 07:54:52 -0700
+Subject: [PATCH 1/1] xen-4.4.4-155.0.82.el6
+
+xen-4.4.4-155.0.82
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ xen/common/sched_credit.c | 416 ++++++++++++++++++++++++++++++++++++++
+ xen/common/schedule.c     |   4 +
+ xen/include/xen/sched.h   |  19 ++
+ 3 files changed, 439 insertions(+)
+
+diff --git a/xen/common/sched_credit.c b/xen/common/sched_credit.c
+index e3d13c276b..8a3653b214 100644
+--- a/xen/common/sched_credit.c
++++ b/xen/common/sched_credit.c
+@@ -29,6 +29,10 @@
+  * Basic constants
+  */
+ #define CSCHED_DEFAULT_WEIGHT       256
++/*
++ * 在以下使用CSCHED_TICKS_PER_TSLICE:
++ *   - common/sched_credit.c|1258| <<__csched_set_tslice>> prv->ticks_per_tslice = CSCHED_TICKS_PER_TSLICE;
++ */
+ #define CSCHED_TICKS_PER_TSLICE     3
+ /* Default timeslice: 30ms */
+ #define CSCHED_DEFAULT_TSLICE_MS    30
+@@ -38,9 +42,25 @@
+ /*
+  * Priorities
+  */
++/*
++ * 在以下使用CSCHED_PRI_TS_BOOST:
++ *   - common/sched_credit.c|991| <<csched_vcpu_acct>> if ( svc->pri == CSCHED_PRI_TS_BOOST )
++ *   - common/sched_credit.c|1182| <<csched_vcpu_wake>> svc->pri = CSCHED_PRI_TS_BOOST;
++ *   - common/sched_credit.c|1985| <<csched_schedule>> snext->pri = CSCHED_PRI_TS_BOOST;
++ */
+ #define CSCHED_PRI_TS_BOOST      0      /* time-share waking up */
+ #define CSCHED_PRI_TS_UNDER     -1      /* time-share w/ credits */
+ #define CSCHED_PRI_TS_OVER      -2      /* time-share w/o credits */
++/*
++ * 在以下使用CSCHED_PRI_IDLE:
++ *   - common/sched_credit.c|403| <<__runq_insert>> && __runq_elem(iter)->pri > CSCHED_PRI_IDLE )
++ *   - common/sched_credit.c|521| <<__runq_tickle>> if ( cur->pri == CSCHED_PRI_IDLE
++ *   - common/sched_credit.c|524| <<__runq_tickle>> if ( cur->pri != CSCHED_PRI_IDLE )
++ *   - common/sched_credit.c|1050| <<csched_alloc_vdata>> CSCHED_PRI_IDLE : CSCHED_PRI_TS_UNDER;
++ *   - common/sched_credit.c|1787| <<csched_load_balance>> if ( snext->pri == CSCHED_PRI_IDLE )
++ *   - common/sched_credit.c|1943| <<csched_schedule>> scurr->pri = CSCHED_PRI_IDLE;
++ *   - common/sched_credit.c|2024| <<csched_schedule>> if ( snext->pri == CSCHED_PRI_IDLE )
++ */
+ #define CSCHED_PRI_IDLE         -64     /* idle */
+ 
+ 
+@@ -60,6 +80,30 @@
+     ((struct csched_pcpu *)per_cpu(schedule_data, _c).sched_priv)
+ #define CSCHED_VCPU(_vcpu)  ((struct csched_vcpu *) (_vcpu)->sched_priv)
+ #define CSCHED_DOM(_dom)    ((struct csched_dom *) (_dom)->sched_priv)
++/*
++ * DEFINE_PER_CPU(struct schedule_data, schedule_data);
++ *
++ * struct schedule_data {
++ *     spinlock_t *schedule_lock,
++ *                _lock;
++ *     struct vcpu *curr; // current task
++ *     void *sched_priv; --> 指向struct csched_pcpu
++ *     struct timer s_timer; // scheduling timt
++ *     atomic_t urgent_count; // how many urgent vcpus
++ * };
++ *
++ * struct csched_pcpu {
++ *     struct list_head runq; --> 就是RUNQ(cpu), 链接着struct csched_vcpu
++ *     uint32_t runq_sort_last;
++ *     struct timer ticker;
++ *     unsigned int tick;
++ *     unsigned int idle_bias;
++ *     // Store this here to avoid having too many cpumask_var_t-s on stack
++ *     cpumask_var_t balance_mask;
++ * };
++ *
++ * 核心就是获得percpu的schedule_data的sched_priv(struct csched_pcpu)的runq (list_head)
++ */
+ #define RUNQ(_cpu)          (&(CSCHED_PCPU(_cpu)->runq))
+ /* Is the first element of _cpu's runq its idle vcpu? */
+ #define IS_RUNQ_IDLE(_cpu)  (list_empty(RUNQ(_cpu)) || \
+@@ -128,12 +172,35 @@
+  * does not find any suitable and free pcpu, we fall back checking the hard
+  * affinity.
+  */
++/*
++ * 在以下使用CSCHED_BALANCE_SOFT_AFFINITY:
++ *   - common/sched_credit.c|312| <<csched_balance_cpumask>> if ( step == CSCHED_BALANCE_SOFT_AFFINITY )
++ *   - common/sched_credit.c|392| <<__runq_tickle>> if ( balance_step == CSCHED_BALANCE_SOFT_AFFINITY
++ *   - common/sched_credit.c|410| <<__runq_tickle>> && balance_step == CSCHED_BALANCE_SOFT_AFFINITY )
++ *   - common/sched_credit.c|652| <<_csched_cpu_pick>> if ( balance_step == CSCHED_BALANCE_SOFT_AFFINITY
++ *   - common/sched_credit.c|1481| <<csched_runq_steal>> if ( balance_step == CSCHED_BALANCE_SOFT_AFFINITY
++ */
+ #define CSCHED_BALANCE_SOFT_AFFINITY    0
++/*
++ * 在以下使用CSCHED_BALANCE_HARD_AFFINITY:
++ *   - common/sched_credit.c|277| <<for_each_csched_balance_step>> for ( (step) = 0; (step) <= CSCHED_BALANCE_HARD_AFFINITY; (step)++ )
++ */
+ #define CSCHED_BALANCE_HARD_AFFINITY    1
+ 
+ /*
+  * Boot parameters
+  */
++/*
++ * 在以下使用sched_credit_tslice_ms:
++ *   - common/sched_credit.c|180| <<global>> integer_param("sched_credit_tslice_ms", sched_credit_tslice_ms);
++ *   - common/sched_credit.c|2210| <<csched_init>> if ( sched_credit_tslice_ms > XEN_SYSCTL_CSCHED_TSLICE_MAX
++ *   - common/sched_credit.c|2211| <<csched_init>> || sched_credit_tslice_ms < XEN_SYSCTL_CSCHED_TSLICE_MIN )
++ *   - common/sched_credit.c|2218| <<csched_init>> sched_credit_tslice_ms = CSCHED_DEFAULT_TSLICE_MS;
++ *   - common/sched_credit.c|2221| <<csched_init>> __csched_set_tslice(prv, sched_credit_tslice_ms);
++ *   - common/sched_credit.c|2223| <<csched_init>> if ( MICROSECS(sched_ratelimit_us) > MILLISECS(sched_credit_tslice_ms) )
++ *
++ * 默认30
++ */
+ static int __read_mostly sched_credit_tslice_ms = CSCHED_DEFAULT_TSLICE_MS;
+ integer_param("sched_credit_tslice_ms", sched_credit_tslice_ms);
+ 
+@@ -141,7 +208,34 @@ integer_param("sched_credit_tslice_ms", sched_credit_tslice_ms);
+  * Physical CPU
+  */
+ struct csched_pcpu {
++    /*
++     * 在以下使用csched_pcpu->runq:
++     *   - common/sched_credit.c|63| <<RUNQ>> #define RUNQ(_cpu) (&(CSCHED_PCPU(_cpu)->runq))
++     *   - common/sched_credit.c|240| <<__runq_insert>> const struct list_head * const runq = RUNQ(cpu);
++     *   - common/sched_credit.c|246| <<__runq_insert>> list_for_each( iter, runq ) 
++     *   - common/sched_credit.c|262| <<__runq_insert>> BUG_ON(iter == runq);
++     *   - common/sched_credit.c|533| <<csched_alloc_pdata>> INIT_LIST_HEAD(&spc->runq);
++     *   - common/sched_credit.c|1165| <<csched_runq_sort>> struct list_head *runq, *elem, *next, *last_under;
++     *   - common/sched_credit.c|1179| <<csched_runq_sort>> runq = &spc->runq;
++     *   - common/sched_credit.c|1180| <<csched_runq_sort>> elem = runq->next;
++     *   - common/sched_credit.c|1181| <<csched_runq_sort>> last_under = runq;
++     *   - common/sched_credit.c|1183| <<csched_runq_sort>> while ( elem != runq )
++     *   - common/sched_credit.c|1454| <<csched_runq_steal>> list_for_each( iter, &peer_pcpu->runq )
++     *   - common/sched_credit.c|1661| <<csched_schedule>> struct list_head * const runq = RUNQ(cpu);
++     *   - common/sched_credit.c|1728| <<csched_schedule>> BUG_ON( is_idle_vcpu(current) || list_empty(runq) );
++     *   - common/sched_credit.c|1730| <<csched_schedule>> snext = __runq_elem(runq->next);
++     *   - common/sched_credit.c|1822| <<csched_dump_pcpu>> struct list_head *runq, *iter;
++     *   - common/sched_credit.c|1829| <<csched_dump_pcpu>> runq = &spc->runq;
++     *   - common/sched_credit.c|1845| <<csched_dump_pcpu>> list_for_each( iter, runq )
++     */
+     struct list_head runq;
++    /*
++     * 在以下使用csched_pcpu->runq_sort_last:
++     *   - common/sched_credit.c|534| <<csched_alloc_pdata>> spc->runq_sort_last = prv->runq_sort;
++     *   - common/sched_credit.c|1172| <<csched_runq_sort>> if ( sort_epoch == spc->runq_sort_last )
++     *   - common/sched_credit.c|1175| <<csched_runq_sort>> spc->runq_sort_last = sort_epoch;
++     *   - common/sched_credit.c|1832| <<csched_dump_pcpu>> printk(" sort=%d, sibling=%s, ", spc->runq_sort_last, cpustr);
++     */
+     uint32_t runq_sort_last;
+     struct timer ticker;
+     unsigned int tick;
+@@ -157,20 +251,74 @@ struct csched_pcpu {
+  * as there is a csched_pcpu for each PCPU, and we always hold the
+  * runqueue lock for the proper PCPU when using this.
+  */
++/*
++ * called by:
++ *   - common/sched_credit.c|545| <<__runq_tickle>> csched_balance_mask(cpu));
++ *   - common/sched_credit.c|546| <<__runq_tickle>> cpumask_and(csched_balance_mask(cpu),
++ *   - common/sched_credit.c|547| <<__runq_tickle>> csched_balance_mask(cpu), &idle_mask);
++ *   - common/sched_credit.c|548| <<__runq_tickle>> new_idlers_empty = cpumask_empty(csched_balance_mask(cpu));
++ *   - common/sched_credit.c|1704| <<csched_runq_steal>> csched_balance_cpumask(vc, balance_step, csched_balance_mask(cpu));
++ *   - common/sched_credit.c|1706| <<csched_runq_steal>> csched_balance_mask(cpu)) )
++ */
+ #define csched_balance_mask(c) (CSCHED_PCPU(c)->balance_mask)
+ 
+ /*
+  * Virtual CPU
+  */
+ struct csched_vcpu {
++    /*
++     * 在以下使用csched_vcpu->runq_elem:
++     *   - common/sched_credit.c|291| <<__vcpu_on_runq>> return !list_empty(&svc->runq_elem);
++     *   - common/sched_credit.c|297| <<__runq_elem>> return list_entry(elem, struct csched_vcpu, runq_elem);
++     *   - common/sched_credit.c|352| <<__runq_insert>> list_add_tail(&svc->runq_elem, iter);
++     *   - common/sched_credit.c|359| <<__runq_remove>> list_del_init(&svc->runq_elem);
++     *   - common/sched_credit.c|981| <<csched_alloc_vdata>> INIT_LIST_HEAD(&svc->runq_elem);
++     *   - common/sched_credit.c|1018| <<csched_free_vdata>> BUG_ON( !list_empty(&svc->runq_elem) );
++     *   - common/sched_credit.c|1053| <<csched_vcpu_remove>> BUG_ON( !list_empty(&svc->runq_elem) );
++     */
+     struct list_head runq_elem;
+     struct list_head active_vcpu_elem;
+     struct csched_dom *sdom;
++    /*
++     * 只在以下设置csched_vcpu->vcpu:
++     *   - common/sched_credit.c|1033| <<csched_alloc_vdata>> svc->vcpu = vc;
++     */
+     struct vcpu *vcpu;
+     atomic_t credit;
+     unsigned int residual;
++    /*
++     * 在以下使用csched_vcpu->start_time:
++     *   - common/sched_credit.c|478| <<burn_credits>> if ( (delta = now - svc->start_time) <= 0 )
++     *   - common/sched_credit.c|486| <<burn_credits>> svc->start_time += (credits * MILLISECS(1)) / CSCHED_CREDITS_PER_MSEC;
++     *   - common/sched_credit.c|1938| <<csched_schedule>> scurr->start_time -= now;
++     *   - common/sched_credit.c|1967| <<csched_schedule>> snext->start_time += now;
++     *   - common/sched_credit.c|2035| <<csched_schedule>> snext->start_time += now;
++     */
+     s_time_t start_time;   /* When we were scheduled (used for credit) */
+     unsigned flags;
++    /*
++     * 在以下设置csched_vcpu->pri:
++     *   - common/sched_credit.c|965| <<csched_vcpu_acct>> svc->pri = CSCHED_PRI_TS_UNDER;
++     *   - common/sched_credit.c|1011| <<csched_alloc_vdata>> svc->pri = is_idle_domain(vc->domain) ?
++     *   - common/sched_credit.c|1150| <<csched_vcpu_wake>> svc->pri = CSCHED_PRI_TS_BOOST;
++     *   - common/sched_credit.c|1519| <<csched_acct>> svc->pri = CSCHED_PRI_TS_OVER;
++     *   - common/sched_credit.c|1540| <<csched_acct>> svc->pri = CSCHED_PRI_TS_UNDER;
++     * 在以下使用csched_vcpu->pri:
++     *   - common/sched_credit.c|362| <<__runq_insert>> if ( svc->pri > iter_svc->pri )
++     *   - common/sched_credit.c|370| <<__runq_insert>> && __runq_elem(iter)->pri > CSCHED_PRI_IDLE )
++     *   - common/sched_credit.c|488| <<__runq_tickle>> if ( cur->pri == CSCHED_PRI_IDLE
++     *   - common/sched_credit.c|489| <<__runq_tickle>> || (idlers_empty && new->pri > cur->pri) )
++     *   - common/sched_credit.c|491| <<__runq_tickle>> if ( cur->pri != CSCHED_PRI_IDLE )
++     *   - common/sched_credit.c|537| <<__runq_tickle>> if ( new_idlers_empty && new->pri > cur->pri )
++     *   - common/sched_credit.c|964| <<csched_vcpu_acct>> if ( svc->pri == CSCHED_PRI_TS_BOOST )
++     *   - common/sched_credit.c|1147| <<csched_vcpu_wake>> if ( svc->pri == CSCHED_PRI_TS_UNDER &&
++     *   - common/sched_credit.c|1359| <<csched_runq_sort>> if ( svc_elem->pri >= CSCHED_PRI_TS_UNDER )
++     *   - common/sched_credit.c|1611| <<csched_runq_steal>> csched_runq_steal(int peer_cpu, int cpu, int pri, int balance_step)
++     *   - common/sched_credit.c|1633| <<csched_runq_steal>> if ( speer->pri <= pri )
++     *   - common/sched_credit.c|1717| <<csched_load_balance>> if ( snext->pri == CSCHED_PRI_IDLE )
++     *   - common/sched_credit.c|1719| <<csched_load_balance>> else if ( snext->pri == CSCHED_PRI_TS_OVER )
++     *   - common/sched_credit.c|1771| <<csched_load_balance>> csched_runq_steal(peer_cpu, cpu, snext->pri, bstep) : NULL;
++     */
+     int16_t pri;
+ #ifdef CSCHED_STATS
+     struct {
+@@ -225,6 +373,16 @@ static void csched_acct(void *dummy);
+ static inline int
+ __vcpu_on_runq(struct csched_vcpu *svc)
+ {
++    /*
++     * 在以下使用csched_vcpu->runq_elem:
++     *   - common/sched_credit.c|291| <<__vcpu_on_runq>> return !list_empty(&svc->runq_elem);
++     *   - common/sched_credit.c|297| <<__runq_elem>> return list_entry(elem, struct csched_vcpu, runq_elem);
++     *   - common/sched_credit.c|352| <<__runq_insert>> list_add_tail(&svc->runq_elem, iter);
++     *   - common/sched_credit.c|359| <<__runq_remove>> list_del_init(&svc->runq_elem);
++     *   - common/sched_credit.c|981| <<csched_alloc_vdata>> INIT_LIST_HEAD(&svc->runq_elem);
++     *   - common/sched_credit.c|1018| <<csched_free_vdata>> BUG_ON( !list_empty(&svc->runq_elem) );
++     *   - common/sched_credit.c|1053| <<csched_vcpu_remove>> BUG_ON( !list_empty(&svc->runq_elem) );
++     */
+     return !list_empty(&svc->runq_elem);
+ }
+ 
+@@ -234,9 +392,39 @@ __runq_elem(struct list_head *elem)
+     return list_entry(elem, struct csched_vcpu, runq_elem);
+ }
+ 
++/*
++ * called by:
++ *   - common/sched_credit.c|1025| <<csched_vcpu_insert>> __runq_insert(vc->processor, svc);
++ *   - common/sched_credit.c|1148| <<csched_vcpu_wake>> __runq_insert(cpu, svc);
++ *   - common/sched_credit.c|1902| <<csched_schedule>> __runq_insert(cpu, scurr);
++ */
+ static inline void
+ __runq_insert(unsigned int cpu, struct csched_vcpu *svc)
+ {
++    /*
++     * DEFINE_PER_CPU(struct schedule_data, schedule_data);
++     *
++     * struct schedule_data {
++     *     spinlock_t *schedule_lock,
++     *                _lock;
++     *     struct vcpu *curr; // current task
++     *     void *sched_priv; --> 指向struct csched_pcpu
++     *     struct timer s_timer; // scheduling timt
++     *     atomic_t urgent_count; // how many urgent vcpus
++     * };
++     *
++     * struct csched_pcpu {
++     *     struct list_head runq; --> 就是RUNQ(cpu), 链接着struct csched_vcpu
++     *     uint32_t runq_sort_last;
++     *     struct timer ticker;
++     *     unsigned int tick;
++     *     unsigned int idle_bias;
++     *     // Store this here to avoid having too many cpumask_var_t-s on stack
++     *     cpumask_var_t balance_mask;
++     * };
++     *
++     * 核心就是获得percpu的schedule_data的sched_priv(struct csched_pcpu)的runq (list_head)
++     */
+     const struct list_head * const runq = RUNQ(cpu);
+     struct list_head *iter;
+ 
+@@ -265,6 +453,14 @@ __runq_insert(unsigned int cpu, struct csched_vcpu *svc)
+     list_add_tail(&svc->runq_elem, iter);
+ }
+ 
++/*
++ * called by:
++ *   - common/sched_credit.c|1149| <<csched_vcpu_remove>> __runq_remove(svc);
++ *   - common/sched_credit.c|1177| <<csched_vcpu_sleep>> __runq_remove(svc);
++ *   - common/sched_credit.c|1766| <<csched_runq_steal>> __runq_remove(speer);
++ *   - common/sched_credit.c|1904| <<csched_load_balance>> __runq_remove(snext);
++ *   - common/sched_credit.c|2058| <<csched_schedule>> __runq_remove(snext);
++ */
+ static inline void
+ __runq_remove(struct csched_vcpu *svc)
+ {
+@@ -273,6 +469,12 @@ __runq_remove(struct csched_vcpu *svc)
+ }
+ 
+ 
++/*
++ * called by:
++ *   - common/sched_credit.c|576| <<__runq_tickle>> for_each_csched_balance_step( balance_step )
++ *   - common/sched_credit.c|831| <<_csched_cpu_pick>> for_each_csched_balance_step( balance_step )
++ *   - common/sched_credit.c|1843| <<csched_load_balance>> for_each_csched_balance_step( bstep )
++ */
+ #define for_each_csched_balance_step(step) \
+     for ( (step) = 0; (step) <= CSCHED_BALANCE_HARD_AFFINITY; (step)++ )
+ 
+@@ -289,6 +491,12 @@ __runq_remove(struct csched_vcpu *svc)
+  * hard affinity, or to the && of hard affinity and the set of online cpus
+  * in the domain's cpupool.
+  */
++/*
++ * called by:
++ *   - common/sched_credit.c|581| <<__runq_tickle>> && !__vcpu_has_soft_affinity(new->vcpu,
++ *   - common/sched_credit.c|852| <<_csched_cpu_pick>> && !__vcpu_has_soft_affinity(vc, &cpus) )
++ *   - common/sched_credit.c|1743| <<csched_runq_steal>> && !__vcpu_has_soft_affinity(vc, vc->cpu_hard_affinity) )
++ */
+ static inline int __vcpu_has_soft_affinity(const struct vcpu *vc,
+                                            const cpumask_t *mask)
+ {
+@@ -306,6 +514,12 @@ static inline int __vcpu_has_soft_affinity(const struct vcpu *vc,
+  * filtered out from the result, to avoid running a vcpu where it would
+  * like, but is not allowed to!
+  */
++/*
++ * called by:
++ *   - common/sched_credit.c|586| <<__runq_tickle>> csched_balance_cpumask(new->vcpu, balance_step,
++ *   - common/sched_credit.c|856| <<_csched_cpu_pick>> csched_balance_cpumask(vc, balance_step, &cpus);
++ *   - common/sched_credit.c|1746| <<csched_runq_steal>> csched_balance_cpumask(vc, balance_step, csched_balance_mask(cpu));
++ */
+ static void
+ csched_balance_cpumask(const struct vcpu *vc, int step, cpumask_t *mask)
+ {
+@@ -320,6 +534,11 @@ csched_balance_cpumask(const struct vcpu *vc, int step, cpumask_t *mask)
+         cpumask_copy(mask, vc->cpu_hard_affinity);
+ }
+ 
++/*
++ * called by:
++ *   - common/sched_credit.c|1072| <<csched_vcpu_acct>> burn_credits(svc, NOW());
++ *   - common/sched_credit.c|2005| <<csched_schedule>> burn_credits(scurr, now);
++ */
+ static void burn_credits(struct csched_vcpu *svc, s_time_t now)
+ {
+     s_time_t delta;
+@@ -464,6 +683,9 @@ __runq_tickle(unsigned int cpu, struct csched_vcpu *new)
+     }
+ }
+ 
++/*
++ * struct scheduler sched_credit_def.free_pdata = csched_free_pdata()
++ */
+ static void
+ csched_free_pdata(const struct scheduler *ops, void *pcpu, int cpu)
+ {
+@@ -495,6 +717,9 @@ csched_free_pdata(const struct scheduler *ops, void *pcpu, int cpu)
+     xfree(spc);
+ }
+ 
++/*
++ * struct scheduler sched_credit_def.alloc_pdata = csched_alloc_pdata = csched_alloc_pdata()
++ */
+ static void *
+ csched_alloc_pdata(const struct scheduler *ops, int cpu)
+ {
+@@ -615,6 +840,11 @@ __csched_vcpu_is_migrateable(struct vcpu *vc, int dest_cpu, cpumask_t *mask)
+            cpumask_test_cpu(dest_cpu, mask);
+ }
+ 
++/*
++ * called by:
++ *   - common/sched_credit.c|837| <<csched_cpu_pick>> return _csched_cpu_pick(ops, vc, 1);
++ *   - common/sched_credit.c|928| <<csched_vcpu_acct>> else if ( _csched_cpu_pick(ops, current, 0) != cpu )
++ */
+ static int
+ _csched_cpu_pick(const struct scheduler *ops, struct vcpu *vc, bool_t commit)
+ {
+@@ -761,6 +991,9 @@ _csched_cpu_pick(const struct scheduler *ops, struct vcpu *vc, bool_t commit)
+     return cpu;
+ }
+ 
++/*
++ * struct scheduler sched_credit_def.pick_cpu = csched_cpu_pick()
++ */
+ static int
+ csched_cpu_pick(const struct scheduler *ops, struct vcpu *vc)
+ {
+@@ -864,6 +1097,14 @@ csched_vcpu_acct(struct csched_private *prv, unsigned int cpu)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - common/schedule.c|220| <<sched_init_vcpu>> v->sched_priv = SCHED_OP(DOM2OP(d), alloc_vdata, v, d->sched_priv);
++ *   - common/schedule.c|252| <<sched_move_domain>> vcpu_priv[v->vcpu_id] = SCHED_OP(c->sched, alloc_vdata, v, domdata);
++ *   - common/schedule.c|1435| <<schedule_cpu_switch>> vpriv = SCHED_OP(new_ops, alloc_vdata, idle, idle->domain->sched_priv);
++ *
++ * struct scheduler sched_credit_def.alloc_vdata = csched_alloc_vdata()
++ */
+ static void *
+ csched_alloc_vdata(const struct scheduler *ops, struct vcpu *vc, void *dd)
+ {
+@@ -885,6 +1126,9 @@ csched_alloc_vdata(const struct scheduler *ops, struct vcpu *vc, void *dd)
+     return svc;
+ }
+ 
++/*
++ * struct scheduler sched_credit_def.insert_vcpu = csched_vcpu_insert()
++ */
+ static void
+ csched_vcpu_insert(const struct scheduler *ops, struct vcpu *vc)
+ {
+@@ -900,6 +1144,9 @@ csched_vcpu_insert(const struct scheduler *ops, struct vcpu *vc)
+     vcpu_schedule_unlock_irqrestore(lock, flags, vc);
+ }
+ 
++/*
++* struct scheduler sched_credit_def.free_vdata = csched_free_vdata()
++*/
+ static void
+ csched_free_vdata(const struct scheduler *ops, void *priv)
+ {
+@@ -910,6 +1157,9 @@ csched_free_vdata(const struct scheduler *ops, void *priv)
+     xfree(svc);
+ }
+ 
++/*
++ * struct scheduler sched_credit_def.remove_vcpu = csched_vcpu_remove()
++ */
+ static void
+ csched_vcpu_remove(const struct scheduler *ops, struct vcpu *vc)
+ {
+@@ -940,6 +1190,9 @@ csched_vcpu_remove(const struct scheduler *ops, struct vcpu *vc)
+     BUG_ON( !list_empty(&svc->runq_elem) );
+ }
+ 
++/*
++ * struct scheduler sched_credit_def.sleep = csched_vcpu_sleep()
++ */
+ static void
+ csched_vcpu_sleep(const struct scheduler *ops, struct vcpu *vc)
+ {
+@@ -955,6 +1208,9 @@ csched_vcpu_sleep(const struct scheduler *ops, struct vcpu *vc)
+         __runq_remove(svc);
+ }
+ 
++/*
++ * struct scheduler sched_credit_def.wake = csched_vcpu_wake()
++ */
+ static void
+ csched_vcpu_wake(const struct scheduler *ops, struct vcpu *vc)
+ {
+@@ -1010,6 +1266,9 @@ csched_vcpu_wake(const struct scheduler *ops, struct vcpu *vc)
+     __runq_tickle(cpu, svc);
+ }
+ 
++/*
++ * struct scheduler sched_credit_def.yield = csched_vcpu_yield()
++ */
+ static void
+ csched_vcpu_yield(const struct scheduler *ops, struct vcpu *vc)
+ {
+@@ -1019,6 +1278,9 @@ csched_vcpu_yield(const struct scheduler *ops, struct vcpu *vc)
+     set_bit(CSCHED_FLAG_VCPU_YIELD, &svc->flags);
+ }
+ 
++/*
++ * struct scheduler sched_credit_def.adjust = csched_dom_cntl = csched_dom_cntl()
++ */
+ static int
+ csched_dom_cntl(
+     const struct scheduler *ops,
+@@ -1073,6 +1335,9 @@ __csched_set_tslice(struct csched_private *prv, unsigned timeslice)
+     prv->credits_per_tslice = CSCHED_CREDITS_PER_MSEC * prv->tslice_ms;
+ }
+ 
++/*
++ * struct scheduler sched_credit_def.adjust_global = csched_sys_cntl()
++ */
+ static int
+ csched_sys_cntl(const struct scheduler *ops,
+                         struct xen_sysctl_scheduler_op *sc)
+@@ -1104,6 +1369,9 @@ csched_sys_cntl(const struct scheduler *ops,
+     return rc;
+ }
+ 
++/*
++ * struct scheduler sched_credit_def.alloc_domdata = csched_alloc_domdata()
++ */
+ static void *
+ csched_alloc_domdata(const struct scheduler *ops, struct domain *dom)
+ {
+@@ -1122,11 +1390,15 @@ csched_alloc_domdata(const struct scheduler *ops, struct domain *dom)
+     return (void *)sdom;
+ }
+ 
++/*
++ * struct scheduler sched_credit_def.init_domain = csched_dom_init()
++ */
+ static int
+ csched_dom_init(const struct scheduler *ops, struct domain *dom)
+ {
+     struct csched_dom *sdom;
+ 
++    /* 检测(d)->domain_id == DOMID_IDLE */
+     if ( is_idle_domain(dom) )
+         return 0;
+ 
+@@ -1134,17 +1406,27 @@ csched_dom_init(const struct scheduler *ops, struct domain *dom)
+     if ( sdom == NULL )
+         return -ENOMEM;
+ 
++    /*
++     * struct domain:
++     *  -> void *sched_priv;    // scheduler-specific data
++     */
+     dom->sched_priv = sdom;
+ 
+     return 0;
+ }
+ 
++/*
++ * struct scheduler sched_credit_def.free_domdata = csched_free_domdata()
++ */
+ static void
+ csched_free_domdata(const struct scheduler *ops, void *data)
+ {
+     xfree(data);
+ }
+ 
++/*
++ * struct scheduler sched_credit_def.destroy_domain = csched_dom_destroy()
++ */
+ static void
+ csched_dom_destroy(const struct scheduler *ops, struct domain *dom)
+ {
+@@ -1436,10 +1718,20 @@ csched_tick(void *_cpu)
+     set_timer(&spc->ticker, NOW() + MICROSECS(prv->tick_period_us) );
+ }
+ 
++/*
++ * called by:
++ *   - common/sched_credit.c|1794| <<csched_load_balance>> csched_runq_steal(peer_cpu, cpu, snext->pri, bstep) : NULL;
++ */
+ static struct csched_vcpu *
+ csched_runq_steal(int peer_cpu, int cpu, int pri, int balance_step)
+ {
++    /*
++     * ((struct csched_pcpu *)per_cpu(schedule_data, _c).sched_priv)
++     */
+     const struct csched_pcpu * const peer_pcpu = CSCHED_PCPU(peer_cpu);
++    /*
++     * (per_cpu(schedule_data, c).curr)
++     */
+     const struct vcpu * const peer_vcpu = curr_on_cpu(peer_cpu);
+     struct csched_vcpu *speer;
+     struct list_head *iter;
+@@ -1491,6 +1783,16 @@ csched_runq_steal(int peer_cpu, int cpu, int pri, int balance_step)
+                          vc->domain->domain_id, vc->vcpu_id);
+                 SCHED_VCPU_STAT_CRANK(speer, migrate_q);
+                 SCHED_STAT_CRANK(migrate_queued);
++                /*
++		 * 在以下修改vcpu->is_urgent:
++		 *   - common/schedule.c|125| <<vcpu_urgent_count_update>> v->is_urgent = 0;
++		 *   - common/schedule.c|134| <<vcpu_urgent_count_update>> v->is_urgent = 1;
++		 * 在以下使用vcpu->is_urgent:
++		 *   - common/sched_credit.c|1701| <<csched_runq_steal>> WARN_ON(vc->is_urgent);
++		 *   - common/schedule.c|120| <<vcpu_urgent_count_update>> if ( unlikely(v->is_urgent) )
++		 *   - common/schedule.c|335| <<sched_destroy_vcpu>> if ( test_and_clear_bool(v->is_urgent) )
++		 *   - common/schedule.c|514| <<vcpu_migrate>> if ( unlikely(v->is_urgent) && (old_cpu != new_cpu) )
++		 */
+                 WARN_ON(vc->is_urgent);
+                 __runq_remove(speer);
+                 vc->processor = cpu;
+@@ -1503,6 +1805,17 @@ csched_runq_steal(int peer_cpu, int cpu, int pri, int balance_step)
+     return NULL;
+ }
+ 
++/*
++ * SMP Load balance:
++ *
++ * If the next highest priority local runnable VCPU has already eaten
++ * through its credits, look on other PCPUs to see if we have more
++ * urgent work... If not, csched_load_balance() will return snext, but
++ * already removed from the runq.
++ *
++ * called by:
++ *   - common/sched_credit.c|1705| <<csched_schedule>> snext = csched_load_balance(prv, cpu, snext, &ret.migrated);
++ */
+ static struct csched_vcpu *
+ csched_load_balance(struct csched_private *prv, int cpu,
+     struct csched_vcpu *snext, bool_t *stolen)
+@@ -1514,7 +1827,27 @@ csched_load_balance(struct csched_private *prv, int cpu,
+     int peer_cpu, peer_node, bstep;
+     int node = cpu_to_node(cpu);
+ 
++    /*
++     * 在以下设置vcpu->processor:
++     *   - common/sched_credit.c|1496| <<csched_runq_steal>> vc->processor = cpu;
++     *   - common/sched_credit2.c|1226| <<migrate>> svc->vcpu->processor = cpumask_any(&trqd->active);
++     *   - common/sched_credit2.c|1786| <<csched_schedule>> snext->vcpu->processor = cpu;
++     *   - common/schedule.c|195| <<sched_init_vcpu>> v->processor = processor;
++     *   - common/schedule.c|294| <<sched_move_domain>> v->processor = new_p;
++     *   - common/schedule.c|523| <<vcpu_migrate>> v->processor = new_cpu;
++     *
++     * struct csched_vcpu *snext:
++     * -> struct vcpu *vcpu;
++     *    -> int processor;
++     *
++     * error: 没有调度到正确的cpu上
++     */
+     BUG_ON( cpu != snext->vcpu->processor );
++    /*
++     * # xm cpupool-list
++     * Name               CPUs   Sched     Active   Domain count
++     * Pool-0              40    credit       y          3
++     */
+     online = cpupool_online_cpumask(c);
+ 
+     /*
+@@ -1607,13 +1940,55 @@ csched_load_balance(struct csched_private *prv, int cpu,
+  * This function is in the critical path. It is designed to be simple and
+  * fast for the common case.
+  */
++/*
++ * DEFINE_PER_CPU(struct schedule_data, schedule_data);
++ *
++ * struct schedule_data {
++ *     spinlock_t *schedule_lock,
++ *                _lock;
++ *     struct vcpu *curr; // current task
++ *     void *sched_priv; --> 指向struct csched_pcpu
++ *     struct timer s_timer; // scheduling timt
++ *     atomic_t urgent_count; // how many urgent vcpus
++ * };
++ *
++ * struct csched_pcpu {
++ *     struct list_head runq; --> 就是RUNQ(cpu), 链接着struct csched_vcpu
++ *     uint32_t runq_sort_last;
++ *     struct timer ticker;
++ *     unsigned int tick;
++ *     unsigned int idle_bias;
++ *     // Store this here to avoid having too many cpumask_var_t-s on stack
++ *     cpumask_var_t balance_mask;
++ * };
++ *
++ * called by:
++ *   - common/schedule.c|1186| <<schedule>> next_slice = sched->do_schedule(sched, now, tasklet_work_scheduled);
++ *
++ * struct scheduler sched_credit_def.do_schedule = csched_schedule()
++ *
++ * credit算法在执行schedule时,会首先获得该pcpu的就绪队列runq上队首vcpu,即snext,
++ * 检查其credit值有没有用完.
++ * 如果没有用完直接返回.如果用完表明该pcpu的就绪队列上没有under或boost状态的vcpu,
++ * 则进行负载均衡,查找其它pcpu上优先级较高的vcpu,执行run_steal把它偷过来运行.
++ * 如果还没有找到合适的，就返回之前得到的snext.
++ */
+ static struct task_slice
+ csched_schedule(
+     const struct scheduler *ops, s_time_t now, bool_t tasklet_work_scheduled)
+ {
+     const int cpu = smp_processor_id();
++    /*
++     * 核心就是获得percpu的schedule_data的sched_priv(struct csched_pcpu)的runq (list_head)
++     */
+     struct list_head * const runq = RUNQ(cpu);
++    /*
++     * ((struct csched_vcpu *) (_vcpu)->sched_priv)
++     */
+     struct csched_vcpu * const scurr = CSCHED_VCPU(current);
++    /*
++     * ((struct csched_private *)((_ops)->sched_data))
++     */
+     struct csched_private *prv = CSCHED_PRIV(ops);
+     struct csched_vcpu *snext;
+     struct task_slice ret;
+@@ -1622,6 +1997,9 @@ csched_schedule(
+     SCHED_STAT_CRANK(schedule);
+     CSCHED_VCPU_CHECK(current);
+ 
++    /*
++     * When was current state entered (system time, ns)?
++     */
+     runtime = now - current->runstate.state_entry_time;
+     if ( runtime < 0 ) /* Does this ever happen? */
+         runtime = 0;
+@@ -1670,6 +2048,11 @@ csched_schedule(
+     /*
+      * Select next runnable local VCPU (ie top of local runq)
+      */
++    /*
++     * scurr来自((struct csched_vcpu *) (_vcpu)->sched_priv)
++     *
++     * __runq_insert()的核心思想是list_add_tail(&svc->runq_elem, iter);
++     */
+     if ( vcpu_runnable(current) )
+         __runq_insert(cpu, scurr);
+     else
+@@ -1699,6 +2082,9 @@ csched_schedule(
+      * urgent work... If not, csched_load_balance() will return snext, but
+      * already removed from the runq.
+      */
++    /*
++     * prv来自((struct csched_private *)((_ops)->sched_data))
++     */
+     if ( snext->pri > CSCHED_PRI_TS_OVER )
+         __runq_remove(snext);
+     else
+@@ -1764,6 +2150,9 @@ csched_dump_vcpu(struct csched_vcpu *svc)
+     printk("\n");
+ }
+ 
++/*
++ * struct scheduler sched_credit_def.dump_cpu_state = csched_dump_pcpu()
++ */
+ static void
+ csched_dump_pcpu(const struct scheduler *ops, int cpu)
+ {
+@@ -1802,6 +2191,9 @@ csched_dump_pcpu(const struct scheduler *ops, int cpu)
+ #undef cpustr
+ }
+ 
++/*
++ * struct scheduler sched_credit_def.dump_settings = csched_dump()
++ */
+ static void
+ csched_dump(const struct scheduler *ops)
+ {
+@@ -1864,6 +2256,9 @@ csched_dump(const struct scheduler *ops)
+     spin_unlock_irqrestore(&(prv->lock), flags);
+ }
+ 
++/*
++ * struct scheduler sched_credit_def.init = csched_init()
++ */
+ static int
+ csched_init(struct scheduler *ops)
+ {
+@@ -1910,6 +2305,9 @@ csched_init(struct scheduler *ops)
+     return 0;
+ }
+ 
++/*
++ * struct scheduler sched_credit_def.deinit_csched_deinit()
++ */
+ static void
+ csched_deinit(const struct scheduler *ops)
+ {
+@@ -1924,6 +2322,9 @@ csched_deinit(const struct scheduler *ops)
+     }
+ }
+ 
++/*
++ * struct scheduler sched_credit_def.tick_suspend = csched_tick_suspend()
++ */
+ static void csched_tick_suspend(const struct scheduler *ops, unsigned int cpu)
+ {
+     struct csched_pcpu *spc;
+@@ -1933,6 +2334,9 @@ static void csched_tick_suspend(const struct scheduler *ops, unsigned int cpu)
+     stop_timer(&spc->ticker);
+ }
+ 
++/*
++ * struct scheduler sched_credit_def.tick_resume = csched_tick_resume()
++ */
+ static void csched_tick_resume(const struct scheduler *ops, unsigned int cpu)
+ {
+     struct csched_private *prv;
+@@ -1947,8 +2351,20 @@ static void csched_tick_resume(const struct scheduler *ops, unsigned int cpu)
+             - now % MICROSECS(prv->tick_period_us) );
+ }
+ 
++/*
++ * struct scheduler sched_credit_def.sched_data = &_csched_priv
++ */
+ static struct csched_private _csched_priv;
+ 
++/*
++ * 在common/schedule.c使用:
++ * static const struct scheduler *schedulers[] = {
++ *     &sched_sedf_def,
++ *     &sched_credit_def,
++ *     &sched_credit2_def,
++ *     &sched_arinc653_def,
++ * };
++ */
+ const struct scheduler sched_credit_def = {
+     .name           = "SMP Credit Scheduler",
+     .opt_name       = "credit",
+diff --git a/xen/common/schedule.c b/xen/common/schedule.c
+index b2a9b8a3df..64a77be471 100644
+--- a/xen/common/schedule.c
++++ b/xen/common/schedule.c
+@@ -226,6 +226,10 @@ int sched_init_vcpu(struct vcpu *v, unsigned int processor)
+     return 0;
+ }
+ 
++/*
++ * called by:
++ *   - common/cpupool.c|235| <<cpupool_move_domain_locked>> ret = sched_move_domain(d, c);
++ */
+ int sched_move_domain(struct domain *d, struct cpupool *c)
+ {
+     struct vcpu *v;
+diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
+index e2b9db6afa..3fa68175f0 100644
+--- a/xen/include/xen/sched.h
++++ b/xen/include/xen/sched.h
+@@ -116,6 +116,15 @@ struct vcpu
+ {
+     int              vcpu_id;
+ 
++    /*
++     * 在以下设置vcpu->processor:
++     *   - common/sched_credit.c|1703| <<csched_runq_steal>> vc->processor = cpu;
++     *   - common/sched_credit2.c|1226| <<migrate>> svc->vcpu->processor = cpumask_any(&trqd->active);
++     *   - common/sched_credit2.c|1786| <<csched_schedule>> snext->vcpu->processor = cpu;
++     *   - common/schedule.c|195| <<sched_init_vcpu>> v->processor = processor;
++     *   - common/schedule.c|298| <<sched_move_domain>> v->processor = new_p;
++     *   - common/schedule.c|527| <<vcpu_migrate>> v->processor = new_cpu;
++     */
+     int              processor;
+ 
+     vcpu_info_t     *vcpu_info;
+@@ -157,6 +166,16 @@ struct vcpu
+     /* Currently running on a CPU? */
+     bool_t           is_running;
+     /* VCPU should wake fast (do not deep sleep the CPU). */
++    /*
++     * 在以下修改vcpu->is_urgent:
++     *   - common/schedule.c|125| <<vcpu_urgent_count_update>> v->is_urgent = 0;
++     *   - common/schedule.c|134| <<vcpu_urgent_count_update>> v->is_urgent = 1;
++     * 在以下使用vcpu->is_urgent:
++     *   - common/sched_credit.c|1701| <<csched_runq_steal>> WARN_ON(vc->is_urgent);
++     *   - common/schedule.c|120| <<vcpu_urgent_count_update>> if ( unlikely(v->is_urgent) )
++     *   - common/schedule.c|335| <<sched_destroy_vcpu>> if ( test_and_clear_bool(v->is_urgent) )
++     *   - common/schedule.c|514| <<vcpu_migrate>> if ( unlikely(v->is_urgent) && (old_cpu != new_cpu) )
++     */
+     bool_t           is_urgent;
+ 
+ #ifdef VCPU_TRAP_LAST
+-- 
+2.17.1
+
