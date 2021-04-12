@@ -1,6 +1,6 @@
-From 636422ed07ce41c848eca65af59be2825d37c423 Mon Sep 17 00:00:00 2001
+From c24deda94de0bd058ad2eb91e9f0b228f4d5eca6 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Mon, 5 Apr 2021 08:48:37 -0700
+Date: Mon, 12 Apr 2021 09:07:08 -0700
 Subject: [PATCH 1/1] linux v5.11
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
@@ -12,7 +12,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  arch/x86/kernel/cpu/mshyperv.c       |   5 +
  arch/x86/kernel/hpet.c               |   4 +
  arch/x86/kernel/kvm.c                |   7 +
- arch/x86/kernel/kvmclock.c           | 202 +++++++++++
+ arch/x86/kernel/kvmclock.c           | 202 ++++++++++
  arch/x86/kernel/pvclock.c            |  14 +
  arch/x86/kernel/smpboot.c            |   7 +
  arch/x86/kernel/tsc.c                |  35 ++
@@ -24,30 +24,37 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  arch/x86/kvm/svm/nested.c            |  11 +
  arch/x86/kvm/svm/svm.c               |  18 +
  arch/x86/kvm/vmx/capabilities.h      |   5 +
- arch/x86/kvm/vmx/nested.c            | 206 ++++++++++-
+ arch/x86/kvm/vmx/nested.c            | 206 +++++++++-
  arch/x86/kvm/vmx/nested.h            |  14 +
- arch/x86/kvm/vmx/posted_intr.c       |   4 +
+ arch/x86/kvm/vmx/posted_intr.c       |  91 +++++
+ arch/x86/kvm/vmx/posted_intr.h       |  45 +++
  arch/x86/kvm/vmx/vmcs12.c            |   7 +
  arch/x86/kvm/vmx/vmcs12.h            |  53 +++
- arch/x86/kvm/vmx/vmx.c               |  36 ++
+ arch/x86/kvm/vmx/vmx.c               |  46 +++
  arch/x86/kvm/vmx/vmx.h               |  53 +++
- arch/x86/kvm/x86.c                   | 521 +++++++++++++++++++++++++++
+ arch/x86/kvm/x86.c                   | 539 +++++++++++++++++++++++++++
  drivers/clocksource/hyperv_timer.c   |   8 +
+ drivers/iommu/intel/iommu.c          |  20 +
  drivers/iommu/intel/irq_remapping.c  |   5 +
+ drivers/iommu/intel/svm.c            |   7 +
+ drivers/iommu/iommu.c                |  30 ++
  drivers/net/xen-netback/common.h     |  18 +
  drivers/net/xen-netback/rx.c         | 154 ++++++++
  drivers/nvme/host/core.c             |  14 +
  drivers/vfio/pci/vfio_pci_intrs.c    |  39 ++
  drivers/vfio/pci/vfio_pci_private.h  |   9 +
- drivers/vfio/vfio_iommu_type1.c      |  16 +
- drivers/xen/events/events_base.c     |  62 ++++
+ drivers/vfio/vfio_iommu_type1.c      |  89 +++++
+ drivers/xen/events/events_base.c     |  62 +++
  drivers/xen/events/events_internal.h |   4 +
  include/linux/clocksource.h          |  12 +
  include/linux/kvm_host.h             |  33 ++
  include/uapi/linux/kvm.h             |  12 +
+ kernel/cpu.c                         |  12 +
  kernel/sched/core.c                  |   8 +
- virt/kvm/kvm_main.c                  | 239 ++++++++++++
- 42 files changed, 2335 insertions(+), 1 deletion(-)
+ virt/kvm/eventfd.c                   |   4 +
+ virt/kvm/irqchip.c                   |   9 +
+ virt/kvm/kvm_main.c                  | 266 +++++++++++++
+ 49 files changed, 2677 insertions(+), 1 deletion(-)
 
 diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
 index 3d6616f6f6ef..0a91507d5aba 100644
@@ -2032,10 +2039,45 @@ index 197148d76b8f..aea9b37e069b 100644
  }
  
 diff --git a/arch/x86/kvm/vmx/posted_intr.c b/arch/x86/kvm/vmx/posted_intr.c
-index f02962dcc72c..3a7d93085052 100644
+index f02962dcc72c..af6bae898d0a 100644
 --- a/arch/x86/kvm/vmx/posted_intr.c
 +++ b/arch/x86/kvm/vmx/posted_intr.c
-@@ -21,6 +21,10 @@ static inline struct pi_desc *vcpu_to_pi_desc(struct kvm_vcpu *vcpu)
+@@ -9,10 +9,34 @@
+ #include "trace.h"
+ #include "vmx.h"
+ 
++/*
++ * 在以下使用POSTED_INTR_DESC_ADDR:
++ *   - arch/x86/include/asm/vmx.h|197| <<global>> POSTED_INTR_DESC_ADDR = 0x00002016,
++ *   - arch/x86/kvm/vmx/vmcs12.c|42| <<global>> FIELD64(POSTED_INTR_DESC_ADDR, posted_intr_desc_addr),
++ *   - arch/x86/kvm/vmx/nested.c|3282| <<nested_get_vmcs12_pages>> vmcs_write64(POSTED_INTR_DESC_ADDR,
++ *   - arch/x86/kvm/vmx/vmx.c|4341| <<init_vmcs>> vmcs_write64(POSTED_INTR_DESC_ADDR, __pa((&vmx->pi_desc)));
++ *
++ *
++ * 在以下使用POSTED_INTR_VECTOR:
++ *   - arch/x86/include/asm/irq_vectors.h|95| <<global>> #define POSTED_INTR_VECTOR 0xf2
++ *   - arch/x86/kernel/idt.c|138| <<global>> INTG(POSTED_INTR_VECTOR, asm_sysvec_kvm_posted_intr_ipi),
++ *   - arch/x86/include/asm/idtentry.h|660| <<SYM_CODE_END>> DECLARE_IDTENTRY_SYSVEC(POSTED_INTR_VECTOR, sysvec_kvm_posted_intr_ipi);
++ *   - arch/x86/kvm/vmx/posted_intr.c|155| <<__pi_post_block>> new.nv = POSTED_INTR_VECTOR;
++ *   - arch/x86/kvm/vmx/vmx.c|3933| <<kvm_vcpu_trigger_posted_interrupt>> int pi_vec = nested ? POSTED_INTR_NESTED_VECTOR : POSTED_INTR_VECTOR;
++ *   - arch/x86/kvm/vmx/vmx.c|4344| <<init_vmcs>> vmcs_write16(POSTED_INTR_NV, POSTED_INTR_VECTOR);
++ *   - arch/x86/kvm/vmx/vmx.c|6988| <<vmx_create_vcpu>> vmx->pi_desc.nv = POSTED_INTR_VECTOR;
++ */
++
+ /*
+  * We maintian a per-CPU linked-list of vCPU, so in wakeup_handler() we
+  * can find which vCPU should be waken up.
+  */
++/*
++ * 在以下使用blocked_vcpu_on_cpu:
++ *   - arch/x86/kvm/vmx/posted_intr.c|207| <<pi_pre_block>> list_add_tail(&vcpu->blocked_vcpu_list, &per_cpu(blocked_vcpu_on_cpu, vcpu->pre_pcpu));
++ *   - arch/x86/kvm/vmx/posted_intr.c|271| <<pi_wakeup_handler>> list_for_each_entry(vcpu, &per_cpu(blocked_vcpu_on_cpu, cpu),
++ *   - arch/x86/kvm/vmx/posted_intr.c|283| <<pi_init_cpu>> INIT_LIST_HEAD(&per_cpu(blocked_vcpu_on_cpu, cpu));
++ */
+ static DEFINE_PER_CPU(struct list_head, blocked_vcpu_on_cpu);
+ static DEFINE_PER_CPU(spinlock_t, blocked_vcpu_on_cpu_lock);
+ 
+@@ -21,6 +45,10 @@ static inline struct pi_desc *vcpu_to_pi_desc(struct kvm_vcpu *vcpu)
  	return &(to_vmx(vcpu)->pi_desc);
  }
  
@@ -2046,6 +2088,181 @@ index f02962dcc72c..3a7d93085052 100644
  void vmx_vcpu_pi_load(struct kvm_vcpu *vcpu, int cpu)
  {
  	struct pi_desc *pi_desc = vcpu_to_pi_desc(vcpu);
+@@ -77,6 +105,36 @@ void vmx_vcpu_pi_load(struct kvm_vcpu *vcpu, int cpu)
+ 		pi_set_on(pi_desc);
+ }
+ 
++/*
++ * vmx_vcpu_pi_put
++ * kvm_arch_vcpu_put
++ * kvm_sched_out
++ * __fire_sched_out_preempt_notifiers
++ * __schedule
++ * schedule
++ * kvm_vcpu_block
++ * kvm_arch_vcpu_ioctl_run
++ * kvm_vcpu_ioctl
++ * do_vfs_ioctl
++ * ksys_ioctl
++ * __x64_sys_ioctl
++ * do_syscall_64
++ * entry_SYSCALL_64_after_hwframe
++ *
++ * vmx_vcpu_pi_put
++ * kvm_arch_vcpu_put
++ * vcpu_put
++ * kvm_arch_vcpu_ioctl_run
++ * kvm_vcpu_ioctl
++ * do_vfs_ioctl
++ * ksys_ioctl
++ * __x64_sys_ioctl
++ * do_syscall_64
++ * entry_SYSCALL_64_after_hwframe
++ *
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|1409| <<vmx_vcpu_put>> vmx_vcpu_pi_put(vcpu);
++ */
+ void vmx_vcpu_pi_put(struct kvm_vcpu *vcpu)
+ {
+ 	struct pi_desc *pi_desc = vcpu_to_pi_desc(vcpu);
+@@ -151,6 +209,12 @@ int pi_pre_block(struct kvm_vcpu *vcpu)
+ 	if (!WARN_ON_ONCE(vcpu->pre_pcpu != -1)) {
+ 		vcpu->pre_pcpu = vcpu->cpu;
+ 		spin_lock(&per_cpu(blocked_vcpu_on_cpu_lock, vcpu->pre_pcpu));
++		/*
++		 * 在以下使用blocked_vcpu_on_cpu:
++		 *   - arch/x86/kvm/vmx/posted_intr.c|207| <<pi_pre_block>> list_add_tail(&vcpu->blocked_vcpu_list, &per_cpu(blocked_vcpu_on_cpu, vcpu->pre_pcpu));
++		 *   - arch/x86/kvm/vmx/posted_intr.c|271| <<pi_wakeup_handler>> list_for_each_entry(vcpu, &per_cpu(blocked_vcpu_on_cpu, cpu),
++		 *   - arch/x86/kvm/vmx/posted_intr.c|283| <<pi_init_cpu>> INIT_LIST_HEAD(&per_cpu(blocked_vcpu_on_cpu, cpu));
++		 */
+ 		list_add_tail(&vcpu->blocked_vcpu_list,
+ 			      &per_cpu(blocked_vcpu_on_cpu,
+ 				       vcpu->pre_pcpu));
+@@ -206,6 +270,10 @@ void pi_post_block(struct kvm_vcpu *vcpu)
+ /*
+  * Handler for POSTED_INTERRUPT_WAKEUP_VECTOR.
+  */
++/*
++ * 在以下使用pi_wakeup_handler():
++ *   - arch/x86/kvm/vmx/vmx.c|7915| <<hardware_setup>> kvm_set_posted_intr_wakeup_handler(pi_wakeup_handler);
++ */
+ void pi_wakeup_handler(void)
+ {
+ 	struct kvm_vcpu *vcpu;
+@@ -246,6 +314,23 @@ bool pi_has_pending_interrupt(struct kvm_vcpu *vcpu)
+  * @set: set or unset PI
+  * returns 0 on success, < 0 on failure
+  */
++/*
++ * kvm_arch_update_irqfd_routing
++ * kvm_set_irq_routing
++ * kvm_vm_ioctl
++ * do_vfs_ioctl
++ * ksys_ioctl
++ * __x64_sys_ioctl
++ * do_syscall_64
++ * entry_SYSCALL_64_after_hwframe
++ *
++ * called by:
++ *   - arch/x86/kvm/x86.c|11713| <<kvm_arch_irq_bypass_add_producer>> ret = kvm_x86_ops.update_pi_irte(irqfd->kvm,
++ *   - arch/x86/kvm/x86.c|11738| <<kvm_arch_irq_bypass_del_producer>> ret = kvm_x86_ops.update_pi_irte(irqfd->kvm, prod->irq, irqfd->gsi, 0);
++ *   - arch/x86/kvm/x86.c|11749| <<kvm_arch_update_irqfd_routing>> return kvm_x86_ops.update_pi_irte(kvm, host_irq, guest_irq, set);
++ *
++ * struct kvm_x86_ops vmx_x86_ops.update_pi_irte = pi_update_irte()
++ */
+ int pi_update_irte(struct kvm *kvm, unsigned int host_irq, uint32_t guest_irq,
+ 		   bool set)
+ {
+@@ -313,6 +398,12 @@ int pi_update_irte(struct kvm *kvm, unsigned int host_irq, uint32_t guest_irq,
+ 		trace_kvm_pi_irte_update(host_irq, vcpu->vcpu_id, e->gsi,
+ 				vcpu_info.vector, vcpu_info.pi_desc_addr, set);
+ 
++		/*
++		 * 唯一设置urgent的地方:
++		 *   - drivers/iommu/intel/irq_remapping.c|1222| <<intel_ir_set_vcpu_affinity>> irte_pi.p_urgent = 0;
++		 *
++		 * 最终会调用intel_ir_set_vcpu_affinity()
++		 */
+ 		if (set)
+ 			ret = irq_set_vcpu_affinity(host_irq, &vcpu_info);
+ 		else
+diff --git a/arch/x86/kvm/vmx/posted_intr.h b/arch/x86/kvm/vmx/posted_intr.h
+index 0bdc41391c5b..1324142dce30 100644
+--- a/arch/x86/kvm/vmx/posted_intr.h
++++ b/arch/x86/kvm/vmx/posted_intr.h
+@@ -5,8 +5,35 @@
+ #define POSTED_INTR_ON  0
+ #define POSTED_INTR_SN  1
+ 
++/*
++ * 在以下使用POSTED_INTR_DESC_ADDR:
++ *   - arch/x86/include/asm/vmx.h|197| <<global>> POSTED_INTR_DESC_ADDR = 0x00002016,
++ *   - arch/x86/kvm/vmx/vmcs12.c|42| <<global>> FIELD64(POSTED_INTR_DESC_ADDR, posted_intr_desc_addr),
++ *   - arch/x86/kvm/vmx/nested.c|3282| <<nested_get_vmcs12_pages>> vmcs_write64(POSTED_INTR_DESC_ADDR,
++ *   - arch/x86/kvm/vmx/vmx.c|4341| <<init_vmcs>> vmcs_write64(POSTED_INTR_DESC_ADDR, __pa((&vmx->pi_desc)));
++ *
++ *
++ * 在以下使用POSTED_INTR_VECTOR:
++ *   - arch/x86/include/asm/irq_vectors.h|95| <<global>> #define POSTED_INTR_VECTOR 0xf2
++ *   - arch/x86/kernel/idt.c|138| <<global>> INTG(POSTED_INTR_VECTOR, asm_sysvec_kvm_posted_intr_ipi),
++ *   - arch/x86/include/asm/idtentry.h|660| <<SYM_CODE_END>> DECLARE_IDTENTRY_SYSVEC(POSTED_INTR_VECTOR, sysvec_kvm_posted_intr_ipi);
++ *   - arch/x86/kvm/vmx/posted_intr.c|155| <<__pi_post_block>> new.nv = POSTED_INTR_VECTOR;
++ *   - arch/x86/kvm/vmx/vmx.c|3933| <<kvm_vcpu_trigger_posted_interrupt>> int pi_vec = nested ? POSTED_INTR_NESTED_VECTOR : POSTED_INTR_VECTOR;
++ *   - arch/x86/kvm/vmx/vmx.c|4344| <<init_vmcs>> vmcs_write16(POSTED_INTR_NV, POSTED_INTR_VECTOR);
++ *   - arch/x86/kvm/vmx/vmx.c|6988| <<vmx_create_vcpu>> vmx->pi_desc.nv = POSTED_INTR_VECTOR;
++ */
++
+ /* Posted-Interrupt Descriptor */
+ struct pi_desc {
++	/*
++	 * 在以下使用pi_desc->pir:
++	 *   - arch/x86/kvm/vmx/nested.c|3824| <<vmx_complete_nested_posted_interrupt>> max_irr = find_last_bit((unsigned long *)vmx->nested.pi_desc->pir, 256);
++	 *   - arch/x86/kvm/vmx/nested.c|3830| <<vmx_complete_nested_posted_interrupt>> __kvm_apic_update_irr(vmx->nested.pi_desc->pir,
++	 *   - arch/x86/kvm/vmx/posted_intr.h|50| <<pi_test_and_set_pir>> return test_and_set_bit(vector, (unsigned long *)pi_desc->pir);
++	 *   - arch/x86/kvm/vmx/posted_intr.h|59| <<pi_is_pir_empty>> return bitmap_empty((unsigned long *)pi_desc->pir, NR_VECTORS);
++	 *   - arch/x86/kvm/vmx/vmx.c|6330| <<vmx_sync_pir_to_irr>> kvm_apic_update_irr(vcpu, vmx->pi_desc.pir, &max_irr);
++	 *   - arch/x86/kvm/vmx/vmx.c|6369| <<vmx_apicv_post_state_restore>> memset(vmx->pi_desc.pir, 0, sizeof(vmx->pi_desc.pir));
++	 */
+ 	u32 pir[8];     /* Posted interrupt requested */
+ 	union {
+ 		struct {
+@@ -21,6 +48,15 @@ struct pi_desc {
+ 				/* bit 287:280 - Reserved */
+ 			u8	rsvd_2;
+ 				/* bit 319:288 - Notification Destination */
++			/*
++			 * 在以下修改pi_desc->ndst:
++			 *   - arch/x86/kvm/vmx/posted_intr.c|62| <<vmx_vcpu_pi_load>> new.ndst = dest;
++			 *   - arch/x86/kvm/vmx/posted_intr.c|64| <<vmx_vcpu_pi_load>> new.ndst = (dest << 8) & 0xFF00;
++			 *   - arch/x86/kvm/vmx/posted_intr.c|142| <<__pi_post_block>> new.ndst = dest;
++			 *   - arch/x86/kvm/vmx/posted_intr.c|144| <<__pi_post_block>> new.ndst = (dest << 8) & 0xFF00;
++			 *   - arch/x86/kvm/vmx/posted_intr.c|212| <<pi_pre_block>> new.ndst = dest;
++			 *   - arch/x86/kvm/vmx/posted_intr.c|214| <<pi_pre_block>> new.ndst = (dest << 8) & 0xFF00;
++			 */
+ 			u32	ndst;
+ 		};
+ 		u64 control;
+@@ -40,11 +76,20 @@ static inline bool pi_test_and_clear_on(struct pi_desc *pi_desc)
+ 			(unsigned long *)&pi_desc->control);
+ }
+ 
++/*
++ * __apic_accept_irq()
++ * -> kvm_x86_ops.deliver_posted_interrupt = vmx_deliver_posted_interrupt()
++ *    -> pi_test_and_set_pir()
++ */
+ static inline int pi_test_and_set_pir(int vector, struct pi_desc *pi_desc)
+ {
+ 	return test_and_set_bit(vector, (unsigned long *)pi_desc->pir);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/vmx/posted_intr.c|95| <<vmx_vcpu_pi_put>> pi_set_sn(pi_desc);
++ */
+ static inline bool pi_is_pir_empty(struct pi_desc *pi_desc)
+ {
+ 	return bitmap_empty((unsigned long *)pi_desc->pir, NR_VECTORS);
 diff --git a/arch/x86/kvm/vmx/vmcs12.c b/arch/x86/kvm/vmx/vmcs12.c
 index c8e51c004f78..17a64bc76564 100644
 --- a/arch/x86/kvm/vmx/vmcs12.c
@@ -2158,7 +2375,7 @@ index 80232daf00ff..5cb3dcadef0a 100644
  
  	switch (vmcs_field_width(field)) {
 diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
-index eb69fef57485..0138b8a84dab 100644
+index eb69fef57485..1f38bc24cd88 100644
 --- a/arch/x86/kvm/vmx/vmx.c
 +++ b/arch/x86/kvm/vmx/vmx.c
 @@ -1759,6 +1759,17 @@ static u64 vmx_write_l1_tsc_offset(struct kvm_vcpu *vcpu, u64 offset)
@@ -2191,7 +2408,31 @@ index eb69fef57485..0138b8a84dab 100644
  int alloc_loaded_vmcs(struct loaded_vmcs *loaded_vmcs)
  {
  	loaded_vmcs->vmcs = alloc_vmcs(false);
-@@ -4876,6 +4892,9 @@ static int handle_triple_fault(struct kvm_vcpu *vcpu)
+@@ -3976,6 +3992,12 @@ static int vmx_deliver_nested_posted_interrupt(struct kvm_vcpu *vcpu,
+  * 2. If target vcpu isn't running(root mode), kick it to pick up the
+  * interrupt from PIR in next vmentry.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|1093| <<__apic_accept_irq>> if (kvm_x86_ops.deliver_posted_interrupt(vcpu, vector)) {
++ *
++ * struct kvm_x86_ops vmx_x86_ops.deliver_posted_interrupt = vmx_deliver_posted_interrupt()
++ */
+ static int vmx_deliver_posted_interrupt(struct kvm_vcpu *vcpu, int vector)
+ {
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+@@ -4287,6 +4309,10 @@ static void ept_set_mmio_spte_mask(void)
+  * Noting that the initialization of Guest-state Area of VMCS is in
+  * vmx_vcpu_reset().
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|6954| <<vmx_create_vcpu>> init_vmcs(vmx);
++ */
+ static void init_vmcs(struct vcpu_vmx *vmx)
+ {
+ 	if (nested)
+@@ -4876,6 +4902,9 @@ static int handle_triple_fault(struct kvm_vcpu *vcpu)
  	return 0;
  }
  
@@ -2201,7 +2442,7 @@ index eb69fef57485..0138b8a84dab 100644
  static int handle_io(struct kvm_vcpu *vcpu)
  {
  	unsigned long exit_qualification;
-@@ -5605,6 +5624,13 @@ static int handle_encls(struct kvm_vcpu *vcpu)
+@@ -5605,6 +5634,13 @@ static int handle_encls(struct kvm_vcpu *vcpu)
   * may resume.  Otherwise they set the kvm_run parameter to indicate what needs
   * to be done to userspace and return 0.
   */
@@ -2215,7 +2456,7 @@ index eb69fef57485..0138b8a84dab 100644
  static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
  	[EXIT_REASON_EXCEPTION_NMI]           = handle_exception_nmi,
  	[EXIT_REASON_EXTERNAL_INTERRUPT]      = handle_external_interrupt,
-@@ -5908,6 +5934,12 @@ void dump_vmcs(void)
+@@ -5908,6 +5944,12 @@ void dump_vmcs(void)
   * The guest has exited.  See if we can fix it or if we need userspace
   * assistance.
   */
@@ -2228,7 +2469,7 @@ index eb69fef57485..0138b8a84dab 100644
  static int vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
  {
  	struct vcpu_vmx *vmx = to_vmx(vcpu);
-@@ -6531,6 +6563,10 @@ static void atomic_switch_perf_msrs(struct vcpu_vmx *vmx)
+@@ -6531,6 +6573,10 @@ static void atomic_switch_perf_msrs(struct vcpu_vmx *vmx)
  					msrs[i].host, false);
  }
  
@@ -2323,7 +2564,7 @@ index 9d3a557949ac..58dee7141605 100644
  
  	/*
 diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
-index 1b404e4d7dd8..8dcc68b5b56f 100644
+index 1b404e4d7dd8..69449129addd 100644
 --- a/arch/x86/kvm/x86.c
 +++ b/arch/x86/kvm/x86.c
 @@ -123,6 +123,12 @@ module_param(report_ignored_msrs, bool, S_IRUGO | S_IWUSR);
@@ -3273,6 +3514,38 @@ index 1b404e4d7dd8..8dcc68b5b56f 100644
  void kvm_arch_mmu_notifier_invalidate_range(struct kvm *kvm,
  					    unsigned long start, unsigned long end)
  {
+@@ -11139,6 +11660,11 @@ bool kvm_arch_can_dequeue_async_page_present(struct kvm_vcpu *vcpu)
+ 		return apf_pageready_slot_free(vcpu);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|11712| <<kvm_arch_irq_bypass_add_producer>> kvm_arch_start_assignment(irqfd->kvm);
++ *   - virt/kvm/vfio.c|229| <<kvm_vfio_set_group>> kvm_arch_start_assignment(dev->kvm);
++ */
+ void kvm_arch_start_assignment(struct kvm *kvm)
+ {
+ 	atomic_inc(&kvm->arch.assigned_device_count);
+@@ -11222,6 +11748,19 @@ void kvm_arch_irq_bypass_del_producer(struct irq_bypass_consumer *cons,
+ 	kvm_arch_end_assignment(irqfd->kvm);
+ }
+ 
++/*
++ * kvm_arch_update_irqfd_routing
++ * kvm_set_irq_routing
++ * kvm_vm_ioctl
++ * do_vfs_ioctl
++ * ksys_ioctl
++ * __x64_sys_ioctl
++ * do_syscall_64
++ * entry_SYSCALL_64_after_hwframe
++ *
++ * called by:
++ *   - virt/kvm/eventfd.c|622| <<kvm_irq_routing_update>> int ret = kvm_arch_update_irqfd_routing(
++ */
+ int kvm_arch_update_irqfd_routing(struct kvm *kvm, unsigned int host_irq,
+ 				   uint32_t guest_irq, bool set)
+ {
 diff --git a/drivers/clocksource/hyperv_timer.c b/drivers/clocksource/hyperv_timer.c
 index ba04cb381cd3..fda896358526 100644
 --- a/drivers/clocksource/hyperv_timer.c
@@ -3299,6 +3572,44 @@ index ba04cb381cd3..fda896358526 100644
  void __init hv_init_clocksource(void)
  {
  	/*
+diff --git a/drivers/iommu/intel/iommu.c b/drivers/iommu/intel/iommu.c
+index 06b00b5363d8..ef3f2a07bd6a 100644
+--- a/drivers/iommu/intel/iommu.c
++++ b/drivers/iommu/intel/iommu.c
+@@ -982,6 +982,12 @@ static void free_context_table(struct intel_iommu *iommu)
+ 	spin_unlock_irqrestore(&iommu->lock, flags);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/iommu/intel/iommu.c|2325| <<__domain_mapping>> first_pte = pte = pfn_to_dma_pte(domain, iov_pfn, &largepage_lvl);
++ *   - drivers/iommu/intel/iommu.c|4987| <<intel_iommu_unmap>> BUG_ON(!pfn_to_dma_pte(dmar_domain, iova >> VTD_PAGE_SHIFT, &level));
++ *   - drivers/iommu/intel/iommu.c|5034| <<intel_iommu_iova_to_phys>> pte = pfn_to_dma_pte(dmar_domain, iova >> VTD_PAGE_SHIFT, &level);
++ */
+ static struct dma_pte *pfn_to_dma_pte(struct dmar_domain *domain,
+ 				      unsigned long pfn, int *target_level)
+ {
+@@ -2396,6 +2402,20 @@ __domain_mapping(struct dmar_domain *domain, unsigned long iov_pfn,
+ 	return 0;
+ }
+ 
++/*
++ * domain_mapping
++ * iommu_map
++ * vfio_pin_map_dma_chunk
++ * __padata_do_multithreaded
++ * vfio_dma_do_map
++ * vfio_iommu_type1_ioctl
++ * vfio_fops_unl_ioctl
++ * do_vfs_ioctl
++ * ksys_ioctl
++ * __x64_sys_ioctl
++ * do_syscall_64
++ * entry_SYSCALL_64_after_hwframe
++ */
+ static int
+ domain_mapping(struct dmar_domain *domain, unsigned long iov_pfn,
+ 	       unsigned long phys_pfn, unsigned long nr_pages, int prot)
 diff --git a/drivers/iommu/intel/irq_remapping.c b/drivers/iommu/intel/irq_remapping.c
 index 685200a5cff0..8fa957958b23 100644
 --- a/drivers/iommu/intel/irq_remapping.c
@@ -3315,6 +3626,79 @@ index 685200a5cff0..8fa957958b23 100644
  static inline void set_irq_posting_cap(void)
  {
  	struct dmar_drhd_unit *drhd;
+diff --git a/drivers/iommu/intel/svm.c b/drivers/iommu/intel/svm.c
+index 18a9f05df407..d2dc0d7ec425 100644
+--- a/drivers/iommu/intel/svm.c
++++ b/drivers/iommu/intel/svm.c
+@@ -497,6 +497,10 @@ static void load_pasid(struct mm_struct *mm, u32 pasid)
+ }
+ 
+ /* Caller must hold pasid_mutex, mm reference */
++/*
++ * called by:
++ *   - drivers/iommu/intel/svm.c|1108| <<intel_svm_bind>> ret = intel_svm_bind_mm(dev, flags, NULL, mm, &sdev);
++ */
+ static int
+ intel_svm_bind_mm(struct device *dev, unsigned int flags,
+ 		  struct svm_dev_ops *ops,
+@@ -1141,6 +1145,9 @@ u32 intel_svm_get_pasid(struct iommu_sva *sva)
+ 	return pasid;
+ }
+ 
++/*
++ * struct iommu_ops intel_iommu_ops.page_response = intel_svm_page_response()
++ */
+ int intel_svm_page_response(struct device *dev,
+ 			    struct iommu_fault_event *evt,
+ 			    struct iommu_page_response *msg)
+diff --git a/drivers/iommu/iommu.c b/drivers/iommu/iommu.c
+index ffeebda8d6de..21c3fb9c5beb 100644
+--- a/drivers/iommu/iommu.c
++++ b/drivers/iommu/iommu.c
+@@ -2438,6 +2438,30 @@ static int __iommu_map(struct iommu_domain *domain, unsigned long iova,
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm/mm/dma-mapping.c|1335| <<__iommu_create_mapping>> ret = iommu_map(mapping->domain, iova, phys, len,
++ *   - arch/arm/mm/dma-mapping.c|1605| <<__map_sg_chunk>> ret = iommu_map(mapping->domain, iova, phys, len, prot);
++ *   - arch/arm/mm/dma-mapping.c|1816| <<arm_coherent_iommu_map_page>> ret = iommu_map(mapping->domain, dma_addr, page_to_phys(page), len, prot);
++ *   - arch/arm/mm/dma-mapping.c|1922| <<arm_iommu_map_resource>> ret = iommu_map(mapping->domain, dma_addr, addr, len, prot);
++ *   - drivers/gpu/drm/nouveau/nvkm/subdev/instmem/gk20a.c|477| <<gk20a_instobj_ctor_iommu>> ret = iommu_map(imem->domain, offset, node->dma_addrs[i],
++ *   - drivers/gpu/drm/tegra/drm.c|1004| <<tegra_drm_alloc>> err = iommu_map(tegra->domain, *dma, virt_to_phys(virt),
++ *   - drivers/gpu/host1x/cdma.c|107| <<host1x_pushbuffer_init>> err = iommu_map(host1x->domain, pb->dma, pb->phys, size,
++ *   - drivers/infiniband/hw/usnic/usnic_uiom.c|284| <<usnic_uiom_map_sorted_intervals>> err = iommu_map(pd->domain, va_start, pa_start,
++ *   - drivers/infiniband/hw/usnic/usnic_uiom.c|301| <<usnic_uiom_map_sorted_intervals>> err = iommu_map(pd->domain, va_start, pa_start,
++ *   - drivers/iommu/dma-iommu.c|1364| <<iommu_dma_get_msi_page>> if (iommu_map(domain, iova, msi_addr, size, prot))
++ *   - drivers/iommu/iommu.c|775| <<iommu_create_device_direct_mappings>> ret = iommu_map(domain, addr - map_size,
++ *   - drivers/media/platform/qcom/venus/firmware.c|143| <<venus_boot_no_tz>> ret = iommu_map(iommu, VENUS_FW_START_ADDR, mem_phys, mem_size,
++ *   - drivers/net/ipa/ipa_mem.c|314| <<ipa_imem_init>> ret = iommu_map(domain, iova, phys, size, IOMMU_READ | IOMMU_WRITE);
++ *   - drivers/net/ipa/ipa_mem.c|422| <<ipa_smem_init>> ret = iommu_map(domain, iova, phys, size, IOMMU_READ | IOMMU_WRITE);
++ *   - drivers/net/wireless/ath/ath10k/snoc.c|1567| <<ath10k_fw_init>> ret = iommu_map(iommu_dom, ar_snoc->fw.fw_start_addr,
++ *   - drivers/remoteproc/remoteproc_core.c|745| <<rproc_handle_devmem>> ret = iommu_map(rproc->domain, rsc->da, rsc->pa, rsc->len, rsc->flags);
++ *   - drivers/remoteproc/remoteproc_core.c|836| <<rproc_alloc_carveout>> ret = iommu_map(rproc->domain, mem->da, dma, mem->len,
++ *   - drivers/vfio/vfio_iommu_type1.c|1234| <<vfio_iommu_map>> ret = iommu_map(d->domain, iova, (phys_addr_t)pfn << PAGE_SHIFT,
++ *   - drivers/vfio/vfio_iommu_type1.c|1512| <<vfio_iommu_replay>> ret = iommu_map(domain->domain, iova, phys,
++ *   - drivers/vfio/vfio_iommu_type1.c|1596| <<vfio_test_domain_fgsp>> ret = iommu_map(domain->domain, 0, page_to_phys(pages), PAGE_SIZE * 2,
++ *   - drivers/vhost/vdpa.c|572| <<vhost_vdpa_map>> r = iommu_map(v->domain, iova, pa, size,
++ */
+ int iommu_map(struct iommu_domain *domain, unsigned long iova,
+ 	      phys_addr_t paddr, size_t size, int prot)
+ {
+@@ -2971,6 +2995,12 @@ EXPORT_SYMBOL_GPL(iommu_aux_get_pasid);
+  *
+  * On error, returns an ERR_PTR value.
+  */
++/*
++ * called by:
++ *   - drivers/dma/idxd/cdev.c|106| <<idxd_cdev_open>> sva = iommu_sva_bind_device(dev, current->mm, NULL);
++ *   - drivers/dma/idxd/init.c|305| <<idxd_enable_system_pasid>> sva = iommu_sva_bind_device(&idxd->pdev->dev, NULL, &flags);
++ *   - drivers/misc/uacce/uacce.c|102| <<uacce_bind_queue>> handle = iommu_sva_bind_device(uacce->parent, current->mm, NULL);
++ */
+ struct iommu_sva *
+ iommu_sva_bind_device(struct device *dev, struct mm_struct *mm, void *drvdata)
+ {
 diff --git a/drivers/net/xen-netback/common.h b/drivers/net/xen-netback/common.h
 index 8ee24e351bdc..045553a0957d 100644
 --- a/drivers/net/xen-netback/common.h
@@ -3817,10 +4201,54 @@ index 5c90e560c5c7..64dcf198b3d6 100644
  	struct list_head	dummy_resources_list;
  	struct mutex		ioeventfds_lock;
 diff --git a/drivers/vfio/vfio_iommu_type1.c b/drivers/vfio/vfio_iommu_type1.c
-index 0b4dedaa9128..4e23070319a5 100644
+index 0b4dedaa9128..104d9e4acc06 100644
 --- a/drivers/vfio/vfio_iommu_type1.c
 +++ b/drivers/vfio/vfio_iommu_type1.c
-@@ -453,6 +453,9 @@ static int vaddr_get_pfn(struct mm_struct *mm, unsigned long vaddr,
+@@ -90,6 +90,17 @@ struct vfio_dma {
+ 	unsigned long		vaddr;		/* Process virtual addr */
+ 	size_t			size;		/* Map size (bytes) */
+ 	int			prot;		/* IOMMU_READ/WRITE */
++	/*
++	 * 在以下设置vfio_dma->iommu_mapped:
++	 *   - drivers/vfio/vfio_iommu_type1.c|948| <<vfio_unmap_unpin>> dma->iommu_mapped = false;
++	 *   - drivers/vfio/vfio_iommu_type1.c|1286| <<vfio_pin_map_dma>> dma->iommu_mapped = true;
++	 *   - drivers/vfio/vfio_iommu_type1.c|1531| <<vfio_iommu_replay>> dma->iommu_mapped = true;
++	 * 在以下使用vfio_dma->iommu_mapped:
++	 *   - drivers/vfio/vfio_iommu_type1.c|1010| <<update_user_bitmap>> if (!iommu->pinned_page_dirty_scope && dma->iommu_mapped)
++	 *   - drivers/vfio/vfio_iommu_type1.c|1467| <<vfio_iommu_replay>> if (dma->iommu_mapped) {
++	 *   - drivers/vfio/vfio_iommu_type1.c|1515| <<vfio_iommu_replay>> if (!dma->iommu_mapped)
++	 *   - drivers/vfio/vfio_iommu_type1.c|1541| <<vfio_iommu_replay>> if (dma->iommu_mapped) {
++	 */
+ 	bool			iommu_mapped;
+ 	bool			lock_cap;	/* capable(CAP_IPC_LOCK) */
+ 	struct task_struct	*task;
+@@ -173,6 +184,10 @@ static struct vfio_dma *vfio_find_dma(struct vfio_iommu *iommu,
+ 	return NULL;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|1410| <<vfio_dma_do_map>> vfio_link_dma(iommu, dma);
++ */
+ static void vfio_link_dma(struct vfio_iommu *iommu, struct vfio_dma *new)
+ {
+ 	struct rb_node **link = &iommu->dma_list.rb_node, *parent = NULL;
+@@ -441,6 +456,14 @@ static int follow_fault_pfn(struct vm_area_struct *vma, struct mm_struct *mm,
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|516| <<vfio_pin_pages_remote>> ret = vaddr_get_pfn(current->mm, vaddr, dma->prot, pfn_base);
++ *   - drivers/vfio/vfio_iommu_type1.c|543| <<vfio_pin_pages_remote>> ret = vaddr_get_pfn(current->mm, vaddr, dma->prot, &pfn);
++ *   - drivers/vfio/vfio_iommu_type1.c|613| <<vfio_pin_page_external>> ret = vaddr_get_pfn(mm, vaddr, dma->prot, pfn_base);
++ *
++ * 一次处理一个page
++ */
+ static int vaddr_get_pfn(struct mm_struct *mm, unsigned long vaddr,
+ 			 int prot, unsigned long *pfn)
+ {
+@@ -453,6 +476,9 @@ static int vaddr_get_pfn(struct mm_struct *mm, unsigned long vaddr,
  		flags |= FOLL_WRITE;
  
  	mmap_read_lock(mm);
@@ -3830,7 +4258,7 @@ index 0b4dedaa9128..4e23070319a5 100644
  	ret = pin_user_pages_remote(mm, vaddr, 1, flags | FOLL_LONGTERM,
  				    page, NULL, NULL);
  	if (ret == 1) {
-@@ -484,6 +487,19 @@ static int vaddr_get_pfn(struct mm_struct *mm, unsigned long vaddr,
+@@ -484,6 +510,19 @@ static int vaddr_get_pfn(struct mm_struct *mm, unsigned long vaddr,
   * the iommu can only map chunks of consecutive pfns anyway, so get the
   * first page and all consecutive pages with the same locking.
   */
@@ -3850,6 +4278,97 @@ index 0b4dedaa9128..4e23070319a5 100644
  static long vfio_pin_pages_remote(struct vfio_dma *dma, unsigned long vaddr,
  				  long npage, unsigned long *pfn_base,
  				  unsigned long limit)
+@@ -524,6 +563,9 @@ static long vfio_pin_pages_remote(struct vfio_dma *dma, unsigned long vaddr,
+ 	/* Lock all the consecutive pages from pfn_base */
+ 	for (vaddr += PAGE_SIZE, iova += PAGE_SIZE; pinned < npage;
+ 	     pinned++, vaddr += PAGE_SIZE, iova += PAGE_SIZE) {
++		/*
++		 * 一次处理一个page
++		 */
+ 		ret = vaddr_get_pfn(current->mm, vaddr, dma->prot, &pfn);
+ 		if (ret)
+ 			break;
+@@ -1234,9 +1276,27 @@ static int vfio_iommu_map(struct vfio_iommu *iommu, dma_addr_t iova,
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|1416| <<vfio_dma_do_map>> ret = vfio_pin_map_dma(iommu, dma, size);
++ */
+ static int vfio_pin_map_dma(struct vfio_iommu *iommu, struct vfio_dma *dma,
+ 			    size_t map_size)
+ {
++	/*
++	 * struct vfio_dma {
++	 *     struct rb_node          node;
++	 *     dma_addr_t              iova;           // Device address
++	 *     unsigned long           vaddr;          // Process virtual addr
++	 *     size_t                  size;           // Map size (bytes)
++	 *     int                     prot;           // IOMMU_READ/WRITE
++	 *     bool                    iommu_mapped;
++	 *     bool                    lock_cap;       // capable(CAP_IPC_LOCK)
++	 *     struct task_struct      *task;
++	 *     struct rb_root          pfn_list;       // Ex-user pinned pfn list
++	 *     unsigned long           *bitmap;
++	 * };
++	 */
+ 	dma_addr_t iova = dma->iova;
+ 	unsigned long vaddr = dma->vaddr;
+ 	size_t size = map_size;
+@@ -1267,6 +1327,17 @@ static int vfio_pin_map_dma(struct vfio_iommu *iommu, struct vfio_dma *dma,
+ 		dma->size += npage << PAGE_SHIFT;
+ 	}
+ 
++	/*
++	 * 在以下设置vfio_dma->iommu_mapped:
++	 *   - drivers/vfio/vfio_iommu_type1.c|948| <<vfio_unmap_unpin>> dma->iommu_mapped = false;
++	 *   - drivers/vfio/vfio_iommu_type1.c|1286| <<vfio_pin_map_dma>> dma->iommu_mapped = true;
++	 *   - drivers/vfio/vfio_iommu_type1.c|1531| <<vfio_iommu_replay>> dma->iommu_mapped = true;
++	 * 在以下使用vfio_dma->iommu_mapped:
++	 *   - drivers/vfio/vfio_iommu_type1.c|1010| <<update_user_bitmap>> if (!iommu->pinned_page_dirty_scope && dma->iommu_mapped)
++	 *   - drivers/vfio/vfio_iommu_type1.c|1467| <<vfio_iommu_replay>> if (dma->iommu_mapped) {
++	 *   - drivers/vfio/vfio_iommu_type1.c|1515| <<vfio_iommu_replay>> if (!dma->iommu_mapped)
++	 *   - drivers/vfio/vfio_iommu_type1.c|1541| <<vfio_iommu_replay>> if (dma->iommu_mapped) {
++	 */
+ 	dma->iommu_mapped = true;
+ 
+ 	if (ret)
+@@ -1296,9 +1367,24 @@ static bool vfio_iommu_iova_dma_valid(struct vfio_iommu *iommu,
+ 	return list_empty(iova);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|2717| <<vfio_iommu_type1_map_dma>> return vfio_dma_do_map(iommu, &map);
++ */
+ static int vfio_dma_do_map(struct vfio_iommu *iommu,
+ 			   struct vfio_iommu_type1_dma_map *map)
+ {
++	/*
++	 * struct vfio_iommu_type1_dma_map {
++	 *     __u32   argsz;
++	 *     __u32   flags;
++	 * #define VFIO_DMA_MAP_FLAG_READ (1 << 0)         // readable from device
++	 * #define VFIO_DMA_MAP_FLAG_WRITE (1 << 1)        // writable from device
++	 *     __u64   vaddr;                          // Process virtual address
++	 *     __u64   iova;                           // IO virtual address
++	 *     __u64   size;                           // Size of mapping (bytes)
++	 * };
++	 */
+ 	dma_addr_t iova = map->iova;
+ 	unsigned long vaddr = map->vaddr;
+ 	size_t size = map->size;
+@@ -2851,6 +2937,9 @@ static int vfio_iommu_type1_dirty_pages(struct vfio_iommu *iommu,
+ 	return -EINVAL;
+ }
+ 
++/*
++ * struct vfio_iommu_driver_ops vfio_iommu_driver_ops_type1.ioctl = vfio_iommu_type1_ioctl()
++ */
+ static long vfio_iommu_type1_ioctl(void *iommu_data,
+ 				   unsigned int cmd, unsigned long arg)
+ {
 diff --git a/drivers/xen/events/events_base.c b/drivers/xen/events/events_base.c
 index e850f79351cb..308fff4f98da 100644
 --- a/drivers/xen/events/events_base.c
@@ -4081,6 +4600,29 @@ index 374c67875cdb..f784a924e641 100644
  #define KVM_MEM_READONLY	(1UL << 1)
  
  /* for KVM_IRQ_LINE */
+diff --git a/kernel/cpu.c b/kernel/cpu.c
+index 4e11e91010e1..a21131530723 100644
+--- a/kernel/cpu.c
++++ b/kernel/cpu.c
+@@ -145,6 +145,18 @@ static struct cpuhp_step *cpuhp_get_step(enum cpuhp_state state)
+  *
+  * Called from cpu hotplug and from the state register machinery.
+  */
++/*
++ * called by:
++ *   - kernel/cpu.c|590| <<undo_cpu_up>> cpuhp_invoke_callback(cpu, st->state, false, NULL, NULL);
++ *   - kernel/cpu.c|615| <<cpuhp_up_callbacks>> ret = cpuhp_invoke_callback(cpu, st->state, true, NULL, NULL);
++ *   - kernel/cpu.c|703| <<cpuhp_thread_fun>> st->result = cpuhp_invoke_callback(cpu, state, bringup, st->node, &st->last);
++ *   - kernel/cpu.c|711| <<cpuhp_thread_fun>> st->result = cpuhp_invoke_callback(cpu, state, bringup, st->node, &st->last);
++ *   - kernel/cpu.c|753| <<cpuhp_invoke_ap_callback>> return cpuhp_invoke_callback(cpu, state, bringup, node, NULL);
++ *   - kernel/cpu.c|884| <<take_cpu_down>> ret = cpuhp_invoke_callback(cpu, st->state, false, NULL, NULL);
++ *   - kernel/cpu.c|974| <<undo_cpu_down>> cpuhp_invoke_callback(cpu, st->state, true, NULL, NULL);
++ *   - kernel/cpu.c|984| <<cpuhp_down_callbacks>> ret = cpuhp_invoke_callback(cpu, st->state, false, NULL, NULL);
++ *   - kernel/cpu.c|1162| <<notify_cpu_starting>> ret = cpuhp_invoke_callback(cpu, st->state, true, NULL, NULL);
++ */
+ static int cpuhp_invoke_callback(unsigned int cpu, enum cpuhp_state state,
+ 				 bool bringup, struct hlist_node *node,
+ 				 struct hlist_node **lastp)
 diff --git a/kernel/sched/core.c b/kernel/sched/core.c
 index ff74fca39ed2..adfe79bc55dc 100644
 --- a/kernel/sched/core.c
@@ -4100,8 +4642,43 @@ index ff74fca39ed2..adfe79bc55dc 100644
  static DEFINE_STATIC_KEY_FALSE(preempt_notifier_key);
  
  void preempt_notifier_inc(void)
+diff --git a/virt/kvm/eventfd.c b/virt/kvm/eventfd.c
+index e996989cd580..9e1991af6268 100644
+--- a/virt/kvm/eventfd.c
++++ b/virt/kvm/eventfd.c
+@@ -608,6 +608,10 @@ kvm_irqfd_release(struct kvm *kvm)
+  * Take note of a change in irq routing.
+  * Caller must invoke synchronize_srcu(&kvm->irq_srcu) afterwards.
+  */
++/*
++ * called by:
++ *   - virt/kvm/irqchip.c|222| <<kvm_set_irq_routing>> kvm_irq_routing_update(kvm);
++ */
+ void kvm_irq_routing_update(struct kvm *kvm)
+ {
+ 	struct kvm_kernel_irqfd *irqfd;
+diff --git a/virt/kvm/irqchip.c b/virt/kvm/irqchip.c
+index 58e4f88b2b9f..2f8ba72efff7 100644
+--- a/virt/kvm/irqchip.c
++++ b/virt/kvm/irqchip.c
+@@ -166,6 +166,15 @@ bool __weak kvm_arch_can_set_irq_routing(struct kvm *kvm)
+ 	return true;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/vgic/vgic-irqfd.c|152| <<kvm_vgic_setup_default_irq_routing>> ret = kvm_set_irq_routing(kvm, entries, nr, 0);
++ *   - arch/powerpc/kvm/mpic.c|1649| <<mpic_set_default_irq_routing>> kvm_set_irq_routing(opp->kvm, routing, 0, 0);
++ *   - arch/s390/kvm/kvm-s390.c|2391| <<kvm_arch_vm_ioctl>> r = kvm_set_irq_routing(kvm, &routing, 0, 0);
++ *   - arch/x86/kvm/irq_comm.c|375| <<kvm_setup_default_irq_routing>> return kvm_set_irq_routing(kvm, default_routing,
++ *   - arch/x86/kvm/irq_comm.c|383| <<kvm_setup_empty_irq_routing>> return kvm_set_irq_routing(kvm, empty_routing, 0, 0);
++ *   - virt/kvm/kvm_main.c|4171| <<kvm_vm_ioctl>> r = kvm_set_irq_routing(kvm, entries, routing.nr,
++ */
+ int kvm_set_irq_routing(struct kvm *kvm,
+ 			const struct kvm_irq_routing_entry *ue,
+ 			unsigned nr,
 diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
-index 8367d88ce39b..b6b8d32ae342 100644
+index 8367d88ce39b..27af678d79f8 100644
 --- a/virt/kvm/kvm_main.c
 +++ b/virt/kvm/kvm_main.c
 @@ -107,7 +107,22 @@ static atomic_t hardware_enable_failed;
@@ -4532,7 +5109,48 @@ index 8367d88ce39b..b6b8d32ae342 100644
  void kvm_vcpu_on_spin(struct kvm_vcpu *me, bool yield_to_kernel_mode)
  {
  	struct kvm *kvm = me->kvm;
-@@ -4885,6 +5109,17 @@ static void check_processor_compat(void *data)
+@@ -4819,6 +5043,20 @@ struct kvm_vcpu *preempt_notifier_to_vcpu(struct preempt_notifier *pn)
+ 	return container_of(pn, struct kvm_vcpu, preempt_notifier);
+ }
+ 
++/*
++ * kvm_sched_in
++ * finish_task_switch
++ * __schedule
++ * schedule
++ * kvm_vcpu_block
++ * kvm_arch_vcpu_ioctl_run
++ * kvm_vcpu_ioctl
++ * do_vfs_ioctl
++ * ksys_ioctl
++ * __x64_sys_ioctl
++ * do_syscall_64
++ * entry_SYSCALL_64_after_hwframe
++ */
+ static void kvm_sched_in(struct preempt_notifier *pn, int cpu)
+ {
+ 	struct kvm_vcpu *vcpu = preempt_notifier_to_vcpu(pn);
+@@ -4831,6 +5069,19 @@ static void kvm_sched_in(struct preempt_notifier *pn, int cpu)
+ 	kvm_arch_vcpu_load(vcpu, cpu);
+ }
+ 
++/*
++ * kvm_sched_out
++ * __schedule
++ * schedule
++ * kvm_vcpu_block
++ * kvm_arch_vcpu_ioctl_run
++ * kvm_vcpu_ioctl
++ * do_vfs_ioctl
++ * ksys_ioctl
++ * __x64_sys_ioctl
++ * do_syscall_64
++ * entry_SYSCALL_64_after_hwframe
++ */
+ static void kvm_sched_out(struct preempt_notifier *pn,
+ 			  struct task_struct *next)
+ {
+@@ -4885,6 +5136,17 @@ static void check_processor_compat(void *data)
  	*c->ret = kvm_arch_check_processor_compat(c->opaque);
  }
  
@@ -4550,7 +5168,7 @@ index 8367d88ce39b..b6b8d32ae342 100644
  int kvm_init(void *opaque, unsigned vcpu_size, unsigned vcpu_align,
  		  struct module *module)
  {
-@@ -5061,6 +5296,10 @@ static int kvm_vm_worker_thread(void *context)
+@@ -5061,6 +5323,10 @@ static int kvm_vm_worker_thread(void *context)
  	return err;
  }
  

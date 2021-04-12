@@ -1,0 +1,75 @@
+
+
+Posted-interrupt processing is a feature by which a processor processes the virtual interrupts by recording them as pending on the virtual-APIC page.
+
+具体使用的posted-interrupt notification vector的至写入了vmcs_write16(POSTED_INTR_NV, POSTED_INTR_VECTOR)
+
+当物理cpu收到一个interrupt的时候, posted-interrupt processing会被使用当到来的中断和posted-interrupt notification vector相等.
+
+根据intel manual, 当一个正在guest mode的物理CPU在运行的时候, 有可能会收到各种interrupt. 根据一般的配置(比如external-interrupt exiting), 收到中断后物理cpu就会从guest mode来trap到host mode.
+
+然而, 如果使用了posted interrupt就不会trap了. 比如说别的物理cpu发送了POSTED_INTR_VECTOR的IPI, 或者是vt-d的设备发送了posted vector.
+
+cpu posted interrupt只需要Posted-Interrupt Descriptor的Posted-interrupt requests (PIR) 和Outstanding Notification (ON).
+
+------------------------------
+
+CPU Posted Interrupt
+
+假设目标的物理CPU正运行在guest mode, 当前的CPU想要往目标CPU inject interrupt.
+
+vmx_deliver_posted_interrupt(): 当前CPU会把目标CPU对应的vcpu的vmx->pi_desc的PIR中对应的要插入的vector的bit设置上, 然后通过IPI向目标CPU发送POSTED_INTR_VECTOR.
+
+目标CPU被中断后会在硬件层次确认IPI的vector(POSTED_INTR_VECTOR)是否和VMCS中的posted vector相同, 如果相同, 接下来的工作都是由CPU硬件自动完成的.
+
+目标CPU硬件会清空vmx->pi_desc中的ON bit, 把CPU硬件IPI相关的EOI清空, 把PIR的bit同步到vAPIC的VIRR, 设置RVI的值, 最后目标CPU硬件会在guest mode重新evaluate pending virtual interrupts. 这个过程没有软件的参加!
+
+
+如果目标CPU没有在guest mode运行, 当前CPU修改了PIR后就kvm_vcpu_kick()目标CPU就可以了, 不需要IPI.
+
+------------------------------
+
+VT-D Posted Interrupt
+
+一般来说, CPU Posted Interrupt只需要Posted-Interrupt Descriptor的Posted-interrupt requests (PIR) 和Outstanding Notification (ON). 而VT-d Posted Interrupt会使用更多的field, 比如ndst和nv.
+
+ 8 /* Posted-Interrupt Descriptor */
+ 9 struct pi_desc {
+10         u32 pir[8];     /* Posted interrupt requested */
+11         union {
+12                 struct {
+13                                 /* bit 256 - Outstanding Notification */
+14                         u16     on      : 1,
+15                                 /* bit 257 - Suppress Notification */
+16                                 sn      : 1,
+17                                 /* bit 271:258 - Reserved */
+18                                 rsvd_1  : 14;
+19                                 /* bit 279:272 - Notification Vector */
+20                         u8      nv;
+21                                 /* bit 287:280 - Reserved */
+22                         u8      rsvd_2;
+23                                 /* bit 319:288 - Notification Destination */
+24                         u32     ndst;
+25                 };
+26                 u64 control;
+27         };
+28         u32 rsvd[6];
+29 } __aligned(64);
+
+
+核心思想是, pi_update_irte()会配置设置Interrupt Remapping Table (IRTE), 里面包含了三个重要信息:
+
+(1) per-vcpu的PIR的地址
+(2) 要插入的针对VM的中断的vector(不是host上的vector)
+(3) 是否是urgent (似乎kvm的都是irte_pi.p_urgent = 0)
+
+
+当host的vfio的pci设备要触发中断的时候, 会从IRTE里获得PIR的地址, 读取PIR自己欧盟和的Notification Vector (nv)的值.
+
+然后硬件会用这个nv的vector去post目标vcpu. 目标vcpu可能在以下几个状态中.
+
+- running: cpu 正在non-root mode运行
+
+- runnable: cpu 只是被临时调度出来
+
+- blocked: cpu没准备运行
