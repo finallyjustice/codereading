@@ -1,0 +1,118 @@
+This is about the guest_time usage of libvirt-based QEMU/KVM VM (only libvirt-based VM).
+
+The 'pidstat' is able to list the guest CPU usage for each QEMU CPU thread.
+
+hypervisor# pidstat -p 8275  -t 1
+Linux 4.14.35-2047.501.2.el7uek.x86_64 (xxx.xxx.xxx.xxx) 	06/20/2021 	_x86_64_	(xx CPU)
+
+09:47:06 PM   UID      TGID       TID    %usr %system  %guest    %CPU   CPU  Command
+09:47:07 PM     0      8275         -    0.00    1.00    2.00    1.00    17  qemu-system-x86
+09:47:07 PM     0         -      8275    0.00    0.00    0.00    0.00    17  |__qemu-system-x86
+09:47:07 PM     0         -      8299    0.00    0.00    0.00    0.00     7  |__qemu-system-x86
+09:47:07 PM     0         -      8305    0.00    0.00    0.00    0.00    19  |__IO mon_iothread
+09:47:07 PM     0         -      8306    0.00    0.00    0.00    0.00    17  |__CPU 0/KVM
+09:47:07 PM     0         -      8307    0.00    0.00    1.00    0.00    16  |__CPU 1/KVM
+09:47:07 PM     0         -      8309    1.00    0.00    0.00    1.00    10  |__CPU 2/KVM
+09:47:07 PM     0         -      8310    0.00    1.00    0.00    1.00     8  |__CPU 3/KVM
+
+09:47:07 PM   UID      TGID       TID    %usr %system  %guest    %CPU   CPU  Command
+09:47:08 PM     0      8275         -    0.00    0.00    3.00    2.00    17  qemu-system-x86
+09:47:08 PM     0         -      8275    0.00    0.00    0.00    0.00    17  |__qemu-system-x86
+09:47:08 PM     0         -      8299    0.00    0.00    0.00    0.00     7  |__qemu-system-x86
+09:47:08 PM     0         -      8305    0.00    0.00    0.00    0.00    19  |__IO mon_iothread
+09:47:08 PM     0         -      8306    0.00    0.00    2.00    1.00    17  |__CPU 0/KVM
+09:47:08 PM     0         -      8307    0.00    0.00    1.00    0.00    17  |__CPU 1/KVM
+09:47:08 PM     0         -      8309    0.00    0.00    1.00    0.00    10  |__CPU 2/KVM
+09:47:08 PM     0         -      8310    0.00    0.00    1.00    0.00     8  |__CPU 3/KVM
+
+09:47:08 PM   UID      TGID       TID    %usr %system  %guest    %CPU   CPU  Command
+09:47:09 PM     0      8275         -    0.00    0.00    1.00    1.00    17  qemu-system-x86
+09:47:09 PM     0         -      8275    0.00    0.00    0.00    0.00    17  |__qemu-system-x86
+09:47:09 PM     0         -      8299    0.00    0.00    0.00    0.00     7  |__qemu-system-x86
+09:47:09 PM     0         -      8305    0.00    0.00    0.00    0.00    19  |__IO mon_iothread
+09:47:09 PM     0         -      8306    0.00    0.00    1.00    1.00     0  |__CPU 0/KVM
+09:47:09 PM     0         -      8307    0.00    0.00    0.00    0.00    17  |__CPU 1/KVM
+09:47:09 PM     0         -      8309    0.00    0.00    0.00    0.00    10  |__CPU 2/KVM
+09:47:09 PM     0         -      8310    0.00    0.00    0.00    0.00     8  |__CPU 3/KVM
+
+
+According to 'strace' of 'pidstat', I assume the guest time is derived from proc/stat like below.
+
+# cat /proc/8275/task/8310/stat
+8310 (CPU 3/KVM) S 1 8271 8271 0 -1 138412224 1188 0 0 0 16120 6033 0 0 20 0 7 0 63587391 19645276160 455995 18446744073709551615 93989071482880 93989080891999 140722750489440 0 0 0 2147219511 4096 16963 1 0 0 -1 8 0 0 0 15692 0 93989082991208 93989085633428 93989114892288 140722750497978 140722750500494 140722750500494 140722750500828 0
+
+
+According to below link ...
+
+https://man7.org/linux/man-pages/man5/proc.5.html
+
+... the value 15692 is 'guest_time': 
+
+(43) guest_time  %lu  (since Linux 2.6.24)
+       Guest time of the process (time spent running a
+       virtual CPU for a guest operating system), measured
+       in clock ticks (divide by sysconf(_SC_CLK_TCK)).
+
+
+
+Here is the value from live crash analysis.
+
+crash> ps 8310
+   PID    PPID  CPU       TASK        ST  %MEM     VSZ    RSS  COMM
+   8310      1  10  ffff9e507d8017c0  IN   0.7 19184840 1824008  CPU 3/KVM
+
+crash> task_struct.gtime ffff9e507d8017c0
+  gtime = 156922000000
+
+
+
+The below is the source code in uek5 on guest_time accounting.
+
+146 /*
+147  * Account guest cpu time to a process.
+148  * @p: the process that the cpu time gets accounted to
+149  * @cputime: the cpu time spent in virtual machine since the last update
+150  */
+151 void account_guest_time(struct task_struct *p, u64 cputime)
+152 {
+153         u64 *cpustat = kcpustat_this_cpu->cpustat;
+154 
+155         /* Add guest time to process. */
+156         p->utime += cputime;
+157         account_group_user_time(p, cputime);
+158         p->gtime += cputime;
+159 
+160         /* Add guest time to cpustat. */
+161         if (task_nice(p) > 0) {
+162                 cpustat[CPUTIME_NICE] += cputime;
+163                 cpustat[CPUTIME_GUEST_NICE] += cputime;
+164         } else {
+165                 cpustat[CPUTIME_USER] += cputime;
+166                 cpustat[CPUTIME_GUEST] += cputime;
+167         }
+168 }
+
+
+This is to track via bcc.
+
+# /usr/share/bcc/tools/trace -t -C  'account_guest_time'
+... ...
+39.16956 5   8275    8307    CPU 1/KVM       account_guest_time
+40.15156 8   8275    8309    CPU 2/KVM       account_guest_time
+40.15256 23  8275    8310    CPU 3/KVM       account_guest_time
+40.15356 8   8275    8309    CPU 2/KVM       account_guest_time
+40.15356 1   8275    8306    CPU 0/KVM       account_guest_time
+40.15456 23  8275    8310    CPU 3/KVM       account_guest_time
+40.15456 8   8275    8309    CPU 2/KVM       account_guest_time
+40.15556 23  8275    8310    CPU 3/KVM       account_guest_time
+40.56856 5   8275    8307    CPU 1/KVM       account_guest_time
+40.66456 23  8275    8310    CPU 3/KVM       account_guest_time
+40.66456 5   8275    8307    CPU 1/KVM       account_guest_time
+40.72256 5   8275    8307    CPU 1/KVM       account_guest_time
+40.79356 23  8275    8310    CPU 3/KVM       account_guest_time
+41.15656 8   8275    8309    CPU 2/KVM       account_guest_time
+41.15756 23  8275    8310    CPU 3/KVM       account_guest_time
+41.15756 5   8275    8307    CPU 1/KVM       account_guest_time
+
+
+I do not know how the CPU time in "virsh vcpuinfo " is calculated.
