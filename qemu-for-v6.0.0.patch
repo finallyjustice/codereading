@@ -1,0 +1,1511 @@
+From 74c8c9452d674016133a4ed2c6e8e24e6ac1ae21 Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Mon, 26 Jul 2021 09:47:08 -0700
+Subject: [PATCH 1/1] qemu for v6.0.0
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ accel/kvm/kvm-all.c                         | 167 ++++++++++++++++++++
+ hw/core/cpu.c                               |   4 +
+ hw/core/machine.c                           |  19 +++
+ hw/i386/intel_iommu.c                       |  45 ++++++
+ hw/i386/x86-iommu.c                         |  15 ++
+ hw/misc/pvpanic.c                           |   9 ++
+ hw/pci/msix.c                               |  18 +++
+ hw/pci/pci.c                                |  13 ++
+ hw/remote/iohub.c                           |   8 +
+ hw/remote/machine.c                         |  13 ++
+ hw/remote/memory.c                          |   9 ++
+ hw/remote/message.c                         |  14 ++
+ hw/remote/mpqemu-link.c                     |  32 ++++
+ hw/remote/proxy-memory-listener.c           |  27 ++++
+ hw/remote/proxy.c                           |  47 ++++++
+ hw/remote/remote-obj.c                      |  52 ++++++
+ hw/vfio/pci.c                               |   4 +
+ hw/virtio/vhost.c                           |  31 ++++
+ hw/virtio/virtio-pci.c                      |  71 +++++++++
+ hw/virtio/virtio-pci.h                      |   9 ++
+ include/hw/core/cpu.h                       |  29 ++++
+ include/hw/misc/pvpanic.h                   |   7 +
+ include/hw/pci/pci.h                        |  12 ++
+ include/hw/remote/mpqemu-link.h             |   6 +
+ include/standard-headers/linux/virtio_pci.h |   5 +
+ include/sysemu/kvm.h                        |  16 ++
+ softmmu/runstate.c                          |  23 +++
+ target/i386/kvm/kvm.c                       |  24 +++
+ util/qemu-sockets.c                         |   5 +
+ 29 files changed, 734 insertions(+)
+
+diff --git a/accel/kvm/kvm-all.c b/accel/kvm/kvm-all.c
+index b6d9f92f1..1858a677f 100644
+--- a/accel/kvm/kvm-all.c
++++ b/accel/kvm/kvm-all.c
+@@ -115,7 +115,22 @@ struct KVMState
+ #ifdef KVM_CAP_IRQ_ROUTING
+     struct kvm_irq_routing *irq_routes;
+     int nr_allocated_irq_routes;
++    /*
++     * 在以下使用KVMState->used_gsi_bitmap:
++     *   - accel/kvm/kvm-all.c|1392| <<set_gsi>> set_bit(gsi, s->used_gsi_bitmap);
++     *   - accel/kvm/kvm-all.c|1397| <<clear_gsi>> clear_bit(gsi, s->used_gsi_bitmap);
++     *   - accel/kvm/kvm-all.c|1407| <<kvm_init_irq_routing>> s->used_gsi_bitmap = bitmap_new(gsi_count);
++     *   - accel/kvm/kvm-all.c|1585| <<kvm_irqchip_get_virq>> next_virq = find_first_zero_bit(s->used_gsi_bitmap, s->gsi_count);
++     */
+     unsigned long *used_gsi_bitmap;
++    /*
++     * 在以下使用KVMState->gsi_count:
++     *   - accel/kvm/kvm-all.c|1408| <<kvm_init_irq_routing>> s->gsi_count = gsi_count;
++     *   - accel/kvm/kvm-all.c|1503| <<kvm_irqchip_add_irq_route>> assert(pin < s->gsi_count);
++     *   - accel/kvm/kvm-all.c|1580| <<kvm_irqchip_get_virq>> if (!kvm_direct_msi_allowed && s->irq_routes->nr == s->gsi_count) {
++     *   - accel/kvm/kvm-all.c|1585| <<kvm_irqchip_get_virq>> next_virq = find_first_zero_bit(s->used_gsi_bitmap, s->gsi_count);
++     *   - accel/kvm/kvm-all.c|1586| <<kvm_irqchip_get_virq>> if (next_virq >= s->gsi_count) {
++     */
+     unsigned int gsi_count;
+     QTAILQ_HEAD(, KVMMSIRoute) msi_hashtab[KVM_MSI_HASHTAB_SIZE];
+ #endif
+@@ -139,6 +154,14 @@ bool kvm_eventfds_allowed;
+ bool kvm_irqfds_allowed;
+ bool kvm_resamplefds_allowed;
+ bool kvm_msi_via_irqfd_allowed;
++/*
++ * 在以下使用kvm_gsi_routing_allowed:
++ *   - hw/intc/arm_gic_kvm.c|589| <<kvm_arm_gic_realize>> kvm_gsi_routing_allowed = true;
++ *   - hw/intc/arm_gicv3_kvm.c|859| <<kvm_arm_gicv3_realize>> kvm_gsi_routing_allowed = true;
++ *   - hw/intc/openpic_kvm.c|253| <<kvm_openpic_realize>> kvm_gsi_routing_allowed = true;
++ *   - target/i386/kvm/kvm.c|4623| <<kvm_arch_init_irq_routing>> kvm_gsi_routing_allowed = true;
++ *   - target/s390x/kvm.c|2010| <<kvm_arch_init_irq_routing>> kvm_gsi_routing_allowed = true;
++ */
+ bool kvm_gsi_routing_allowed;
+ bool kvm_gsi_direct_mapping;
+ bool kvm_allowed;
+@@ -1420,6 +1443,15 @@ void kvm_init_irq_routing(KVMState *s)
+     kvm_arch_init_irq_routing(s);
+ }
+ 
++/*
++ * 使用KVM_SET_GSI_ROUTING将KVMState->irq_routes给commit到kernel
++ * KVMState *s:
++ * -> struct kvm_irq_routing *irq_routes;
++ *    -> __u32 nr;
++ *    -> __u32 flags;
++ *    -> struct kvm_irq_routing_entry entries[0];
++ * -> int nr_allocated_irq_routes;
++ */
+ void kvm_irqchip_commit_routes(KVMState *s)
+ {
+     int ret;
+@@ -1434,10 +1466,27 @@ void kvm_irqchip_commit_routes(KVMState *s)
+ 
+     s->irq_routes->flags = 0;
+     trace_kvm_irqchip_commit_routes();
++    /*
++     * KVMState *s:
++     * -> struct kvm_irq_routing *irq_routes;
++     *    -> __u32 nr;
++     *    -> __u32 flags;
++     *    -> struct kvm_irq_routing_entry entries[0];
++     * -> int nr_allocated_irq_routes;
++     */
+     ret = kvm_vm_ioctl(s, KVM_SET_GSI_ROUTING, s->irq_routes);
+     assert(ret == 0);
+ }
+ 
++/*
++ * 把参数kvm_irq_routing_entry加入s->irq_routes->entries[n]
++ * KVMState *s:
++ * -> struct kvm_irq_routing *irq_routes;
++ *    -> __u32 nr;
++ *    -> __u32 flags;
++ *    -> struct kvm_irq_routing_entry entries[0];
++ * -> int nr_allocated_irq_routes;
++ */
+ static void kvm_add_routing_entry(KVMState *s,
+                                   struct kvm_irq_routing_entry *entry)
+ {
+@@ -1455,6 +1504,14 @@ static void kvm_add_routing_entry(KVMState *s,
+         s->nr_allocated_irq_routes = n;
+     }
+     n = s->irq_routes->nr++;
++    /*
++     * KVMState *s:
++     * -> struct kvm_irq_routing *irq_routes;
++     *    -> __u32 nr;
++     *    -> __u32 flags;
++     *    -> struct kvm_irq_routing_entry entries[0];
++     * -> int nr_allocated_irq_routes;
++     */
+     new = &s->irq_routes->entries[n];
+ 
+     *new = *entry;
+@@ -1486,6 +1543,16 @@ static int kvm_update_routing_entry(KVMState *s,
+     return -ESRCH;
+ }
+ 
++/*
++ * called by:
++ *   - hw/i386/kvm/ioapic.c|33| <<kvm_pc_setup_irq_routing>> kvm_irqchip_add_irq_route(s, i, KVM_IRQCHIP_PIC_MASTER, i);
++ *   - hw/i386/kvm/ioapic.c|36| <<kvm_pc_setup_irq_routing>> kvm_irqchip_add_irq_route(s, i, KVM_IRQCHIP_PIC_SLAVE, i - 8);
++ *   - hw/i386/kvm/ioapic.c|41| <<kvm_pc_setup_irq_routing>> kvm_irqchip_add_irq_route(s, i, KVM_IRQCHIP_IOAPIC, 2);
++ *   - hw/i386/kvm/ioapic.c|43| <<kvm_pc_setup_irq_routing>> kvm_irqchip_add_irq_route(s, i, KVM_IRQCHIP_IOAPIC, i);
++ *   - hw/intc/arm_gic_kvm.c|586| <<kvm_arm_gic_realize>> kvm_irqchip_add_irq_route(kvm_state, i, 0, i);
++ *   - hw/intc/arm_gicv3_kvm.c|856| <<kvm_arm_gicv3_realize>> kvm_irqchip_add_irq_route(kvm_state, i, 0, i);
++ *   - hw/intc/openpic_kvm.c|249| <<kvm_openpic_realize>> kvm_irqchip_add_irq_route(kvm_state, i, 0, i);
++ */
+ void kvm_irqchip_add_irq_route(KVMState *s, int irq, int irqchip, int pin)
+ {
+     struct kvm_irq_routing_entry e = {};
+@@ -1557,6 +1624,13 @@ static void kvm_flush_dynamic_msi_routes(KVMState *s)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|1627| <<kvm_irqchip_send_msi>> virq = kvm_irqchip_get_virq(s);
++ *   - accel/kvm/kvm-all.c|1677| <<kvm_irqchip_add_msi_route>> virq = kvm_irqchip_get_virq(s);
++ *   - accel/kvm/kvm-all.c|1798| <<kvm_irqchip_add_adapter_route>> virq = kvm_irqchip_get_virq(s);
++ *   - accel/kvm/kvm-all.c|1828| <<kvm_irqchip_add_hv_sint_route>> virq = kvm_irqchip_get_virq(s);
++ */
+ static int kvm_irqchip_get_virq(KVMState *s)
+ {
+     int next_virq;
+@@ -1639,6 +1713,13 @@ int kvm_irqchip_send_msi(KVMState *s, MSIMessage msg)
+     return kvm_set_irq(s, route->kroute.gsi, 1);
+ }
+ 
++/*
++ * called by:
++ *   - hw/misc/ivshmem.c|432| <<ivshmem_add_kvm_msi_virq>> ret = kvm_irqchip_add_msi_route(kvm_state, vector, pdev);
++ *   - hw/vfio/pci.c|426| <<vfio_add_kvm_msi_virq>> virq = kvm_irqchip_add_msi_route(kvm_state, vector_n, &vdev->pdev);
++ *   - hw/virtio/virtio-pci.c|676| <<kvm_virtio_pci_vq_vector_use>> ret = kvm_irqchip_add_msi_route(kvm_state, vector, &proxy->pci_dev);
++ *   - target/i386/kvm/kvm.c|4631| <<kvm_arch_init_irq_routing>> if (kvm_irqchip_add_msi_route(s, 0, NULL) < 0) {
++ */
+ int kvm_irqchip_add_msi_route(KVMState *s, int vector, PCIDevice *dev)
+ {
+     struct kvm_irq_routing_entry kroute = {};
+@@ -1650,6 +1731,9 @@ int kvm_irqchip_add_msi_route(KVMState *s, int vector, PCIDevice *dev)
+     }
+ 
+     if (kvm_gsi_direct_mapping()) {
++        /*
++	 * x86下直接abort()
++	 */
+         return kvm_arch_msi_data_to_gsi(msg.data);
+     }
+ 
+@@ -1663,6 +1747,12 @@ int kvm_irqchip_add_msi_route(KVMState *s, int vector, PCIDevice *dev)
+     }
+ 
+     kroute.gsi = virq;
++    /*
++     * #define KVM_IRQ_ROUTING_IRQCHIP 1
++     * #define KVM_IRQ_ROUTING_MSI 2
++     * #define KVM_IRQ_ROUTING_S390_ADAPTER 3
++     * #define KVM_IRQ_ROUTING_HV_SINT 4
++     */
+     kroute.type = KVM_IRQ_ROUTING_MSI;
+     kroute.flags = 0;
+     kroute.u.msi.address_lo = (uint32_t)msg.address;
+@@ -1680,8 +1770,26 @@ int kvm_irqchip_add_msi_route(KVMState *s, int vector, PCIDevice *dev)
+     trace_kvm_irqchip_add_msi_route(dev ? dev->name : (char *)"N/A",
+                                     vector, virq);
+ 
++    /*
++     * 把参数kvm_irq_routing_entry加入s->irq_routes->entries[n]
++     * KVMState *s:
++     * -> struct kvm_irq_routing *irq_routes;
++     *    -> __u32 nr;
++     *    -> __u32 flags;
++     *    -> struct kvm_irq_routing_entry entries[0];
++     * -> int nr_allocated_irq_routes;
++     */
+     kvm_add_routing_entry(s, &kroute);
+     kvm_arch_add_msi_route_post(&kroute, vector, dev);
++    /*
++     * 使用KVM_SET_GSI_ROUTING将KVMState->irq_routes给commit到kernel
++     * KVMState *s:
++     * -> struct kvm_irq_routing *irq_routes;
++     *    -> __u32 nr;
++     *    -> __u32 flags;
++     *    -> struct kvm_irq_routing_entry entries[0];
++     * -> int nr_allocated_irq_routes;
++     */
+     kvm_irqchip_commit_routes(s);
+ 
+     return virq;
+@@ -1868,6 +1976,19 @@ int kvm_irqchip_update_msi_route(KVMState *s, int virq, MSIMessage msg)
+ }
+ #endif /* !KVM_CAP_IRQ_ROUTING */
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|1892| <<kvm_irqchip_add_irqfd_notifier>> return kvm_irqchip_add_irqfd_notifier_gsi(s, n, rn, GPOINTER_TO_INT(gsi));
++ *   - accel/stubs/kvm-stub.c|125| <<kvm_irqchip_add_irqfd_notifier_gsi>> int kvm_irqchip_add_irqfd_notifier_gsi(KVMState *s, EventNotifier *n,
++ *   - hw/hyperv/hyperv.c|409| <<hyperv_sint_route_new>> r = kvm_irqchip_add_irqfd_notifier_gsi(kvm_state,
++ *   - hw/misc/ivshmem.c|296| <<ivshmem_vector_unmask>> ret = kvm_irqchip_add_irqfd_notifier_gsi(kvm_state, n, NULL, v->virq);
++ *   - hw/misc/ivshmem.c|464| <<setup_interrupt>> kvm_irqchip_add_irqfd_notifier_gsi(kvm_state, n, NULL,
++ *   - hw/remote/proxy.c|52| <<proxy_intx_update>> kvm_irqchip_add_irqfd_notifier_gsi(kvm_state, &dev->intr,
++ *   - hw/s390x/virtio-ccw.c|1001| <<virtio_ccw_add_irqfd>> return kvm_irqchip_add_irqfd_notifier_gsi(kvm_state, notifier, NULL,
++ *   - hw/vfio/pci.c|137| <<vfio_intx_enable_kvm>> if (kvm_irqchip_add_irqfd_notifier_gsi(kvm_state,
++ *   - hw/vfio/pci.c|432| <<vfio_add_kvm_msi_virq>> if (kvm_irqchip_add_irqfd_notifier_gsi(kvm_state, &vector->kvm_interrupt,
++ *   - hw/virtio/virtio-pci.c|703| <<kvm_virtio_pci_irqfd_use>> return kvm_irqchip_add_irqfd_notifier_gsi(kvm_state, n, NULL, irqfd->virq);
++ */
+ int kvm_irqchip_add_irqfd_notifier_gsi(KVMState *s, EventNotifier *n,
+                                        EventNotifier *rn, int virq)
+ {
+@@ -2323,6 +2444,10 @@ bool kvm_cpu_check_are_resettable(void)
+     return kvm_arch_cpu_check_are_resettable();
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|2458| <<kvm_cpu_synchronize_state>> run_on_cpu(cpu, do_kvm_cpu_synchronize_state, RUN_ON_CPU_NULL);
++ */
+ static void do_kvm_cpu_synchronize_state(CPUState *cpu, run_on_cpu_data arg)
+ {
+     if (!cpu->vcpu_dirty) {
+@@ -2331,8 +2456,50 @@ static void do_kvm_cpu_synchronize_state(CPUState *cpu, run_on_cpu_data arg)
+     }
+ }
+ 
++/*
++ * 在以下使用kvm_cpu_synchronize_state():
++ *   - accel/kvm/kvm-accel-ops.c|84| <<kvm_accel_ops_class_init>> ops->synchronize_state = kvm_cpu_synchronize_state;
++ *   - accel/kvm/kvm-all.c|2673| <<kvm_cpu_exec>> kvm_cpu_synchronize_state(cpu);
++ *   - target/arm/kvm64.c|1428| <<kvm_arch_on_sigbus_vcpu>> kvm_cpu_synchronize_state(c);
++ *   - target/arm/kvm64.c|1498| <<kvm_arm_handle_debug>> kvm_cpu_synchronize_state(cs);
++ *   - target/i386/kvm/kvm.c|4264| <<kvm_arch_process_async_events>> kvm_cpu_synchronize_state(cs);
++ *   - target/i386/kvm/kvm.c|4283| <<kvm_arch_process_async_events>> kvm_cpu_synchronize_state(cs);
++ *   - target/i386/kvm/kvm.c|4301| <<kvm_arch_process_async_events>> kvm_cpu_synchronize_state(cs);
++ *   - target/i386/kvm/kvm.c|4306| <<kvm_arch_process_async_events>> kvm_cpu_synchronize_state(cs);
++ *   - target/i386/kvm/kvm.c|4611| <<kvm_arch_stop_on_emulation_error>> kvm_cpu_synchronize_state(cs);
++ *   - target/s390x/kvm.c|1958| <<kvm_arch_handle_exit>> kvm_cpu_synchronize_state(cs);
++ */
+ void kvm_cpu_synchronize_state(CPUState *cpu)
+ {
++    /*
++     * 在以下修改CPUSTate->vcpu_dirty:
++     *   - accel/kvm/kvm-all.c|462| <<kvm_init_vcpu>> cpu->vcpu_dirty = true;
++     *   - accel/kvm/kvm-all.c|2455| <<do_kvm_cpu_synchronize_state>> cpu->vcpu_dirty = true;
++     *   - accel/kvm/kvm-all.c|2482| <<do_kvm_cpu_synchronize_post_reset>> cpu->vcpu_dirty = false;
++     *   - accel/kvm/kvm-all.c|2493| <<do_kvm_cpu_synchronize_post_init>> cpu->vcpu_dirty = false;
++     *   - accel/kvm/kvm-all.c|2503| <<do_kvm_cpu_synchronize_pre_loadvm>> cpu->vcpu_dirty = true;
++     *   - accel/kvm/kvm-all.c|2586| <<kvm_cpu_exec>> cpu->vcpu_dirty = false;
++     *   - target/i386/hax/hax-all.c|229| <<hax_init_vcpu>> cpu->vcpu_dirty = true;
++     *   - target/i386/hax/hax-all.c|628| <<do_hax_cpu_synchronize_state>> cpu->vcpu_dirty = true;
++     *   - target/i386/hax/hax-all.c|644| <<do_hax_cpu_synchronize_post_reset>> cpu->vcpu_dirty = false;
++     *   - target/i386/hax/hax-all.c|657| <<do_hax_cpu_synchronize_post_init>> cpu->vcpu_dirty = false;
++     *   - target/i386/hax/hax-all.c|644| <<do_hax_cpu_synchronize_post_reset>> cpu->vcpu_dirty = false;
++     *   - target/i386/hax/hax-all.c|657| <<do_hax_cpu_synchronize_post_init>> cpu->vcpu_dirty = false;
++     *   - target/i386/hax/hax-all.c|667| <<do_hax_cpu_synchronize_pre_loadvm>> cpu->vcpu_dirty = true;
++     *   - target/i386/hvf/hvf.c|284| <<do_hvf_cpu_synchronize_state>> cpu->vcpu_dirty = true;
++     *   - target/i386/hvf/hvf.c|299| <<do_hvf_cpu_synchronize_post_reset>> cpu->vcpu_dirty = false;
++     *   - target/i386/hvf/hvf.c|311| <<do_hvf_cpu_synchronize_post_init>> cpu->vcpu_dirty = false;
++     *   - target/i386/hvf/hvf.c|322| <<do_hvf_cpu_synchronize_pre_loadvm>> cpu->vcpu_dirty = true;
++     *   - target/i386/hvf/hvf.c|536| <<hvf_init_vcpu>> cpu->vcpu_dirty = 1;
++     *   - target/i386/hvf/hvf.c|708| <<hvf_vcpu_exec>> cpu->vcpu_dirty = false;
++     *   - target/i386/whpx/whpx-all.c|675| <<whpx_emu_setreg_callback>> cpu->vcpu_dirty = false;
++     *   - target/i386/whpx/whpx-all.c|987| <<whpx_vcpu_run>> cpu->vcpu_dirty = false;
++     *   - target/i386/whpx/whpx-all.c|1265| <<do_whpx_cpu_synchronize_state>> cpu->vcpu_dirty = true;
++     *   - target/i386/whpx/whpx-all.c|1273| <<do_whpx_cpu_synchronize_post_reset>> cpu->vcpu_dirty = false;
++     *   - target/i386/whpx/whpx-all.c|1280| <<do_whpx_cpu_synchronize_post_init>> cpu->vcpu_dirty = false;
++     *   - target/i386/whpx/whpx-all.c|1286| <<do_whpx_cpu_synchronize_pre_loadvm>> cpu->vcpu_dirty = true;
++     *   - target/i386/whpx/whpx-all.c|1439| <<whpx_init_vcpu>> cpu->vcpu_dirty = true;
++     */
+     if (!cpu->vcpu_dirty) {
+         run_on_cpu(cpu, do_kvm_cpu_synchronize_state, RUN_ON_CPU_NULL);
+     }
+diff --git a/hw/core/cpu.c b/hw/core/cpu.c
+index 00330ba07..feb7b1b2e 100644
+--- a/hw/core/cpu.c
++++ b/hw/core/cpu.c
+@@ -50,6 +50,10 @@ CPUState *cpu_by_arch_id(int64_t id)
+     return NULL;
+ }
+ 
++/*
++ * called by:
++ *   - target/s390x/cpu.c|216| <<s390_cpu_realizefn>> if (cpu_exists(cpu->env.core_id)) {
++ */
+ bool cpu_exists(int64_t id)
+ {
+     return !!cpu_by_arch_id(id);
+diff --git a/hw/core/machine.c b/hw/core/machine.c
+index 40def7818..4dd4385f5 100644
+--- a/hw/core/machine.c
++++ b/hw/core/machine.c
+@@ -1236,6 +1236,25 @@ void machine_run_board_init(MachineState *machine)
+ static NotifierList machine_init_done_notifiers =
+     NOTIFIER_LIST_INITIALIZER(machine_init_done_notifiers);
+ 
++/*
++ * called by:
++ *   - hw/acpi/piix4.c|516| <<piix4_pm_realize>> qemu_add_machine_init_done_notifier(&s->machine_ready);
++ *   - hw/arm/virt.c|2113| <<machvirt_init>> qemu_add_machine_init_done_notifier(&vms->machine_done);
++ *   - hw/core/machine.c|961| <<machine_initfn>> qemu_add_machine_init_done_notifier(&ms->sysbus_notifier);
++ *   - hw/i386/intel_iommu.c|3850| <<vtd_realize>> qemu_add_machine_init_done_notifier(&vtd_machine_done_notify);
++ *   - hw/i386/microvm.c|669| <<microvm_machine_initfn>> qemu_add_machine_init_done_notifier(&mms->machine_done);
++ *   - hw/i386/pc.c|821| <<pc_guest_info_init>> qemu_add_machine_init_done_notifier(&pcms->machine_done);
++ *   - hw/intc/ioapic.c|470| <<ioapic_realize>> qemu_add_machine_init_done_notifier(&s->machine_done);
++ *   - hw/isa/lpc_ich9.c|702| <<ich9_lpc_realize>> qemu_add_machine_init_done_notifier(&lpc->machine_ready);
++ *   - hw/nvram/fw_cfg.c|1143| <<fw_cfg_common_realize>> qemu_add_machine_init_done_notifier(&s->machine_ready);
++ *   - hw/pci/pci.c|128| <<pci_bus_realize>> qemu_add_machine_init_done_notifier(&bus->machine_done);
++ *   - hw/ppc/e500.c|651| <<ppce500_prep_device_tree>> qemu_add_machine_init_done_notifier(&p->notifier);
++ *   - hw/remote/remote-obj.c|146| <<remote_object_init>> qemu_add_machine_init_done_notifier(&o->machine_done);
++ *   - target/arm/kvm.c|392| <<kvm_arm_register_device>> qemu_add_machine_init_done_notifier(&notify);
++ *   - target/i386/cpu.c|6906| <<x86_cpu_realizefn>> qemu_add_machine_init_done_notifier(&cpu->machine_done);
++ *   - target/i386/kvm/kvm.c|2244| <<kvm_arch_init>> qemu_add_machine_init_done_notifier(&smram_machine_done);
++ *   - target/i386/sev.c|800| <<sev_kvm_init>> qemu_add_machine_init_done_notifier(&sev_machine_done_notify);
++ */
+ void qemu_add_machine_init_done_notifier(Notifier *notify)
+ {
+     notifier_list_add(&machine_init_done_notifiers, notify);
+diff --git a/hw/i386/intel_iommu.c b/hw/i386/intel_iommu.c
+index 6be8f3291..572b885d2 100644
+--- a/hw/i386/intel_iommu.c
++++ b/hw/i386/intel_iommu.c
+@@ -51,6 +51,12 @@
+ /* pe operations */
+ #define VTD_PE_GET_TYPE(pe) ((pe)->val[0] & VTD_SM_PASID_ENTRY_PGTT)
+ #define VTD_PE_GET_LEVEL(pe) (2 + (((pe)->val[0] >> 2) & VTD_SM_PASID_ENTRY_AW))
++/*
++ * called by:
++ *   - hw/i386/intel_iommu.c|1733| <<vtd_do_iommu_translate>> VTD_PE_GET_FPD_ERR(ret_fr, is_fpd_set, s, source_id, addr, is_write);
++ *   - hw/i386/intel_iommu.c|1741| <<vtd_do_iommu_translate>> VTD_PE_GET_FPD_ERR(ret_fr, is_fpd_set, s, source_id, addr, is_write);
++ *   - hw/i386/intel_iommu.c|1777| <<vtd_do_iommu_translate>> VTD_PE_GET_FPD_ERR(ret_fr, is_fpd_set, s, source_id, addr, is_write);
++ */
+ #define VTD_PE_GET_FPD_ERR(ret_fr, is_fpd_set, s, source_id, addr, is_write) {\
+     if (ret_fr) {                                                             \
+         ret_fr = -ret_fr;                                                     \
+@@ -424,6 +430,10 @@ static void vtd_set_frcd_and_update_ppf(IntelIOMMUState *s, uint16_t index)
+ }
+ 
+ /* Must not update F field now, should be done later */
++/*
++ * called by:
++ *   - hw/i386/intel_iommu.c|510| <<vtd_report_dmar_fault>> vtd_record_frcd(s, s->next_frcd_reg, source_id, addr, fault, is_write);
++ */
+ static void vtd_record_frcd(IntelIOMMUState *s, uint16_t index,
+                             uint16_t source_id, hwaddr addr,
+                             VTDFaultReason fault, bool is_write)
+@@ -463,6 +473,10 @@ static bool vtd_try_collapse_fault(IntelIOMMUState *s, uint16_t source_id)
+ }
+ 
+ /* Log and report an DMAR (address translation) fault to software */
++/*
++ * called by:
++ *   - hw/i386/intel_iommu.c|60| <<VTD_PE_GET_FPD_ERR>> vtd_report_dmar_fault(s, source_id, addr, ret_fr, is_write); \
++ */
+ static void vtd_report_dmar_fault(IntelIOMMUState *s, uint16_t source_id,
+                                   hwaddr addr, VTDFaultReason fault,
+                                   bool is_write)
+@@ -1682,6 +1696,10 @@ out:
+  *
+  * Returns true if translation is successful, otherwise false.
+  */
++/*
++ * called by:
++ *   - hw/i386/intel_iommu.c|2994| <<vtd_iommu_translate>> success = vtd_do_iommu_translate(vtd_as, vtd_as->bus, vtd_as->devfn,
++ */
+ static bool vtd_do_iommu_translate(VTDAddressSpace *vtd_as, PCIBus *bus,
+                                    uint8_t devfn, hwaddr addr, bool is_write,
+                                    IOMMUTLBEntry *entry)
+@@ -2969,6 +2987,10 @@ static void vtd_mem_write(void *opaque, hwaddr addr,
+     }
+ }
+ 
++/*
++ * 在以下使用vtd_iommu_translate():
++ *   - hw/i386/intel_iommu.c|3915| <<vtd_iommu_memory_region_class_init>> imrc->translate = vtd_iommu_translate;
++ */
+ static IOMMUTLBEntry vtd_iommu_translate(IOMMUMemoryRegion *iommu, hwaddr addr,
+                                          IOMMUAccessFlags flag, int iommu_idx)
+ {
+@@ -3106,6 +3128,10 @@ static Property vtd_properties[] = {
+ };
+ 
+ /* Read IRTE entry with specific index */
++/*
++ * called by:
++ *   - hw/i386/intel_iommu.c|3200| <<vtd_remap_irq_get>> ret = vtd_irte_get(iommu, index, &irte, sid);
++ */
+ static int vtd_irte_get(IntelIOMMUState *iommu, uint16_t index,
+                         VTD_IR_TableEntry *entry, uint16_t sid)
+ {
+@@ -3121,6 +3147,12 @@ static int vtd_irte_get(IntelIOMMUState *iommu, uint16_t index,
+         return -VTD_FR_IR_INDEX_OVER;
+     }
+ 
++    /*
++     * struct IntelIOMMUState *iommu:
++     * -> bool intr_enabled;    // Whether guest enabled IR
++     * -> dma_addr_t intr_root; // Interrupt remapping table pointer
++     * -> uint32_t intr_size;   // Number of IR table entries
++     */
+     addr = iommu->intr_root + index * sizeof(*entry);
+     if (dma_memory_read(&address_space_memory, addr, entry,
+                         sizeof(*entry))) {
+@@ -3191,6 +3223,10 @@ static int vtd_irte_get(IntelIOMMUState *iommu, uint16_t index,
+ }
+ 
+ /* Fetch IRQ information of specific IR index */
++/*
++ * called by:
++ *   - hw/i386/intel_iommu.c|3273| <<vtd_interrupt_remap_msi>> ret = vtd_remap_irq_get(iommu, index, &irq, sid);
++ */
+ static int vtd_remap_irq_get(IntelIOMMUState *iommu, uint16_t index,
+                              X86IOMMUIrq *irq, uint16_t sid)
+ {
+@@ -3222,6 +3258,11 @@ static int vtd_remap_irq_get(IntelIOMMUState *iommu, uint16_t index,
+ }
+ 
+ /* Interrupt remapping for MSI/MSI-X entry */
++/*
++ * called by:
++ *   - hw/i386/intel_iommu.c|3324| <<vtd_int_remap>> return vtd_interrupt_remap_msi(INTEL_IOMMU_DEVICE(iommu),
++ *   - hw/i386/intel_iommu.c|3351| <<vtd_mem_ir_write>> ret = vtd_interrupt_remap_msi(opaque, &from, &to, sid);
++ */
+ static int vtd_interrupt_remap_msi(IntelIOMMUState *iommu,
+                                    MSIMessage *origin,
+                                    MSIMessage *translated,
+@@ -3318,6 +3359,10 @@ out:
+     return 0;
+ }
+ 
++/*
++ * 在以下使用vtd_int_remap():
++ *   - hw/i386/intel_iommu.c|3863| <<vtd_class_init>> x86_class->int_remap = vtd_int_remap;
++ */
+ static int vtd_int_remap(X86IOMMUState *iommu, MSIMessage *src,
+                          MSIMessage *dst, uint16_t sid)
+ {
+diff --git a/hw/i386/x86-iommu.c b/hw/i386/x86-iommu.c
+index 5f4301639..e9f7614e1 100644
+--- a/hw/i386/x86-iommu.c
++++ b/hw/i386/x86-iommu.c
+@@ -94,6 +94,21 @@ static void x86_iommu_set_default(X86IOMMUState *x86_iommu)
+     x86_iommu_default = x86_iommu;
+ }
+ 
++/*
++ * called by:
++ *   - hw/i386/acpi-build.c|2005| <<build_dmar_q35>> X86IOMMUState *iommu = x86_iommu_get_default();
++ *   - hw/i386/acpi-build.c|2182| <<build_amd_iommu>> AMDVIState *s = AMD_IOMMU_DEVICE(x86_iommu_get_default());
++ *   - hw/i386/acpi-build.c|2229| <<build_amd_iommu>> if (x86_iommu_ir_supported(x86_iommu_get_default())) {
++ *   - hw/i386/acpi-build.c|2264| <<build_amd_iommu>> if (x86_iommu_ir_supported(x86_iommu_get_default())) {
++ *   - hw/i386/acpi-build.c|2433| <<acpi_build>> if (x86_iommu_get_default()) {
++ *   - hw/i386/intel_iommu.c|3825| <<vtd_machine_done_notify_one>> IntelIOMMUState *iommu = INTEL_IOMMU_DEVICE(x86_iommu_get_default());
++ *   - hw/i386/pc.c|1666| <<pc_hotplug_allowed>> X86IOMMUState *iommu = x86_iommu_get_default();
++ *   - hw/i386/x86-iommu-stub.c|30| <<x86_iommu_get_default>> X86IOMMUState *x86_iommu_get_default(void )
++ *   - hw/intc/ioapic.c|437| <<ioapic_machine_done_notify>> X86IOMMUState *iommu = x86_iommu_get_default();
++ *   - include/hw/i386/x86-iommu.h|141| <<OBJECT_DECLARE_TYPE>> X86IOMMUState *x86_iommu_get_default(void );
++ *   - target/i386/kvm/kvm.c|4697| <<kvm_arch_fixup_msi_route>> X86IOMMUState *iommu = x86_iommu_get_default();
++ *   - target/i386/kvm/kvm.c|4820| <<kvm_arch_add_msi_route_post>> X86IOMMUState *iommu = x86_iommu_get_default();
++ */
+ X86IOMMUState *x86_iommu_get_default(void)
+ {
+     return x86_iommu_default;
+diff --git a/hw/misc/pvpanic.c b/hw/misc/pvpanic.c
+index e2cb4a5d2..f211a0d57 100644
+--- a/hw/misc/pvpanic.c
++++ b/hw/misc/pvpanic.c
+@@ -22,6 +22,10 @@
+ #include "hw/misc/pvpanic.h"
+ #include "qom/object.h"
+ 
++/*
++ * called by:
++ *   - hw/misc/pvpanic.c|55| <<pvpanic_write>> handle_event(val);
++ */
+ static void handle_event(int event)
+ {
+     static bool logged;
+@@ -64,6 +68,11 @@ static const MemoryRegionOps pvpanic_ops = {
+     },
+ };
+ 
++/*
++ * called by:
++ *   - hw/misc/pvpanic-isa.c|43| <<pvpanic_isa_initfn>> pvpanic_setup_io(&s->pvpanic, DEVICE(s), 1);
++ *   - hw/misc/pvpanic-pci.c|51| <<pvpanic_pci_realizefn>> pvpanic_setup_io(&s->pvpanic, DEVICE(s), 2);
++ */
+ void pvpanic_setup_io(PVPanicState *s, DeviceState *dev, unsigned size)
+ {
+     memory_region_init_io(&s->mr, OBJECT(dev), &pvpanic_ops, s, "pvpanic", size);
+diff --git a/hw/pci/msix.c b/hw/pci/msix.c
+index ae9331cd0..99a29af55 100644
+--- a/hw/pci/msix.c
++++ b/hw/pci/msix.c
+@@ -110,6 +110,18 @@ static void msix_fire_vector_notifier(PCIDevice *dev,
+         dev->msix_vector_release_notifier(dev, vector);
+     } else {
+         msg = msix_get_message(dev, vector);
++        /*
++	 * 在以下设置PCIDevie->msix_vector_use_notifier:
++         *   - hw/pci/msix.c|597| <<msix_set_vector_notifiers>> dev->msix_vector_use_notifier = use_notifier;
++         *   - hw/pci/msix.c|619| <<msix_set_vector_notifiers>> dev->msix_vector_use_notifier = NULL;
++         *   - hw/pci/msix.c|637| <<msix_unset_vector_notifiers>> dev->msix_vector_use_notifier = NULL;
++         * 在以下使用PCIDevie->msix_vector_use_notifier:
++         *   - hw/misc/ivshmem.c|795| <<ivshmem_disable_irqfd>> if (!pdev->msix_vector_use_notifier) {
++         *   - hw/pci/msix.c|106| <<msix_fire_vector_notifier>> if (!dev->msix_vector_use_notifier) {
++         *   - hw/pci/msix.c|113| <<msix_fire_vector_notifier>> ret = dev->msix_vector_use_notifier(dev, vector, msg);
++         *   - hw/pci/msix.c|571| <<msix_set_notifier_for_vector>> return dev->msix_vector_use_notifier(dev, vector, msg);
++         *   - hw/pci/msix.c|628| <<msix_unset_vector_notifiers>> assert(dev->msix_vector_use_notifier &&
++	 */
+         ret = dev->msix_vector_use_notifier(dev, vector, msg);
+         assert(ret >= 0);
+     }
+@@ -579,6 +591,12 @@ static void msix_unset_notifier_for_vector(PCIDevice *dev, unsigned int vector)
+     dev->msix_vector_release_notifier(dev, vector);
+ }
+ 
++/*
++ * called by:
++ *   - hw/misc/ivshmem.c|775| <<ivshmem_enable_irqfd>> if (msix_set_vector_notifiers(pdev,
++ *   - hw/vfio/pci.c|608| <<vfio_msix_enable>> if (msix_set_vector_notifiers(pdev, vfio_msix_vector_use,
++ *   - hw/virtio/virtio-pci.c|1025| <<virtio_pci_set_guest_notifiers>> r = msix_set_vector_notifiers(&proxy->pci_dev,
++ */
+ int msix_set_vector_notifiers(PCIDevice *dev,
+                               MSIVectorUseNotifier use_notifier,
+                               MSIVectorReleaseNotifier release_notifier,
+diff --git a/hw/pci/pci.c b/hw/pci/pci.c
+index 8f35e13a0..da236f2c6 100644
+--- a/hw/pci/pci.c
++++ b/hw/pci/pci.c
+@@ -476,6 +476,16 @@ void pci_root_bus_cleanup(PCIBus *bus)
+     qbus_unrealize(BUS(bus));
+ }
+ 
++/*
++ * called by:
++ *   - hw/i386/pc_q35.c|248| <<pc_q35_init>> pci_bus_irqs(host_bus, ich9_lpc_set_irq, ich9_lpc_map_irq, ich9_lpc,
++ *   - hw/isa/piix3.c|383| <<piix3_create>> pci_bus_irqs(pci_bus, xen_piix3_set_irq, xen_pci_slot_get_pirq,
++ *   - hw/isa/piix3.c|389| <<piix3_create>> pci_bus_irqs(pci_bus, piix3_set_irq, pci_slot_get_pirq,
++ *   - hw/pci-host/prep.c|261| <<raven_pcihost_realizefn>> pci_bus_irqs(&s->pci_bus, raven_set_irq, raven_map_irq, s, PCI_NUM_PINS);
++ *   - hw/pci-host/versatile.c|425| <<pci_vpb_realize>> pci_bus_irqs(&s->pci_bus, pci_vpb_set_irq, mapfn, s->irq, 4);
++ *   - hw/pci/pci.c|510| <<pci_register_root_bus>> pci_bus_irqs(bus, set_irq, map_irq, irq_opaque, nirq);
++ *   - hw/remote/machine.c|56| <<remote_machine_init>> pci_bus_irqs(pci_host->bus, remote_iohub_set_irq, remote_iohub_map_irq,
++ */
+ void pci_bus_irqs(PCIBus *bus, pci_set_irq_fn set_irq, pci_map_irq_fn map_irq,
+                   void *irq_opaque, int nirq)
+ {
+@@ -2819,6 +2829,9 @@ MSIMessage pci_get_msi_message(PCIDevice *dev, int vector)
+ {
+     MSIMessage msg;
+     if (msix_enabled(dev)) {
++        /*
++	 * 从PCIDevice->msix_table[]获取msix message
++	 */
+         msg = msix_get_message(dev, vector);
+     } else if (msi_enabled(dev)) {
+         msg = msi_get_message(dev, vector);
+diff --git a/hw/remote/iohub.c b/hw/remote/iohub.c
+index e4ff131a6..070d5b9ce 100644
+--- a/hw/remote/iohub.c
++++ b/hw/remote/iohub.c
+@@ -53,6 +53,10 @@ int remote_iohub_map_irq(PCIDevice *pci_dev, int intx)
+     return pci_dev->devfn;
+ }
+ 
++/*
++ * 在以下使用remote_iohub_set_irq():
++ *   - hw/remote/machine.c|56| <<remote_machine_init>> pci_bus_irqs(pci_host->bus, remote_iohub_set_irq, remote_iohub_map_irq,
++ */
+ void remote_iohub_set_irq(void *opaque, int pirq, int level)
+ {
+     RemoteIOHubState *iohub = opaque;
+@@ -90,6 +94,10 @@ static void intr_resample_handler(void *opaque)
+     }
+ }
+ 
++/*
++ * 处理MPQEMU_CMD_SET_IRQFD:
++ *   - hw/remote/message.c|77| <<mpqemu_remote_msg_loop_co>> process_set_irqfd_msg(pci_dev, &msg);
++ */
+ void process_set_irqfd_msg(PCIDevice *pci_dev, MPQemuMsg *msg)
+ {
+     RemoteMachineState *machine = REMOTE_MACHINE(current_machine);
+diff --git a/hw/remote/machine.c b/hw/remote/machine.c
+index c0ab4f528..1ba882b9d 100644
+--- a/hw/remote/machine.c
++++ b/hw/remote/machine.c
+@@ -53,6 +53,16 @@ static void remote_machine_init(MachineState *machine)
+ 
+     remote_iohub_init(&s->iohub);
+ 
++    /*
++     * called by:
++     *   - hw/i386/pc_q35.c|248| <<pc_q35_init>> pci_bus_irqs(host_bus, ich9_lpc_set_irq, ich9_lpc_map_irq, ich9_lpc,
++     *   - hw/isa/piix3.c|383| <<piix3_create>> pci_bus_irqs(pci_bus, xen_piix3_set_irq, xen_pci_slot_get_pirq,
++     *   - hw/isa/piix3.c|389| <<piix3_create>> pci_bus_irqs(pci_bus, piix3_set_irq, pci_slot_get_pirq,
++     *   - hw/pci-host/prep.c|261| <<raven_pcihost_realizefn>> pci_bus_irqs(&s->pci_bus, raven_set_irq, raven_map_irq, s, PCI_NUM_PINS);
++     *   - hw/pci-host/versatile.c|425| <<pci_vpb_realize>> pci_bus_irqs(&s->pci_bus, pci_vpb_set_irq, mapfn, s->irq, 4);
++     *   - hw/pci/pci.c|510| <<pci_register_root_bus>> pci_bus_irqs(bus, set_irq, map_irq, irq_opaque, nirq);
++     *   - hw/remote/machine.c|56| <<remote_machine_init>> pci_bus_irqs(pci_host->bus, remote_iohub_set_irq, remote_iohub_map_irq,
++     */
+     pci_bus_irqs(pci_host->bus, remote_iohub_set_irq, remote_iohub_map_irq,
+                  &s->iohub, REMOTE_IOHUB_NB_PIRQS);
+ }
+@@ -65,6 +75,9 @@ static void remote_machine_class_init(ObjectClass *oc, void *data)
+     mc->desc = "Experimental remote machine";
+ }
+ 
++/*
++ * TYPE_REMOTE_MACHINE应该直接由qemu cmdline调用吧
++ */
+ static const TypeInfo remote_machine = {
+     .name = TYPE_REMOTE_MACHINE,
+     .parent = TYPE_MACHINE,
+diff --git a/hw/remote/memory.c b/hw/remote/memory.c
+index 32085b1e0..0547cfb4c 100644
+--- a/hw/remote/memory.c
++++ b/hw/remote/memory.c
+@@ -16,6 +16,11 @@
+ #include "exec/ram_addr.h"
+ #include "qapi/error.h"
+ 
++/*
++ * called by:
++ *   - hw/remote/memory.c|43| <<remote_sysmem_reconfig>> remote_sysmem_reset();
++ *   - hw/remote/memory.c|57| <<remote_sysmem_reconfig>> remote_sysmem_reset();
++ */
+ static void remote_sysmem_reset(void)
+ {
+     MemoryRegion *sysmem, *subregion, *next;
+@@ -30,6 +35,10 @@ static void remote_sysmem_reset(void)
+     }
+ }
+ 
++/*
++ * 处理MPQEMU_CMD_SYNC_SYSMEM:
++ *   - hw/remote/message.c|74| <<mpqemu_remote_msg_loop_co>> remote_sysmem_reconfig(&msg, &local_err);
++ */
+ void remote_sysmem_reconfig(MPQemuMsg *msg, Error **errp)
+ {
+     ERRP_GUARD();
+diff --git a/hw/remote/message.c b/hw/remote/message.c
+index 11d729845..0b11cf121 100644
+--- a/hw/remote/message.c
++++ b/hw/remote/message.c
+@@ -30,6 +30,10 @@ static void process_bar_read(QIOChannel *ioc, MPQemuMsg *msg, Error **errp);
+ static void process_device_reset_msg(QIOChannel *ioc, PCIDevice *dev,
+                                      Error **errp);
+ 
++/*
++ * 在以下使用mpqemu_remote_msg_loop_co():
++ *   - hw/remote/remote-obj.c|125| <<remote_object_machine_done>> co = qemu_coroutine_create(mpqemu_remote_msg_loop_co, comdev);
++ */
+ void coroutine_fn mpqemu_remote_msg_loop_co(void *data)
+ {
+     g_autofree RemoteCommDev *com = (RemoteCommDev *)data;
+@@ -70,6 +74,12 @@ void coroutine_fn mpqemu_remote_msg_loop_co(void *data)
+             remote_sysmem_reconfig(&msg, &local_err);
+             break;
+         case MPQEMU_CMD_SET_IRQFD:
++	    /*
++	     * 在以下使用MPQEMU_CMD_SET_IRQFD:
++	     *   - hw/remote/message.c|76| <<mpqemu_remote_msg_loop_co>> case MPQEMU_CMD_SET_IRQFD:
++	     *   - hw/remote/mpqemu-link.c|257| <<mpqemu_msg_valid>> case MPQEMU_CMD_SET_IRQFD:
++	     *   - hw/remote/proxy.c|62| <<setup_irqfd>> msg.cmd = MPQEMU_CMD_SET_IRQFD;
++	     */
+             process_set_irqfd_msg(pci_dev, &msg);
+             break;
+         case MPQEMU_CMD_DEVICE_RESET:
+@@ -213,6 +223,10 @@ fail:
+     }
+ }
+ 
++/*
++ * 处理MPQEMU_CMD_DEVICE_RESET:
++ *   - hw/remote/message.c|76| <<mpqemu_remote_msg_loop_co>> process_device_reset_msg(com->ioc, pci_dev, &local_err);
++ */
+ static void process_device_reset_msg(QIOChannel *ioc, PCIDevice *dev,
+                                      Error **errp)
+ {
+diff --git a/hw/remote/mpqemu-link.c b/hw/remote/mpqemu-link.c
+index 9ce31526e..a2212b6b9 100644
+--- a/hw/remote/mpqemu-link.c
++++ b/hw/remote/mpqemu-link.c
+@@ -32,6 +32,17 @@
+  *   will block IOThread;
+  * Returns true if no errors were encountered, false otherwise.
+  */
++/*
++ * called by:
++ *   - hw/remote/message.c|122| <<process_config_write>> if (!mpqemu_msg_send(&ret, ioc, NULL)) {
++ *   - hw/remote/message.c|146| <<process_config_read>> if (!mpqemu_msg_send(&ret, ioc, NULL)) {
++ *   - hw/remote/message.c|183| <<process_bar_write>> if (!mpqemu_msg_send(&ret, ioc, NULL)) {
++ *   - hw/remote/message.c|220| <<process_bar_read>> if (!mpqemu_msg_send(&ret, ioc, NULL)) {
++ *   - hw/remote/message.c|243| <<process_device_reset_msg>> mpqemu_msg_send(&ret, ioc, errp);
++ *   - hw/remote/mpqemu-link.c|202| <<mpqemu_msg_send_and_await_reply>> if (!mpqemu_msg_send(msg, pdev->ioc, errp)) {
++ *   - hw/remote/proxy-memory-listener.c|218| <<proxy_memory_listener_commit>> if (!mpqemu_msg_send(&msg, proxy_listener->ioc, &local_err)) {
++ *   - hw/remote/proxy.c|73| <<setup_irqfd>> if (!mpqemu_msg_send(&msg, dev->ioc, &local_err)) {
++ */
+ bool mpqemu_msg_send(MPQemuMsg *msg, QIOChannel *ioc, Error **errp)
+ {
+     ERRP_GUARD();
+@@ -94,6 +105,11 @@ bool mpqemu_msg_send(MPQemuMsg *msg, QIOChannel *ioc, Error **errp)
+  * - From IOThread within co-routine context, outside of co-routine context
+  *   will block IOThread;
+  */
++/*
++ * called by:
++ *   - hw/remote/mpqemu-link.c|133| <<mpqemu_msg_recv>> len = mpqemu_read(ioc, msg, MPQEMU_MSG_HDR_SIZE, &fds, &nfds, errp);
++ *   - hw/remote/mpqemu-link.c|150| <<mpqemu_msg_recv>> len = mpqemu_read(ioc, &msg->data, msg->size, NULL, NULL, errp);
++ */
+ static ssize_t mpqemu_read(QIOChannel *ioc, void *buf, size_t len, int **fds,
+                            size_t *nfds, Error **errp)
+ {
+@@ -122,6 +138,11 @@ static ssize_t mpqemu_read(QIOChannel *ioc, void *buf, size_t len, int **fds,
+     return (ret <= 0) ? ret : iov.iov_len;
+ }
+ 
++/*
++ * called by:
++ *   - hw/remote/message.c|49| <<mpqemu_remote_msg_loop_co>> if (!mpqemu_msg_recv(&msg, com->ioc, &local_err)) {
++ *   - hw/remote/mpqemu-link.c|206| <<mpqemu_msg_send_and_await_reply>> if (!mpqemu_msg_recv(&msg_reply, pdev->ioc, errp)) {
++ */
+ bool mpqemu_msg_recv(MPQemuMsg *msg, QIOChannel *ioc, Error **errp)
+ {
+     ERRP_GUARD();
+@@ -189,6 +210,12 @@ fail:
+  * Called from VCPU thread in non-coroutine context.
+  * Used by the Proxy object to communicate to remote processes.
+  */
++/*
++ * called by:
++ *   - hw/remote/proxy.c|194| <<config_op_send>> ret = mpqemu_msg_send_and_await_reply(&msg, pdev, &local_err);
++ *   - hw/remote/proxy.c|292| <<send_bar_access_msg>> ret = mpqemu_msg_send_and_await_reply(&msg, pdev, &local_err);
++ *   - hw/remote/proxy.c|421| <<proxy_device_reset>> mpqemu_msg_send_and_await_reply(&msg, pdev, &local_err);
++ */
+ uint64_t mpqemu_msg_send_and_await_reply(MPQemuMsg *msg, PCIProxyDev *pdev,
+                                          Error **errp)
+ {
+@@ -216,6 +243,11 @@ uint64_t mpqemu_msg_send_and_await_reply(MPQemuMsg *msg, PCIProxyDev *pdev,
+     return msg_reply.data.u64;
+ }
+ 
++/*
++ * called by:
++ *   - hw/remote/message.c|53| <<mpqemu_remote_msg_loop_co>> if (!mpqemu_msg_valid(&msg)) {
++ *   - hw/remote/mpqemu-link.c|210| <<mpqemu_msg_send_and_await_reply>> if (!mpqemu_msg_valid(&msg_reply) || msg_reply.cmd != MPQEMU_CMD_RET) {
++ */
+ bool mpqemu_msg_valid(MPQemuMsg *msg)
+ {
+     if (msg->cmd >= MPQEMU_CMD_MAX && msg->cmd < 0) {
+diff --git a/hw/remote/proxy-memory-listener.c b/hw/remote/proxy-memory-listener.c
+index af1fa6f5a..ebc4c7a39 100644
+--- a/hw/remote/proxy-memory-listener.c
++++ b/hw/remote/proxy-memory-listener.c
+@@ -29,6 +29,11 @@
+  *
+  */
+ 
++/*
++ * called by:
++ *   - hw/remote/proxy-memory-listener.c|222| <<proxy_memory_listener_deconfigure>> proxy_memory_listener_reset(&proxy_listener->listener);
++ *   - hw/remote/proxy-memory-listener.c|237| <<proxy_memory_listener_configure>> proxy_listener->listener.begin = proxy_memory_listener_reset;
++ */
+ static void proxy_memory_listener_reset(MemoryListener *listener)
+ {
+     ProxyMemoryListener *proxy_listener = container_of(listener,
+@@ -45,6 +50,13 @@ static void proxy_memory_listener_reset(MemoryListener *listener)
+     proxy_listener->n_mr_sections = 0;
+ }
+ 
++/*
++ * called by:
++ *   - hw/remote/proxy-memory-listener.c|75| <<proxy_mrs_can_merge>> if (get_fd_from_hostaddr(host, NULL) !=
++ *   - hw/remote/proxy-memory-listener.c|76| <<proxy_mrs_can_merge>> get_fd_from_hostaddr(prev_host, NULL)) {
++ *   - hw/remote/proxy-memory-listener.c|103| <<try_merge>> if (get_fd_from_hostaddr(mrs_host, NULL) < 0) {
++ *   - hw/remote/proxy-memory-listener.c|196| <<proxy_memory_listener_commit>> msg.fds[region] = get_fd_from_hostaddr(host_addr, &offset);
++ */
+ static int get_fd_from_hostaddr(uint64_t host, ram_addr_t *offset)
+ {
+     MemoryRegion *mr;
+@@ -187,6 +199,13 @@ static void proxy_memory_listener_commit(MemoryListener *listener)
+     }
+ 
+     for (region = 0; region < proxy_listener->n_mr_sections; region++) {
++        /*
++	 * ProxyMemoryListener *proxy_listener:
++	 * -> MemoryListener listener;
++	 * -> int n_mr_sections;
++	 * -> MemoryRegionSection *mr_sections;
++	 * -> QIOChannel *ioc;
++	 */
+         section = &proxy_listener->mr_sections[region];
+         msg.data.sync_sysmem.gpas[region] =
+             section->offset_within_address_space;
+@@ -201,6 +220,10 @@ static void proxy_memory_listener_commit(MemoryListener *listener)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - hw/remote/proxy.c|162| <<pci_proxy_dev_exit>> proxy_memory_listener_deconfigure(&dev->proxy_listener);
++ */
+ void proxy_memory_listener_deconfigure(ProxyMemoryListener *proxy_listener)
+ {
+     memory_listener_unregister(&proxy_listener->listener);
+@@ -208,6 +231,10 @@ void proxy_memory_listener_deconfigure(ProxyMemoryListener *proxy_listener)
+     proxy_memory_listener_reset(&proxy_listener->listener);
+ }
+ 
++/*
++ * called by:
++ *   - hw/remote/proxy.c|116| <<pci_proxy_dev_realize>> proxy_memory_listener_configure(&dev->proxy_listener, dev->ioc);
++ */
+ void proxy_memory_listener_configure(ProxyMemoryListener *proxy_listener,
+                                      QIOChannel *ioc)
+ {
+diff --git a/hw/remote/proxy.c b/hw/remote/proxy.c
+index 4fa4be079..214fb63e3 100644
+--- a/hw/remote/proxy.c
++++ b/hw/remote/proxy.c
+@@ -28,6 +28,11 @@
+ static void probe_pci_info(PCIDevice *dev, Error **errp);
+ static void proxy_device_reset(DeviceState *dev);
+ 
++/*
++ * 在以下使用proxy_intx_update():
++ *   - hw/remote/proxy.c|74| <<setup_irqfd>> proxy_intx_update(pci_dev);
++ *   - hw/remote/proxy.c|76| <<setup_irqfd>> pci_device_set_intx_routing_notifier(pci_dev, proxy_intx_update);
++ */
+ static void proxy_intx_update(PCIDevice *pci_dev)
+ {
+     PCIProxyDev *dev = PCI_PROXY_DEV(pci_dev);
+@@ -101,6 +106,28 @@ static void pci_proxy_dev_realize(PCIDevice *device, Error **errp)
+         return;
+     }
+ 
++    /*
++     * qio_channel_new_fd:
++     * @fd: the file descriptor
++     * @errp: pointer to a NULL-initialized error object
++     *
++     * Create a channel for performing I/O on the file
++     * descriptor @fd. The particular subclass of QIOChannel
++     * that is returned will depend on what underlying object
++     * the file descriptor is associated with. It may be either
++     * a QIOChannelSocket or a QIOChannelFile instance. Upon
++     * success, the returned QIOChannel instance will own
++     * the @fd file descriptor, and take responsibility for
++     * closing it when no longer required. On failure, the
++     * caller is responsible for closing @fd.
++     *
++     * Returns: the channel object, or NULL on error
++     *
++     *
++     * PCIProxyDev *dev:
++     * -> QIOChannel *ioc;
++     * -> ProxyMemoryListener proxy_listener;
++     */
+     dev->ioc = qio_channel_new_fd(fd, errp);
+ 
+     error_setg(&dev->migration_blocker, "%s does not support migration",
+@@ -138,6 +165,19 @@ static void pci_proxy_dev_exit(PCIDevice *pdev)
+     event_notifier_cleanup(&dev->resample);
+ }
+ 
++/*
++ * called by:
++ *   - hw/remote/proxy.c|173| <<pci_proxy_read_config>> config_op_send(PCI_PROXY_DEV(d), addr, &val, len, MPQEMU_CMD_PCI_CFGREAD);
++ *   - hw/remote/proxy.c|188| <<pci_proxy_write_config>> config_op_send(PCI_PROXY_DEV(d), addr, &val, len, MPQEMU_CMD_PCI_CFGWRITE);
++ *   - hw/remote/proxy.c|298| <<probe_pci_info>> config_op_send(pdev, PCI_VENDOR_ID, &val, 2, MPQEMU_CMD_PCI_CFGREAD);
++ *   - hw/remote/proxy.c|301| <<probe_pci_info>> config_op_send(pdev, PCI_DEVICE_ID, &val, 2, MPQEMU_CMD_PCI_CFGREAD);
++ *   - hw/remote/proxy.c|304| <<probe_pci_info>> config_op_send(pdev, PCI_CLASS_DEVICE, &val, 2, MPQEMU_CMD_PCI_CFGREAD);
++ *   - hw/remote/proxy.c|307| <<probe_pci_info>> config_op_send(pdev, PCI_SUBSYSTEM_ID, &val, 2, MPQEMU_CMD_PCI_CFGREAD);
++ *   - hw/remote/proxy.c|336| <<probe_pci_info>> config_op_send(pdev, PCI_BASE_ADDRESS_0 + (4 * i), &orig_val, 4,
++ *   - hw/remote/proxy.c|339| <<probe_pci_info>> config_op_send(pdev, PCI_BASE_ADDRESS_0 + (4 * i), &new_val, 4,
++ *   - hw/remote/proxy.c|341| <<probe_pci_info>> config_op_send(pdev, PCI_BASE_ADDRESS_0 + (4 * i), &new_val, 4,
++ *   - hw/remote/proxy.c|344| <<probe_pci_info>> config_op_send(pdev, PCI_BASE_ADDRESS_0 + (4 * i), &orig_val, 4,
++ */
+ static void config_op_send(PCIProxyDev *pdev, uint32_t addr, uint32_t *val,
+                            int len, unsigned int op)
+ {
+@@ -208,6 +248,9 @@ static void pci_proxy_dev_class_init(ObjectClass *klass, void *data)
+     device_class_set_props(dc, proxy_properties);
+ }
+ 
++/*
++ * qemu command line用的, main VM的
++ */
+ static const TypeInfo pci_proxy_dev_type_info = {
+     .name          = TYPE_PCI_PROXY_DEV,
+     .parent        = TYPE_PCI_DEVICE,
+@@ -276,6 +319,10 @@ static uint64_t proxy_bar_read(void *opaque, hwaddr addr, unsigned size)
+     return val;
+ }
+ 
++/*
++ * 在以下使用proxy_mr_ops:
++ *   - hw/remote/proxy.c|374| <<probe_pci_info>> &proxy_mr_ops, &pdev->region[i],
++ */
+ const MemoryRegionOps proxy_mr_ops = {
+     .read = proxy_bar_read,
+     .write = proxy_bar_write,
+diff --git a/hw/remote/remote-obj.c b/hw/remote/remote-obj.c
+index 4f2125421..4ba760505 100644
+--- a/hw/remote/remote-obj.c
++++ b/hw/remote/remote-obj.c
+@@ -49,6 +49,19 @@ struct RemoteObject {
+     DeviceListener listener;
+ };
+ 
++/*
++ * (gdb) bt
++ * #0  0x00005555558ccdd4 in remote_object_set_fd (obj=0x555556b68fe0, str=0x555556b6a200 "10", errp=0x7fffffffdd18) at ../hw/remote/remote-obj.c:70
++ * #1  0x0000555555d13ff4 in property_set_str (obj=0x555556b68fe0, v= 0x555556b6a340, name=0x555556b6a290 "fd", opaque=0x555556ad1fe0, errp=0x7fffffffdd18) at ../qom/object.c:2180
++ * #2  0x0000555555d12385 in object_property_set (obj=0x555556b68fe0, name=0x555556b6a290 "fd", v=0x555556b6a340, errp=0x7fffffffdd70) at ../qom/object.c:1402
++ * #3  0x0000555555d159e9 in user_creatable_add_type (type=0x5555562b883c "x-remote-object", id=0x55555696ad90 "robj1", qdict=0x555556b690c0, v=0x555556b6a340, errp=0x7fffffffdd90)
++ *                        at ../qom/object_interfaces.c:85
++ * #4  0x0000555555d15c52 in user_creatable_add_qapi (options=0x55555696aae0, errp=0x5555568dfef8 <error_fatal>) at ../qom/object_interfaces.c:137
++ * #5  0x0000555555ccd908 in object_option_foreach_add (type_opt_predicate=0x555555ccdb80 <object_create_early>) at ../softmmu/vl.c:1702
++ * #6  0x0000555555ccdfc8 in qemu_create_early_backends () at ../softmmu/vl.c:1874
++ * #7  0x0000555555cd1df7 in qemu_init (argc=9, argv=0x7fffffffe0e8, envp=0x7fffffffe138) at ../softmmu/vl.c:3550
++ * #8  0x000055555581966d in main (argc=9, argv=0x7fffffffe0e8, envp=0x7fffffffe138) at ../softmmu/main.c:49
++ */
+ static void remote_object_set_fd(Object *obj, const char *str, Error **errp)
+ {
+     RemoteObject *o = REMOTE_OBJECT(obj);
+@@ -97,6 +110,10 @@ static void remote_object_machine_done(Notifier *notifier, void *data)
+     RemoteCommDev *comdev = NULL;
+     Error *err = NULL;
+ 
++    /*
++     * RemoteObject *o:
++     * -> char *devid;
++     */
+     dev = qdev_find_recursive(sysbus_get_default(), o->devid);
+     if (!dev || !object_dynamic_cast(OBJECT(dev), TYPE_PCI_DEVICE)) {
+         error_report("%s is not a PCI device", o->devid);
+@@ -143,9 +160,31 @@ static void remote_object_init(Object *obj)
+     k->nr_devs++;
+ 
+     o->machine_done.notify = remote_object_machine_done;
++    /*
++     * called by:
++     *   - hw/acpi/piix4.c|516| <<piix4_pm_realize>> qemu_add_machine_init_done_notifier(&s->machine_ready);
++     *   - hw/arm/virt.c|2113| <<machvirt_init>> qemu_add_machine_init_done_notifier(&vms->machine_done);
++     *   - hw/core/machine.c|961| <<machine_initfn>> qemu_add_machine_init_done_notifier(&ms->sysbus_notifier);
++     *   - hw/i386/intel_iommu.c|3850| <<vtd_realize>> qemu_add_machine_init_done_notifier(&vtd_machine_done_notify);
++     *   - hw/i386/microvm.c|669| <<microvm_machine_initfn>> qemu_add_machine_init_done_notifier(&mms->machine_done);
++     *   - hw/i386/pc.c|821| <<pc_guest_info_init>> qemu_add_machine_init_done_notifier(&pcms->machine_done);
++     *   - hw/intc/ioapic.c|470| <<ioapic_realize>> qemu_add_machine_init_done_notifier(&s->machine_done);
++     *   - hw/isa/lpc_ich9.c|702| <<ich9_lpc_realize>> qemu_add_machine_init_done_notifier(&lpc->machine_ready);
++     *   - hw/nvram/fw_cfg.c|1143| <<fw_cfg_common_realize>> qemu_add_machine_init_done_notifier(&s->machine_ready);
++     *   - hw/pci/pci.c|128| <<pci_bus_realize>> qemu_add_machine_init_done_notifier(&bus->machine_done);
++     *   - hw/ppc/e500.c|651| <<ppce500_prep_device_tree>> qemu_add_machine_init_done_notifier(&p->notifier);
++     *   - hw/remote/remote-obj.c|146| <<remote_object_init>> qemu_add_machine_init_done_notifier(&o->machine_done);
++     *   - target/arm/kvm.c|392| <<kvm_arm_register_device>> qemu_add_machine_init_done_notifier(&notify);
++     *   - target/i386/cpu.c|6906| <<x86_cpu_realizefn>> qemu_add_machine_init_done_notifier(&cpu->machine_done);
++     *   - target/i386/kvm/kvm.c|2244| <<kvm_arch_init>> qemu_add_machine_init_done_notifier(&smram_machine_done);
++     *   - target/i386/sev.c|800| <<sev_kvm_init>> qemu_add_machine_init_done_notifier(&sev_machine_done_notify);
++     */
+     qemu_add_machine_init_done_notifier(&o->machine_done);
+ }
+ 
++/*
++ * TypeInfo remote_object_info.instance_finalize = remote_object_finalize()
++ */
+ static void remote_object_finalize(Object *obj)
+ {
+     RemoteObjectClass *k = REMOTE_OBJECT_GET_CLASS(obj);
+@@ -181,6 +220,19 @@ static void remote_object_class_init(ObjectClass *klass, void *data)
+                                   remote_object_set_devid);
+ }
+ 
++/*
++ * test的例子:
++ *  35         # Create remote process
++ *  36         remote_vm = self.get_vm()
++ *  37         remote_vm.add_args('-machine', 'x-remote')
++ *  38         remote_vm.add_args('-nodefaults')
++ *  39         remote_vm.add_args('-device', 'lsi53c895a,id=lsi1')
++ *  40         remote_vm.add_args('-object', 'x-remote-object,id=robj1,'
++ *  41                            'devid=lsi1,fd='+str(remote_sock.fileno()))
++ *  42         remote_vm.launch()
++ *
++ * 似乎是qemu cmdline
++ */
+ static const TypeInfo remote_object_info = {
+     .name = TYPE_REMOTE_OBJECT,
+     .parent = TYPE_OBJECT,
+diff --git a/hw/vfio/pci.c b/hw/vfio/pci.c
+index 5c65aa0a9..33aa99c6c 100644
+--- a/hw/vfio/pci.c
++++ b/hw/vfio/pci.c
+@@ -2465,6 +2465,10 @@ static int vfio_pci_load_config(VFIODevice *vbasedev, QEMUFile *f)
+     return ret;
+ }
+ 
++/*
++ * 在以下使用vfio_pci_ops:
++ *   - hw/vfio/pci.c|2810| <<vfio_realize>> vdev->vbasedev.ops = &vfio_pci_ops;
++ */
+ static VFIODeviceOps vfio_pci_ops = {
+     .vfio_compute_needs_reset = vfio_pci_compute_needs_reset,
+     .vfio_hot_reset_multi = vfio_pci_hot_reset_multi,
+diff --git a/hw/virtio/vhost.c b/hw/virtio/vhost.c
+index e2163a0d6..6222ef70b 100644
+--- a/hw/virtio/vhost.c
++++ b/hw/virtio/vhost.c
+@@ -764,6 +764,10 @@ static void vhost_iommu_region_del(MemoryListener *listener,
+     }
+ }
+ 
++/*
++ * called by:
++ *   - hw/virtio/vhost.c|1123| <<vhost_virtqueue_start>> r = vhost_virtqueue_set_addr(dev, vq, vhost_vq_index, dev->log_enabled);
++ */
+ static int vhost_virtqueue_set_addr(struct vhost_dev *dev,
+                                     struct vhost_virtqueue *vq,
+                                     unsigned idx, bool enable_log)
+@@ -1050,6 +1054,33 @@ out:
+     return ret;
+ }
+ 
++/*
++ * (gdb) bt
++ * #0  0x000055be200149a4 in vhost_virtqueue_start (dev=0x55be21df0890, vdev=0x55be22b90300, vq=0x55be21df0b50, idx=3) at ../hw/virtio/vhost.c:1057
++ * #1  0x000055be20016891 in vhost_dev_start (hdev=0x55be21df0890, vdev=0x55be22b90300) at ../hw/virtio/vhost.c:1734
++ * #2  0x000055be1fccc8b5 in vhost_net_start_one (net=0x55be21df0890, dev=0x55be22b90300) at ../hw/net/vhost_net.c:246
++ * #3  0x000055be1fcccd73 in vhost_net_start (dev=0x55be22b90300, ncs=0x55be22baac80, total_queues=2) at ../hw/net/vhost_net.c:351
++ * #4  0x000055be200095e1 in virtio_net_vhost_status (n=0x55be22b90300, status=15 '\017') at ../hw/net/virtio-net.c:288
++ * #5  0x000055be2000988c in virtio_net_set_status (vdev=0x55be22b90300, status=15 '\017') at ../hw/net/virtio-net.c:369
++ * #6  0x000055be1ffd07f0 in virtio_set_status (vdev=0x55be22b90300, val=15 '\017') at ../hw/virtio/virtio.c:1958
++ * #7  0x000055be1fc7d0af in virtio_pci_common_write (opaque=0x55be22b88160, addr=20, val=15, size=1) at ../hw/virtio/virtio-pci.c:1260
++ * #8  0x000055be2003abd3 in memory_region_write_accessor (mr=0x55be22b88b50, addr=20, value=0x7f68777fd6c8, size=1, shift=0, mask=255, attrs=...) at ../softmmu/memory.c:491
++ * #9  0x000055be2003adf7 in access_with_adjusted_size (addr=20, value=0x7f68777fd6c8, size=1, access_size_min=1, access_size_max=4, access_fn= 0x55be2003aaee <memory_region_write_accessor>,
++ *                              mr=0x55be22b88b50, attrs=...) at ../softmmu/memory.c:552
++ * #10 0x000055be2003ddf6 in memory_region_dispatch_write (mr=0x55be22b88b50, addr=20, data=15, op=MO_8, attrs=...) at ../softmmu/memory.c:1502
++ * #11 0x000055be2006a2cc in flatview_write_continue (fv=0x7f686c008230, addr=4261412884, attrs=..., ptr=0x7f69877a2028, len=1, addr1=20, l=1, mr=0x55be22b88b50) at ../softmmu/physmem.c:2746
++ * #12 0x000055be2006a411 in flatview_write (fv=0x7f686c008230, addr=4261412884, attrs=..., buf=0x7f69877a2028, len=1) at ../softmmu/physmem.c:2786
++ * #13 0x000055be2006a77d in address_space_write (as=0x55be20c94bc0 <address_space_memory>, addr=4261412884, attrs=..., buf=0x7f69877a2028, len=1) at ../softmmu/physmem.c:2878
++ * #14 0x000055be2006a7ea in address_space_rw (as=0x55be20c94bc0 <address_space_memory>, addr=4261412884, attrs=..., buf=0x7f69877a2028, len=1, is_write=true) at ../softmmu/physmem.c:2888
++ * #15 0x000055be1fff59c6 in kvm_cpu_exec (cpu=0x55be21e89650) at ../accel/kvm/kvm-all.c:2517
++ * #16 0x000055be20037aa9 in kvm_vcpu_thread_fn (arg=0x55be21e89650) at ../accel/kvm/kvm-accel-ops.c:49
++ * #17 0x000055be202437ea in qemu_thread_start (args=0x55be21e96780) at ../util/qemu-thread-posix.c:521
++ * #18 0x00007f6984be0ea5 in start_thread () at /lib64/libpthread.so.0
++ * #19 0x00007f69849098cd in clone () at /lib64/libc.so.6
++ *
++ * called by:
++ *   - hw/virtio/vhost.c|1734| <<vhost_dev_start>> r = vhost_virtqueue_start(hdev,
++ */
+ static int vhost_virtqueue_start(struct vhost_dev *dev,
+                                 struct VirtIODevice *vdev,
+                                 struct vhost_virtqueue *vq,
+diff --git a/hw/virtio/virtio-pci.c b/hw/virtio/virtio-pci.c
+index b321604d9..7c8bba54d 100644
+--- a/hw/virtio/virtio-pci.c
++++ b/hw/virtio/virtio-pci.c
+@@ -665,6 +665,10 @@ static uint32_t virtio_read_config(PCIDevice *pci_dev,
+     return pci_default_read_config(pci_dev, address, len);
+ }
+ 
++/*
++ * called by:
++ *   - hw/virtio/virtio-pci.c|736| <<kvm_virtio_pci_vector_use>> ret = kvm_virtio_pci_vq_vector_use(proxy, queue_no, vector);
++ */
+ static int kvm_virtio_pci_vq_vector_use(VirtIOPCIProxy *proxy,
+                                         unsigned int queue_no,
+                                         unsigned int vector)
+@@ -692,6 +696,11 @@ static void kvm_virtio_pci_vq_vector_release(VirtIOPCIProxy *proxy,
+     }
+ }
+ 
++/*
++ * called by:
++ *   - hw/virtio/virtio-pci.c|744| <<kvm_virtio_pci_vector_use>> ret = kvm_virtio_pci_irqfd_use(proxy, queue_no, vector);
++ *   - hw/virtio/virtio-pci.c|828| <<virtio_pci_vq_vector_unmask>> ret = kvm_virtio_pci_irqfd_use(proxy, queue_no, vector);
++ */
+ static int kvm_virtio_pci_irqfd_use(VirtIOPCIProxy *proxy,
+                                  unsigned int queue_no,
+                                  unsigned int vector)
+@@ -717,6 +726,10 @@ static void kvm_virtio_pci_irqfd_release(VirtIOPCIProxy *proxy,
+     assert(ret == 0);
+ }
+ 
++/*
++ * called by:
++ *   - hw/virtio/virtio-pci.c|1020| <<virtio_pci_set_guest_notifiers>> r = kvm_virtio_pci_vector_use(proxy, nvqs);
++ */
+ static int kvm_virtio_pci_vector_use(VirtIOPCIProxy *proxy, int nvqs)
+ {
+     PCIDevice *dev = &proxy->pci_dev;
+@@ -733,6 +746,9 @@ static int kvm_virtio_pci_vector_use(VirtIOPCIProxy *proxy, int nvqs)
+         if (vector >= msix_nr_vectors_allocated(dev)) {
+             continue;
+         }
++        /*
++	 * 这里的vector是queue vector, 是0, 1, 2 ...
++	 */
+         ret = kvm_virtio_pci_vq_vector_use(proxy, queue_no, vector);
+         if (ret < 0) {
+             goto undo;
+@@ -972,12 +988,51 @@ static bool virtio_pci_query_guest_notifiers(DeviceState *d)
+     return msix_enabled(&proxy->pci_dev);
+ }
+ 
++/*
++ * called by:
++ *   - backends/cryptodev-vhost.c|201| <<cryptodev_vhost_start>> r = k->set_guest_notifiers(qbus->parent, total_queues, true);
++ *   - backends/cryptodev-vhost.c|235| <<cryptodev_vhost_start>> e = k->set_guest_notifiers(qbus->parent, total_queues, false);
++ *   - backends/cryptodev-vhost.c|262| <<cryptodev_vhost_stop>> r = k->set_guest_notifiers(qbus->parent, total_queues, false);
++ *   - backends/vhost-user.c|81| <<vhost_user_backend_start>> ret = k->set_guest_notifiers(qbus->parent, b->dev.nvqs, true);
++ *   - backends/vhost-user.c|107| <<vhost_user_backend_start>> k->set_guest_notifiers(qbus->parent, b->dev.nvqs, false);
++ *   - backends/vhost-user.c|126| <<vhost_user_backend_stop>> ret = k->set_guest_notifiers(qbus->parent,
++ *   - hw/block/dataplane/virtio-blk.c|194| <<virtio_blk_data_plane_start>> r = k->set_guest_notifiers(qbus->parent, nvqs, true);
++ *   - hw/block/dataplane/virtio-blk.c|317| <<virtio_blk_data_plane_stop>> k->set_guest_notifiers(qbus->parent, nvqs, false);
++ *   - hw/block/vhost-user-blk.c|130| <<vhost_user_blk_start>> ret = k->set_guest_notifiers(qbus->parent, s->dev.nvqs, true);
++ *   - hw/block/vhost-user-blk.c|176| <<vhost_user_blk_start>> k->set_guest_notifiers(qbus->parent, s->dev.nvqs, false);
++ *   - hw/block/vhost-user-blk.c|200| <<vhost_user_blk_stop>> ret = k->set_guest_notifiers(qbus->parent, s->dev.nvqs, false);
++ *   - hw/net/vhost_net.c|343| <<vhost_net_start>> r = k->set_guest_notifiers(qbus->parent, total_queues * 2, true);
++ *   - hw/net/vhost_net.c|374| <<vhost_net_start>> e = k->set_guest_notifiers(qbus->parent, total_queues * 2, false);
++ *   - hw/net/vhost_net.c|395| <<vhost_net_stop>> r = k->set_guest_notifiers(qbus->parent, total_queues * 2, false);
++ *   - hw/scsi/vhost-scsi-common.c|47| <<vhost_scsi_common_start>> ret = k->set_guest_notifiers(qbus->parent, vsc->dev.nvqs, true);
++ *   - hw/scsi/vhost-scsi-common.c|91| <<vhost_scsi_common_start>> k->set_guest_notifiers(qbus->parent, vsc->dev.nvqs, false);
++ *   - hw/scsi/vhost-scsi-common.c|107| <<vhost_scsi_common_stop>> ret = k->set_guest_notifiers(qbus->parent, vsc->dev.nvqs, false);
++ *   - hw/scsi/virtio-scsi-dataplane.c|150| <<virtio_scsi_dataplane_start>> rc = k->set_guest_notifiers(qbus->parent, vs->conf.num_queues + 2, true);
++ *   - hw/scsi/virtio-scsi-dataplane.c|193| <<virtio_scsi_dataplane_start>> k->set_guest_notifiers(qbus->parent, vs->conf.num_queues + 2, false);
++ *   - hw/scsi/virtio-scsi-dataplane.c|234| <<virtio_scsi_dataplane_stop>> k->set_guest_notifiers(qbus->parent, vs->conf.num_queues + 2, false);
++ *   - hw/virtio/vhost-user-fs.c|70| <<vuf_start>> ret = k->set_guest_notifiers(qbus->parent, fs->vhost_dev.nvqs, true);
++ *   - hw/virtio/vhost-user-fs.c|95| <<vuf_start>> k->set_guest_notifiers(qbus->parent, fs->vhost_dev.nvqs, false);
++ *   - hw/virtio/vhost-user-fs.c|113| <<vuf_stop>> ret = k->set_guest_notifiers(qbus->parent, fs->vhost_dev.nvqs, false);
++ *   - hw/virtio/vhost-vsock-common.c|40| <<vhost_vsock_common_start>> ret = k->set_guest_notifiers(qbus->parent, vvc->vhost_dev.nvqs, true);
++ *   - hw/virtio/vhost-vsock-common.c|65| <<vhost_vsock_common_start>> k->set_guest_notifiers(qbus->parent, vvc->vhost_dev.nvqs, false);
++ *   - hw/virtio/vhost-vsock-common.c|84| <<vhost_vsock_common_stop>> ret = k->set_guest_notifiers(qbus->parent, vvc->vhost_dev.nvqs, false);
++ *
++ * 在以下使用virtio_pci_set_guest_notifiers():
++ *   - hw/virtio/virtio-pci.c|2179| <<virtio_pci_bus_class_init>> k->set_guest_notifiers = virtio_pci_set_guest_notifiers;
++ */
+ static int virtio_pci_set_guest_notifiers(DeviceState *d, int nvqs, bool assign)
+ {
+     VirtIOPCIProxy *proxy = to_virtio_pci_proxy(d);
+     VirtIODevice *vdev = virtio_bus_get_device(&proxy->bus);
+     VirtioDeviceClass *k = VIRTIO_DEVICE_GET_CLASS(vdev);
+     int r, n;
++    /*
++     * kvm_msi_via_irqfd_enabled:
++     *
++     * Returns: true if we can route a PCI MSI (Message Signaled Interrupt)
++     * to a KVM CPU via an irqfd. This requires that the kernel supports
++     * this and that we're running in a configuration that permits it.
++     */
+     bool with_irqfd = msix_enabled(&proxy->pci_dev) &&
+         kvm_msi_via_irqfd_enabled();
+ 
+@@ -986,6 +1041,15 @@ static int virtio_pci_set_guest_notifiers(DeviceState *d, int nvqs, bool assign)
+     /* When deassigning, pass a consistent nvqs value
+      * to avoid leaking notifiers.
+      */
++    /*
++     * 在以下使用VirtIOPCIProxy->nvqs_with_notifiers:
++     *   - hw/virtio/virtio-pci.c|876| <<virtio_pci_vector_unmask>> if (index < proxy->nvqs_with_notifiers) {
++     *   - hw/virtio/virtio-pci.c|892| <<virtio_pci_vector_unmask>> if (index < proxy->nvqs_with_notifiers) {
++     *   - hw/virtio/virtio-pci.c|913| <<virtio_pci_vector_mask>> if (index < proxy->nvqs_with_notifiers) {
++     *   - hw/virtio/virtio-pci.c|932| <<virtio_pci_vector_poll>> for (queue_no = 0; queue_no < proxy->nvqs_with_notifiers; queue_no++) {
++     *   - hw/virtio/virtio-pci.c|1034| <<virtio_pci_set_guest_notifiers>> assert(assign || nvqs == proxy->nvqs_with_notifiers);
++     *   - hw/virtio/virtio-pci.c|1036| <<virtio_pci_set_guest_notifiers>> proxy->nvqs_with_notifiers = nvqs;
++     */
+     assert(assign || nvqs == proxy->nvqs_with_notifiers);
+ 
+     proxy->nvqs_with_notifiers = nvqs;
+@@ -1014,6 +1078,13 @@ static int virtio_pci_set_guest_notifiers(DeviceState *d, int nvqs, bool assign)
+     /* Must set vector notifier after guest notifier has been assigned */
+     if ((with_irqfd || k->guest_notifier_mask) && assign) {
+         if (with_irqfd) {
++            /*
++	     * VirtIOPCIProxy *proxy:
++	     * -> VirtIOIRQFD *vector_irqfd;
++	     *    -> MSIMessage msg;
++	     *    -> int virq;
++	     *    -> unsigned int users;
++	     */
+             proxy->vector_irqfd =
+                 g_malloc0(sizeof(*proxy->vector_irqfd) *
+                           msix_nr_vectors_allocated(&proxy->pci_dev));
+diff --git a/hw/virtio/virtio-pci.h b/hw/virtio/virtio-pci.h
+index 2446dcd9a..a7038adf6 100644
+--- a/hw/virtio/virtio-pci.h
++++ b/hw/virtio/virtio-pci.h
+@@ -154,6 +154,15 @@ struct VirtIOPCIProxy {
+     VirtIOPCIQueue vqs[VIRTIO_QUEUE_MAX];
+ 
+     VirtIOIRQFD *vector_irqfd;
++    /*
++     * 在以下使用VirtIOPCIProxy->nvqs_with_notifiers:
++     *   - hw/virtio/virtio-pci.c|876| <<virtio_pci_vector_unmask>> if (index < proxy->nvqs_with_notifiers) {
++     *   - hw/virtio/virtio-pci.c|892| <<virtio_pci_vector_unmask>> if (index < proxy->nvqs_with_notifiers) {
++     *   - hw/virtio/virtio-pci.c|913| <<virtio_pci_vector_mask>> if (index < proxy->nvqs_with_notifiers) {
++     *   - hw/virtio/virtio-pci.c|932| <<virtio_pci_vector_poll>> for (queue_no = 0; queue_no < proxy->nvqs_with_notifiers; queue_no++) {
++     *   - hw/virtio/virtio-pci.c|1034| <<virtio_pci_set_guest_notifiers>> assert(assign || nvqs == proxy->nvqs_with_notifiers);
++     *   - hw/virtio/virtio-pci.c|1036| <<virtio_pci_set_guest_notifiers>> proxy->nvqs_with_notifiers = nvqs;
++     */
+     int nvqs_with_notifiers;
+     VirtioBusState bus;
+ };
+diff --git a/include/hw/core/cpu.h b/include/hw/core/cpu.h
+index c68bc3ba8..e4ae74fbd 100644
+--- a/include/hw/core/cpu.h
++++ b/include/hw/core/cpu.h
+@@ -419,6 +419,35 @@ struct CPUState {
+     int32_t exception_index;
+ 
+     /* shared by kvm, hax and hvf */
++    /*
++     * 在以下修改CPUSTate->vcpu_dirty:
++     *   - accel/kvm/kvm-all.c|462| <<kvm_init_vcpu>> cpu->vcpu_dirty = true;
++     *   - accel/kvm/kvm-all.c|2455| <<do_kvm_cpu_synchronize_state>> cpu->vcpu_dirty = true;
++     *   - accel/kvm/kvm-all.c|2482| <<do_kvm_cpu_synchronize_post_reset>> cpu->vcpu_dirty = false;
++     *   - accel/kvm/kvm-all.c|2493| <<do_kvm_cpu_synchronize_post_init>> cpu->vcpu_dirty = false;
++     *   - accel/kvm/kvm-all.c|2503| <<do_kvm_cpu_synchronize_pre_loadvm>> cpu->vcpu_dirty = true;
++     *   - accel/kvm/kvm-all.c|2586| <<kvm_cpu_exec>> cpu->vcpu_dirty = false;
++     *   - target/i386/hax/hax-all.c|229| <<hax_init_vcpu>> cpu->vcpu_dirty = true;
++     *   - target/i386/hax/hax-all.c|628| <<do_hax_cpu_synchronize_state>> cpu->vcpu_dirty = true;
++     *   - target/i386/hax/hax-all.c|644| <<do_hax_cpu_synchronize_post_reset>> cpu->vcpu_dirty = false;
++     *   - target/i386/hax/hax-all.c|657| <<do_hax_cpu_synchronize_post_init>> cpu->vcpu_dirty = false;
++     *   - target/i386/hax/hax-all.c|644| <<do_hax_cpu_synchronize_post_reset>> cpu->vcpu_dirty = false;
++     *   - target/i386/hax/hax-all.c|657| <<do_hax_cpu_synchronize_post_init>> cpu->vcpu_dirty = false;
++     *   - target/i386/hax/hax-all.c|667| <<do_hax_cpu_synchronize_pre_loadvm>> cpu->vcpu_dirty = true;
++     *   - target/i386/hvf/hvf.c|284| <<do_hvf_cpu_synchronize_state>> cpu->vcpu_dirty = true;
++     *   - target/i386/hvf/hvf.c|299| <<do_hvf_cpu_synchronize_post_reset>> cpu->vcpu_dirty = false;
++     *   - target/i386/hvf/hvf.c|311| <<do_hvf_cpu_synchronize_post_init>> cpu->vcpu_dirty = false;
++     *   - target/i386/hvf/hvf.c|322| <<do_hvf_cpu_synchronize_pre_loadvm>> cpu->vcpu_dirty = true;
++     *   - target/i386/hvf/hvf.c|536| <<hvf_init_vcpu>> cpu->vcpu_dirty = 1;
++     *   - target/i386/hvf/hvf.c|708| <<hvf_vcpu_exec>> cpu->vcpu_dirty = false;
++     *   - target/i386/whpx/whpx-all.c|675| <<whpx_emu_setreg_callback>> cpu->vcpu_dirty = false;
++     *   - target/i386/whpx/whpx-all.c|987| <<whpx_vcpu_run>> cpu->vcpu_dirty = false;
++     *   - target/i386/whpx/whpx-all.c|1265| <<do_whpx_cpu_synchronize_state>> cpu->vcpu_dirty = true;
++     *   - target/i386/whpx/whpx-all.c|1273| <<do_whpx_cpu_synchronize_post_reset>> cpu->vcpu_dirty = false;
++     *   - target/i386/whpx/whpx-all.c|1280| <<do_whpx_cpu_synchronize_post_init>> cpu->vcpu_dirty = false;
++     *   - target/i386/whpx/whpx-all.c|1286| <<do_whpx_cpu_synchronize_pre_loadvm>> cpu->vcpu_dirty = true;
++     *   - target/i386/whpx/whpx-all.c|1439| <<whpx_init_vcpu>> cpu->vcpu_dirty = true;
++     */
+     bool vcpu_dirty;
+ 
+     /* Used to keep track of an outstanding cpu throttle thread for migration
+diff --git a/include/hw/misc/pvpanic.h b/include/hw/misc/pvpanic.h
+index ca3c5bb53..fe0b056b5 100644
+--- a/include/hw/misc/pvpanic.h
++++ b/include/hw/misc/pvpanic.h
+@@ -27,6 +27,13 @@
+ #define PVPANIC_F_CRASHLOADED   1
+ 
+ /* The pv event value */
++/*
++ * 在以下使用PVPANIC_PANICKED:
++ *   - hw/misc/pvpanic-isa.c|68| <<global>> DEFINE_PROP_UINT8("events", PVPanicISAState, pvpanic.events, PVPANIC_PANICKED | PVPANIC_CRASHLOADED),
++ *   - hw/misc/pvpanic-pci.c|57| <<global>> DEFINE_PROP_UINT8("events", PVPanicPCIState, pvpanic.events, PVPANIC_PANICKED | PVPANIC_CRASHLOADED),
++ *   - hw/misc/pvpanic.c|29| <<handle_event>> if (event & ~(PVPANIC_PANICKED | PVPANIC_CRASHLOADED) && !logged) {
++ *   - hw/misc/pvpanic.c|34| <<handle_event>> if (event & PVPANIC_PANICKED) {
++ */
+ #define PVPANIC_PANICKED        (1 << PVPANIC_F_PANICKED)
+ #define PVPANIC_CRASHLOADED     (1 << PVPANIC_F_CRASHLOADED)
+ 
+diff --git a/include/hw/pci/pci.h b/include/hw/pci/pci.h
+index 6be4e0c46..95f6591ba 100644
+--- a/include/hw/pci/pci.h
++++ b/include/hw/pci/pci.h
+@@ -353,6 +353,18 @@ struct PCIDevice {
+     PCIINTxRoutingNotifier intx_routing_notifier;
+ 
+     /* MSI-X notifiers */
++    /*
++     * 在以下设置PCIDevie->msix_vector_use_notifier:
++     *   - hw/pci/msix.c|597| <<msix_set_vector_notifiers>> dev->msix_vector_use_notifier = use_notifier;
++     *   - hw/pci/msix.c|619| <<msix_set_vector_notifiers>> dev->msix_vector_use_notifier = NULL;
++     *   - hw/pci/msix.c|637| <<msix_unset_vector_notifiers>> dev->msix_vector_use_notifier = NULL;
++     * 在以下使用PCIDevie->msix_vector_use_notifier:
++     *   - hw/misc/ivshmem.c|795| <<ivshmem_disable_irqfd>> if (!pdev->msix_vector_use_notifier) {
++     *   - hw/pci/msix.c|106| <<msix_fire_vector_notifier>> if (!dev->msix_vector_use_notifier) {
++     *   - hw/pci/msix.c|113| <<msix_fire_vector_notifier>> ret = dev->msix_vector_use_notifier(dev, vector, msg);
++     *   - hw/pci/msix.c|571| <<msix_set_notifier_for_vector>> return dev->msix_vector_use_notifier(dev, vector, msg);
++     *   - hw/pci/msix.c|628| <<msix_unset_vector_notifiers>> assert(dev->msix_vector_use_notifier &&
++     */
+     MSIVectorUseNotifier msix_vector_use_notifier;
+     MSIVectorReleaseNotifier msix_vector_release_notifier;
+     MSIVectorPollNotifier msix_vector_poll_notifier;
+diff --git a/include/hw/remote/mpqemu-link.h b/include/hw/remote/mpqemu-link.h
+index 4ec091588..89345fd85 100644
+--- a/include/hw/remote/mpqemu-link.h
++++ b/include/hw/remote/mpqemu-link.h
+@@ -39,6 +39,12 @@ typedef enum {
+     MPQEMU_CMD_PCI_CFGREAD,
+     MPQEMU_CMD_BAR_WRITE,
+     MPQEMU_CMD_BAR_READ,
++    /*
++     * 在以下使用MPQEMU_CMD_SET_IRQFD:
++     *   - hw/remote/message.c|76| <<mpqemu_remote_msg_loop_co>> case MPQEMU_CMD_SET_IRQFD:
++     *   - hw/remote/mpqemu-link.c|257| <<mpqemu_msg_valid>> case MPQEMU_CMD_SET_IRQFD:
++     *   - hw/remote/proxy.c|62| <<setup_irqfd>> msg.cmd = MPQEMU_CMD_SET_IRQFD;
++     */
+     MPQEMU_CMD_SET_IRQFD,
+     MPQEMU_CMD_DEVICE_RESET,
+     MPQEMU_CMD_MAX,
+diff --git a/include/standard-headers/linux/virtio_pci.h b/include/standard-headers/linux/virtio_pci.h
+index db7a8e2fc..9a50619d1 100644
+--- a/include/standard-headers/linux/virtio_pci.h
++++ b/include/standard-headers/linux/virtio_pci.h
+@@ -73,6 +73,11 @@
+ /* A 16-bit vector for configuration changes. */
+ #define VIRTIO_MSI_CONFIG_VECTOR        20
+ /* A 16-bit vector for selected queue notifications. */
++/*
++ * 在以下使用VIRTIO_MSI_QUEUE_VECTOR:
++ *   - hw/virtio/virtio-pci.c|360| <<virtio_ioport_write>> case VIRTIO_MSI_QUEUE_VECTOR:
++ *   - hw/virtio/virtio-pci.c|409| <<virtio_ioport_read>> case VIRTIO_MSI_QUEUE_VECTOR:
++ */
+ #define VIRTIO_MSI_QUEUE_VECTOR         22
+ 
+ /* The remaining space is defined by each driver as the per-driver
+diff --git a/include/sysemu/kvm.h b/include/sysemu/kvm.h
+index a1ab1ee12..d3417bf9e 100644
+--- a/include/sysemu/kvm.h
++++ b/include/sysemu/kvm.h
+@@ -434,6 +434,22 @@ int kvm_vm_check_extension(KVMState *s, unsigned int extension);
+         kvm_vm_ioctl(s, KVM_ENABLE_CAP, &cap);                       \
+     })
+ 
++/*
++ * called by:
++ *   - hw/intc/openpic_kvm.c|262| <<kvm_openpic_connect_vcpu>> return kvm_vcpu_enable_cap(cs, KVM_CAP_IRQ_MPIC, 0, opp->fd,
++ *   - hw/intc/spapr_xive_kvm.c|169| <<kvmppc_xive_cpu_connect>> ret = kvm_vcpu_enable_cap(tctx->cs, KVM_CAP_PPC_IRQ_XIVE, 0, xive->fd,
++ *   - hw/intc/xics_kvm.c|166| <<icp_kvm_realize>> ret = kvm_vcpu_enable_cap(cs, KVM_CAP_IRQ_XICS, 0, kernel_xics_fd, vcpu_id);
++ *   - target/i386/kvm/kvm.c|1187| <<hyperv_handle_properties>> r = kvm_vcpu_enable_cap(cs, KVM_CAP_HYPERV_ENLIGHTENED_VMCS, 0,
++ *   - target/i386/kvm/kvm.c|1443| <<hyperv_init_vcpu>> ret = kvm_vcpu_enable_cap(cs, synic_cap, 0);
++ *   - target/mips/kvm.c|74| <<kvm_arch_init_vcpu>> ret = kvm_vcpu_enable_cap(cs, KVM_CAP_MIPS_FPU, 0, 0);
++ *   - target/mips/kvm.c|83| <<kvm_arch_init_vcpu>> ret = kvm_vcpu_enable_cap(cs, KVM_CAP_MIPS_MSA, 0, 0);
++ *   - target/ppc/kvm.c|230| <<kvm_booke206_tlb_init>> ret = kvm_vcpu_enable_cap(cs, KVM_CAP_SW_TLB, 0, (uintptr_t)&cfg);
++ *   - target/ppc/kvm.c|1780| <<kvmppc_booke_watchdog_enable>> ret = kvm_vcpu_enable_cap(cs, KVM_CAP_PPC_BOOKE_WATCHDOG, 0);
++ *   - target/ppc/kvm.c|2052| <<kvmppc_set_papr>> ret = kvm_vcpu_enable_cap(cs, KVM_CAP_PPC_PAPR, 0);
++ *   - target/ppc/kvm.c|2075| <<kvmppc_set_mpic_proxy>> ret = kvm_vcpu_enable_cap(cs, KVM_CAP_PPC_EPR, 0, mpic_proxy);
++ *   - target/ppc/kvm.c|2091| <<kvmppc_set_fwnmi>> return kvm_vcpu_enable_cap(cs, KVM_CAP_PPC_FWNMI, 0);
++ *   - target/s390x/kvm.c|1998| <<kvm_s390_enable_css_support>> r = kvm_vcpu_enable_cap(CPU(cpu), KVM_CAP_S390_CSS_SUPPORT, 0);
++ */
+ #define kvm_vcpu_enable_cap(cpu, capability, cap_flags, ...)         \
+     ({                                                               \
+         struct kvm_enable_cap cap = {                                \
+diff --git a/softmmu/runstate.c b/softmmu/runstate.c
+index ce8977c6a..ea56b6244 100644
+--- a/softmmu/runstate.c
++++ b/softmmu/runstate.c
+@@ -430,6 +430,13 @@ static int qemu_debug_requested(void)
+ /*
+  * Reset the VM. Issue an event unless @reason is SHUTDOWN_CAUSE_NONE.
+  */
++/*
++ * called by:
++ *   - hw/core/machine.c|1311| <<qdev_machine_creation_done>> qemu_system_reset(SHUTDOWN_CAUSE_NONE);
++ *   - hw/i386/xen/xen-hvm.c|1202| <<cpu_handle_ioreq>> qemu_system_reset(request);
++ *   - migration/savevm.c|3048| <<load_snapshot>> qemu_system_reset(SHUTDOWN_CAUSE_NONE);
++ *   - softmmu/runstate.c|703| <<main_loop_should_exit>> qemu_system_reset(request);
++ */
+ void qemu_system_reset(ShutdownCause reason)
+ {
+     MachineClass *mc;
+@@ -463,6 +470,18 @@ static void qemu_system_wakeup(void)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|2721| <<kvm_cpu_exec>> qemu_system_guest_panicked(cpu_get_crash_info(cpu));
++ *   - hw/misc/pvpanic.c|35| <<handle_event>> qemu_system_guest_panicked(NULL);
++ *   - hw/ppc/spapr.c|3353| <<spapr_do_system_reset_on_cpu>> qemu_system_guest_panicked(NULL);
++ *   - hw/ppc/spapr_events.c|838| <<spapr_mce_dispatch_elog>> qemu_system_guest_panicked(NULL);
++ *   - hw/ppc/spapr_events.c|896| <<spapr_mce_req_event>> qemu_system_guest_panicked(NULL);
++ *   - hw/ppc/spapr_rtas.c|355| <<rtas_ibm_os_term>> qemu_system_guest_panicked(NULL);
++ *   - target/i386/whpx/whpx-all.c|1245| <<whpx_vcpu_run>> qemu_system_guest_panicked(cpu_get_crash_info(cpu));
++ *   - target/s390x/helper.c|102| <<s390_handle_wait>> qemu_system_guest_panicked(cpu_get_crash_info(cs));
++ *   - target/s390x/kvm.c|1712| <<unmanageable_intercept>> qemu_system_guest_panicked(cpu_get_crash_info(cs));
++ */
+ void qemu_system_guest_panicked(GuestPanicInformation *info)
+ {
+     qemu_log_mask(LOG_GUEST_ERROR, "Guest crashed");
+@@ -511,6 +530,10 @@ void qemu_system_guest_panicked(GuestPanicInformation *info)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - hw/misc/pvpanic.c|40| <<handle_event>> qemu_system_guest_crashloaded(NULL);
++ */
+ void qemu_system_guest_crashloaded(GuestPanicInformation *info)
+ {
+     qemu_log_mask(LOG_GUEST_ERROR, "Guest crash loaded");
+diff --git a/target/i386/kvm/kvm.c b/target/i386/kvm/kvm.c
+index 7fe9f5271..d086eebec 100644
+--- a/target/i386/kvm/kvm.c
++++ b/target/i386/kvm/kvm.c
+@@ -3689,6 +3689,10 @@ static int kvm_get_mp_state(X86CPU *cpu)
+     return 0;
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|4116| <<kvm_arch_get_registers>> ret = kvm_get_apic(cpu);
++ */
+ static int kvm_get_apic(X86CPU *cpu)
+ {
+     DeviceState *apic = cpu->apic_state;
+@@ -4613,6 +4617,10 @@ bool kvm_arch_stop_on_emulation_error(CPUState *cs)
+            ((env->segs[R_CS].selector  & 3) != 3);
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|1435| <<kvm_init_irq_routing>> kvm_arch_init_irq_routing(s);
++ */
+ void kvm_arch_init_irq_routing(KVMState *s)
+ {
+     /* We know at this point that we're using the in-kernel
+@@ -4736,6 +4744,14 @@ struct MSIRouteEntry {
+ };
+ 
+ /* List of used GSI routes */
++/*
++ * 在以下使用msi_route_list:
++ *   - target/i386/kvm/kvm.c|4743| <<QLIST_HEAD>> static QLIST_HEAD(, MSIRouteEntry) msi_route_list = \
++ *   - target/i386/kvm/kvm.c|4744| <<QLIST_HEAD>> QLIST_HEAD_INITIALIZER(msi_route_list);
++ *   - target/i386/kvm/kvm.c|4755| <<kvm_update_msi_routes_all>> QLIST_FOREACH(entry, &msi_route_list, list) {
++ *   - target/i386/kvm/kvm.c|4793| <<kvm_arch_add_msi_route_post>> QLIST_INSERT_HEAD(&msi_route_list, entry, list);
++ *   - target/i386/kvm/kvm.c|4814| <<kvm_arch_release_virq_post>> QLIST_FOREACH_SAFE(entry, &msi_route_list, list, next) {
++ */
+ static QLIST_HEAD(, MSIRouteEntry) msi_route_list = \
+     QLIST_HEAD_INITIALIZER(msi_route_list);
+ 
+@@ -4786,6 +4802,14 @@ int kvm_arch_add_msi_route_post(struct kvm_irq_routing_entry *route,
+     entry->dev = dev;
+     entry->vector = vector;
+     entry->virq = route->gsi;
++    /*
++     * 在以下使用msi_route_list:
++     *   - target/i386/kvm/kvm.c|4743| <<QLIST_HEAD>> static QLIST_HEAD(, MSIRouteEntry) msi_route_list = \
++     *   - target/i386/kvm/kvm.c|4744| <<QLIST_HEAD>> QLIST_HEAD_INITIALIZER(msi_route_list);
++     *   - target/i386/kvm/kvm.c|4755| <<kvm_update_msi_routes_all>> QLIST_FOREACH(entry, &msi_route_list, list) {
++     *   - target/i386/kvm/kvm.c|4793| <<kvm_arch_add_msi_route_post>> QLIST_INSERT_HEAD(&msi_route_list, entry, list);
++     *   - target/i386/kvm/kvm.c|4814| <<kvm_arch_release_virq_post>> QLIST_FOREACH_SAFE(entry, &msi_route_list, list, next) {
++     */
+     QLIST_INSERT_HEAD(&msi_route_list, entry, list);
+ 
+     trace_kvm_x86_add_msi_route(route->gsi);
+diff --git a/util/qemu-sockets.c b/util/qemu-sockets.c
+index 8af0278f1..98b75de82 100644
+--- a/util/qemu-sockets.c
++++ b/util/qemu-sockets.c
+@@ -1064,6 +1064,11 @@ int unix_listen(const char *str, Error **errp)
+     return sock;
+ }
+ 
++/*
++ * called by:
++ *   - tests/qtest/test-filter-redirector.c|109| <<test_redirector_tx>> recv_sock = unix_connect(sock_path1, NULL);
++ *   - tests/qtest/test-filter-redirector.c|189| <<test_redirector_rx>> send_sock = unix_connect(sock_path1, NULL);
++ */
+ int unix_connect(const char *path, Error **errp)
+ {
+     UnixSocketAddress *saddr;
+-- 
+2.17.1
+
