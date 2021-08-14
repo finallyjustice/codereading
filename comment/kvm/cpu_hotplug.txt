@@ -37,3 +37,109 @@ SUBSYSTEM=="cpu", ACTION=="add", TEST=="online", ATTR{online}=="0", ATTR{online}
 [   22.720091]  ksys_write+0x54/0xd0
 [   22.720093]  do_syscall_64+0x33/0x40
 [   22.720103]  entry_SYSCALL_64_after_hwframe+0x44/0xae
+
+-------------------------------------
+
+We see below QMP event message when the hot-added CPU is detected by guest kernel, even the CPU is not onlined via sysfs.
+
+{"timestamp": {"seconds": 1628873592, "microseconds": 941033}, "event": "ACPI_DEVICE_OST", "data": {"info": {"device": "core1", "source": 1, "status": 0, "slot": "2", "slot-type": "CPU"}}}
+
+
+From the QMP event, the source=1 and status=0 for slot-type="CPU".
+
+----------------------------------
+
+cpu hotplug triggers acpi_device_hotplug() as in below callstack:
+
+[0] acpi_device_hotplug
+[0] acpi_hotplug_work_fn0
+[0] process_one_work
+[0] worker_thread
+[0] kthread
+[0] ret_from_fork
+
+
+acpi_device_hotplug()
+-> acpi_generic_hotplug_event()
+   -> acpi_scan_device_check()
+      -> acpi_bus_scan()
+-> acpi_evaluate_ost()
+
+
+The acpi_device_hotplug()-->acpi_evaluate_ost() will have:
+
+source_event = ACPI_NOTIFY_DEVICE_CHECK = 1
+status_code = ACPI_OST_SC_SUCCESS = 0
+
+
+acpi_evaluate_ost() finally arrives at acpi_ps_parse_aml(), which is to parse and run the "_OST" byte-code exposed by QEMU.
+
+
+[0] acpi_ps_parse_aml
+[0] acpi_ps_execute_method
+[0] acpi_ns_evaluate
+[0] acpi_evaluate_object
+[0] acpi_evaluate_ost
+[0] acpi_device_hotplug
+[0] acpi_hotplug_work_fn
+[0] process_one_work
+[0] worker_thread
+[0] kthread
+[0] ret_from_fork
+
+
+The below is how "_OST" (CPU_OST_METHOD) is constructed by QEMU. The core idea of CPU_OST_METHOD is that it writes ev_cmd (aml_arg(1)) and st_cmd (aml_arg(2)) to cpu_cmd.
+
+
+352 void build_cpus_aml(Aml *table, MachineState *machine, CPUHotplugFeatures opts,
+353                     hwaddr io_base,
+354                     const char *res_root,
+355                     const char *event_handler_method)
+356 {
+... ...
+644         method = aml_method(CPU_OST_METHOD, 4, AML_SERIALIZED);
+645         {
+646             Aml *uid = aml_arg(0);
+647             Aml *ev_cmd = aml_int(CPHP_OST_EVENT_CMD);
+648             Aml *st_cmd = aml_int(CPHP_OST_STATUS_CMD);
+649
+650             aml_append(method, aml_acquire(ctrl_lock, 0xFFFF));
+651             aml_append(method, aml_store(uid, cpu_selector));
+652             aml_append(method, aml_store(ev_cmd, cpu_cmd));
+653             aml_append(method, aml_store(aml_arg(1), cpu_data));
+654             aml_append(method, aml_store(st_cmd, cpu_cmd));
+655             aml_append(method, aml_store(aml_arg(2), cpu_data));
+656             aml_append(method, aml_release(ctrl_lock));
+657         }
+658         aml_append(cpus_dev, method);
+
+
+The write with ev_cmd and st_cmd will trap to cpu_hotplug_wr() in QEMU. As mentioned above, ev_cmd=1 and st_cmd=0.
+
+
+110 static void cpu_hotplug_wr(void *opaque, hwaddr addr, uint64_t data,
+111                            unsigned int size)
+112 {
+... ...
+184     case ACPI_CPU_CMD_DATA_OFFSET_RW:
+185         switch (cpu_st->command) {
+186         case CPHP_OST_EVENT_CMD: {
+187            cdev = &cpu_st->devs[cpu_st->selector];
+188            cdev->ost_event = data;
+189            trace_cpuhp_acpi_write_ost_ev(cpu_st->selector, cdev->ost_event);
+190            break;
+191         }
+192         case CPHP_OST_STATUS_CMD: {
+193            cdev = &cpu_st->devs[cpu_st->selector];
+194            cdev->ost_status = data;
+195            info = acpi_cpu_device_status(cpu_st->selector, cdev);
+196            qapi_event_send_acpi_device_ost(info);
+197            qapi_free_ACPIOSTInfo(info);
+198            trace_cpuhp_acpi_write_ost_status(cpu_st->selector,
+199                                              cdev->ost_status);
+200            break;
+201         }
+
+The line 196 sends out below message:
+
+{"timestamp": {"seconds": 1628873592, "microseconds": 941033}, "event": "ACPI_DEVICE_OST", "data": {"info": {"device": "core1", "source": 1, "status": 0, "slot": "2", "slot-type": "CPU"}}}
