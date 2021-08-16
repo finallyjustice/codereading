@@ -1,0 +1,162 @@
+在创建vcpu的时候在kernel space分配vcpu->run.
+
+3338 static int kvm_vm_ioctl_create_vcpu(struct kvm *kvm, u32 id)
+3339 {
+... ...
+3367         page = alloc_page(GFP_KERNEL_ACCOUNT | __GFP_ZERO);
+3368         if (!page) {
+3369                 r = -ENOMEM;
+3370                 goto vcpu_free;
+3371         }
+3372         vcpu->run = page_address(page);
+
+
+vcpu的fd是由kvm_vcpu_fops处理的.
+
+3299 static struct file_operations kvm_vcpu_fops = {
+3300         .release        = kvm_vcpu_release,
+3301         .unlocked_ioctl = kvm_vcpu_ioctl,
+3302         .mmap           = kvm_vcpu_mmap,
+3303         .llseek         = noop_llseek,
+3304         KVM_COMPAT(kvm_vcpu_compat_ioctl),
+3305 };
+
+
+当userspace的QEMU针对vcpu的fp mmap()的时候, 会绑定kvm_vcpu_vm_ops.
+
+3277 static int kvm_vcpu_mmap(struct file *file, struct vm_area_struct *vma)
+3278 {
+3279         struct kvm_vcpu *vcpu = file->private_data;
+3280         unsigned long pages = (vma->vm_end - vma->vm_start) >> PAGE_SHIFT;
+3281
+3282         if ((kvm_page_in_dirty_ring(vcpu->kvm, vma->vm_pgoff) ||
+3283              kvm_page_in_dirty_ring(vcpu->kvm, vma->vm_pgoff + pages - 1)) &&
+3284             ((vma->vm_flags & VM_EXEC) || !(vma->vm_flags & VM_SHARED)))
+3285                 return -EINVAL;
+3286
+3287         vma->vm_ops = &kvm_vcpu_vm_ops;
+3288         return 0;
+3289 }
+
+3273 static const struct vm_operations_struct kvm_vcpu_vm_ops = {
+3274         .fault = kvm_vcpu_fault,
+3275 };
+
+
+当读取mmap的内存的时候, 如果offset=0就会访问vcpu->run.
+
+3247 static vm_fault_t kvm_vcpu_fault(struct vm_fault *vmf)
+3248 {
+3249         struct kvm_vcpu *vcpu = vmf->vma->vm_file->private_data;
+3250         struct page *page;
+3251
+3252         if (vmf->pgoff == 0)
+3253                 page = virt_to_page(vcpu->run);
+3254 #ifdef CONFIG_X86
+3255         else if (vmf->pgoff == KVM_PIO_PAGE_OFFSET)
+3256                 page = virt_to_page(vcpu->arch.pio_data);
+3257 #endif
+3258 #ifdef CONFIG_KVM_MMIO
+3259         else if (vmf->pgoff == KVM_COALESCED_MMIO_PAGE_OFFSET)
+3260                 page = virt_to_page(vcpu->kvm->coalesced_mmio_ring);
+3261 #endif
+3262         else if (kvm_page_in_dirty_ring(vcpu->kvm, vmf->pgoff))
+3263                 page = kvm_dirty_ring_get_page(
+3264                     &vcpu->dirty_ring,
+3265                     vmf->pgoff - KVM_DIRTY_LOG_PAGE_OFFSET);
+3266         else
+3267                 return kvm_arch_vcpu_fault(vcpu, vmf);
+3268         get_page(page);
+3269         vmf->page = page;
+3270         return 0;
+3271 }
+
+--------------------------------
+
+vcpu->run就是kvm_run.
+
+323 struct kvm_run {
+... ...
+330         __u32 exit_reason;
+... ...
+418                 /* KVM_EXIT_INTERNAL_ERROR */
+419                 struct {
+420                         __u32 suberror;
+421                         /* Available with KVM_CAP_INTERNAL_ERROR_DATA: */
+422                         __u32 ndata;
+423                         __u64 data[16];
+424                 } internal;
+
+
+以下是可能的exit_reason.
+
+#define KVM_EXIT_UNKNOWN          0
+#define KVM_EXIT_EXCEPTION        1
+#define KVM_EXIT_IO               2
+#define KVM_EXIT_HYPERCALL        3
+#define KVM_EXIT_DEBUG            4
+#define KVM_EXIT_HLT              5
+#define KVM_EXIT_MMIO             6
+#define KVM_EXIT_IRQ_WINDOW_OPEN  7
+#define KVM_EXIT_SHUTDOWN         8
+#define KVM_EXIT_FAIL_ENTRY       9
+#define KVM_EXIT_INTR             10
+#define KVM_EXIT_SET_TPR          11
+#define KVM_EXIT_TPR_ACCESS       12
+#define KVM_EXIT_S390_SIEIC       13
+#define KVM_EXIT_S390_RESET       14
+#define KVM_EXIT_DCR              15 /* deprecated */
+#define KVM_EXIT_NMI              16
+#define KVM_EXIT_INTERNAL_ERROR   17
+#define KVM_EXIT_OSI              18
+#define KVM_EXIT_PAPR_HCALL       19
+#define KVM_EXIT_S390_UCONTROL    20
+#define KVM_EXIT_WATCHDOG         21
+#define KVM_EXIT_S390_TSCH        22
+#define KVM_EXIT_EPR              23
+#define KVM_EXIT_SYSTEM_EVENT     24
+#define KVM_EXIT_S390_STSI        25
+#define KVM_EXIT_IOAPIC_EOI       26
+#define KVM_EXIT_HYPERV           27
+#define KVM_EXIT_ARM_NISV         28
+#define KVM_EXIT_X86_RDMSR        29
+#define KVM_EXIT_X86_WRMSR        30
+#define KVM_EXIT_DIRTY_RING_FULL  31
+#define KVM_EXIT_AP_RESET_HOLD    32
+#define KVM_EXIT_X86_BUS_LOCK     33
+#define KVM_EXIT_XEN              34
+
+
+当exit_reason = KVM_EXIT_INTERNAL_ERROR的时候, 以下是可能的suberror.
+
+/* For KVM_EXIT_INTERNAL_ERROR */
+/* Emulate instruction failed. */
+#define KVM_INTERNAL_ERROR_EMULATION    1
+/* Encounter unexpected simultaneous exceptions. */
+#define KVM_INTERNAL_ERROR_SIMUL_EX     2
+/* Encounter unexpected vm-exit due to delivery event. */
+#define KVM_INTERNAL_ERROR_DELIVERY_EV  3
+/* Encounter unexpected vm-exit reason */
+#define KVM_INTERNAL_ERROR_UNEXPECTED_EXIT_REASON       4
+
+
+
+用cscope查看KVM_EXIT_INTERNAL_ERROR就能找到所有设置ndata和data[]的地方.
+
+下面是一个例子.
+
+6156 static int __vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
+6157 {
+... ...
+6304 unexpected_vmexit:
+6305         vcpu_unimpl(vcpu, "vmx: unexpected exit reason 0x%x\n",
+6306                     exit_reason.full);
+6307         dump_vmcs(vcpu);
+6308         vcpu->run->exit_reason = KVM_EXIT_INTERNAL_ERROR;
+6309         vcpu->run->internal.suberror =
+6310                         KVM_INTERNAL_ERROR_UNEXPECTED_EXIT_REASON;
+6311         vcpu->run->internal.ndata = 2;
+6312         vcpu->run->internal.data[0] = exit_reason.full;
+6313         vcpu->run->internal.data[1] = vcpu->arch.last_vmentry_cpu;
+6314         return 0;
+6315 }
