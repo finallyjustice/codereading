@@ -1,18 +1,24 @@
-From 74c8c9452d674016133a4ed2c6e8e24e6ac1ae21 Mon Sep 17 00:00:00 2001
+From 4ddf6761cd062594a87dc8ec0321211a9a402322 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Mon, 26 Jul 2021 09:47:08 -0700
+Date: Sun, 29 Aug 2021 12:03:04 -0700
 Subject: [PATCH 1/1] qemu for v6.0.0
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
  accel/kvm/kvm-all.c                         | 167 ++++++++++++++++++++
+ block.c                                     |   7 +
+ block/curl.c                                |  76 +++++++++
+ hw/acpi/cpu.c                               |   8 +
+ hw/acpi/cpu_hotplug.c                       |   4 +
+ hw/acpi/generic_event_device.c              |   5 +
  hw/core/cpu.c                               |   4 +
  hw/core/machine.c                           |  19 +++
  hw/i386/intel_iommu.c                       |  45 ++++++
+ hw/i386/kvm/clock.c                         |  48 ++++++
  hw/i386/x86-iommu.c                         |  15 ++
  hw/misc/pvpanic.c                           |   9 ++
- hw/pci/msix.c                               |  18 +++
- hw/pci/pci.c                                |  13 ++
+ hw/pci/msix.c                               |  28 ++++
+ hw/pci/pci.c                                |  19 +++
  hw/remote/iohub.c                           |   8 +
  hw/remote/machine.c                         |  13 ++
  hw/remote/memory.c                          |   9 ++
@@ -21,20 +27,21 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  hw/remote/proxy-memory-listener.c           |  27 ++++
  hw/remote/proxy.c                           |  47 ++++++
  hw/remote/remote-obj.c                      |  52 ++++++
- hw/vfio/pci.c                               |   4 +
- hw/virtio/vhost.c                           |  31 ++++
+ hw/vfio/pci.c                               |  14 ++
+ hw/virtio/vhost.c                           |  41 +++++
  hw/virtio/virtio-pci.c                      |  71 +++++++++
  hw/virtio/virtio-pci.h                      |   9 ++
  include/hw/core/cpu.h                       |  29 ++++
  include/hw/misc/pvpanic.h                   |   7 +
- include/hw/pci/pci.h                        |  12 ++
+ include/hw/pci/pci.h                        |  21 +++
  include/hw/remote/mpqemu-link.h             |   6 +
  include/standard-headers/linux/virtio_pci.h |   5 +
  include/sysemu/kvm.h                        |  16 ++
  softmmu/runstate.c                          |  23 +++
  target/i386/kvm/kvm.c                       |  24 +++
+ target/i386/monitor.c                       |  20 +++
  util/qemu-sockets.c                         |   5 +
- 29 files changed, 734 insertions(+)
+ 36 files changed, 947 insertions(+)
 
 diff --git a/accel/kvm/kvm-all.c b/accel/kvm/kvm-all.c
 index b6d9f92f1..1858a677f 100644
@@ -314,6 +321,207 @@ index b6d9f92f1..1858a677f 100644
      if (!cpu->vcpu_dirty) {
          run_on_cpu(cpu, do_kvm_cpu_synchronize_state, RUN_ON_CPU_NULL);
      }
+diff --git a/block.c b/block.c
+index c5b887cec..642374fd4 100644
+--- a/block.c
++++ b/block.c
+@@ -3245,6 +3245,13 @@ out:
+  * should be opened. If specified, neither options nor a filename may be given,
+  * nor can an existing BDS be reused (that is, *pbs has to be NULL).
+  */
++/*
++ * called by:
++ *   - block.c|3015| <<bdrv_open_backing_file>> backing_hd = bdrv_open_inherit(backing_filename, reference, options, 0, bs,
++ *   - block.c|3079| <<bdrv_open_child_bs>> bs = bdrv_open_inherit(filename, reference, image_options, 0,
++ *   - block.c|3158| <<bdrv_open_blockdev_ref>> bs = bdrv_open_inherit(NULL, reference, qdict, 0, NULL, NULL, 0, errp);
++ *   - block.c|3537| <<bdrv_open>> return bdrv_open_inherit(filename, reference, options, flags, NULL,
++ */
+ static BlockDriverState *bdrv_open_inherit(const char *filename,
+                                            const char *reference,
+                                            QDict *options, int flags,
+diff --git a/block/curl.c b/block/curl.c
+index 50e741a0d..32bcd45da 100644
+--- a/block/curl.c
++++ b/block/curl.c
+@@ -106,6 +106,12 @@ typedef struct BDRVCURLState {
+     bool sslverify;
+     uint64_t timeout;
+     char *cookie;
++    /*
++     * 在以下使用BDRVURLState->accept_range:
++     *   - block/curl.c|230| <<curl_header_cb>> s->accept_range = true;
++     *   - block/curl.c|764| <<curl_open>> s->accept_range = false;
++     *   - block/curl.c|795| <<curl_open>> && !s->accept_range) {
++     */
+     bool accept_range;
+     AioContext *aio_context;
+     QemuMutex mutex;
+@@ -197,10 +203,59 @@ static int curl_sock_cb(CURL *curl, curl_socket_t fd, int action,
+ }
+ 
+ /* Called from curl_multi_do_locked, with s->mutex held.  */
++/*
++ * (gdb) bt
++ * #0  curl_header_cb (ptr=0x555555962620, size=1, nmemb=17, opaque=0x555555956a20) at ../block/curl.c:203
++ * #1  0x00007ffff6ba9b6a in Curl_client_write () from /lib64/libcurl.so.4
++ * #2  0x00007ffff6ba8285 in Curl_http_readwrite_headers () from /lib64/libcurl.so.4
++ * #3  0x00007ffff6bbdd40 in Curl_readwrite () from /lib64/libcurl.so.4
++ * #4  0x00007ffff6bc7dbb in multi_runsingle () from /lib64/libcurl.so.4
++ * #5  0x00007ffff6bc8761 in curl_multi_perform () from /lib64/libcurl.so.4
++ * #6  0x00007ffff6bbf973 in curl_easy_perform () from /lib64/libcurl.so.4
++ * #7  0x000055555558c12b in curl_open (bs=0x55555594f5f0, options=<optimized out>, flags=<optimized out>, errp=0x7fffffffdb80) at ../block/curl.c:769
++ * #8  0x00005555555dec36 in bdrv_open_driver (bs=bs@entry=0x55555594f5f0, drv=drv@entry=0x55555590bbe0 <bdrv_https>, node_name=<optimized out>, options=options@entry=0x555555954c60,
++ *                               open_flags=16384, errp=errp@entry=0x7fffffffdc30) at ../block.c:1528
++ * #9  0x00005555555e3132 in bdrv_open_common (errp=0x7fffffffdc30, options=0x555555954c60, file=0x0, bs=0x55555594f5f0) at ../block.c:1802
++ * #10 bdrv_open_inherit (filename=<optimized out>, filename@entry=0x7fffffffe388 "https://www/test.iso", reference=<optimized out>, options=0x555555954c60,
++ *                           flags=<optimized out>, flags@entry=0, parent=parent@entry=0x555555947f50, child_class=child_class@entry=0x555555906ea0 <child_of_bds>, child_role=19,
++ *                           errp=0x7fffffffdd90) at ../block.c:3444
++ * #11 0x00005555555e3f3a in bdrv_open_child_bs (filename=filename@entry=0x7fffffffe388 "https://www/test.iso", options=options@entry=0x55555594d3e0,
++ *                               bdref_key=bdref_key@entry=0x5555556be49c "file", parent=parent@entry=0x555555947f50, child_class=child_class@entry=0x555555906ea0 <child_of_bds>,
++ *                               child_role=child_role@entry=19, allow_none=true, errp=0x7fffffffdd90) at ../block.c:3079
++ * #12 0x00005555555e371b in bdrv_open_inherit (filename=filename@entry=0x7fffffffe388 "https://www/test.iso", reference=reference@entry=0x0, options=0x55555594d3e0,
++ *                               options@entry=0x555555946be0, flags=<optimized out>, flags@entry=65792, parent=parent@entry=0x0, child_class=child_class@entry=0x0, child_role=0,
++ *                               errp=0x7fffffffde80) at ../block.c:3391
++ * #13 0x00005555555e4203 in bdrv_open (filename=filename@entry=0x7fffffffe388 "https://www/test.iso", reference=reference@entry=0x0, options=options@entry=0x555555946be0,
++ *                               flags=flags@entry=65792, errp=errp@entry=0x7fffffffde80) at ../block.c:3537
++ * #14 0x00005555555a0f06 in blk_new_open (filename=0x7fffffffe388 "https://www/test.iso", reference=0x0, options=0x555555946be0, flags=65792, errp=0x7fffffffde80) at ../block/block-backend.c:421
++ * #15 0x000055555557b27b in img_open_file (filename=0x7fffffffe388 "https://www/test.iso", options=0x555555946be0, fmt=<optimized out>, flags=65792,
++ *                               writethrough=<optimized out>, force_share=<optimized out>, quiet=<optimized out>) at ../qemu-img.c:397
++ * #16 0x000055555557b492 in img_open (image_opts=false, force_share=false, quiet=<optimized out>, writethrough=<optimized out>, flags=65792, fmt=<optimized out>,
++ *                               filename=0x7fffffffe388 "https://www/test.iso") at ../qemu-img.c:442
++ * #17 img_open (image_opts=<optimized out>, filename=0x7fffffffe388 "https://www/test.iso", fmt=<optimized out>, flags=65792, writethrough=<optimized out>, quiet=<optimized out>,
++ *                               force_share=false) at ../qemu-img.c:422
++ * #18 0x000055555557b6f5 in collect_image_info_list (force_share=<optimized out>, chain=false, fmt=0x0, filename=0x7fffffffe388 "https://www/test.iso", image_opts=false) at ../qemu-img.c:2813
++ * #19 img_info (argc=<optimized out>, argv=<optimized out>) at ../qemu-img.c:2932
++ * #20 0x000055555557845c in main (argc=2, argv=<optimized out>) at ../qemu-img.c:5375
++ *
++ * called by:
++ *   - block/curl.c|785| <<curl_open>> curl_easy_setopt(state->curl, CURLOPT_HEADERFUNCTION, curl_header_cb);
++ */
+ static size_t curl_header_cb(void *ptr, size_t size, size_t nmemb, void *opaque)
+ {
+     BDRVCURLState *s = opaque;
+     size_t realsize = size * nmemb;
++    /*
++     * 猜测此时ptr是以下的
++     * HTTP/1.1 200 OK
++     * Date: Mon, 09 Aug 2021 21:52:58 GMT
++     * Server: Apache/x.x.x () OpenSSL/x.x.2k-fips
++     * Last-Modified: Mon, 24 May 2021 17:20:54 GMT
++     * ETag: "111100000-y123412343456"
++     * Accept-Ranges: bytes
++     * Content-Length: 9931063296
++     * Content-Type: application/octet-stream
++     */
+     const char *header = (char *)ptr;
+     const char *end = header + realsize;
+     const char *accept_ranges = "accept-ranges:";
+@@ -210,6 +265,9 @@ static size_t curl_header_cb(void *ptr, size_t size, size_t nmemb, void *opaque)
+         && g_ascii_strncasecmp(header, accept_ranges,
+                                strlen(accept_ranges)) == 0) {
+ 
++        /*
++	 * returns a pointer to the first occurrence of the character
++	 */
+         char *p = strchr(header, ':') + 1;
+ 
+         /* Skip whitespace between the header name and value. */
+@@ -227,6 +285,12 @@ static size_t curl_header_cb(void *ptr, size_t size, size_t nmemb, void *opaque)
+             }
+ 
+             if (p == end || !*p) {
++                /*
++		 * 在以下使用BDRVURLState->accept_range:
++		 *   - block/curl.c|230| <<curl_header_cb>> s->accept_range = true;
++		 *   - block/curl.c|764| <<curl_open>> s->accept_range = false;
++		 *   - block/curl.c|795| <<curl_open>> && !s->accept_range) {
++		 */
+                 s->accept_range = true;
+             }
+         }
+@@ -761,6 +825,12 @@ static int curl_open(BlockDriverState *bs, QDict *options, int flags,
+         goto out;
+     }
+ 
++    /*
++     * 在以下使用BDRVURLState->accept_range:
++     *   - block/curl.c|230| <<curl_header_cb>> s->accept_range = true;
++     *   - block/curl.c|764| <<curl_open>> s->accept_range = false;
++     *   - block/curl.c|795| <<curl_open>> && !s->accept_range) {
++     */
+     s->accept_range = false;
+     curl_easy_setopt(state->curl, CURLOPT_NOBODY, 1);
+     curl_easy_setopt(state->curl, CURLOPT_HEADERFUNCTION,
+@@ -790,6 +860,12 @@ static int curl_open(BlockDriverState *bs, QDict *options, int flags,
+ 
+     s->len = d;
+ 
++    /*
++     * 在以下使用BDRVURLState->accept_range:
++     *   - block/curl.c|230| <<curl_header_cb>> s->accept_range = true;
++     *   - block/curl.c|764| <<curl_open>> s->accept_range = false;
++     *   - block/curl.c|795| <<curl_open>> && !s->accept_range) {
++     */
+     if ((!strncasecmp(s->url, "http://", strlen("http://"))
+         || !strncasecmp(s->url, "https://", strlen("https://")))
+         && !s->accept_range) {
+diff --git a/hw/acpi/cpu.c b/hw/acpi/cpu.c
+index e2317be54..f24368d77 100644
+--- a/hw/acpi/cpu.c
++++ b/hw/acpi/cpu.c
+@@ -7,6 +7,10 @@
+ #include "trace.h"
+ #include "sysemu/numa.h"
+ 
++/*
++ * https://zhuanlan.zhihu.com/p/113296734
++ */
++
+ #define ACPI_CPU_HOTPLUG_REG_LEN 12
+ #define ACPI_CPU_SELECTOR_OFFSET_WR 0
+ #define ACPI_CPU_FLAGS_OFFSET_RW 4
+@@ -341,6 +345,10 @@ const VMStateDescription vmstate_cpu_hotplug = {
+ #define CPU_EJECT_EVENT   "CEJ0"
+ #define CPU_FW_EJECT_EVENT "CEJF"
+ 
++/*
++ * called by:
++ *   - hw/i386/acpi-build.c|1468| <<build_dsdt>> build_cpus_aml(dsdt, machine, opts, pm->cpu_hp_io_base,
++ */
+ void build_cpus_aml(Aml *table, MachineState *machine, CPUHotplugFeatures opts,
+                     hwaddr io_base,
+                     const char *res_root,
+diff --git a/hw/acpi/cpu_hotplug.c b/hw/acpi/cpu_hotplug.c
+index 53654f863..9f217136d 100644
+--- a/hw/acpi/cpu_hotplug.c
++++ b/hw/acpi/cpu_hotplug.c
+@@ -103,6 +103,10 @@ void acpi_switch_to_modern_cphp(AcpiCpuHotplug *gpe_cpu,
+     cpu_hotplug_hw_init(parent, gpe_cpu->device, cpuhp_state, io_port);
+ }
+ 
++/*
++ * called by:
++ *   - hw/i386/acpi-build.c|1461| <<build_dsdt>> build_legacy_cpu_hotplug_aml(dsdt, machine, pm->cpu_hp_io_base);
++ */
+ void build_legacy_cpu_hotplug_aml(Aml *ctx, MachineState *machine,
+                                   uint16_t io_base)
+ {
+diff --git a/hw/acpi/generic_event_device.c b/hw/acpi/generic_event_device.c
+index 5454be67d..040582d83 100644
+--- a/hw/acpi/generic_event_device.c
++++ b/hw/acpi/generic_event_device.c
+@@ -38,6 +38,11 @@ static const uint32_t ged_supported_events[] = {
+  * affected by the interrupt. This way, we can support up to 32 events
+  * with a unique interrupt.
+  */
++/*
++ * called by:
++ *   - hw/arm/virt-acpi-build.c|624| <<build_dsdt>> build_ged_aml(scope, "\\_SB."GED_DEVICE,
++ *   - hw/i386/acpi-microvm.c|130| <<build_dsdt_microvm>> build_ged_aml(sb_scope, GED_DEVICE, x86ms->acpi_dev,
++ */
+ void build_ged_aml(Aml *table, const char *name, HotplugHandler *hotplug_dev,
+                    uint32_t ged_irq, AmlRegionSpace rs, hwaddr ged_base)
+ {
 diff --git a/hw/core/cpu.c b/hw/core/cpu.c
 index 00330ba07..feb7b1b2e 100644
 --- a/hw/core/cpu.c
@@ -478,6 +686,107 @@ index 6be8f3291..572b885d2 100644
  static int vtd_int_remap(X86IOMMUState *iommu, MSIMessage *src,
                           MSIMessage *dst, uint16_t sid)
  {
+diff --git a/hw/i386/kvm/clock.c b/hw/i386/kvm/clock.c
+index 51872dd84..ab3821590 100644
+--- a/hw/i386/kvm/clock.c
++++ b/hw/i386/kvm/clock.c
+@@ -50,6 +50,13 @@ struct KVMClockState {
+ 
+     /* whether the 'clock' value was obtained in a host with
+      * reliable KVM_GET_CLOCK */
++    /*
++     * 在以下使用KVMClockState->clock_is_reliable:
++     *   - hw/i386/kvm/clock.c|250| <<global>> VMSTATE_BOOL(clock_is_reliable, KVMClockState),
++     *   - hw/i386/kvm/clock.c|153| <<kvm_update_clock>> s->clock_is_reliable = kvm_has_adjust_clock_stable();
++     *   - hw/i386/kvm/clock.c|180| <<kvmclock_vm_state_change>> if (!s->clock_is_reliable) {
++     *   - hw/i386/kvm/clock.c|263| <<kvmclock_pre_load>> s->clock_is_reliable = false;
++     */
+     bool clock_is_reliable;
+ };
+ 
+@@ -64,6 +71,10 @@ struct pvclock_vcpu_time_info {
+     uint8_t    pad[2];
+ } __attribute__((__packed__)); /* 32 bytes */
+ 
++/*
++ * called by:
++ *   - hw/i386/kvm/clock.c|202| <<kvmclock_vm_state_change>> uint64_t pvclock_via_mem = kvmclock_current_nsec(s);
++ */
+ static uint64_t kvmclock_current_nsec(KVMClockState *s)
+ {
+     CPUState *cpu = first_cpu;
+@@ -150,6 +161,13 @@ static void kvm_update_clock(KVMClockState *s)
+      *       if !kvm_has_adjust_clock_stable() then
+      *               read from memory
+      */
++    /*
++     * 在以下使用KVMClockState->clock_is_reliable:
++     *   - hw/i386/kvm/clock.c|250| <<global>> VMSTATE_BOOL(clock_is_reliable, KVMClockState),
++     *   - hw/i386/kvm/clock.c|153| <<kvm_update_clock>> s->clock_is_reliable = kvm_has_adjust_clock_stable();
++     *   - hw/i386/kvm/clock.c|180| <<kvmclock_vm_state_change>> if (!s->clock_is_reliable) {
++     *   - hw/i386/kvm/clock.c|263| <<kvmclock_pre_load>> s->clock_is_reliable = false;
++     */
+     s->clock_is_reliable = kvm_has_adjust_clock_stable();
+ }
+ 
+@@ -162,6 +180,16 @@ static void do_kvmclock_ctrl(CPUState *cpu, run_on_cpu_data data)
+     }
+ }
+ 
++/*
++ * 启动执行
++ * kvmclock_vm_state_change() running=1
++ *
++ * 然后
++ * (qemu) stop
++ * kvmclock_vm_state_change() running=0
++ * (qemu) cont
++ * kvmclock_vm_state_change() running=1
++ */
+ static void kvmclock_vm_state_change(void *opaque, bool running,
+                                      RunState state)
+ {
+@@ -177,6 +205,13 @@ static void kvmclock_vm_state_change(void *opaque, bool running,
+          * If the host where s->clock was read did not support reliable
+          * KVM_GET_CLOCK, read kvmclock value from memory.
+          */
++	/*
++	 * 在以下使用KVMClockState->clock_is_reliable:
++	 *   - hw/i386/kvm/clock.c|250| <<global>> VMSTATE_BOOL(clock_is_reliable, KVMClockState),
++	 *   - hw/i386/kvm/clock.c|153| <<kvm_update_clock>> s->clock_is_reliable = kvm_has_adjust_clock_stable();
++	 *   - hw/i386/kvm/clock.c|180| <<kvmclock_vm_state_change>> if (!s->clock_is_reliable) {
++	 *   - hw/i386/kvm/clock.c|263| <<kvmclock_pre_load>> s->clock_is_reliable = false;
++	 */
+         if (!s->clock_is_reliable) {
+             uint64_t pvclock_via_mem = kvmclock_current_nsec(s);
+             /* We can't rely on the saved clock value, just discard it */
+@@ -260,6 +295,13 @@ static int kvmclock_pre_load(void *opaque)
+ {
+     KVMClockState *s = opaque;
+ 
++    /*
++     * 在以下使用KVMClockState->clock_is_reliable:
++     *   - hw/i386/kvm/clock.c|250| <<global>> VMSTATE_BOOL(clock_is_reliable, KVMClockState),
++     *   - hw/i386/kvm/clock.c|153| <<kvm_update_clock>> s->clock_is_reliable = kvm_has_adjust_clock_stable();
++     *   - hw/i386/kvm/clock.c|180| <<kvmclock_vm_state_change>> if (!s->clock_is_reliable) {
++     *   - hw/i386/kvm/clock.c|263| <<kvmclock_pre_load>> s->clock_is_reliable = false;
++     */
+     s->clock_is_reliable = false;
+ 
+     return 0;
+@@ -329,6 +371,12 @@ static const TypeInfo kvmclock_info = {
+ };
+ 
+ /* Note: Must be called after VCPU initialization. */
++/*
++ * called by:
++ *   - hw/i386/microvm.c|184| <<microvm_devices_init>> kvmclock_create(true);
++ *   - hw/i386/pc_piix.c|162| <<pc_init1>> kvmclock_create(pcmc->kvmclock_create_always);
++ *   - hw/i386/pc_q35.c|182| <<pc_q35_init>> kvmclock_create(pcmc->kvmclock_create_always);
++ */
+ void kvmclock_create(bool create_always)
+ {
+     X86CPU *cpu = X86_CPU(first_cpu);
 diff --git a/hw/i386/x86-iommu.c b/hw/i386/x86-iommu.c
 index 5f4301639..e9f7614e1 100644
 --- a/hw/i386/x86-iommu.c
@@ -532,7 +841,7 @@ index e2cb4a5d2..f211a0d57 100644
  {
      memory_region_init_io(&s->mr, OBJECT(dev), &pvpanic_ops, s, "pvpanic", size);
 diff --git a/hw/pci/msix.c b/hw/pci/msix.c
-index ae9331cd0..99a29af55 100644
+index ae9331cd0..0f888e48b 100644
 --- a/hw/pci/msix.c
 +++ b/hw/pci/msix.c
 @@ -110,6 +110,18 @@ static void msix_fire_vector_notifier(PCIDevice *dev,
@@ -554,7 +863,31 @@ index ae9331cd0..99a29af55 100644
          ret = dev->msix_vector_use_notifier(dev, vector, msg);
          assert(ret >= 0);
      }
-@@ -579,6 +591,12 @@ static void msix_unset_notifier_for_vector(PCIDevice *dev, unsigned int vector)
+@@ -136,6 +148,11 @@ static bool msix_masked(PCIDevice *dev)
+     return dev->config[dev->msix_cap + MSIX_CONTROL_OFFSET] & MSIX_MASKALL_MASK;
+ }
+ 
++/*
++ * called by:
++ *   - hw/pci/msix.c|171| <<msix_write_config>> msix_update_function_masked(dev);
++ *   - hw/pci/msix.c|483| <<msix_load>> msix_update_function_masked(dev);
++ */
+ static void msix_update_function_masked(PCIDevice *dev)
+ {
+     dev->msix_function_masked = !msix_enabled(dev) || msix_masked(dev);
+@@ -451,6 +468,11 @@ void msix_save(PCIDevice *dev, QEMUFile *f)
+ }
+ 
+ /* Should be called after restoring the config space. */
++/*
++ * called by:
++ *   - hw/pci/msix.c|665| <<get_msix_state>> msix_load(pv, f);
++ *   - hw/virtio/virtio-pci.c|184| <<virtio_pci_load_config>> msix_load(&proxy->pci_dev, f);
++ */
+ void msix_load(PCIDevice *dev, QEMUFile *f)
+ {
+     unsigned n = dev->msix_entries_nr;
+@@ -579,6 +601,12 @@ static void msix_unset_notifier_for_vector(PCIDevice *dev, unsigned int vector)
      dev->msix_vector_release_notifier(dev, vector);
  }
  
@@ -568,7 +901,7 @@ index ae9331cd0..99a29af55 100644
                                MSIVectorUseNotifier use_notifier,
                                MSIVectorReleaseNotifier release_notifier,
 diff --git a/hw/pci/pci.c b/hw/pci/pci.c
-index 8f35e13a0..da236f2c6 100644
+index 8f35e13a0..11c5f74a1 100644
 --- a/hw/pci/pci.c
 +++ b/hw/pci/pci.c
 @@ -476,6 +476,16 @@ void pci_root_bus_cleanup(PCIBus *bus)
@@ -588,7 +921,20 @@ index 8f35e13a0..da236f2c6 100644
  void pci_bus_irqs(PCIBus *bus, pci_set_irq_fn set_irq, pci_map_irq_fn map_irq,
                    void *irq_opaque, int nirq)
  {
-@@ -2819,6 +2829,9 @@ MSIMessage pci_get_msi_message(PCIDevice *dev, int vector)
+@@ -2674,6 +2684,12 @@ static void pci_device_class_base_init(ObjectClass *klass, void *data)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - hw/pci/pci.c|101| <<pci_init_bus_master>> AddressSpace *dma_as = pci_device_iommu_address_space(pci_dev);
++ *   - hw/vfio/pci.c|2838| <<vfio_realize>> group = vfio_get_group(groupid, pci_device_iommu_address_space(pdev), errp);
++ *   - target/arm/kvm.c|997| <<kvm_arch_fixup_msi_route>> AddressSpace *as = pci_device_iommu_address_space(dev);
++ */
+ AddressSpace *pci_device_iommu_address_space(PCIDevice *dev)
+ {
+     PCIBus *bus = pci_get_bus(dev);
+@@ -2819,6 +2835,9 @@ MSIMessage pci_get_msi_message(PCIDevice *dev, int vector)
  {
      MSIMessage msg;
      if (msix_enabled(dev)) {
@@ -1032,10 +1378,34 @@ index 4f2125421..4ba760505 100644
      .name = TYPE_REMOTE_OBJECT,
      .parent = TYPE_OBJECT,
 diff --git a/hw/vfio/pci.c b/hw/vfio/pci.c
-index 5c65aa0a9..33aa99c6c 100644
+index 5c65aa0a9..1349f6fff 100644
 --- a/hw/vfio/pci.c
 +++ b/hw/vfio/pci.c
-@@ -2465,6 +2465,10 @@ static int vfio_pci_load_config(VFIODevice *vbasedev, QEMUFile *f)
+@@ -455,6 +455,11 @@ static void vfio_update_kvm_msi_virq(VFIOMSIVector *vector, MSIMessage msg,
+     kvm_irqchip_commit_routes(kvm_state);
+ }
+ 
++/*
++ * called by:
++ *   - hw/vfio/pci.c|541| <<vfio_msix_vector_use>> return vfio_msix_vector_do_use(pdev, nr, &msg, vfio_msi_interrupt);
++ *   - hw/vfio/pci.c|605| <<vfio_msix_enable>> vfio_msix_vector_do_use(pdev, max_vec, NULL, NULL);
++ */
+ static int vfio_msix_vector_do_use(PCIDevice *pdev, unsigned int nr,
+                                    MSIMessage *msg, IOHandler *handler)
+ {
+@@ -567,6 +572,11 @@ static void vfio_msix_vector_release(PCIDevice *pdev, unsigned int nr)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - hw/vfio/pci.c|1187| <<vfio_pci_write_config>> vfio_msix_enable(vdev);
++ *   - hw/vfio/pci.c|2462| <<vfio_pci_load_config>> vfio_msix_enable(vdev);
++ */
+ static void vfio_msix_enable(VFIOPCIDevice *vdev)
+ {
+     PCIDevice *pdev = &vdev->pdev;
+@@ -2465,6 +2475,10 @@ static int vfio_pci_load_config(VFIODevice *vbasedev, QEMUFile *f)
      return ret;
  }
  
@@ -1047,10 +1417,27 @@ index 5c65aa0a9..33aa99c6c 100644
      .vfio_compute_needs_reset = vfio_pci_compute_needs_reset,
      .vfio_hot_reset_multi = vfio_pci_hot_reset_multi,
 diff --git a/hw/virtio/vhost.c b/hw/virtio/vhost.c
-index e2163a0d6..6222ef70b 100644
+index e2163a0d6..ff23bad8d 100644
 --- a/hw/virtio/vhost.c
 +++ b/hw/virtio/vhost.c
-@@ -764,6 +764,10 @@ static void vhost_iommu_region_del(MemoryListener *listener,
+@@ -277,6 +277,16 @@ static inline void vhost_dev_log_resize(struct vhost_dev *dev, uint64_t size)
+     dev->log_size = size;
+ }
+ 
++/*
++ * called by:
++ *   - hw/virtio/vhost.c|297| <<vhost_memory_map>> if (!vhost_dev_has_iommu(dev)) {
++ *   - hw/virtio/vhost.c|308| <<vhost_memory_unmap>> if (!vhost_dev_has_iommu(dev)) {
++ *   - hw/virtio/vhost.c|353| <<vhost_verify_ring_mappings>> if (vhost_dev_has_iommu(dev)) {
++ *   - hw/virtio/vhost.c|809| <<vhost_dev_set_features>> if (!vhost_dev_has_iommu(dev)) {
++ *   - hw/virtio/vhost.c|1754| <<vhost_dev_start>> if (vhost_dev_has_iommu(hdev)) {
++ *   - hw/virtio/vhost.c|1796| <<vhost_dev_start>> if (vhost_dev_has_iommu(hdev) &&
++ *   - hw/virtio/vhost.c|1843| <<vhost_dev_stop>> if (vhost_dev_has_iommu(hdev)) {
++ */
+ static int vhost_dev_has_iommu(struct vhost_dev *dev)
+ {
+     VirtIODevice *vdev = dev->vdev;
+@@ -764,6 +774,10 @@ static void vhost_iommu_region_del(MemoryListener *listener,
      }
  }
  
@@ -1061,7 +1448,7 @@ index e2163a0d6..6222ef70b 100644
  static int vhost_virtqueue_set_addr(struct vhost_dev *dev,
                                      struct vhost_virtqueue *vq,
                                      unsigned idx, bool enable_log)
-@@ -1050,6 +1054,33 @@ out:
+@@ -1050,6 +1064,33 @@ out:
      return ret;
  }
  
@@ -1304,10 +1691,26 @@ index ca3c5bb53..fe0b056b5 100644
  #define PVPANIC_CRASHLOADED     (1 << PVPANIC_F_CRASHLOADED)
  
 diff --git a/include/hw/pci/pci.h b/include/hw/pci/pci.h
-index 6be4e0c46..95f6591ba 100644
+index 6be4e0c46..a6af2e51d 100644
 --- a/include/hw/pci/pci.h
 +++ b/include/hw/pci/pci.h
-@@ -353,6 +353,18 @@ struct PCIDevice {
+@@ -329,6 +329,15 @@ struct PCIDevice {
+     /* Reference-count for entries actually in use by driver. */
+     unsigned *msix_entry_used;
+     /* MSIX function mask set or MSIX disabled */
++    /*
++     * 在以下使用PCIDevice->msix_function_masked:
++     *   - hw/pci/msix.c|97| <<msix_is_masked>> return msix_vector_masked(dev, vector, dev->msix_function_masked);
++     *   - hw/pci/msix.c|153| <<msix_update_function_masked>> dev->msix_function_masked = !msix_enabled(dev) || msix_masked(dev);
++     *   - hw/pci/msix.c|170| <<msix_write_config>> was_masked = dev->msix_function_masked;
++     *   - hw/pci/msix.c|179| <<msix_write_config>> if (dev->msix_function_masked == was_masked) {
++     *   - hw/pci/msix.c|337| <<msix_init>> dev->msix_function_masked = true;
++     *   - hw/vfio/pci.c|598| <<vfio_msix_enable>> if (!pdev->msix_function_masked) {
++     */
+     bool msix_function_masked;
+     /* Version id needed for VMState */
+     int32_t version_id;
+@@ -353,6 +362,18 @@ struct PCIDevice {
      PCIINTxRoutingNotifier intx_routing_notifier;
  
      /* MSI-X notifiers */
@@ -1490,6 +1893,37 @@ index 7fe9f5271..d086eebec 100644
      QLIST_INSERT_HEAD(&msi_route_list, entry, list);
  
      trace_kvm_x86_add_msi_route(route->gsi);
+diff --git a/target/i386/monitor.c b/target/i386/monitor.c
+index 5994408be..a117cd9e4 100644
+--- a/target/i386/monitor.c
++++ b/target/i386/monitor.c
+@@ -650,6 +650,26 @@ const MonitorDef *target_monitor_defs(void)
+     return monitor_defs;
+ }
+ 
++/*
++ * (qemu) info lapic 1
++ * dumping local APIC state for CPU 1
++ *
++ * LVT0     0x00010700 active-hi edge  masked                      ExtINT (vec 0)
++ * LVT1     0x00010400 active-hi edge  masked                      NMI
++ * LVTPC    0x00000400 active-hi edge                              NMI
++ * LVTERR   0x000000fe active-hi edge                              Fixed  (vec 254)
++ * LVTTHMR  0x00010000 active-hi edge  masked                      Fixed  (vec 0)
++ * LVTT     0x000400ec active-hi edge                 tsc-deadline Fixed  (vec 236)
++ * Timer    DCR=0x0 (divide by 2) initial_count = 0 current_count = 0
++ * SPIV     0x000001ff APIC enabled, focus=off, spurious vec 255
++ * ICR      0x000000fb physical edge de-assert no-shorthand
++ * ICR2     0x00000000 cpu 0 (X2APIC ID)
++ * ESR      0x00000000
++ * ISR      (none)
++ * IRR      36 236 251 253
++ *
++ * APR 0x00 TPR 0x10 DFR 0x0f LDR 0x00 PPR 0x10
++ */
+ void hmp_info_local_apic(Monitor *mon, const QDict *qdict)
+ {
+     CPUState *cs;
 diff --git a/util/qemu-sockets.c b/util/qemu-sockets.c
 index 8af0278f1..98b75de82 100644
 --- a/util/qemu-sockets.c

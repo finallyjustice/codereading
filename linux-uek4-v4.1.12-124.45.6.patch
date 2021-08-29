@@ -1,0 +1,513 @@
+From 94f0f217ab61ed09b3bd824d5a60f8b7d7d0fcf3 Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Sun, 29 Aug 2021 12:11:23 -0700
+Subject: [PATCH 1/1] linux-uek4-v4.1.12-124.45.6
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ drivers/net/xen-netback/common.h    | 18 ++++++
+ drivers/net/xen-netback/interface.c |  4 ++
+ drivers/net/xen-netback/netback.c   |  4 ++
+ drivers/net/xen-netback/rx.c        | 97 +++++++++++++++++++++++++++++
+ drivers/xen/events/events_base.c    | 17 +++++
+ drivers/xen/events/events_fifo.c    | 93 +++++++++++++++++++++++++++
+ kernel/softirq.c                    | 52 ++++++++++++++++
+ 7 files changed, 285 insertions(+)
+
+diff --git a/drivers/net/xen-netback/common.h b/drivers/net/xen-netback/common.h
+index 6250343c31ed..0030ea6d93bc 100644
+--- a/drivers/net/xen-netback/common.h
++++ b/drivers/net/xen-netback/common.h
+@@ -216,6 +216,24 @@ struct xenvif_queue { /* Per-queue data for xenvif */
+ 	unsigned long last_rx_time;
+ 	bool stalled;
+ 
++	/*
++	 * 在以下使用xenvif_queue->rx_copy:
++	 *   - drivers/net/xen-netback/rx.c|176| <<xenvif_rx_copy_flush>> if (queue->rx_copy.num)
++	 *   - drivers/net/xen-netback/rx.c|177| <<xenvif_rx_copy_flush>> gnttab_batch_copy(queue->rx_copy.op, queue->rx_copy.num);
++	 *   - drivers/net/xen-netback/rx.c|182| <<xenvif_rx_copy_flush>> for (i = 0; i < queue->rx_copy.num; i++) {
++	 *   - drivers/net/xen-netback/rx.c|185| <<xenvif_rx_copy_flush>> op = &queue->rx_copy.op[i];
++	 *   - drivers/net/xen-netback/rx.c|194| <<xenvif_rx_copy_flush>> queue->rx_copy.idx[i]);
++	 *   - drivers/net/xen-netback/rx.c|199| <<xenvif_rx_copy_flush>> queue->rx_copy.num = 0;
++	 *   - drivers/net/xen-netback/rx.c|225| <<xenvif_rx_copy_flush>> if (queue->rx_copy.completed)
++	 *   - drivers/net/xen-netback/rx.c|226| <<xenvif_rx_copy_flush>> __skb_queue_purge(queue->rx_copy.completed);
++	 *   - drivers/net/xen-netback/rx.c|247| <<xenvif_rx_copy_add>> if (queue->rx_copy.num == COPY_BATCH_SIZE)
++	 *   - drivers/net/xen-netback/rx.c|250| <<xenvif_rx_copy_add>> op = &queue->rx_copy.op[queue->rx_copy.num];
++	 *   - drivers/net/xen-netback/rx.c|272| <<xenvif_rx_copy_add>> queue->rx_copy.idx[queue->rx_copy.num] = queue->rx.req_cons;
++	 *   - drivers/net/xen-netback/rx.c|273| <<xenvif_rx_copy_add>> queue->rx_copy.num++;
++	 *   - drivers/net/xen-netback/rx.c|544| <<xenvif_rx_action>> queue->rx_copy.completed = &completed_skbs;
++	 *   - drivers/net/xen-netback/rx.c|558| <<xenvif_rx_action>> __skb_queue_tail(queue->rx_copy.completed, skb);
++	 *   - drivers/net/xen-netback/rx.c|572| <<xenvif_rx_action>> queue->rx_copy.completed = NULL;
++	 */
+ 	struct xenvif_copy_state rx_copy;
+ 
+ 	/* Transmit shaping: allow 'credit_bytes' every 'credit_usec'. */
+diff --git a/drivers/net/xen-netback/interface.c b/drivers/net/xen-netback/interface.c
+index a043c2e68d42..1aeeed8aa4e7 100644
+--- a/drivers/net/xen-netback/interface.c
++++ b/drivers/net/xen-netback/interface.c
+@@ -92,6 +92,10 @@ static irqreturn_t xenvif_tx_interrupt(int irq, void *dev_id)
+ 	return IRQ_HANDLED;
+ }
+ 
++/*
++ * 在以下使用xenvif_poll():
++ *   - drivers/net/xen-netback/interface.c|579| <<xenvif_connect>> netif_napi_add(queue->vif->dev, &queue->napi, xenvif_poll,
++ */
+ static int xenvif_poll(struct napi_struct *napi, int budget)
+ {
+ 	struct xenvif_queue *queue =
+diff --git a/drivers/net/xen-netback/netback.c b/drivers/net/xen-netback/netback.c
+index 068195c9a915..1a4192570d09 100644
+--- a/drivers/net/xen-netback/netback.c
++++ b/drivers/net/xen-netback/netback.c
+@@ -1383,6 +1383,10 @@ static inline void xenvif_tx_dealloc_action(struct xenvif_queue *queue)
+ 
+ 
+ /* Called after netfront has transmitted */
++/*
++ * called by:
++ *   - drivers/net/xen-netback/interface.c|110| <<xenvif_poll>> work_done = xenvif_tx_action(queue, budget);
++ */
+ int xenvif_tx_action(struct xenvif_queue *queue, int budget)
+ {
+ 	unsigned nr_mops, nr_cops = 0, nr_gnts = 0;
+diff --git a/drivers/net/xen-netback/rx.c b/drivers/net/xen-netback/rx.c
+index a4d4faca6962..18d7c3b86546 100644
+--- a/drivers/net/xen-netback/rx.c
++++ b/drivers/net/xen-netback/rx.c
+@@ -138,14 +138,47 @@ static void xenvif_rx_queue_drop_expired(struct xenvif_queue *queue)
+ 	}
+ }
+ 
++/*
++ * xenvif_kthread_guest_rx()
++ * -> xenvif_rx_action()
++ *    -> spin_lock_irq(&queue->rx_lock);
++ *    -> loop xenvif_rx_skb()
++ *            -> xenvif_rx_data_slot()
++ *               -> xenvif_rx_copy_add()
++ *                  -> xenvif_rx_copy_flush() --> flush!
++ *    -> xenvif_rx_copy_flush() --> flush!
++ *    -> spin_unlock_irq(&queue->rx_lock);
++ *
++ *
++ * xenvif_start_xmit()
++ * -> xenvif_rx_one_skb()
++ *    -> spin_lock_irqsave(&queue->rx_lock, flags);
++ *    -> xenvif_rx_skb()
++ *       -> xenvif_rx_data_slot()
++ *          -> xenvif_rx_copy_add()
++ *             -> xenvif_rx_copy_flush() --> flush!
++ *    -> xenvif_rx_copy_flush() --> flush!
++ *    -> spin_unlock_irqrestore(&queue->rx_lock, flags);
++ *
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|200| <<xenvif_rx_copy_add>> xenvif_rx_copy_flush(queue);
++ *   - drivers/net/xen-netback/rx.c|455| <<xenvif_rx_one_skb>> xenvif_rx_copy_flush(queue);
++ *   - drivers/net/xen-netback/rx.c|482| <<xenvif_rx_action>> xenvif_rx_copy_flush(queue);
++ */
+ static void xenvif_rx_copy_flush(struct xenvif_queue *queue)
+ {
+ 	unsigned int i;
+ 	int notify;
+ 
++	/*
++	 * 调用GNTTABOP_copy
++	 */
+ 	if (queue->rx_copy.num)
+ 		gnttab_batch_copy(queue->rx_copy.op, queue->rx_copy.num);
+ 
++	/*
++	 * 这里的for loop是为每一个GNTTABOP_copy检查结果
++	 */
+ 	for (i = 0; i < queue->rx_copy.num; i++) {
+ 		struct gnttab_copy *op;
+ 
+@@ -170,10 +203,33 @@ static void xenvif_rx_copy_flush(struct xenvif_queue *queue)
+ 	if (notify)
+ 		notify_remote_via_irq(queue->rx_irq);
+ 
++	/*
++	 * struct xenvif_queue *queue:
++	 * -> struct xenvif_copy_state rx_copy;
++	 *    -> struct gnttab_copy op[COPY_BATCH_SIZE];
++	 *    -> RING_IDX idx[COPY_BATCH_SIZE];
++	 *    -> unsigned int num;
++	 *    -> struct sk_buff_head *completed;
++	 *       -> struct sk_buff  *next;
++	 *       -> struct sk_buff  *prev; 
++	 *       -> __u32           qlen;
++	 *       -> spinlock_t      lock;
++	 *
++	 * 在以下使用queue->rx_copy.completed:
++	 *   - drivers/net/xen-netback/rx.c|214| <<xenvif_rx_copy_flush>> if (queue->rx_copy.completed)
++	 *   - drivers/net/xen-netback/rx.c|215| <<xenvif_rx_copy_flush>> __skb_queue_purge(queue->rx_copy.completed);
++	 *   - drivers/net/xen-netback/rx.c|521| <<xenvif_rx_action>> queue->rx_copy.completed = &completed_skbs;
++	 *   - drivers/net/xen-netback/rx.c|527| <<xenvif_rx_action>> __skb_queue_tail(queue->rx_copy.completed, skb);
++	 *   - drivers/net/xen-netback/rx.c|533| <<xenvif_rx_action>> queue->rx_copy.completed = NULL;
++	 */
+ 	if (queue->rx_copy.completed)
+ 		__skb_queue_purge(queue->rx_copy.completed);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|356| <<xenvif_rx_data_slot>> xenvif_rx_copy_add(queue, grant, req, offset, data, len);
++ */
+ static void xenvif_rx_copy_add(struct xenvif_queue *queue,
+ 			       struct xenvif_grant *grant,
+ 			       struct xen_netif_rx_request *req,
+@@ -329,6 +385,10 @@ static void xenvif_rx_next_chunk(struct xenvif_queue *queue,
+ 	*len = chunk_len;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|443| <<xenvif_rx_skb>> xenvif_rx_data_slot(queue, &pkt, req, rsp);
++ */
+ static void xenvif_rx_data_slot(struct xenvif_queue *queue,
+ 				struct xenvif_pkt_state *pkt,
+ 				struct xen_netif_rx_request *req,
+@@ -403,6 +463,11 @@ static void xenvif_rx_extra_slot(struct xenvif_queue *queue,
+ 	BUG();
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|468| <<xenvif_rx_one_skb>> xenvif_rx_skb(queue, skb);
++ *   - drivers/net/xen-netback/rx.c|490| <<xenvif_rx_action>> xenvif_rx_skb(queue, skb);
++ */
+ void xenvif_rx_skb(struct xenvif_queue *queue, struct sk_buff *skb)
+ {
+ 	struct xenvif_pkt_state pkt;
+@@ -432,6 +497,10 @@ void xenvif_rx_skb(struct xenvif_queue *queue, struct sk_buff *skb)
+ 	queue->rx.rsp_prod_pvt = queue->rx.req_cons;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/interface.c|209| <<xenvif_start_xmit>> } else if (xenvif_rx_one_skb(queue, skb) < 0) {
++ */
+ int xenvif_rx_one_skb(struct xenvif_queue *queue, struct sk_buff *skb)
+ {
+ 	unsigned long flags;
+@@ -452,6 +521,10 @@ int xenvif_rx_one_skb(struct xenvif_queue *queue, struct sk_buff *skb)
+ 
+ #define RX_BATCH_SIZE 64
+ 
++/*
++ * called by:
++ *   - drivers/net/xen-netback/rx.c|671| <<xenvif_kthread_guest_rx>> xenvif_rx_action(queue);
++ */
+ void xenvif_rx_action(struct xenvif_queue *queue)
+ {
+ 	struct sk_buff_head completed_skbs;
+@@ -460,18 +533,42 @@ void xenvif_rx_action(struct xenvif_queue *queue)
+ 
+ 	spin_lock_irq(&queue->rx_lock);
+ 	__skb_queue_head_init(&completed_skbs);
++	/*
++	 * 在以下使用queue->rx_copy.completed:
++	 *   - drivers/net/xen-netback/rx.c|214| <<xenvif_rx_copy_flush>> if (queue->rx_copy.completed)
++	 *   - drivers/net/xen-netback/rx.c|215| <<xenvif_rx_copy_flush>> __skb_queue_purge(queue->rx_copy.completed);
++	 *   - drivers/net/xen-netback/rx.c|521| <<xenvif_rx_action>> queue->rx_copy.completed = &completed_skbs;
++	 *   - drivers/net/xen-netback/rx.c|527| <<xenvif_rx_action>> __skb_queue_tail(queue->rx_copy.completed, skb);
++	 *   - drivers/net/xen-netback/rx.c|533| <<xenvif_rx_action>> queue->rx_copy.completed = NULL;
++	 */
+ 	queue->rx_copy.completed = &completed_skbs;
+ 
+ 	while (xenvif_rx_queue_slots_available(queue) &&
+ 	       work_done < RX_BATCH_SIZE) {
+ 		skb = xenvif_rx_dequeue(queue);
+ 		xenvif_rx_skb(queue, skb);
++		/*
++		 * 在以下使用queue->rx_copy.completed:
++		 *   - drivers/net/xen-netback/rx.c|214| <<xenvif_rx_copy_flush>> if (queue->rx_copy.completed)
++		 *   - drivers/net/xen-netback/rx.c|215| <<xenvif_rx_copy_flush>> __skb_queue_purge(queue->rx_copy.completed);
++		 *   - drivers/net/xen-netback/rx.c|521| <<xenvif_rx_action>> queue->rx_copy.completed = &completed_skbs;
++		 *   - drivers/net/xen-netback/rx.c|527| <<xenvif_rx_action>> __skb_queue_tail(queue->rx_copy.completed, skb);
++		 *   - drivers/net/xen-netback/rx.c|533| <<xenvif_rx_action>> queue->rx_copy.completed = NULL;
++		 */
+ 		__skb_queue_tail(queue->rx_copy.completed, skb);
+ 		work_done++;
+ 	}
+ 
+ 	/* Flush any pending copies and complete all skbs. */
+ 	xenvif_rx_copy_flush(queue);
++	/*
++	 * 在以下使用queue->rx_copy.completed:
++	 *   - drivers/net/xen-netback/rx.c|214| <<xenvif_rx_copy_flush>> if (queue->rx_copy.completed)
++	 *   - drivers/net/xen-netback/rx.c|215| <<xenvif_rx_copy_flush>> __skb_queue_purge(queue->rx_copy.completed);
++	 *   - drivers/net/xen-netback/rx.c|521| <<xenvif_rx_action>> queue->rx_copy.completed = &completed_skbs;
++	 *   - drivers/net/xen-netback/rx.c|527| <<xenvif_rx_action>> __skb_queue_tail(queue->rx_copy.completed, skb);
++	 *   - drivers/net/xen-netback/rx.c|533| <<xenvif_rx_action>> queue->rx_copy.completed = NULL;
++	 */
+ 	queue->rx_copy.completed = NULL;
+ 	spin_unlock_irq(&queue->rx_lock);
+ }
+diff --git a/drivers/xen/events/events_base.c b/drivers/xen/events/events_base.c
+index 228d33d218df..8019d5de243e 100644
+--- a/drivers/xen/events/events_base.c
++++ b/drivers/xen/events/events_base.c
+@@ -77,6 +77,23 @@ static DEFINE_PER_CPU(int [NR_VIRQS], virq_to_irq) = {[0 ... NR_VIRQS-1] = -1};
+ /* IRQ <-> IPI mapping */
+ static DEFINE_PER_CPU(int [XEN_NR_IPIS], ipi_to_irq) = {[0 ... XEN_NR_IPIS-1] = -1};
+ 
++/*
++ * 在以下使用evtchn_to_irq:
++ *   - drivers/xen/events/events_base.c|86| <<EVTCHN_ROW>> #define EVTCHN_ROW(e) (e / (PAGE_SIZE/sizeof(**evtchn_to_irq)))
++ *   - drivers/xen/events/events_base.c|87| <<EVTCHN_COL>> #define EVTCHN_COL(e) (e % (PAGE_SIZE/sizeof(**evtchn_to_irq)))
++ *   - drivers/xen/events/events_base.c|88| <<EVTCHN_PER_ROW>> #define EVTCHN_PER_ROW (PAGE_SIZE / sizeof(**evtchn_to_irq))
++ *   - drivers/xen/events/events_base.c|104| <<clear_evtchn_to_irq_row>> evtchn_to_irq[row][col] = -1;
++ *   - drivers/xen/events/events_base.c|112| <<clear_evtchn_to_irq_all>> if (evtchn_to_irq[row] == NULL)
++ *   - drivers/xen/events/events_base.c|129| <<set_evtchn_to_irq>> if (evtchn_to_irq[row] == NULL) {
++ *   - drivers/xen/events/events_base.c|134| <<set_evtchn_to_irq>> evtchn_to_irq[row] = (int *)get_zeroed_page(GFP_KERNEL);
++ *   - drivers/xen/events/events_base.c|135| <<set_evtchn_to_irq>> if (evtchn_to_irq[row] == NULL)
++ *   - drivers/xen/events/events_base.c|141| <<set_evtchn_to_irq>> evtchn_to_irq[EVTCHN_ROW(evtchn)][EVTCHN_COL(evtchn)] = irq;
++ *   - drivers/xen/events/events_base.c|149| <<get_evtchn_to_irq>> if (evtchn_to_irq[EVTCHN_ROW(evtchn)] == NULL)
++ *   - drivers/xen/events/events_base.c|151| <<get_evtchn_to_irq>> return evtchn_to_irq[EVTCHN_ROW(evtchn)][EVTCHN_COL(evtchn)];
++ *   - drivers/xen/events/events_base.c|1689| <<xen_init_IRQ>> evtchn_to_irq = kcalloc(EVTCHN_ROW(xen_evtchn_max_channels()),
++ *   - drivers/xen/events/events_base.c|1690| <<xen_init_IRQ>> sizeof(*evtchn_to_irq), GFP_KERNEL);
++ *   - drivers/xen/events/events_base.c|1691| <<xen_init_IRQ>> BUG_ON(!evtchn_to_irq);
++ */
+ int **evtchn_to_irq;
+ #ifdef CONFIG_X86
+ static unsigned long *pirq_eoi_map;
+diff --git a/drivers/xen/events/events_fifo.c b/drivers/xen/events/events_fifo.c
+index b82c7637e118..ebe8a9924949 100644
+--- a/drivers/xen/events/events_fifo.c
++++ b/drivers/xen/events/events_fifo.c
+@@ -54,16 +54,46 @@
+ 
+ #include "events_internal.h"
+ 
++/*
++ * 4092 / 4 = 1024
++ */
+ #define EVENT_WORDS_PER_PAGE (XEN_PAGE_SIZE / sizeof(event_word_t))
++/*
++ * (1 << 17) / 1024 = 131072 / 1024 = 128
++ */
+ #define MAX_EVENT_ARRAY_PAGES (EVTCHN_FIFO_NR_CHANNELS / EVENT_WORDS_PER_PAGE)
+ 
+ struct evtchn_fifo_queue {
++	/*
++	 * EVTCHN_FIFO_PRIORITY_MIN + 1 = 16
++	 */
+ 	uint32_t head[EVTCHN_FIFO_MAX_QUEUES];
+ };
+ 
+ static DEFINE_PER_CPU(struct evtchn_fifo_control_block *, cpu_control_block);
+ static DEFINE_PER_CPU(struct evtchn_fifo_queue, cpu_queue);
++/*
++ * 在以下使用"static event_word_t *event_array[MAX_EVENT_ARRAY_PAGES] __read_mostly":
++ *   - drivers/xen/events/events_fifo.c|89| <<event_word_from_port>> return event_array[i] + port % EVENT_WORDS_PER_PAGE;
++ *   - drivers/xen/events/events_fifo.c|126| <<free_unused_array_pages>> if (!event_array[i])
++ *   - drivers/xen/events/events_fifo.c|128| <<free_unused_array_pages>> free_page((unsigned long )event_array[i]);
++ *   - drivers/xen/events/events_fifo.c|129| <<free_unused_array_pages>> event_array[i] = NULL;
++ *   - drivers/xen/events/events_fifo.c|157| <<evtchn_fifo_setup>> array_page = event_array[event_array_pages];
++ *   - drivers/xen/events/events_fifo.c|164| <<evtchn_fifo_setup>> event_array[event_array_pages] = array_page;
++ */
+ static event_word_t *event_array[MAX_EVENT_ARRAY_PAGES] __read_mostly;
++/*
++ * 在以下修改event_array_pages:
++ *   - drivers/xen/events/events_fifo.c|176| <<evtchn_fifo_setup>> event_array_pages++;
++ *   - drivers/xen/events/events_fifo.c|380| <<evtchn_fifo_resume>> event_array_pages = 0;
++ * 在以下使用event_array_pages:
++ *   - drivers/xen/events/events_fifo.c|99| <<evtchn_fifo_nr_channels>> return event_array_pages * EVENT_WORDS_PER_PAGE;
++ *   - drivers/xen/events/events_fifo.c|125| <<free_unused_array_pages>> for (i = event_array_pages; i < MAX_EVENT_ARRAY_PAGES; i++) {
++ *   - drivers/xen/events/events_fifo.c|152| <<evtchn_fifo_setup>> while (event_array_pages < new_array_pages) {
++ *   - drivers/xen/events/events_fifo.c|157| <<evtchn_fifo_setup>> array_page = event_array[event_array_pages];
++ *   - drivers/xen/events/events_fifo.c|164| <<evtchn_fifo_setup>> event_array[event_array_pages] = array_page;
++ *   - drivers/xen/events/events_fifo.c|181| <<evtchn_fifo_setup>> if (event_array_pages == 0)
++ */
+ static unsigned event_array_pages __read_mostly;
+ 
+ /*
+@@ -71,7 +101,29 @@ static unsigned event_array_pages __read_mostly;
+  */
+ #if BITS_PER_LONG > 32
+ 
++/*
++ * #define EVTCHN_FIFO_PENDING 31
++ * #define EVTCHN_FIFO_MASKED  30
++ * #define EVTCHN_FIFO_LINKED  29
++ * #define EVTCHN_FIFO_BUSY    28
++ */
+ #define BM(w) (unsigned long *)((unsigned long)w & ~0x7UL)
++/*
++ * called by:
++ *   - drivers/xen/events/events_fifo.c|197| <<evtchn_fifo_clear_pending>> sync_clear_bit(EVTCHN_FIFO_BIT(PENDING, word), BM(word));
++ *   - drivers/xen/events/events_fifo.c|203| <<evtchn_fifo_set_pending>> sync_set_bit(EVTCHN_FIFO_BIT(PENDING, word), BM(word));
++ *   - drivers/xen/events/events_fifo.c|209| <<evtchn_fifo_is_pending>> return sync_test_bit(EVTCHN_FIFO_BIT(PENDING, word), BM(word));
++ *   - drivers/xen/events/events_fifo.c|215| <<evtchn_fifo_test_and_set_mask>> return sync_test_and_set_bit(EVTCHN_FIFO_BIT(MASKED, word), BM(word));
++ *   - drivers/xen/events/events_fifo.c|221| <<evtchn_fifo_mask>> sync_set_bit(EVTCHN_FIFO_BIT(MASKED, word), BM(word));
++ *   - drivers/xen/events/events_fifo.c|227| <<evtchn_fifo_is_masked>> return sync_test_bit(EVTCHN_FIFO_BIT(MASKED, word), BM(word));
++ *
++ * 一般来说0x4UL (从0开始第2位) 都没设置
++ * 所以返回以下的之一 (EVTCHN_FIFO_ ##b)
++ * #define EVTCHN_FIFO_PENDING 31
++ * #define EVTCHN_FIFO_MASKED  30
++ * #define EVTCHN_FIFO_LINKED  29
++ * #define EVTCHN_FIFO_BUSY    28
++ */
+ #define EVTCHN_FIFO_BIT(b, w) \
+     (((unsigned long)w & 0x4UL) ? (EVTCHN_FIFO_ ##b + 32) : EVTCHN_FIFO_ ##b)
+ 
+@@ -84,6 +136,9 @@ static unsigned event_array_pages __read_mostly;
+ 
+ static inline event_word_t *event_word_from_port(unsigned port)
+ {
++	/*
++	 * EVENT_WORDS_PER_PAGE = 1024
++	 */
+ 	unsigned i = port / EVENT_WORDS_PER_PAGE;
+ 
+ 	return event_array[i] + port % EVENT_WORDS_PER_PAGE;
+@@ -130,6 +185,10 @@ static void free_unused_array_pages(void)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - drivers/xen/events/events_fifo.c|223| <<evtchn_fifo_setup>> init_array_page(array_page);
++ */
+ static void init_array_page(event_word_t *array_page)
+ {
+ 	unsigned i;
+@@ -138,17 +197,35 @@ static void init_array_page(event_word_t *array_page)
+ 		array_page[i] = 1 << EVTCHN_FIFO_MASKED;
+ }
+ 
++/*
++ * struct evtchn_ops evtchn_ops_fifo.setup = evtchn_fifo_setup()
++ */
+ static int evtchn_fifo_setup(struct irq_info *info)
+ {
+ 	unsigned port = info->evtchn;
+ 	unsigned new_array_pages;
+ 	int ret;
+ 
++	/*
++	 * EVENT_WORDS_PER_PAGE = 1024
++	 */
+ 	new_array_pages = port / EVENT_WORDS_PER_PAGE + 1;
+ 
+ 	if (new_array_pages > MAX_EVENT_ARRAY_PAGES)
+ 		return -EINVAL;
+ 
++	/*
++	 * 在以下修改event_array_pages:
++	 *   - drivers/xen/events/events_fifo.c|176| <<evtchn_fifo_setup>> event_array_pages++;
++	 *   - drivers/xen/events/events_fifo.c|380| <<evtchn_fifo_resume>> event_array_pages = 0;
++	 * 在以下使用event_array_pages:
++	 *   - drivers/xen/events/events_fifo.c|99| <<evtchn_fifo_nr_channels>> return event_array_pages * EVENT_WORDS_PER_PAGE;
++	 *   - drivers/xen/events/events_fifo.c|125| <<free_unused_array_pages>> for (i = event_array_pages; i < MAX_EVENT_ARRAY_PAGES; i++) {
++	 *   - drivers/xen/events/events_fifo.c|152| <<evtchn_fifo_setup>> while (event_array_pages < new_array_pages) {
++	 *   - drivers/xen/events/events_fifo.c|157| <<evtchn_fifo_setup>> array_page = event_array[event_array_pages];
++	 *   - drivers/xen/events/events_fifo.c|164| <<evtchn_fifo_setup>> event_array[event_array_pages] = array_page;
++	 *   - drivers/xen/events/events_fifo.c|181| <<evtchn_fifo_setup>> if (event_array_pages == 0)
++	 */
+ 	while (event_array_pages < new_array_pages) {
+ 		void *array_page;
+ 		struct evtchn_expand_array expand_array;
+@@ -173,6 +250,18 @@ static int evtchn_fifo_setup(struct irq_info *info)
+ 		if (ret < 0)
+ 			goto error;
+ 
++		/*
++		 * 在以下修改event_array_pages:
++		 *   - drivers/xen/events/events_fifo.c|176| <<evtchn_fifo_setup>> event_array_pages++;
++		 *   - drivers/xen/events/events_fifo.c|380| <<evtchn_fifo_resume>> event_array_pages = 0;
++		 * 在以下使用event_array_pages:
++		 *   - drivers/xen/events/events_fifo.c|99| <<evtchn_fifo_nr_channels>> return event_array_pages * EVENT_WORDS_PER_PAGE;
++		 *   - drivers/xen/events/events_fifo.c|125| <<free_unused_array_pages>> for (i = event_array_pages; i < MAX_EVENT_ARRAY_PAGES; i++) {
++		 *   - drivers/xen/events/events_fifo.c|152| <<evtchn_fifo_setup>> while (event_array_pages < new_array_pages) {
++		 *   - drivers/xen/events/events_fifo.c|157| <<evtchn_fifo_setup>> array_page = event_array[event_array_pages];
++		 *   - drivers/xen/events/events_fifo.c|164| <<evtchn_fifo_setup>> event_array[event_array_pages] = array_page;
++		 *   - drivers/xen/events/events_fifo.c|181| <<evtchn_fifo_setup>> if (event_array_pages == 0)
++		 */
+ 		event_array_pages++;
+ 	}
+ 	return 0;
+@@ -279,6 +368,10 @@ static void handle_irq_for_port(unsigned port)
+ 		generic_handle_irq(irq);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/xen/events/events_fifo.c|428| <<__evtchn_fifo_handle_events>> consume_one_event(cpu, control_block, q, &ready, drop);
++ */
+ static void consume_one_event(unsigned cpu,
+ 			      struct evtchn_fifo_control_block *control_block,
+ 			      unsigned priority, unsigned long *ready,
+diff --git a/kernel/softirq.c b/kernel/softirq.c
+index 479e4436f787..7986c7f9fbe9 100644
+--- a/kernel/softirq.c
++++ b/kernel/softirq.c
+@@ -145,8 +145,60 @@ void _local_bh_enable(void)
+ }
+ EXPORT_SYMBOL(_local_bh_enable);
+ 
++/*
++ * called by:
++ *   - include/linux/bottom_half.h|27| <<local_bh_enable_ip>> __local_bh_enable_ip(ip, SOFTIRQ_DISABLE_OFFSET);
++ *   - include/linux/bottom_half.h|32| <<local_bh_enable>> __local_bh_enable_ip(_THIS_IP_, SOFTIRQ_DISABLE_OFFSET);
++ *   - include/linux/rwlock_api_smp.h|283| <<__raw_read_unlock_bh>> __local_bh_enable_ip(_RET_IP_, SOFTIRQ_LOCK_OFFSET);
++ *   - include/linux/rwlock_api_smp.h|313| <<__raw_write_unlock_bh>> __local_bh_enable_ip(_RET_IP_, SOFTIRQ_LOCK_OFFSET);
++ *   - include/linux/spinlock_api_smp.h|189| <<__raw_spin_unlock_bh>> __local_bh_enable_ip(_RET_IP_, SOFTIRQ_LOCK_OFFSET);
++ *   - include/linux/spinlock_api_smp.h|200| <<__raw_spin_trylock_bh>> __local_bh_enable_ip(_RET_IP_, SOFTIRQ_LOCK_OFFSET);
++ *   - include/linux/spinlock_api_up.h|49| <<__UNLOCK_BH>> do { __local_bh_enable_ip(_THIS_IP_, SOFTIRQ_LOCK_OFFSET); \
++ */
+ void __local_bh_enable_ip(unsigned long ip, unsigned int cnt)
+ {
++	/*
++	 * disable/enable bottom half是一种内核同步机制.在硬件中断的handler(top half)中,
++	 * 不应该调用disable/enable bottom half函数来保护共享数据,因为bottom half其实是
++	 * 不可能抢占top half的.同样的,soft irq也不会抢占另外一个soft irq的执行,也就是说,
++	 * 一旦一个softirq handler被调度执行(无论在哪一个processor上),那么,本地的softirq
++	 * handler都无法抢占其运行,要等到当前的softirq handler运行完毕后,才能执行下一个
++	 * soft irq handler.注意:上面我们说的是本地,是local,softirq handler是可以在多个
++	 * CPU上同时运行的,但是，linux kernel中没有disable all softirq的接口函数(就好像没
++	 * 有disable all CPU interrupt的接口一样,注意体会local_bh_enable/disable中的local的含义).
++	 *
++	 * 说了这么多,一言以蔽之,local_bh_enable/disable是给进程上下文使用的,用于防止softirq handler
++	 * 抢占local_bh_enable/disable之间的临界区的.
++	 *
++	 * irqs_disabled接口函数可以获知当前本地CPU中断是否是disable的,如果返回1,那么当前是disable
++	 * 本地CPU的中断的.如果irqs_disabled返回1,有可能是下面这样的代码造成的:
++	 *
++	 * local_irq_disable();
++	 * ... ...
++	 * local_bh_disable();
++	 * ... ...
++	 * local_bh_enable();
++	 * ... ...
++	 * local_irq_enable();
++	 *
++	 * 本质上,关本地中断是一种比关本地bottom half更强劲的锁,关本地中断实际上是禁止了top half和
++	 * bottom half抢占当前进程上下文的运行.也许你会说:这也没有什么,就是有些浪费,至少代码逻辑没
++	 * 有问题.但事情没有这么简单,在local_bh_enable--->do_softirq--->__do_softirq中,有一条无条件
++	 * 打开当前中断的操作,也就是说,原本想通过local_irq_disable/local_irq_enable保护的临界区被
++	 * 破坏了,其他的中断handler可以插入执行,从而无法保证local_irq_disable/local_irq_enable保护
++	 * 的临界区的原子性,从而破坏了代码逻辑.
++	 *
++	 * in_irq()这个函数如果不等于0的话,说明local_bh_enable被irq_enter和irq_exit包围,也就是说在
++	 * 中断handler中调用了local_bh_enable/disable.
++	 *
++	 * ---------------------------
++	 *
++	 * WARN_ON_ONCE()是一个比较弱的警告语句.in_irq()返回true,表示现在正在硬件中断上下文中.
++	 * 有些不规范的驱动,可能会在硬件中断处理函数primary handler中调用local_bh_disable()/local_bh_enable(),
++	 * 其实硬件中断处理函数primary handler是在关中断环境(CPU自动关闭的本地中断)下执行的,关中断是比关BH更
++	 * 猛烈的一种锁机制.因此在关中断情况下,没有必要在调用关BH相关操作.irqs_disabled()返回true,说明现在处
++	 * 于关中断状态,也不适合调用关BH操作,原理和前者一样.
++	 */
+ 	WARN_ON_ONCE(in_irq() || irqs_disabled());
+ #ifdef CONFIG_TRACE_IRQFLAGS
+ 	local_irq_disable();
+-- 
+2.17.1
+
