@@ -1,0 +1,147 @@
+Binary Stat是从一个fd获取信息. read的时候可以是任意的offset和size. offset=0就是Header. 下面是格式:
+
++-------------+
+|   Header    |
++-------------+
+|  id string  |
++-------------+
+| Descriptors |
++-------------+
+| Stats Data  |
++-------------+
+
+
+首先是Header. 其中的name_size就是id_string还有每一个desc的name的长度(一般是KVM_STATS_NAME_SIZE)
+
+struct kvm_stats_header {
+	__u32 flags;
+	__u32 name_size;
+	__u32 num_desc;
+	__u32 id_offset;
+	__u32 desc_offset;
+	__u32 data_offset;
+};
+
+
+然后是id_string (kvm-%d or kvm-%d/vcpu-%d)
+
+
+然后是若干Descriptors. 每一个desc后面的都有一个name (长度是kvm_stats_header->name_size=KVM_STATS_NAME_SIZE).
+
+struct _kvm_stats_desc {
+	struct kvm_stats_desc desc;
+	   -> __u32 flags;
+	   -> __s16 exponent;
+	   -> __u16 size;
+	   -> __u32 offset;
+	   -> __u32 unused;
+	   -> char name[];
+	char name[KVM_STATS_NAME_SIZE];
+};
+
+
+最后是每一个desc对应的data.
+
+
+所有的offset/size都是最终通过kvm_stats_read().
+
+----------------------------------
+
+
+kvm_vm_ioctl(KVM_GET_STATS_FD)会创建一个给per-VM的fd
+
+kvm_vcpu_ioctl(KVM_GET_STATS_FD)会创建一个给per-VCPU的fd
+
+
+static int kvm_vcpu_ioctl_get_stats_fd(struct kvm_vcpu *vcpu)
+{
+	int fd;
+	struct file *file;
+	char name[15 + ITOA_MAX_LEN + 1];
+
+	snprintf(name, sizeof(name), "kvm-vcpu-stats:%d", vcpu->vcpu_id);
+
+	fd = get_unused_fd_flags(O_CLOEXEC);
+	if (fd < 0)
+		return fd;
+
+	file = anon_inode_getfile(name, &kvm_vcpu_stats_fops, vcpu, O_RDONLY);
+	if (IS_ERR(file)) {
+		put_unused_fd(fd);
+		return PTR_ERR(file);
+	}
+	file->f_mode |= FMODE_PREAD;
+	fd_install(fd, file);
+
+	return fd;
+}
+
+static int kvm_vcpu_ioctl_get_stats_fd(struct kvm_vcpu *vcpu)
+{
+	int fd;
+	struct file *file;
+	char name[15 + ITOA_MAX_LEN + 1];
+
+	snprintf(name, sizeof(name), "kvm-vcpu-stats:%d", vcpu->vcpu_id);
+
+	fd = get_unused_fd_flags(O_CLOEXEC);
+	if (fd < 0)
+		return fd;
+
+	file = anon_inode_getfile(name, &kvm_vcpu_stats_fops, vcpu, O_RDONLY);
+	if (IS_ERR(file)) {
+		put_unused_fd(fd);
+		return PTR_ERR(file);
+	}
+	file->f_mode |= FMODE_PREAD;
+	fd_install(fd, file);
+
+	return fd;
+}
+
+static ssize_t kvm_vm_stats_read(struct file *file, char __user *user_buffer,
+				 size_t size, loff_t *offset)
+{
+	struct kvm *kvm = file->private_data;
+
+	return kvm_stats_read(kvm->stats_id, &kvm_vm_stats_header,
+			      &kvm_vm_stats_desc[0], &kvm->stat,
+			      sizeof(kvm->stat), user_buffer, size, offset);
+}
+
+static ssize_t kvm_vm_stats_read(struct file *file, char __user *user_buffer,
+				 size_t size, loff_t *offset)
+{
+	struct kvm *kvm = file->private_data;
+
+	return kvm_stats_read(kvm->stats_id, &kvm_vm_stats_header,
+			      &kvm_vm_stats_desc[0], &kvm->stat,
+			      sizeof(kvm->stat), user_buffer, size, offset);
+}
+
+static ssize_t kvm_vcpu_stats_read(struct file *file, char __user *user_buffer,
+				   size_t size, loff_t *offset)
+{
+	struct kvm_vcpu *vcpu = file->private_data;
+
+	return kvm_stats_read(vcpu->stats_id, &kvm_vcpu_stats_header,
+			      &kvm_vcpu_stats_desc[0], &vcpu->stat,
+			      sizeof(vcpu->stat), user_buffer, size, offset);
+}
+
+-------------------------------------
+
+读取一个fd的过程
+
+Although this function allows userspace to read any amount of data (as long
+as in the limit) from any position, the typical usage would follow below
+steps:
+1. Read header from offset 0. Get the offset of descriptors and stats data
+   and some other necessary information. This is a one-time work for the
+   lifecycle of the corresponding vm/vcpu stats fd.
+2. Read id string from its offset. This is a one-time work for the lifecycle
+   of the corresponding vm/vcpu stats fd.
+3. Read descriptors from its offset and discover all the stats by parsing
+   descriptors. This is a one-time work for the lifecycle of the
+   corresponding vm/vcpu stats fd.
+4. Periodically read stats data from its offset using pread.
