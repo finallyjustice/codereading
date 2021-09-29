@@ -1,0 +1,150 @@
+From a94b76cdfd19582e1ea4c9819d561a252c5039fc Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Tue, 28 Sep 2021 22:46:52 -0700
+Subject: [PATCH 1/1] rseq selftests f9e36107ec70
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ tools/testing/selftests/kvm/rseq_test.c | 84 +++++++++++++++++++++++++
+ 1 file changed, 84 insertions(+)
+
+diff --git a/tools/testing/selftests/kvm/rseq_test.c b/tools/testing/selftests/kvm/rseq_test.c
+index 060538bd405a..b6318dc01259 100644
+--- a/tools/testing/selftests/kvm/rseq_test.c
++++ b/tools/testing/selftests/kvm/rseq_test.c
+@@ -19,8 +19,49 @@
+ #include "processor.h"
+ #include "test_util.h"
+ 
++/*
++ * commit 61e52f1630f54713f5dffa1ab4bb49772235aa5a
++ * Author: Sean Christopherson <seanjc@google.com>
++ * Date:   Wed Sep 1 13:30:29 2021 -0700
++ *
++ * KVM: selftests: Add a test for KVM_RUN+rseq to detect task migration bugs
++ *
++ * Add a test to verify an rseq's CPU ID is updated correctly if the task is
++ * migrated while the kernel is handling KVM_RUN.  This is a regression test
++ * for a bug introduced by commit 72c3c0fe54a3 ("x86/kvm: Use generic xfer
++ * to guest work function"), where TIF_NOTIFY_RESUME would be cleared by KVM
++ * without updating rseq, leading to a stale CPU ID and other badness.
++ *
++ * Signed-off-by: Sean Christopherson <seanjc@google.com>
++ * Acked-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
++ * Message-Id: <20210901203030.1292304-5-seanjc@google.com>
++ * Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
++ *
++ * 
++ * commit 72c3c0fe54a3f3ddea8f5ca468ddf9deaf2100b7
++ * Author: Thomas Gleixner <tglx@linutronix.de>
++ * Date:   Thu Jul 23 00:00:09 2020 +0200
++ *
++ * x86/kvm: Use generic xfer to guest work function
++ *
++ * Use the generic infrastructure to check for and handle pending work before
++ * transitioning into guest mode.
++ *
++ * This now handles TIF_NOTIFY_RESUME as well which was ignored so
++ * far. Handling it is important as this covers task work and task work will
++ * be used to offload the heavy lifting of POSIX CPU timers to thread context.
++ *
++ * Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
++ * Link: https://lkml.kernel.org/r/20200722220520.979724969@linutronix.de
++ */
++
+ #define VCPU_ID 0
+ 
++/*
++ * 在以下使用__rseq:
++ *   - tools/testing/selftests/kvm/rseq_test.c|56| <<sys_rseq>> r = syscall(__NR_rseq, &__rseq, sizeof(__rseq), flags, RSEQ_SIG);
++ *   - tools/testing/selftests/kvm/rseq_test.c|211| <<main>> rseq_cpu = READ_ONCE(__rseq.cpu_id);
++ */
+ static __thread volatile struct rseq __rseq = {
+ 	.cpu_id = RSEQ_CPU_ID_UNINITIALIZED,
+ };
+@@ -29,18 +70,46 @@ static __thread volatile struct rseq __rseq = {
+  * Use an arbitrary, bogus signature for configuring rseq, this test does not
+  * actually enter an rseq critical section.
+  */
++/*
++ * 在以下使用RSEQ_SIG:
++ *   - tools/testing/selftests/kvm/rseq_test.c|56| <<sys_rseq>> r = syscall(__NR_rseq, &__rseq, sizeof(__rseq), flags, RSEQ_SIG);
++ */
+ #define RSEQ_SIG 0xdeadbeef
+ 
+ /*
+  * Any bug related to task migration is likely to be timing-dependent; perform
+  * a large number of migrations to reduce the odds of a false negative.
+  */
++/*
++ * 在以下使用NR_TASK_MIGRATIONS:
++ *   - tools/testing/selftests/kvm/rseq_test.c|69| <<migration_worker>> for (i = 0; i < NR_TASK_MIGRATIONS; i++) {
++ *   - tools/testing/selftests/kvm/rseq_test.c|226| <<main>> TEST_ASSERT(i > (NR_TASK_MIGRATIONS / 2),
++ */
+ #define NR_TASK_MIGRATIONS 100000
+ 
++/*
++ * 在以下使用migration_thread:
++ *   - tools/testing/selftests/kvm/rseq_test.c|184| <<main>> pthread_create(&migration_thread, NULL, migration_worker, 0);
++ *   - tools/testing/selftests/kvm/rseq_test.c|229| <<main>> pthread_join(migration_thread, NULL);
++ */
+ static pthread_t migration_thread;
++/*
++ * 在以下使用possible_mask:
++ *   - tools/testing/selftests/kvm/rseq_test.c|67| <<migration_worker>> nr_cpus = CPU_COUNT(&possible_mask);
++ *   - tools/testing/selftests/kvm/rseq_test.c|71| <<migration_worker>> if (!CPU_ISSET(cpu, &possible_mask))
++ *   - tools/testing/selftests/kvm/rseq_test.c|166| <<main>> r = sched_getaffinity(0, sizeof(possible_mask), &possible_mask);
++ *   - tools/testing/selftests/kvm/rseq_test.c|170| <<main>> if (CPU_COUNT(&possible_mask) < 2) {
++ */
+ static cpu_set_t possible_mask;
+ static bool done;
+ 
++/*
++ * 在以下使用seq_cnt:
++ *   - tools/testing/selftests/kvm/rseq_test.c|83| <<migration_worker>> atomic_inc(&seq_cnt);
++ *   - tools/testing/selftests/kvm/rseq_test.c|94| <<migration_worker>> atomic_inc(&seq_cnt);
++ *   - tools/testing/selftests/kvm/rseq_test.c|202| <<main>> snapshot = atomic_read(&seq_cnt) & ~1;
++ *   - tools/testing/selftests/kvm/rseq_test.c|213| <<main>> } while (snapshot != atomic_read(&seq_cnt));
++ */
+ static atomic_t seq_cnt;
+ 
+ static void guest_code(void)
+@@ -80,6 +149,13 @@ static void *migration_worker(void *ign)
+ 		 * is in-progress, while a completely different count indicates
+ 		 * a migration occurred since the count was last read.
+ 		 */
++		/*
++		 * 在以下使用seq_cnt:
++		 *   - tools/testing/selftests/kvm/rseq_test.c|83| <<migration_worker>> atomic_inc(&seq_cnt);
++		 *   - tools/testing/selftests/kvm/rseq_test.c|94| <<migration_worker>> atomic_inc(&seq_cnt);
++		 *   - tools/testing/selftests/kvm/rseq_test.c|202| <<main>> snapshot = atomic_read(&seq_cnt) & ~1;
++		 *   - tools/testing/selftests/kvm/rseq_test.c|213| <<main>> } while (snapshot != atomic_read(&seq_cnt));
++		 */
+ 		atomic_inc(&seq_cnt);
+ 
+ 		/*
+@@ -163,6 +239,9 @@ int main(int argc, char *argv[])
+ 	/* Tell stdout not to buffer its content */
+ 	setbuf(stdout, NULL);
+ 
++	/*
++	 * 0表示自己
++	 */
+ 	r = sched_getaffinity(0, sizeof(possible_mask), &possible_mask);
+ 	TEST_ASSERT(!r, "sched_getaffinity failed, errno = %d (%s)", errno,
+ 		    strerror(errno));
+@@ -181,6 +260,11 @@ int main(int argc, char *argv[])
+ 	 */
+ 	vm = vm_create_default(VCPU_ID, 0, guest_code);
+ 
++	/*
++	 * 在以下使用migration_thread:
++	 *   - tools/testing/selftests/kvm/rseq_test.c|184| <<main>> pthread_create(&migration_thread, NULL, migration_worker, 0);
++	 *   - tools/testing/selftests/kvm/rseq_test.c|229| <<main>> pthread_join(migration_thread, NULL);
++	 */
+ 	pthread_create(&migration_thread, NULL, migration_worker, 0);
+ 
+ 	for (i = 0; !done; i++) {
+-- 
+2.17.1
+
