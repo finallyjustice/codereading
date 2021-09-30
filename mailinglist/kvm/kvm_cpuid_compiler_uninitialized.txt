@@ -1,0 +1,65 @@
+[PATCH 0/2] KVM: x86: Fix mostly theoretical undefined behavior
+
+... from Sean Christopherson ...
+
+https://lore.kernel.org/kvm/20210929222426.1855730-1-seanjc@google.com/
+
+这是一个compiler在极端情况下才会发现的问题.
+
+在kvm_vcpu_reset()的时候会用kvm_cpuid()获得eax=1, 因为结果"Version Information: Type, Family, Model, and Stepping ID"会放入eax, 所以其他的参数都是dummy.
+
+10822 void kvm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
+10823 {
+10824         unsigned long old_cr0 = kvm_read_cr0(vcpu);
+10825         unsigned long new_cr0;
+10826         u32 eax, dummy;
+... ...
+10900         eax = 1;
+10901         if (!kvm_cpuid(vcpu, &eax, &dummy, &dummy, &dummy, true))
+
+
+1176 bool kvm_cpuid(struct kvm_vcpu *vcpu, u32 *eax, u32 *ebx,
+1177                u32 *ecx, u32 *edx, bool exact_only)
+1178 {
+1179         u32 orig_function = *eax, function = *eax, index = *ecx;
+1180         struct kvm_cpuid_entry2 *entry;
+1181         bool exact, used_max_basic = false;
+1182 
+1183         entry = kvm_find_cpuid_entry(vcpu, function, index);
+
+
+1100 struct kvm_cpuid_entry2 *kvm_find_cpuid_entry(struct kvm_vcpu *vcpu,
+1101                                               u32 function, u32 index)
+1102 {
+1103         return cpuid_entry2_find(vcpu->arch.cpuid_entries, vcpu->arch.cpuid_nent,
+1104                                  function, index);
+1105 }
+1106 EXPORT_SYMBOL_GPL(kvm_find_cpuid_entry);
+
+
+如果上面的build都是inline的话, dummy会变成这里的index.
+
+在line 68就会使用未初始化的variable.
+
+59 static inline struct kvm_cpuid_entry2 *cpuid_entry2_find(
+60         struct kvm_cpuid_entry2 *entries, int nent, u32 function, u32 index)
+61 {
+62         struct kvm_cpuid_entry2 *e;
+63         int i;
+64
+65         for (i = 0; i < nent; i++) {
+66                 e = &entries[i];
+67
+68                 if (e->function == function && (e->index == index ||
+69                     !(e->flags & KVM_CPUID_FLAG_SIGNIFCANT_INDEX)))
+70                         return e;
+71         }
+72
+73         return NULL;
+74 }
+
+-----------------------------
+
+1. PATCH 1/2 会把!(e->flags & KVM_CPUID_FLAG_SIGNIFCANT_INDEX)和e->index == index的顺序调换, 作为临时的fix.
+
+2. PATCH 2/2 不调用kvm_cpuid()了, 而是直接调用kvm_find_cpuid_entry()
