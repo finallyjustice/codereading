@@ -1,0 +1,325 @@
+基于v5.13.
+
+vdpa可以理解为是VM(或者host)的virtio通过vdpa_driver直接和硬件通信.
+
+virtio(vm/host) <--> virtio_vdpa/vhost_vdpa <--> 硬件
+
+
+硬件一共有4种(sim_net和sim_blk是一种):
+
+- ifcvf_probe()->vdpa_alloc_device()
+- mlx5_vdpa_dev_add()->vdpa_alloc_device()
+- vdpasim_create()->vdpa_alloc_device()
+- vp_vdpa_probe()->vdpa_alloc_device()
+
+
+一共有两种vdpa_driver, virtio和vhost:
+
+- drivers/virtio/virtio_vdpa.c:static struct vdpa_driver virtio_vdpa_driver = {
+- drivers/vhost/vdpa.c:static struct vdpa_driver vhost_vdpa_driver = {
+
+------------------------------
+
+关于virtio_vdpa_driver, 可以用sim进行测试.
+
+1. vdpasim_net_init()初始化的时候会注册一个mgmt_dev. mgmt_dev.ops.dev_add = vdpasim_net_dev_add()可以添加新的硬件.
+
+[0] virtnet_probe
+[0] virtio_dev_probe
+[0] really_probe
+[0] driver_probe_device
+[0] bus_for_each_drv
+[0] __device_attach
+[0] bus_probe_device
+[0] device_add
+[0] register_virtio_device
+[0] virtio_vdpa_probe
+[0] really_probe
+[0] driver_probe_device
+[0] bus_for_each_drv
+[0] __device_attach
+[0] bus_probe_device
+[0] device_add
+[0] ? _vdpa_register_device
+[0] ? bus_find_device
+[0] vdpasim_net_dev_add
+[0] ? vdpasim_net_dev_add
+[0] ? vdpasim_create
+[0] vdpa_nl_cmd_dev_add_set_doit
+[0] genl_family_rcv_msg_doit.isra.17
+[0] genl_rcv_msg
+[0] netlink_rcv_skb
+[0] genl_rcv
+[0] netlink_unicast
+[0] netlink_sendmsg
+[0] sock_sendmsg
+[0] __sys_sendto
+[0] __x64_sys_sendto
+[0] do_syscall_64
+[0] entry_SYSCALL_64_after_hwframe
+
+
+2. vdpasim_net_dev_add()
+   -> dev_attr.id = VIRTIO_ID_NET; --> 这样能识别是virtio_net
+   -> vdpasim_create()
+      -> ops = &vdpasim_batch_config_ops;
+         或者ops = &vdpasim_config_ops;
+      -> vdpa_alloc_device()
+   -> _vdpa_register_device()
+      -> __vdpa_register_device()
+         -> device_add(&vdev->dev);
+
+vdpa_alloc_device()会创建struct vdpasim, 设置vdpasim.vdev->dev.bus = &vdpa_bus.
+
+struct vdpasim *vdpasim;
+-> struct vdpa_device vdpa;
+   -> struct device dev;
+   -> struct device *dma_dev;
+   -> const struct vdpa_config_ops *config;
+   -> unsigned int index;
+   -> bool features_valid;
+   -> int nvqs;
+   -> struct vdpa_mgmt_dev *mdev;
+      -> struct device *device;
+      -> const struct vdpa_mgmtdev_ops *ops;
+      -> const struct virtio_device_id *id_table;
+      -> struct list_head list;
+
+这样_vdpa_register_device()调用device_add(&vdev->dev)就会通过vdpa_bus添加设备.
+
+
+3. vdpa_bus并没有实现一个match的方法, 因此会自动和vdpa_bus上的第一个vdpa_driver进行匹配. 感觉virtio_vdpa_driver和vhost_vdpa_driver理论是并不能够共存.
+
+假设只有virtio_vdpa_driver ...
+
+vdpa_bus.probe = vdpa_dev_probe()
+-> drv->probe(vdev) (drv是vdpa_driver)
+   -> virtio_vdpa_probe()
+      -> 分配struct virtio_vdpa_device
+      -> vd_dev->vdev.config = &virtio_vdpa_config_ops;
+      -> vd_dev->vdev.id.device = ops->get_device_id(vdpa); --> 识别virtio-net
+      -> vd_dev->vdev.id.vendor = ops->get_vendor_id(vdpa);
+      -> register_virtio_device(&vd_dev->vdev)
+
+最终会添加一个virtio_net. 虽然server上并没有virtio_net的虚拟pci设备, 但这个是被vdpa添加的(不是pci bus).
+
+[0] vdpasim_kick_vq
+[0] virtio_vdpa_notify
+[0] virtqueue_notify
+[0] start_xmit
+[0] dev_hard_start_xmit
+[0] sch_direct_xmit
+[0] __qdisc_run
+[0] __dev_queue_xmit
+[0] ip_finish_output2
+[0] ip_mc_output
+[0] ip_send_skb
+[0] udp_send_skb.isra.59
+[0] udp_sendmsg
+[0] sock_sendmsg
+[0] ____sys_sendmsg
+[0] ___sys_sendmsg
+[0] __sys_sendmsg
+[0] do_syscall_64
+[0] entry_SYSCALL_64_after_hwframe
+
+[0] vdpasim_kick_vq
+[0] virtio_vdpa_notify
+[0] virtqueue_notify
+[0] try_fill_recv
+[0] virtnet_poll
+[0] __napi_poll
+[0] net_rx_action
+[0] __do_softirq
+[0] do_softirq
+[0] </IRQ>
+[0] __local_bh_enable_ip
+[0] vdpasim_net_work
+[0] process_one_work
+[0] worker_thread
+[0] kthread
+[0] ret_from_fork
+
+[0] vdpasim_vq_notify.cold.13
+[0] vdpasim_net_work
+[0] process_one_work
+[0] worker_thread
+[0] kthread
+[0] ret_from_fork
+
+[0] skb_recv_done
+[0] vring_interrupt
+[0] vdpasim_net_work
+[0] process_one_work
+[0] worker_thread
+[0] kthread
+[0] ret_from_fork
+
+------------------------------
+
+关于virtio_vdpa_driver的使用.
+
+1. Download the code of iproute2 to manage vdpa devices.
+
+# git clone https://github.com/shemminger/iproute2
+
+# apt-get install libmnl-dev
+
+# ./configure --enable-vdpa
+
+# ./vdpa mgmtdev show
+vdpasim_net: 
+  supported_classes net
+
+
+2. Create virtio_vdpa/net device.
+
+# ./vdpa dev add mgmtdev vdpasim_net name net0
+
+# ./vdpa dev show net0 -jp
+{
+    "dev": {
+        "net0": {
+            "type": "network",
+            "mgmtdev": "vdpasim_net",
+            "vendor_id": 0,
+            "max_vqs": 2,
+            "max_vq_size": 256
+        }
+    }
+}
+
+3. Delete the device.
+
+# ./vdpa dev del net0
+
+# ./vdpa dev show net0 -jp
+{
+kernel answers: No such device
+    "dev": {}
+}
+
+
+# cat .config | grep VDPA
+CONFIG_VIRTIO_VDPA=y
+CONFIG_VDPA=y
+CONFIG_VDPA_SIM=y
+CONFIG_VDPA_SIM_NET=y
+# CONFIG_VDPA_SIM_BLOCK is not set
+# CONFIG_VP_VDPA is not set
+CONFIG_VHOST_VDPA=y
+
+----------------------------------------
+
+关于vhost_vdpa_driver的使用.
+
+vdpa_bus上只能用一个vdpa_driver, 所以不可以加载vdpa_virtio.
+
+# cat .config | grep VDPA
+# CONFIG_VIRTIO_VDPA is not set
+CONFIG_VDPA=y
+CONFIG_VDPA_SIM=y
+CONFIG_VDPA_SIM_NET=y
+# CONFIG_VDPA_SIM_BLOCK is not set
+# CONFIG_VP_VDPA is not set
+CONFIG_VHOST_VDPA=y
+
+
+
+1. To create a vdpa_sim device with vdpa utility.
+
+# ./vdpa dev add mgmtdev vdpasim_net name net0
+
+此时就能看到/dev/vhost-vdpa-0
+
+2. To create a VM.
+
+# ./qemu-6.1.0/build/x86_64-softmmu/qemu-system-x86_64 -hda ol7.qcow2 \
+  -netdev vhost-vdpa,vhostdev=/dev/vhost-vdpa-0,id=vdpa0 \
+  -device virtio-net-pci,netdev=vdpa0 -vnc :0 \
+  -serial stdio -enable-kvm -smp 4 -m 1500M
+
+
+
+[0] vhost_vdpa_probe
+[0] really_probe
+[0] driver_probe_device
+[0] bus_for_each_drv
+[0] __device_attach
+[0] bus_probe_device
+[0] device_add
+[0] ? _vdpa_register_device.cold.13
+[0] ? bus_find_device
+[0] vdpasim_net_dev_add
+[0] ? vdpasim_net_dev_add
+[0] ? vdpasim_create
+[0] vdpa_nl_cmd_dev_add_set_doit
+[0] genl_family_rcv_msg_doit.isra.17
+[0] genl_rcv_msg
+[0] netlink_rcv_skb
+[0] genl_rcv
+[0] netlink_unicast
+[0] netlink_sendmsg
+[0] sock_sendmsg
+[0] __sys_sendto
+[0] __x64_sys_sendto
+[0] do_syscall_64
+[0] entry_SYSCALL_64_after_hwframe
+
+
+[0] vdpasim_kick_vq
+[0] vhost_poll_wakeup
+[0] vhost_poll_start
+[0] vhost_vring_ioctl
+[0] vhost_vdpa_unlocked_ioctl
+[0] __x64_sys_ioctl
+[0] do_syscall_64
+[0] entry_SYSCALL_64_after_hwframe
+
+[0] vdpasim_kick_vq
+[0] vhost_poll_wakeup
+[0] __wake_up_common
+[0] eventfd_signal
+[0] ioeventfd_write
+[0] __kvm_io_bus_write
+[0] kvm_io_bus_write
+[0] handle_ept_misconfig
+[0] vmx_handle_exit
+[0] vcpu_enter_guest
+[0] kvm_arch_vcpu_ioctl_run
+[0] kvm_vcpu_ioctl
+[0] __x64_sys_ioctl
+[0] do_syscall_64
+[0] entry_SYSCALL_64_after_hwframe
+
+[0] vdpasim_kick_vq
+[0] vhost_poll_wakeup
+[0] __wake_up_common
+[0] eventfd_signal
+[0] ioeventfd_write
+[0] __kvm_io_bus_write
+[0] kvm_io_bus_write
+[0] write_mmio
+[0] emulator_read_write_onepage
+[0] emulator_read_write.isra.160
+[0] emulator_write_emulated
+[0] segmented_write
+[0] writeback
+[0] x86_emulate_insn
+[0] x86_emulate_instruction
+[0] kvm_mmu_page_fault
+[0] ? vmx_set_msr
+[0] ? vmx_vmexit
+[0] ? vmx_vmexit
+[0] vmx_handle_exit
+[0] vcpu_enter_guest
+[0] kvm_arch_vcpu_ioctl_run
+[0] kvm_vcpu_ioctl
+[0] __x64_sys_ioctl
+[0] do_syscall_64
+[0] entry_SYSCALL_64_after_hwframe
+
+
+
+有一些已经不可以用了
+https://www.redhat.com/en/blog/hands-vdpa-what-do-you-do-when-you-aint-got-hardware
