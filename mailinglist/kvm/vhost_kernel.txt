@@ -1,0 +1,106 @@
+[RFC PATCH 00/10] Support kernel buffers in vhost
+
+... from Vincent Whitchurch <vincent.whitchurch@axis.com> ...
+
+https://lore.kernel.org/kvm/20210929151119.14778-1-vincent.whitchurch@axis.com/
+
+这个patch究竟是什么目的也不清楚, 为什么非要在vhost之间通信呢?
+
+把以前的vhost的ring增加到了两个: user和kernel.
+
+ 91 struct vhost_virtqueue {
+ 92         struct vhost_dev *dev;
+ 93
+ 94         /* The actual ring of buffers. */
+ 95         struct mutex mutex;
+ 96         unsigned int num;
+ 97         struct {
+ 98                 vring_desc_t __user *desc;
+ 99                 vring_avail_t __user *avail;
+100                 vring_used_t __user *used;
+101         } user;
+102         struct {
+103                 vring_desc_t *desc;
+104                 vring_avail_t *avail;
+105                 vring_used_t *used;
+106         } kern;
+
+kernel的ring通过vhost_dev_set_num_addr(), 并没有一个ioctl的cmd. 可以kernel space之间不需要cmd吧.
+
+1804 int vhost_dev_set_num_addr(struct vhost_dev *dev, unsigned int idx, void *desc,
+1805                            void *avail, void *used)
+1806 {
+1807         struct vhost_virtqueue *vq;
+1808         int ret = 0;
+1809 
+1810         if (idx >= dev->nvqs)
+1811                 return -ENOBUFS;
+1812 
+1813         vq = dev->vqs[idx];
+1814 
+1815         mutex_lock(&vq->mutex);
+1816         vq->kern.desc = desc;
+1817         vq->kern.avail = avail;
+1818         vq->kern.used = used;
+1819         vq->last_avail_idx = 0;
+1820         vq->avail_idx = vq->last_avail_idx;
+1821         mutex_unlock(&vq->mutex);
+1822 
+1823         return ret;
+1824 }
+1825 EXPORT_SYMBOL_GPL(vhost_dev_set_num_addr);
+
+目前use case不是很清晰, 不理解
+
+测试的case在:
+
+- drivers/vdpa/vhost_kernel_test/vhost_kernel_test.c
+- tools/testing/selftests/vhost_kernel/vhost_kernel_test.c
+- tools/testing/selftests/vhost_kernel/vhost_kernel_test.sh
+
+
+TUN--vhost_net_kernel--virtio_vdpa--virtio_net
+
+1. "./vhost_kernel_test --serve"
+
+1.1. vhost = open("/dev/vhost-net-kernel", O_RDONLY);
+
+1.2. vktest = open("/dev/vktest", O_RDONLY);
+
+vktest = vdpa_alloc_device(struct vktest, vdpa, NULL, &vktest_config_ops, NULL, false);
+
+最终会创建一个virtio_net (根据vktest_get_device_id()), 基于virtio_vdpa. 
+
+1.3. 为vhost和vktest设置VHOST_SET_VRING_KICK和VHOST_SET_VRING_CALL
+
+1.4. vhost_net_set_backend(vhost)创建一个TUN并且设置为vhost(不是vktest)的backend
+
+1.5. ret = ioctl(vktest, VKTEST_ATTACH_VHOST, vhost);
+
+把vhost-net-kernel和virtio_vdpa联系在一起.
+
+2. 设置h2g和g2h
+
+h2g是TUN
+g2h是virtio_net
+
+3. 把TUN和virtio_net加入不同的namespace
+
+ip netns add g2h
+ip netns add h2g
+
+ip link set dev $h2g netns h2g
+ip netns exec h2g ip addr add dev $h2g scope link $hostip
+ip netns exec h2g ip link set dev $h2g up
+
+ip link set dev $g2h netns g2h
+ip netns exec g2h ip addr add dev $g2h scope link $guestip
+ip netns exec g2h ip link set dev $g2h up
+
+4. ping6测试!
+
+hostip=fe80::0
+guestip=fe80::1
+
+ip netns exec h2g ping6 -c10 -A -s 20000 $guestip%$h2g
+ip netns exec g2h ping6 -c10 -A -s 20000 $hostip%$g2h
