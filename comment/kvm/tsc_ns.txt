@@ -1,0 +1,84 @@
+"constant tsc" (或者"synchronized tsc")是指"The TSC is synchronized across all sockets/cores".
+
+下面是"/proc/cpuinfo"中部分关于tsc的解释
+
+tsc          : The system has a TSC clock
+rdtscp       : The RDTSCP instruction is available
+constant_tsc : The TSC is synchronized across all sockets/cores
+nonstop_tsc  : The TSC is not affected by power management code
+
+
+关于msr_tsc_adjust
+
+如果想要修改tsc的counter, 可以直接写入msr_tsc.
+然而这样很难保证所有的CPU是同步的 (因为每个CPU都要往msr_tsc写一个absolute value)
+使用msr_tsc_adjust就可以解决这个问题, 因为为每个CPU写入的是offset, 不是absolute value
+
+------------------------
+
+CLOCK_REALTIME clock gives the time passed since January 1, 1970. This clock is affected by NTP adjustments and can jump forward and backward when a system administrator adjusts system time.
+CLOCK_MONOTONIC clock gives the time since a fixed starting point—usually since you booted the system. This clock is affected by NTP, but it can't jump backward.
+CLOCK_MONOTONIC_RAW clock gives the same time as CLOCK_MONOTONIC, but this clock is not affected by NTP adjustments.
+CLOCK_REALTIME_COARSE and CLOCK_MONOTONIC_COARSE are faster but less-accurate variants of CLOCK_REALTIME and CLOCK_MONOTONIC.
+
+------------------------
+
+master clock的定义:
+在KVM中, KVM希望各个vCPU的TSC处在同步(synchronized)状态,称之为"Master Clock"模式.
+
+------------------------
+
+monotonic time字面意思是单调时间,实际上它指的是系统启动以后流逝的时间,这是由变量jiffies来记录的.
+系统每次启动时jiffies初始化为0,每来一个timer interrupt,jiffies加1,也就是说它代表系统启动后流逝的tick数.
+jiffies一定是单调递增的.
+
+wall time字面意思是挂钟时间,实际上就是指的是现实的时间,这是由变量xtime来记录的.
+系统每次启动时将CMOS上的RTC时间读入xtime,这个值是"自1970-01-01起经历的秒数,本秒中经历的纳秒数",
+每来一个timer interrupt,也需要去更新xtime.
+
+相比monotonic time, wall time未必是单调递增的, 因为这个时间(比如RTC)是可以修改的.
+
+------------------------
+
+
+cpu_khz是cpu频率, tsc_khz是tsc频率, 这两个频率可能不相等.
+
+GTOD: Generic time of Day
+
+KVM_REQ_CLOCK_UPDATE调用kvm_guest_time_update(), 似乎用来填充"struct pvclock_vcpu_time_info"
+应该是在很多地方被调用
+
+
+KVM_REQ_GLOBAL_CLOCK_UPDATE调用kvm_gen_kvmclock_update() --> 感觉是KVM_REQ_CLOCK_UPDATE的global版本 (为所有的CPU调用)
+核心思想是为kvm的每一个vcpu触发KVM_REQ_CLOCK_UPDATE
+调用kvm_guest_time_update(), 似乎用来填充"struct pvclock_vcpu_time_info"
+只在写MSR_KVM_SYSTEM_TIME/MSR_KVM_SYSTEM_TIME_NEW或极少的情况调用
+
+
+KVM_REQ_MASTERCLOCK_UPDATE, 调用kvm_gen_update_masterclock()
+核心思想是为整个kvm更新:
+- ka->use_master_clock
+- ka->master_kernel_ns
+- ka->master_cycle_now
+- kvm_guest_has_master_clock
+然后为每个vcpu触发KVM_REQ_CLOCK_UPDATE调用kvm_guest_time_update(),
+似乎用来填充"struct pvclock_vcpu_time_info"
+
+
+
+
+
+
+
+KVM_REQ_MASTERCLOCK_UPDATE --> kvm_gen_update_masterclock()
+KVM_REQ_MCLOCK_INPROGRESS --> 给所有vCPU发送KVM_REQ_MCLOCK_INPROGRESS,将它们踢出Guest模式
+                              该请求没有Handler,因此vCPU无法再进入Guest
+KVM_REQ_GLOBAL_CLOCK_UPDATE --> kvm_gen_kvmclock_update()
+KVM_REQ_CLOCK_UPDATE --> kvm_guest_time_update()
+
+
+当VM写入MSR的时候, 会trap到kvm_write_system_time()来request KVM_REQ_GLOBAL_CLOCK_UPDATE
+
+KVM_REQ_GLOBAL_CLOCK_UPDATE会调用kvm_gen_kvmclock_update(), 会为每个vcpu request KVM_REQ_CLOCK_UPDATE
+
+KVM_REQ_CLOCK_UPDATE调用kvm_guest_time_update(), 似乎用来填充"struct pvclock_vcpu_time_info"

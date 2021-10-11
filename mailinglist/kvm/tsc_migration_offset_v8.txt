@@ -1,0 +1,307 @@
+[PATCH v8 0/7] KVM: x86: Add idempotent controls for migrating system counter state
+
+... from Oliver Upton <oupton@google.com> ...
+
+https://lore.kernel.org/kvm/20210916181538.968978-1-oupton@google.com/
+
+这个patch是关于在live migration的时候如何迁移tsc和ns(system time).
+
+live migration的时候 ...
+
+1. QEMU src为每一个vcpu通过kvm的kvm_get_msr_common():MSR_IA32_TSC获取tsc. 核心代码:
+
+u64 tsc_offset = msr_info->host_initiated ? vcpu->arch.l1_tsc_offset :
+                                            vcpu->arch.tsc_offset;
+msr_info->data = kvm_scale_tsc(vcpu, rdtsc()) + tsc_offset;
+
+2. QEMU src通过KVM_GET_CLOCK获取ns.
+
+struct kvm_clock_data user_ns;
+u64 now_ns;
+
+now_ns = get_kvmclock_ns(kvm); // 返回的应该是VM启动了的ns
+user_ns.clock = now_ns;
+user_ns.flags = kvm->arch.use_master_clock ? KVM_CLOCK_TSC_STABLE : 0;
+memset(&user_ns.pad, 0, sizeof(user_ns.pad));
+
+3. 为VM设置kvm_set_tsc_khz().
+
+4. QEMU dst为每一个vcpu通过kvm的kvm_set_msr_common():MSR_IA32_TSC设置tsc.
+
+kvm_synchronize_tsc(vcpu, data);
+
+这个kvm_synchronize_tsc()函数最大的目的:
+- 计算kvm->arch.nr_vcpus_matched_tsc, 稍后好同步master clock
+- 使用kvm_vcpu_write_tsc_offset(vcpu, offset)来计算vcpu->arch.l1_tsc_offset和vcpu->arch.tsc_offset
+
+5. QEMU dst通过KVM_SET_CLOCK设置ns. user_ns.clock是写入的ns.
+
+if (kvm->arch.use_master_clock)
+    now_ns = ka->master_kernel_ns;
+else
+    now_ns = get_kvmclock_base_ns();
+ka->kvmclock_offset = user_ns.clock - now_ns;
+
+
+这里是创建src VM的过程.
+
+[   37.878252] kvm_set_tsc_khz() kvm=805, vcpu=0, user_tsc_khz=3392426
+--> 从kvm_arch_vcpu_create()调用的kvm_set_tsc_khz()
+[   37.879383] kvm_synchronize_tsc() kvm=805, vcpu=0, tsc=0, last_tsc_nsec=0, elapsed=37547933616
+--> 从kvm_arch_vcpu_postcreate()调用kvm_synchronize_tsc()
+
+[   37.881229] kvm_set_tsc_khz() kvm=805, vcpu=1, user_tsc_khz=3392426
+--> 从kvm_arch_vcpu_create()调用的kvm_set_tsc_khz()
+[   37.882887] kvm_synchronize_tsc() kvm=805, vcpu=1, tsc=0, last_tsc_nsec=37547933616, elapsed=3504032
+--> 从kvm_arch_vcpu_postcreate()调用kvm_synchronize_tsc()
+
+[   37.885802] kvm_set_tsc_khz() kvm=805, vcpu=2, user_tsc_khz=3392426
+--> 从kvm_arch_vcpu_create()调用的kvm_set_tsc_khz()
+[   37.887564] kvm_synchronize_tsc() kvm=805, vcpu=2, tsc=0, last_tsc_nsec=37551437648, elapsed=4677241
+--> 从kvm_arch_vcpu_postcreate()调用kvm_synchronize_tsc()
+
+[   37.889299] kvm_set_tsc_khz() kvm=805, vcpu=3, user_tsc_khz=3392426
+--> 从kvm_arch_vcpu_create()调用的kvm_set_tsc_khz()
+[   37.890446] kvm_synchronize_tsc() kvm=805, vcpu=3, tsc=0, last_tsc_nsec=37556114889, elapsed=2882149
+--> 从kvm_arch_vcpu_postcreate()调用kvm_synchronize_tsc()
+
+[   37.892217] KVM_GET_CLOCK kvm=805, user_ns.clock=16948327
+
+[   37.911071] kvm_set_tsc_khz() kvm=805, vcpu=0, user_tsc_khz=3392426
+--> 从kvm_arch_vcpu_ioctl()调用的kvm_set_tsc_khz()
+[   37.912137] kvm_set_msr_common() MSR_IA32_TSC host_init=1, kvm=805, vcpu=0, tsc=0
+[   37.913318] kvm_synchronize_tsc() kvm=805, vcpu=0, tsc=0, last_tsc_nsec=37558997038, elapsed=22871966
+
+[   37.915285] kvm_set_tsc_khz() kvm=805, vcpu=1, user_tsc_khz=3392426
+--> 从kvm_arch_vcpu_ioctl()调用的kvm_set_tsc_khz()
+[   37.916168] kvm_set_msr_common() MSR_IA32_TSC host_init=1, kvm=805, vcpu=1, tsc=0
+[   37.917070] kvm_synchronize_tsc() kvm=805, vcpu=1, tsc=0, last_tsc_nsec=37581869004, elapsed=3751525
+
+[   37.918290] kvm_set_tsc_khz() kvm=805, vcpu=2, user_tsc_khz=3392426
+--> 从kvm_arch_vcpu_ioctl()调用的kvm_set_tsc_khz()
+[   37.919299] kvm_set_msr_common() MSR_IA32_TSC host_init=1, kvm=805, vcpu=2, tsc=0
+[   37.921056] kvm_synchronize_tsc() kvm=805, vcpu=2, tsc=0, last_tsc_nsec=37585620529, elapsed=3986403
+
+[   37.922816] kvm_set_tsc_khz() kvm=805, vcpu=3, user_tsc_khz=3392426
+--> 从kvm_arch_vcpu_ioctl()调用的kvm_set_tsc_khz()
+[   37.924141] kvm_set_msr_common() MSR_IA32_TSC host_init=1, kvm=805, vcpu=3, tsc=0
+[   37.925174] kvm_synchronize_tsc() kvm=805, vcpu=3, tsc=0, last_tsc_nsec=37589606932, elapsed=4117597
+
+[   37.935824] kvm_get_msr_common() MSR_IA32_TSC host_init=1, kvm=805, vcpu=0, tsc=77608687
+[   37.937526] kvm_get_msr_common() MSR_IA32_TSC host_init=1, kvm=805, vcpu=1, tsc=12749219
+[   37.939595] kvm_get_msr_common() MSR_IA32_TSC host_init=1, kvm=805, vcpu=2, tsc=13537514
+[   37.940929] kvm_get_msr_common() MSR_IA32_TSC host_init=1, kvm=805, vcpu=3, tsc=13982994
+
+[   37.943673] kvm_set_msr_common() MSR_IA32_TSC host_init=1, kvm=805, vcpu=0, tsc=0
+[   37.944964] kvm_synchronize_tsc() kvm=805, vcpu=0, tsc=0, last_tsc_nsec=37593724529, elapsed=19789929
+
+[   37.946641] kvm_set_msr_common() MSR_IA32_TSC host_init=1, kvm=805, vcpu=1, tsc=0
+[   37.947970] kvm_synchronize_tsc() kvm=805, vcpu=1, tsc=0, last_tsc_nsec=37613514458, elapsed=3006187
+
+[   37.949649] kvm_set_msr_common() MSR_IA32_TSC host_init=1, kvm=805, vcpu=2, tsc=0
+[   37.950950] kvm_synchronize_tsc() kvm=805, vcpu=2, tsc=0, last_tsc_nsec=37616520645, elapsed=2980670
+
+[   37.952555] kvm_set_msr_common() MSR_IA32_TSC host_init=1, kvm=805, vcpu=3, tsc=0
+[   37.953964] kvm_synchronize_tsc() kvm=805, vcpu=3, tsc=0, last_tsc_nsec=37619501315, elapsed=3013574
+
+[   37.955579] KVM_SET_CLOCK kvm=805, user_ns.clock=16948327
+
+[   38.086381] kvm_get_msr_common() MSR_IA32_TSC host_init=1, kvm=805, vcpu=0, tsc=702024851
+[   55.172961] kvm_get_msr_common() MSR_IA32_TSC host_init=1, kvm=805, vcpu=0, tsc=58666919287
+[   55.174374] kvm_get_msr_common() MSR_IA32_TSC host_init=1, kvm=805, vcpu=0, tsc=58671796092
+[   55.175500] kvm_get_msr_common() MSR_IA32_TSC host_init=1, kvm=805, vcpu=0, tsc=58675586130
+[   55.177187] kvm_get_msr_common() MSR_IA32_TSC host_init=1, kvm=805, vcpu=0, tsc=58681316362
+[   55.179077] kvm_get_msr_common() MSR_IA32_TSC host_init=1, kvm=805, vcpu=0, tsc=58687747971
+[   55.180888] kvm_get_msr_common() MSR_IA32_TSC host_init=1, kvm=805, vcpu=0, tsc=58693888640
+
+
+这里是创建dst VM的过程.
+
+[   88.926924] kvm_set_tsc_khz() kvm=954, vcpu=0, user_tsc_khz=3392426
+--> 从kvm_arch_vcpu_create()调用的kvm_set_tsc_khz()
+[   88.928228] kvm_synchronize_tsc() kvm=954, vcpu=0, tsc=0, last_tsc_nsec=0, elapsed=88596779158
+--> 从kvm_arch_vcpu_postcreate()调用kvm_synchronize_tsc()
+
+[   88.929873] kvm_set_tsc_khz() kvm=954, vcpu=1, user_tsc_khz=3392426
+--> 从kvm_arch_vcpu_create()调用的kvm_set_tsc_khz()
+[   88.931601] kvm_synchronize_tsc() kvm=954, vcpu=1, tsc=0, last_tsc_nsec=88596779158, elapsed=3372325
+--> 从kvm_arch_vcpu_postcreate()调用kvm_synchronize_tsc()
+
+[   88.933690] kvm_set_tsc_khz() kvm=954, vcpu=2, user_tsc_khz=3392426
+--> 从kvm_arch_vcpu_create()调用的kvm_set_tsc_khz()
+[   88.935605] kvm_synchronize_tsc() kvm=954, vcpu=2, tsc=0, last_tsc_nsec=88600151483, elapsed=4003906
+--> 从kvm_arch_vcpu_postcreate()调用kvm_synchronize_tsc()
+
+[   88.937222] kvm_set_tsc_khz() kvm=954, vcpu=3, user_tsc_khz=3392426
+--> 从kvm_arch_vcpu_create()调用的kvm_set_tsc_khz()
+[   88.939374] kvm_synchronize_tsc() kvm=954, vcpu=3, tsc=0, last_tsc_nsec=88604155389, elapsed=3769793
+--> 从kvm_arch_vcpu_postcreate()调用kvm_synchronize_tsc()
+
+[   88.940632] KVM_GET_CLOCK kvm=954, user_ns.clock=15904666
+
+[   88.957137] kvm_set_tsc_khz() kvm=954, vcpu=0, user_tsc_khz=3392426
+--> 从kvm_arch_vcpu_ioctl()调用的kvm_set_tsc_khz()
+[   88.958101] kvm_set_msr_common() MSR_IA32_TSC host_init=1, kvm=954, vcpu=0, tsc=0
+[   88.959139] kvm_synchronize_tsc() kvm=954, vcpu=0, tsc=0, last_tsc_nsec=88607925182, elapsed=19764811
+
+[   88.961062] kvm_set_tsc_khz() kvm=954, vcpu=1, user_tsc_khz=3392426
+--> 从kvm_arch_vcpu_ioctl()调用的kvm_set_tsc_khz()
+[   88.962008] kvm_set_msr_common() MSR_IA32_TSC host_init=1, kvm=954, vcpu=1, tsc=0
+[   88.963665] kvm_synchronize_tsc() kvm=954, vcpu=1, tsc=0, last_tsc_nsec=88627689993, elapsed=4526348
+
+[   88.965513] kvm_set_tsc_khz() kvm=954, vcpu=2, user_tsc_khz=3392426
+--> 从kvm_arch_vcpu_ioctl()调用的kvm_set_tsc_khz()
+[   88.966542] kvm_set_msr_common() MSR_IA32_TSC host_init=1, kvm=954, vcpu=2, tsc=0
+[   88.967408] kvm_synchronize_tsc() kvm=954, vcpu=2, tsc=0, last_tsc_nsec=88632216341, elapsed=3742690
+
+[   88.969300] kvm_set_tsc_khz() kvm=954, vcpu=3, user_tsc_khz=3392426
+--> 从kvm_arch_vcpu_ioctl()调用的kvm_set_tsc_khz()
+[   88.970287] kvm_set_msr_common() MSR_IA32_TSC host_init=1, kvm=954, vcpu=3, tsc=0
+[   88.971218] kvm_synchronize_tsc() kvm=954, vcpu=3, tsc=0, last_tsc_nsec=88635959031, elapsed=3809652
+
+[   88.979908] kvm_get_msr_common() MSR_IA32_TSC host_init=1, kvm=954, vcpu=0, tsc=67073342
+[   88.981145] kvm_get_msr_common() MSR_IA32_TSC host_init=1, kvm=954, vcpu=1, tsc=15369830
+[   88.982761] kvm_get_msr_common() MSR_IA32_TSC host_init=1, kvm=954, vcpu=2, tsc=12718064
+[   88.984798] kvm_get_msr_common() MSR_IA32_TSC host_init=1, kvm=954, vcpu=3, tsc=12938959
+
+[   88.986748] kvm_set_msr_common() MSR_IA32_TSC host_init=1, kvm=954, vcpu=0, tsc=0
+[   88.988577] kvm_synchronize_tsc() kvm=954, vcpu=0, tsc=0, last_tsc_nsec=88639768683, elapsed=17358693
+[   88.990294] kvm_set_msr_common() MSR_IA32_TSC host_init=1, kvm=954, vcpu=1, tsc=0
+[   88.991328] kvm_synchronize_tsc() kvm=954, vcpu=1, tsc=0, last_tsc_nsec=88657127376, elapsed=2751080
+[   88.993179] kvm_set_msr_common() MSR_IA32_TSC host_init=1, kvm=954, vcpu=2, tsc=0
+[   88.994594] kvm_synchronize_tsc() kvm=954, vcpu=2, tsc=0, last_tsc_nsec=88659878456, elapsed=3266853
+[   88.996595] kvm_set_msr_common() MSR_IA32_TSC host_init=1, kvm=954, vcpu=3, tsc=0
+[   88.997744] kvm_synchronize_tsc() kvm=954, vcpu=3, tsc=0, last_tsc_nsec=88663145309, elapsed=3149899
+
+
+这里是live migration的过程.
+
+(1) 读取每一个vcpu的guest tsc
+
+[  101.337934] kvm_get_msr_common() MSR_IA32_TSC host_init=1, kvm=805, vcpu=0, tsc=213710479499
+[  101.339157] kvm_get_msr_common() MSR_IA32_TSC host_init=1, kvm=805, vcpu=1, tsc=215223582316
+[  101.340356] kvm_get_msr_common() MSR_IA32_TSC host_init=1, kvm=805, vcpu=2, tsc=214409323183
+[  101.342033] kvm_get_msr_common() MSR_IA32_TSC host_init=1, kvm=805, vcpu=3, tsc=214617190502
+
+(2) 获取VM的ns
+
+[  101.343376] KVM_GET_CLOCK kvm=805, user_ns.clock=63404036122
+[  101.354304] KVM_GET_CLOCK kvm=805, user_ns.clock=63414963787
+
+(3) 为VM设置tsc_khz
+
+[  101.360835] kvm_set_tsc_khz() kvm=954, vcpu=0, user_tsc_khz=3392426
+
+(4) 为每一个vcpu设置tsc
+
+[  101.361697] kvm_set_msr_common() MSR_IA32_TSC host_init=1, kvm=954, vcpu=0, tsc=213710479499
+[  101.362644] kvm_synchronize_tsc() kvm=954, vcpu=0, tsc=213710479499, last_tsc_nsec=88666295208, elapsed=12364899388
+[  101.364415] kvm_set_tsc_khz() kvm=954, vcpu=1, user_tsc_khz=3392426
+[  101.365250] kvm_set_msr_common() MSR_IA32_TSC host_init=1, kvm=954, vcpu=1, tsc=215223582316
+[  101.367135] kvm_synchronize_tsc() kvm=954, vcpu=1, tsc=215223582316, last_tsc_nsec=101031194596, elapsed=4491499
+[  101.369249] kvm_set_tsc_khz() kvm=954, vcpu=2, user_tsc_khz=3392426
+[  101.370841] kvm_set_msr_common() MSR_IA32_TSC host_init=1, kvm=954, vcpu=2, tsc=214409323183
+[  101.372363] kvm_synchronize_tsc() kvm=954, vcpu=2, tsc=214409323183, last_tsc_nsec=101035686095, elapsed=5227623
+[  101.375017] kvm_set_tsc_khz() kvm=954, vcpu=3, user_tsc_khz=3392426
+[  101.376121] kvm_set_msr_common() MSR_IA32_TSC host_init=1, kvm=954, vcpu=3, tsc=214617190502
+[  101.377548] kvm_synchronize_tsc() kvm=954, vcpu=3, tsc=214617190502, last_tsc_nsec=101040913718, elapsed=5185027
+
+(5) 设置VM的ns
+
+[  101.389179] KVM_SET_CLOCK kvm=954, user_ns.clock=63414963787
+
+
+
+新的算法不再是单纯的设置tsc, 而是基于tsc针对src host tsc的offset.
+
+From the source VMM process:
+
+1. Invoke the KVM_GET_CLOCK ioctl to record the host TSC (t_0),
+   kvmclock nanoseconds (k_0), and realtime nanoseconds (r_0).
+
+2. Read the KVM_VCPU_TSC_OFFSET attribute for every vCPU to record the
+   guest TSC offset (off_n).
+
+3. Invoke the KVM_GET_TSC_KHZ ioctl to record the frequency of the
+   guest's TSC (freq).
+
+From the destination VMM process:
+
+4. Invoke the KVM_SET_CLOCK ioctl, providing the kvmclock nanoseconds
+   (k_0) and realtime nanoseconds (r_0) in their respective fields.
+   Ensure that the KVM_CLOCK_REALTIME flag is set in the provided
+   structure. KVM will advance the VM's kvmclock to account for elapsed
+   time since recording the clock values.
+
+5. Invoke the KVM_GET_CLOCK ioctl to record the host TSC (t_1) and
+   kvmclock nanoseconds (k_1).
+
+6. Adjust the guest TSC offsets for every vCPU to account for (1) time
+   elapsed since recording state and (2) difference in TSCs between the
+   source and destination machine:
+
+   new_off_n = t_0 + off_n + (k_1 - k_0) * freq - t_1
+
+7. Write the KVM_VCPU_TSC_OFFSET attribute for every vCPU with the
+   respective value derived in the previous step.
+
+
+新的代码并没有修改已经有的设置tsc的方式, 而是增加了一个方式.
+
+新增加的__kvm_synchronize_tsc()可以被两种路径调用:
+
+1. 传统的kvm_synchronize_tsc()
+
+2. kvm_vcpu_ioctl_device_attr()的KVM_SET_DEVICE_ATTR --> kvm_arch_tsc_set_attr()
+
+
+!!!!! 个人理解, 目前的方式sync tsc的时候很容易超过1-second, 这里改成了写offset的方式.
+
+4974 static int kvm_arch_tsc_set_attr(struct kvm_vcpu *vcpu,
+4975                                  struct kvm_device_attr *attr)
+4976 {       
+4977         u64 __user *uaddr = (u64 __user *)attr->addr;
+4978         struct kvm *kvm = vcpu->kvm;
+4979         int r;  
+4980 
+4981         switch (attr->attr) {
+4982         case KVM_VCPU_TSC_OFFSET: {
+4983                 u64 offset, tsc, ns;
+4984                 unsigned long flags;
+4985                 bool matched;
+4986                 
+4987                 r = -EFAULT;
+4988                 if (get_user(offset, uaddr))
+4989                         break;
+4990                 
+4991                 raw_spin_lock_irqsave(&kvm->arch.tsc_write_lock, flags);
+4992          
+4993                 matched = (vcpu->arch.virtual_tsc_khz &&
+4994                            kvm->arch.last_tsc_khz == vcpu->arch.virtual_tsc_khz &&
+4995                            kvm->arch.last_tsc_offset == offset);
+4996 
+4997                 tsc = kvm_scale_tsc(vcpu, rdtsc(), vcpu->arch.l1_tsc_scaling_ratio) + offset;
+4998                 ns = get_kvmclock_base_ns();
+4999 
+5000                 __kvm_synchronize_tsc(vcpu, offset, tsc, ns, matched);
+5001                 raw_spin_unlock_irqrestore(&kvm->arch.tsc_write_lock, flags);
+5002  
+5003                 r = 0;
+5004                 break;
+5005         }
+5006         default:
+5007                 r = -ENXIO;
+5008         }                             
+5009                                       
+5010         return r;                  
+5011 }
+
+
+==========================================
+
+[PATCH v8 0/9] selftests: KVM: Test offset-based counter controls
+
+... from Oliver Upton <oupton@google.com> ...
+
+https://lore.kernel.org/kvm/20210916181555.973085-1-oupton@google.com/
+
