@@ -1,0 +1,55 @@
+[RFC PATCH v3 0/5] x86/kvm: Virtual suspend time injection support
+
+... from Hikaru Nishida ...
+
+https://lkml.org/lkml/2021/10/20/415
+
+
+This patch series adds virtual suspend time injection support to KVM.
+
+Before this change, if the host goes into suspended state while the
+guest is running, the guest will experience a time jump after the host's
+resume. This can confuse some services in the guest since they can't
+detect if the system went into suspend or not by comparing
+CLOCK_BOOTTIME and CLOCK_MONOTONIC.
+
+修改分别在host side和VM side.
+
+1. 在host side:
+
+(1) VM side会通过MSR_KVM_HOST_SUSPEND_TIME这个MSR共享suspend time的内存.
+
+(2) host被suspend的时候, kvm_pm_notifier_call()会被调用. suspend的时候调用kvm_suspend_notifier()来kvm_make_request(KVM_REQ_SUSPEND_TIME_ADJ, vcpu).
+
+(3) 处理KVM_REQ_SUSPEND_TIME_ADJ()调用kvm_adjust_suspend_time()
+
+@@ -9421,6 +9528,8 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 			r = -EIO;
+ 			goto out;
+ 		}
++		if (kvm_check_request(KVM_REQ_SUSPEND_TIME_ADJ, vcpu))
++			kvm_adjust_suspend_time(vcpu);
+
+(4) 会通过HYPERVISOR_CALLBACK_VECTOR这个vector通知VM suspend time被更新了.
+
+(5) resume的时候调用kvm_resume_notifier()来kvm_clear_request(KVM_REQ_SUSPEND_TIME_ADJ, vcpu);
+
+
+2. 在VM side:
+
+注册asm_sysvec_kvm_hv_callback()是HYPERVISOR_CALLBACK_VECTOR的handler.
+
+@@ -710,10 +713,13 @@ static void __init kvm_guest_init(void)
+ 	if (kvm_para_has_feature(KVM_FEATURE_PV_EOI))
+ 		apic_set_eoi_write(kvm_guest_apic_eoi_write);
+
+-	if (kvm_para_has_feature(KVM_FEATURE_ASYNC_PF_INT) && kvmapf) {
++	if (kvm_para_has_feature(KVM_FEATURE_ASYNC_PF_INT) && kvmapf)
+ 		static_branch_enable(&kvm_async_pf_enabled);
+-		alloc_intr_gate(HYPERVISOR_CALLBACK_VECTOR, asm_sysvec_kvm_asyncpf_interrupt);
+-	}
++
++	if ((kvm_para_has_feature(KVM_FEATURE_ASYNC_PF_INT) && kvmapf) ||
++	    kvm_para_has_feature(KVM_FEATURE_HOST_SUSPEND_TIME))
++		alloc_intr_gate(HYPERVISOR_CALLBACK_VECTOR,
++				asm_sysvec_kvm_hv_callback);
