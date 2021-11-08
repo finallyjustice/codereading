@@ -1,0 +1,528 @@
+From c31aa871134fe789ae83199dbb80eae5f38d671b Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Mon, 8 Nov 2021 07:22:43 -0800
+Subject: [PATCH 1/1] xen-4.4.4-155.0.90.el6
+
+xen-4.4.4-155.0.90
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ xen/arch/x86/domain.c              |  55 ++++++++++++
+ xen/arch/x86/hvm/vmx/vmcs.c        | 133 +++++++++++++++++++++++++++++
+ xen/arch/x86/hvm/vmx/vmx.c         |  14 +++
+ xen/common/schedule.c              |  47 ++++++++++
+ xen/include/asm-x86/current.h      |  10 +++
+ xen/include/asm-x86/hvm/vmx/vmcs.h |  13 +++
+ xen/include/xen/sched.h            |  23 +++++
+ 7 files changed, 295 insertions(+)
+
+diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
+index a1139bb047..744be06a63 100644
+--- a/xen/arch/x86/domain.c
++++ b/xen/arch/x86/domain.c
+@@ -63,6 +63,18 @@
+ #include <xen/iommu.h>
+ #include <compat/vcpu.h>
+ 
++/*
++ * x86在以下使用percpu的curr_vcpu:
++ *   - arch/x86/domain.c|66| <<global>> DEFINE_PER_CPU(struct vcpu *, curr_vcpu);
++ *   - include/asm-x86/current.h|112| <<global>> DECLARE_PER_CPU(struct vcpu *, curr_vcpu);
++ *   - arch/x86/domain.c|1562| <<__context_switch>> struct vcpu *p = per_cpu(curr_vcpu, cpu);
++ *   - arch/x86/domain.c|1635| <<__context_switch>> per_cpu(curr_vcpu, cpu) = n;
++ *   - arch/x86/domain.c|1676| <<context_switch>> if ( (per_cpu(curr_vcpu, cpu) == next) ||
++ *   - arch/x86/domain.c|1782| <<__sync_local_execstate>> switch_required = (this_cpu(curr_vcpu) != current);
++ *   - arch/x86/setup.c|259| <<init_idle_domain>> this_cpu(curr_vcpu) = current;
++ *   - arch/x86/smpboot.c|331| <<start_secondary>> this_cpu(curr_vcpu) = idle_vcpu[cpu];
++ *   - arch/x86/x86_64/traps.c|84| <<show_registers>> struct vcpu *v = this_cpu(curr_vcpu) ? current : NULL;
++ */
+ DEFINE_PER_CPU(struct vcpu *, curr_vcpu);
+ DEFINE_PER_CPU(unsigned long, cr4);
+ 
+@@ -1550,6 +1562,11 @@ static inline int need_full_gdt(struct vcpu *v)
+     return (is_pv_vcpu(v) && !is_idle_vcpu(v));
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/domain.c|1678| <<context_switch>> __context_switch();
++ *   - arch/x86/domain.c|1765| <<__sync_local_execstate>> __context_switch();
++ */
+ static void __context_switch(void)
+ {
+     struct cpu_user_regs *stack_regs = guest_cpu_user_regs();
+@@ -1566,6 +1583,9 @@ static void __context_switch(void)
+     {
+         memcpy(&p->arch.user_regs, stack_regs, CTXT_SWITCH_STACK_BYTES);
+         vcpu_save_fpu(p);
++	/*
++	 * vmx_ctxt_switch_from()
++	 */
+         p->arch.ctxt_switch_from(p);
+     }
+ 
+@@ -1631,6 +1651,10 @@ static void __context_switch(void)
+ }
+ 
+ 
++/*
++ * called by:
++ *   - common/schedule.c|1246| <<schedule>> context_switch(prev, next);
++ */
+ void context_switch(struct vcpu *prev, struct vcpu *next)
+ {
+     unsigned int cpu = smp_processor_id();
+@@ -1664,6 +1688,18 @@ void context_switch(struct vcpu *prev, struct vcpu *next)
+ 
+     set_current(next);
+ 
++    /*
++     * x86在以下使用percpu的curr_vcpu:
++     *   - arch/x86/domain.c|66| <<global>> DEFINE_PER_CPU(struct vcpu *, curr_vcpu);
++     *   - include/asm-x86/current.h|112| <<global>> DECLARE_PER_CPU(struct vcpu *, curr_vcpu);
++     *   - arch/x86/domain.c|1562| <<__context_switch>> struct vcpu *p = per_cpu(curr_vcpu, cpu);
++     *   - arch/x86/domain.c|1635| <<__context_switch>> per_cpu(curr_vcpu, cpu) = n;
++     *   - arch/x86/domain.c|1676| <<context_switch>> if ( (per_cpu(curr_vcpu, cpu) == next) ||
++     *   - arch/x86/domain.c|1782| <<__sync_local_execstate>> switch_required = (this_cpu(curr_vcpu) != current);
++     *   - arch/x86/setup.c|259| <<init_idle_domain>> this_cpu(curr_vcpu) = current;
++     *   - arch/x86/smpboot.c|331| <<start_secondary>> this_cpu(curr_vcpu) = idle_vcpu[cpu];
++     *   - arch/x86/x86_64/traps.c|84| <<show_registers>> struct vcpu *v = this_cpu(curr_vcpu) ? current : NULL;
++     */
+     if ( (per_cpu(curr_vcpu, cpu) == next) ||
+          (is_idle_vcpu(next) && cpu_online(cpu)) )
+     {
+@@ -1728,6 +1764,9 @@ void context_switch(struct vcpu *prev, struct vcpu *next)
+         /* Must be done with interrupts enabled */
+         vpmu_load(next);
+ 
++    /*
++     * 会设置prev->is_running = 0;
++     */
+     context_saved(prev);
+ 
+     if ( prev != next )
+@@ -1736,8 +1775,24 @@ void context_switch(struct vcpu *prev, struct vcpu *next)
+     /* Ensure that the vcpu has an up-to-date time base. */
+     update_vcpu_system_time(next);
+ 
++    /*
++     * x86下的使用:
++     *   - arch/x86/domain.c|478| <<vcpu_initialise>> v->arch.schedule_tail = continue_nonidle_domain;
++     *   - arch/x86/domain.c|484| <<vcpu_initialise>> v->arch.schedule_tail = continue_idle_domain;
++     *   - arch/x86/hvm/svm/svm.c|1099| <<svm_vcpu_initialise>> v->arch.schedule_tail = svm_do_resume;
++     *   - arch/x86/hvm/vmx/vmx.c|105| <<vmx_vcpu_initialise>> v->arch.schedule_tail = vmx_do_resume;
++     *
++     * #define schedule_tail(vcpu) (((vcpu)->arch.schedule_tail)(vcpu))
++     */
+     schedule_tail(next);
+     BUG();
++
++    /*
++     * 在以下设置vcpu->is_running:
++     *   - common/schedule.c|215| <<sched_init_vcpu>> v->is_running = 1;
++     *   - common/schedule.c|1239| <<schedule>> next->is_running = 1;
++     *   - common/schedule.c|1260| <<context_saved>> prev->is_running = 0;
++     */
+ }
+ 
+ void continue_running(struct vcpu *same)
+diff --git a/xen/arch/x86/hvm/vmx/vmcs.c b/xen/arch/x86/hvm/vmx/vmcs.c
+index ae0e3885df..1352ea9163 100644
+--- a/xen/arch/x86/hvm/vmx/vmcs.c
++++ b/xen/arch/x86/hvm/vmx/vmcs.c
+@@ -96,6 +96,18 @@ u32 vmx_vmentry_control __read_mostly;
+ u64 vmx_ept_vpid_cap __read_mostly;
+ 
+ static DEFINE_PER_CPU_READ_MOSTLY(struct vmcs_struct *, vmxon_region);
++/*
++ * 在以下设置percpu current_vmcs:
++ *   - arch/x86/hvm/vmx/vmcs.c|451| <<__vmx_clear_vmcs>> this_cpu(current_vmcs) = NULL;
++ *   - arch/x86/hvm/vmx/vmcs.c|478| <<vmx_load_vmcs>> this_cpu(current_vmcs) = v->arch.hvm_vmx.vmcs;
++ *   - arch/x86/hvm/vmx/vmcs.c|837| <<vmx_vmcs_switch>> this_cpu(current_vmcs) = to;
++ * 在以下使用percpu current_vmcs:
++ *   - arch/x86/hvm/vmx/vmcs.c|99| <<global>> static DEFINE_PER_CPU(struct vmcs_struct *, current_vmcs);
++ *   - arch/x86/hvm/vmx/vmcs.c|450| <<__vmx_clear_vmcs>> if ( arch_vmx->vmcs == this_cpu(current_vmcs) )
++ *   - arch/x86/hvm/vmx/vmcs.c|637| <<vmx_vmcs_try_enter>> return v->arch.hvm_vmx.vmcs == this_cpu(current_vmcs);
++ *   - arch/x86/hvm/vmx/vmcs.c|855| <<virtual_vmcs_exit>> struct vmcs_struct *cur = this_cpu(current_vmcs);
++ *   - arch/x86/hvm/vmx/vmcs.c|1343| <<vmx_do_resume>> if ( v->arch.hvm_vmx.vmcs != this_cpu(current_vmcs) )
++ */
+ static DEFINE_PER_CPU(struct vmcs_struct *, current_vmcs);
+ static DEFINE_PER_CPU(struct list_head, active_vmcs_list);
+ DEFINE_PER_CPU(bool_t, vmxon);
+@@ -428,6 +440,11 @@ static void vmx_free_vmcs(struct vmcs_struct *vmcs)
+     free_xenheap_page(vmcs);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/hvm/vmx/vmcs.c|460| <<vmx_clear_vmcs>> on_selected_cpus(cpumask_of(cpu), __vmx_clear_vmcs, v, 1);
++ *   - arch/x86/hvm/vmx/vmcs.c|612| <<vmx_cpu_down>> __vmx_clear_vmcs(list_entry(active_vmcs_list->next,
++ */
+ static void __vmx_clear_vmcs(void *info)
+ {
+     struct vcpu *v = info;
+@@ -447,19 +464,58 @@ static void __vmx_clear_vmcs(void *info)
+ 
+         list_del(&arch_vmx->active_list);
+ 
++	/*
++	 * 在以下设置percpu current_vmcs:
++	 *   - arch/x86/hvm/vmx/vmcs.c|451| <<__vmx_clear_vmcs>> this_cpu(current_vmcs) = NULL;
++	 *   - arch/x86/hvm/vmx/vmcs.c|478| <<vmx_load_vmcs>> this_cpu(current_vmcs) = v->arch.hvm_vmx.vmcs;
++	 *   - arch/x86/hvm/vmx/vmcs.c|837| <<vmx_vmcs_switch>> this_cpu(current_vmcs) = to;
++	 * 在以下使用percpu current_vmcs:
++	 *   - arch/x86/hvm/vmx/vmcs.c|99| <<global>> static DEFINE_PER_CPU(struct vmcs_struct *, current_vmcs);
++	 *   - arch/x86/hvm/vmx/vmcs.c|450| <<__vmx_clear_vmcs>> if ( arch_vmx->vmcs == this_cpu(current_vmcs) )
++	 *   - arch/x86/hvm/vmx/vmcs.c|637| <<vmx_vmcs_try_enter>> return v->arch.hvm_vmx.vmcs == this_cpu(current_vmcs);
++	 *   - arch/x86/hvm/vmx/vmcs.c|855| <<virtual_vmcs_exit>> struct vmcs_struct *cur = this_cpu(current_vmcs);
++	 *   - arch/x86/hvm/vmx/vmcs.c|1343| <<vmx_do_resume>> if ( v->arch.hvm_vmx.vmcs != this_cpu(current_vmcs) )
++	 */
+         if ( arch_vmx->vmcs == this_cpu(current_vmcs) )
+             this_cpu(current_vmcs) = NULL;
+     }
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/hvm/vmx/vmcs.c|653| <<vmx_vmcs_try_enter>> vmx_clear_vmcs(v);
++ *   - arch/x86/hvm/vmx/vmcs.c|685| <<vmx_vmcs_exit>> vmx_clear_vmcs(v);
++ *   - arch/x86/hvm/vmx/vmcs.c|1312| <<vmx_destroy_vmcs>> vmx_clear_vmcs(v);
++ *   - arch/x86/hvm/vmx/vmcs.c|1366| <<vmx_do_resume>> vmx_clear_vmcs(v);
++ */
+ static void vmx_clear_vmcs(struct vcpu *v)
+ {
++    /*
++     * 在以下设置arch_vmx_struct->active_cpu:
++     *   - arch/x86/hvm/vmx/vmcs.c|462| <<__vmx_clear_vmcs>> arch_vmx->active_cpu = -1;
++     *   - arch/x86/hvm/vmx/vmcs.c|515| <<vmx_load_vmcs>> v->arch.hvm_vmx.active_cpu = smp_processor_id();
++     *   - arch/x86/hvm/vmx/vmcs.c|1378| <<vmx_create_vmcs>> arch_vmx->active_cpu = -1;
++     * 在以下使用arch_vmx_struct->active_cpu:
++     *   - arch/x86/hvm/vmx/vmcs.c|456| <<__vmx_clear_vmcs>> if ( arch_vmx->active_cpu == smp_processor_id() )
++     *   - arch/x86/hvm/vmx/vmcs.c|493| <<vmx_clear_vmcs>> int cpu = v->arch.hvm_vmx.active_cpu;
++     *   - arch/x86/hvm/vmx/vmcs.c|512| <<vmx_load_vmcs>> if ( v->arch.hvm_vmx.active_cpu == -1 )
++     *   - arch/x86/hvm/vmx/vmcs.c|518| <<vmx_load_vmcs>> ASSERT(v->arch.hvm_vmx.active_cpu == smp_processor_id());
++     *   - arch/x86/hvm/vmx/vmcs.c|1423| <<vmx_do_resume>> if ( v->arch.hvm_vmx.active_cpu == smp_processor_id() )
++     *   - arch/x86/hvm/vmx/vmcs.c|1443| <<vmx_do_resume>> int cpu = v->arch.hvm_vmx.active_cpu;
++     */
+     int cpu = v->arch.hvm_vmx.active_cpu;
+ 
+     if ( cpu != -1 )
+         on_selected_cpus(cpumask_of(cpu), __vmx_clear_vmcs, v, 1);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/hvm/vmx/vmcs.c|654| <<vmx_vmcs_try_enter>> vmx_load_vmcs(v);
++ *   - arch/x86/hvm/vmx/vmcs.c|687| <<vmx_vmcs_exit>> vmx_load_vmcs(current);
++ *   - arch/x86/hvm/vmx/vmcs.c|1344| <<vmx_do_resume>> vmx_load_vmcs(v);
++ *   - arch/x86/hvm/vmx/vmcs.c|1367| <<vmx_do_resume>> vmx_load_vmcs(v);
++ */
+ static void vmx_load_vmcs(struct vcpu *v)
+ {
+     unsigned long flags;
+@@ -475,6 +531,18 @@ static void vmx_load_vmcs(struct vcpu *v)
+     ASSERT(v->arch.hvm_vmx.active_cpu == smp_processor_id());
+ 
+     __vmptrld(virt_to_maddr(v->arch.hvm_vmx.vmcs));
++    /*
++     * 在以下设置percpu current_vmcs:
++     *   - arch/x86/hvm/vmx/vmcs.c|451| <<__vmx_clear_vmcs>> this_cpu(current_vmcs) = NULL;
++     *   - arch/x86/hvm/vmx/vmcs.c|478| <<vmx_load_vmcs>> this_cpu(current_vmcs) = v->arch.hvm_vmx.vmcs;
++     *   - arch/x86/hvm/vmx/vmcs.c|837| <<vmx_vmcs_switch>> this_cpu(current_vmcs) = to;
++     * 在以下使用percpu current_vmcs:
++     *   - arch/x86/hvm/vmx/vmcs.c|99| <<global>> static DEFINE_PER_CPU(struct vmcs_struct *, current_vmcs);
++     *   - arch/x86/hvm/vmx/vmcs.c|450| <<__vmx_clear_vmcs>> if ( arch_vmx->vmcs == this_cpu(current_vmcs) )
++     *   - arch/x86/hvm/vmx/vmcs.c|637| <<vmx_vmcs_try_enter>> return v->arch.hvm_vmx.vmcs == this_cpu(current_vmcs);
++     *   - arch/x86/hvm/vmx/vmcs.c|855| <<virtual_vmcs_exit>> struct vmcs_struct *cur = this_cpu(current_vmcs);
++     *   - arch/x86/hvm/vmx/vmcs.c|1343| <<vmx_do_resume>> if ( v->arch.hvm_vmx.vmcs != this_cpu(current_vmcs) )
++     */
+     this_cpu(current_vmcs) = v->arch.hvm_vmx.vmcs;
+ 
+     local_irq_restore(flags);
+@@ -625,6 +693,11 @@ struct foreign_vmcs {
+ };
+ static DEFINE_PER_CPU(struct foreign_vmcs, foreign_vmcs);
+ 
++/*
++ * calld by:
++ *   - arch/x86/hvm/vmx/vmcs.c|721| <<vmx_vmcs_enter>> bool_t okay = vmx_vmcs_try_enter(v);
++ *   - arch/x86/hvm/vmx/vmx.c|721| <<vmx_get_segment_register>> if ( unlikely(!vmx_vmcs_try_enter(v)) )
++ */
+ bool_t vmx_vmcs_try_enter(struct vcpu *v)
+ {
+     struct foreign_vmcs *fv;
+@@ -661,6 +734,28 @@ bool_t vmx_vmcs_try_enter(struct vcpu *v)
+     return 1;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/hvm/vmx/vmcs.c|944| <<construct_vmcs>> vmx_vmcs_enter(v);
++ *   - arch/x86/hvm/vmx/vmcs.c|1487| <<vmcs_dump_vcpu>> vmx_vmcs_enter(v);
++ *   - arch/x86/hvm/vmx/vmx.c|446| <<vmx_vmcs_save>> vmx_vmcs_enter(v);
++ *   - arch/x86/hvm/vmx/vmx.c|521| <<vmx_vmcs_restore>> vmx_vmcs_enter(v);
++ *   - arch/x86/hvm/vmx/vmx.c|549| <<vmx_vmcs_restore>> vmx_vmcs_enter(v);
++ *   - arch/x86/hvm/vmx/vmx.c|899| <<vmx_set_segment_register>> vmx_vmcs_enter(v);
++ *   - arch/x86/hvm/vmx/vmx.c|978| <<vmx_set_guest_pat>> vmx_vmcs_enter(v);
++ *   - arch/x86/hvm/vmx/vmx.c|990| <<vmx_get_guest_pat>> vmx_vmcs_enter(v);
++ *   - arch/x86/hvm/vmx/vmx.c|1050| <<vmx_set_tsc_offset>> vmx_vmcs_enter(v);
++ *   - arch/x86/hvm/vmx/vmx.c|1061| <<vmx_set_rdtsc_exiting>> vmx_vmcs_enter(v);
++ *   - arch/x86/hvm/vmx/vmx.c|1143| <<vmx_load_pdptrs>> vmx_vmcs_enter(v);
++ *   - arch/x86/hvm/vmx/vmx.c|1162| <<vmx_update_host_cr3>> vmx_vmcs_enter(v);
++ *   - arch/x86/hvm/vmx/vmx.c|1174| <<vmx_update_debug_state>> vmx_vmcs_enter(v);
++ *   - arch/x86/hvm/vmx/vmx.c|1181| <<vmx_update_guest_cr>> vmx_vmcs_enter(v);
++ *   - arch/x86/hvm/vmx/vmx.c|1328| <<vmx_update_guest_efer>> vmx_vmcs_enter(v);
++ *   - arch/x86/hvm/vmx/vmx.c|1535| <<vmx_set_info_guest>> vmx_vmcs_enter(v);
++ *   - arch/x86/hvm/vmx/vmx.c|1582| <<vmx_process_isr>> vmx_vmcs_enter(v);
++ *   - arch/x86/hvm/vmx/vmx.c|2193| <<vmx_install_vlapic_mapping>> vmx_vmcs_enter(v);
++ *   - arch/x86/hvm/vmx/vmx.c|2213| <<vmx_vlapic_msr_changed>> vmx_vmcs_enter(v);
++ */
+ void vmx_vmcs_enter(struct vcpu *v)
+ {
+     bool_t okay = vmx_vmcs_try_enter(v);
+@@ -1334,12 +1429,50 @@ static void wbinvd_ipi(void *info)
+     wbinvd();
+ }
+ 
++/*
++ * 在以下使用schedule_tail():
++ *   - arch/x86/domain.c|1787| <<context_switch>> schedule_tail(next);
++ *   - arch/x86/domain.c|1800| <<continue_running>> schedule_tail(same);
++ *   - include/asm-x86/current.h|105| <<schedule_tail>> #define schedule_tail(vcpu) (((vcpu)->arch.schedule_tail)(vcpu))
++ *   - arch/x86/domain.c|490| <<vcpu_initialise>> v->arch.schedule_tail = continue_nonidle_domain;
++ *   - arch/x86/domain.c|496| <<vcpu_initialise>> v->arch.schedule_tail = continue_idle_domain;
++ *   - arch/x86/hvm/svm/svm.c|1099| <<svm_vcpu_initialise>> v->arch.schedule_tail = svm_do_resume;
++ *   - arch/x86/hvm/vmx/vmx.c|105| <<vmx_vcpu_initialise>> v->arch.schedule_tail = vmx_do_resume;
++ *
++ * 在以下使用vmx_do_resume():
++ *   - arch/x86/hvm/vmx/vmx.c|105| <<vmx_vcpu_initialise>> v->arch.schedule_tail = vmx_do_resume;
++ */
+ void vmx_do_resume(struct vcpu *v)
+ {
+     bool_t debug_state;
+ 
++    /*
++     * 在以下设置arch_vmx_struct->active_cpu:
++     *   - arch/x86/hvm/vmx/vmcs.c|462| <<__vmx_clear_vmcs>> arch_vmx->active_cpu = -1;
++     *   - arch/x86/hvm/vmx/vmcs.c|515| <<vmx_load_vmcs>> v->arch.hvm_vmx.active_cpu = smp_processor_id();
++     *   - arch/x86/hvm/vmx/vmcs.c|1378| <<vmx_create_vmcs>> arch_vmx->active_cpu = -1;
++     * 在以下使用arch_vmx_struct->active_cpu:
++     *   - arch/x86/hvm/vmx/vmcs.c|456| <<__vmx_clear_vmcs>> if ( arch_vmx->active_cpu == smp_processor_id() )
++     *   - arch/x86/hvm/vmx/vmcs.c|493| <<vmx_clear_vmcs>> int cpu = v->arch.hvm_vmx.active_cpu;
++     *   - arch/x86/hvm/vmx/vmcs.c|512| <<vmx_load_vmcs>> if ( v->arch.hvm_vmx.active_cpu == -1 )
++     *   - arch/x86/hvm/vmx/vmcs.c|518| <<vmx_load_vmcs>> ASSERT(v->arch.hvm_vmx.active_cpu == smp_processor_id());
++     *   - arch/x86/hvm/vmx/vmcs.c|1423| <<vmx_do_resume>> if ( v->arch.hvm_vmx.active_cpu == smp_processor_id() )
++     *   - arch/x86/hvm/vmx/vmcs.c|1443| <<vmx_do_resume>> int cpu = v->arch.hvm_vmx.active_cpu;
++     */
+     if ( v->arch.hvm_vmx.active_cpu == smp_processor_id() )
+     {
++        /*
++	 * 在以下设置percpu current_vmcs:
++	 *   - arch/x86/hvm/vmx/vmcs.c|451| <<__vmx_clear_vmcs>> this_cpu(current_vmcs) = NULL;
++	 *   - arch/x86/hvm/vmx/vmcs.c|478| <<vmx_load_vmcs>> this_cpu(current_vmcs) = v->arch.hvm_vmx.vmcs;
++	 *   - arch/x86/hvm/vmx/vmcs.c|837| <<vmx_vmcs_switch>> this_cpu(current_vmcs) = to;
++	 * 在以下使用percpu current_vmcs:
++	 *   - arch/x86/hvm/vmx/vmcs.c|99| <<global>> static DEFINE_PER_CPU(struct vmcs_struct *, current_vmcs);
++	 *   - arch/x86/hvm/vmx/vmcs.c|450| <<__vmx_clear_vmcs>> if ( arch_vmx->vmcs == this_cpu(current_vmcs) )
++	 *   - arch/x86/hvm/vmx/vmcs.c|637| <<vmx_vmcs_try_enter>> return v->arch.hvm_vmx.vmcs == this_cpu(current_vmcs);
++	 *   - arch/x86/hvm/vmx/vmcs.c|855| <<virtual_vmcs_exit>> struct vmcs_struct *cur = this_cpu(current_vmcs);
++	 *   - arch/x86/hvm/vmx/vmcs.c|1343| <<vmx_do_resume>> if ( v->arch.hvm_vmx.vmcs != this_cpu(current_vmcs) )
++	 */
+         if ( v->arch.hvm_vmx.vmcs != this_cpu(current_vmcs) )
+             vmx_load_vmcs(v);
+     }
+diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
+index 79ef2570ee..9aa91f509a 100644
+--- a/xen/arch/x86/hvm/vmx/vmx.c
++++ b/xen/arch/x86/hvm/vmx/vmx.c
+@@ -501,6 +501,10 @@ static int vmx_restore_cr0_cr3(
+     return 0;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/hvm/vmx/vmx.c|604| <<vmx_load_vmcs_ctxt>> if ( vmx_vmcs_restore(v, ctxt) )
++ */
+ static int vmx_vmcs_restore(struct vcpu *v, struct hvm_hw_cpu *c)
+ {
+     int rc;
+@@ -646,6 +650,16 @@ static void vmx_fpu_leave(struct vcpu *v)
+     }
+ }
+ 
++/*
++ * 在以下使用ctxt_swtich_from指针:
++ *   - arch/x86/domain.c|1569| <<__context_switch>> p->arch.ctxt_switch_from(p);
++ *   - arch/x86/domain.c|479| <<vcpu_initialise>> v->arch.ctxt_switch_from = paravirt_ctxt_switch_from;
++ *   - arch/x86/hvm/svm/svm.c|1100| <<svm_vcpu_initialise>> v->arch.ctxt_switch_from = svm_ctxt_switch_from;
++ *   - arch/x86/hvm/vmx/vmx.c|106| <<vmx_vcpu_initialise>> v->arch.ctxt_switch_from = vmx_ctxt_switch_from;
++ *
++ * 在以下使用vmx_ctxt_switch_from():
++ *   - arch/x86/hvm/vmx/vmx.c|106| <<vmx_vcpu_initialise>> v->arch.ctxt_switch_from = vmx_ctxt_switch_from;
++ */
+ static void vmx_ctxt_switch_from(struct vcpu *v)
+ {
+     /*
+diff --git a/xen/common/schedule.c b/xen/common/schedule.c
+index b2a9b8a3df..45b579d054 100644
+--- a/xen/common/schedule.c
++++ b/xen/common/schedule.c
+@@ -364,10 +364,39 @@ void vcpu_sleep_nosync(struct vcpu *v)
+     TRACE_2D(TRC_SCHED_SLEEP, v->domain->domain_id, v->vcpu_id);
+ }
+ 
++/*
++ * called by:
++ *   - common/domain.c|896| <<vcpu_pause>> vcpu_sleep_sync(v);
++ *   - common/domain.c|920| <<domain_pause>> vcpu_sleep_sync(v);
++ *   - common/domain.c|1410| <<continue_hypercall_tasklet_handler>> vcpu_sleep_sync(v);
++ */
+ void vcpu_sleep_sync(struct vcpu *v)
+ {
+     vcpu_sleep_nosync(v);
+ 
++    /*
++     * 在以下设置vcpu->is_running:
++     *   - common/schedule.c|215| <<sched_init_vcpu>> v->is_running = 1;
++     *   - common/schedule.c|1239| <<schedule>> next->is_running = 1;
++     *   - common/schedule.c|1260| <<context_saved>> prev->is_running = 0;
++     * 在以下使用vcpu->is_running:
++     *   - arch/arm/vgic.c|749| <<vgic_vcpu_inject_irq>> running = v->is_running;
++     *   - arch/x86/domain.c|2291| <<vcpu_kick>> bool_t running = v->is_running;
++     *   - arch/x86/hvm/hvm.c|4269| <<hvmop_flush_tlb_all>> while ( !vcpu_runnable(v) && v->is_running )
++     *   - arch/x86/hvm/vmx/vmx.c|1618| <<__vmx_deliver_posted_interrupt>> bool_t running = v->is_running;
++     *   - common/domctl.c|176| <<getdomaininfo>> if ( v->is_running )
++     *   - common/domctl.c|893| <<XEN_GUEST_HANDLE_PARAM>> op->u.getvcpuinfo.running = v->is_running;
++     *   - common/keyhandler.c|300| <<dump_domains>> v->is_running ? 'T':'F', v->poll_evtchn,
++     *   - common/sched_credit.c|613| <<__csched_vcpu_is_migrateable>> return !vc->is_running &&
++     *   - common/sched_credit.c|897| <<csched_vcpu_insert>> if ( !__vcpu_on_runq(svc) && vcpu_runnable(vc) && !vc->is_running )
++     *   - common/sched_credit2.c|423| <<__runq_insert>> BUG_ON(svc->vcpu->is_running);
++     *   - common/sched_credit2.c|1756| <<csched_schedule>> if ( snext->vcpu->is_running )
++     *   - common/sched_sedf.c|1191| <<sedf_dump_domain>> d->is_running ? 'T':'F');
++     *   - common/schedule.c|377| <<vcpu_sleep_sync>> while ( !vcpu_runnable(v) && v->is_running )
++     *   - common/schedule.c|502| <<vcpu_migrate>> if ( v->is_running ||
++     *   - common/schedule.c|553| <<vcpu_force_reschedule>> if ( v->is_running )
++     *   - common/schedule.c|1238| <<schedule>> ASSERT(!next->is_running);
++     */
+     while ( !vcpu_runnable(v) && v->is_running )
+         cpu_relax();
+ 
+@@ -1230,6 +1259,12 @@ static void schedule(void)
+      */
+ 
+     ASSERT(!next->is_running);
++    /*
++     * 在以下设置vcpu->is_running:
++     *   - common/schedule.c|215| <<sched_init_vcpu>> v->is_running = 1;
++     *   - common/schedule.c|1239| <<schedule>> next->is_running = 1;
++     *   - common/schedule.c|1260| <<context_saved>> prev->is_running = 0;
++     */
+     next->is_running = 1;
+ 
+     pcpu_schedule_unlock_irq(lock, cpu);
+@@ -1246,11 +1281,23 @@ static void schedule(void)
+     context_switch(prev, next);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm/domain.c|234| <<schedule_tail>> context_saved(prev);
++ *   - arch/x86/domain.c|1735| <<context_switch>> context_saved(prev);
++ *   - common/schedule.c|1265| <<context_saved>> SCHED_OP(VCPU2OP(prev), context_saved, prev);
++ */
+ void context_saved(struct vcpu *prev)
+ {
+     /* Clear running flag /after/ writing context to memory. */
+     smp_wmb();
+ 
++    /*
++     * 在以下设置vcpu->is_running:
++     *   - common/schedule.c|215| <<sched_init_vcpu>> v->is_running = 1;
++     *   - common/schedule.c|1239| <<schedule>> next->is_running = 1;
++     *   - common/schedule.c|1260| <<context_saved>> prev->is_running = 0;
++     */
+     prev->is_running = 0;
+ 
+     /* Check for migration request /after/ clearing running flag. */
+diff --git a/xen/include/asm-x86/current.h b/xen/include/asm-x86/current.h
+index f39965070f..d363d096da 100644
+--- a/xen/include/asm-x86/current.h
++++ b/xen/include/asm-x86/current.h
+@@ -102,6 +102,16 @@ unsigned long get_stack_dump_bottom (unsigned long sp);
+             : : "r" (guest_cpu_user_regs()), "i" (__fn) : "memory" );   \
+     })
+ 
++/*
++ * 在以下使用schedule_tail():
++ *   - arch/x86/domain.c|1787| <<context_switch>> schedule_tail(next);
++ *   - arch/x86/domain.c|1800| <<continue_running>> schedule_tail(same);
++ *   - include/asm-x86/current.h|105| <<schedule_tail>> #define schedule_tail(vcpu) (((vcpu)->arch.schedule_tail)(vcpu))
++ *   - arch/x86/domain.c|490| <<vcpu_initialise>> v->arch.schedule_tail = continue_nonidle_domain;
++ *   - arch/x86/domain.c|496| <<vcpu_initialise>> v->arch.schedule_tail = continue_idle_domain;
++ *   - arch/x86/hvm/svm/svm.c|1099| <<svm_vcpu_initialise>> v->arch.schedule_tail = svm_do_resume;
++ *   - arch/x86/hvm/vmx/vmx.c|105| <<vmx_vcpu_initialise>> v->arch.schedule_tail = vmx_do_resume;
++ */
+ #define schedule_tail(vcpu) (((vcpu)->arch.schedule_tail)(vcpu))
+ 
+ /*
+diff --git a/xen/include/asm-x86/hvm/vmx/vmcs.h b/xen/include/asm-x86/hvm/vmx/vmcs.h
+index 76d933c7a8..4b2ad3ceff 100644
+--- a/xen/include/asm-x86/hvm/vmx/vmcs.h
++++ b/xen/include/asm-x86/hvm/vmx/vmcs.h
+@@ -100,6 +100,19 @@ struct arch_vmx_struct {
+      *  - Launched on active CPU by VMLAUNCH when current VMCS.
+      */
+     struct list_head     active_list;
++    /*
++     * 在以下设置arch_vmx_struct->active_cpu:
++     *   - arch/x86/hvm/vmx/vmcs.c|462| <<__vmx_clear_vmcs>> arch_vmx->active_cpu = -1;
++     *   - arch/x86/hvm/vmx/vmcs.c|515| <<vmx_load_vmcs>> v->arch.hvm_vmx.active_cpu = smp_processor_id();
++     *   - arch/x86/hvm/vmx/vmcs.c|1378| <<vmx_create_vmcs>> arch_vmx->active_cpu = -1;
++     * 在以下使用arch_vmx_struct->active_cpu:
++     *   - arch/x86/hvm/vmx/vmcs.c|456| <<__vmx_clear_vmcs>> if ( arch_vmx->active_cpu == smp_processor_id() )
++     *   - arch/x86/hvm/vmx/vmcs.c|493| <<vmx_clear_vmcs>> int cpu = v->arch.hvm_vmx.active_cpu;
++     *   - arch/x86/hvm/vmx/vmcs.c|512| <<vmx_load_vmcs>> if ( v->arch.hvm_vmx.active_cpu == -1 )
++     *   - arch/x86/hvm/vmx/vmcs.c|518| <<vmx_load_vmcs>> ASSERT(v->arch.hvm_vmx.active_cpu == smp_processor_id());
++     *   - arch/x86/hvm/vmx/vmcs.c|1423| <<vmx_do_resume>> if ( v->arch.hvm_vmx.active_cpu == smp_processor_id() )
++     *   - arch/x86/hvm/vmx/vmcs.c|1443| <<vmx_do_resume>> int cpu = v->arch.hvm_vmx.active_cpu;
++     */
+     int                  active_cpu;
+     int                  launched;
+ 
+diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
+index e2b9db6afa..c6443d497b 100644
+--- a/xen/include/xen/sched.h
++++ b/xen/include/xen/sched.h
+@@ -155,6 +155,29 @@ struct vcpu
+     /* Initialization completed for this VCPU? */
+     bool_t           is_initialised;
+     /* Currently running on a CPU? */
++    /*
++     * 在以下设置vcpu->is_running:
++     *   - common/schedule.c|215| <<sched_init_vcpu>> v->is_running = 1;
++     *   - common/schedule.c|1239| <<schedule>> next->is_running = 1;
++     *   - common/schedule.c|1260| <<context_saved>> prev->is_running = 0;
++     * 在以下使用vcpu->is_running:
++     *   - arch/arm/vgic.c|749| <<vgic_vcpu_inject_irq>> running = v->is_running;
++     *   - arch/x86/domain.c|2291| <<vcpu_kick>> bool_t running = v->is_running;
++     *   - arch/x86/hvm/hvm.c|4269| <<hvmop_flush_tlb_all>> while ( !vcpu_runnable(v) && v->is_running )
++     *   - arch/x86/hvm/vmx/vmx.c|1618| <<__vmx_deliver_posted_interrupt>> bool_t running = v->is_running;
++     *   - common/domctl.c|176| <<getdomaininfo>> if ( v->is_running )
++     *   - common/domctl.c|893| <<XEN_GUEST_HANDLE_PARAM>> op->u.getvcpuinfo.running = v->is_running;
++     *   - common/keyhandler.c|300| <<dump_domains>> v->is_running ? 'T':'F', v->poll_evtchn,
++     *   - common/sched_credit.c|613| <<__csched_vcpu_is_migrateable>> return !vc->is_running &&
++     *   - common/sched_credit.c|897| <<csched_vcpu_insert>> if ( !__vcpu_on_runq(svc) && vcpu_runnable(vc) && !vc->is_running )
++     *   - common/sched_credit2.c|423| <<__runq_insert>> BUG_ON(svc->vcpu->is_running);
++     *   - common/sched_credit2.c|1756| <<csched_schedule>> if ( snext->vcpu->is_running )
++     *   - common/sched_sedf.c|1191| <<sedf_dump_domain>> d->is_running ? 'T':'F');
++     *   - common/schedule.c|377| <<vcpu_sleep_sync>> while ( !vcpu_runnable(v) && v->is_running )
++     *   - common/schedule.c|502| <<vcpu_migrate>> if ( v->is_running ||
++     *   - common/schedule.c|553| <<vcpu_force_reschedule>> if ( v->is_running )
++     *   - common/schedule.c|1238| <<schedule>> ASSERT(!next->is_running);
++     */
+     bool_t           is_running;
+     /* VCPU should wake fast (do not deep sleep the CPU). */
+     bool_t           is_urgent;
+-- 
+2.17.1
+
