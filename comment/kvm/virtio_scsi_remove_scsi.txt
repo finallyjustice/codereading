@@ -1,0 +1,144 @@
+This is how the Linux kernel v5.13 at VM side responses, if we fail the SCSI device at host side on purpose ...
+
+qemu-system-x86_64 -smp 16 -m 32G -enable-kvm -cpu host -vnc :7 -serial stdio \
+-net nic -net user,hostfwd=tcp::5027-:22 -hda /home/.../vm.raw \
+-device virtio-scsi-pci,id=vscsi0,bus=pci.0,addr=0x4 \
+-drive file=/dev/sdc,format=raw,if=none,id=drive01 \
+-device scsi-block,bus=vscsi0.0,channel=0,scsi-id=0,lun=0,drive=drive01
+
+... with below command at host side.
+
+host# echo 1 > /sys/block/sdc/device/delete
+
+
+Suppose the virtio-scsi-pci at VM side submits a READ. Once it is finished, the virtscsi_complete_cmd() will be triggered.
+
+1. virtscsi_complete_cmd() with ...
+
+resp->response = VIRTIO_SCSI_S_FAILURE
+resp->status = GOOD
+resp->sense_len = 0
+scsi_cmnd->retries = 0
+
+Therefore, the hostbyte is set to DID_ERROR, then ...
+
+sc->scsi_done = scsi_mq_done()
+-> blk_mq_complete_request()
+   -> rq->q->mq_ops->complete = scsi_complete()
+
+The scsi_complete() calls scsi_decide_disposition(). The scsi_decide_disposition() will fallthrough from DID_ERROR to DID_PARITY, and goto maybe_retry. Finally, the scsi_decide_disposition() returns NEEDS_RETRY. The scsi_cmd_retry_allowed() increases scsi_cmnd->retries from 0 to 1.
+
+The scsi_complete() inserts IO via scsi_queue_insert(cmd, SCSI_MLQUEUE_EH_RETRY). Finally, the blk_mq_requeue_request() is triggered to requeue the request.
+
+
+2. When the same scsi_cmnd (request) is completed for the 2nd time, the virtscsi_complete_cmd() is called again, with ...
+
+resp->response = VIRTIO_SCSI_S_OK
+resp->status = CHECK_CONDITION (refer to status_byte())
+resp->sense_len = 18
+scsi_cmnd->retries = 1
+
+Therefore, the hostbyte is set to DID_OK, then ...
+
+sc->scsi_done = scsi_mq_done()
+-> blk_mq_complete_request()
+   -> rq->q->mq_ops->complete = scsi_complete()
+
+The scsi_complete() calls scsi_decide_disposition(). The scsi_decide_disposition() will break the 1st switch. The scsi_check_sense() returns NEEDS_RETRY. It goes to "maybe_retry". Finally, the scsi_decide_disposition() returns NEEDS_RETRY. The scsi_cmd_retry_allowed() increases scsi_cmnd->retries from 1 to 2.
+
+
+3. The same command is re-submitted again and again, as scsi_cmnd->allowed = 5. It retries for at most 5 times.
+
+119 static bool scsi_cmd_retry_allowed(struct scsi_cmnd *cmd)
+120 {
+121         if (cmd->allowed == SCSI_CMD_RETRIES_NO_LIMIT)
+122                 return true;
+123
+124         return ++cmd->retries <= cmd->allowed;
+125 }
+
+Now cmd->retries is 6 and cmd->allowed is 5 at line 124. scsi_cmd_retry_allowed() returns false.
+
+
+4. The scsi_decide_disposition() returns SUCCESS, as the scsi_cmd_retry_allowed() returns false in step 3.
+
+The scsi_complete()-->scsi_finish_command() is triggered.
+
+scsi_complete()
+-> scsi_decide_disposition() returns SUCCESS
+   -> scsi_cmd_retry_allowed()
+-> scsi_finish_command()
+   -> scsi_io_completion() (blk_stat=BLK_STS_OK)
+      -> if (likely(blk_rq_bytes(req) > 0 || blk_stat == BLK_STS_OK)) {
+         scsi_end_request() returns non-zero
+      -> scsi_io_completion_action() (since blk_stat is zero and result is not zero)
+
+
+In scsi_io_completion_action(), scsi_result_to_blk_status() returns BLK_STS_IOERR = 10 at line 598.
+
+587 static blk_status_t scsi_result_to_blk_status(struct scsi_cmnd *cmd, int result)
+588 {
+589         switch (host_byte(result)) {
+590         case DID_OK:
+591                 /*
+592                  * Also check the other bytes than the status byte in result
+593                  * to handle the case when a SCSI LLD sets result to
+594                  * DRIVER_SENSE << 24 without setting SAM_STAT_CHECK_CONDITION.
+595                  */
+596                 if (scsi_status_is_good(result) && (result & ~0xff) == 0)
+597                         return BLK_STS_OK;
+598                 return BLK_STS_IOERR;
+599         case DID_TRANSPORT_FAILFAST:
+
+
+The scsi_io_completion_action() goes to ABORTED_COMMAND, since sshdr.sense_key=ABORTED_COMMAND=11, blk_stat=BLK_STS_IOERR=10. The action is set to ACTION_FAIL.
+
+726                 case ABORTED_COMMAND:
+727                         action = ACTION_FAIL;
+728                         if (sshdr.asc == 0x10) /* DIF */
+729                                 blk_stat = BLK_STS_PROTECTION;
+
+
+For ACTION_FAIL ...
+
+784         switch (action) {
+785         case ACTION_FAIL:
+786                 /* Give up and fail the remainder of the request */
+787                 if (!(req->rq_flags & RQF_QUIET)) {
+788                         static DEFINE_RATELIMIT_STATE(_rs,
+789                                         DEFAULT_RATELIMIT_INTERVAL,
+790                                         DEFAULT_RATELIMIT_BURST);
+791
+792                         if (unlikely(scsi_logging_level))
+793                                 level =
+794                                      SCSI_LOG_LEVEL(SCSI_LOG_MLCOMPLETE_SHIFT,
+795                                                     SCSI_LOG_MLCOMPLETE_BITS);
+796
+797                         /*
+798                          * if logging is enabled the failure will be printed
+799                          * in scsi_log_completion(), so avoid duplicate messages
+800                          */
+801                         if (!level && __ratelimit(&_rs)) {
+802                                 scsi_print_result(cmd, NULL, FAILED);
+803                                 if (driver_byte(result) == DRIVER_SENSE)
+804                                         scsi_print_sense(cmd);
+805                                 scsi_print_command(cmd);
+806                         }
+807                 }
+808                 if (!scsi_end_request(req, blk_stat, blk_rq_err_bytes(req)))
+809                         return;
+810                 fallthrough;
+
+... the line 787-807 prints below error logs, and then ...
+
+[   45.703614] sd 0:0:0:0: [sda] tag#36 FAILED Result: hostbyte=DID_OK driverbyte=DRIVER_SENSE cmd_age=0s
+[   45.703614] sd 0:0:0:0: [sda] tag#36 Sense Key : Aborted Command [current]
+[   45.703614] sd 0:0:0:0: [sda] tag#36 Add. Sense: I/O process terminated
+[   45.703614] sd 0:0:0:0: [sda] tag#36 CDB: Read(10) 28 00 00 05 58 70 00 00 10 00
+
+... the line 808 prints the below error logs. The blk_stat is BLK_STS_IOERR=10.
+
+[   45.703614] blk_update_request: I/O error, dev sda, sector 350320 op 0x0:(READ) flags 0x0 phys_seg 2 prio class 0
+
+
+If there is multipath configured at host side, the retry happens only once and there is no log printed at VM kernel side.
