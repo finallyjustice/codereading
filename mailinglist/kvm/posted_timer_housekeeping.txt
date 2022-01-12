@@ -1,0 +1,102 @@
+commit 0c5f81dad46c90792e6c3c4797131323c9e96dcd
+Author: Wanpeng Li <wanpengli@tencent.com>
+Date:   Sat Jul 6 09:26:51 2019 +0800
+
+KVM: LAPIC: Inject timer interrupt via posted interrupt
+
+Dedicated instances are currently disturbed by unnecessary jitter due
+to the emulated lapic timers firing on the same pCPUs where the
+vCPUs reside.  There is no hardware virtual timer on Intel for guest
+like ARM, so both programming timer in guest and the emulated timer fires
+incur vmexits.  This patch tries to avoid vmexit when the emulated timer
+fires, at least in dedicated instance scenario when nohz_full is enabled.
+
+In that case, the emulated timers can be offload to the nearest busy
+housekeeping cpus since APICv has been found for several years in server
+processors. The guest timer interrupt can then be injected via posted interrupts,
+which are delivered by the housekeeping cpu once the emulated timer fires.
+
+The host should tuned so that vCPUs are placed on isolated physical
+processors, and with several pCPUs surplus for busy housekeeping.
+If disabled mwait/hlt/pause vmexits keep the vCPUs in non-root mode,
+~3% redis performance benefit can be observed on Skylake server, and the
+number of external interrupt vmexits drops substantially.  Without patch
+
+            VM-EXIT  Samples  Samples%  Time%   Min Time  Max Time   Avg time
+EXTERNAL_INTERRUPT    42916    49.43%   39.30%   0.47us   106.09us   0.71us ( +-   1.09% )
+
+While with patch:
+
+            VM-EXIT  Samples  Samples%  Time%   Min Time  Max Time         Avg time
+EXTERNAL_INTERRUPT    6871     9.29%     2.96%   0.44us    57.88us   0.72us ( +-   4.02% )
+
+Cc: Paolo Bonzini <pbonzini@redhat.com>
+Cc: Radim Krčmář <rkrcmar@redhat.com>
+Cc: Marcelo Tosatti <mtosatti@redhat.com>
+Signed-off-by: Wanpeng Li <wanpengli@tencent.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+
+
+根据v5.13的代码, 不一定会使用hv timer.
+也就是说, 如果mwait不exit, 或者支持poste_timer_interrupt, 都会使用sw timer
+
+static bool kvm_can_post_timer_interrupt(struct kvm_vcpu *vcpu)
+{
+	return pi_inject_timer && kvm_vcpu_apicv_active(vcpu);
+}
+
+bool kvm_can_use_hv_timer(struct kvm_vcpu *vcpu)
+{
+	return kvm_x86_ops.set_hv_timer
+	       && !(kvm_mwait_in_guest(vcpu->kvm) ||
+		    kvm_can_post_timer_interrupt(vcpu));
+}
+EXPORT_SYMBOL_GPL(kvm_can_use_hv_timer);
+
+======================================
+
+然而, 上面的patch可能有问题. 所以多检查一下, 如果cpu是housekeeping的, 就算给了VM, 也不要用posted interrupt.
+这样就可以用hv timer了 (preemption timer).
+"or we can make some kvm guests isolated and some not, the global judgement pi_inject_timer is not enough;"
+
+https://lore.kernel.org/all/20211122095619.000060d2@gmail.com/
+
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 759952dd1222..72dde5532101 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -34,6 +34,7 @@
+ #include <asm/delay.h>
+ #include <linux/atomic.h>
+ #include <linux/jump_label.h>
++#include <linux/sched/isolation.h>
+ #include "kvm_cache_regs.h"
+ #include "irq.h"
+ #include "ioapic.h"
+@@ -113,7 +114,8 @@ static inline u32 kvm_x2apic_id(struct kvm_lapic *apic)
+
+ static bool kvm_can_post_timer_interrupt(struct kvm_vcpu *vcpu)
+ {
+-	return pi_inject_timer && kvm_vcpu_apicv_active(vcpu);
++	return pi_inject_timer && kvm_vcpu_apicv_active(vcpu) &&
++		!housekeeping_cpu(vcpu->cpu, HK_FLAG_TIMER);
+ }
+
+ bool kvm_can_use_hv_timer(struct kvm_vcpu *vcpu)
+
+
+======================================
+
+但是Wanpeng又改变了上面的fix.
+
+如果mwait或者hlt不会exit, 用sw timer (posted interrupt)比较好.
+否则的话, 还是hv timer的性能更好一些.
+
+https://lore.kernel.org/all/1641471612-34483-1-git-send-email-wanpengli@tencent.com/
+
+ static bool kvm_can_post_timer_interrupt(struct kvm_vcpu *vcpu)
+ {
+-	return pi_inject_timer && kvm_vcpu_apicv_active(vcpu);
++	return pi_inject_timer && kvm_vcpu_apicv_active(vcpu) &&
++		(kvm_mwait_in_guest(vcpu->kvm) || kvm_hlt_in_guest(vcpu->kvm));
+ }
