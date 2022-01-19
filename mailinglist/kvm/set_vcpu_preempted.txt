@@ -1,0 +1,61 @@
+下面的patch认为hlt emulation的时候不要把vcpu设置成preempted. 这样会影响VM中的scheduling.
+比如available_idle_cpu()->vcpu_is_preempted()会阻止调度.
+
+KVM: x86: Don't set preempted when vCPU does HLT VMEXIT
+https://lore.kernel.org/all/20210526133727.42339-1-m.misono760@gmail.com/T/#m2dd01c46774293a14daf1c71df60c595891dae40
+
+patch中提到了"each vCPU is pinned to the corresponding pCPU". (也就是KVM_HINT_REALTIME???)
+Sean Christopherson建议这样的情况不要exit HLT.
+
+
+之后又有人提出来, 因为HLT造成的schedule()不应该算是preempt.
+
+KVM: X86: set vcpu preempted only if it is preempted
+https://lore.kernel.org/all/1641988921-3507-1-git-send-email-lirongqing@baidu.com/
+
+emulate HLT的时候会把vcpu设置成interruptable (不是running了)
+
+kvm_sched_out()
+-> kvm_arch_vcpu_put()
+   -> kvm_steal_time_set_preempted()
+
+line 5421不会执行, 所以vcpu->preempted不是true.
+
+5416 static void kvm_sched_out(struct preempt_notifier *pn,
+5417                           struct task_struct *next)
+5418 {
+5419         struct kvm_vcpu *vcpu = preempt_notifier_to_vcpu(pn);
+5420
+5421         if (current->state == TASK_RUNNING) {
+5422                 WRITE_ONCE(vcpu->preempted, true);
+5423                 WRITE_ONCE(vcpu->ready, true);
+5424         }
+5425         kvm_arch_vcpu_put(vcpu);
+5426         __this_cpu_write(kvm_running_vcpu, NULL);
+5427 }
+
+但是有人反对, 因为只要schedule out就有可能用来schedule其他task.
+
+更严重的是, 不设置preempt, 这个vcpu可能会被VM用来调度, 引发延迟.
+参考commit 247f2f6f3c70 ("sched/core: Don't schedule threads on pre-empted vCPUs")
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index ffde9eebc846..71bdb86e07f9 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -4028,6 +4028,9 @@ int idle_cpu(int cpu)
+                return 0;
+ #endif
+
++       if (vcpu_is_preempted(cpu))
++               return 0;
++
+        return 1;
+ }
+
+---------------------------------------
+
+最后, 上面patch的author又做了下面这一个. 如果设置了KVM_HINTS_REALTIME, 也要考虑使用steal time (preempt) 的情况.
+
+KVM: x86: Support the vCPU preemption check with nopvspin and realtime hint
+https://lore.kernel.org/all/1642157667-18350-1-git-send-email-lirongqing@baidu.com/
