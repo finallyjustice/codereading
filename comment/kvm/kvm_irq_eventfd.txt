@@ -1,0 +1,141 @@
+这是v5.13中vhost把一个中断插入VM中.
+	
+vhost_signal()
+-> eventfd_signal(vq->call_ctx.ctx, 1)
+   -> wake_up_locked_poll(&ctx->wqh, EPOLLIN)
+      -> wait_queue_entry_t->func = irqfd_wakeup()
+
+
+line 187根据wait_queue_entry_t找到包含的struct kvm_kernel_irqfd.
+
+line 206尝试fast path, 如果失败就唤醒irqfd->inject, 也就是irqfd_inject.
+
+184 static int
+185 irqfd_wakeup(wait_queue_entry_t *wait, unsigned mode, int sync, void *key)
+186 {
+187         struct kvm_kernel_irqfd *irqfd =
+188                 container_of(wait, struct kvm_kernel_irqfd, wait);
+189         __poll_t flags = key_to_poll(key);
+190         struct kvm_kernel_irq_routing_entry irq;
+191         struct kvm *kvm = irqfd->kvm;
+192         unsigned seq;
+193         int idx;
+194         int ret = 0;
+195 
+196         if (flags & EPOLLIN) { 
+197                 u64 cnt;
+198                 eventfd_ctx_do_read(irqfd->eventfd, &cnt);
+199 
+200                 idx = srcu_read_lock(&kvm->irq_srcu);
+201                 do {
+202                         seq = read_seqcount_begin(&irqfd->irq_entry_sc);
+203                         irq = irqfd->irq_entry;
+204                 } while (read_seqcount_retry(&irqfd->irq_entry_sc, seq));
+205                 /* An event has been signaled, inject an interrupt */
+206                 if (kvm_arch_set_irq_inatomic(&irq, kvm,
+207                                               KVM_USERSPACE_IRQ_SOURCE_ID, 1,
+208                                               false) == -EWOULDBLOCK)
+209                         schedule_work(&irqfd->inject);
+210                 srcu_read_unlock(&kvm->irq_srcu, idx);
+211                 ret = 1;
+212         }
+
+
+line 174会处理插入中断.
+
+156 int kvm_arch_set_irq_inatomic(struct kvm_kernel_irq_routing_entry *e,
+157                               struct kvm *kvm, int irq_source_id, int level,
+158                               bool line_status)
+159 {
+160         struct kvm_lapic_irq irq;      
+161         int r;
+162 
+163         switch (e->type) {
+164         case KVM_IRQ_ROUTING_HV_SINT:
+165                 return kvm_hv_set_sint(e, kvm, irq_source_id, level,
+166                                        line_status);
+167 
+168         case KVM_IRQ_ROUTING_MSI:
+169                 if (kvm_msi_route_invalid(kvm, e))
+170                         return -EINVAL;
+171 
+172                 kvm_set_msi_irq(kvm, e, &irq); 
+173 
+174                 if (kvm_irq_delivery_to_apic_fast(kvm, NULL, &irq, &r, NULL))
+175                         return r;
+176                 break;
+177 
+178         default:
+179                 break;
+180         }
+181 
+182         return -EWOULDBLOCK;
+183 }
+
+
+先在line 1000获得要插入中断的vcpus (可能被map到多个vcpu), 然后在line 1006一个一个vcpu插入
+
+ 981 bool kvm_irq_delivery_to_apic_fast(struct kvm *kvm, struct kvm_lapic *src,
+ 982                 struct kvm_lapic_irq *irq, int *r, struct dest_map *dest_map)
+ 983 {
+ 984         struct kvm_apic_map *map;
+ 985         unsigned long bitmap;
+ 986         struct kvm_lapic **dst = NULL;
+ 987         int i;
+ 988         bool ret;
+ 989                 
+ 990         *r = -1;
+ 991 
+ 992         if (irq->shorthand == APIC_DEST_SELF) {
+ 993                 *r = kvm_apic_set_irq(src->vcpu, irq, dest_map);
+ 994                 return true;
+ 995         }
+ 996 
+ 997         rcu_read_lock();
+ 998         map = rcu_dereference(kvm->arch.apic_map);
+ 999                 
+1000         ret = kvm_apic_map_get_dest_lapic(kvm, &src, irq, map, &dst, &bitmap);
+1001         if (ret) {
+1002                 *r = 0;
+1003                 for_each_set_bit(i, &bitmap, 16) {
+1004                         if (!dst[i])
+1005                                 continue;
+1006                         *r += kvm_apic_set_irq(dst[i]->vcpu, irq, dest_map);
+1007                 }
+1008         }
+1009         
+1010         rcu_read_unlock();
+1011         return ret;
+1012 }
+
+
+594 int kvm_apic_set_irq(struct kvm_vcpu *vcpu, struct kvm_lapic_irq *irq,
+595                      struct dest_map *dest_map)
+596 {
+597         struct kvm_lapic *apic = vcpu->arch.apic;
+598 
+599         return __apic_accept_irq(apic, irq->delivery_mode, irq->vector,
+600                         irq->level, irq->trig_mode, dest_map);
+601 }
+
+line 1097是核心的, 是vmx_deliver_posted_interrupt()
+
+1060 static int __apic_accept_irq(struct kvm_lapic *apic, int delivery_mode,
+1061                              int vector, int level, int trig_mode,
+1062                              struct dest_map *dest_map)
+... ...
+1097                 if (static_call(kvm_x86_deliver_posted_interrupt)(vcpu, vector)) {
+1098                         kvm_lapic_set_irr(vector, apic);
+1099                         kvm_make_request(KVM_REQ_EVENT, vcpu);
+1100                         kvm_vcpu_kick(vcpu);
+1101                 }
+1102                 break;
+
+
+如果可以posted, 就设置pi_desc, 然后post一个vector
+
+如果不可以posted, 就设置pi_desc, kvm_vcpu_kick()这个vcpu. 这个vcpu在再次run的时候会把pir同步到irr.
+
+vcpu_run()
+-> vcpu_enter_guest()
+   -> kvm_x86_sync_pir_to_irr = vmx_sync_pir_to_irr()
