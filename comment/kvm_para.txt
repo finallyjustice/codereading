@@ -1,0 +1,213 @@
+
+#define KVM_CPUID_FEATURES      0x40000001
+#define KVM_FEATURE_CLOCKSOURCE         0
+#define KVM_FEATURE_NOP_IO_DELAY        1
+#define KVM_FEATURE_MMU_OP              2
+#define KVM_FEATURE_CLOCKSOURCE2        3
+#define KVM_FEATURE_ASYNC_PF            4
+#define KVM_FEATURE_STEAL_TIME          5
+#define KVM_FEATURE_PV_EOI              6
+#define KVM_FEATURE_PV_UNHALT           7
+#define KVM_FEATURE_PV_TLB_FLUSH        9
+#define KVM_FEATURE_ASYNC_PF_VMEXIT     10
+#define KVM_FEATURE_PV_SEND_IPI         11
+#define KVM_FEATURE_POLL_CONTROL        12
+#define KVM_FEATURE_PV_SCHED_YIELD      13
+#define KVM_FEATURE_ASYNC_PF_INT        14
+#define KVM_FEATURE_MSI_EXT_DEST_ID     15
+
+
+------------------
+
+#define KVM_FEATURE_CLOCKSOURCE         0
+
+msr_kvm_system_time and msr_kvm_wall_clock with old msr values
+
+------------------
+
+#define KVM_FEATURE_NOP_IO_DELAY        1
+
+pv_ops.cpu.io_delay = kvm_io_delay ...
+... and kvm_io_delay does nothing.
+
+------------------
+
+#define KVM_FEATURE_MMU_OP              2
+
+not used
+
+------------------
+
+#define KVM_FEATURE_CLOCKSOURCE2        3
+
+msr_kvm_system_time and msr_kvm_wall_clock with new msr values
+
+------------------
+
+#define KVM_FEATURE_ASYNC_PF            4
+
+guest side不使用, 被host side用来判断是否支持aync page fault
+
+------------------
+
+#define KVM_FEATURE_STEAL_TIME          5
+
+支持"struct kvm_steal_time", 其中还包括KVM_VCPU_PREEMPTED和KVM_VCPU_FLUSH_TLB
+
+------------------
+
+#define KVM_FEATURE_PV_EOI              6
+
+pv-eoi (减少vmexit的数量)
+
+x86 PC体系架构中的中断控制器,早先是8259A,现在更普遍使用的是APIC,他们处理中断的流程遵循如下流程:
+
+1. 外部设备产生一个中断,如果该中断没有被屏蔽掉,中断控制器将IRR寄存器中相应的位置1,表示收到中断,但是还未提交给CPU处理.
+2. 中断控制器将该中断提交给CPU,CPU收到中断请求后,会应答中断控制器.
+3. 中断控制器收到CPU的中断应答后,将IRR寄存器中相应的位清0,并将ISR寄存器相应的位置1,表示CPU正在处理该中断.
+4. 当该中断的处理程序结束以前,需要将中断控制器的EOI寄存器对应的位置1,表示CPU完成了对该中断的处理.
+5. 中断控制器收到EOI后,ISR寄存器中相应的位清0，允许下次中断.
+6. 在虚拟化场景中,该流程至少会导致两次VM Exit: 第一次是VMM截获到设备中断的时候,通知客户机退出,将这个中断注入到客户机中;
+   另外一次是当客户机操作系统处理完该中断后,写中断控制器的EOI寄存器,这是个MMIO操作,也会导致客户机退出.
+   在一个外部IO比较频繁的场景中,外部中断会导致大量的VM Exit,影响客户机的整体性能.
+
+PV-EOI其实就是通过半虚拟化的办法来优化上述的VM Exit影响,virtio也是使用这个思想来优化网络和磁盘;就EOI的优化来说,其思想本质上很简单:
+
+1. 客户机和VMM协商,首先确定双方是否都能支持PV-EOI特性,如果成功,则进一步协商一块2 bytes的内存区间作为双方处理EOI的共享缓存;
+2. 在VMM向客户机注入中断之前,会把缓存的最低位置1,表示客户机不需要通过写EOI寄存器;
+3. 客户机在写EOI之前,如果发现该位被设置,则将该位清0;VMM轮询这个标志位,当检查到清0后,会更新模拟中断控制器中的EOI寄存器;
+   如果客户机发现该位未被设置,则继续使用MMIO或者MSR写EOI寄存器;
+
+需要注意的是,为了保证客户机和VMM同时处理共享内存的性能和可靠性,目前KVM的PV-EOF方案采用了如下的优化措施:
+
+1. VMM保障仅会在客户机VCPU的上下文中更改共享内存中的最低位,从而避免了客户机采用任何锁机制来与VMM进行同步;
+2. 客户机必须使用原子的test_and_clear操作来更改共享内存中的最低位,这是因为VMM在任何时候都有可能设置或者清除该位;
+
+------------------
+
+#define KVM_FEATURE_PV_UNHALT           7
+
+只有支持KVM_FEATURE_PV_UNHALT才能支持pv spinlock的unhalt (kick)
+
+Implement paravirt qspinlocks; the general idea is to halt the vcpus instead
+of spinning them.
+
+This relies on the architecture to provide two paravirt hypercalls:
+
+   pv_wait(u8 *ptr, u8 val) -- suspends the vcpu if *ptr == val
+   pv_kick(cpu)             -- wakes a suspended vcpu
+
+------------------
+
+#define KVM_FEATURE_PV_TLB_FLUSH        9
+
+当target cpu被preempted (KVM_VCPU_PREEMPTED)的时候就不用ipi了,直接设置KVM_VCPU_FLUSH_TLB,
+这样当vcpu enter的时候可以kvm_vcpu_flush_tlb_guest().
+总之减少了ipi的次数
+
+支持pv tlb flush的情况
+
+653 static bool pv_tlb_flush_supported(void)
+654 {
+655         return (kvm_para_has_feature(KVM_FEATURE_PV_TLB_FLUSH) &&
+656                 !kvm_para_has_hint(KVM_HINTS_REALTIME) &&
+657                 kvm_para_has_feature(KVM_FEATURE_STEAL_TIME));
+658 }
+
+------------------
+
+#define KVM_FEATURE_ASYNC_PF_VMEXIT     10
+
+似乎是legacy的方式
+
+------------------
+
+#define KVM_FEATURE_PV_SEND_IPI         11
+
+通过KVM_HC_SEND_IPI发送IPI
+
+------------------
+#define KVM_FEATURE_POLL_CONTROL        12
+
+host side时候会block and poll. halt指令的时候, 既可以在guest poll, 也可以trap到host poll.
+
+------------------
+
+#define KVM_FEATURE_PV_SCHED_YIELD      13
+
+在smp_call_func()的时候主动yield给target cpu, 让被preempted的target vcpu有
+调用func的机会.
+
+669 static bool pv_sched_yield_supported(void)
+670 {
+671         return (kvm_para_has_feature(KVM_FEATURE_PV_SCHED_YIELD) &&
+672                 !kvm_para_has_hint(KVM_HINTS_REALTIME) &&
+673             kvm_para_has_feature(KVM_FEATURE_STEAL_TIME));
+674 }
+
+
+774 static void kvm_smp_send_call_func_ipi(const struct cpumask *mask)
+775 {
+776         int cpu;
+777 
+778         native_send_call_func_ipi(mask);
+779 
+780         /* Make sure other vCPUs get a chance to run if they need to. */
+781         for_each_cpu(cpu, mask) {
+782                 if (vcpu_is_preempted(cpu)) {
+783                         kvm_hypercall1(KVM_HC_SCHED_YIELD, per_cpu(x86_cpu_to_apicid, cpu));
+784                         break;
+785                 }
+786         }
+787 }
+
+------------------
+
+#define KVM_FEATURE_ASYNC_PF_INT        14
+
+似乎是async page fault是否以interrupt的方式支持?
+
+commit b1d405751cd5792856b1b8333aafaca6bf09ccbb
+Author: Vitaly Kuznetsov <vkuznets@redhat.com>
+Date:   Mon May 25 16:41:23 2020 +0200
+
+KVM: x86: Switch KVM guest to using interrupts for page ready APF delivery
+
+KVM now supports using interrupt for 'page ready' APF event delivery and
+legacy mechanism was deprecated. Switch KVM guests to the new one.
+
+Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Message-Id: <20200525144125.143875-9-vkuznets@redhat.com>
+[Use HYPERVISOR_CALLBACK_VECTOR instead of a separate vector. - Paolo]
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+
+------------------
+
+#define KVM_FEATURE_MSI_EXT_DEST_ID     15
+
+If the hypervisor supports extended destination ID in
+MSI, that increases the maximum APIC ID that can be
+used for non-remapped IRQ domains.
+
+
+commit 2e008ffe426f927b1697adb4ed10c1e419927ae4
+Author: David Woodhouse <dwmw@amazon.co.uk>
+Date:   Sat Oct 24 22:35:35 2020 +0100
+
+x86/kvm: Enable 15-bit extension when KVM_FEATURE_MSI_EXT_DEST_ID detected
+
+This allows the host to indicate that MSI emulation supports 15-bit
+destination IDs, allowing up to 32768 CPUs without interrupt remapping.
+
+cf. https://patchwork.kernel.org/patch/11816693/ for qemu
+
+Signed-off-by: David Woodhouse <dwmw@amazon.co.uk>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Acked-by: Paolo Bonzini <pbonzini@redhat.com>
+Link: https://lore.kernel.org/r/20201024213535.443185-36-dwmw2@infradead.org
+
+
+1043 static bool __init kvm_msi_ext_dest_id(void)
+1044 {
+1045         return kvm_para_has_feature(KVM_FEATURE_MSI_EXT_DEST_ID);
+1046 }
