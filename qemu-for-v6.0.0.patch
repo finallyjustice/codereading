@@ -1,12 +1,13 @@
-From 8c46e1c0b2afe6e08d7337c67e44a31038501b1d Mon Sep 17 00:00:00 2001
+From 903825c387bd4c9046ca7a684824cf217cc842ec Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Sun, 27 Feb 2022 22:32:41 -0800
+Date: Wed, 23 Mar 2022 21:34:45 -0700
 Subject: [PATCH 1/1] qemu for v6.0.0
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
  accel/kvm/kvm-all.c                         | 172 ++++++
  block.c                                     |   7 +
+ block/accounting.c                          |  90 +++
  block/block-backend.c                       | 123 ++++
  block/curl.c                                |  76 +++
  block/file-posix.c                          |  41 ++
@@ -18,9 +19,9 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  hw/core/machine.c                           |  19 +
  hw/core/nmi.c                               |  11 +
  hw/core/qdev.c                              |   6 +
- hw/i386/intel_iommu.c                       |  45 ++
+ hw/i386/intel_iommu.c                       |  49 ++
  hw/i386/kvm/clock.c                         |  48 ++
- hw/i386/x86-iommu.c                         |  15 +
+ hw/i386/x86-iommu.c                         |  26 +
  hw/misc/pvpanic.c                           |   9 +
  hw/pci/msi.c                                |   3 +
  hw/pci/msix.c                               |  31 +
@@ -34,7 +35,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  hw/remote/proxy.c                           |  47 ++
  hw/remote/remote-obj.c                      |  52 ++
  hw/scsi/emulation.c                         |   5 +
- hw/scsi/scsi-bus.c                          | 391 +++++++++++++
+ hw/scsi/scsi-bus.c                          | 394 +++++++++++++
  hw/scsi/scsi-disk.c                         | 617 ++++++++++++++++++++
  hw/scsi/scsi-generic.c                      |  52 ++
  hw/scsi/virtio-scsi-dataplane.c             |   9 +
@@ -44,6 +45,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  hw/virtio/virtio-pci.c                      |  71 +++
  hw/virtio/virtio-pci.h                      |   9 +
  hw/virtio/virtio.c                          | 130 +++++
+ include/block/accounting.h                  |   5 +
  include/hw/core/cpu.h                       |  29 +
  include/hw/misc/pvpanic.h                   |   7 +
  include/hw/pci/pci.h                        |  21 +
@@ -53,21 +55,22 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  include/qemu/timer.h                        |  21 +
  include/scsi/utils.h                        |   6 +
  include/standard-headers/linux/virtio_pci.h |   5 +
+ include/sysemu/accel-ops.h                  |  16 +
  include/sysemu/dma.h                        |  16 +
  include/sysemu/kvm.h                        |  16 +
  net/tap-linux.c                             |   4 +
  scsi/utils.c                                |   5 +
- softmmu/cpus.c                              |   4 +
+ softmmu/cpus.c                              |   9 +
  softmmu/dma-helpers.c                       |  19 +
  softmmu/qdev-monitor.c                      |  22 +
  softmmu/runstate.c                          |  23 +
  target/i386/cpu.c                           |  20 +
- target/i386/kvm/kvm.c                       |  24 +
+ target/i386/kvm/kvm.c                       |  29 +
  target/i386/monitor.c                       |  20 +
  target/i386/xsave_helper.c                  |   5 +
  util/coroutine-ucontext.c                   |  10 +
  util/qemu-sockets.c                         |   5 +
- 62 files changed, 2923 insertions(+)
+ 65 files changed, 3062 insertions(+)
 
 diff --git a/accel/kvm/kvm-all.c b/accel/kvm/kvm-all.c
 index b6d9f92f1..a9f18565b 100644
@@ -377,6 +380,126 @@ index c5b887cec..642374fd4 100644
  static BlockDriverState *bdrv_open_inherit(const char *filename,
                                             const char *reference,
                                             QDict *options, int flags,
+diff --git a/block/accounting.c b/block/accounting.c
+index 2030851d7..ec74d94bc 100644
+--- a/block/accounting.c
++++ b/block/accounting.c
+@@ -84,6 +84,51 @@ BlockAcctTimedStats *block_acct_interval_next(BlockAcctStats *stats,
+     }
+ }
+ 
++/*
++ * called by:
++ *   - hw/block/dataplane/xen-block.c|377| <<xen_block_do_aio>> block_acct_start(blk_get_stats(dataplane->blk), &request->acct,
++ *   - hw/block/dataplane/xen-block.c|390| <<xen_block_do_aio>> block_acct_start(blk_get_stats(dataplane->blk), &request->acct,
++ *   - hw/block/nvme-dif.c|454| <<nvme_dif_rw>> block_acct_start(blk_get_stats(blk), &req->acct, ctx->data.iov.size,
++ *   - hw/block/nvme-dif.c|500| <<nvme_dif_rw>> block_acct_start(blk_get_stats(blk), &req->acct, ctx->data.iov.size,
++ *   - hw/block/nvme.c|2294| <<nvme_copy_in_complete>> block_acct_start(blk_get_stats(ns->blkconf.blk), &req->acct, 0,
++ *   - hw/block/nvme.c|2626| <<nvme_verify>> block_acct_start(blk_get_stats(blk), &req->acct, ctx->data.iov.size,
++ *   - hw/block/nvme.c|2723| <<nvme_copy>> block_acct_start(blk_get_stats(ns->blkconf.blk), &req->acct, 0,
++ *   - hw/block/nvme.c|2845| <<nvme_compare>> block_acct_start(blk_get_stats(blk), &req->acct, data_len,
++ *   - hw/block/nvme.c|2869| <<nvme_flush>> block_acct_start(blk_get_stats(req->ns->blkconf.blk), &req->acct, 0,
++ *   - hw/block/nvme.c|2890| <<nvme_flush>> block_acct_start(blk_get_stats(ns->blkconf.blk), &ctx->acct, 0,
++ *   - hw/block/nvme.c|2971| <<nvme_read>> block_acct_start(blk_get_stats(blk), &req->acct, data_size,
++ *   - hw/block/nvme.c|3097| <<nvme_do_write>> block_acct_start(blk_get_stats(blk), &req->acct, data_size,
++ *   - hw/block/virtio-blk.c|504| <<virtio_blk_handle_flush>> block_acct_start(blk_get_stats(s->blk), &req->acct, 0,
++ *   - hw/block/virtio-blk.c|587| <<virtio_blk_handle_discard_write_zeroes>> block_acct_start(blk_get_stats(s->blk), &req->acct, bytes,
++ *   - hw/block/virtio-blk.c|683| <<virtio_blk_handle_request>> block_acct_start(blk_get_stats(s->blk), &req->acct, req->qiov.size,
++ *   - hw/ide/atapi.c|93| <<cd_read_sector_sync>> block_acct_start(blk_get_stats(s->blk), &s->acct,
++ *   - hw/ide/atapi.c|165| <<cd_read_sector>> block_acct_start(blk_get_stats(s->blk), &s->acct,
++ *   - hw/ide/atapi.c|310| <<ide_atapi_cmd_reply>> block_acct_start(blk_get_stats(s->blk), &s->acct, size,
++ *   - hw/ide/atapi.c|432| <<ide_atapi_cmd_read_dma>> block_acct_start(blk_get_stats(s->blk), &s->acct, s->packet_transfer_size,
++ *   - hw/ide/core.c|475| <<ide_issue_trim_cb>> block_acct_start(blk_get_stats(s->blk), &s->acct,
++ *   - hw/ide/core.c|796| <<ide_sector_read>> block_acct_start(blk_get_stats(s->blk), &s->acct,
++ *   - hw/ide/core.c|968| <<ide_sector_start_dma>> block_acct_start(blk_get_stats(s->blk), &s->acct,
++ *   - hw/ide/core.c|972| <<ide_sector_start_dma>> block_acct_start(blk_get_stats(s->blk), &s->acct,
++ *   - hw/ide/core.c|1071| <<ide_sector_write>> block_acct_start(blk_get_stats(s->blk), &s->acct,
++ *   - hw/ide/core.c|1107| <<ide_flush_cache>> block_acct_start(blk_get_stats(s->blk), &s->acct, 0, BLOCK_ACCT_FLUSH);
++ *   - hw/ide/macio.c|228| <<pmac_ide_transfer>> block_acct_start(blk_get_stats(s->blk), &s->acct, io->len,
++ *   - hw/ide/macio.c|237| <<pmac_ide_transfer>> block_acct_start(blk_get_stats(s->blk), &s->acct, io->len,
++ *   - hw/ide/macio.c|241| <<pmac_ide_transfer>> block_acct_start(blk_get_stats(s->blk), &s->acct, io->len,
++ *   - hw/scsi/scsi-disk.c|444| <<scsi_write_do_fua>> block_acct_start(blk_get_stats(s->qdev.conf.blk), &r->acct, 0,
++ *   - hw/scsi/scsi-disk.c|652| <<scsi_do_read>> block_acct_start(blk_get_stats(s->qdev.conf.blk), &r->acct,
++ *   - hw/scsi/scsi-disk.c|757| <<scsi_read_data>> block_acct_start(blk_get_stats(s->qdev.conf.blk), &r->acct, 0,
++ *   - hw/scsi/scsi-disk.c|858| <<scsi_write_data>> block_acct_start(blk_get_stats(s->qdev.conf.blk), &r->acct,
++ *   - hw/scsi/scsi-disk.c|1843| <<scsi_disk_emulate_mode_select>> block_acct_start(blk_get_stats(s->qdev.conf.blk), &r->acct, 0,
++ *   - hw/scsi/scsi-disk.c|1907| <<scsi_unmap_complete_noio>> block_acct_start(blk_get_stats(s->qdev.conf.blk), &r->acct,
++ *   - hw/scsi/scsi-disk.c|2035| <<scsi_write_same_complete>> block_acct_start(blk_get_stats(s->qdev.conf.blk), &r->acct,
++ *   - hw/scsi/scsi-disk.c|2086| <<scsi_disk_emulate_write_same>> block_acct_start(blk_get_stats(s->qdev.conf.blk), &r->acct,
++ *   - hw/scsi/scsi-disk.c|2111| <<scsi_disk_emulate_write_same>> block_acct_start(blk_get_stats(s->qdev.conf.blk), &r->acct,
++ *   - hw/scsi/scsi-disk.c|2382| <<scsi_disk_emulate_command>> block_acct_start(blk_get_stats(s->qdev.conf.blk), &r->acct, 0,
++ *   - qemu-io-cmds.c|1519| <<aio_read_f>> block_acct_start(blk_get_stats(blk), &ctx->acct, ctx->qiov.size,
++ *   - qemu-io-cmds.c|1664| <<aio_write_f>> block_acct_start(blk_get_stats(blk), &ctx->acct, ctx->qiov.size,
++ *   - qemu-io-cmds.c|1677| <<aio_flush_f>> block_acct_start(blk_get_stats(blk), &cookie, 0, BLOCK_ACCT_FLUSH);
++ *   - softmmu/dma-helpers.c|350| <<dma_acct_start>> block_acct_start(blk_get_stats(blk), cookie, sg->size, type);
++ */
+ void block_acct_start(BlockAcctStats *stats, BlockAcctCookie *cookie,
+                       int64_t bytes, enum BlockAcctType type)
+ {
+@@ -182,11 +227,21 @@ void block_latency_histograms_clear(BlockAcctStats *stats)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - block/accounting.c|228| <<block_acct_done>> block_account_one_io(stats, cookie, false);
++ *   - block/accounting.c|233| <<block_acct_failed>> block_account_one_io(stats, cookie, true);
++ */
+ static void block_account_one_io(BlockAcctStats *stats, BlockAcctCookie *cookie,
+                                  bool failed)
+ {
+     BlockAcctTimedStats *s;
+     int64_t time_ns = qemu_clock_get_ns(clock_type);
++    /*
++     * 在以下使用BlockAcctCookie->start_time_ns:
++     *   - block/accounting.c|93| <<block_acct_start>> cookie->start_time_ns = qemu_clock_get_ns(clock_type);
++     *   - block/accounting.c|190| <<block_account_one_io>> int64_t latency_ns = time_ns - cookie->start_time_ns;
++     */
+     int64_t latency_ns = time_ns - cookie->start_time_ns;
+ 
+     if (qtest_enabled()) {
+@@ -223,6 +278,41 @@ static void block_account_one_io(BlockAcctStats *stats, BlockAcctCookie *cookie,
+     cookie->type = BLOCK_ACCT_NONE;
+ }
+ 
++/*
++ * called by:
++ *   - hw/block/dataplane/xen-block.c|303| <<xen_block_complete_aio>> block_acct_done(blk_get_stats(dataplane->blk), &request->acct);
++ *   - hw/block/nvme.c|1792| <<nvme_misc_cb>> block_acct_done(stats, acct);
++ *   - hw/block/nvme.c|1812| <<nvme_rw_complete_cb>> block_acct_done(stats, acct);
++ *   - hw/block/nvme.c|1927| <<nvme_aio_flush_cb>> block_acct_done(stats, acct);
++ *   - hw/block/nvme.c|1968| <<nvme_verify_cb>> block_acct_done(stats, acct);
++ *   - hw/block/nvme.c|2146| <<nvme_copy_complete_cb>> block_acct_done(blk_get_stats(ns->blkconf.blk), &req->acct);
++ *   - hw/block/nvme.c|2203| <<nvme_copy_in_complete>> block_acct_done(blk_get_stats(ns->blkconf.blk), &req->acct);
++ *   - hw/block/nvme.c|2488| <<nvme_compare_data_cb>> block_acct_done(stats, acct);
++ *   - hw/block/virtio-blk.c|153| <<virtio_blk_rw_complete>> block_acct_done(blk_get_stats(s->blk), &req->acct);
++ *   - hw/block/virtio-blk.c|172| <<virtio_blk_flush_complete>> block_acct_done(blk_get_stats(s->blk), &req->acct);
++ *   - hw/block/virtio-blk.c|195| <<virtio_blk_discard_write_zeroes_complete>> block_acct_done(blk_get_stats(s->blk), &req->acct);
++ *   - hw/ide/ahci.c|1017| <<ncq_finish>> block_acct_done(blk_get_stats(ncq_tfs->drive->port.ifs[0].blk),
++ *   - hw/ide/atapi.c|118| <<cd_read_sector_sync>> block_acct_done(blk_get_stats(s->blk), &s->acct);
++ *   - hw/ide/atapi.c|138| <<cd_read_sector_cb>> block_acct_done(blk_get_stats(s->blk), &s->acct);
++ *   - hw/ide/atapi.c|415| <<ide_atapi_cmd_read_dma_cb>> block_acct_done(blk_get_stats(s->blk), &s->acct);
++ *   - hw/ide/core.c|447| <<ide_issue_trim_cb>> block_acct_done(blk_get_stats(s->blk), &s->acct);
++ *   - hw/ide/core.c|751| <<ide_sector_read_cb>> block_acct_done(blk_get_stats(s->blk), &s->acct);
++ *   - hw/ide/core.c|955| <<ide_dma_cb>> block_acct_done(blk_get_stats(s->blk), &s->acct);
++ *   - hw/ide/core.c|1013| <<ide_sector_write_cb>> block_acct_done(blk_get_stats(s->blk), &s->acct);
++ *   - hw/ide/core.c|1091| <<ide_flush_cb>> block_acct_done(blk_get_stats(s->blk), &s->acct);
++ *   - hw/ide/macio.c|128| <<pmac_ide_atapi_transfer_cb>> block_acct_done(blk_get_stats(s->blk), &s->acct);
++ *   - hw/ide/macio.c|212| <<pmac_ide_transfer_cb>> block_acct_done(blk_get_stats(s->blk), &s->acct);
++ *   - hw/scsi/scsi-disk.c|402| <<scsi_aio_complete>> block_acct_done(blk_get_stats(s->qdev.conf.blk), &r->acct);
++ *   - hw/scsi/scsi-disk.c|529| <<scsi_dma_complete>> block_acct_done(blk_get_stats(s->qdev.conf.blk), &r->acct);
++ *   - hw/scsi/scsi-disk.c|582| <<scsi_read_complete>> block_acct_done(blk_get_stats(s->qdev.conf.blk), &r->acct);
++ *   - hw/scsi/scsi-disk.c|674| <<scsi_do_read_cb>> block_acct_done(blk_get_stats(s->qdev.conf.blk), &r->acct);
++ *   - hw/scsi/scsi-disk.c|802| <<scsi_write_complete>> block_acct_done(blk_get_stats(s->qdev.conf.blk), &r->acct);
++ *   - hw/scsi/scsi-disk.c|1950| <<scsi_unmap_complete>> block_acct_done(blk_get_stats(s->qdev.conf.blk), &r->acct);
++ *   - hw/scsi/scsi-disk.c|2028| <<scsi_write_same_complete>> block_acct_done(blk_get_stats(s->qdev.conf.blk), &r->acct);
++ *   - qemu-io-cmds.c|1360| <<aio_write_done>> block_acct_done(blk_get_stats(ctx->blk), &ctx->acct);
++ *   - qemu-io-cmds.c|1402| <<aio_read_done>> block_acct_done(blk_get_stats(ctx->blk), &ctx->acct);
++ *   - qemu-io-cmds.c|1679| <<aio_flush_f>> block_acct_done(blk_get_stats(blk), &cookie);
++ */
+ void block_acct_done(BlockAcctStats *stats, BlockAcctCookie *cookie)
+ {
+     block_account_one_io(stats, cookie, false);
 diff --git a/block/block-backend.c b/block/block-backend.c
 index 413af51f3..5d5a59be8 100644
 --- a/block/block-backend.c
@@ -898,7 +1021,7 @@ index cefc5eaa0..601ffb786 100644
  {
      BusState *old_parent_bus = dev->parent_bus;
 diff --git a/hw/i386/intel_iommu.c b/hw/i386/intel_iommu.c
-index 6be8f3291..572b885d2 100644
+index 6be8f3291..3e863971c 100644
 --- a/hw/i386/intel_iommu.c
 +++ b/hw/i386/intel_iommu.c
 @@ -51,6 +51,12 @@
@@ -947,7 +1070,18 @@ index 6be8f3291..572b885d2 100644
  static bool vtd_do_iommu_translate(VTDAddressSpace *vtd_as, PCIBus *bus,
                                     uint8_t devfn, hwaddr addr, bool is_write,
                                     IOMMUTLBEntry *entry)
-@@ -2969,6 +2987,10 @@ static void vtd_mem_write(void *opaque, hwaddr addr,
+@@ -2197,6 +2215,10 @@ static void vtd_handle_gcmd_ire(IntelIOMMUState *s, bool en)
+ }
+ 
+ /* Handle write to Global Command Register */
++/*
++ * 处理DMAR_GCMD_REG:
++ *   - hw/i386/intel_iommu.c|2761| <<vtd_mem_write>> vtd_handle_gcmd_write(s);
++ */
+ static void vtd_handle_gcmd_write(IntelIOMMUState *s)
+ {
+     uint32_t status = vtd_get_long_raw(s, DMAR_GSTS_REG);
+@@ -2969,6 +2991,10 @@ static void vtd_mem_write(void *opaque, hwaddr addr,
      }
  }
  
@@ -958,7 +1092,7 @@ index 6be8f3291..572b885d2 100644
  static IOMMUTLBEntry vtd_iommu_translate(IOMMUMemoryRegion *iommu, hwaddr addr,
                                           IOMMUAccessFlags flag, int iommu_idx)
  {
-@@ -3106,6 +3128,10 @@ static Property vtd_properties[] = {
+@@ -3106,6 +3132,10 @@ static Property vtd_properties[] = {
  };
  
  /* Read IRTE entry with specific index */
@@ -969,7 +1103,7 @@ index 6be8f3291..572b885d2 100644
  static int vtd_irte_get(IntelIOMMUState *iommu, uint16_t index,
                          VTD_IR_TableEntry *entry, uint16_t sid)
  {
-@@ -3121,6 +3147,12 @@ static int vtd_irte_get(IntelIOMMUState *iommu, uint16_t index,
+@@ -3121,6 +3151,12 @@ static int vtd_irte_get(IntelIOMMUState *iommu, uint16_t index,
          return -VTD_FR_IR_INDEX_OVER;
      }
  
@@ -982,7 +1116,7 @@ index 6be8f3291..572b885d2 100644
      addr = iommu->intr_root + index * sizeof(*entry);
      if (dma_memory_read(&address_space_memory, addr, entry,
                          sizeof(*entry))) {
-@@ -3191,6 +3223,10 @@ static int vtd_irte_get(IntelIOMMUState *iommu, uint16_t index,
+@@ -3191,6 +3227,10 @@ static int vtd_irte_get(IntelIOMMUState *iommu, uint16_t index,
  }
  
  /* Fetch IRQ information of specific IR index */
@@ -993,7 +1127,7 @@ index 6be8f3291..572b885d2 100644
  static int vtd_remap_irq_get(IntelIOMMUState *iommu, uint16_t index,
                               X86IOMMUIrq *irq, uint16_t sid)
  {
-@@ -3222,6 +3258,11 @@ static int vtd_remap_irq_get(IntelIOMMUState *iommu, uint16_t index,
+@@ -3222,6 +3262,11 @@ static int vtd_remap_irq_get(IntelIOMMUState *iommu, uint16_t index,
  }
  
  /* Interrupt remapping for MSI/MSI-X entry */
@@ -1005,7 +1139,7 @@ index 6be8f3291..572b885d2 100644
  static int vtd_interrupt_remap_msi(IntelIOMMUState *iommu,
                                     MSIMessage *origin,
                                     MSIMessage *translated,
-@@ -3318,6 +3359,10 @@ out:
+@@ -3318,6 +3363,10 @@ out:
      return 0;
  }
  
@@ -1118,7 +1252,7 @@ index 51872dd84..ab3821590 100644
  {
      X86CPU *cpu = X86_CPU(first_cpu);
 diff --git a/hw/i386/x86-iommu.c b/hw/i386/x86-iommu.c
-index 5f4301639..e9f7614e1 100644
+index 5f4301639..11719b888 100644
 --- a/hw/i386/x86-iommu.c
 +++ b/hw/i386/x86-iommu.c
 @@ -94,6 +94,21 @@ static void x86_iommu_set_default(X86IOMMUState *x86_iommu)
@@ -1143,6 +1277,24 @@ index 5f4301639..e9f7614e1 100644
  X86IOMMUState *x86_iommu_get_default(void)
  {
      return x86_iommu_default;
+@@ -156,6 +171,17 @@ static void x86_iommu_class_init(ObjectClass *klass, void *data)
+     device_class_set_props(dc, x86_iommu_properties);
+ }
+ 
++/*
++ * called by:
++ *   - hw/i386/acpi-build.c|2012| <<build_dmar_q35>> if (x86_iommu_ir_supported(iommu)) {
++ *   - hw/i386/acpi-build.c|2229| <<build_amd_iommu>> if (x86_iommu_ir_supported(x86_iommu_get_default())) {
++ *   - hw/i386/acpi-build.c|2264| <<build_amd_iommu>> if (x86_iommu_ir_supported(x86_iommu_get_default())) {
++ *   - hw/i386/amd_iommu.c|1239| <<amdvi_int_remap_msi>> if (!x86_iommu_ir_supported(X86_IOMMU_DEVICE(iommu))) {
++ *   - hw/i386/intel_iommu.c|3679| <<vtd_init>> if (x86_iommu_ir_supported(x86_iommu)) {
++ *   - hw/i386/intel_iommu.c|3785| <<vtd_decide_config>> if (s->intr_eim == ON_OFF_AUTO_ON && !x86_iommu_ir_supported(x86_iommu)) {
++ *   - hw/i386/intel_iommu.c|3792| <<vtd_decide_config>> && x86_iommu_ir_supported(x86_iommu) ?
++ *   - hw/i386/x86-iommu.c|146| <<x86_iommu_realize>> if (x86_iommu_ir_supported(x86_iommu) && irq_all_kernel) {
++ */
+ bool x86_iommu_ir_supported(X86IOMMUState *s)
+ {
+     return s->intr_supported == ON_OFF_AUTO_ON;
 diff --git a/hw/misc/pvpanic.c b/hw/misc/pvpanic.c
 index e2cb4a5d2..f211a0d57 100644
 --- a/hw/misc/pvpanic.c
@@ -1752,7 +1904,7 @@ index 06d62f3c3..d672ad89a 100644
  {
      /* required VPD size with unmap support */
 diff --git a/hw/scsi/scsi-bus.c b/hw/scsi/scsi-bus.c
-index 2a0a98cac..8fc8c0350 100644
+index 2a0a98cac..05dc5fec7 100644
 --- a/hw/scsi/scsi-bus.c
 +++ b/hw/scsi/scsi-bus.c
 @@ -24,6 +24,12 @@ static void scsi_target_free_buf(SCSIRequest *req);
@@ -2232,7 +2384,17 @@ index 2a0a98cac..8fc8c0350 100644
  /* Tell the device that we finished processing this chunk of I/O.  It
     will start the next chunk or complete the command.  */
  void scsi_req_continue(SCSIRequest *req)
-@@ -1428,6 +1721,11 @@ void scsi_req_data(SCSIRequest *req, int len)
+@@ -1387,6 +1680,9 @@ void scsi_req_continue(SCSIRequest *req)
+         trace_scsi_req_continue_canceled(req->dev->id, req->lun, req->tag);
+         return;
+     }
++    /*
++     * 这个trace只在这里调用
++     */
+     trace_scsi_req_continue(req->dev->id, req->lun, req->tag);
+     if (req->cmd.mode == SCSI_XFER_TO_DEV) {
+         req->ops->write_data(req);
+@@ -1428,6 +1724,11 @@ void scsi_req_data(SCSIRequest *req, int len)
      scsi_req_continue(req);
  }
  
@@ -2244,7 +2406,7 @@ index 2a0a98cac..8fc8c0350 100644
  void scsi_req_print(SCSIRequest *req)
  {
      FILE *fp = stderr;
-@@ -1456,6 +1754,11 @@ void scsi_req_print(SCSIRequest *req)
+@@ -1456,6 +1757,11 @@ void scsi_req_print(SCSIRequest *req)
      }
  }
  
@@ -2256,7 +2418,7 @@ index 2a0a98cac..8fc8c0350 100644
  void scsi_req_complete_failed(SCSIRequest *req, int host_status)
  {
      SCSISense sense;
-@@ -1464,7 +1767,21 @@ void scsi_req_complete_failed(SCSIRequest *req, int host_status)
+@@ -1464,7 +1770,21 @@ void scsi_req_complete_failed(SCSIRequest *req, int host_status)
      assert(req->status == -1 && req->host_status == -1);
      assert(req->ops != &reqops_unit_attention);
  
@@ -2278,7 +2440,7 @@ index 2a0a98cac..8fc8c0350 100644
          status = scsi_sense_from_host_status(req->host_status, &sense);
          if (status == CHECK_CONDITION) {
              scsi_req_build_sense(req, sense);
-@@ -1483,6 +1800,42 @@ void scsi_req_complete_failed(SCSIRequest *req, int host_status)
+@@ -1483,6 +1803,42 @@ void scsi_req_complete_failed(SCSIRequest *req, int host_status)
      scsi_req_unref(req);
  }
  
@@ -2321,7 +2483,7 @@ index 2a0a98cac..8fc8c0350 100644
  void scsi_req_complete(SCSIRequest *req, int status)
  {
      assert(req->status == -1 && req->host_status == -1);
-@@ -1495,6 +1848,14 @@ void scsi_req_complete(SCSIRequest *req, int status)
+@@ -1495,6 +1851,14 @@ void scsi_req_complete(SCSIRequest *req, int status)
      }
  
      if (req->sense_len) {
@@ -2336,7 +2498,7 @@ index 2a0a98cac..8fc8c0350 100644
          memcpy(req->dev->sense, req->sense, req->sense_len);
          req->dev->sense_len = req->sense_len;
          req->dev->sense_is_ua = (req->ops == &reqops_unit_attention);
-@@ -1512,6 +1873,9 @@ void scsi_req_complete(SCSIRequest *req, int status)
+@@ -1512,6 +1876,9 @@ void scsi_req_complete(SCSIRequest *req, int status)
  
      scsi_req_ref(req);
      scsi_req_dequeue(req);
@@ -2346,7 +2508,7 @@ index 2a0a98cac..8fc8c0350 100644
      req->bus->info->complete(req, req->resid);
  
      /* Cancelled requests might end up being completed instead of cancelled */
-@@ -1559,6 +1923,25 @@ void scsi_req_cancel_async(SCSIRequest *req, Notifier *notifier)
+@@ -1559,6 +1926,25 @@ void scsi_req_cancel_async(SCSIRequest *req, Notifier *notifier)
      }
  }
  
@@ -2372,7 +2534,7 @@ index 2a0a98cac..8fc8c0350 100644
  void scsi_req_cancel(SCSIRequest *req)
  {
      trace_scsi_req_cancel(req->dev->id, req->lun, req->tag);
-@@ -1814,6 +2197,14 @@ static void scsi_dev_instance_init(Object *obj)
+@@ -1814,6 +2200,14 @@ static void scsi_dev_instance_init(Object *obj)
                                    &s->qdev);
  }
  
@@ -4590,6 +4752,22 @@ index 07f4e60b3..065ee7034 100644
  static void virtio_queue_host_notifier_aio_read(EventNotifier *n)
  {
      VirtQueue *vq = container_of(n, VirtQueue, host_notifier);
+diff --git a/include/block/accounting.h b/include/block/accounting.h
+index 878b4c358..fb30ba815 100644
+--- a/include/block/accounting.h
++++ b/include/block/accounting.h
+@@ -95,6 +95,11 @@ struct BlockAcctStats {
+ 
+ typedef struct BlockAcctCookie {
+     int64_t bytes;
++    /*
++     * 在以下使用BlockAcctCookie->start_time_ns:
++     *   - block/accounting.c|93| <<block_acct_start>> cookie->start_time_ns = qemu_clock_get_ns(clock_type);
++     *   - block/accounting.c|190| <<block_account_one_io>> int64_t latency_ns = time_ns - cookie->start_time_ns; 
++     */
+     int64_t start_time_ns;
+     enum BlockAcctType type;
+ } BlockAcctCookie;
 diff --git a/include/hw/core/cpu.h b/include/hw/core/cpu.h
 index c68bc3ba8..e4ae74fbd 100644
 --- a/include/hw/core/cpu.h
@@ -4848,6 +5026,33 @@ index db7a8e2fc..9a50619d1 100644
  #define VIRTIO_MSI_QUEUE_VECTOR         22
  
  /* The remaining space is defined by each driver as the per-driver
+diff --git a/include/sysemu/accel-ops.h b/include/sysemu/accel-ops.h
+index 032f6979d..90310bbf2 100644
+--- a/include/sysemu/accel-ops.h
++++ b/include/sysemu/accel-ops.h
+@@ -28,6 +28,22 @@ struct AccelOpsClass {
+     /* initialization function called when accel is chosen */
+     void (*ops_init)(AccelOpsClass *ops);
+ 
++    /*
++     * 在以下设置AccelOpsClass->create_vcpu_thread:
++     *   - accel/kvm/kvm-accel-ops.c|81| <<kvm_accel_ops_class_init>> ops->create_vcpu_thread = kvm_start_vcpu_thread;
++     *   - accel/qtest/qtest.c|53| <<qtest_accel_ops_class_init>> ops->create_vcpu_thread = dummy_start_vcpu_thread;
++     *   - accel/tcg/tcg-accel-ops.c|98| <<tcg_accel_ops_init>> ops->create_vcpu_thread = mttcg_start_vcpu_thread;
++     *   - accel/tcg/tcg-accel-ops.c|102| <<tcg_accel_ops_init>> ops->create_vcpu_thread = rr_start_vcpu_thread;
++     *   - accel/tcg/tcg-accel-ops.c|108| <<tcg_accel_ops_init>> ops->create_vcpu_thread = rr_start_vcpu_thread;
++     *   - accel/xen/xen-all.c|222| <<xen_accel_ops_class_init>> ops->create_vcpu_thread = dummy_start_vcpu_thread;
++     *   - target/i386/hax/hax-accel-ops.c|81| <<hax_accel_ops_class_init>> ops->create_vcpu_thread = hax_start_vcpu_thread;
++     * 在以下使用AccelOpsClass->create_vcpu_thread:
++     *   - softmmu/cpus.c|605| <<cpus_register_accel>> assert(ops->create_vcpu_thread != NULL);
++     *   - softmmu/cpus.c|627| <<qemu_init_vcpu>> g_assert(cpus_accel != NULL && cpus_accel->create_vcpu_thread != NULL);
++     *   - softmmu/cpus.c|628| <<qemu_init_vcpu>> cpus_accel->create_vcpu_thread(cpu);
++     *   - target/i386/hvf/hvf-accel-ops.c|128| <<hvf_accel_ops_class_init>> ops->create_vcpu_thread = hvf_start_vcpu_thread;
++     *   - target/i386/whpx/whpx-accel-ops.c|90| <<whpx_accel_ops_class_init>> ops->create_vcpu_thread = whpx_start_vcpu_thread;
++     */
+     void (*create_vcpu_thread)(CPUState *cpu); /* MANDATORY NON-NULL */
+     void (*kick_vcpu_thread)(CPUState *cpu);
+ 
 diff --git a/include/sysemu/dma.h b/include/sysemu/dma.h
 index 3201e7901..6955facd0 100644
 --- a/include/sysemu/dma.h
@@ -4934,10 +5139,22 @@ index 357b03667..42d3c3e14 100644
                                  SCSISense *sense)
  {
 diff --git a/softmmu/cpus.c b/softmmu/cpus.c
-index a7ee43118..f50c593d4 100644
+index a7ee43118..6d1b49880 100644
 --- a/softmmu/cpus.c
 +++ b/softmmu/cpus.c
-@@ -798,6 +798,10 @@ exit:
+@@ -589,6 +589,11 @@ void resume_all_vcpus(void)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - hw/ppc/pnv_core.c|270| <<pnv_core_cpu_unrealize>> cpu_remove_sync(CPU(cpu));
++ *   - target/i386/cpu.c|6973| <<x86_cpu_unrealizefn>> cpu_remove_sync(CPU(dev));
++ */
+ void cpu_remove_sync(CPUState *cpu)
+ {
+     cpu->stop = true;
+@@ -798,6 +803,10 @@ exit:
      fclose(f);
  }
  
@@ -5119,10 +5336,22 @@ index ad99cad0e..189b620f7 100644
  {
      int i;
 diff --git a/target/i386/kvm/kvm.c b/target/i386/kvm/kvm.c
-index 7fe9f5271..d086eebec 100644
+index 7fe9f5271..c293255d9 100644
 --- a/target/i386/kvm/kvm.c
 +++ b/target/i386/kvm/kvm.c
-@@ -3689,6 +3689,10 @@ static int kvm_get_mp_state(X86CPU *cpu)
+@@ -182,6 +182,11 @@ bool kvm_has_x2apic_api(void)
+     return has_x2apic_api;
+ }
+ 
++/*
++ * called by:
++ *   - hw/i386/intel_iommu.c|3800| <<vtd_decide_config>> if (!kvm_enable_x2apic()) {
++ *   - target/i386/cpu.c|5304| <<x86_cpu_load_model>> } else if (kvm_irqchip_is_split() && kvm_enable_x2apic()) {
++ */
+ bool kvm_enable_x2apic(void)
+ {
+     return MEMORIZE(
+@@ -3689,6 +3694,10 @@ static int kvm_get_mp_state(X86CPU *cpu)
      return 0;
  }
  
@@ -5133,7 +5362,7 @@ index 7fe9f5271..d086eebec 100644
  static int kvm_get_apic(X86CPU *cpu)
  {
      DeviceState *apic = cpu->apic_state;
-@@ -4613,6 +4617,10 @@ bool kvm_arch_stop_on_emulation_error(CPUState *cs)
+@@ -4613,6 +4622,10 @@ bool kvm_arch_stop_on_emulation_error(CPUState *cs)
             ((env->segs[R_CS].selector  & 3) != 3);
  }
  
@@ -5144,7 +5373,7 @@ index 7fe9f5271..d086eebec 100644
  void kvm_arch_init_irq_routing(KVMState *s)
  {
      /* We know at this point that we're using the in-kernel
-@@ -4736,6 +4744,14 @@ struct MSIRouteEntry {
+@@ -4736,6 +4749,14 @@ struct MSIRouteEntry {
  };
  
  /* List of used GSI routes */
@@ -5159,7 +5388,7 @@ index 7fe9f5271..d086eebec 100644
  static QLIST_HEAD(, MSIRouteEntry) msi_route_list = \
      QLIST_HEAD_INITIALIZER(msi_route_list);
  
-@@ -4786,6 +4802,14 @@ int kvm_arch_add_msi_route_post(struct kvm_irq_routing_entry *route,
+@@ -4786,6 +4807,14 @@ int kvm_arch_add_msi_route_post(struct kvm_irq_routing_entry *route,
      entry->dev = dev;
      entry->vector = vector;
      entry->virq = route->gsi;
