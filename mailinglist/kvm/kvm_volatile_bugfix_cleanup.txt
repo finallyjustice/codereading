@@ -1,0 +1,81 @@
+[PATCH 00/12] KVM: x86/mmu: Bug fixes and cleanups
+
+... from Sean Christopherson ...
+
+https://lore.kernel.org/all/20220423034752.1161007-1-seanjc@google.com/
+
+这个patchset的核心是volatile bits的使用.
+
+volatile bits: bits that can be set outside of mmu_lock. The Writable bit
+can be set by KVM's fast page fault handler, and Accessed and Dirty bits
+can be set by the CPU.
+
+也就是说,volatile bits是那些可以在lock外修改的bit,比如在fast page fault中
+的writable,或者硬件支持的access/dirty bit.
+
+下面是patchset的几个核心patch.
+
+----------------------------
+
+[PATCH 01/12] KVM: x86/mmu: Don't treat fully writable SPTEs as volatile (modulo A/D)
+
+对spte_has_volatile_bits()进行修改.核心思想是,如果writable bit(bit 1)已经设置了,就不算volatile了.
+因为KVM只在mmu_lock外set writable bit,一旦设置了就不会在mmu_lock外clear.
+所以set了就不算是volatile了.
+
+static inline bool is_writable_pte(unsigned long pte)
+{
+    return pte & PT_WRITABLE_MASK;
+}
+
+----------------------------
+
+[PATCH 03/12] KVM: x86/mmu: Use atomic XCHG to write TDP MMU SPTEs with volatile bits
+
+如果spte是volatile的,就要用atomic XCHG,而不是WRITE_ONCE().
+正如上面说的,volatile的可以在mmu_lock外修改.
+
++static inline u64 kvm_tdp_mmu_write_spte(tdp_ptep_t sptep, u64 old_spte,
++                                        u64 new_spte, int level)
++{
++       /*
++        * Atomically write the SPTE if it is a shadow-present, leaf SPTE with
++        * volatile bits, i.e. has bits that can be set outside of mmu_lock.
++        * The Writable bit can be set by KVM's fast page fault handler, and
++        * Accessed and Dirty bits can be set by the CPU.
++        *
++        * Note, non-leaf SPTEs do have Accessed bits and those bits are
++        * technically volatile, but KVM doesn't consume the Accessed bit of
++        * non-leaf SPTEs, i.e. KVM doesn't care if it clobbers the bit.  This
++        * logic needs to be reassessed if KVM were to use non-leaf Accessed
++        * bits, e.g. to skip stepping down into child SPTEs when aging SPTEs.
++        */
++       if (is_shadow_present_pte(old_spte) && is_last_spte(old_spte, level) &&
++           spte_has_volatile_bits(old_spte))
++               return kvm_tdp_mmu_write_spte_atomic(sptep, new_spte);
++
++       __kvm_tdp_mmu_write_spte(sptep, new_spte);
++       return old_spte;
+ }
+
+----------------------------
+
+[PATCH 04/12] KVM: x86/mmu: Don't attempt fast page fault just because EPT is in use
+
+如果硬件不支持A/D,就要靠着触发page fault来用restore_acc_track_spte()模拟这个过程.
+
+核心思想: 当硬件支持A/D的时候, accessed和dirty都是靠硬件设置的,就不会fast page fault了.
+
+@@ -3140,13 +3141,25 @@ static int fast_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
+
+                 new_spte = spte;
+
+-               if (is_access_track_spte(spte))
++               /*
++                * KVM only supports fixing page faults outside of MMU lock for
++                * direct MMUs, nested MMUs are always indirect, and KVM always
++                * uses A/D bits for non-nested MMUs.  Thus, if A/D bits are
++                * enabled, the SPTE can't be an access-tracked SPTE.
++                */
++               if (unlikely(!kvm_ad_enabled()) && is_access_track_spte(spte))
+                         new_spte = restore_acc_track_spte(new_spte);
