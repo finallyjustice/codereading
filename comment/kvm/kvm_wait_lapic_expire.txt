@@ -1,0 +1,117 @@
+wait_lapic_expire()被下面的patch引入.
+
+
+commit d0659d946be05e098883b6955d2764595997f6a4
+Author: Marcelo Tosatti <mtosatti@redhat.com>
+Date:   Tue Dec 16 09:08:15 2014 -0500
+
+KVM: x86: add option to advance tscdeadline hrtimer expiration
+
+For the hrtimer which emulates the tscdeadline timer in the guest,
+add an option to advance expiration, and busy spin on VM-entry waiting
+for the actual expiration time to elapse.
+
+This allows achieving low latencies in cyclictest (or any scenario
+which requires strict timing regarding timer expiration).
+
+Reduces average cyclictest latency from 12us to 8us
+on Core i5 desktop.
+
+Note: this option requires tuning to find the appropriate value
+for a particular hardware/guest combination. One method is to measure the
+average delay between apic_timer_fn and VM-entry.
+Another method is to start with 1000ns, and increase the value
+in say 500ns increments until avg cyclictest numbers stop decreasing.
+
+Signed-off-by: Marcelo Tosatti <mtosatti@redhat.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+
+
+为了能够让timer expire的更精确,先提前一些让timer尽早的expire,然后在enter的时候spin一下.这样保证timer expire准确.
+
+
+在set timer的时候,在line 1208减去一些,这样timer能稍微早一些expire.
+
+1143 static void start_apic_timer(struct kvm_lapic *apic)
+1144 {
+... ...
+1188         } else if (apic_lvtt_tscdeadline(apic)) {
+1189                 /* lapic timer in tsc deadline mode */
+1190                 u64 guest_tsc, tscdeadline = apic->lapic_timer.tscdeadline;
+1191                 u64 ns = 0;
+1192                 ktime_t expire;
+1193                 struct kvm_vcpu *vcpu = apic->vcpu;
+1194                 unsigned long this_tsc_khz = vcpu->arch.virtual_tsc_khz;
+1195                 unsigned long flags;
+1196 
+1197                 if (unlikely(!tscdeadline || !this_tsc_khz))
+1198                         return;
+1199 
+1200                 local_irq_save(flags);
+1201 
+1202                 now = apic->lapic_timer.timer.base->get_time();
+1203                 guest_tsc = kvm_x86_ops->read_l1_tsc(vcpu, native_read_tsc());
+1204                 if (likely(tscdeadline > guest_tsc)) {
+1205                         ns = (tscdeadline - guest_tsc) * 1000000ULL;
+1206                         do_div(ns, this_tsc_khz);
+1207                         expire = ktime_add_ns(now, ns);
+1208                         expire = ktime_sub_ns(expire, lapic_timer_advance_ns);
+1209                         hrtimer_start(&apic->lapic_timer.timer,
+1210                                       expire, HRTIMER_MODE_ABS);
+1211                 } else
+1212                         apic_timer_expired(apic);
+1213 
+1214                 local_irq_restore(flags);
+1215         }
+1216 }
+
+
+在vcpu_enter_guest()的时候,在line 6319调用wait_lapic_expire().
+
+6183 static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+6184 {
+... ...
+6307         kvm_guest_enter();
+6308 
+6309         if (unlikely(vcpu->arch.switch_db_regs)) {
+6310                 set_debugreg(0, 7);
+6311                 set_debugreg(vcpu->arch.eff_db[0], 0);
+6312                 set_debugreg(vcpu->arch.eff_db[1], 1);
+6313                 set_debugreg(vcpu->arch.eff_db[2], 2);
+6314                 set_debugreg(vcpu->arch.eff_db[3], 3);
+6315                 set_debugreg(vcpu->arch.dr6, 6);
+6316         }
+6317 
+6318         trace_kvm_entry(vcpu->vcpu_id);
+6319         wait_lapic_expire(vcpu);
+6320         kvm_x86_ops->run(vcpu);
+
+因为之前set timer的时候有意尽早的expire了一些,这里要稍微spin一下(line 1140)来补齐.
+这样更容易控制timer的准确度.
+
+1120 void wait_lapic_expire(struct kvm_vcpu *vcpu)
+1121 {
+1122         struct kvm_lapic *apic = vcpu->arch.apic;
+1123         u64 guest_tsc, tsc_deadline;
+1124
+1125         if (!kvm_vcpu_has_lapic(vcpu))
+1126                 return;
+1127
+1128         if (apic->lapic_timer.expired_tscdeadline == 0)
+1129                 return;
+1130
+1131         if (!lapic_timer_int_injected(vcpu))
+1132                 return;
+1133
+1134         tsc_deadline = apic->lapic_timer.expired_tscdeadline;
+1135         apic->lapic_timer.expired_tscdeadline = 0;
+1136         guest_tsc = kvm_x86_ops->read_l1_tsc(vcpu, native_read_tsc());
+1137
+1138         /* __delay is delay_tsc whenever the hardware has TSC, thus always.  */
+1139         if (guest_tsc < tsc_deadline)
+1140                 __delay(tsc_deadline - guest_tsc);
+1141 }
+
+
+
+

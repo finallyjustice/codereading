@@ -1,0 +1,112 @@
+[PATCH v2 0/4] KVM: x86: APICv fixes
+
+... Sean Christopherson ...
+
+https://lore.kernel.org/all/20220420013732.3308816-1-seanjc@google.com/
+
+-------------------------------------------
+
+The 1st patch is to fix the case that APICV_INHIBIT_REASON_DISABLE is erroneously regarded as APICV_INHIBIT_REASON_ABSENT.
+
+-------------------------------------------
+
+The 3rd patch is to fix a race.
+
+There is below warning during vcpu_enter_guest(). That is, the apicv is inhibited while vcpu->arch.apicv_active = true. This is invalid.
+
+WARN_ON_ONCE(kvm_apicv_activated(vcpu->kvm) != kvm_vcpu_apicv_active(vcpu));
+
+
+Here is an example.
+
+r0 = openat$kvm(0xffffffffffffff9c, &(0x7f0000000000), 0x0, 0x0)
+r1 = ioctl$KVM_CREATE_VM(r0, 0xae01, 0x0)
+ioctl$KVM_CAP_SPLIT_IRQCHIP(r1, 0x4068aea3, &(0x7f0000000000)) (async)
+r2 = ioctl$KVM_CREATE_VCPU(r1, 0xae41, 0x0) (async)
+r3 = ioctl$KVM_CREATE_VCPU(r1, 0xae41, 0x400000000000002)
+ioctl$KVM_SET_GUEST_DEBUG(r3, 0x4048ae9b, &(0x7f00000000c0)={0x5dda9c14aa95f5c5})
+ioctl$KVM_RUN(r2, 0xae80, 0x0)
+
+
+While the r2 is still being created, the r3 is ready and online. The userspace calls KVM_SET_GUEST_DEBUG for r3, which leads to below race.
+
+
+      "r2 creation"                                      "r3 KVM_SET_GUEST_DEBUG"
+
+kvm_vm_ioctl(KVM_CREATE_VCPU)
+-> kvm_vm_ioctl_create_vcpu()
+   -> mutex_lock(&kvm->lock);
+   -> kvm->created_vcpus++;
+   -> mutex_unlock(&kvm->lock);
+   -> kvm_arch_vcpu_create()
+      -> if (kvm_apicv_activated(vcpu->kvm))
+             vcpu->arch.apicv_active = true;
+                                               kvm_vcpu_ioctl(KVM_SET_GUEST_DEBUG)
+                                               -> kvm_arch_vcpu_ioctl_set_guest_debug()
+                                                  -> kvm_arch_vcpu_guestdbg_update_apicv_inhibit(vcpu->kvm)
+                                                     -> down_write(&kvm->arch.apicv_update_lock);
+                                                     -> __kvm_set_or_clear_apicv_inhibit(kvm, APICV_INHIBIT_REASON_BLOCKIRQ, set);
+                                                        -> kvm_make_all_cpus_request(kvm, KVM_REQ_APICV_UPDATE);
+                                                        -> kvm->arch.apicv_inhibit_reasons = new;
+                                                           -> kvm_make_all_cpus_request_except()
+                                                               The r2 is still not online so that kvm->online_vcpus does not cover r2!!!
+                                                               Therefore, r2 does not have KVM_REQ_APICV_UPDATE received.
+                                                               323         kvm_for_each_vcpu(i, vcpu, kvm) {
+                                                               324                 if (vcpu == except)
+	                                                       325                         continue;
+                                                               326                 kvm_make_vcpu_request(vcpu, req, cpus, me);
+                                                               327         }
+                                                     -> up_write(&kvm->arch.apicv_update_lock);
+
+   -> mutex_lock(&kvm->lock);
+   -> r = xa_insert(&kvm->vcpu_array, vcpu->vcpu_idx, vcpu, GFP_KERNEL_ACCOUNT);
+   -> atomic_inc(&kvm->online_vcpus);
+   -> mutex_unlock(&kvm->lock);
+
+
+Without KVM_REQ_APICV_UPDATE received, the r2 will not update vcpu->arch.apicv_active as below.
+
+9757 void kvm_vcpu_update_apicv(struct kvm_vcpu *vcpu)
+9758 {
+9759         bool activate;
+9760 
+9761         if (!lapic_in_kernel(vcpu))
+9762                 return;
+9763 
+9764         down_read(&vcpu->kvm->arch.apicv_update_lock);
+9765 
+9766         activate = kvm_apicv_activated(vcpu->kvm);
+9767         if (vcpu->arch.apicv_active == activate)
+9768                 goto out;
+9769 
+9770         vcpu->arch.apicv_active = activate;
+9771         kvm_apic_update_apicv(vcpu);
+9772         static_call(kvm_x86_refresh_apicv_exec_ctrl)(vcpu);
+9773 
+9774         /*
+9775          * When APICv gets disabled, we may still have injected interrupts
+9776          * pending. At the same time, KVM_REQ_EVENT may not be set as APICv was
+9777          * still active when the interrupt got accepted. Make sure
+9778          * inject_pending_event() is called to check for that.
+9779          */
+9780         if (!vcpu->arch.apicv_active)
+9781                 kvm_make_request(KVM_REQ_EVENT, vcpu);
+9782 
+9783 out:
+9784         up_read(&vcpu->kvm->arch.apicv_update_lock);
+9785 }
+9786 EXPORT_SYMBOL_GPL(kvm_vcpu_update_apicv);
+
+
+As a result, the WARNING at line 10174 is encountered.
+
+vcpu_enter_guest() for r2.
+10050                 if (kvm_check_request(KVM_REQ_APICV_UPDATE, vcpu))
+10051                         kvm_vcpu_update_apicv(vcpu);
+... ...
+10174                 WARN_ON_ONCE(kvm_apicv_activated(vcpu->kvm) != kvm_vcpu_apicv_active(vcpu));
+
+
+-------------------------------------------
+
+The 4th patch is to avoid inhibit apicv if it is already disabled.

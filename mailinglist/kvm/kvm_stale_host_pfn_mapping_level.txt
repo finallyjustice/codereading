@@ -1,0 +1,155 @@
+[PATCH] KVM: x86/mmu: fix potential races when walking host page table
+
+... from Mingwei Zhang <mizhang@google.com> ...
+
+https://lore.kernel.org/all/20220429031757.2042406-1-mizhang@google.com/
+
+这个patch认为lookup_address_in_pgd()实现的有问题, 所以重新实现了kvm_lookup_address_level_in_mm().
+
+这里是kvm_lookup_address_level_in_mm()的实现.
+
++/*
++ * Lookup the valid mapping level for a virtual address in the current mm.
++ * Return the level of the mapping if there is present one. Otherwise, always
++ * return PG_LEVEL_NONE.
++ *
++ * Note: the information retrieved may be stale. Use it with causion.
++ */
++int kvm_lookup_address_level_in_mm(struct kvm *kvm, unsigned long address)
++{
++       pgd_t *pgdp, pgd;
++       p4d_t *p4dp, p4d;
++       pud_t *pudp, pud;
++       pmd_t *pmdp, pmd;
++       pte_t *ptep, pte;
++       unsigned long flags;
++       int level = PG_LEVEL_NONE;
++
++       /* Disable IRQs to prevent any tear down of page tables. */
++       local_irq_save(flags);
++
++       pgdp = pgd_offset(kvm->mm, address);
++       pgd = READ_ONCE(*pgdp);
++       if (pgd_none(pgd))
++               goto out;
++
++       p4dp = p4d_offset(pgdp, address);
++       p4d = READ_ONCE(*p4dp);
++       if (p4d_none(p4d) || !p4d_present(p4d))
++               goto out;
++
++       if (p4d_large(p4d)) {
++               level = PG_LEVEL_512G;
++               goto out;
++       }
++
++       pudp = pud_offset(p4dp, address);
++       pud = READ_ONCE(*pudp);
++       if (pud_none(pud) || !pud_present(pud))
++               goto out;
++
++       if (pud_large(pud)) {
++               level = PG_LEVEL_1G;
++               goto out;
++       }
++
++       pmdp = pmd_offset(pudp, address);
++       pmd = READ_ONCE(*pmdp);
++       if (pmd_none(pmd) || !pmd_present(pmd))
++               goto out;
++
++       if (pmd_large(pmd)) {
++               level = PG_LEVEL_2M;
++               goto out;
++       }
++
++       ptep = pte_offset_map(&pmd, address);
++       pte = ptep_get(ptep);
++       if (pte_present(pte)) {
++               pte_unmap(ptep);
++               level = PG_LEVEL_4K;
++               goto out;
++       }
++       pte_unmap(ptep);
++
++out:
++       local_irq_restore(flags);
++       return level;
++}
++EXPORT_SYMBOL_GPL(kvm_lookup_address_level_in_mm);
+
+这里是lookup_address_in_pgd()的实现.
+
+586 pte_t *lookup_address_in_pgd(pgd_t *pgd, unsigned long address,
+587                              unsigned int *level)
+588 {
+589         p4d_t *p4d;
+590         pud_t *pud;
+591         pmd_t *pmd;
+592
+593         *level = PG_LEVEL_NONE;
+594
+595         if (pgd_none(*pgd))
+596                 return NULL;
+597
+598         p4d = p4d_offset(pgd, address);
+599         if (p4d_none(*p4d))
+600                 return NULL;
+601
+602         *level = PG_LEVEL_512G;
+603         if (p4d_large(*p4d) || !p4d_present(*p4d))
+604                 return (pte_t *)p4d;
+605
+606         pud = pud_offset(p4d, address);
+607         if (pud_none(*pud))
+608                 return NULL;
+609
+610         *level = PG_LEVEL_1G;
+611         if (pud_large(*pud) || !pud_present(*pud))
+612                 return (pte_t *)pud;
+613
+614         pmd = pmd_offset(pud, address);
+615         if (pmd_none(*pmd))
+616                 return NULL;
+617
+618         *level = PG_LEVEL_2M;
+619         if (pmd_large(*pmd) || !pmd_present(*pmd))
+620                 return (pte_t *)pmd;
+621
+622         *level = PG_LEVEL_4K;
+623
+624         return pte_offset_kernel(pmd, address);
+625 }
+
+=================================
+
+maintainer提到就算是有问题也被更上层的mmu_notifier_retry保护.
+
+This is a change in semantics, because host_pfn_mapping_level never
+returned PG_LEVEL_NONE.  Returning PG_LEVEL_4K for a non-present entry
+is safe; if it happens, MMU notifiers will force a retry.  If the
+function is inlined in host_pfn_mapping_level, returning PG_LEVEL_4K
+would allow making the semantic change in a separate patch.
+
+In fact, kvm_mmu_hugepage_adjust will go on and set fault->req_level and
+fault->goal_level to PG_LEVEL_NONE, which is wrong even if it does not
+cause havoc.
+
+
+
+最后maintainer直接merge成了inline的到host_pfn_mapping_level()
+
+KVM: x86/mmu: fix potential races when walking host page table
+https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=44187235cbcc7c1129ea7c004bc12f8757d29415
+
+并且注释:
+
+2827         /*
+2828          * Lookup the mapping level in the current mm.  The information
+2829          * may become stale soon, but it is safe to use as long as
+2830          * 1) mmu_notifier_retry was checked after taking mmu_lock, and
+2831          * 2) mmu_lock is taken now.
+2832          *
+2833          * We still need to disable IRQs to prevent concurrent tear down
+2834          * of page tables.
+2835          */
