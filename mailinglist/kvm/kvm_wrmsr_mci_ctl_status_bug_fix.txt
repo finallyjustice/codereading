@@ -1,0 +1,73 @@
+[PATCH 0/3] KVM: x86: WRMSR MCi_CTL/STATUS bug fix and cleanups
+
+... from Sean Christopherson <seanjc@google.com> ...
+
+https://lore.kernel.org/all/20220512222716.4112548-1-seanjc@google.com/
+
+
+这个patchset就是第一个patch是一个fix.
+
+[PATCH 1/3] KVM: x86: Signal #GP, not -EPERM, on bad WRMSR(MCi_CTL/STATUS)
+
+核心思想是让set_msr_mce()在guest写的msr有问题的时候返回1, 而不是-1.
+
+返回1会给guest inject一个GP: the intent is to inject a #GP
+
+返回-1会让QEMU kill掉guest: not exit to userspace due to an unhandled
+emulation case.  Returning '-1' gets interpreted as -EPERM up the stack
+and effecitvely kills the guest.
+
+
+下面是代码的分析 (没有验证过).
+
+__vmx_handle_exit()
+-> if (exit_reason.basic == EXIT_REASON_MSR_WRITE) kvm_emulate_wrmsr
+   -> kvm_set_msr()
+      -> return kvm_set_msr_ignored_check(vcpu, index, data, false);
+         -> int ret = __kvm_set_msr(vcpu, index, data, host_initiated);
+            -> return static_call(kvm_x86_set_msr)(vcpu, &msr); --> vmx_x86_ops.set_msr = vmx_set_msr()
+               -> ret = kvm_set_msr_common(vcpu, msr_info);
+                  -> -> return set_msr_mce(vcpu, msr_info)
+
+
+ret(-1或者1)最终会返回到line 2003.
+
+最终到达line 2013. 如果是-1, kvm_emulate_wrmsr()返回-1.
+
+1997 int kvm_emulate_wrmsr(struct kvm_vcpu *vcpu)
+1998 {
+1999         u32 ecx = kvm_rcx_read(vcpu);
+2000         u64 data = kvm_read_edx_eax(vcpu);
+2001         int r;
+2002 
+2003         r = kvm_set_msr(vcpu, ecx, data);
+2004 
+2005         if (!r) {
+2006                 trace_kvm_msr_write(ecx, data);
+2007         } else {
+2008                 /* MSR write failed? See if we should ask user space */
+2009                 if (kvm_msr_user_space(vcpu, ecx, KVM_EXIT_X86_WRMSR, data,
+2010                                        complete_fast_msr_access, r))
+2011                         return 0;
+2012                 /* Signal all other negative errors to userspace */
+2013                 if (r < 0)
+2014                         return r;
+2015                 trace_kvm_msr_write_ex(ecx, data);
+2016         }
+2017 
+2018         return static_call(kvm_x86_complete_emulated_msr)(vcpu, r);
+2019 }
+2020 EXPORT_SYMBOL_GPL(kvm_emulate_wrmsr);
+
+
+如果是1的话, line 2018会调用kvm_complete_insn_gp(). 最终在line 760 inject gp!
+
+757 int kvm_complete_insn_gp(struct kvm_vcpu *vcpu, int err)
+758 {
+759         if (err)
+760                 kvm_inject_gp(vcpu, 0);
+761         else
+762                 return kvm_skip_emulated_instruction(vcpu); 
+763 
+764         return 1;
+765 }

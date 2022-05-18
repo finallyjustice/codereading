@@ -1,0 +1,67 @@
+[PATCH v5] KVM: x86: Use current rather than snapshotted TSC frequency if it is constant
+
+... from Anton Romanov <romanton@google.com> ...
+
+https://lore.kernel.org/all/20220511202932.3266607-1-romanton@google.com/
+
+tsc_khz是hypervisor kernel的tsc使用的.
+目前在kvm将tsc_khz在初始化还有kvm cpu online的时候保存在了cpu_tsc_khz.
+这是没有必要的.
+
+如果支持constant TSC, frequency在定下来后就不会变.所以没有必要为kvm单独保存.
+
+如果支持constant TSC但是进行了Refined,这种情况下会有race,尽管race很难遇到.
+tsc_refine_calibration_work()是用workqueue来asynchronously处理refined的,
+可能在kvm完成snapshot之后才完成.这样保存的cpu_tsc_khz就不准确了.
+Refined距离初始化晚了40-second.
+
+[    0.000000] tsc: Fast TSC calibration using PIT
+[    0.001000] tsc: Detected 3392.254 MHz processor
+[    0.002000] Calibrating delay loop (skipped), value calculated using timer frequency.. 6784.50 BogoMIPS (lpj=3392254)
+... ...
+[   41.055019] tsc: Refined TSC clocksource calibration: 3392.422 MHz
+
+比如一个crash的例子. 在4.14上是3392425, 对应dmesg
+[    5.536054] tsc: Refined TSC clocksource calibration: 3392.425 MHz
+
+4.14在简单测试的时候
+crash> cpu_khz
+cpu_khz = $4 = 3392635
+crash> tsc_khz
+tsc_khz = $5 = 3392425
+
+
+这个patch的核心就是不再保存了.
+
++/*
++ * Use the kernel's tsc_khz directly if the TSC is constant, otherwise use KVM's
++ * per-CPU value (which may be zero if a CPU is going offline).  Note, tsc_khz
++ * can change during boot even if the TSC is constant, as it's possible for KVM
++ * to be loaded before TSC calibration completes.  Ideally, KVM would get a
++ * notification when calibration completes, but practically speaking calibration
++ * will complete before userspace is alive enough to create VMs.
++ */
++static unsigned long get_cpu_tsc_khz(void)
++{
++	if (static_cpu_has(X86_FEATURE_CONSTANT_TSC))
++		return tsc_khz;
++	else
++		return __this_cpu_read(cpu_tsc_khz);
++}
+
+
+还有就是用WARN_ON_ONCE()检测初始化完成后不应该再变了(如果是constant的).
+
+@@ -8646,9 +8663,11 @@ static void tsc_khz_changed(void *data)
+ 	struct cpufreq_freqs *freq = data;
+ 	unsigned long khz = 0;
+
++	WARN_ON_ONCE(boot_cpu_has(X86_FEATURE_CONSTANT_TSC));
++
+ 	if (data)
+ 		khz = freq->new;
+-	else if (!boot_cpu_has(X86_FEATURE_CONSTANT_TSC))
++	else
+ 		khz = cpufreq_quick_get(raw_smp_processor_id());
+ 	if (!khz)
+ 		khz = tsc_khz;

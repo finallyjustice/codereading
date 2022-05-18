@@ -1,0 +1,106 @@
+[PATCH] KVM: VMX: do not disable interception for MSR_IA32_SPEC_CTRL on eIBRS
+
+... from Jon Kohler <jon@nutanix.com> ...
+
+https://lore.kernel.org/all/20220512174427.3608-1-jon@nutanix.com/
+
+这个patch的核心思想是减少在vmx entry和exit的时候native write msr(MSR_IA32_SPEC_CTRL)的次数.
+
+------------------------------
+
+关于MSR_IA32_SPEC_CTRL ...
+
+Intel更新microcode后,CPU将会有IBRS(限制间接分支预测)以及IBPB(间接分支预测屏障)的MSR.
+
+AMD K10架构以后已有类似IBRS和IBPB的相关功能,不需要微码补丁.但更新微码补丁后将不再需要IBRS
+
+
+在虚拟化vmx使用MSR_IA32_SPEC_CTRL的时候,在write msr的时候,在line 2087配置不再vmexit对于MSR_IA32_SPEC_CTRL的rw.
+
+1957 static int vmx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+1958 {
+... ...
+2063         case MSR_IA32_SPEC_CTRL:
+2064                 if (!msr_info->host_initiated &&
+2065                     !guest_has_spec_ctrl_msr(vcpu))
+2066                         return 1;
+2067
+2068                 if (kvm_spec_ctrl_test_value(data))
+2069                         return 1;
+2070
+2071                 vmx->spec_ctrl = data;
+2072                 if (!data)
+2073                         break;
+2074
+2075                 /*
+2076                  * For non-nested:
+2077                  * When it's written (to non-zero) for the first time, pass
+2078                  * it through.
+2079                  *
+2080                  * For nested:
+2081                  * The handling of the MSR bitmap for L2 guests is done in
+2082                  * nested_vmx_prepare_msr_bitmap. We should not touch the
+2083                  * vmcs02.msr_bitmap here since it gets completely overwritten
+2084                  * in the merging. We update the vmcs01 here for L1 as well
+2085                  * since it will end up touching the MSR anyway now.
+2086                  */
+2087                 vmx_disable_intercept_for_msr(vcpu,
+2088                                               MSR_IA32_SPEC_CTRL,
+2089                                               MSR_TYPE_RW);
+
+
+在vmx enter的时候:
+
+(1) 在line 6914更新host的MSR_IA32_SPEC_CTRL.
+
+(2) 在line 6917 enter vmx
+
+(3) exit的时候, 如果不vmexit MSR_IA32_SPEC_CTRL, 就要手动的保存 (line 6935). 这个native MSR access有性能开销.
+
+(4) 在line 6937恢复host的MSR_IA32_SPEC_CTRL.
+
+6818 static fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu)
+6819 {
+... ...
+6908         /*
+6909          * If this vCPU has touched SPEC_CTRL, restore the guest's value if
+6910          * it's non-zero. Since vmentry is serialising on affected CPUs, there
+6911          * is no need to worry about the conditional branch over the wrmsr
+6912          * being speculatively taken.
+6913          */
+6914         x86_spec_ctrl_set_guest(vmx->spec_ctrl, 0);
+6915
+6916         /* The actual VMENTER/EXIT is in the .noinstr.text section. */
+6917         vmx_vcpu_enter_exit(vcpu, vmx);
+6918
+6919         /*
+6920          * We do not use IBRS in the kernel. If this vCPU has used the
+6921          * SPEC_CTRL MSR it may have left it on; save the value and
+6922          * turn it off. This is much more efficient than blindly adding
+6923          * it to the atomic save/restore list. Especially as the former
+6924          * (Saving guest MSRs on vmexit) doesn't even exist in KVM.
+6925          *
+6926          * For non-nested case:
+6927          * If the L01 MSR bitmap does not intercept the MSR, then we need to
+6928          * save it.
+6929          *
+6930          * For nested case:
+6931          * If the L02 MSR bitmap does not intercept the MSR, then we need to
+6932          * save it.
+6933          */
+6934         if (unlikely(!msr_write_intercepted(vmx, MSR_IA32_SPEC_CTRL)))
+6935                 vmx->spec_ctrl = native_read_msr(MSR_IA32_SPEC_CTRL);
+6936
+6937         x86_spec_ctrl_restore_host(vmx->spec_ctrl, 0);
+
+------------------------------
+
+这个patch的核心思想就是减少line 6935的开销.
+
+不同于IBRS, eIBRS (Enhanced Indirect Branch Restricted Speculation)只需要写几次, 所以没必要每次enter/exit就native read/write.
+
+关于eIBRS:
+
+https://blogs.oracle.com/linux/post/an-update-on-meltdown-and-enhanced-ibrs
+
+https://tucao.org/archives/2018-01/cpu-meltdown-spectre-what-we-know.html

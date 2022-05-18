@@ -1,0 +1,82 @@
+[PATCH v3] KVM: x86/mmu: Update number of zapped pages even if page list is stable
+
+... from Sean Christopherson <seanjc@google.com> ...
+
+https://lore.kernel.org/all/20220511145122.3133334-1-seanjc@google.com/
+
+这个patch解决下面的softlockup.
+
+ watchdog: BUG: soft lockup - CPU#12 stuck for 22s! [dirty_log_perf_:13020]
+   RIP: 0010:workingset_activation+0x19/0x130
+   mark_page_accessed+0x266/0x2e0
+   kvm_set_pfn_accessed+0x31/0x40
+   mmu_spte_clear_track_bits+0x136/0x1c0
+   drop_spte+0x1a/0xc0
+   mmu_page_zap_pte+0xef/0x120
+   __kvm_mmu_prepare_zap_page+0x205/0x5e0
+   kvm_mmu_zap_all_fast+0xd7/0x190
+   kvm_mmu_invalidate_zap_pages_in_memslot+0xe/0x10
+   kvm_page_track_flush_slot+0x5c/0x80
+   kvm_arch_flush_shadow_memslot+0xe/0x10
+   kvm_set_memslot+0x1a8/0x5d0
+   __kvm_set_memory_region+0x337/0x590
+   kvm_vm_ioctl+0xb08/0x1040
+
+
+因为line 5699返回false的时候并不会更新batch.
+所以在一些条件下,line 5693的resched不会触发.
+一直占用cpu就会导致softlockup.
+
+5664 static void kvm_zap_obsolete_pages(struct kvm *kvm)
+5665 {
+5666         struct kvm_mmu_page *sp, *node;
+5667         int nr_zapped, batch = 0;
+5668
+5669 restart:
+5670         list_for_each_entry_safe_reverse(sp, node,
+5671               &kvm->arch.active_mmu_pages, link) {
+5672                 /*
+5673                  * No obsolete valid page exists before a newly created page
+5674                  * since active_mmu_pages is a FIFO list.
+5675                  */
+5676                 if (!is_obsolete_sp(kvm, sp))
+5677                         break;
+5678
+5679                 /*
+5680                  * Invalid pages should never land back on the list of active
+5681                  * pages.  Skip the bogus page, otherwise we'll get stuck in an
+5682                  * infinite loop if the page gets put back on the list (again).
+5683                  */
+5684                 if (WARN_ON(sp->role.invalid))
+5685                         continue;
+5686
+5687                 /*
+5688                  * No need to flush the TLB since we're only zapping shadow
+5689                  * pages with an obsolete generation number and all vCPUS have
+5690                  * loaded a new root, i.e. the shadow pages being zapped cannot
+5691                  * be in active use by the guest.
+5692                  */
+5693                 if (batch >= BATCH_ZAP_PAGES &&
+5694                     cond_resched_rwlock_write(&kvm->mmu_lock)) {
+5695                         batch = 0;
+5696                         goto restart;
+5697                 }
+5698
+5699                 if (__kvm_mmu_prepare_zap_page(kvm, sp,
+5700                                 &kvm->arch.zapped_obsolete_pages, &nr_zapped)) {
+5701                         batch += nr_zapped;
+5702                         goto restart;
+5703                 }
+5704         }
+5705
+5706         /*
+5707          * Kick all vCPUs (via remote TLB flush) before freeing the page tables
+5708          * to ensure KVM is not in the middle of a lockless shadow page table
+5709          * walk, which may reference the pages.  The remote TLB flush itself is
+5710          * not required and is simply a convenient way to kick vCPUs as needed.
+5711          * KVM performs a local TLB flush when allocating a new root (see
+5712          * kvm_mmu_load()), and the reload in the caller ensure no vCPUs are
+5713          * running with an obsolete MMU.
+5714          */
+5715         kvm_mmu_commit_zap_page(kvm, &kvm->arch.zapped_obsolete_pages);
+5716 }
