@@ -1,0 +1,173 @@
+[PATCH v2 0/2] KVM: VMX: Sanitize VM-Entry/VM-Exit pairs during setup
+
+... from Sean Christopherson <seanjc@google.com> ...
+
+https://lore.kernel.org/all/20220527170658.3571367-1-seanjc@google.com/
+
+==============================================
+
+[PATCH v2 1/2] KVM: VMX: Sanitize VM-Entry/VM-Exit control pairs at kvm_intel load time
+
+在vm entry的时候会从指定的地方load一些MSR到guest mode
+
+在vm exit的时候,不但会从guest save一些到指定的地方,还会从另外指定的地方load一些到host mode
+
+在vm entry的时候只会load, 下面是要load的msr的指定地方(count和存放的地方)
+	
+VM_ENTRY_MSR_LOAD_ADDR          = 0x0000200a,
+VM_ENTRY_MSR_LOAD_ADDR_HIGH     = 0x0000200b,
+VM_ENTRY_MSR_LOAD_COUNT         = 0x00004014,
+
+在vm exit的时候可能load,也可能store.
+
+VM_EXIT_MSR_STORE_ADDR          = 0x00002006,
+VM_EXIT_MSR_STORE_ADDR_HIGH     = 0x00002007,
+VM_EXIT_MSR_LOAD_ADDR           = 0x00002008,
+VM_EXIT_MSR_LOAD_ADDR_HIGH      = 0x00002009,
+VM_EXIT_MSR_STORE_COUNT         = 0x0000400e
+VM_EXIT_MSR_LOAD_COUNT          = 0x00004010,
+
+
+哪些msr要load, clear或者save都是在vm entry control和vm exit control设置的.
+
+这个patch认为同时检查entry和exit对应的时候都设置了不好,因为如果只有一个支持整个函数就返回false引起bug.
+
+但是事实上没有CPU这样做.
+
+ static inline bool cpu_has_load_ia32_efer(void)
+ {
+-       return (vmcs_config.vmentry_ctrl & VM_ENTRY_LOAD_IA32_EFER) &&
+-              (vmcs_config.vmexit_ctrl & VM_EXIT_LOAD_IA32_EFER);
++       return vmcs_config.vmentry_ctrl & VM_ENTRY_LOAD_IA32_EFER;
+ }
+
+这个patch改成在初始化的时候检查entry和exit对应的bit时候设置了,如果没设置, 在entry和exit都删除掉.
+
+@@ -2614,6 +2632,20 @@ static __init int setup_vmcs_config(struct vmcs_config *vmcs_conf,
+                                 &_vmentry_control) < 0)
+                 return -EIO;
+ 
++       for (i = 0; i < ARRAY_SIZE(vmcs_entry_exit_pairs); i++) {
++               u32 n_ctrl = vmcs_entry_exit_pairs[i].entry_control;
++               u32 x_ctrl = vmcs_entry_exit_pairs[i].exit_control;
++
++               if (!(_vmentry_control & n_ctrl) == !(_vmexit_control & x_ctrl))
++                       continue;
++
++               pr_warn_once("Inconsistent VM-Entry/VM-Exit pair, entry = %x, exit = %x\n",
++                            _vmentry_control & n_ctrl, _vmexit_control & x_ctrl);
++
++               _vmentry_control &= ~n_ctrl;
++               _vmexit_control &= ~x_ctrl;
++       }
++
+
+===================================================
+
+[PATCH v2 2/2] KVM: VMX: Reject kvm_intel if an inconsistent VMCS config is detected
+
+patch的核心是MSR_IA32_VMX_PROCBASED_CTLS2和MSR_IA32_VMX_EPT_VPID_CAP的结果不一致的时候报错,这个不会发生的,
+除非是硬件错误或者是nested virtualization的L1有bug.
+
+
+关于MSR_IA32_VMX_PROCBASED_CTLS2,根据手册,也就是说high 32-bit表示哪些bit可以设置成1, low 32-bit表示哪些可以设置成0.
+
+Secondary Processor-Based VM-Execution Controls
+
+The IA32_VMX_PROCBASED_CTLS2 MSR (index 48BH) reports on the allowed settings of the secondary processor-
+based VM-execution controls (see Section 24.6.2). The following items provide details, including enforcement by
+VM entry:
+
+- Bits 31:0 indicate the allowed 0-settings of these controls. These bits are always 0. This fact indicates that
+VM entry allows each bit of the secondary processor-based VM-execution controls to be 0 (reserved bits must
+be 0)
+
+- Bits 63:32 indicate the allowed 1-settings of these controls; the 1-setting is not allowed for any reserved bit.
+VM entry allows control X (bit X of the secondary processor-based VM-execution controls) to be 1 if bit 32+X in
+the MSR is set to 1; if bit 32+X in the MSR is cleared to 0, VM entry fails if control X and the “activate secondary
+controls” primary processor-based VM-execution control are both 1.
+
+The IA32_VMX_PROCBASED_CTLS2 MSR exists only on processors that support the 1-setting of the “activate
+secondary controls” VM-execution control (only if bit 63 of the IA32_VMX_PROCBASED_CTLS MSR is 1).
+
+
+一开始的时候setup_vmcs_config()会在opt2初始化一个想要的版本,SECONDARY_EXEC_ENABLE_EPT是激活的.
+
+2498 static __init int setup_vmcs_config(struct vmcs_config *vmcs_conf,
+2499                                     struct vmx_capability *vmx_cap)
+2500 {
+... ...
+2536         if (_cpu_based_exec_control & CPU_BASED_ACTIVATE_SECONDARY_CONTROLS) {
+2537                 min2 = 0;
+2538                 opt2 = SECONDARY_EXEC_VIRTUALIZE_APIC_ACCESSES |
+2539                         SECONDARY_EXEC_VIRTUALIZE_X2APIC_MODE |
+2540                         SECONDARY_EXEC_WBINVD_EXITING |
+2541                         SECONDARY_EXEC_ENABLE_VPID |
+2542                         SECONDARY_EXEC_ENABLE_EPT |
+2543                         SECONDARY_EXEC_UNRESTRICTED_GUEST |
+2544                         SECONDARY_EXEC_PAUSE_LOOP_EXITING |
+2545                         SECONDARY_EXEC_DESC |
+2546                         SECONDARY_EXEC_ENABLE_RDTSCP |
+2547                         SECONDARY_EXEC_ENABLE_INVPCID |
+2548                         SECONDARY_EXEC_APIC_REGISTER_VIRT |
+2549                         SECONDARY_EXEC_VIRTUAL_INTR_DELIVERY |
+2550                         SECONDARY_EXEC_SHADOW_VMCS |
+2551                         SECONDARY_EXEC_XSAVES |
+2552                         SECONDARY_EXEC_RDSEED_EXITING |
+2553                         SECONDARY_EXEC_RDRAND_EXITING |
+2554                         SECONDARY_EXEC_ENABLE_PML |
+2555                         SECONDARY_EXEC_TSC_SCALING |
+2556                         SECONDARY_EXEC_ENABLE_USR_WAIT_PAUSE |
+2557                         SECONDARY_EXEC_PT_USE_GPA |
+2558                         SECONDARY_EXEC_PT_CONCEAL_VMX |
+2559                         SECONDARY_EXEC_ENABLE_VMFUNC |
+2560                         SECONDARY_EXEC_BUS_LOCK_DETECTION;
+2561                 if (cpu_has_sgx())
+2562                         opt2 |= SECONDARY_EXEC_ENCLS_EXITING;
+2563                 if (adjust_vmx_controls(min2, opt2,
+2564                                         MSR_IA32_VMX_PROCBASED_CTLS2,
+2565                                         &_cpu_based_2nd_exec_control) < 0)
+2566                         return -EIO;
+2567         }
+
+
+在line 2563调用adjust_vmx_controls()判断SECONDARY_EXEC_ENABLE_EPT有没有被high 32-bit删掉.
+
+2474 static __init int adjust_vmx_controls(u32 ctl_min, u32 ctl_opt,
+2475                                       u32 msr, u32 *result)
+2476 {
+2477         u32 vmx_msr_low, vmx_msr_high;
+2478         u32 ctl = ctl_min | ctl_opt;
+2479
+2480         rdmsr(msr, vmx_msr_low, vmx_msr_high);
+2481
+2482         ctl &= vmx_msr_high; /* bit == 0 in high word ==> must be zero */
+2483         ctl |= vmx_msr_low;  /* bit == 1 in low word  ==> must be one  */
+2484
+2485         /* Ensure minimum (required) set of control bits are supported. */
+2486         if (ctl_min & ~ctl)
+2487                 return -EIO;
+2488
+2489         *result = ctl;
+2490         return 0;
+2491 }
+
+如果删掉就会进入line 2589, 和MSR_IA32_VMX_EPT_VPID_CAP的结果不一致.
+
+2583         if (_cpu_based_2nd_exec_control & SECONDARY_EXEC_ENABLE_EPT) {
+2584                 /* CR3 accesses and invlpg don't need to cause VM Exits when EPT
+2585                    enabled */
+2586                 _cpu_based_exec_control &= ~(CPU_BASED_CR3_LOAD_EXITING |
+2587                                              CPU_BASED_CR3_STORE_EXITING |
+2588                                              CPU_BASED_INVLPG_EXITING);
+2589         } else if (vmx_cap->ept) {
+2590                 vmx_cap->ept = 0;
+2591                 pr_warn_once("EPT CAP should not exist if not support "
+2592                                 "1-setting enable EPT VM-execution control\n");
+2593         }
+2594         if (!(_cpu_based_2nd_exec_control & SECONDARY_EXEC_ENABLE_VPID) &&
+2595                 vmx_cap->vpid) {
+2596                 vmx_cap->vpid = 0;
+2597                 pr_warn_once("VPID CAP should not exist if not support "
+2598                                 "1-setting enable VPID VM-execution control\n");
+2599         }

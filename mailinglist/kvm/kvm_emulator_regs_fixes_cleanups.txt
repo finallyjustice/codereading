@@ -1,0 +1,191 @@
+[PATCH v2 0/8] KVM: x86: Emulator _regs fixes and cleanups
+
+... from Sean Christopherson <seanjc@google.com> ...
+
+https://lore.kernel.org/all/20220526210817.3428868-1-seanjc@google.com/
+
+在gcc-12之后, commit e6148767825c ("Makefile: Enable -Warray-bounds")激活了新的选项.
+因为gcc的bug, 编译linux的时候会报out of bound access的error.
+
+-------------------------------
+
+[PATCH v2 1/8] KVM: x86: Grab regs_dirty in local 'unsigned long'
+
+ctxt->regs_dirty是32-bit的.但是gcc会在for_each_set_bit()中从ctxt->regs_dirty拷贝64-bit(因为ulong *,尽管16的上限被设置了)的cast.
+
+@@ -269,9 +269,10 @@ static ulong *reg_rmw(struct x86_emulate_ctxt *ctxt, unsigned nr)
+
+ static void writeback_registers(struct x86_emulate_ctxt *ctxt)
+ {
++	unsigned long dirty = ctxt->regs_dirty;
+ 	unsigned reg;
+
+-	for_each_set_bit(reg, (ulong *)&ctxt->regs_dirty, 16)
++	for_each_set_bit(reg, &dirty, 16)
+ 		ctxt->ops->write_gpr(ctxt, reg, ctxt->_regs[reg]);
+ }
+
+-------------------------------
+
+[PATCH v2 2/8] KVM: x86: Harden _regs accesses to guard against buggy input
+
+gcc-12错误的认为ctxt->_regs[nr]的nr可能大于17 (unsigned long _regs[NR_VCPU_REGS];)
+
+这里的patch用的'16'因为Sean认为VCPU_REGS_RIP不会在这些函数的调用中使用.稍后会改成16.
+
+diff --git a/arch/x86/kvm/emulate.c b/arch/x86/kvm/emulate.c
+index 7226a127ccb4..c58366ae4da2 100644
+--- a/arch/x86/kvm/emulate.c
++++ b/arch/x86/kvm/emulate.c
+@@ -247,6 +247,9 @@ enum x86_transfer_type {
+
+ static ulong reg_read(struct x86_emulate_ctxt *ctxt, unsigned nr)
+ {
++	if (WARN_ON_ONCE(nr >= 16))
++		nr &= 16 - 1;
++
+ 	if (!(ctxt->regs_valid & (1 << nr))) {
+ 		ctxt->regs_valid |= 1 << nr;
+ 		ctxt->_regs[nr] = ctxt->ops->read_gpr(ctxt, nr);
+@@ -256,6 +259,9 @@ static ulong reg_read(struct x86_emulate_ctxt *ctxt, unsigned nr)
+
+ static ulong *reg_write(struct x86_emulate_ctxt *ctxt, unsigned nr)
+ {
++	if (WARN_ON_ONCE(nr >= 16))
++		nr &= 16 - 1;
++
+ 	ctxt->regs_valid |= 1 << nr;
+ 	ctxt->regs_dirty |= 1 << nr;
+ 	return &ctxt->_regs[nr];
+	
+-------------------------------
+
+[PATCH v2 3/8] KVM: x86: Omit VCPU_REGS_RIP from emulator's _regs array
+
+这里就是紧接着上面的patch的修改. x86_emulate_ctxt->_regs[NR_VCPU_REGS](17个)改成_regs[NR_VCPU_REGS](16个).
+
++/*
++ * The emulator's _regs array tracks only the GPRs, i.e. excludes RIP.  RIP is
++ * tracked/accessed via _eip, and except for RIP relative addressing, which
++ * also uses _eip, RIP cannot be a register operand nor can it be an operand in
++ * a ModRM or SIB byte.
++ *
++ * TODO: this is technically wrong for 32-bit KVM, which only supports 8 GPRs;
++ * R8-R15 don't exist.
++ */
++#define NR_EMULATOR_GPRS	16
++
+
+-------------------------------
+
+[PATCH v2 4/8] KVM: x86: Use 16-bit fields to track dirty/valid emulator GPRs
+
+因为寄存器使用的_regs[NR_VCPU_REGS]是16个了, 所以u16就够了.
+
++++ b/arch/x86/kvm/kvm_emulate.h
+@@ -356,9 +356,9 @@ struct x86_emulate_ctxt {
+ 	u8 lock_prefix;
+ 	u8 rep_prefix;
+ 	/* bitmaps of registers in _regs[] that can be read */
+-	u32 regs_valid;
++	u16 regs_valid;
+ 	/* bitmaps of registers in _regs[] that have been written */
+-	u32 regs_dirty;
++	u16 regs_dirty;
+ 	/* modrm */
+ 	u8 modrm;
+ 	u8 modrm_mod;
+
+-------------------------------
+
+[PATCH v2 5/8] KVM: x86: Reduce the number of emulator GPRs to '8' for 32-bit KVM
+
+32-bit下的linux的GPRs在KVM只用8个(64-bit的GPRs是16个).
+
+@@ -306,11 +306,12 @@ typedef void (*fastop_t)(struct fastop *);
+  * tracked/accessed via _eip, and except for RIP relative addressing, which
+  * also uses _eip, RIP cannot be a register operand nor can it be an operand in
+  * a ModRM or SIB byte.
+- *
+- * TODO: this is technically wrong for 32-bit KVM, which only supports 8 GPRs;
+- * R8-R15 don't exist.
+  */
++#ifdef CONFIG_X86_64
+ #define NR_EMULATOR_GPRS	16
++#else
++#define NR_EMULATOR_GPRS	8
++#endif
+
+-------------------------------
+
+[PATCH v2 6/8] KVM: x86: Bug the VM if the emulator accesses a non-existent GPR
+
+在"struct x86_emulate_ops"中添加了新的callback.
+
+ struct x86_emulate_ops {
++	void (*vm_bugged)(struct x86_emulate_ctxt *ctxt);
+ 	/*
+ 	 * read_gpr: read a general purpose register (rax - r15)
+ 	 *
+
+
+最后实际调用的是kvm_vm_bugged().
+
++static void emulator_vm_bugged(struct x86_emulate_ctxt *ctxt)
++{
++	struct kvm *kvm = emul_to_vcpu(ctxt)->kvm;
++
++	if (!kvm->vm_bugged)
++		kvm_vm_bugged(kvm);
++}
++
+ static const struct x86_emulate_ops emulate_ops = {
++	.vm_bugged           = emulator_vm_bugged,
+ 	.read_gpr            = emulator_read_gpr,
+ 	.write_gpr           = emulator_write_gpr,
+ 	.read_std            = emulator_read_std,
+
+
+
+kvm run failed Input/output error
+EAX=00000000 EBX=00000000 ECX=00000000 EDX=00060fb1
+ESI=00000000 EDI=00000000 EBP=00000000 ESP=00000000
+EIP=0000fff0 EFL=00000002 [-------] CPL=0 II=0 A20=1 SMM=0 HLT=1
+ES =0000 00000000 0000ffff 00009300
+CS =f000 ffff0000 0000ffff 00009b00
+SS =0000 00000000 0000ffff 00009300
+DS =0000 00000000 0000ffff 00009300
+FS =0000 00000000 0000ffff 00009300
+GS =0000 00000000 0000ffff 00009300
+LDT=0000 00000000 0000ffff 00008200
+TR =0000 00000000 0000ffff 00008b00
+GDT=     00000000 0000ffff
+IDT=     00000000 0000ffff
+CR0=60000010 CR2=00000000 CR3=00000000 CR4=00000000
+DR0=0000000000000000 DR1=0000000000000000 DR2=0000000000000000 DR3=0000000000000000 
+DR6=00000000ffff0ff0 DR7=0000000000000400
+EFER=0000000000000000
+Code=04 66 41 eb f1 66 83 c9 ff 66 89 c8 66 5b 66 5e 66 5f 66 c3 <ea> 5b e0 00 f0 30 36 2f 32 33 2f 39 39 00 fc 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+KVM_GET_PIT2 failed: Input/output error
+Aborted (core dumped)
+
+
+在QEMU中被下面返回.
+
+2856 int kvm_cpu_exec(CPUState *cpu)
+2857 {
+... ...
+2909         if (run_ret < 0) {
+2910             if (run_ret == -EINTR || run_ret == -EAGAIN) {
+2911                 DPRINTF("io window exit\n");
+2912                 kvm_eat_signals(cpu);
+2913                 ret = EXCP_INTERRUPT;
+2914                 break;
+2915             }
+
+-------------------------------
+
+[PATCH v2 7/8] KVM: x86: Bug the VM if the emulator generates a bogus exception vector Sean Christopherson
+[PATCH v2 8/8] KVM: x86: Bug the VM on an out-of-bounds data read Sean Christopherson
+
+最后两个patch都是在一些vector/exception的地方,判断.

@@ -1,0 +1,75 @@
+[PATCH] KVM: Free new dirty bitmap if creating a new memslot fails
+
+... from Sean Christopherson <seanjc@google.com> ...
+
+https://lore.kernel.org/all/20220518003842.1341782-1-seanjc@google.com/
+
+就是失败的时候没有free内存的问题. 比方下面的例子, 完全没有old, 就是CREATE.
+
+  ioctl(3, KVM_CREATE_VM, 0)              = 4
+  ioctl(4, KVM_SET_USER_MEMORY_REGION, {slot=0,
+                                        flags=KVM_MEM_LOG_DIRTY_PAGES,
+                                        guest_phys_addr=0x10000000000000,
+                                        memory_size=4096,
+                                        userspace_addr=0x20fe8000}
+       ) = -1 EINVAL (Invalid argument)
+
+
+@@ -1560,7 +1560,7 @@ static int kvm_prepare_memory_region(struct kvm *kvm,
+ 	r = kvm_arch_prepare_memory_region(kvm, old, new, change);
+ 
+ 	/* Free the bitmap on failure if it was allocated above. */
+-	if (r && new && new->dirty_bitmap && old && !old->dirty_bitmap)
++	if (r && new && new->dirty_bitmap && (!old || !old->dirty_bitmap))
+ 		kvm_destroy_dirty_bitmap(new);
+ 
+ 	return r;
+
+
+
+关于patch中的 ...
+
+"The logic is supposed to detect if the bitmap was allocated and thus needs to
+be freed, versus if the bitmap was inherited from the old memslot and thus
+needs to be kept.  If there is no old memslot, then obviously the bitmap can't
+have been inherited"
+
+... 应该是在line 1545-1558:
+
+1531 static int kvm_prepare_memory_region(struct kvm *kvm,
+1532                                      const struct kvm_memory_slot *old,
+1533                                      struct kvm_memory_slot *new,
+1534                                      enum kvm_mr_change change)
+1535 {
+1536         int r;
+1537 
+1538         /*
+1539          * If dirty logging is disabled, nullify the bitmap; the old bitmap
+1540          * will be freed on "commit".  If logging is enabled in both old and
+1541          * new, reuse the existing bitmap.  If logging is enabled only in the
+1542          * new and KVM isn't using a ring buffer, allocate and initialize a
+1543          * new bitmap.
+1544          */
+1545         if (change != KVM_MR_DELETE) {
+1546                 if (!(new->flags & KVM_MEM_LOG_DIRTY_PAGES))
+1547                         new->dirty_bitmap = NULL;
+1548                 else if (old && old->dirty_bitmap)
+1549                         new->dirty_bitmap = old->dirty_bitmap;
+1550                 else if (!kvm->dirty_ring_size) {
+1551                         r = kvm_alloc_dirty_bitmap(new);
+1552                         if (r)
+1553                                 return r;
+1554 
+1555                         if (kvm_dirty_log_manual_protect_and_init_set(kvm))
+1556                                 bitmap_set(new->dirty_bitmap, 0, new->npages);
+1557                 }
+1558         }
+1559 
+1560         r = kvm_arch_prepare_memory_region(kvm, old, new, change);
+1561 
+1562         /* Free the bitmap on failure if it was allocated above. */
+1563         if (r && new && new->dirty_bitmap && old && !old->dirty_bitmap)
+1564                 kvm_destroy_dirty_bitmap(new);
+1565 
+1566         return r;
+1567 }

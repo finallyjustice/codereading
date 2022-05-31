@@ -1,0 +1,98 @@
+[PATCH v2 1/2] KVM: Inject #GP on invalid write to APIC_SELF_IPI register
+
+... from Venkatesh Srinivas <venkateshs@chromium.org> ...
+
+https://lore.kernel.org/all/20220525173933.1611076-1-venkateshs@chromium.org/
+
+这个patch主要是说x2APIC APIC_SELF_IPI只有低7-bit被用作vector, 其他都是reserved的.
+所以通过让kvm_lapic_reg_write()返回1, 来向VM插入GP.
+
+
+返回1会给guest inject一个GP: the intent is to inject a #GP
+
+返回-1会让QEMU kill掉guest: not exit to userspace due to an unhandled
+emulation case.  Returning '-1' gets interpreted as -EPERM up the stack
+and effecitvely kills the guest.
+
+
+下面是代码的分析 (没有验证过).
+
+__vmx_handle_exit()
+-> if (exit_reason.basic == EXIT_REASON_MSR_WRITE) kvm_emulate_wrmsr
+   -> kvm_set_msr()
+      -> return kvm_set_msr_ignored_check(vcpu, index, data, false);
+         -> int ret = __kvm_set_msr(vcpu, index, data, host_initiated);
+            -> return static_call(kvm_x86_set_msr)(vcpu, &msr); --> vmx_x86_ops.set_msr = vmx_set_msr()
+               -> ret = kvm_set_msr_common(vcpu, msr_info);
+                  -> -> return set_msr_mce(vcpu, msr_info)
+
+
+ret(-1或者1)最终会返回到line 2003.
+
+最终到达line 2013. 如果是-1, kvm_emulate_wrmsr()返回-1.
+
+1997 int kvm_emulate_wrmsr(struct kvm_vcpu *vcpu)
+1998 {
+1999         u32 ecx = kvm_rcx_read(vcpu);
+2000         u64 data = kvm_read_edx_eax(vcpu);
+2001         int r;
+2002
+2003         r = kvm_set_msr(vcpu, ecx, data);
+2004
+2005         if (!r) {
+2006                 trace_kvm_msr_write(ecx, data);
+2007         } else {
+2008                 /* MSR write failed? See if we should ask user space */
+2009                 if (kvm_msr_user_space(vcpu, ecx, KVM_EXIT_X86_WRMSR, data,
+2010                                        complete_fast_msr_access, r))
+2011                         return 0;
+2012                 /* Signal all other negative errors to userspace */
+2013                 if (r < 0)
+2014                         return r;
+2015                 trace_kvm_msr_write_ex(ecx, data);
+2016         }
+2017
+2018         return static_call(kvm_x86_complete_emulated_msr)(vcpu, r);
+2019 }
+2020 EXPORT_SYMBOL_GPL(kvm_emulate_wrmsr);
+
+
+如果是1的话, line 2018会调用kvm_complete_insn_gp(). 最终在line 760 inject gp!
+
+757 int kvm_complete_insn_gp(struct kvm_vcpu *vcpu, int err)
+758 {
+759         if (err)
+760                 kvm_inject_gp(vcpu, 0);
+761         else
+762                 return kvm_skip_emulated_instruction(vcpu);
+763
+764         return 1;
+765 }
+
+
+====================================================
+
+[PATCH v2 2/2] KVM: Inject #GP on invalid writes to x2APIC registers
+
+... from Venkatesh Srinivas <venkateshs@chromium.org> ...
+
+https://lore.kernel.org/all/20220525173933.1611076-2-venkateshs@chromium.org/
+
+这个patch认为upper bytes of any x2APIC register are reserved.
+
+根据Sean Christopherson, 这是不对的.
+ICR就是64位的.于是Sean建议修改检查的位置,绕过ICR.
+
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 39b805666a18..54d0f350acdf 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -2892,6 +2892,9 @@ static int kvm_lapic_msr_write(struct kvm_lapic *apic, u32 reg, u64 data)
+        if (reg == APIC_ICR)
+                return kvm_x2apic_icr_write(apic, data);
+
++       if (data >> 32)
++               return 1;
++
+        return kvm_lapic_reg_write(apic, reg, (u32)data);
+ }
