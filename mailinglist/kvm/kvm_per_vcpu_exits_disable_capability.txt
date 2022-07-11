@@ -1,0 +1,242 @@
+[RFC PATCH v4 0/7] KVM: x86: add per-vCPU exits disable capability
+
+... from Kechen Lu <kechenl@nvidia.com> ...
+https://lore.kernel.org/all/20220622004924.155191-1-kechenl@nvidia.com/
+
+
+ 5954 int kvm_vm_ioctl_enable_cap(struct kvm *kvm,
+ 5955                             struct kvm_enable_cap *cap)
+... ...
+ 6007         case KVM_CAP_X86_DISABLE_EXITS:
+ 6008                 r = -EINVAL;
+ 6009                 if (cap->args[0] & ~KVM_X86_DISABLE_VALID_EXITS)
+ 6010                         break;
+ 6011
+ 6012                 if ((cap->args[0] & KVM_X86_DISABLE_EXITS_MWAIT) &&
+ 6013                         kvm_can_mwait_in_guest())
+ 6014                         kvm->arch.mwait_in_guest = true;
+ 6015                 if (cap->args[0] & KVM_X86_DISABLE_EXITS_HLT)
+ 6016                         kvm->arch.hlt_in_guest = true;
+ 6017                 if (cap->args[0] & KVM_X86_DISABLE_EXITS_PAUSE)
+ 6018                         kvm->arch.pause_in_guest = true;
+ 6019                 if (cap->args[0] & KVM_X86_DISABLE_EXITS_CSTATE)
+ 6020                         kvm->arch.cstate_in_guest = true;
+ 6021                 r = 0;
+ 6022                 break;
+
+ Summary
+===========
+Introduce support of vCPU-scoped ioctl with KVM_CAP_X86_DISABLE_EXITS
+cap for disabling exits to enable finer-grained VM exits disabling
+on per vCPU scales instead of whole guest. This patch series enabled
+the vCPU-scoped exits control and toggling.
+
+Motivation
+============
+In use cases like Windows guest running heavy CPU-bound
+workloads, disabling HLT VM-exits could mitigate host sched ctx switch
+overhead. Simply HLT disabling on all vCPUs could bring
+performance benefits, but if no pCPUs reserved for host threads, could
+happened to the forced preemption as host does not know the time to do
+the schedule for other host threads want to run. With this patch, we
+could only disable part of vCPUs HLT exits for one guest, this still
+keeps performance benefits, and also shows resiliency to host stressing
+workload running at the same time.
+
+Performance and Testing
+=========================
+In the host stressing workload experiment with Windows guest heavy
+CPU-bound workloads, it shows good resiliency and having the ~3%
+performance improvement. E.g. Passmark running in a Windows guest
+with this patch disabling HLT exits on only half of vCPUs still
+showing 2.4% higher main score v/s baseline.
+
+-----------------------------------------
+
+[RFC PATCH v4 1/7] KVM: x86: only allow exits disable before vCPUs created
+
+如果vcpus都被创建了, 就不要允许修改exits了.
+
+@@ -6006,6 +6006,10 @@ int kvm_vm_ioctl_enable_cap(struct kvm *kvm,
+ 		if (cap->args[0] & ~KVM_X86_DISABLE_VALID_EXITS)
+ 			break;
+
++		mutex_lock(&kvm->lock);
++		if (kvm->created_vcpus)
++			goto disable_exits_unlock;
++
+ 		if ((cap->args[0] & KVM_X86_DISABLE_EXITS_MWAIT) &&
+ 			kvm_can_mwait_in_guest())
+ 			kvm->arch.mwait_in_guest = true;
+@@ -6016,6 +6020,8 @@ int kvm_vm_ioctl_enable_cap(struct kvm *kvm,
+ 		if (cap->args[0] & KVM_X86_DISABLE_EXITS_CSTATE)
+ 			kvm->arch.cstate_in_guest = true;
+ 		r = 0;
++disable_exits_unlock:
++		mutex_unlock(&kvm->lock);
+ 		break;
+
+-----------------------------------------
+
+[RFC PATCH v4 2/7] KVM: x86: Move *_in_guest power management flags to vCPU scope
+
+把mwait_in_guest等move到kvm_vcpu_arch. 其实不能叫move, 因为会在struct kvm继续保留 ...
+
+@@ -924,6 +924,11 @@ struct kvm_vcpu_arch {
+ #if IS_ENABLED(CONFIG_HYPERV)
+ 	hpa_t hv_root_tdp;
+ #endif
++
++	bool mwait_in_guest;
++	bool hlt_in_guest;
++	bool pause_in_guest;
++	bool cstate_in_guest;
+ };
+
+... 然后创建vcpu的时候generate一个copy
+
+@@ -11355,6 +11355,10 @@ int kvm_arch_vcpu_create(struct kvm_vcpu *vcpu)
+ #if IS_ENABLED(CONFIG_HYPERV)
+ 	vcpu->arch.hv_root_tdp = INVALID_PAGE;
+ #endif
++	vcpu->arch.mwait_in_guest = vcpu->kvm->arch.mwait_in_guest;
++	vcpu->arch.hlt_in_guest = vcpu->kvm->arch.hlt_in_guest;
++	vcpu->arch.pause_in_guest = vcpu->kvm->arch.pause_in_guest;
++	vcpu->arch.cstate_in_guest = vcpu->kvm->arch.cstate_in_guest;
+
+ 	r = static_call(kvm_x86_vcpu_create)(vcpu);
+ 	if (r)
+
+-----------------------------------------
+
+[RFC PATCH v4 3/7] KVM: x86: Reject disabling of MWAIT interception when not allowed
+
+核心思想在comment的"Reject".
+
+以前如果userspace想要"disabling of MWAIT interception when not allowed", 以前返回0, 现在返回-EINVAL.
+
+-----------------------------------------
+
+[RFC PATCH v4 4/7] KVM: x86: Let userspace re-enable previously disabled exits
+
+添加一个KVM_X86_DISABLE_EXITS_OVERRIDE, 允许重新re-enable exits and/or override previous settings.
+
+-----------------------------------------
+
+[RFC PATCH v4 5/7] KVM: x86: add vCPU scoped toggling for disabled exits
+
+添加新的KVM_CAP_X86_DISABLE_EXITS来disabling exits to enable finer-grained VM
+exits disabling on per vCPU scales instead of whole guest.
+
+-----------------------------------------
+
+[RFC PATCH v4 6/7] KVM: x86: Add a new guest_debug flag forcing exit to userspace
+
+核心思想是在userspace设置KVM_GUESTDBG_EXIT_USERSPACE这样对于一些exits就能trap会userspace.
+
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 6165f0b046ed..91384a56ae0a 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -8349,6 +8349,8 @@ int kvm_skip_emulated_instruction(struct kvm_vcpu *vcpu)
+ 	 */
+ 	if (unlikely(rflags & X86_EFLAGS_TF))
+ 		r = kvm_vcpu_do_singlestep(vcpu);
++	r &= !(vcpu->guest_debug & KVM_GUESTDBG_EXIT_USERSPACE);
++
+ 	return r;
+ }
+
+
+比如当设置的时候, 有了patch, 上面的r就是false. kvm_skip_emulated_instruction()就返回false.
+因此kvm_emulate_halt()返回的就是false不是true.
+
+9082 int kvm_emulate_halt(struct kvm_vcpu *vcpu)
+9083 {
+9084         int ret = kvm_skip_emulated_instruction(vcpu);
+9085         /*
+9086          * TODO: we might be squashing a GUESTDBG_SINGLESTEP-triggered
+9087          * KVM_EXIT_DEBUG here.
+9088          */
+9089         return kvm_emulate_halt_noskip(vcpu) && ret;
+9090 }
+9091 EXPORT_SYMBOL_GPL(kvm_emulate_halt);
+
+
+6074 static int __vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
+6075 {
+... ...
+6226         else if (exit_reason.basic == EXIT_REASON_HLT)
+6227                 return kvm_emulate_halt(vcpu);
+
+
+6252 static int vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
+6253 {
+6254         int ret = __vmx_handle_exit(vcpu, exit_fastpath);
+6255
+6256         /*
+6257          * Exit to user space when bus lock detected to inform that there is
+6258          * a bus lock in guest.
+6259          */
+6260         if (to_vmx(vcpu)->exit_reason.bus_lock_detected) {
+6261                 if (ret > 0)
+6262                         vcpu->run->exit_reason = KVM_EXIT_X86_BUS_LOCK;
+6263
+6264                 vcpu->run->flags |= KVM_RUN_X86_BUS_LOCK;
+6265                 return 0;
+6266         }
+6267         return ret;
+6268 }
+
+
+10011 static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+10012 {
+... ...
+10366         r = static_call(kvm_x86_handle_exit)(vcpu, exit_fastpath);
+10367         return r;
+
+
+10440 static int vcpu_run(struct kvm_vcpu *vcpu)
+10441 {
+10442         int r;
+10443
+10444         vcpu->arch.l1tf_flush_l1d = true;
+10445
+10446         for (;;) {
+10447                 /*
+10448                  * If another guest vCPU requests a PV TLB flush in the middle
+10449                  * of instruction emulation, the rest of the emulation could
+10450                  * use a stale page translation. Assume that any code after
+10451                  * this point can start executing an instruction.
+10452                  */
+10453                 vcpu->arch.at_instruction_boundary = false;
+10454                 if (kvm_vcpu_running(vcpu)) {
+10455                         r = vcpu_enter_guest(vcpu);
+10456                 } else {
+10457                         r = vcpu_block(vcpu);
+10458                 }
+10459
+10460                 if (r <= 0)
+10461                         break;
+... ...
+10487         return r;
+... ...
+
+
+结果通过kvm_arch_vcpu_ioctl_run()返回.
+
+还有很多其他情况, 比如下面的就不讨论了.
+
+5772         [EXIT_REASON_HLT]                     = kvm_emulate_halt,
+
+
+最后的patch实现了一个selftest表示KVM_GUESTDBG_EXIT_USERSPACE怎么用.
+
+
++/* Set debug control for trapped instruction exiting to userspace */
++static void vcpu_set_debug_exit_userspace(struct kvm_vm *vm, int vcpu_id) {
++	struct kvm_guest_debug debug;
++	memset(&debug, 0, sizeof(debug));
++	debug.control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_EXIT_USERSPACE;
++	vcpu_set_guest_debug(vm, vcpu_id, &debug);
++}

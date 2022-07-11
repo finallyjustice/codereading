@@ -1,0 +1,56 @@
+[PATCH] KVM: VMX: Skip filter updates for MSRs that KVM is already intercepting
+
+... from Sean Christopherson <seanjc@google.com> ...
+
+https://lore.kernel.org/all/20220610214140.612025-1-seanjc@google.com/
+
+下面是vmx_clear_msr_bitmap_read()等的macro.
+
+arch/x86/kvm/vmx/vmx.h
+
+440 /*
+441  * Note, early Intel manuals have the write-low and read-high bitmap offsets
+442  * the wrong way round.  The bitmaps control MSRs 0x00000000-0x00001fff and
+443  * 0xc0000000-0xc0001fff.  The former (low) uses bytes 0-0x3ff for reads and
+444  * 0x800-0xbff for writes.  The latter (high) uses 0x400-0x7ff for reads and
+445  * 0xc00-0xfff for writes.  MSRs not covered by either of the ranges always
+446  * VM-Exit.
+447  */
+448 #define __BUILD_VMX_MSR_BITMAP_HELPER(rtype, action, bitop, access, base)      \
+449 static inline rtype vmx_##action##_msr_bitmap_##access(unsigned long *bitmap,  \
+450                                                        u32 msr)                \
+451 {                                                                              \
+452         int f = sizeof(unsigned long);                                         \
+453                                                                                \
+454         if (msr <= 0x1fff)                                                     \
+455                 return bitop##_bit(msr, bitmap + base / f);                    \
+456         else if ((msr >= 0xc0000000) && (msr <= 0xc0001fff))                   \
+457                 return bitop##_bit(msr & 0x1fff, bitmap + (base + 0x400) / f); \
+458         return (rtype)true;                                                    \
+459 }
+460 #define BUILD_VMX_MSR_BITMAP_HELPERS(ret_type, action, bitop)                  \
+461         __BUILD_VMX_MSR_BITMAP_HELPER(ret_type, action, bitop, read,  0x0)     \
+462         __BUILD_VMX_MSR_BITMAP_HELPER(ret_type, action, bitop, write, 0x800)
+
+
+
+vmx_enable_intercept_for_msr()和vmx_disable_intercept_for_msr()会在很多地方调用, 包括vmx_set_intercept_for_msr().
+
+除了msr bitmap, vmx_enable_intercept_for_msr()和vmx_disable_intercept_for_msr()也会设置vmx->shadow_msr_intercept.
+
+417 static inline void vmx_set_intercept_for_msr(struct kvm_vcpu *vcpu, u32 msr,
+418                                              int type, bool value)
+419 {
+420         if (value)
+421                 vmx_enable_intercept_for_msr(vcpu, msr, type);
+422         else
+423                 vmx_disable_intercept_for_msr(vcpu, msr, type);
+424 }
+
+因此, vmx_enable_intercept_for_msr()和vmx_disable_intercept_for_msr()是设置vmx->shadow_msr_intercept的唯一途径.
+
+
+因此, 这个patch认为, 在vmx_msr_filter_changed()中, 如果vmx->shadow_msr_intercept已经设置了, 说明vmx_enable_intercept_for_msr()已经调用过了, 就没必要再调用了.
+
+所以"the call to vmx_enable_intercept_for_msr() really is just a gigantic nop."
+

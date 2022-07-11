@@ -1,0 +1,49 @@
+[PATCH net V3] virtio-net: fix the race between refill work and close
+
+... from Jason Wang <jasowang@redhat.com> ...
+
+https://lore.kernel.org/all/20220701020655.86532-1-jasowang@redhat.com/
+
+这个patch解决下面的kasan memory问题.
+
+BUG: KASAN: use-after-free in refill_work+0x43/0xd4
+Read of size 2 at addr ffff88810562c92e by task kworker/2:1/42
+
+CPU: 2 PID: 42 Comm: kworker/2:1 Not tainted 5.19.0-rc1+ #480
+Hardware name: QEMU Standard PC (Q35 + ICH9, 2009), BIOS rel-1.16.0-0-gd239552ce722-prebuilt.qemu.org 04/01/2014
+Workqueue: events refill_work
+Call Trace:
+ <TASK>
+ dump_stack_lvl+0x34/0x44
+ print_report.cold+0xbb/0x6ac
+ ? _printk+0xad/0xde
+ ? refill_work+0x43/0xd4
+ kasan_report+0xa8/0x130
+ ? refill_work+0x43/0xd4
+ refill_work+0x43/0xd4
+ process_one_work+0x43d/0x780
+ worker_thread+0x2a0/0x6f0
+ ? process_one_work+0x780/0x780
+ kthread+0x167/0x1a0
+ ? kthread_exit+0x50/0x50
+ ret_from_fork+0x22/0x30
+ </TASK>
+... ...
+
+
+这个是因为在close的时候存在race
+
+cancel_delayed_work_sync(&vi->refill)的注释是"cancel a delayed work and wait for it to finish".所以会等待refill_work()完成.
+
+
+   CPU X                                             CPU Y
+
+                                                  napi virtnet_poll()
+virtnet_close()
+-> cancel_delayed_work_sync(&vi->refill);
+                                                  -> virtnet_receive()
+                                                     -> schedule_delayed_work(&vi->refill, 0);
+
+最终, 可能在close()后继续调用refill_work(). This means an NAPI poll callback
+after cancel_delayed_work_sync() can schedule the refill work then can
+re-enable the NAPI that leads to use-after-free.

@@ -1,0 +1,60 @@
+[PATCH 0/4] kvm/mm: Allow GUP to respond to non fatal signals
+
+... from Peter Xu <peterx@redhat.com> ...
+
+https://lore.kernel.org/all/20220622213656.81546-1-peterx@redhat.com/
+
+patchset虽然是在kernel side, 但是一开始是为了修复一个qemu的postcopy migration的symptom.
+
+关于postcopy migration, 查看reference.
+
+
+问题是, postcopy migration以来GUP (get user pages)的userfaultfd这个feature.
+
+kernel在handle_userfault()的时候, 可能是uninterruptible所以没法kill.
+
+patchset最核心的就是为faultin_page()参数的flags引入了FOLL_INTERRUPTIBLE,
+如果FOLL_INTERRUPTIBLE被caller (e.g., gup)设置了, 就会设置FAULT_FLAG_INTERRUPTIBLE.
+
+@@ -933,8 +933,17 @@ static int faultin_page(struct vm_area_struct *vma,
+ 		fault_flags |= FAULT_FLAG_WRITE;
+ 	if (*flags & FOLL_REMOTE)
+ 		fault_flags |= FAULT_FLAG_REMOTE;
+-	if (locked)
++	if (locked) {
+ 		fault_flags |= FAULT_FLAG_ALLOW_RETRY | FAULT_FLAG_KILLABLE;
++		/*
++		 * We should only grant FAULT_FLAG_INTERRUPTIBLE when we're
++		 * (at least) killable.  It also mostly means we're not
++		 * with NOWAIT.  Otherwise ignore FOLL_INTERRUPTIBLE since
++		 * it won't make a lot of sense to be used alone.
++		 */
++		if (*flags & FOLL_INTERRUPTIBLE)
++			fault_flags |= FAULT_FLAG_INTERRUPTIBLE;
++	}
+ 	if (*flags & FOLL_NOWAIT)
+ 		fault_flags |= FAULT_FLAG_ALLOW_RETRY | FAULT_FLAG_RETRY_NOWAIT;
+ 	if (*flags & FOLL_TRIED) {
+
+
+如果FAULT_FLAG_INTERRUPTIBLE设置了, 后面的userfaultfd_get_blocking_state()就会在handle_userfault()返回TASK_INTERRUPTIBLE.
+
+ 342 static inline unsigned int userfaultfd_get_blocking_state(unsigned int flags)
+ 343 {       
+ 344         if (flags & FAULT_FLAG_INTERRUPTIBLE)
+ 345                 return TASK_INTERRUPTIBLE;
+ 346 
+ 347         if (flags & FAULT_FLAG_KILLABLE)
+ 348                 return TASK_KILLABLE;
+ 349 
+ 350         return TASK_UNINTERRUPTIBLE;
+ 351 }
+
+
+References:
+
+https://richardweiyang-2.gitbook.io/understanding_qemu/00-lm/05-postcopy
+
+https://wiki.qemu.org/Features/PostCopyLiveMigration
+
+https://gitlab.com/qemu-project/qemu/-/issues/1052

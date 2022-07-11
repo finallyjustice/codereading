@@ -1,0 +1,85 @@
+[PATCH 0/3] KVM: VMX: Let userspace set IA32_FEAT_CTL at will
+
+... from Sean Christopherson <seanjc@google.com> ...
+
+https://lore.kernel.org/all/20220607232353.3375324-1-seanjc@google.com/
+
+
+核心的就是第一个patch.
+
+[PATCH 1/3] KVM: VMX: Allow userspace to set all supported FEATURE_CONTROL bits
+
+
+当前的代码只允许按照下面的条件通过MSR_IA32_FEAT_CTL进行设置 (line 2194):
+
+1. !vmx_feature_control_msr_valid(vcpu, data) 或者
+2. to_vmx(vcpu)->msr_ia32_feature_control & FEAT_CTL_LOCKED  &&  !msr_info->host_initiated
+
+2002 static int vmx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+2003 {
+... ...
+2193         case MSR_IA32_FEAT_CTL:
+2194                 if (!vmx_feature_control_msr_valid(vcpu, data) ||
+2195                     (to_vmx(vcpu)->msr_ia32_feature_control &
+2196                      FEAT_CTL_LOCKED && !msr_info->host_initiated))
+2197                         return 1;
+2198                 vmx->msr_ia32_feature_control = data;
+2199                 if (msr_info->host_initiated && data == 0)
+2200                         vmx_leave_nested(vcpu);
+2201 
+2202                 /* SGX may be enabled/disabled by guest's firmware */
+2203                 vmx_write_encls_bitmap(vcpu, NULL);
+2204                 break;
+
+第一个条件是通过to_vmx(vcpu)->msr_ia32_feature_control_valid_bits判断是否同意. 不同意立刻返回1.
+
+1796 static inline bool vmx_feature_control_msr_valid(struct kvm_vcpu *vcpu,
+1797                                                  uint64_t val)
+1798 {
+1799         uint64_t valid_bits = to_vmx(vcpu)->msr_ia32_feature_control_valid_bits;
+1800 
+1801         return !(val & ~valid_bits);
+1802 }
+
+第二个条件是判断是否locked了 (在!msr_info->host_initiated的时候)
+
+
+这个patch保持了!msr_info->host_initiated的情况, 但是对于QEMU的情况, 允许设置全部支持的bit.
+
+-static inline bool vmx_feature_control_msr_valid(struct kvm_vcpu *vcpu,
+-						 uint64_t val)
++/*
++ * Userspace is allowed to set any supported IA32_FEATURE_CONTROL regardless of
++ * guest CPUID.  Note, KVM allows userspace to set "VMX in SMX" to maintain
++ * backwards compatibility even though KVM doesn't support emulating SMX.  And
++ * because userspace set "VMX in SMX", the guest must also be allowed to set it,
++ * e.g. if the MSR is left unlocked and the guest does a RMW operation.
++ */
++#define KVM_SUPPORTED_FEATURE_CONTROL  (FEAT_CTL_LOCKED			 | \
++					FEAT_CTL_VMX_ENABLED_INSIDE_SMX	 | \
++					FEAT_CTL_VMX_ENABLED_OUTSIDE_SMX | \
++					FEAT_CTL_SGX_LC_ENABLED		 | \
++					FEAT_CTL_SGX_ENABLED		 | \
++					FEAT_CTL_LMCE_ENABLED)
++
++static inline bool vmx_feature_control_msr_valid(struct vcpu_vmx *vmx,
++						 struct msr_data *msr)
+ {
+-	uint64_t valid_bits = to_vmx(vcpu)->msr_ia32_feature_control_valid_bits;
++	uint64_t valid_bits;
+
+-	return !(val & ~valid_bits);
++	/*
++	 * Ensure KVM_SUPPORTED_FEATURE_CONTROL is updated when new bits are
++	 * exposed to the guest.
++	 */
++	WARN_ON_ONCE(vmx->msr_ia32_feature_control_valid_bits &
++		     ~KVM_SUPPORTED_FEATURE_CONTROL);
++
++	if (msr->host_initiated)
++		valid_bits = KVM_SUPPORTED_FEATURE_CONTROL;
++	else
++		valid_bits = vmx->msr_ia32_feature_control_valid_bits;
++
++	return !(msr->data & ~valid_bits);
+ }

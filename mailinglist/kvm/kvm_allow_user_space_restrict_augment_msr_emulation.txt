@@ -1,0 +1,88 @@
+[PATCH v8 0/8] Allow user space to restrict and augment MSR emulation
+
+... from Alexander Graf <graf@amazon.com> ...
+
+https://lore.kernel.org/all/20200925143422.21718-1-graf@amazon.com/
+
+这个patchset主要分为两部分:
+- Deflect unknown MSR accesses to user space
+- Introduce MSR filtering
+
+前者通过KVM_CAP_X86_USER_SPACE_MSR配置vcpu->kvm->arch.user_space_msr_mask,
+如果有kernel KVM不支持的msr access, 以前是GP, 现在是先看一下vcpu->kvm->arch.user_space_msr_mask,
+如果userspace愿意处理, 就返回userspace处理.
+
++static int kvm_msr_user_space(struct kvm_vcpu *vcpu, u32 index,
++			      u32 exit_reason, u64 data,
++			      int (*completion)(struct kvm_vcpu *vcpu),
++			      int r)
++{
++	u64 msr_reason = kvm_msr_reason(r);
++
++	/* Check if the user wanted to know about this MSR fault */
++	if (!(vcpu->kvm->arch.user_space_msr_mask & msr_reason))
++		return 0;
++
++	vcpu->run->exit_reason = exit_reason;
++	vcpu->run->msr.error = 0;
++	memset(vcpu->run->msr.pad, 0, sizeof(vcpu->run->msr.pad));
++	vcpu->run->msr.reason = msr_reason;
++	vcpu->run->msr.index = index;
++	vcpu->run->msr.data = data;
++	vcpu->arch.complete_userspace_io = completion;
++
++	return 1;
++}
+
+
+[PATCH v8 7/8] KVM: x86: Introduce MSR filtering
+
+前者可以在userspace处理一些msr.但是对于那些kvm kernel处理了的却没有办法.
+于是后者引入filter, 来主动告诉kvm kernel去主动fail一些msr.
+这样被fail的msr再根据KVM_CAP_X86_USER_SPACE_MSR配置的vcpu->kvm->arch.user_space_msr_mask
+判断userspace是否处理.
+
+It's not desireable to have all MSRs always handled by KVM kernel space. Some
+MSRs would be useful to handle in user space to either emulate behavior (like
+uCode updates) or differentiate whether they are valid based on the CPU model.
+
+To allow user space to specify which MSRs it wants to see handled by KVM,
+this patch introduces a new ioctl to push filter rules with bitmaps into
+KVM. Based on these bitmaps, KVM can then decide whether to reject MSR access.
+With the addition of KVM_CAP_X86_USER_SPACE_MSR it can also deflect the
+denied MSR events to user space to operate on.
+
+ bool kvm_msr_allowed(struct kvm_vcpu *vcpu, u32 index, u32 type)
+ {
+-	return true;
++	struct kvm *kvm = vcpu->kvm;
++	struct msr_bitmap_range *ranges = kvm->arch.msr_filter.ranges;
++	u32 count = kvm->arch.msr_filter.count;
++	u32 i;
++	bool r = kvm->arch.msr_filter.default_allow;
++	int idx;
++
++	/* MSR filtering not set up, allow everything */
++	if (!count)
++		return true;
++
++	/* Prevent collision with set_msr_filter */
++	idx = srcu_read_lock(&kvm->srcu);
++
++	for (i = 0; i < count; i++) {
++		u32 start = ranges[i].base;
++		u32 end = start + ranges[i].nmsrs;
++		u32 flags = ranges[i].flags;
++		unsigned long *bitmap = ranges[i].bitmap;
++
++		if ((index >= start) && (index < end) && (flags & type)) {
++			r = !!test_bit(index - start, bitmap);
++			break;
++		}
++	}
++
++	srcu_read_unlock(&kvm->srcu, idx);
++
++	return r;
+ }
+ EXPORT_SYMBOL_GPL(kvm_msr_allowed);
