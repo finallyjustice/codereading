@@ -1,0 +1,87 @@
+这个patchset有两个patch. 其实我不理解之前google的那个方案有什么不好 ...
+
+[PATCH 1/2] KVM: x86: add KVM clock time reference arg to kvm_write_tsc()
+
+... from Simon Veith <sveith@amazon.de> ...
+
+https://lore.kernel.org/all/20220707164326.394601-1-sveith@amazon.de/
+
+---------------------------------
+
+[PATCH 2/2] KVM: x86: add KVM_VCPU_TSC_VALUE attribute
+
+... from Simon Veith <sveith@amazon.de> ...
+
+https://lore.kernel.org/all/20220707164326.394601-2-sveith@amazon.de/
+
+
+
+核心思想就是:
+
+1. 为kvm_synchronize_tsc()增加了新参数: kvm_ns. 这样就有了两个参数: tsc和kvm_ns.
+意义就是:
+
+"the TSC value being written was valid at this corresponding KVM clock time point"
+
+说明在live migration的时候, 这个tsc在这个kvm_ns的这一刻是非常accurate的. (过了这个kvm_ns就未知了)
+
+
+本来"ns + vcpu->kvm->arch.kvmclock_offset"应该是live migration后VM启动了的ns. 这个肯定比kvm_ns要大.
+所以把这个diff转换成tsc增加到data上: data += nsec_to_cycles(vcpu, (u64)delta_ns);
+
+-static void kvm_synchronize_tsc(struct kvm_vcpu *vcpu, u64 data)
++static void kvm_synchronize_tsc(struct kvm_vcpu *vcpu, u64 data, u64 *kvm_ns)
+ {
+ 	struct kvm *kvm = vcpu->kvm;
+ 	u64 offset, ns, elapsed;
+@@ -2638,12 +2638,24 @@ static void kvm_synchronize_tsc(struct kvm_vcpu *vcpu, u64 data)
+ 	bool synchronizing = false;
+ 
+ 	raw_spin_lock_irqsave(&kvm->arch.tsc_write_lock, flags);
+-	offset = kvm_compute_l1_tsc_offset(vcpu, data);
+ 	ns = get_kvmclock_base_ns();
++
++	if (kvm_ns) {
++		/*
++		 * We have been provided a KVM clock reference time point at
++		 * which this TSC value was correct.
++		 * Use this time point to compensate for any delays that were
++		 * incurred since that TSC value was valid.
++		 */
++		s64 delta_ns = ns + vcpu->kvm->arch.kvmclock_offset - *kvm_ns;
++		data += nsec_to_cycles(vcpu, (u64)delta_ns);
++	}
++
++	offset = kvm_compute_l1_tsc_offset(vcpu, data);
+ 	elapsed = ns - kvm->arch.last_tsc_nsec;
+
+
+
+
+2. 增加了ioctl的getter/setter: KVM_VCPU_TSC_VALUE.
+
+目前这个feature只给KVM_VCPU_TSC_VALUE用.
+
+
++
++4.2 ATTRIBUTE: KVM_VCPU_TSC_VALUE
++
++:Parameters: kvm_device_attr.addr points to a struct kvm_vcpu_tsc_value
++
++Returns:
++
++	 ======= ======================================
++	 -EFAULT Error reading/writing the provided
++		 parameter address.
++	 -ENXIO  Attribute not supported
++	 ======= ======================================
++
++Gets or sets a matched pair of guest TSC value and KVM clock time point.
++
++When setting the TSC value through this attribute, a corresponding KVM clock
++reference time point (as retrieved by KVM_GET_CLOCK in the clock field) must be
++provided.
++
++The actual TSC value written will be adjusted based on the time that has
++elapsed since the provided reference time point, taking TSC scaling into
++account.

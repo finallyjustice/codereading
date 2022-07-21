@@ -1,0 +1,427 @@
+[PATCH v7 00/14] KVM: mm: fd-based approach for supporting KVM guest private memory
+
+... from Chao Peng <chao.p.peng@linux.intel.com> ...
+
+https://lore.kernel.org/all/20220706082016.2603916-1-chao.p.peng@linux.intel.com/
+
+这个patchset引入fd-based memslot.
+
+当前的设计是从userspace分配memory, 然后把hva share给KVM. 这样的缺点是guest的内存可能被"map"到QEMU或者KVM, 不安全. (我们希望内存只map到VM).
+这个patchset提出的fd-based就能达到这个目标.
+
+Comparing to existing hva-based memslot, this new type of memslot allows
+guest memory unmapped from host userspace like QEMU and even the kernel
+itself, therefore reduce attack surface and prevent bugs.
+
+---------------------------------
+
+[PATCH v7 01/14] mm: Add F_SEAL_AUTO_ALLOCATE seal to memfd
+
+猜测为了方便为VM分配内存, 引入新的flag F_SEAL_AUTO_ALLOCATE (来使用SGP_NOALLOC),
+防止在write的时候自动分配内存(因为是fd-based吧, 希望KVM通过某个API/notifier稍后向
+memory的backend获取内存的pfn, 来map到VM上).
+
+This is used to prevent unintentional allocation from userspace on a
+stray or careless write and any intentional allocation should use an
+explicit fallocate(). One of the main usecases is to avoid memory double
+allocation for confidential computing usage where we use two memfds to
+back guest memory and at a single point only one memfd is alive and we
+want to prevent memory allocation for the other memfd which may have
+been mmap-ed previously. More discussion can be found at:
+
+  https://lkml.org/lkml/2022/6/14/1255
+
+---------------------------------
+
+[PATCH v7 03/14] mm: Introduce memfile_notifier
+
+引入了memfile_notifier, 方便其他的component (KVM)来通过fd管理内存.
+
+In KVM usages, userspace is in charge of guest memory lifecycle: it first
+allocates pages in memory backing store and then passes the fd to KVM and
+lets KVM register memory slot to memory backing store via
+memfile_register_notifier.
+
+---------------------------------
+
+[PATCH v7 04/14] mm/shmem: Support memfile_notifier
+
+为shmem引入memfile_notifier. 下面是其他component使用shmem的例子.
+
+shmem_getpage
+generic_perform_write
+__generic_file_write_iter
+generic_file_write_iter
+__vfs_write
+vfs_write
+sys_write
+do_syscall_64
+entry_SYSCALL_64_after_hwframe
+
+shmem_getpage
+__vfs_read
+vfs_read
+sys_read
+do_syscall_64
+entry_SYSCALL_64_after_hwframe
+
+!!! 最核心的是下面的get_pfn方法. 以前KVM是通过gup或者page, 以后就是通过fd和get_pfn获得了.
+
++static int shmem_get_pfn(struct file *file, pgoff_t offset, pfn_t *pfn,
++			 int *order)
++{
++	struct page *page;
++	int ret;
++
++	ret = shmem_getpage(file_inode(file), offset, &page, SGP_WRITE);
++	if (ret)
++		return ret;
++
++	unlock_page(page);
++	*pfn = page_to_pfn_t(page);
++	*order = thp_order(compound_head(page));
++	return 0;
++}
+
++static struct memfile_backing_store shmem_backing_store = {
++	.lookup_memfile_node = shmem_lookup_memfile_node,
++	.get_pfn = shmem_get_pfn,
++	.put_pfn = shmem_put_pfn,
++};
++#endif /* CONFIG_MEMFILE_NOTIFIER */
++
+ void __init shmem_init(void)
+ {
+ 	int error;
+@@ -3956,6 +4059,10 @@ void __init shmem_init(void)
+ 	else
+ 		shmem_huge = SHMEM_HUGE_NEVER; /* just in case it was patched */
+ #endif
++
++#ifdef CONFIG_MEMFILE_NOTIFIER
++	memfile_register_backing_store(&shmem_backing_store);
++#endif
+ 	return;
+
+ out1:
+
+---------------------------------
+
+[PATCH v7 05/14] mm/memfd: Introduce MFD_INACCESSIBLE flag
+
+为memfd_create()接口添加一个flag对应之前的MEMFILE_F_USER_INACCESSIBLE.
+这个就没法通过fd的read/write直接map访问这些内存了.人们只希望这些内存被map到VM.
+
+Introduce a new memfd_create() flag indicating the content of the
+created memfd is inaccessible from userspace through ordinary MMU
+access (e.g., read/write/mmap). However, the file content can be
+accessed via a different mechanism (e.g. KVM MMU) indirectly.
+
+It provides semantics required for KVM guest private memory support
+that a file descriptor with this flag set is going to be used as the
+source of guest memory in confidential computing environments such
+as Intel TDX/AMD SEV but may not be accessible from host userspace.
+
+The flag can not coexist with MFD_ALLOW_SEALING, future sealing is
+also impossible for a memfd created with this flag.
+
+下面是之前patch 04的例子.
+
+@@ -2477,6 +2506,8 @@ shmem_write_begin(struct file *file, struct address_space *mapping,
+ 		if ((info->seals & F_SEAL_GROW) && pos + len > inode->i_size)
+ 			return -EPERM;
+ 	}
++	if (unlikely(info->memfile_node.flags & MEMFILE_F_USER_INACCESSIBLE))
++		return -EPERM;
+
+ 	if (unlikely(info->seals & F_SEAL_AUTO_ALLOCATE))
+ 		sgp = SGP_NOALLOC;
+@@ -2556,6 +2587,13 @@ static ssize_t shmem_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
+ 		end_index = i_size >> PAGE_SHIFT;
+ 		if (index > end_index)
+ 			break;
++
++		if (SHMEM_I(inode)->memfile_node.flags &
++				MEMFILE_F_USER_INACCESSIBLE) {
++			error = -EPERM;
++			break;
++		}
+
+---------------------------------
+
+[PATCH v7 06/14] KVM: Rename KVM_PRIVATE_MEM_SLOTS to KVM_INTERNAL_MEM_SLOTS
+
+这个patchset做的才是"private", 把很久以前的定义成"internal".
+
+---------------------------------
+
+[PATCH v7 07/14] KVM: Use gfn instead of hva for mmu_notifier_retry
+
+当前mmu_notifier_retry_hva()来检查地址是否合法的时候用的hva, 可是新的fd-based不支持hva.
+
+所以把参数都换成pfn, 检查也换成pfn. 这样不影响非fd-based的.
+
+@@ -1923,9 +1921,9 @@ static inline int mmu_notifier_retry(struct kvm *kvm, unsigned long mmu_seq)
+ 	return 0;
+ }
+
+-static inline int mmu_notifier_retry_hva(struct kvm *kvm,
++static inline int mmu_notifier_retry_gfn(struct kvm *kvm,
+ 					 unsigned long mmu_seq,
+-					 unsigned long hva)
++					 gfn_t gfn)
+ {
+ 	lockdep_assert_held(&kvm->mmu_lock);
+ 	/*
+@@ -1935,8 +1933,8 @@ static inline int mmu_notifier_retry_hva(struct kvm *kvm,
+ 	 * positives, due to shortcuts when handing concurrent invalidations.
+ 	 */
+ 	if (unlikely(kvm->mmu_notifier_count) &&
+-	    hva >= kvm->mmu_notifier_range_start &&
+-	    hva < kvm->mmu_notifier_range_end)
++	    gfn >= kvm->mmu_notifier_range_start &&
++	    gfn < kvm->mmu_notifier_range_end)
+ 		return 1;
+ 	if (kvm->mmu_notifier_seq != mmu_seq)
+ 		return 1;
+
+---------------------------------
+
+[PATCH v7 08/14] KVM: Rename mmu_notifier_*
+
+@@ -765,10 +765,10 @@ struct kvm {
+
+ #if defined(CONFIG_MMU_NOTIFIER) && defined(KVM_ARCH_WANT_MMU_NOTIFIER)
+ 	struct mmu_notifier mmu_notifier;
+-	unsigned long mmu_notifier_seq;
+-	long mmu_notifier_count;
+-	gfn_t mmu_notifier_range_start;
+-	gfn_t mmu_notifier_range_end;
++	unsigned long mmu_updating_seq;
++	long mmu_updating_count;
++	gfn_t mmu_updating_range_start;
++	gfn_t mmu_updating_range_end;
+ #endif
+
+---------------------------------
+
+[PATCH v7 09/14] KVM: Extend the memslot to support fd-based private memory
+
+增加了ioctl KVM_SET_USER_MEMORY_REGION的接口增加一个新的flag bit "KVM_MEM_PRIVATE".
+用来向KVM注册memory region (fd-based private memory).
+
++- KVM_MEM_PRIVATE can be set to indicate a new slot has private memory backed by
++  a file descirptor(fd) and the content of the private memory is invisible to
++  userspace. In this case, userspace should use private_fd/private_offset in
++  kvm_userspace_memory_region_ext to instruct KVM to provide private memory to
++  guest. Userspace should guarantee not to map the same pfn indicated by
++  private_fd/private_offset to different gfns with multiple memslots. Failed to
++  do this may result undefined behavior.
+
+kvm_user_mem_region是内核用的
+kvm_userspace_memory_region_ext是用户向内核的时候用的
+"kvm_user_mem_region is a kernel-only alias of kvm_userspace_memory_region_ext
+that "unpacks" kvm_userspace_memory_region so that KVM can directly access
+all fields from the top-level "extended" region."
+
+
+核心都在commit message里.
+
+Extend the memslot definition to provide guest private memory through a
+file descriptor(fd) instead of userspace_addr(hva). Such guest private
+memory(fd) may never be mapped into userspace so no userspace_addr(hva)
+can be used. Instead add another two new fields
+(private_fd/private_offset), plus the existing memory_size to represent
+the private memory range. Such memslot can still have the existing
+userspace_addr(hva). When use, a single memslot can maintain both
+private memory through private fd(private_fd/private_offset) and shared
+memory through hva(userspace_addr). Whether the private or shared part
+is effective for a guest GPA is maintained by other KVM code.
+
+Since there is no userspace mapping for private fd so we cannot
+rely on get_user_pages() to get the pfn in KVM, instead we add a new
+memfile_notifier in the memslot and rely on it to get pfn by interacting
+the callbacks from memory backing store with the fd/offset.
+
+This new extension is indicated by a new flag KVM_MEM_PRIVATE. At
+compile time, a new config HAVE_KVM_PRIVATE_MEM is added and right now
+it is selected on X86_64 for Intel TDX usage.
+
+To make KVM easy, internally we use a binary compatible alias struct
+kvm_user_mem_region to handle both the normal and the '_ext' variants.
+
+---------------------------------
+
+[PATCH v7 10/14] KVM: Add KVM_EXIT_MEMORY_FAULT exit
+
+增加新的exit reson KVM_EXIT_MEMORY_FAULT (是从KVM到QEMU的exit reson), 表示这个virtualization的memory fault不能被kvm处理,
+需要被userspace处理. kvm_run的结构如下. flag的最后一个bit 0表示错误的原因: 是private fd-based还是普通的shared.
+
+Currently bit 0 is defined as 'private memory' where '1'
+indicates error happens due to private memory access and '0' indicates
+error happens due to shared memory access.
+
+
++		/* KVM_EXIT_MEMORY_FAULT */
++		struct {
++  #define KVM_MEMORY_EXIT_FLAG_PRIVATE	(1 << 0)
++			__u32 flags;
++			__u32 padding;
++			__u64 gpa;
++			__u64 size;
++		} memory;
+
+---------------------------------
+
+[PATCH v7 11/14] KVM: Register/unregister the guest private memory regions
+
+memory region是在userspace分配(不管是不是用fd-base), 然后告诉KVM.
+
+但是我们还需要有一种方法(快速的)注册哪些address是private或者sev.
+
+-It is used in the SEV-enabled guest. When encryption is enabled, a guest
+-memory region may contain encrypted data. The SEV memory encryption
+-engine uses a tweak such that two identical plaintext pages, each at
+-different locations will have differing ciphertexts. So swapping or
++Currently this ioctl supports registering memory regions for two usages:
++private memory and SEV-encrypted memory.
++
++When private memory is enabled, this ioctl is used to register guest private
++memory region and the addr/size of kvm_enc_region represents guest physical
++address (GPA). In this usage, this ioctl zaps the existing guest memory
++mappings in KVM that fallen into the region.
++
++When SEV-encrypted memory is enabled, this ioctl is used to register guest
++memory region which may contain encrypted data for a SEV-enabled guest. The
++addr/size of kvm_enc_region represents userspace address (HVA). The SEV
++memory encryption engine uses a tweak such that two identical plaintext pages,
++each at different locations will have differing ciphertexts. So swapping or
+ moving ciphertext of those pages will not result in plaintext being
+ swapped. So relocating (or migrating) physical backing pages for the SEV
+ guest will require some additional steps.
+
+下面的代码来自下一个patch, 通过一个xarray的kvm->mem_attr_array就能知道哪个地址是private/sev的.
+
++static inline bool kvm_mem_is_private(struct kvm *kvm, gfn_t gfn)
++{
++	return !!xa_load(&kvm->mem_attr_array, gfn);
++}
+	
+---------------------------------
+
+[PATCH v7 12/14] KVM: Handle page fault for private memory
+
+在direct (ept) page fault的时候, 应该:
+
+1. 通过fault的信息得到gfn.
+2. 根据gfn获得userspace QEMU的hva
+3. 根据hva或者pfn (过去是gup)
+4. 把pfn给map到VM space
+
+2和3是通过kvm_faultin_pfn().
+
+但是对于private fd-based的要用新的方式, 是没有hva的.
+所以增加了下面在kvm_faultin_pfn()对于private fd-based的可以用新的方式获得pfn
+
++static int kvm_faultin_pfn_private(struct kvm_vcpu *vcpu,
++				   struct kvm_page_fault *fault)
++{
++	int order;
++	struct kvm_memory_slot *slot = fault->slot;
++	bool private_exist = kvm_mem_is_private(vcpu->kvm, fault->gfn);
++
++	if (fault->is_private != private_exist) {
++		vcpu->run->exit_reason = KVM_EXIT_MEMORY_FAULT;
++		if (fault->is_private)
++			vcpu->run->memory.flags = KVM_MEMORY_EXIT_FLAG_PRIVATE;
++		else
++			vcpu->run->memory.flags = 0;
++		vcpu->run->memory.padding = 0;
++		vcpu->run->memory.gpa = fault->gfn << PAGE_SHIFT;
++		vcpu->run->memory.size = PAGE_SIZE;
++		return RET_PF_USER;
++	}
++
++	if (fault->is_private) {
++		if (kvm_private_mem_get_pfn(slot, fault->gfn, &fault->pfn, &order))
++			return RET_PF_RETRY;
++		fault->max_level = min(order_to_level(order), fault->max_level);
++		fault->map_writable = !(slot->flags & KVM_MEM_READONLY);
++		return RET_PF_FIXED;
++	}
++
++	/* Fault is shared, fallthrough. */
++	return RET_PF_CONTINUE;
++}
+
+
+@@ -4133,6 +4178,12 @@ static int kvm_faultin_pfn(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
+ 			return RET_PF_EMULATE;
+ 	}
+
++	if (kvm_slot_can_be_private(slot)) {
++		r = kvm_faultin_pfn_private(vcpu, fault);
++		if (r != RET_PF_CONTINUE)
++			return r == RET_PF_FIXED ? RET_PF_CONTINUE : r;
++	}
++
+ 	async = false;
+ 	fault->pfn = __gfn_to_pfn_memslot(slot, fault->gfn, false, &async,
+ 					  fault->write, &fault->map_writable,
+
+
+kvm_private_mem_get_pfn()是通过之前的memfile notifier获得的.
+
++#ifdef CONFIG_HAVE_KVM_PRIVATE_MEM
++static inline int kvm_private_mem_get_pfn(struct kvm_memory_slot *slot,
++					  gfn_t gfn, kvm_pfn_t *pfn, int *order)
++{
++	int ret;
++	pfn_t pfnt;
++	pgoff_t index = gfn - slot->base_gfn +
++			(slot->private_offset >> PAGE_SHIFT);
++
++	ret = slot->notifier.bs->get_pfn(slot->private_file, index, &pfnt,
++					 order);
++	*pfn = pfn_t_to_pfn(pfnt);
++	return ret;
++}
+
+---------------------------------
+
+[PATCH v7 13/14] KVM: Enable and expose KVM_MEM_PRIVATE
+
+让KVM注册一个memfile notifier. 这样当shmem的内存不存在的时候, 可以通过notifier调用invalidate来kvm_zap_gfn_range().
+
++static void kvm_memfile_notifier_invalidate(struct memfile_notifier *notifier,
++					    pgoff_t start, pgoff_t end)
++{
++	struct kvm_memory_slot *slot = container_of(notifier,
++						    struct kvm_memory_slot,
++						    notifier);
++	unsigned long base_pgoff = slot->private_offset >> PAGE_SHIFT;
++	gfn_t start_gfn = slot->base_gfn;
++	gfn_t end_gfn = slot->base_gfn + slot->npages;
++
++
++	if (start > base_pgoff)
++		start_gfn = slot->base_gfn + start - base_pgoff;
++
++	if (end < base_pgoff + slot->npages)
++		end_gfn = slot->base_gfn + end - base_pgoff;
++
++	if (start_gfn >= end_gfn)
++		return;
++
++	kvm_zap_gfn_range(slot->kvm, start_gfn, end_gfn);
++}
+
+---------------------------------
+
+[PATCH v7 14/14] memfd_create.2: Describe MFD_INACCESSIBLE flag
+
+userspace是通过memfd_create()创建内存的.
+
+---------------------------------
+
+
