@@ -1,0 +1,120 @@
+Basic knowledge summary.
+
+- lapic
+- lapic irq affinity reset
+- vcpu enter exit
+- vcpu IN_GUEST_MODE
+- vcpu irq handling during enter/exit
+- vcpu sched_in/sched_out
+- vcpu preemted
+- vcpu block/halt/run
+- vcpu irq affinity reset
+- cpu posted interrupt
+- vt-d posted interrupt
+- virtio/vhost
+
+Objective.
+
+1. The interrupt from the KVM vhost to the VM virtio.
+
+2. The interrupt from the QEMU virtio backend to the VM virtio.
+
+3. The interrupt from VFIO passthrough device to the VM driver.
+
+4. The APIC timer interrupt from the KVM to the VM kernel.
+
+5. The IPI interrupt from the KVM to the VM kernel.
+
+
+
+--------------------------
+
+# APIC IRR/ISR, interrupt procedure
+
+interrupt和exception不一样. 如果是interrupt在开始的时候会禁用中断, 然后在rett
+的时候恢复被保存的EFLAGS (肯定是enable的).
+The only difference between an interrupt gate and a trap gate is the way the
+processor handles the IF flag in the EFLAGS register. When accessing an
+exception- or interrupt-handling procedure through an interrupt gate, the
+processor clears the IF flag to prevent other interrupts from interfering with
+the current interrupt handler. A subse- quent IRET instruction restores the IF
+flag to its value in the saved contents of the EFLAGS register on the stack.
+Accessing a handler procedure through a trap gate does not affect the IF flag.
+
+IRR: Interrupt Request Register
+ISR: In-Service Register
+
+1. 中断被设置到IRR
+2. 根据算法, 选出下一个要处理的, 放入ISR, 清空IRR
+3. CPU被中断, 处理 (此时EFLAGS的interrupt被disable)
+4. 写入EOI来清空ISR, 下一个ISR/IRR被选择
+5. 退出interrupt handler, 调用ret会恢复interrupt (EFLAGS)
+
+不同的CPU版本不一样, 有的允许vector在IRR和ISR都设置,
+有的只允许设置一个.
+
+--------------------------
+
+# 没有APICv的情况
+
+如果没有apicv, 下一个的vector要被写入vmcs的VM_ENTRY_INTR_INFO_FIELD.
+
+1. vm entry前配置VM_ENTRY_INTR_INFO_FIELD的vector信息, 手动设置ISR和清空IRR.
+2. vm entry后, 触发vector/interrupt, 处理后写入EOI.
+3. VM写EOI要trap到KVM.
+4. KVM清空ISR, 并选择下一个vector从ISR/IRR中.
+5. vm entry前配置VM_ENTRY_INTR_INFO_FIELD的vector信息.
+
+--------------------------
+
+# 有APICv的情况
+
+Evaluation是自动的.
+很多对寄存器的读写也virtualize了.
+
+1. vm entry前配置GUEST_INTR_STATUS作为下个vector.
+2. vm entry后, 触发vector/interrupt, 处理后写入EOI.
+3. 写EOI不会导致trap到KVM, CPU自动evaluateu选择下个vector, 自动修改ISR/IRR.
+4. 下个vector被触发.
+
+如果guest mode在运行并且有新vector来, 需要trap到KVM重新配置GUEST_INTR_STATUS.
+这个trap有性能开销.
+
+--------------------------
+
+# CPU Posted Interrupt
+
+1. 在vmcs中配置告知posted vector是POSTED_INTR_VECTOR
+2. 假设vcpu在running, 在pi_desc (地址写入了vmcs)中对应的vector bit标记.
+3. 根据情况标记其他bit, 并post POSTED_INTR_VECTOR.
+4. 因为vmcs中是POSTED_INTR_VECTOR, target vcpu不会当成外部中断, 而是自动evaluate vector.
+
+如果vcpu没有running, POSTED_INTR_VECTOR的KVM的handler什么也不做.
+等vm entry的时候把pir给sync到irr就好.
+
+--------------------------
+
+# IOMMU Posted Interrupt
+
+1. KVM上PCI的MSI-x table的entry指向IOMMU的Interrupt Remapping Table (IRTE).
+2. IRTE的entry写入大概下面的信息.
+   - per-vcpu的PIR的地址 (包括指定POSTED_INTR_VECTOR)
+   - 要插入的针对VM的中断的vector(不是host上的vector)
+   - 是否是urgent (似乎kvm的都是irte_pi.p_urgent = 0)
+3. 硬件有中断的时候, 假设vcpu在running, IOMMU直接post POSTED_INTR_VECTOR
+
+(根据QEMU的vtd_mem_ir_write()的callstack, 还是用MSI-x entry的ctrl来mask中断)
+
+1. 当vcpu没有running的时候(在blocked), vector会设置成POSTED_INTERRUPT_WAKEUP_VECTOR
+2. IOMMU会post POSTED_INTERRUPT_WAKEUP_VECTOR唤醒vcpu. vcpu就可以vm entry了.
+
+--------------------------
+
+virtio-net
+
+- virtio和vhost共享vring (avail和used)
+- virtio发送avail增加avail_index
+- vhost处理avail, 发送used, 增加used_index
+- 因为性能问题, interrupt是conditional的 (不然就没有loss的问题了)
+
+--------------------------
