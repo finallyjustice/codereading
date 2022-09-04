@@ -1,0 +1,181 @@
+[PATCHv4 0/8] Virtual NMI feature
+
+... from Santosh Shukla <santosh.shukla@amd.com> ...
+
+https://lore.kernel.org/all/20220829100850.1474-1-santosh.shukla@amd.com/
+
+This patchset is for AMD SVM (and nested), to enable the vNMI.
+
+Without the vNMI, it is delivered to the guest using the Event Injection
+mechanism [1]. The Event Injection mechanism does not block the delivery of
+subsequent NMIs. So the Hypervisor needs to track the NMI delivery and its
+completion(by intercepting IRET) before sending a new NMI.
+
+2474 static int iret_interception(struct kvm_vcpu *vcpu)
+2475 {
+2476         struct vcpu_svm *svm = to_svm(vcpu);
+2477
+2478         ++vcpu->stat.nmi_window_exits;
+2479         vcpu->arch.hflags |= HF_IRET_MASK;
+2480         if (!sev_es_guest(vcpu->kvm)) {
+2481                 svm_clr_intercept(svm, INTERCEPT_IRET);
+2482                 svm->nmi_iret_rip = kvm_rip_read(vcpu);
+2483         }
+2484         kvm_make_request(KVM_REQ_EVENT, vcpu);
+2485         return 1;
+2486 }
+
+3477 static void svm_inject_nmi(struct kvm_vcpu *vcpu)
+3478 {
+3479         struct vcpu_svm *svm = to_svm(vcpu);
+3480
+3481         svm->vmcb->control.event_inj = SVM_EVTINJ_VALID | SVM_EVTINJ_TYPE_NMI;
+3482
+3483         if (svm->nmi_l1_to_l2)
+3484                 return;
+3485
+3486         vcpu->arch.hflags |= HF_NMI_MASK;
+3487         if (!sev_es_guest(vcpu->kvm))
+3488                 svm_set_intercept(svm, INTERCEPT_IRET);
+3489         ++vcpu->stat.nmi_injections;
+3490 }
+
+About the new feature ..
+
+Virtual NMI (VNMI) allows the hypervisor to inject the NMI into the guest w/o
+using Event Injection mechanism meaning not required to track the guest NMI and
+intercepting the IRET. To achieve that, VNMI feature provides virtualized NMI
+and NMI_MASK capability bits in VMCB intr_control:
+
+V_NMI(11) - Indicates whether a virtual NMI is pending in the guest.
+V_NMI_MASK(12) - Indicates whether virtual NMI is masked in the guest.
+V_NMI_ENABLE(26) - Enables the NMI virtualization feature for the guest.
+
+
+When Hypervisor wants to inject NMI, it will set V_NMI bit, Processor will
+clear the V_NMI bit and Set the V_NMI_MASK which means the Guest is handling
+NMI, After the guest handled the NMI, The processor will clear the V_NMI_MASK
+on the successful completion of IRET instruction Or if VMEXIT occurs while
+delivering the virtual NMI.
+
+---------------------------------
+
+[PATCHv4 1/8] x86/cpu: Add CPUID feature bit for VNMI
+
+Introduce the X86_FEATURE_V_NMI bit.
+
+---------------------------------
+
+[PATCHv4 2/8] KVM: SVM: Add VNMI bit definition
+
+Introduce many bits, e.g., V_NMI_MASK : Indicates whether virtual NMI is masked
+in the guest.
+
+---------------------------------
+
+[PATCHv4 3/8] KVM: SVM: Add VNMI support in get/set_nmi_mask
+
+The core idea is to introduce the APIs like below ...
+
++static inline struct vmcb *get_vnmi_vmcb(struct vcpu_svm *svm)
++{
++	if (!vnmi)
++		return NULL;
++
++	if (is_guest_mode(&svm->vcpu))
++		return svm->nested.vmcb02.ptr;
++	else
++		return svm->vmcb01.ptr;
++}
++
++static inline bool is_vnmi_enabled(struct vcpu_svm *svm)
++{
++	struct vmcb *vmcb = get_vnmi_vmcb(svm);
++
++	if (vmcb)
++		return !!(vmcb->control.int_ctl & V_NMI_ENABLE);
++	else
++		return false;
++}
+
+... in order to differentiate when vNMI is supported and when it is not
+supported.
+
+ static bool svm_get_nmi_mask(struct kvm_vcpu *vcpu)
+ {
+-	return !!(vcpu->arch.hflags & HF_NMI_MASK);
++	struct vcpu_svm *svm = to_svm(vcpu);
++
++	if (is_vnmi_enabled(svm))
++		return is_vnmi_mask_set(svm);
++	else
++		return !!(vcpu->arch.hflags & HF_NMI_MASK);
+ }
+
+
+E.g., the vNMI is supported and will be used with vmcb->control.int_ctl &
+V_NMI_ENABLE. Otherwise, it is something like vcpu->arch.hflags & HF_NMI_MASK.
+
+The vmcb->control.int_ctl looks like a bit in VMCS to indicate status of interrupt.
+
+---------------------------------
+
+[PATCHv4 4/8] KVM: SVM: Report NMI not allowed when Guest busy handling VNMI
+
+The core idea is to use "vmcb->control.int_ctl & V_NMI_PENDING" to indicate
+whether further NMI is allowed. In the VNMI case, Report NMI is not allowed
+when V_NMI_PENDING is set which mean virtual NMI already pended for Guest to
+process while the Guest is busy handling the current virtual NMI. The Guest
+will first finish handling the current virtual NMI and then it will take the
+pended event w/o vmexit.
+
+@@ -3598,6 +3598,9 @@ bool svm_nmi_blocked(struct kvm_vcpu *vcpu)
+ 	if (is_guest_mode(vcpu) && nested_exit_on_nmi(svm))
+ 		return false;
+
++	if (is_vnmi_enabled(svm) && is_vnmi_pending_set(svm))
++		return true;
++
+ 	ret = (vmcb->control.int_state & SVM_INTERRUPT_SHADOW_MASK) ||
+ 	      (vcpu->arch.hflags & HF_NMI_MASK);
+
+3605 static int svm_nmi_allowed(struct kvm_vcpu *vcpu, bool for_injection)
+3606 {
+3607         struct vcpu_svm *svm = to_svm(vcpu);
+3608         if (svm->nested.nested_run_pending)
+3609                 return -EBUSY;
+3610
+3611         if (svm_nmi_blocked(vcpu))
+3612                 return 0;
+3613
+3614         /* An NMI must not be injected into L2 if it's supposed to VM-Exit.  */
+3615         if (for_injection && is_guest_mode(vcpu) && nested_exit_on_nmi(svm))
+3616                 return -EBUSY;
+3617         return 1;
+3618 }
+
+---------------------------------
+
+[PATCHv4 5/8] KVM: SVM: Add VNMI support in inject_nmi
+
+Inject the NMI by setting V_NMI in the VMCB interrupt control. processor will
+clear V_NMI to acknowledge processing has started and will keep the V_NMI_MASK
+set until the processor is done with processing the NMI event.
+
+ static void svm_inject_nmi(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
++	struct vmcb *vmcb = NULL;
+
++	if (is_vnmi_enabled(svm) && !svm->nmi_l1_to_l2) {
++		vmcb = get_vnmi_vmcb(svm);
++		vmcb->control.int_ctl |= V_NMI_PENDING;
++		++vcpu->stat.nmi_injections;
++		return;
++	}
+ 	svm->vmcb->control.event_inj = SVM_EVTINJ_VALID | SVM_EVTINJ_TYPE_NMI;
+
+
+
+The rest of patches are for nested. Ignore them to concentrate on L1
+virtualization.

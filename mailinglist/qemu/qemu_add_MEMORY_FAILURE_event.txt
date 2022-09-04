@@ -1,0 +1,102 @@
+[PATCH v3 0/3] add MEMORY_FAILURE event
+
+... from zhenwei pi <pizhenwei@bytedance.com> ...
+
+https://lore.kernel.org/qemu-devel/20200930100440.1060708-1-pizhenwei@bytedance.com/#r
+
+----------------------------
+
+[PATCH v3 1/3] target-i386: seperate MCIP & MCE_MASK error reason
+
+有两个条件
+- (cenv->mcg_status & MCG_STATUS_MCIP) ||
+- !(cenv->cr[4] & CR4_MCE_MASK)
+
+之前对于两个条件都是打印"Triple fault"
+
+
+现在单独
+对第一个条件打印"CPU %d: Previous MCE still in progress, raising triple fault"
+对第二个条件打印""CPU %d: MCE capability is not enabled, raising triple fault"
+
+----------------------------
+
+[PATCH v3 2/3] qapi/run-state.json: introduce memory failure event
+
+发出MemoryFailureAction
+
+
+有两个接收的: guest和hypervisor
+
++##
++# @MemoryFailureRecipient:
++#
++# Hardware memory failure occurs, handled by recipient.
++#
++# @hypervisor: memory failure at QEMU process address space.
++#              (none guest memory, but used by QEMU itself).
++#
++# @guest: memory failure at guest memory,
++#
++# Since: 5.2
++#
++##
++{ 'enum': 'MemoryFailureRecipient',
++  'data': [ 'hypervisor',
++            'guest' ] }
+
+----------------------------
+
+[PATCH v3 3/3] target-i386: post memory failure event to uplayer
+
+没太仔细看, line 621应该是判断是guest memory, 还是在QEMU space的其他(host) memory. 
+
+ 604 void kvm_arch_on_sigbus_vcpu(CPUState *c, int code, void *addr)
+ 605 {
+ 606     X86CPU *cpu = X86_CPU(c);
+ 607     CPUX86State *env = &cpu->env;
+ 608     ram_addr_t ram_addr;
+ 609     hwaddr paddr;
+ 610
+ 611     /* If we get an action required MCE, it has been injected by KVM
+ 612      * while the VM was running.  An action optional MCE instead should
+ 613      * be coming from the main thread, which qemu_init_sigbus identifies
+ 614      * as the "early kill" thread.
+ 615      */
+ 616     assert(code == BUS_MCEERR_AR || code == BUS_MCEERR_AO);
+ 617
+ 618     if ((env->mcg_cap & MCG_SER_P) && addr) {
+ 619         ram_addr = qemu_ram_addr_from_host(addr);
+ 620         if (ram_addr != RAM_ADDR_INVALID &&
+ 621             kvm_physical_memory_addr_from_host(c->kvm_state, addr, &paddr)) {
+ 622             kvm_hwpoison_page_add(ram_addr);
+ 623             kvm_mce_inject(cpu, paddr, code);
+ 624
+ 625             /*
+ 626              * Use different logging severity based on error type.
+ 627              * If there is additional MCE reporting on the hypervisor, QEMU VA
+ 628              * could be another source to identify the PA and MCE details.
+ 629              */
+ 630             if (code == BUS_MCEERR_AR) {
+ 631                 error_report("Guest MCE Memory Error at QEMU addr %p and "
+ 632                     "GUEST addr 0x%" HWADDR_PRIx " of type %s injected",
+ 633                     addr, paddr, "BUS_MCEERR_AR");
+ 634             } else {
+ 635                  warn_report("Guest MCE Memory Error at QEMU addr %p and "
+ 636                      "GUEST addr 0x%" HWADDR_PRIx " of type %s injected",
+ 637                      addr, paddr, "BUS_MCEERR_AO");
+ 638             }
+ 639
+ 640             return;
+ 641         }
+ 642
+ 643         if (code == BUS_MCEERR_AO) {
+ 644             warn_report("Hardware memory error at addr %p of type %s "
+ 645                 "for memory used by QEMU itself instead of guest system!",
+ 646                  addr, "BUS_MCEERR_AO");
+ 647         }
+ 648     }
+ 649
+ 650     if (code == BUS_MCEERR_AR) {
+ 651         hardware_memory_error(addr);
+ 652     }

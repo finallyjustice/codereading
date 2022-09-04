@@ -1,0 +1,71 @@
+[PATCH v2 0/4] Fix a race between posted interrupt delivery and migration in a nested VM
+
+... from Mingwei Zhang <mizhang@google.com> ...
+
+https://lore.kernel.org/all/20220828222544.1964917-1-mizhang@google.com/
+
+--------------------------------------
+
+[PATCH v2 1/4] KVM: x86: move the event handling of KVM_REQ_GET_VMCS12_PAGES into a common function
+
+This patchset (the 1st one) is to fix the below warning.
+
+[237880.809453] ------------[ cut here ]------------
+[237880.809455] WARNING: CPU: 21 PID: 112454 at arch/x86/kvm/vmx/vmx.c:3973 vmx_guest_apic_has_interrupt+0x79/0xe0 [kvm_intel]
+[237880.809469] Modules linked in: kvm_intel vfat fat i2c_mux_pca954x
+i2c_mux spidev cdc_acm xhci_pci xhci_hcd sha3_generic gq(O)
+[237880.809479] CPU: 21 PID: 112454 Comm: vmx_migrate_pi_ Tainted: G S O      5.19.0-smp-DEV #2
+		......
+[237880.809484] RIP: 0010:vmx_guest_apic_has_interrupt+0x79/0xe0 [kvm_intel]
+... ...
+[237880.809493] RSP: 0018:ffff88815c9e7d80 EFLAGS: 00010246
+[237880.809495] RAX: ffff88813acbd000 RBX: ffff8881943ec9c0 RCX: 00000000ffffffff
+[237880.809497] RDX: 0000000000000000 RSI: ffff8881d8676000 RDI: ffff8881943ec9c0
+[237880.809499] RBP: ffff88815c9e7d90 R08: ffff88815c9e7ce8 R09: ffff88815c9e7cf0
+[237880.809500] R10: 0000000000000000 R11: 0000000000000000 R12: 0000000000009aa8
+[237880.809501] R13: ffff8881943ec9c0 R14: ffff8881943ed101 R15: ffff8881943ec9c0
+[237880.809503] FS:  00000000006283c0(0000) GS:ffff88af80740000(0000) knlGS:0000000000000000
+[237880.809505] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[237880.809506] CR2: 00007f9314b4f001 CR3: 00000001cd7b0005 CR4: 00000000003726e0
+[237880.809508] DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+[237880.809509] DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+[237880.809511] Call Trace:
+[237880.809512]  <TASK>
+[237880.809514]  kvm_vcpu_has_events+0xe1/0x150
+[237880.809519]  vcpu_run+0xee/0x2c0
+[237880.809523]  kvm_arch_vcpu_ioctl_run+0x355/0x610
+[237880.809526]  kvm_vcpu_ioctl+0x551/0x610
+[237880.809531]  ? do_futex+0xc8/0x160
+[237880.809537]  __se_sys_ioctl+0x77/0xc0
+[237880.809541]  __x64_sys_ioctl+0x1d/0x20
+[237880.809543]  do_syscall_64+0x44/0xa0
+[237880.809549]  ? irqentry_exit+0x12/0x30
+[237880.809552]  entry_SYSCALL_64_after_hwframe+0x46/0xb0
+[237880.809555] RIP: 0033:0x471777
+
+
+This is related to KVM_REQ_GET_NESTED_STATE_PAGES. As in below link,
+KVM_REQ_GET_NESTED_STATE_PAGES exists to delay reading/writing/pinning of the
+guest memory, which is pointed by various fields of current vmcs/vmcb to next
+KVM_RUN, under an assumption that it is not safe to do in case when we do a non
+natural VM entry (which is either due to resume of nested guest that was
+interrupted by SMM or when we set the nested state after migration. The alleged
+reason for that is that either kvm's mmu is not in 'right state', or that
+userspace VMM will do some modifications to the VM after the entry and before
+we actually enter the nested guest.
+
+https://lore.kernel.org/all/fc6bea3249f26e8dd973ce1bd1e3f6f42c142469.camel@redhat.com/
+
+In this bug, it is because KVM implicitly assumes the virtual APIC page being
+present + mapped into the kernel address space when executing
+vmx_guest_apic_has_interrupt(). However, those memory are not ready as the
+KVM_REQ_GET_VMCS12_PAGES event isn't assessed before entering vcpu_block.
+
+THE FIX IS TO: Fix this by getting vmcs12 pages before inspecting the guest's
+APIC page.
+
+The interesting functions are vmx_get_nested_state_pages-->nested_get_vmcs12_pages().
+
+-----------------------------------
+
+Another intersting part is: the selftest patch implements code to simulate migration.
