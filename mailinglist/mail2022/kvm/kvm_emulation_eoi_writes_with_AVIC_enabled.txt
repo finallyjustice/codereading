@@ -1,0 +1,80 @@
+[PATCH 1/1] KVM: x86: Allow emulation of EOI writes with AVIC enabled
+
+
+... from Santosh Shukla <santosh.shukla@amd.com> ...
+
+https://lore.kernel.org/all/20220903200557.1719-1-alejandro.j.jimenez@oracle.com/
+
+The commit message is clear enough. Due to the lack of knowledge on AMD AVIC, I assume:
+
+1. The VM may trap by EOI write, but needs to obtain the value from the APIC
+page via kvm_lapic_msr_read().
+
+2. However, the kvm_lapic_msr_read() disallows access so that GP.
+
+2281 /* emulate APIC access in a trap manner */
+2282 void kvm_apic_write_nodecode(struct kvm_vcpu *vcpu, u32 offset)
+2283 {
+2284         struct kvm_lapic *apic = vcpu->arch.apic;
+2285         u64 val;
+2286 
+2287         if (apic_x2apic_mode(apic)) {
+2288                 if (KVM_BUG_ON(kvm_lapic_msr_read(apic, offset, &val), vcpu->kvm))
+2289                         return;
+2290         } else {
+2291                 val = kvm_lapic_get_reg(apic, offset);
+2292         }
+2293 
+2294         /*
+2295          * ICR is a single 64-bit register when x2APIC is enabled.  For legacy
+2296          * xAPIC, ICR writes need to go down the common (slightly slower) path
+2297          * to get the upper half from ICR2.
+2298          */
+2299         if (apic_x2apic_mode(apic) && offset == APIC_ICR) {
+2300                 kvm_apic_send_ipi(apic, (u32)val, (u32)(val >> 32));
+2301                 trace_kvm_apic_write(APIC_ICR, val);
+2302         } else {
+2303                 /* TODO: optimize to just emulate side effect w/o one more write */
+2304                 kvm_lapic_reg_write(apic, offset, (u32)val);
+2305         }
+2306 }
+2307 EXPORT_SYMBOL_GPL(kvm_apic_write_nodecode);
+
+-------------------------
+
+The original proposed fix is to allow EOI access in kvm_lapic_reg_read().
+However, the GP should not be discarded. Sean Christopherson proposed below:
+
+---> The only reason KVM uses kvm_lapic_msr_read() is to play nice with the
+64-bit ICR in x2APIC.
+
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 4cebbdd3431b..76a19bf1eb55 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -2349,23 +2349,18 @@ void kvm_apic_write_nodecode(struct kvm_vcpu *vcpu, u32 offset)
+ 	struct kvm_lapic *apic = vcpu->arch.apic;
+ 	u64 val;
+ 
+-	if (apic_x2apic_mode(apic)) {
+-		if (KVM_BUG_ON(kvm_lapic_msr_read(apic, offset, &val), vcpu->kvm))
+-			return;
+-	} else {
+-		val = kvm_lapic_get_reg(apic, offset);
+-	}
+-
+ 	/*
+ 	 * ICR is a single 64-bit register when x2APIC is enabled.  For legacy
+ 	 * xAPIC, ICR writes need to go down the common (slightly slower) path
+ 	 * to get the upper half from ICR2.
+ 	 */
+ 	if (apic_x2apic_mode(apic) && offset == APIC_ICR) {
++		val = kvm_lapic_get_reg64(apic, APIC_ICR);
+ 		kvm_apic_send_ipi(apic, (u32)val, (u32)(val >> 32));
+ 		trace_kvm_apic_write(APIC_ICR, val);
+ 	} else {
+ 		/* TODO: optimize to just emulate side effect w/o one more write */
++		val = kvm_lapic_get_reg(apic, offset);
+ 		kvm_lapic_reg_write(apic, offset, (u32)val);
+ 	}
+ }

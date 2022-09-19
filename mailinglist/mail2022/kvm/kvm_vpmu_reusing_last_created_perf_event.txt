@@ -1,0 +1,230 @@
+[PATCH v4 0/6]  KVM: x86/vPMU: Efficiency optimization by reusing last created perf_event
+
+... from Like Xu <like.xu@linux.intel.com> ...
+
+https://lore.kernel.org/kvm/20191027105243.34339-1-like.xu@linux.intel.com/
+
+
+This patchset is about to optimize the PMU virtualization at KVM side. IT is to
+improve vPMU Efficiency for guest perf users which is mainly measured by guest
+NMI handler latency for basic perf usage. However, I have no idea what does
+"guest NMI handler latency indicate".
+
+[1] multiplexing sampling usage: time perf record  -e `perf list | grep Hardware | grep event | awk '{print $1}' | head -n 10 |tr '\n' ',' | sed 's/,$//' ` ./ftest
+[2] one gp counter sampling usage: perf record -e branch-misses ./ftest
+[3] one fixed counter sampling usage: perf record -e instructions ./ftest
+[4] event count usage: perf stat -e branch-misses ./ftest
+
+The patchset has two goals:
+
+1. To reuse last created perf_event for the same vPMC when:
+
+(1) the new requested config is the exactly same as the last programed config
+(used by pmc_reprogram_counter())
+AND
+(2) the new event period is appropriate and accepted (via perf_event_period()).
+
+Before the perf_event is resued, it would be disabled until it's could be
+reused and reassigned a hw-counter again to serve for vPMC.
+
+
+2. If the disabled perf_event is no longer reused, we do a lazy release
+mechanism, which in a short is to release the disabled perf_events in the call
+of kvm_pmu_handle_event since the vcpu gets next scheduled in if guest doesn't
+WRMSR its MSRs in the last sched time slice. In the kvm_arch_sched_in(),
+KVM_REQ_PMU is requested if the pmu->event_count has not been reduced to zero
+and then do kvm_pmu_cleanup only once for a sched time slice to ensure that
+overhead is very limited.
+
+-----------------------------------------
+
+[PATCH v4 1/6] perf/core: Provide a kernel-internal interface to recalibrate event period
+
+While so far perf_event_period() is only an interface for userspace, this patch
+makes it available to kernel space user (e.g., KVM) as well.
+
+-----------------------------------------
+
+[PATCH v4 2/6] perf/core: Provide a kernel-internal interface to pause perf_event
+
+As the idea of the patchset is to avoid always
+perf_event_create_kernel_counter(), this patch introduces perf_event_pause(). 
+
++/* Assume it's not an event with inherit set. */
++u64 perf_event_pause(struct perf_event *event, bool reset)
++{
++	struct perf_event_context *ctx;
++	u64 count;
++
++	ctx = perf_event_ctx_lock(event);
++	WARN_ON_ONCE(event->attr.inherit);
++	_perf_event_disable(event);
++	count = local64_read(&event->count);
++	if (reset)
++		local64_set(&event->count, 0);
++	perf_event_ctx_unlock(event, ctx);
++
++	return count;
++}
++EXPORT_SYMBOL_GPL(perf_event_pause);
+
+-----------------------------------------
+
+[PATCH v4 3/6] KVM: x86/vPMU: Rename pmu_ops callbacks from msr_idx to rdpmc_ecx
+
+Replace pmu_ops->msr_idx_to_pmc with pmu_ops->rdpmc_ecx_to_pmc so that the
+former can be re-defined in the next patch.
+
+-----------------------------------------
+
+[PATCH v4 4/6] KVM: x86/vPMU: Introduce a new kvm_pmu_ops->msr_idx_to_pmc callback
+
+Re-introduce kvm_pmu_ops->msr_idx_to_pmc to return the PMC for the given msr
+index, e.g.,:
+
++static struct kvm_pmc *intel_msr_idx_to_pmc(struct kvm_vcpu *vcpu, u32 msr)
++{
++	struct kvm_pmu *pmu = vcpu_to_pmu(vcpu);
++	struct kvm_pmc *pmc;
++
++	pmc = get_fixed_pmc(pmu, msr);
++	pmc = pmc ? pmc : get_gp_pmc(pmu, msr, MSR_P6_EVNTSEL0);
++	pmc = pmc ? pmc : get_gp_pmc(pmu, msr, MSR_IA32_PERFCTR0);
++
++	return pmc;
++}
+
+-----------------------------------------
+
+[PATCH v4 5/6] KVM: x86/vPMU: Reuse perf_event to avoid unnecessary pmc_reprogram_counter
+
+This patch is to avoid perf_event_create_kernel_counter() as much as possible, when the below conditions are meet.
+
+(1) the reuqested config ('u64 eventsel' for gp and 'u8 ctrl' for fixed) is the
+same as its current config
+AND
+(2) a new sample period based on pmc->counter is accepted by host perf interface
+
+... the current event could be reused safely as a new created one does.
+Otherwise, do release the undesirable perf_event and reprogram a new one as
+usual.
+
+-----------------------------------------
+
+[PATCH v4 6/6] KVM: x86/vPMU: Add lazy mechanism to release perf_event per vPMC
+
+This patch is about how to destroy the un-used event.
+
+
+An 'event_count'  is introduce ...
+
+@@ -475,6 +475,20 @@ struct kvm_pmu {
+ 	struct kvm_pmc fixed_counters[INTEL_PMC_MAX_FIXED];
+ 	struct irq_work irq_work;
+ 	u64 reprogram_pmi;
++	DECLARE_BITMAP(all_valid_pmc_idx, X86_PMC_IDX_MAX);
++	DECLARE_BITMAP(pmc_in_use, X86_PMC_IDX_MAX);
++
++	/*
++	 * The gate to release perf_events not marked in
++	 * pmc_in_use only once in a vcpu time slice.
++	 */
++	bool need_cleanup;
++
++	/*
++	 * The total number of programmed perf_events and it helps to avoid
++	 * redundant check before cleanup if guest don't use vPMU at all.
++	 */
++	u8 event_count;
+ };
+
+
+... it is incremented when used ...
+
+@@ -137,6 +137,7 @@ static void pmc_reprogram_counter(struct kvm_pmc *pmc, u32 type,
+ 	}
+
+ 	pmc->perf_event = event;
++	pmc_to_pmu(pmc)->event_count++;
+ 	clear_bit(pmc->idx, (unsigned long*)&pmc_to_pmu(pmc)->reprogram_pmi);
+ }
+
+... and decremented when released.
+
+@@ -62,6 +62,7 @@ static inline void pmc_release_perf_event(struct kvm_pmc *pmc)
+ 		perf_event_release_kernel(pmc->perf_event);
+ 		pmc->perf_event = NULL;
+ 		pmc->current_config = 0;
++		pmc_to_pmu(pmc)->event_count--;
+ 	}
+ }
+
+
+If the guest doesn't WRMSR any of the vPMC's MSRs during an entire vcpu sched
+time slice, and its independent enable bit of the vPMC isn't set, we can
+predict that the guest has finished the use of this vPMC, and then do request
+KVM_REQ_PMU in kvm_arch_sched_in and release those perf_events in the first
+call of kvm_pmu_handle_event() after the vcpu is scheduled in.
+
+
+Here are some sample callstacks on 4.14.
+
+reprogram_gp_counter
+intel_pmu_set_msr
+kvm_pmu_set_msr
+kvm_set_msr_common
+vmx_set_msr
+kvm_set_msr
+__dta_handle_wrmsr_188
+vmx_handle_exit
+__dta_vcpu_enter_guest_1387
+kvm_arch_vcpu_ioctl_run
+kvm_vcpu_ioctl
+do_vfs_ioctl
+sys_ioctl
+do_syscall_64
+entry_SYSCALL_64_after_hwframe
+
+
+reprogram_fixed_counter
+kvm_pmu_handle_event
+__dta_vcpu_enter_guest_1387
+kvm_arch_vcpu_ioctl_run
+kvm_vcpu_ioctl
+do_vfs_ioctl
+sys_ioctl
+do_syscall_64
+entry_SYSCALL_64_after_hwframe
+
+
+reprogram_fixed_counter
+kvm_pmu_set_msr
+kvm_set_msr_common
+vmx_set_msr
+kvm_set_msr
+__dta_handle_wrmsr_188
+vmx_handle_exit
+__dta_vcpu_enter_guest_1387
+kvm_arch_vcpu_ioctl_run
+kvm_vcpu_ioctl
+do_vfs_ioctl
+sys_ioctl
+do_syscall_64
+entry_SYSCALL_64_after_hwframe
+
+
+reprogram_fixed_counter
+intel_pmu_set_msr
+kvm_pmu_set_msr
+kvm_set_msr_common
+vmx_set_msr
+kvm_set_msr
+__dta_handle_wrmsr_188
+vmx_handle_exit
+__dta_vcpu_enter_guest_1387
+kvm_arch_vcpu_ioctl_run
+kvm_vcpu_ioctl
+do_vfs_ioctl
+sys_ioctl
+do_syscall_64
+entry_SYSCALL_64_after_hwframe
