@@ -1,6 +1,6 @@
-From 29ac06acd887ba6b1ba33aa3e64a7da94c52ab2c Mon Sep 17 00:00:00 2001
+From b91271ad11a71ced1e7eaaab144070813c3c164f Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Mon, 19 Sep 2022 09:53:08 -0700
+Date: Sun, 25 Sep 2022 18:27:48 -0700
 Subject: [PATCH 1/1] linux v5.19
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
@@ -19,7 +19,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  arch/x86/kvm/mmu/spte.h            |   7 ++
  arch/x86/kvm/mmu/tdp_iter.c        | 150 ++++++++++++++++++++++++++++-
  arch/x86/kvm/mmu/tdp_iter.h        |  79 +++++++++++++++
- arch/x86/kvm/mmu/tdp_mmu.c         |  93 ++++++++++++++++++
+ arch/x86/kvm/mmu/tdp_mmu.c         | 109 +++++++++++++++++++++
  arch/x86/kvm/pmu.c                 |  77 +++++++++++++++
  arch/x86/kvm/pmu.h                 |  12 +++
  arch/x86/kvm/svm/svm.c             |  23 +++++
@@ -27,16 +27,21 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  arch/x86/kvm/vmx/pmu_intel.c       |   4 +
  arch/x86/kvm/vmx/vmcs12.h          |   9 ++
  arch/x86/kvm/vmx/vmx.c             |  13 +++
- arch/x86/kvm/x86.c                 |  33 +++++++
+ arch/x86/kvm/x86.c                 |  37 +++++++
+ drivers/acpi/cppc_acpi.c           |   6 ++
  drivers/net/virtio_net.c           |   4 +
+ drivers/virtio/virtio_ring.c       | 114 ++++++++++++++++++++++
  include/linux/kvm_para.h           |  48 +++++++++
  kernel/events/core.c               |  98 +++++++++++++++++++
  tools/perf/arch/x86/util/evlist.c  |   8 ++
  tools/perf/arch/x86/util/topdown.c |   8 ++
- tools/perf/builtin-stat.c          |  21 ++++
+ tools/perf/builtin-stat.c          |  39 ++++++++
+ tools/perf/util/evlist.c           |   5 +
+ tools/perf/util/evsel.c            |   7 ++
+ tools/perf/util/parse-events.c     |   9 ++
  tools/perf/util/pmu.c              |   4 +
- virt/kvm/kvm_main.c                |  14 +++
- 31 files changed, 1049 insertions(+), 1 deletion(-)
+ virt/kvm/kvm_main.c                |  21 ++++
+ 36 files changed, 1235 insertions(+), 1 deletion(-)
 
 diff --git a/arch/x86/events/core.c b/arch/x86/events/core.c
 index 30788894124f..d64ff2280223 100644
@@ -446,7 +451,7 @@ index 21a5482bcf84..d298fd698d2c 100644
  {
  	u64 disable_mask = __this_cpu_read(cpu_hw_events.perf_ctr_virt_mask);
 diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
-index 9217bd6cf0d1..4bd7d1ce8afa 100644
+index 9217bd6cf0d1..751ebef8d4bf 100644
 --- a/arch/x86/include/asm/kvm_host.h
 +++ b/arch/x86/include/asm/kvm_host.h
 @@ -494,6 +494,18 @@ struct kvm_pmc {
@@ -494,7 +499,7 @@ index 9217bd6cf0d1..4bd7d1ce8afa 100644
  	 * it up, freeing the root after an RCU grace period.
  	 */
 +	/*
-+	 * 在以下使用kvm_arch->bool tdp_mmu_enabled:
++	 * 在以下使用kvm_arch->tdp_mmu_roots:
 +	 *   - arch/x86/kvm/mmu/tdp_mmu.c|30| <<kvm_mmu_init_tdp_mmu>> INIT_LIST_HEAD(&kvm->arch.tdp_mmu_roots);
 +	 *   - arch/x86/kvm/mmu/tdp_mmu.c|58| <<kvm_mmu_uninit_tdp_mmu>> WARN_ON(!list_empty(&kvm->arch.tdp_mmu_roots));
 +	 *   - arch/x86/kvm/mmu/tdp_mmu.c|213| <<tdp_mmu_next_root>> next_root = list_next_or_null_rcu(&kvm->arch.tdp_mmu_roots,
@@ -1132,10 +1137,10 @@ index adfca0cf94d3..5cd25a1956b7 100644
  	for_each_tdp_pte_min_level(iter, root, PG_LEVEL_4K, start, end)
  
 diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
-index 7b9265d67131..5be4b9df330d 100644
+index 7b9265d67131..f632f2c1ae3d 100644
 --- a/arch/x86/kvm/mmu/tdp_mmu.c
 +++ b/arch/x86/kvm/mmu/tdp_mmu.c
-@@ -26,6 +26,11 @@ int kvm_mmu_init_tdp_mmu(struct kvm *kvm)
+@@ -26,7 +26,16 @@ int kvm_mmu_init_tdp_mmu(struct kvm *kvm)
  		return -ENOMEM;
  
  	/* This should not be changed for the lifetime of the VM. */
@@ -1145,9 +1150,14 @@ index 7b9265d67131..5be4b9df330d 100644
 +	 *    -> bool tdp_mmu_enabled;
 +	 */
  	kvm->arch.tdp_mmu_enabled = true;
++	/*
++	 * 只在以下添加kvm_arch->tdp_mmu_roots:
++	 *   - arch/x86/kvm/mmu/tdp_mmu.c|335| <<kvm_tdp_mmu_get_vcpu_root_hpa>> list_add_rcu(&root->link, &kvm->arch.tdp_mmu_roots);
++	 */
  	INIT_LIST_HEAD(&kvm->arch.tdp_mmu_roots);
  	spin_lock_init(&kvm->arch.tdp_mmu_pages_lock);
-@@ -35,6 +40,14 @@ int kvm_mmu_init_tdp_mmu(struct kvm *kvm)
+ 	INIT_LIST_HEAD(&kvm->arch.tdp_mmu_pages);
+@@ -35,6 +44,14 @@ int kvm_mmu_init_tdp_mmu(struct kvm *kvm)
  }
  
  /* Arbitrarily returns true so that this may be used in if statements. */
@@ -1162,7 +1172,7 @@ index 7b9265d67131..5be4b9df330d 100644
  static __always_inline bool kvm_lockdep_assert_mmu_lock_held(struct kvm *kvm,
  							     bool shared)
  {
-@@ -65,6 +78,12 @@ void kvm_mmu_uninit_tdp_mmu(struct kvm *kvm)
+@@ -65,6 +82,12 @@ void kvm_mmu_uninit_tdp_mmu(struct kvm *kvm)
  	rcu_barrier();
  }
  
@@ -1175,7 +1185,7 @@ index 7b9265d67131..5be4b9df330d 100644
  static void tdp_mmu_free_sp(struct kvm_mmu_page *sp)
  {
  	free_page((unsigned long)sp->spt);
-@@ -79,6 +98,11 @@ static void tdp_mmu_free_sp(struct kvm_mmu_page *sp)
+@@ -79,6 +102,11 @@ static void tdp_mmu_free_sp(struct kvm_mmu_page *sp)
   * section, and freeing it after a grace period, lockless access to that
   * memory won't use it after it is freed.
   */
@@ -1187,7 +1197,7 @@ index 7b9265d67131..5be4b9df330d 100644
  static void tdp_mmu_free_sp_rcu_callback(struct rcu_head *head)
  {
  	struct kvm_mmu_page *sp = container_of(head, struct kvm_mmu_page,
-@@ -90,6 +114,10 @@ static void tdp_mmu_free_sp_rcu_callback(struct rcu_head *head)
+@@ -90,6 +118,10 @@ static void tdp_mmu_free_sp_rcu_callback(struct rcu_head *head)
  static void tdp_mmu_zap_root(struct kvm *kvm, struct kvm_mmu_page *root,
  			     bool shared);
  
@@ -1198,7 +1208,7 @@ index 7b9265d67131..5be4b9df330d 100644
  static void tdp_mmu_zap_root_work(struct work_struct *work)
  {
  	struct kvm_mmu_page *root = container_of(work, struct kvm_mmu_page,
-@@ -120,6 +148,11 @@ static void tdp_mmu_zap_root_work(struct work_struct *work)
+@@ -120,6 +152,11 @@ static void tdp_mmu_zap_root_work(struct work_struct *work)
  	read_unlock(&kvm->mmu_lock);
  }
  
@@ -1210,7 +1220,7 @@ index 7b9265d67131..5be4b9df330d 100644
  static void tdp_mmu_schedule_zap_root(struct kvm *kvm, struct kvm_mmu_page *root)
  {
  	root->tdp_mmu_async_data = kvm;
-@@ -127,6 +160,10 @@ static void tdp_mmu_schedule_zap_root(struct kvm *kvm, struct kvm_mmu_page *root
+@@ -127,6 +164,10 @@ static void tdp_mmu_schedule_zap_root(struct kvm *kvm, struct kvm_mmu_page *root
  	queue_work(kvm->arch.tdp_mmu_zap_wq, &root->tdp_mmu_async_work);
  }
  
@@ -1221,7 +1231,7 @@ index 7b9265d67131..5be4b9df330d 100644
  static inline bool kvm_tdp_root_mark_invalid(struct kvm_mmu_page *page)
  {
  	union kvm_mmu_page_role role = page->role;
-@@ -137,6 +174,13 @@ static inline bool kvm_tdp_root_mark_invalid(struct kvm_mmu_page *page)
+@@ -137,6 +178,13 @@ static inline bool kvm_tdp_root_mark_invalid(struct kvm_mmu_page *page)
  	return role.invalid;
  }
  
@@ -1235,7 +1245,7 @@ index 7b9265d67131..5be4b9df330d 100644
  void kvm_tdp_mmu_put_root(struct kvm *kvm, struct kvm_mmu_page *root,
  			  bool shared)
  {
-@@ -201,6 +245,11 @@ void kvm_tdp_mmu_put_root(struct kvm *kvm, struct kvm_mmu_page *root,
+@@ -201,6 +249,11 @@ void kvm_tdp_mmu_put_root(struct kvm *kvm, struct kvm_mmu_page *root,
   *
   * Returns NULL if the end of tdp_mmu_roots was reached.
   */
@@ -1247,7 +1257,18 @@ index 7b9265d67131..5be4b9df330d 100644
  static struct kvm_mmu_page *tdp_mmu_next_root(struct kvm *kvm,
  					      struct kvm_mmu_page *prev_root,
  					      bool shared, bool only_valid)
-@@ -600,6 +649,10 @@ static void __handle_changed_spte(struct kvm *kvm, int as_id, gfn_t gfn,
+@@ -308,6 +361,10 @@ static void tdp_mmu_init_child_sp(struct kvm_mmu_page *child_sp,
+ 	tdp_mmu_init_sp(child_sp, iter->sptep, iter->gfn, role);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu/mmu.c|3397| <<mmu_alloc_direct_roots>> root = kvm_tdp_mmu_get_vcpu_root_hpa(vcpu);
++ */
+ hpa_t kvm_tdp_mmu_get_vcpu_root_hpa(struct kvm_vcpu *vcpu)
+ {
+ 	union kvm_mmu_page_role role = vcpu->arch.mmu->root_role;
+@@ -600,6 +657,10 @@ static void __handle_changed_spte(struct kvm *kvm, int as_id, gfn_t gfn,
  		handle_removed_pt(kvm, spte_to_child_pt(old_spte, level), shared);
  }
  
@@ -1258,7 +1279,7 @@ index 7b9265d67131..5be4b9df330d 100644
  static void handle_changed_spte(struct kvm *kvm, int as_id, gfn_t gfn,
  				u64 old_spte, u64 new_spte, int level,
  				bool shared)
-@@ -722,6 +775,11 @@ static inline int tdp_mmu_zap_spte_atomic(struct kvm *kvm,
+@@ -722,6 +783,11 @@ static inline int tdp_mmu_zap_spte_atomic(struct kvm *kvm,
   * Returns the old SPTE value, which _may_ be different than @old_spte if the
   * SPTE had voldatile bits.
   */
@@ -1270,7 +1291,7 @@ index 7b9265d67131..5be4b9df330d 100644
  static u64 __tdp_mmu_set_spte(struct kvm *kvm, int as_id, tdp_ptep_t sptep,
  			      u64 old_spte, u64 new_spte, gfn_t gfn, int level,
  			      bool record_acc_track, bool record_dirty_log)
-@@ -808,6 +866,15 @@ static inline void tdp_mmu_set_spte_no_dirty_log(struct kvm *kvm,
+@@ -808,6 +874,15 @@ static inline void tdp_mmu_set_spte_no_dirty_log(struct kvm *kvm,
   *
   * Returns true if this function yielded.
   */
@@ -1286,7 +1307,7 @@ index 7b9265d67131..5be4b9df330d 100644
  static inline bool __must_check tdp_mmu_iter_cond_resched(struct kvm *kvm,
  							  struct tdp_iter *iter,
  							  bool flush, bool shared)
-@@ -850,6 +917,11 @@ static inline gfn_t tdp_mmu_max_gfn_exclusive(void)
+@@ -850,6 +925,11 @@ static inline gfn_t tdp_mmu_max_gfn_exclusive(void)
  	return kvm_mmu_max_gfn() + 1;
  }
  
@@ -1298,7 +1319,7 @@ index 7b9265d67131..5be4b9df330d 100644
  static void __tdp_mmu_zap_root(struct kvm *kvm, struct kvm_mmu_page *root,
  			       bool shared, int zap_level)
  {
-@@ -858,6 +930,9 @@ static void __tdp_mmu_zap_root(struct kvm *kvm, struct kvm_mmu_page *root,
+@@ -858,6 +938,9 @@ static void __tdp_mmu_zap_root(struct kvm *kvm, struct kvm_mmu_page *root,
  	gfn_t end = tdp_mmu_max_gfn_exclusive();
  	gfn_t start = 0;
  
@@ -1308,7 +1329,7 @@ index 7b9265d67131..5be4b9df330d 100644
  	for_each_tdp_pte_min_level(iter, root, zap_level, start, end) {
  retry:
  		if (tdp_mmu_iter_cond_resched(kvm, &iter, false, shared))
-@@ -876,6 +951,11 @@ static void __tdp_mmu_zap_root(struct kvm *kvm, struct kvm_mmu_page *root,
+@@ -876,6 +959,11 @@ static void __tdp_mmu_zap_root(struct kvm *kvm, struct kvm_mmu_page *root,
  	}
  }
  
@@ -1320,7 +1341,7 @@ index 7b9265d67131..5be4b9df330d 100644
  static void tdp_mmu_zap_root(struct kvm *kvm, struct kvm_mmu_page *root,
  			     bool shared)
  {
-@@ -912,6 +992,10 @@ static void tdp_mmu_zap_root(struct kvm *kvm, struct kvm_mmu_page *root,
+@@ -912,6 +1000,10 @@ static void tdp_mmu_zap_root(struct kvm *kvm, struct kvm_mmu_page *root,
  	rcu_read_unlock();
  }
  
@@ -1331,7 +1352,7 @@ index 7b9265d67131..5be4b9df330d 100644
  bool kvm_tdp_mmu_zap_sp(struct kvm *kvm, struct kvm_mmu_page *sp)
  {
  	u64 old_spte;
-@@ -1126,6 +1210,11 @@ static int tdp_mmu_map_handle_target_level(struct kvm_vcpu *vcpu,
+@@ -1126,6 +1218,11 @@ static int tdp_mmu_map_handle_target_level(struct kvm_vcpu *vcpu,
   * Returns: 0 if the new page table was installed. Non-0 if the page table
   *          could not be installed (e.g. the atomic compare-exchange failed).
   */
@@ -1343,7 +1364,7 @@ index 7b9265d67131..5be4b9df330d 100644
  static int tdp_mmu_link_sp(struct kvm *kvm, struct tdp_iter *iter,
  			   struct kvm_mmu_page *sp, bool account_nx,
  			   bool shared)
-@@ -1154,6 +1243,10 @@ static int tdp_mmu_link_sp(struct kvm *kvm, struct tdp_iter *iter,
+@@ -1154,6 +1251,10 @@ static int tdp_mmu_link_sp(struct kvm *kvm, struct tdp_iter *iter,
   * Handle a TDP page fault (NPT/EPT violation/misconfiguration) by installing
   * page tables and SPTEs to translate the faulting guest physical address.
   */
@@ -1354,6 +1375,28 @@ index 7b9265d67131..5be4b9df330d 100644
  int kvm_tdp_mmu_map(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
  {
  	struct kvm_mmu *mmu = vcpu->arch.mmu;
+@@ -1871,6 +1972,10 @@ bool kvm_tdp_mmu_write_protect_gfn(struct kvm *kvm,
+  *
+  * Must be called between kvm_tdp_mmu_walk_lockless_{begin,end}.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu/mmu.c|3822| <<get_mmio_spte>> leaf = kvm_tdp_mmu_get_walk(vcpu, addr, sptes, &root);
++ */
+ int kvm_tdp_mmu_get_walk(struct kvm_vcpu *vcpu, u64 addr, u64 *sptes,
+ 			 int *root_level)
+ {
+@@ -1900,6 +2005,10 @@ int kvm_tdp_mmu_get_walk(struct kvm_vcpu *vcpu, u64 addr, u64 *sptes,
+  *
+  * WARNING: This function is only intended to be called during fast_page_fault.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu/mmu.c|3162| <<fast_page_fault>> sptep = kvm_tdp_mmu_fast_pf_get_last_sptep(vcpu, fault->addr, &spte);
++ */
+ u64 *kvm_tdp_mmu_fast_pf_get_last_sptep(struct kvm_vcpu *vcpu, u64 addr,
+ 					u64 *spte)
+ {
 diff --git a/arch/x86/kvm/pmu.c b/arch/x86/kvm/pmu.c
 index 3f868fed9114..522d2e57f10e 100644
 --- a/arch/x86/kvm/pmu.c
@@ -1704,7 +1747,7 @@ index be7c19374fdd..4f4a91c650ab 100644
  {
  	struct vcpu_vmx *vmx = to_vmx(vcpu);
 diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
-index e5fa335a4ea7..48af72136ced 100644
+index e5fa335a4ea7..21f10f37f480 100644
 --- a/arch/x86/kvm/x86.c
 +++ b/arch/x86/kvm/x86.c
 @@ -797,6 +797,11 @@ bool kvm_inject_emulated_page_fault(struct kvm_vcpu *vcpu,
@@ -1778,7 +1821,18 @@ index e5fa335a4ea7..48af72136ced 100644
  static int emulator_read_write_onepage(unsigned long addr, void *val,
  				       unsigned int bytes,
  				       struct x86_exception *exception,
-@@ -11783,6 +11812,10 @@ bool kvm_vcpu_is_bsp(struct kvm_vcpu *vcpu)
+@@ -10387,6 +10416,10 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ }
+ 
+ /* Called within kvm->srcu read side.  */
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|10496| <<vcpu_run>> r = vcpu_block(vcpu);
++ */
+ static inline int vcpu_block(struct kvm_vcpu *vcpu)
+ {
+ 	bool hv_timer;
+@@ -11783,6 +11816,10 @@ bool kvm_vcpu_is_bsp(struct kvm_vcpu *vcpu)
  __read_mostly DEFINE_STATIC_KEY_FALSE(kvm_has_noapic_vcpu);
  EXPORT_SYMBOL_GPL(kvm_has_noapic_vcpu);
  
@@ -1789,6 +1843,23 @@ index e5fa335a4ea7..48af72136ced 100644
  void kvm_arch_sched_in(struct kvm_vcpu *vcpu, int cpu)
  {
  	struct kvm_pmu *pmu = vcpu_to_pmu(vcpu);
+diff --git a/drivers/acpi/cppc_acpi.c b/drivers/acpi/cppc_acpi.c
+index 3c6d4ef87be0..caac8a3eb543 100644
+--- a/drivers/acpi/cppc_acpi.c
++++ b/drivers/acpi/cppc_acpi.c
+@@ -198,6 +198,12 @@ static struct kobj_type cppc_ktype = {
+ 	.default_groups = cppc_groups,
+ };
+ 
++/*
++ * called by:
++ *   - drivers/acpi/cppc_acpi.c|257| <<send_pcc_cmd>> ret = check_pcc_chan(pcc_ss_id, false);
++ *   - drivers/acpi/cppc_acpi.c|319| <<send_pcc_cmd>> ret = check_pcc_chan(pcc_ss_id, true);
++ *   - drivers/acpi/cppc_acpi.c|1411| <<cppc_set_perf>> ret = check_pcc_chan(pcc_ss_id, false);
++ */
+ static int check_pcc_chan(int pcc_ss_id, bool chk_err_bit)
+ {
+ 	int ret, status;
 diff --git a/drivers/net/virtio_net.c b/drivers/net/virtio_net.c
 index ec8e1b3108c3..1c3a6ee39aa8 100644
 --- a/drivers/net/virtio_net.c
@@ -1804,6 +1875,263 @@ index ec8e1b3108c3..1c3a6ee39aa8 100644
  static int add_recvbuf_big(struct virtnet_info *vi, struct receive_queue *rq,
  			   gfp_t gfp)
  {
+diff --git a/drivers/virtio/virtio_ring.c b/drivers/virtio/virtio_ring.c
+index 643ca779fcc6..4b9b839101cd 100644
+--- a/drivers/virtio/virtio_ring.c
++++ b/drivers/virtio/virtio_ring.c
+@@ -16,6 +16,13 @@
+ 
+ #ifdef DEBUG
+ /* For development, we want to crash whenever the ring is screwed. */
++/*
++ * called by:
++ *   - drivers/virtio/virtio_ring.c|772| <<virtqueue_get_buf_ctx_split>> BAD_RING(vq, "id %u out of range\n", i);
++ *   - drivers/virtio/virtio_ring.c|776| <<virtqueue_get_buf_ctx_split>> BAD_RING(vq, "id %u is not a head!\n", i);
++ *   - drivers/virtio/virtio_ring.c|1462| <<virtqueue_get_buf_ctx_packed>> BAD_RING(vq, "id %u out of range\n", id);
++ *   - drivers/virtio/virtio_ring.c|1466| <<virtqueue_get_buf_ctx_packed>> BAD_RING(vq, "id %u is not a head!\n", id);
++ */
+ #define BAD_RING(_vq, fmt, args...)				\
+ 	do {							\
+ 		dev_err(&(_vq)->vq.vdev->dev,			\
+@@ -32,6 +39,11 @@
+ 	} while (0)
+ #define END_USE(_vq) \
+ 	do { BUG_ON(!(_vq)->in_use); (_vq)->in_use = 0; } while(0)
++/*
++ * called by:
++ *   - drivers/virtio/virtio_ring.c|496| <<virtqueue_add_split>> LAST_ADD_TIME_UPDATE(vq);
++ *   - drivers/virtio/virtio_ring.c|1186| <<virtqueue_add_packed>> LAST_ADD_TIME_UPDATE(vq);
++ */
+ #define LAST_ADD_TIME_UPDATE(_vq)				\
+ 	do {							\
+ 		ktime_t now = ktime_get();			\
+@@ -43,6 +55,11 @@
+ 		(_vq)->last_add_time = now;			\
+ 		(_vq)->last_add_time_valid = true;		\
+ 	} while (0)
++/*
++ * called by:
++ *   - drivers/virtio/virtio_ring.c|668| <<virtqueue_kick_prepare_split>> LAST_ADD_TIME_CHECK(vq);
++ *   - drivers/virtio/virtio_ring.c|1338| <<virtqueue_kick_prepare_packed>> LAST_ADD_TIME_CHECK(vq);
++ */
+ #define LAST_ADD_TIME_CHECK(_vq)				\
+ 	do {							\
+ 		if ((_vq)->last_add_time_valid) {		\
+@@ -50,6 +67,15 @@
+ 				      (_vq)->last_add_time)) > 100); \
+ 		}						\
+ 	} while (0)
++/*
++ * called by:
++ *   - drivers/virtio/virtio_ring.c|669| <<virtqueue_kick_prepare_split>> LAST_ADD_TIME_INVALID(vq);
++ *   - drivers/virtio/virtio_ring.c|792| <<virtqueue_get_buf_ctx_split>> LAST_ADD_TIME_INVALID(vq);
++ *   - drivers/virtio/virtio_ring.c|1339| <<virtqueue_kick_prepare_packed>> LAST_ADD_TIME_INVALID(vq);
++ *   - drivers/virtio/virtio_ring.c|1493| <<virtqueue_get_buf_ctx_packed>> LAST_ADD_TIME_INVALID(vq);
++ *
++ * 把(_vq)->last_add_time_valid设置为false
++ */
+ #define LAST_ADD_TIME_INVALID(_vq)				\
+ 	((_vq)->last_add_time_valid = false)
+ #else
+@@ -126,6 +152,14 @@ struct vring_virtqueue {
+ 		/* Available for split ring */
+ 		struct {
+ 			/* Actual memory layout for this queue. */
++			/*
++			 * struct vring {
++			 *     unsigned int num;
++			 *     vring_desc_t *desc;
++			 *     vring_avail_t *avail;
++			 *     vring_used_t *used;
++			 * };
++			 */
+ 			struct vring vring;
+ 
+ 			/* Last written value to avail->flags */
+@@ -188,6 +222,16 @@ struct vring_virtqueue {
+ 	bool (*notify)(struct virtqueue *vq);
+ 
+ 	/* DMA, allocation, and size information */
++	/*
++	 * 在以下使用vring_virtqueue->we_own_ring:
++	 *   - drivers/virtio/virtio_ring.c|1012| <<vring_create_virtqueue_split>> to_vvq(vq)->we_own_ring = true;
++	 *   - drivers/virtio/virtio_ring.c|1751| <<vring_create_virtqueue_packed>> vq->we_own_ring = true;
++	 *   - drivers/virtio/virtio_ring.c|2250| <<__vring_new_virtqueue>> vq->we_own_ring = false;
++	 *   - drivers/virtio/virtio_ring.c|2371| <<vring_del_virtqueue>> if (vq->we_own_ring) {
++	 *   - drivers/virtio/virtio_ring.c|2501| <<virtqueue_get_desc_addr>> BUG_ON(!vq->we_own_ring);
++	 *   - drivers/virtio/virtio_ring.c|2514| <<virtqueue_get_avail_addr>> BUG_ON(!vq->we_own_ring);
++	 *   - drivers/virtio/virtio_ring.c|2528| <<virtqueue_get_used_addr>> BUG_ON(!vq->we_own_ring);
++	 */
+ 	bool we_own_ring;
+ 
+ #ifdef DEBUG
+@@ -195,6 +239,15 @@ struct vring_virtqueue {
+ 	unsigned int in_use;
+ 
+ 	/* Figure out if their kicks are too delayed. */
++	/*
++	 * 在以下使用vring_virtqueue->last_add_time_valid:
++	 *   - drivers/virtio/virtio_ring.c|40| <<LAST_ADD_TIME_UPDATE>> if ((_vq)->last_add_time_valid) \
++	 *   - drivers/virtio/virtio_ring.c|44| <<LAST_ADD_TIME_UPDATE>> (_vq)->last_add_time_valid = true; \
++	 *   - drivers/virtio/virtio_ring.c|48| <<LAST_ADD_TIME_CHECK>> if ((_vq)->last_add_time_valid) { \
++	 *   - drivers/virtio/virtio_ring.c|54| <<LAST_ADD_TIME_INVALID>> ((_vq)->last_add_time_valid = false)
++	 *   - drivers/virtio/virtio_ring.c|1723| <<bool>> vq->last_add_time_valid = false;
++	 *   - drivers/virtio/virtio_ring.c|2221| <<bool>> vq->last_add_time_valid = false;
++	 */
+ 	bool last_add_time_valid;
+ 	ktime_t last_add_time;
+ #endif
+@@ -263,6 +316,10 @@ static bool vring_use_dma_api(struct virtio_device *vdev)
+ 	return false;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/block/virtio_blk.c|997| <<virtblk_probe>> max_size = virtio_max_dma_size(vdev);
++ */
+ size_t virtio_max_dma_size(struct virtio_device *vdev)
+ {
+ 	size_t max_segment_size = SIZE_MAX;
+@@ -274,6 +331,14 @@ size_t virtio_max_dma_size(struct virtio_device *vdev)
+ }
+ EXPORT_SYMBOL_GPL(virtio_max_dma_size);
+ 
++/*
++ * called by:
++ *   - drivers/virtio/virtio_ring.c|993| <<vring_create_virtqueue_split>> queue = vring_alloc_queue(vdev, vring_size(num, vring_align),
++ *   - drivers/virtio/virtio_ring.c|1007| <<vring_create_virtqueue_split>> queue = vring_alloc_queue(vdev, vring_size(num, vring_align),
++ *   - drivers/virtio/virtio_ring.c|1736| <<vring_create_virtqueue_packed>> ring = vring_alloc_queue(vdev, ring_size_in_bytes,
++ *   - drivers/virtio/virtio_ring.c|1744| <<vring_create_virtqueue_packed>> driver = vring_alloc_queue(vdev, event_size_in_bytes,
++ *   - drivers/virtio/virtio_ring.c|1750| <<vring_create_virtqueue_packed>> device = vring_alloc_queue(vdev, event_size_in_bytes,
++ */
+ static void *vring_alloc_queue(struct virtio_device *vdev, size_t size,
+ 			      dma_addr_t *dma_handle, gfp_t flag)
+ {
+@@ -321,6 +386,18 @@ static void vring_free_queue(struct virtio_device *vdev, size_t size,
+  * making all of the arch DMA ops work on the vring device itself
+  * is a mess.  For now, we use the parent device for DMA ops.
+  */
++/*
++ * called by:
++ *   - drivers/virtio/virtio_ring.c|399| <<vring_map_one_sg>> return dma_map_page(vring_dma_dev(vq),
++ *   - drivers/virtio/virtio_ring.c|411| <<vring_map_single>> return dma_map_single(vring_dma_dev(vq),
++ *   - drivers/virtio/virtio_ring.c|421| <<vring_mapping_error>> return dma_mapping_error(vring_dma_dev(vq), addr);
++ *   - drivers/virtio/virtio_ring.c|439| <<vring_unmap_one_split_indirect>> dma_unmap_page(vring_dma_dev(vq),
++ *   - drivers/virtio/virtio_ring.c|458| <<vring_unmap_one_split>> dma_unmap_single(vring_dma_dev(vq),
++ *   - drivers/virtio/virtio_ring.c|464| <<vring_unmap_one_split>> dma_unmap_page(vring_dma_dev(vq),
++ *   - drivers/virtio/virtio_ring.c|1056| <<vring_unmap_extra_packed>> dma_unmap_single(vring_dma_dev(vq),
++ *   - drivers/virtio/virtio_ring.c|1061| <<vring_unmap_extra_packed>> dma_unmap_page(vring_dma_dev(vq),
++ *   - drivers/virtio/virtio_ring.c|1078| <<vring_unmap_desc_packed>> dma_unmap_page(vring_dma_dev(vq),
++ */
+ static inline struct device *vring_dma_dev(const struct vring_virtqueue *vq)
+ {
+ 	return vq->vq.vdev->dev.parent;
+@@ -467,6 +544,10 @@ static inline unsigned int virtqueue_add_desc_split(struct virtqueue *vq,
+ 	return next;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/virtio/virtio_ring.c|1867| <<virtqueue_add>> virtqueue_add_split(_vq, sgs, total_sg, out_sgs, in_sgs, data, ctx, gfp);
++ */
+ static inline int virtqueue_add_split(struct virtqueue *_vq,
+ 				      struct scatterlist *sgs[],
+ 				      unsigned int total_sg,
+@@ -650,6 +731,10 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
+ 	return -ENOMEM;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/virtio/virtio_ring.c|1990| <<virtqueue_kick_prepare>> virtqueue_kick_prepare_split(_vq);
++ */
+ static bool virtqueue_kick_prepare_split(struct virtqueue *_vq)
+ {
+ 	struct vring_virtqueue *vq = to_vvq(_vq);
+@@ -907,6 +992,10 @@ static void *virtqueue_detach_unused_buf_split(struct virtqueue *_vq)
+ 	return NULL;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/virtio/virtio_ring.c|2348| <<vring_create_virtqueue>> return vring_create_virtqueue_split(index, num, vring_align,
++ */
+ static struct virtqueue *vring_create_virtqueue_split(
+ 	unsigned int index,
+ 	unsigned int num,
+@@ -1156,6 +1245,10 @@ static int virtqueue_add_indirect_packed(struct vring_virtqueue *vq,
+ 	return -ENOMEM;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/virtio/virtio_ring.c|1906| <<virtqueue_add>> return vq->packed_ring ? virtqueue_add_packed(_vq, sgs, total_sg,
++ */
+ static inline int virtqueue_add_packed(struct virtqueue *_vq,
+ 				       struct scatterlist *sgs[],
+ 				       unsigned int total_sg,
+@@ -1203,6 +1296,9 @@ static inline int virtqueue_add_packed(struct virtqueue *_vq,
+ 
+ 	WARN_ON_ONCE(total_sg > vq->packed.vring.num && !vq->indirect);
+ 
++	/*
++	 * struct vring_packed_desc *desc;
++	 */
+ 	desc = vq->packed.vring.desc;
+ 	i = head;
+ 	descs_used = total_sg;
+@@ -1402,6 +1498,12 @@ static void detach_buf_packed(struct vring_virtqueue *vq,
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - drivers/virtio/virtio_ring.c|1516| <<more_used_packed>> return is_used_desc_packed(vq, last_used, used_wrap_counter);
++ *   - drivers/virtio/virtio_ring.c|1641| <<virtqueue_poll_packed>> return is_used_desc_packed(vq, used_idx, wrap_counter);
++ *   - drivers/virtio/virtio_ring.c|1696| <<virtqueue_enable_cb_delayed_packed>> if (is_used_desc_packed(vq, used_idx, wrap_counter)) {
++ */
+ static inline bool is_used_desc_packed(const struct vring_virtqueue *vq,
+ 				       u16 idx, bool used_wrap_counter)
+ {
+@@ -1540,6 +1642,9 @@ static unsigned int virtqueue_enable_cb_prepare_packed(struct virtqueue *_vq)
+ 	return vq->last_used_idx;
+ }
+ 
++/*
++ * Returns "true" if there are pending used buffers in the queue.
++ */
+ static bool virtqueue_poll_packed(struct virtqueue *_vq, u16 off_wrap)
+ {
+ 	struct vring_virtqueue *vq = to_vvq(_vq);
+@@ -1676,6 +1781,9 @@ static struct virtqueue *vring_create_virtqueue_packed(
+ 
+ 	ring_size_in_bytes = num * sizeof(struct vring_packed_desc);
+ 
++	/*
++	 * 分配的是&ring_dma_addr
++	 */
+ 	ring = vring_alloc_queue(vdev, ring_size_in_bytes,
+ 				 &ring_dma_addr,
+ 				 GFP_KERNEL|__GFP_NOWARN|__GFP_ZERO);
+@@ -1684,12 +1792,18 @@ static struct virtqueue *vring_create_virtqueue_packed(
+ 
+ 	event_size_in_bytes = sizeof(struct vring_packed_desc_event);
+ 
++	/*
++	 * 分配的是&driver_event_dma_addr
++	 */
+ 	driver = vring_alloc_queue(vdev, event_size_in_bytes,
+ 				   &driver_event_dma_addr,
+ 				   GFP_KERNEL|__GFP_NOWARN|__GFP_ZERO);
+ 	if (!driver)
+ 		goto err_driver;
+ 
++	/*
++	 * 分配的是&device_event_dma_addr
++	 */
+ 	device = vring_alloc_queue(vdev, event_size_in_bytes,
+ 				   &device_event_dma_addr,
+ 				   GFP_KERNEL|__GFP_NOWARN|__GFP_ZERO);
 diff --git a/include/linux/kvm_para.h b/include/linux/kvm_para.h
 index f23b90b02898..896e287671b4 100644
 --- a/include/linux/kvm_para.h
@@ -2115,7 +2443,7 @@ index f81a7cfe4d63..97be018ad133 100644
  {
  	if (!evsel__sys_has_perf_metrics(leader))
 diff --git a/tools/perf/builtin-stat.c b/tools/perf/builtin-stat.c
-index d2ecd4d29624..c6800b649292 100644
+index d2ecd4d29624..11ba15600ec8 100644
 --- a/tools/perf/builtin-stat.c
 +++ b/tools/perf/builtin-stat.c
 @@ -697,6 +697,11 @@ static void compute_tts(struct timespec *time_start, struct timespec *time_stop,
@@ -2130,7 +2458,19 @@ index d2ecd4d29624..c6800b649292 100644
  static int dispatch_events(bool forks, int timeout, int interval, int *times)
  {
  	int child_exited = 0, status = 0;
-@@ -762,6 +767,10 @@ static enum counter_recovery stat_handle_error(struct evsel *counter)
+@@ -742,6 +747,11 @@ enum counter_recovery {
+ 	COUNTER_FATAL,
+ };
+ 
++/*
++ * called by:
++ *   - tools/perf/builtin-stat.c|895| <<__run_perf_stat>> switch (stat_handle_error(counter)) {
++ *   - tools/perf/builtin-stat.c|938| <<__run_perf_stat>> switch (stat_handle_error(counter)) {
++ */
+ static enum counter_recovery stat_handle_error(struct evsel *counter)
+ {
+ 	char msg[BUFSIZ];
+@@ -762,6 +772,10 @@ static enum counter_recovery stat_handle_error(struct evsel *counter)
  		 */
  		counter->errored = true;
  
@@ -2141,7 +2481,7 @@ index d2ecd4d29624..c6800b649292 100644
  		if ((evsel__leader(counter) != counter) ||
  		    !(counter->core.leader->nr_members > 1))
  			return COUNTER_SKIP;
-@@ -791,6 +800,10 @@ static enum counter_recovery stat_handle_error(struct evsel *counter)
+@@ -791,6 +805,10 @@ static enum counter_recovery stat_handle_error(struct evsel *counter)
  	return COUNTER_FATAL;
  }
  
@@ -2152,7 +2492,34 @@ index d2ecd4d29624..c6800b649292 100644
  static int __run_perf_stat(int argc, const char **argv, int run_idx)
  {
  	int interval = stat_config.interval;
-@@ -1048,6 +1061,10 @@ static int __run_perf_stat(int argc, const char **argv, int run_idx)
+@@ -825,6 +843,12 @@ static int __run_perf_stat(int argc, const char **argv, int run_idx)
+ 		affinity = &saved_affinity;
+ 	}
+ 
++	/*
++	 * static struct evlist *evsel_list;
++	 * -> struct perf_evlist core;
++	 *    -> struct list_head         entries;
++	 *    -> int                      nr_entries;
++	 */
+ 	evlist__for_each_entry(evsel_list, counter) {
+ 		if (bpf_counter__load(counter, &target))
+ 			return -1;
+@@ -832,6 +856,13 @@ static int __run_perf_stat(int argc, const char **argv, int run_idx)
+ 			all_counters_use_bpf = false;
+ 	}
+ 
++	/*
++	 * struct evlist_cpu_iterator evlist_cpu_itr;
++	 * -> // The list being iterated through.
++	 * -> struct evlist *container;
++	 * -> // The current evsel of the iterator.
++	 * -> struct evsel *evsel;
++	 */
+ 	evlist__for_each_cpu(evlist_cpu_itr, evsel_list, affinity) {
+ 		counter = evlist_cpu_itr.evsel;
+ 
+@@ -1048,6 +1079,10 @@ static int __run_perf_stat(int argc, const char **argv, int run_idx)
  	return WEXITSTATUS(status);
  }
  
@@ -2163,7 +2530,7 @@ index d2ecd4d29624..c6800b649292 100644
  static int run_perf_stat(int argc, const char **argv, int run_idx)
  {
  	int ret;
-@@ -1662,6 +1679,10 @@ static int perf_stat_init_aggr_mode_file(struct perf_stat *st)
+@@ -1662,6 +1697,10 @@ static int perf_stat_init_aggr_mode_file(struct perf_stat *st)
   * Add default attributes, if there were no attributes specified or
   * if -d/--detailed, -d -d or -d -d -d is used:
   */
@@ -2174,6 +2541,67 @@ index d2ecd4d29624..c6800b649292 100644
  static int add_default_attributes(void)
  {
  	int err;
+diff --git a/tools/perf/util/evlist.c b/tools/perf/util/evlist.c
+index 48af7d379d82..1c7b7ca21fd1 100644
+--- a/tools/perf/util/evlist.c
++++ b/tools/perf/util/evlist.c
+@@ -319,6 +319,11 @@ static int evlist__add_attrs(struct evlist *evlist, struct perf_event_attr *attr
+ 		evsel = evsel__new_idx(attrs + i, evlist->core.nr_entries + i);
+ 		if (evsel == NULL)
+ 			goto out_delete_partial_list;
++		/*
++		 * struct evsel *evsel:
++		 * -> struct perf_evsel       core;
++		 * -> struct evlist           *evlist;
++		 */
+ 		list_add_tail(&evsel->core.node, &head);
+ 	}
+ 
+diff --git a/tools/perf/util/evsel.c b/tools/perf/util/evsel.c
+index 094b0a9c0bc0..ca825a857db8 100644
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@ -3084,6 +3084,13 @@ bool evsel__is_hybrid(struct evsel *evsel)
+ 
+ struct evsel *evsel__leader(struct evsel *evsel)
+ {
++	/*
++	 * struct evsel *evsel:
++	 * -> struct perf_evsel       core;
++	 *    -> struct perf_evsel       *leader;
++	 *    -> int                      nr_members;
++	 * -> struct evlist           *evlist;
++	 */
+ 	return container_of(evsel->core.leader, struct evsel, core);
+ }
+ 
+diff --git a/tools/perf/util/parse-events.c b/tools/perf/util/parse-events.c
+index 7ed235740431..57c84e9b8dcd 100644
+--- a/tools/perf/util/parse-events.c
++++ b/tools/perf/util/parse-events.c
+@@ -1736,6 +1736,10 @@ int parse_events_multi_pmu_add(struct parse_events_state *parse_state,
+ 	return ok ? 0 : -1;
+ }
+ 
++/*
++ * called by (是y的file):
++ *   - tools/perf/util/parse-events.y|183| <<yyparse>> err = parse_events__modifier_group(list, $3);
++ */
+ int parse_events__modifier_group(struct list_head *list,
+ 				 char *event_mod)
+ {
+@@ -2029,6 +2033,11 @@ static int check_modifier(char *str)
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - tools/perf/util/parse-events.c|1742| <<parse_events__modifier_group>> return parse_events__modifier_event(list, event_mod, true);
++ *   - tools/perf/util/parse-events.y|245| <<yyparse>> err = parse_events__modifier_event(list, $2, false);
++ */
+ int parse_events__modifier_event(struct list_head *list, char *str, bool add)
+ {
+ 	struct evsel *evsel;
 diff --git a/tools/perf/util/pmu.c b/tools/perf/util/pmu.c
 index 9a1c7e63e663..9a88437bf3de 100644
 --- a/tools/perf/util/pmu.c
@@ -2190,10 +2618,24 @@ index 9a1c7e63e663..9a88437bf3de 100644
  {
  	struct dirent *evt_ent;
 diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
-index a49df8988cd6..9a95bd11fc11 100644
+index a49df8988cd6..e9349cde5749 100644
 --- a/virt/kvm/kvm_main.c
 +++ b/virt/kvm/kvm_main.c
-@@ -2745,6 +2745,20 @@ void kvm_release_pfn(kvm_pfn_t pfn, bool dirty)
+@@ -527,6 +527,13 @@ static void kvm_null_fn(void)
+ 	     node;							     \
+ 	     node = interval_tree_iter_next(node, start, last))	     \
+ 
++/*
++ * called by:
++ *   - virt/kvm/kvm_main.c|624| <<kvm_handle_hva_range>> return __kvm_handle_hva_range(kvm, &range);
++ *   - virt/kvm/kvm_main.c|644| <<kvm_handle_hva_range_no_flush>> return __kvm_handle_hva_range(kvm, &range);
++ *   - virt/kvm/kvm_main.c|730| <<kvm_mmu_notifier_invalidate_range_start>> __kvm_handle_hva_range(kvm, &hva_range);
++ *   - virt/kvm/kvm_main.c|769| <<kvm_mmu_notifier_invalidate_range_end>> __kvm_handle_hva_range(kvm, &hva_range);
++ */
+ static __always_inline int __kvm_handle_hva_range(struct kvm *kvm,
+ 						  const struct kvm_hva_range *range)
+ {
+@@ -2745,6 +2752,20 @@ void kvm_release_pfn(kvm_pfn_t pfn, bool dirty)
  		kvm_release_pfn_clean(pfn);
  }
  
