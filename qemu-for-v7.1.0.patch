@@ -1,0 +1,1124 @@
+From dd417c5985811d2586daa7e92092bbd107a92722 Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Thu, 13 Oct 2022 14:15:52 -0700
+Subject: [PATCH 1/1] qemu for v7.1.0
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ block/block-backend.c           |   7 ++
+ hw/scsi/virtio-scsi-dataplane.c |  70 +++++++++++
+ hw/virtio/virtio-bus.c          |  52 ++++++++
+ hw/virtio/virtio-pci.c          |  19 +++
+ hw/virtio/virtio.c              |   7 ++
+ include/exec/memory.h           |  46 ++++++++
+ include/hw/core/cpu.h           |  11 ++
+ include/hw/virtio/virtio-bus.h  |  21 ++++
+ include/hw/virtio/virtio-scsi.h |  39 ++++++
+ iothread.c                      |   4 +
+ monitor/hmp.c                   |   8 ++
+ softmmu/memory.c                | 202 ++++++++++++++++++++++++++++++++
+ softmmu/physmem.c               |  18 +++
+ softmmu/vl.c                    |  14 +++
+ target/i386/cpu.h               |  12 ++
+ util/aio-wait.c                 |  17 +++
+ util/log.c                      |  29 +++++
+ util/qemu-config.c              |   3 +
+ util/qemu-option.c              |  29 +++++
+ 19 files changed, 608 insertions(+)
+
+diff --git a/block/block-backend.c b/block/block-backend.c
+index d4a5df2ac..afb5077df 100644
+--- a/block/block-backend.c
++++ b/block/block-backend.c
+@@ -1795,6 +1795,13 @@ void blk_drain(BlockBackend *blk)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - hw/scsi/megasas.c|1464| <<megasas_cache_flush>> blk_drain_all();
++ *   - hw/scsi/virtio-scsi-dataplane.c|252| <<virtio_scsi_dataplane_stop>> blk_drain_all();
++ *   - qemu-io-cmds.c|1692| <<aio_flush_f>> blk_drain_all();
++ *   - tests/unit/test-block-backend.c|67| <<test_drain_all_aio_error>> blk_drain_all();
++ */
+ void blk_drain_all(void)
+ {
+     BlockBackend *blk = NULL;
+diff --git a/hw/scsi/virtio-scsi-dataplane.c b/hw/scsi/virtio-scsi-dataplane.c
+index 20bb91766..1927c9600 100644
+--- a/hw/scsi/virtio-scsi-dataplane.c
++++ b/hw/scsi/virtio-scsi-dataplane.c
+@@ -22,6 +22,12 @@
+ #include "hw/virtio/virtio-access.h"
+ 
+ /* Context: QEMU global mutex held */
++/*
++ * called by:
++ *   - hw/scsi/virtio-scsi.c|1067| <<virtio_scsi_device_realize>> virtio_scsi_dataplane_setup(s, errp);
++ *
++ * 核心思想是设置VirtIOSCSI->ctx (类型struct AioContext *)
++ */
+ void virtio_scsi_dataplane_setup(VirtIOSCSI *s, Error **errp)
+ {
+     VirtIOSCSICommon *vs = VIRTIO_SCSI_COMMON(s);
+@@ -40,15 +46,31 @@ void virtio_scsi_dataplane_setup(VirtIOSCSI *s, Error **errp)
+             error_setg(errp, "ioeventfd is required for iothread");
+             return;
+         }
++        /*
++         * struct VirtIOSCSI:
++         * -> VirtIOSCSICommon parent_obj;
++         *    -> VirtIODevice parent_obj;
++	 * -> AioContext *ctx;
++         */
+         s->ctx = iothread_get_aio_context(vs->conf.iothread);
+     } else {
+         if (!virtio_device_ioeventfd_enabled(vdev)) {
+             return;
+         }
++        /*
++	 * 返回qemu_aio_context
++	 * static AioContext *qemu_aio_context;
++	 */
+         s->ctx = qemu_get_aio_context();
+     }
+ }
+ 
++/*
++ * called by:
++ *   - hw/scsi/virtio-scsi-dataplane.c|130| <<virtio_scsi_dataplane_start>> rc = virtio_scsi_set_host_notifier(s, vs->ctrl_vq, 0);
++ *   - hw/scsi/virtio-scsi-dataplane.c|136| <<virtio_scsi_dataplane_start>> rc = virtio_scsi_set_host_notifier(s, vs->event_vq, 1);
++ *   - hw/scsi/virtio-scsi-dataplane.c|144| <<virtio_scsi_dataplane_start>> rc = virtio_scsi_set_host_notifier(s, vs->cmd_vqs[i], i + 2);
++ */
+ static int virtio_scsi_set_host_notifier(VirtIOSCSI *s, VirtQueue *vq, int n)
+ {
+     BusState *qbus = BUS(qdev_get_parent_bus(DEVICE(s)));
+@@ -59,6 +81,18 @@ static int virtio_scsi_set_host_notifier(VirtIOSCSI *s, VirtQueue *vq, int n)
+     if (rc != 0) {
+         fprintf(stderr, "virtio-scsi: Failed to set host notifier (%d)\n",
+                 rc);
++        /*
++         * 在以下设置VirtIOSCSI->dataplane_fenced:
++         *   - hw/scsi/virtio-scsi-dataplane.c|62| <<virtio_scsi_set_host_notifier>> s->dataplane_fenced = true;
++         *   - hw/scsi/virtio-scsi-dataplane.c|177| <<virtio_scsi_dataplane_start>> s->dataplane_fenced = true;
++         *   - hw/scsi/virtio-scsi-dataplane.c|198| <<virtio_scsi_dataplane_stop>> s->dataplane_fenced = false;
++         * 在以下使用VirtIOSCSI->dataplane_fenced:
++         *   - hw/scsi/virtio-scsi-dataplane.c|100| <<virtio_scsi_dataplane_start>> s->dataplane_fenced) {
++         *   - hw/scsi/virtio-scsi-dataplane.c|197| <<virtio_scsi_dataplane_stop>> if (s->dataplane_fenced) {
++         *   - hw/scsi/virtio-scsi.c|113| <<virtio_scsi_complete_req>> if (s->dataplane_started && !s->dataplane_fenced) {
++         *   - hw/scsi/virtio-scsi.c|524| <<virtio_scsi_defer_to_dataplane>> return !s->dataplane_fenced;
++         *   - hw/scsi/virtio-scsi.c|940| <<virtio_scsi_hotplug>> if (s->ctx && !s->dataplane_fenced) {
++	 */
+         s->dataplane_fenced = true;
+         return rc;
+     }
+@@ -67,6 +101,10 @@ static int virtio_scsi_set_host_notifier(VirtIOSCSI *s, VirtQueue *vq, int n)
+ }
+ 
+ /* Context: BH in IOThread */
++/*
++ * called by:
++ *   - hw/scsi/virtio-scsi-dataplane.c|249| <<virtio_scsi_dataplane_stop>> aio_wait_bh_oneshot(s->ctx, virtio_scsi_dataplane_stop_bh, s);
++ */
+ static void virtio_scsi_dataplane_stop_bh(void *opaque)
+ {
+     VirtIOSCSI *s = opaque;
+@@ -81,14 +119,28 @@ static void virtio_scsi_dataplane_stop_bh(void *opaque)
+ }
+ 
+ /* Context: QEMU global mutex held */
++/*
++ * 在以下设置VirtioDeviceClass->start_ioeventfd:
++ *   - hw/scsi/virtio-scsi.c|1146| <<virtio_scsi_class_init>> vdc->start_ioeventfd = virtio_scsi_dataplane_start;
++ */
+ int virtio_scsi_dataplane_start(VirtIODevice *vdev)
+ {
+     int i;
+     int rc;
+     int vq_init_count = 0;
++    /*
++     * VirtIODevice *vdev:
++     * -> DeviceState parent_obj;
++     *    -> BusState *parent_bus;
++     */
+     BusState *qbus = qdev_get_parent_bus(DEVICE(vdev));
+     VirtioBusClass *k = VIRTIO_BUS_GET_CLASS(qbus);
+     VirtIOSCSICommon *vs = VIRTIO_SCSI_COMMON(vdev);
++    /*
++     * struct VirtIOSCSI:
++     * -> VirtIOSCSICommon parent_obj;
++     *    -> VirtIODevice parent_obj;
++     */
+     VirtIOSCSI *s = VIRTIO_SCSI(vdev);
+ 
+     if (s->dataplane_started ||
+@@ -100,6 +152,12 @@ int virtio_scsi_dataplane_start(VirtIODevice *vdev)
+     s->dataplane_starting = true;
+ 
+     /* Set up guest notifier (irq) */
++    /*
++     * 在以下设置VirtioBusClass->set_guest_notifiers:
++     *   - hw/s390x/virtio-ccw.c|1276| <<virtio_ccw_bus_class_init>> k->set_guest_notifiers = virtio_ccw_set_guest_notifiers;
++     *   - hw/virtio/virtio-mmio.c|839| <<virtio_mmio_bus_class_init>> k->set_guest_notifiers = virtio_mmio_set_guest_notifiers;
++     *   - hw/virtio/virtio-pci.c|2240| <<virtio_pci_bus_class_init>> k->set_guest_notifiers = virtio_pci_set_guest_notifiers;
++     */
+     rc = k->set_guest_notifiers(qbus->parent, vs->conf.num_queues + 2, true);
+     if (rc != 0) {
+         error_report("virtio-scsi: Failed to set guest notifiers (%d), "
+@@ -168,6 +226,12 @@ fail_host_notifiers:
+     for (i = 0; i < vq_init_count; i++) {
+         virtio_bus_cleanup_host_notifier(VIRTIO_BUS(qbus), i);
+     }
++    /*
++     * 在以下设置VirtioBusClass->set_guest_notifiers:
++     *   - hw/s390x/virtio-ccw.c|1276| <<virtio_ccw_bus_class_init>> k->set_guest_notifiers = virtio_ccw_set_guest_notifiers;
++     *   - hw/virtio/virtio-mmio.c|839| <<virtio_mmio_bus_class_init>> k->set_guest_notifiers = virtio_mmio_set_guest_notifiers;
++     *   - hw/virtio/virtio-pci.c|2240| <<virtio_pci_bus_class_init>> k->set_guest_notifiers = virtio_pci_set_guest_notifiers;
++     */
+     k->set_guest_notifiers(qbus->parent, vs->conf.num_queues + 2, false);
+ fail_guest_notifiers:
+     s->dataplane_fenced = true;
+@@ -224,6 +288,12 @@ void virtio_scsi_dataplane_stop(VirtIODevice *vdev)
+     }
+ 
+     /* Clean up guest notifier (irq) */
++    /*
++     * 在以下设置VirtioBusClass->set_guest_notifiers:
++     *   - hw/s390x/virtio-ccw.c|1276| <<virtio_ccw_bus_class_init>> k->set_guest_notifiers = virtio_ccw_set_guest_notifiers;
++     *   - hw/virtio/virtio-mmio.c|839| <<virtio_mmio_bus_class_init>> k->set_guest_notifiers = virtio_mmio_set_guest_notifiers;
++     *   - hw/virtio/virtio-pci.c|2240| <<virtio_pci_bus_class_init>> k->set_guest_notifiers = virtio_pci_set_guest_notifiers;
++     */
+     k->set_guest_notifiers(qbus->parent, vs->conf.num_queues + 2, false);
+     s->dataplane_stopping = false;
+     s->dataplane_started = false;
+diff --git a/hw/virtio/virtio-bus.c b/hw/virtio/virtio-bus.c
+index 896feb37a..2e87257d5 100644
+--- a/hw/virtio/virtio-bus.c
++++ b/hw/virtio/virtio-bus.c
+@@ -273,6 +273,22 @@ bool virtio_bus_ioeventfd_enabled(VirtioBusState *bus)
+  * This function switches ioeventfd on/off in the device.
+  * The caller must set or clear the handlers for the EventNotifier.
+  */
++/*
++ * called by:
++ *   - hw/block/dataplane/virtio-blk.c|198| <<virtio_blk_data_plane_start>> r = virtio_bus_set_host_notifier(VIRTIO_BUS(qbus), i, true);
++ *   - hw/block/dataplane/virtio-blk.c|204| <<virtio_blk_data_plane_start>> virtio_bus_set_host_notifier(VIRTIO_BUS(qbus), i, false);
++ *   - hw/block/dataplane/virtio-blk.c|264| <<virtio_blk_data_plane_start>> virtio_bus_set_host_notifier(VIRTIO_BUS(qbus), i, false);
++ *   - hw/block/dataplane/virtio-blk.c|341| <<virtio_blk_data_plane_stop>> virtio_bus_set_host_notifier(VIRTIO_BUS(qbus), i, false);
++ *   - hw/scsi/virtio-scsi-dataplane.c|58| <<virtio_scsi_set_host_notifier>> rc = virtio_bus_set_host_notifier(VIRTIO_BUS(qbus), n, true);
++ *   - hw/scsi/virtio-scsi-dataplane.c|173| <<virtio_scsi_dataplane_start>> virtio_bus_set_host_notifier(VIRTIO_BUS(qbus), i, false);
++ *   - hw/scsi/virtio-scsi-dataplane.c|227| <<virtio_scsi_dataplane_stop>> virtio_bus_set_host_notifier(VIRTIO_BUS(qbus), i, false);
++ *   - hw/virtio/vhost.c|1520| <<vhost_dev_enable_notifiers>> r = virtio_bus_set_host_notifier(VIRTIO_BUS(qbus), hdev->vq_index + i,
++ *   - hw/virtio/vhost.c|1531| <<vhost_dev_enable_notifiers>> e = virtio_bus_set_host_notifier(VIRTIO_BUS(qbus), hdev->vq_index + i,
++ *   - hw/virtio/vhost.c|1555| <<vhost_dev_disable_notifiers>> r = virtio_bus_set_host_notifier(VIRTIO_BUS(qbus), hdev->vq_index + i,
++ *   - hw/virtio/virtio.c|3769| <<virtio_device_start_ioeventfd_impl>> r = virtio_bus_set_host_notifier(qbus, n, true);
++ *   - hw/virtio/virtio.c|3798| <<virtio_device_start_ioeventfd_impl>> r = virtio_bus_set_host_notifier(qbus, n, false);
++ *   - hw/virtio/virtio.c|3841| <<virtio_device_stop_ioeventfd_impl>> r = virtio_bus_set_host_notifier(qbus, n, false);
++ */
+ int virtio_bus_set_host_notifier(VirtioBusState *bus, int n, bool assign)
+ {
+     VirtIODevice *vdev = virtio_bus_get_device(bus);
+@@ -287,12 +303,33 @@ int virtio_bus_set_host_notifier(VirtioBusState *bus, int n, bool assign)
+     }
+ 
+     if (assign) {
++        /*
++	 * EventNotifier *notifier
++	 * -> int rfd;
++	 * -> int wfd;
++	 * -> bool initialized;
++	 */
+         r = event_notifier_init(notifier, 1);
+         if (r < 0) {
+             error_report("%s: unable to init event notifier: %s (%d)",
+                          __func__, strerror(-r), r);
+             return r;
+         }
++        /*
++	 * 在以下设置VirtioBusClass->ioeventfd_assign:
++         *   - hw/s390x/virtio-ccw.c|1285| <<virtio_ccw_bus_class_init>> k->ioeventfd_assign = virtio_ccw_ioeventfd_assign;
++         *   - hw/virtio/virtio-mmio.c|841| <<virtio_mmio_bus_class_init>> k->ioeventfd_assign = virtio_mmio_ioeventfd_assign;
++         *   - hw/virtio/virtio-pci.c|2229| <<virtio_pci_bus_class_init>> k->ioeventfd_assign = virtio_pci_ioeventfd_assign;
++         * 在以下使用VirtioBusClass->ioeventfd_assign:
++         *   - hw/block/dataplane/virtio-blk.c|95| <<virtio_blk_data_plane_create>> if (!k->set_guest_notifiers || !k->ioeventfd_assign) {
++         *   - hw/scsi/virtio-scsi-dataplane.c|39| <<virtio_scsi_dataplane_setup>> if (!k->set_guest_notifiers || !k->ioeventfd_assign) {
++         *   - hw/virtio/virtio-bus.c|194| <<virtio_bus_grab_ioeventfd>> if (!k->ioeventfd_assign) {
++         *   - hw/virtio/virtio-bus.c|227| <<virtio_bus_start_ioeventfd>> if (!k->ioeventfd_assign || !k->ioeventfd_enabled(proxy)) {
++         *   - hw/virtio/virtio-bus.c|269| <<virtio_bus_ioeventfd_enabled>> return k->ioeventfd_assign && k->ioeventfd_enabled(proxy);
++         *   - hw/virtio/virtio-bus.c|301| <<virtio_bus_set_host_notifier>> if (!k->ioeventfd_assign) {
++         *   - hw/virtio/virtio-bus.c|312| <<virtio_bus_set_host_notifier>> r = k->ioeventfd_assign(proxy, notifier, n, true);
++         *   - hw/virtio/virtio-bus.c|318| <<virtio_bus_set_host_notifier>> k->ioeventfd_assign(proxy, notifier, n, false);
++         */
+         r = k->ioeventfd_assign(proxy, notifier, n, true);
+         if (r < 0) {
+             error_report("%s: unable to assign ioeventfd: %d", __func__, r);
+@@ -309,6 +346,21 @@ int virtio_bus_set_host_notifier(VirtioBusState *bus, int n, bool assign)
+     return r;
+ }
+ 
++/*
++ * called by:
++ *   - hw/block/dataplane/virtio-blk.c|214| <<virtio_blk_data_plane_start>> virtio_bus_cleanup_host_notifier(VIRTIO_BUS(qbus), j);
++ *   - hw/block/dataplane/virtio-blk.c|270| <<virtio_blk_data_plane_start>> virtio_bus_cleanup_host_notifier(VIRTIO_BUS(qbus), i);
++ *   - hw/block/dataplane/virtio-blk.c|351| <<virtio_blk_data_plane_stop>> virtio_bus_cleanup_host_notifier(VIRTIO_BUS(qbus), i);
++ *   - hw/scsi/virtio-scsi-dataplane.c|217| <<virtio_scsi_dataplane_start>> virtio_bus_cleanup_host_notifier(VIRTIO_BUS(qbus), i);
++ *   - hw/scsi/virtio-scsi-dataplane.c|271| <<virtio_scsi_dataplane_stop>> virtio_bus_cleanup_host_notifier(VIRTIO_BUS(qbus), i);
++ *   - hw/virtio/vhost.c|1537| <<vhost_dev_enable_notifiers>> virtio_bus_cleanup_host_notifier(VIRTIO_BUS(qbus), hdev->vq_index + i);
++ *   - hw/virtio/vhost.c|1561| <<vhost_dev_disable_notifiers>> virtio_bus_cleanup_host_notifier(VIRTIO_BUS(qbus), hdev->vq_index + i);
++ *   - hw/virtio/virtio-bus.c|315| <<virtio_bus_set_host_notifier>> virtio_bus_cleanup_host_notifier(bus, n);
++ *   - hw/virtio/virtio.c|3818| <<virtio_device_start_ioeventfd_impl>> virtio_bus_cleanup_host_notifier(qbus, i);
++ *   - hw/virtio/virtio.c|3861| <<virtio_device_stop_ioeventfd_impl>> virtio_bus_cleanup_host_notifier(qbus, n);
++ *
++ * Tell the bus that the ioeventfd handler is no longer required.
++ */
+ void virtio_bus_cleanup_host_notifier(VirtioBusState *bus, int n)
+ {
+     VirtIODevice *vdev = virtio_bus_get_device(bus);
+diff --git a/hw/virtio/virtio-pci.c b/hw/virtio/virtio-pci.c
+index a50c5a57d..01ae42b78 100644
+--- a/hw/virtio/virtio-pci.c
++++ b/hw/virtio/virtio-pci.c
+@@ -228,6 +228,21 @@ static inline int virtio_pci_queue_mem_mult(struct VirtIOPCIProxy *proxy)
+         QEMU_VIRTIO_PCI_QUEUE_MEM_MULT : 4;
+ }
+ 
++/*
++ * 在以下设置VirtioBusClass->ioeventfd_assign:
++ *   - hw/s390x/virtio-ccw.c|1285| <<virtio_ccw_bus_class_init>> k->ioeventfd_assign = virtio_ccw_ioeventfd_assign;
++ *   - hw/virtio/virtio-mmio.c|841| <<virtio_mmio_bus_class_init>> k->ioeventfd_assign = virtio_mmio_ioeventfd_assign;
++ *   - hw/virtio/virtio-pci.c|2229| <<virtio_pci_bus_class_init>> k->ioeventfd_assign = virtio_pci_ioeventfd_assign;
++ * 在以下使用VirtioBusClass->ioeventfd_assign:
++ *   - hw/block/dataplane/virtio-blk.c|95| <<virtio_blk_data_plane_create>> if (!k->set_guest_notifiers || !k->ioeventfd_assign) {
++ *   - hw/scsi/virtio-scsi-dataplane.c|39| <<virtio_scsi_dataplane_setup>> if (!k->set_guest_notifiers || !k->ioeventfd_assign) {
++ *   - hw/virtio/virtio-bus.c|194| <<virtio_bus_grab_ioeventfd>> if (!k->ioeventfd_assign) {
++ *   - hw/virtio/virtio-bus.c|227| <<virtio_bus_start_ioeventfd>> if (!k->ioeventfd_assign || !k->ioeventfd_enabled(proxy)) {
++ *   - hw/virtio/virtio-bus.c|269| <<virtio_bus_ioeventfd_enabled>> return k->ioeventfd_assign && k->ioeventfd_enabled(proxy);
++ *   - hw/virtio/virtio-bus.c|301| <<virtio_bus_set_host_notifier>> if (!k->ioeventfd_assign) {
++ *   - hw/virtio/virtio-bus.c|312| <<virtio_bus_set_host_notifier>> r = k->ioeventfd_assign(proxy, notifier, n, true);
++ *   - hw/virtio/virtio-bus.c|318| <<virtio_bus_set_host_notifier>> k->ioeventfd_assign(proxy, notifier, n, false);
++ */
+ static int virtio_pci_ioeventfd_assign(DeviceState *d, EventNotifier *notifier,
+                                        int n, bool assign)
+ {
+@@ -251,6 +266,10 @@ static int virtio_pci_ioeventfd_assign(DeviceState *d, EventNotifier *notifier,
+                 memory_region_add_eventfd(modern_mr, modern_addr, 0,
+                                           false, n, notifier);
+             } else {
++                /*
++		 * 核心思想就是制作MemoryRegionIoeventfd给MemoryRegion->ioeventfds[i]
++                 * 可能会g_realloc()
++		 */
+                 memory_region_add_eventfd(modern_mr, modern_addr, 2,
+                                           false, n, notifier);
+             }
+diff --git a/hw/virtio/virtio.c b/hw/virtio/virtio.c
+index 5d607aeaa..d021275f9 100644
+--- a/hw/virtio/virtio.c
++++ b/hw/virtio/virtio.c
+@@ -3597,6 +3597,13 @@ void virtio_queue_aio_attach_host_notifier_no_poll(VirtQueue *vq, AioContext *ct
+                            NULL, NULL);
+ }
+ 
++/*
++ * called by:
++ *   - hw/block/dataplane/virtio-blk.c|298| <<virtio_blk_data_plane_stop_bh>> virtio_queue_aio_detach_host_notifier(vq, s->ctx);
++ *   - hw/scsi/virtio-scsi-dataplane.c|76| <<virtio_scsi_dataplane_stop_bh>> virtio_queue_aio_detach_host_notifier(vs->ctrl_vq, s->ctx);
++ *   - hw/scsi/virtio-scsi-dataplane.c|77| <<virtio_scsi_dataplane_stop_bh>> virtio_queue_aio_detach_host_notifier(vs->event_vq, s->ctx);
++ *   - hw/scsi/virtio-scsi-dataplane.c|79| <<virtio_scsi_dataplane_stop_bh>> virtio_queue_aio_detach_host_notifier(vs->cmd_vqs[i], s->ctx);
++ */
+ void virtio_queue_aio_detach_host_notifier(VirtQueue *vq, AioContext *ctx)
+ {
+     aio_set_event_notifier(ctx, &vq->host_notifier, true, NULL, NULL, NULL);
+diff --git a/include/exec/memory.h b/include/exec/memory.h
+index bfb1de8ee..d652a7d75 100644
+--- a/include/exec/memory.h
++++ b/include/exec/memory.h
+@@ -758,6 +758,25 @@ struct MemoryRegion {
+     QTAILQ_ENTRY(MemoryRegion) subregions_link;
+     QTAILQ_HEAD(, CoalescedMemoryRange) coalesced;
+     const char *name;
++    /*
++     * 在以下使用MemoryRegion->ioeventfd_nb:
++     *   - softmmu/memory.c|899| <<address_space_update_ioeventfds>> for (i = 0; i < fr->mr->ioeventfd_nb; ++i) {
++     *   - softmmu/memory.c|1545| <<memory_region_dispatch_write_eventfds>> for (i = 0; i < mr->ioeventfd_nb; i++) {
++     *   - softmmu/memory.c|2565| <<memory_region_add_eventfd>> for (i = 0; i < mr->ioeventfd_nb; ++i) {
++     *   - softmmu/memory.c|2570| <<memory_region_add_eventfd>> ++mr->ioeventfd_nb;
++     *   - softmmu/memory.c|2575| <<memory_region_add_eventfd>> sizeof(*mr->ioeventfds) * mr->ioeventfd_nb);
++     *   - softmmu/memory.c|2581| <<memory_region_add_eventfd>> sizeof(*mr->ioeventfds) * (mr->ioeventfd_nb-1 - i));
++     *   - softmmu/memory.c|2628| <<memory_region_del_eventfd>> for (i = 0; i < mr->ioeventfd_nb; ++i) {
++     *   - softmmu/memory.c|2633| <<memory_region_del_eventfd>> assert(i != mr->ioeventfd_nb);
++     *   - softmmu/memory.c|2635| <<memory_region_del_eventfd>> sizeof(*mr->ioeventfds) * (mr->ioeventfd_nb - (i+1)));
++     *   - softmmu/memory.c|2636| <<memory_region_del_eventfd>> --mr->ioeventfd_nb;
++     *   - softmmu/memory.c|2638| <<memory_region_del_eventfd>> sizeof(*mr->ioeventfds)*mr->ioeventfd_nb + 1);
++     * 在以下使用struct AddressSpace->ioeventfd_nb:
++     *   - softmmu/memory.c|878| <<address_space_update_ioeventfds>> ioeventfd_max = QEMU_ALIGN_UP(as->ioeventfd_nb, 4);
++     *   - softmmu/memory.c|921| <<address_space_update_ioeventfds>> as->ioeventfds, as->ioeventfd_nb);
++     *   - softmmu/memory.c|925| <<address_space_update_ioeventfds>> as->ioeventfd_nb = ioeventfd_nb;
++     *   - softmmu/memory.c|3126| <<address_space_init>> as->ioeventfd_nb = 0;
++     */
+     unsigned ioeventfd_nb;
+     MemoryRegionIoeventfd *ioeventfds;
+     RamDiscardManager *rdm; /* Only for RAM */
+@@ -1041,8 +1060,35 @@ struct AddressSpace {
+     MemoryRegion *root;
+ 
+     /* Accessed via RCU.  */
++    /*
++     * 在以下使用AddressSpace->current_map:
++     *   - include/exec/memory.h|1108| <<address_space_to_flatview>> return qatomic_rcu_read(&as->current_map);
++     *   - softmmu/memory.c|1144| <<address_space_set_flatview>> qatomic_rcu_set(&as->current_map, new_view);
++     *   - softmmu/memory.c|3144| <<address_space_init>> as->current_map = NULL;
++     *   - softmmu/memory.c|3158| <<do_address_space_destroy>> flatview_unref(as->current_map);
++     *   - tests/qtest/fuzz/generic_fuzz.c|294| <<get_io_address>> view = as->current_map;
++     */
+     struct FlatView *current_map;
+ 
++    /*
++     * 在以下使用MemoryRegion->ioeventfd_nb:
++     *   - softmmu/memory.c|899| <<address_space_update_ioeventfds>> for (i = 0; i < fr->mr->ioeventfd_nb; ++i) {
++     *   - softmmu/memory.c|1545| <<memory_region_dispatch_write_eventfds>> for (i = 0; i < mr->ioeventfd_nb; i++) {
++     *   - softmmu/memory.c|2565| <<memory_region_add_eventfd>> for (i = 0; i < mr->ioeventfd_nb; ++i) {
++     *   - softmmu/memory.c|2570| <<memory_region_add_eventfd>> ++mr->ioeventfd_nb;
++     *   - softmmu/memory.c|2575| <<memory_region_add_eventfd>> sizeof(*mr->ioeventfds) * mr->ioeventfd_nb);
++     *   - softmmu/memory.c|2581| <<memory_region_add_eventfd>> sizeof(*mr->ioeventfds) * (mr->ioeventfd_nb-1 - i));
++     *   - softmmu/memory.c|2628| <<memory_region_del_eventfd>> for (i = 0; i < mr->ioeventfd_nb; ++i) {
++     *   - softmmu/memory.c|2633| <<memory_region_del_eventfd>> assert(i != mr->ioeventfd_nb);
++     *   - softmmu/memory.c|2635| <<memory_region_del_eventfd>> sizeof(*mr->ioeventfds) * (mr->ioeventfd_nb - (i+1)));
++     *   - softmmu/memory.c|2636| <<memory_region_del_eventfd>> --mr->ioeventfd_nb;
++     *   - softmmu/memory.c|2638| <<memory_region_del_eventfd>> sizeof(*mr->ioeventfds)*mr->ioeventfd_nb + 1);
++     * 在以下使用struct AddressSpace->ioeventfd_nb:
++     *   - softmmu/memory.c|878| <<address_space_update_ioeventfds>> ioeventfd_max = QEMU_ALIGN_UP(as->ioeventfd_nb, 4);
++     *   - softmmu/memory.c|921| <<address_space_update_ioeventfds>> as->ioeventfds, as->ioeventfd_nb);
++     *   - softmmu/memory.c|925| <<address_space_update_ioeventfds>> as->ioeventfd_nb = ioeventfd_nb;
++     *   - softmmu/memory.c|3126| <<address_space_init>> as->ioeventfd_nb = 0;
++     */
+     int ioeventfd_nb;
+     struct MemoryRegionIoeventfd *ioeventfds;
+     QTAILQ_HEAD(, MemoryListener) listeners;
+diff --git a/include/hw/core/cpu.h b/include/hw/core/cpu.h
+index 500503da1..b871a8eea 100644
+--- a/include/hw/core/cpu.h
++++ b/include/hw/core/cpu.h
+@@ -353,6 +353,17 @@ struct CPUState {
+     QemuMutex work_mutex;
+     QSIMPLEQ_HEAD(, qemu_work_item) work_list;
+ 
++    /*
++     * 在以下CPUState->cpu_ases:
++     *   - softmmu/physmem.c|683| <<address_space_translate_for_iotlb>> qatomic_rcu_read(&cpu->cpu_ases[asidx].memory_dispatch);
++     *   - softmmu/physmem.c|772| <<cpu_address_space_init>> if (!cpu->cpu_ases) {
++     *   - softmmu/physmem.c|773| <<cpu_address_space_init>> cpu->cpu_ases = g_new0(CPUAddressSpace, cpu->num_ases);
++     *   - softmmu/physmem.c|776| <<cpu_address_space_init>> newas = &cpu->cpu_ases[asidx];
++     *   - softmmu/physmem.c|790| <<cpu_get_address_space>> return cpu->cpu_ases[asidx].as;
++     *   - softmmu/physmem.c|2596| <<iotlb_to_section>> CPUAddressSpace *cpuas = &cpu->cpu_ases[asidx];
++     *   - softmmu/physmem.c|3519| <<cpu_memory_rw_debug>> res = address_space_write_rom(cpu->cpu_ases[asidx].as, phys_addr,
++     *   - softmmu/physmem.c|3522| <<cpu_memory_rw_debug>> res = address_space_read(cpu->cpu_ases[asidx].as, phys_addr,
++     */
+     CPUAddressSpace *cpu_ases;
+     int num_ases;
+     AddressSpace *as;
+diff --git a/include/hw/virtio/virtio-bus.h b/include/hw/virtio/virtio-bus.h
+index 7ab8c9dab..a8e5ba304 100644
+--- a/include/hw/virtio/virtio-bus.h
++++ b/include/hw/virtio/virtio-bus.h
+@@ -49,6 +49,12 @@ struct VirtioBusClass {
+     int (*load_extra_state)(DeviceState *d, QEMUFile *f);
+     bool (*has_extra_state)(DeviceState *d);
+     bool (*query_guest_notifiers)(DeviceState *d);
++    /*
++     * 在以下设置VirtioBusClass->set_guest_notifiers:
++     *   - hw/s390x/virtio-ccw.c|1276| <<virtio_ccw_bus_class_init>> k->set_guest_notifiers = virtio_ccw_set_guest_notifiers;
++     *   - hw/virtio/virtio-mmio.c|839| <<virtio_mmio_bus_class_init>> k->set_guest_notifiers = virtio_mmio_set_guest_notifiers;
++     *   - hw/virtio/virtio-pci.c|2240| <<virtio_pci_bus_class_init>> k->set_guest_notifiers = virtio_pci_set_guest_notifiers;
++     */
+     int (*set_guest_notifiers)(DeviceState *d, int nvqs, bool assign);
+     int (*set_host_notifier_mr)(DeviceState *d, int n,
+                                 MemoryRegion *mr, bool assign);
+@@ -80,6 +86,21 @@ struct VirtioBusClass {
+      * the device for queue number n. Returns an error value on
+      * failure.
+      */
++    /*
++     * 在以下设置VirtioBusClass->ioeventfd_assign:
++     *   - hw/s390x/virtio-ccw.c|1285| <<virtio_ccw_bus_class_init>> k->ioeventfd_assign = virtio_ccw_ioeventfd_assign;
++     *   - hw/virtio/virtio-mmio.c|841| <<virtio_mmio_bus_class_init>> k->ioeventfd_assign = virtio_mmio_ioeventfd_assign;
++     *   - hw/virtio/virtio-pci.c|2229| <<virtio_pci_bus_class_init>> k->ioeventfd_assign = virtio_pci_ioeventfd_assign;
++     * 在以下使用VirtioBusClass->ioeventfd_assign:
++     *   - hw/block/dataplane/virtio-blk.c|95| <<virtio_blk_data_plane_create>> if (!k->set_guest_notifiers || !k->ioeventfd_assign) {
++     *   - hw/scsi/virtio-scsi-dataplane.c|39| <<virtio_scsi_dataplane_setup>> if (!k->set_guest_notifiers || !k->ioeventfd_assign) {
++     *   - hw/virtio/virtio-bus.c|194| <<virtio_bus_grab_ioeventfd>> if (!k->ioeventfd_assign) {
++     *   - hw/virtio/virtio-bus.c|227| <<virtio_bus_start_ioeventfd>> if (!k->ioeventfd_assign || !k->ioeventfd_enabled(proxy)) {
++     *   - hw/virtio/virtio-bus.c|269| <<virtio_bus_ioeventfd_enabled>> return k->ioeventfd_assign && k->ioeventfd_enabled(proxy);
++     *   - hw/virtio/virtio-bus.c|301| <<virtio_bus_set_host_notifier>> if (!k->ioeventfd_assign) {
++     *   - hw/virtio/virtio-bus.c|312| <<virtio_bus_set_host_notifier>> r = k->ioeventfd_assign(proxy, notifier, n, true);
++     *   - hw/virtio/virtio-bus.c|318| <<virtio_bus_set_host_notifier>> k->ioeventfd_assign(proxy, notifier, n, false);
++     */
+     int (*ioeventfd_assign)(DeviceState *d, EventNotifier *notifier,
+                             int n, bool assign);
+     /*
+diff --git a/include/hw/virtio/virtio-scsi.h b/include/hw/virtio/virtio-scsi.h
+index a36aad9c8..5a0334c7f 100644
+--- a/include/hw/virtio/virtio-scsi.h
++++ b/include/hw/virtio/virtio-scsi.h
+@@ -85,9 +85,48 @@ struct VirtIOSCSI {
+     /* Fields for dataplane below */
+     AioContext *ctx; /* one iothread per virtio-scsi-pci for now */
+ 
++    /*
++     * 在以下设置VirtIOSCSI->dataplane_started:
++     *   - hw/scsi/virtio-scsi-dataplane.c|149| <<virtio_scsi_dataplane_start>> s->dataplane_started = true;
++     *   - hw/scsi/virtio-scsi-dataplane.c|179| <<virtio_scsi_dataplane_start>> s->dataplane_started = true;
++     *   - hw/scsi/virtio-scsi-dataplane.c|233| <<virtio_scsi_dataplane_stop>> s->dataplane_started = false;
++     *   - hw/scsi/virtio-scsi-dataplane.c|199| <<virtio_scsi_dataplane_stop>> s->dataplane_started = false;
++     * 在以下使用VirtIOSCSI->dataplane_started:
++     *   - hw/scsi/virtio-scsi-dataplane.c|98| <<virtio_scsi_dataplane_start>> if (s->dataplane_started ||
++     *   - hw/scsi/virtio-scsi-dataplane.c|192| <<virtio_scsi_dataplane_stop>> if (!s->dataplane_started || s->dataplane_stopping) {
++     *   - hw/scsi/virtio-scsi.c|113| <<virtio_scsi_complete_req>> if (s->dataplane_started && !s->dataplane_fenced) {
++     *   - hw/scsi/virtio-scsi.c|291| <<virtio_scsi_ctx_check>> if (s->dataplane_started && d && blk_is_available(d->conf.blk)) {
++     *   - hw/scsi/virtio-scsi.c|519| <<virtio_scsi_defer_to_dataplane>> if (!s->ctx || s->dataplane_started) {
++     *   - hw/scsi/virtio-scsi.c|831| <<virtio_scsi_reset>> assert(!s->dataplane_started);
++     */
+     bool dataplane_started;
++    /*
++     * 在以下使用VirtIOSCSI->dataplane_starting:
++     *   - hw/scsi/virtio-scsi-dataplane.c|99| <<virtio_scsi_dataplane_start>> s->dataplane_starting ||
++     *   - hw/scsi/virtio-scsi-dataplane.c|104| <<virtio_scsi_dataplane_start>> s->dataplane_starting = true;
++     *   - hw/scsi/virtio-scsi-dataplane.c|148| <<virtio_scsi_dataplane_start>> s->dataplane_starting = false;
++     *   - hw/scsi/virtio-scsi-dataplane.c|178| <<virtio_scsi_dataplane_start>> s->dataplane_starting = false;
++     */
+     bool dataplane_starting;
++    /*
++     * 在以下使用VirtIOSCSI->dataplane_stopping:
++     *   - hw/scsi/virtio-scsi-dataplane.c|192| <<virtio_scsi_dataplane_stop>> if (!s->dataplane_started || s->dataplane_stopping) {
++     *   - hw/scsi/virtio-scsi-dataplane.c|202| <<virtio_scsi_dataplane_stop>> s->dataplane_stopping = true;
++     *   - hw/scsi/virtio-scsi-dataplane.c|232| <<virtio_scsi_dataplane_stop>> s->dataplane_stopping = false;
++     */
+     bool dataplane_stopping;
++    /*
++     * 在以下设置VirtIOSCSI->dataplane_fenced:
++     *   - hw/scsi/virtio-scsi-dataplane.c|62| <<virtio_scsi_set_host_notifier>> s->dataplane_fenced = true;
++     *   - hw/scsi/virtio-scsi-dataplane.c|177| <<virtio_scsi_dataplane_start>> s->dataplane_fenced = true;
++     *   - hw/scsi/virtio-scsi-dataplane.c|198| <<virtio_scsi_dataplane_stop>> s->dataplane_fenced = false;
++     * 在以下使用VirtIOSCSI->dataplane_fenced:
++     *   - hw/scsi/virtio-scsi-dataplane.c|100| <<virtio_scsi_dataplane_start>> s->dataplane_fenced) {
++     *   - hw/scsi/virtio-scsi-dataplane.c|197| <<virtio_scsi_dataplane_stop>> if (s->dataplane_fenced) {
++     *   - hw/scsi/virtio-scsi.c|113| <<virtio_scsi_complete_req>> if (s->dataplane_started && !s->dataplane_fenced) {
++     *   - hw/scsi/virtio-scsi.c|524| <<virtio_scsi_defer_to_dataplane>> return !s->dataplane_fenced;
++     *   - hw/scsi/virtio-scsi.c|940| <<virtio_scsi_hotplug>> if (s->ctx && !s->dataplane_fenced) {
++     */
+     bool dataplane_fenced;
+     uint32_t host_features;
+ };
+diff --git a/iothread.c b/iothread.c
+index 529194a56..253db1a3e 100644
+--- a/iothread.c
++++ b/iothread.c
+@@ -339,6 +339,10 @@ char *iothread_get_id(IOThread *iothread)
+ 
+ AioContext *iothread_get_aio_context(IOThread *iothread)
+ {
++    /*
++     * IOThread *iothread:
++     * -> AioContext *ctx;
++     */
+     return iothread->ctx;
+ }
+ 
+diff --git a/monitor/hmp.c b/monitor/hmp.c
+index 15ca04735..04f8659de 100644
+--- a/monitor/hmp.c
++++ b/monitor/hmp.c
+@@ -274,6 +274,14 @@ static void help_cmd_dump(Monitor *mon, const HMPCommand *cmds,
+     }
+ }
+ 
++/*
++ * called by:
++ *   - monitor/misc.c|175| <<do_help_cmd>> help_cmd(mon, qdict_get_try_str(qdict, "name"));
++ *   - monitor/misc.c|217| <<hmp_trace_file>> help_cmd(mon, "trace-file");
++ *   - monitor/misc.c|224| <<hmp_info_help>> help_cmd(mon, "info");
++ *   - monitor/misc.c|440| <<hmp_log>> help_cmd(mon, "log");
++ *   - qemu-io-cmds.c|2498| <<init_qemuio_commands>> qemuio_add_command(&help_cmd);
++ */
+ void help_cmd(Monitor *mon, const char *name)
+ {
+     char *args[MAX_ARGS];
+diff --git a/softmmu/memory.c b/softmmu/memory.c
+index 7ba204883..53d0a3007 100644
+--- a/softmmu/memory.c
++++ b/softmmu/memory.c
+@@ -37,13 +37,50 @@
+ //#define DEBUG_UNASSIGNED
+ 
+ static unsigned memory_region_transaction_depth;
++/*
++ * 在以下使用memory_region_update_pending:
++ *   - softmmu/memory.c|1137| <<memory_region_transaction_commit>> if (memory_region_update_pending) {
++ *   - softmmu/memory.c|1146| <<memory_region_transaction_commit>> memory_region_update_pending = false;
++ *   - softmmu/memory.c|2178| <<memory_region_set_log>> memory_region_update_pending |= mr->enabled;
++ *   - softmmu/memory.c|2308| <<memory_region_set_readonly>> memory_region_update_pending |= mr->enabled;
++ *   - softmmu/memory.c|2318| <<memory_region_set_nonvolatile>> memory_region_update_pending |= mr->enabled;
++ *   - softmmu/memory.c|2328| <<memory_region_rom_device_set_romd>> memory_region_update_pending |= mr->enabled;
++ *   - softmmu/memory.c|2629| <<memory_region_update_container_subregions>> memory_region_update_pending |= mr->enabled && subregion->enabled;
++ *   - softmmu/memory.c|2679| <<memory_region_del_subregion>> memory_region_update_pending |= mr->enabled && subregion->enabled;
++ *   - softmmu/memory.c|2690| <<memory_region_set_enabled>> memory_region_update_pending = true;
++ *   - softmmu/memory.c|2706| <<memory_region_set_size>> memory_region_update_pending = true;
++ *   - softmmu/memory.c|2742| <<memory_region_set_alias_offset>> memory_region_update_pending |= mr->enabled;
++ *   - softmmu/memory.c|2913| <<memory_global_dirty_log_start>> memory_region_update_pending = true;
++ *   - softmmu/memory.c|2928| <<memory_global_dirty_log_do_stop>> memory_region_update_pending = true;
++ */
+ static bool memory_region_update_pending;
++/*
++ * 在以下使用ioeventfd_update_pending:
++ *   - softmmu/memory.c|1107| <<memory_region_transaction_commit>> ioeventfd_update_pending = false;
++ *   - softmmu/memory.c|1109| <<memory_region_transaction_commit>> } else if (ioeventfd_update_pending) {
++ *   - softmmu/memory.c|1113| <<memory_region_transaction_commit>> ioeventfd_update_pending = false;
++ *   - softmmu/memory.c|2485| <<memory_region_add_eventfd>> ioeventfd_update_pending |= mr->enabled;
++ *   - softmmu/memory.c|2520| <<memory_region_del_eventfd>> ioeventfd_update_pending |= mr->enabled;
++ */
+ static bool ioeventfd_update_pending;
+ unsigned int global_dirty_tracking;
+ 
+ static QTAILQ_HEAD(, MemoryListener) memory_listeners
+     = QTAILQ_HEAD_INITIALIZER(memory_listeners);
+ 
++/*
++ * 在以下使用address_spaces (list):
++ *   - softmmu/memory.c|72| <<QTAILQ_HEAD>> = QTAILQ_HEAD_INITIALIZER(address_spaces);
++ *   - softmmu/memory.c|598| <<memory_region_to_address_space>> QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
++ *   - softmmu/memory.c|1122| <<flatviews_reset>> QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
++ *   - softmmu/memory.c|1209| <<memory_region_transaction_commit>> QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
++ *   - softmmu/memory.c|1217| <<memory_region_transaction_commit>> QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
++ *   - softmmu/memory.c|2491| <<memory_region_update_coalesced_range>> QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
++ *   - softmmu/memory.c|3166| <<address_space_init>> QTAILQ_INSERT_TAIL(&address_spaces, as, address_spaces_link);
++ *   - softmmu/memory.c|3190| <<address_space_destroy>> QTAILQ_REMOVE(&address_spaces, as, address_spaces_link);
++ *   - softmmu/memory.c|3501| <<mtree_info_flatview>> QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
++ *   - softmmu/memory.c|3579| <<mtree_info_as>> QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
++ */
+ static QTAILQ_HEAD(, AddressSpace) address_spaces
+     = QTAILQ_HEAD_INITIALIZER(address_spaces);
+ 
+@@ -170,6 +207,12 @@ struct MemoryRegionIoeventfd {
+     EventNotifier *e;
+ };
+ 
++/*
++ * called by:
++ *   - softmmu/memory.c|780| <<address_space_add_del_ioeventfds>> || memory_region_ioeventfd_before(&fds_old[iold],
++ *   - softmmu/memory.c|793| <<address_space_add_del_ioeventfds>> || memory_region_ioeventfd_before(&fds_new[inew],
++ *   - softmmu/memory.c|2522| <<memory_region_add_eventfd>> if (memory_region_ioeventfd_before(&mrfd, &mr->ioeventfds[i])) {
++ */
+ static bool memory_region_ioeventfd_before(MemoryRegionIoeventfd *a,
+                                            MemoryRegionIoeventfd *b)
+ {
+@@ -576,6 +619,12 @@ static AddressSpace *memory_region_to_address_space(MemoryRegion *mr)
+ /* Render a memory region into the global view.  Ranges in @view obscure
+  * ranges in @mr.
+  */
++/*
++ * called by:
++ *   - softmmu/memory.c|656| <<render_memory_region>> render_memory_region(view, mr->alias, base, clip,
++ *   - softmmu/memory.c|663| <<render_memory_region>> render_memory_region(view, subregion, base, clip,
++ *   - softmmu/memory.c|785| <<generate_memory_topology>> render_memory_region(view, mr, int128_zero(),
++ */
+ static void render_memory_region(FlatView *view,
+                                  MemoryRegion *mr,
+                                  Int128 base,
+@@ -725,6 +774,12 @@ static MemoryRegion *memory_region_get_flatview_root(MemoryRegion *mr)
+ }
+ 
+ /* Render a memory topology into a list of disjoint absolute ranges. */
++/*
++ * called by:
++ *   - softmmu/memory.c|1035| <<flatviews_init>> empty_view = generate_memory_topology(NULL);
++ *   - softmmu/memory.c|1062| <<flatviews_reset>> generate_memory_topology(physmr);
++ *   - softmmu/memory.c|1117| <<address_space_update_topology>> generate_memory_topology(physmr);
++ */
+ static FlatView *generate_memory_topology(MemoryRegion *mr)
+ {
+     int i;
+@@ -751,6 +806,10 @@ static FlatView *generate_memory_topology(MemoryRegion *mr)
+     return view;
+ }
+ 
++/*
++ * called by:
++ *   - softmmu/memory.c|916| <<address_space_update_ioeventfds>> address_space_add_del_ioeventfds(as, ioeventfds, ioeventfd_nb,
++ */
+ static void address_space_add_del_ioeventfds(AddressSpace *as,
+                                              MemoryRegionIoeventfd *fds_new,
+                                              unsigned fds_new_nb,
+@@ -800,6 +859,17 @@ static void address_space_add_del_ioeventfds(AddressSpace *as,
+     }
+ }
+ 
++/*
++ * called by:
++ *   - softmmu/memory.c|913| <<address_space_update_ioeventfds>> view = address_space_get_flatview(as);
++ *   - softmmu/memory.c|2259| <<memory_region_sync_dirty_bitmap>> view = address_space_get_flatview(as);
++ *   - softmmu/memory.c|2295| <<memory_region_clear_dirty_bitmap>> view = address_space_get_flatview(as);
++ *   - softmmu/memory.c|2474| <<memory_region_update_coalesced_range>> view = address_space_get_flatview(as);
++ *   - softmmu/memory.c|3043| <<listener_add_address_space>> view = address_space_get_flatview(as);
++ *   - softmmu/memory.c|3069| <<listener_del_address_space>> view = address_space_get_flatview(as);
++ *   - softmmu/memory.c|3484| <<mtree_info_flatview>> view = address_space_get_flatview(as);
++ *   - softmmu/physmem.c|3352| <<address_space_cache_init>> cache->fv = address_space_get_flatview(as);
++ */
+ FlatView *address_space_get_flatview(AddressSpace *as)
+ {
+     FlatView *view;
+@@ -814,6 +884,12 @@ FlatView *address_space_get_flatview(AddressSpace *as)
+     return view;
+ }
+ 
++/*
++ * called by:
++ *   - softmmu/memory.c|1104| <<memory_region_transaction_commit>> address_space_update_ioeventfds(as);
++ *   - softmmu/memory.c|1111| <<memory_region_transaction_commit>> address_space_update_ioeventfds(as);
++ *   - softmmu/memory.c|3013| <<address_space_init>> address_space_update_ioeventfds(as);
++ */
+ static void address_space_update_ioeventfds(AddressSpace *as)
+ {
+     FlatView *view;
+@@ -824,6 +900,25 @@ static void address_space_update_ioeventfds(AddressSpace *as)
+     AddrRange tmp;
+     unsigned i;
+ 
++    /*
++     * 在以下使用MemoryRegion->ioeventfd_nb:
++     *   - softmmu/memory.c|899| <<address_space_update_ioeventfds>> for (i = 0; i < fr->mr->ioeventfd_nb; ++i) {
++     *   - softmmu/memory.c|1545| <<memory_region_dispatch_write_eventfds>> for (i = 0; i < mr->ioeventfd_nb; i++) {
++     *   - softmmu/memory.c|2565| <<memory_region_add_eventfd>> for (i = 0; i < mr->ioeventfd_nb; ++i) {
++     *   - softmmu/memory.c|2570| <<memory_region_add_eventfd>> ++mr->ioeventfd_nb;
++     *   - softmmu/memory.c|2575| <<memory_region_add_eventfd>> sizeof(*mr->ioeventfds) * mr->ioeventfd_nb);
++     *   - softmmu/memory.c|2581| <<memory_region_add_eventfd>> sizeof(*mr->ioeventfds) * (mr->ioeventfd_nb-1 - i));
++     *   - softmmu/memory.c|2628| <<memory_region_del_eventfd>> for (i = 0; i < mr->ioeventfd_nb; ++i) {
++     *   - softmmu/memory.c|2633| <<memory_region_del_eventfd>> assert(i != mr->ioeventfd_nb);
++     *   - softmmu/memory.c|2635| <<memory_region_del_eventfd>> sizeof(*mr->ioeventfds) * (mr->ioeventfd_nb - (i+1)));
++     *   - softmmu/memory.c|2636| <<memory_region_del_eventfd>> --mr->ioeventfd_nb;
++     *   - softmmu/memory.c|2638| <<memory_region_del_eventfd>> sizeof(*mr->ioeventfds)*mr->ioeventfd_nb + 1);
++     * 在以下使用struct AddressSpace->ioeventfd_nb:
++     *   - softmmu/memory.c|878| <<address_space_update_ioeventfds>> ioeventfd_max = QEMU_ALIGN_UP(as->ioeventfd_nb, 4);
++     *   - softmmu/memory.c|921| <<address_space_update_ioeventfds>> as->ioeventfds, as->ioeventfd_nb);
++     *   - softmmu/memory.c|925| <<address_space_update_ioeventfds>> as->ioeventfd_nb = ioeventfd_nb;
++     *   - softmmu/memory.c|3126| <<address_space_init>> as->ioeventfd_nb = 0;
++     */
+     /*
+      * It is likely that the number of ioeventfds hasn't changed much, so use
+      * the previous size as the starting value, with some headroom to avoid
+@@ -832,9 +927,29 @@ static void address_space_update_ioeventfds(AddressSpace *as)
+     ioeventfd_max = QEMU_ALIGN_UP(as->ioeventfd_nb, 4);
+     ioeventfds = g_new(MemoryRegionIoeventfd, ioeventfd_max);
+ 
++    /*
++     * struct FlatView {
++     *     struct rcu_head rcu;
++     *     unsigned ref; 
++     *     FlatRange *ranges;
++     *     unsigned nr;
++     *     unsigned nr_allocated;
++     *     struct AddressSpaceDispatch *dispatch;
++     *     MemoryRegion *root;
++     * };
++     *
++     * FlatView *view;
++     */
+     view = address_space_get_flatview(as);
++    /*
++     * 对于每一个fr
++     */
+     FOR_EACH_FLAT_RANGE(fr, view) {
+         for (i = 0; i < fr->mr->ioeventfd_nb; ++i) {
++            /*
++	     * 大概是:
++	     * fr->mr->ioeventfds[i].addr + (fr->addr.start - fr->offset_in_region)
++	     */
+             tmp = addrrange_shift(fr->mr->ioeventfds[i].addr,
+                                   int128_sub(fr->addr.start,
+                                              int128_make64(fr->offset_in_region)));
+@@ -851,6 +966,13 @@ static void address_space_update_ioeventfds(AddressSpace *as)
+         }
+     }
+ 
++    /*
++     * 794 static void address_space_add_del_ioeventfds(AddressSpace *as,
++     * 795                                              MemoryRegionIoeventfd *fds_new,
++     * 796                                              unsigned fds_new_nb,
++     * 797                                              MemoryRegionIoeventfd *fds_old,
++     * 798                                              unsigned fds_old_nb)
++     */
+     address_space_add_del_ioeventfds(as, ioeventfds, ioeventfd_nb,
+                                      as->ioeventfds, as->ioeventfd_nb);
+ 
+@@ -1001,6 +1123,10 @@ static void flatviews_init(void)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - softmmu/memory.c|1138| <<memory_region_transaction_commit>> flatviews_reset();
++ */
+ static void flatviews_reset(void)
+ {
+     AddressSpace *as;
+@@ -1099,6 +1225,19 @@ void memory_region_transaction_commit(void)
+ 
+             MEMORY_LISTENER_CALL_GLOBAL(begin, Forward);
+ 
++            /*
++	     * 在以下使用address_spaces (list):
++	     *   - softmmu/memory.c|72| <<QTAILQ_HEAD>> = QTAILQ_HEAD_INITIALIZER(address_spaces);
++             *   - softmmu/memory.c|598| <<memory_region_to_address_space>> QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
++             *   - softmmu/memory.c|1122| <<flatviews_reset>> QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
++             *   - softmmu/memory.c|1209| <<memory_region_transaction_commit>> QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
++             *   - softmmu/memory.c|1217| <<memory_region_transaction_commit>> QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
++             *   - softmmu/memory.c|2491| <<memory_region_update_coalesced_range>> QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
++             *   - softmmu/memory.c|3166| <<address_space_init>> QTAILQ_INSERT_TAIL(&address_spaces, as, address_spaces_link);
++             *   - softmmu/memory.c|3190| <<address_space_destroy>> QTAILQ_REMOVE(&address_spaces, as, address_spaces_link);
++             *   - softmmu/memory.c|3501| <<mtree_info_flatview>> QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
++             *   - softmmu/memory.c|3579| <<mtree_info_as>> QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
++	     */
+             QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
+                 address_space_set_flatview(as);
+                 address_space_update_ioeventfds(as);
+@@ -2444,6 +2583,22 @@ void memory_region_clear_flush_coalesced(MemoryRegion *mr)
+ 
+ static bool userspace_eventfd_warning;
+ 
++/*
++ * called by:
++ *   - hw/misc/ivshmem.c|365| <<ivshmem_add_eventfd>> memory_region_add_eventfd(&s->ivshmem_mmio,
++ *   - hw/misc/pci-testdev.c|113| <<pci_testdev_start>> memory_region_add_eventfd(test->mr,
++ *   - hw/nvme/ctrl.c|4270| <<nvme_init_cq_ioeventfd>> memory_region_add_eventfd(&n->iomem,
++ *   - hw/nvme/ctrl.c|4299| <<nvme_init_sq_ioeventfd>> memory_region_add_eventfd(&n->iomem,
++ *   - hw/vfio/pci-quirks.c|401| <<vfio_ioeventfd_init>> memory_region_add_eventfd(ioeventfd->mr, ioeventfd->addr, ioeventfd->size,
++ *   - hw/virtio/virtio-mmio.c|52| <<virtio_mmio_ioeventfd_assign>> memory_region_add_eventfd(&proxy->iomem, VIRTIO_MMIO_QUEUE_NOTIFY, 4,
++ *   - hw/virtio/virtio-pci.c|251| <<virtio_pci_ioeventfd_assign>> memory_region_add_eventfd(modern_mr, modern_addr, 0,
++ *   - hw/virtio/virtio-pci.c|254| <<virtio_pci_ioeventfd_assign>> memory_region_add_eventfd(modern_mr, modern_addr, 2,
++ *   - hw/virtio/virtio-pci.c|258| <<virtio_pci_ioeventfd_assign>> memory_region_add_eventfd(modern_notify_mr, 0, 2,
++ *   - hw/virtio/virtio-pci.c|263| <<virtio_pci_ioeventfd_assign>> memory_region_add_eventfd(legacy_mr, legacy_addr, 2,
++ *
++ * 核心思想就是制作MemoryRegionIoeventfd给MemoryRegion->ioeventfds[i]
++ * 可能会g_realloc()
++ */
+ void memory_region_add_eventfd(MemoryRegion *mr,
+                                hwaddr addr,
+                                unsigned size,
+@@ -2471,21 +2626,54 @@ void memory_region_add_eventfd(MemoryRegion *mr,
+         adjust_endianness(mr, &mrfd.data, size_memop(size) | MO_TE);
+     }
+     memory_region_transaction_begin();
++    /*
++     * MemoryRegion *mr:
++     * -> unsigned ioeventfd_nb;
++     * -> MemoryRegionIoeventfd *ioeventfds;
++     */
+     for (i = 0; i < mr->ioeventfd_nb; ++i) {
+         if (memory_region_ioeventfd_before(&mrfd, &mr->ioeventfds[i])) {
+             break;
+         }
+     }
+     ++mr->ioeventfd_nb;
++    /*
++     * 似乎这里是唯一alloc的地方
++     */
+     mr->ioeventfds = g_realloc(mr->ioeventfds,
+                                   sizeof(*mr->ioeventfds) * mr->ioeventfd_nb);
++    /*
++     * dst: &mr->ioeventfds[i+1]
++     * src: &mr->ioeventfds[i]
++     */
+     memmove(&mr->ioeventfds[i+1], &mr->ioeventfds[i],
+             sizeof(*mr->ioeventfds) * (mr->ioeventfd_nb-1 - i));
+     mr->ioeventfds[i] = mrfd;
++    /*
++     * 在以下使用ioeventfd_update_pending:
++     *   - softmmu/memory.c|1107| <<memory_region_transaction_commit>> ioeventfd_update_pending = false;
++     *   - softmmu/memory.c|1109| <<memory_region_transaction_commit>> } else if (ioeventfd_update_pending) {
++     *   - softmmu/memory.c|1113| <<memory_region_transaction_commit>> ioeventfd_update_pending = false;
++     *   - softmmu/memory.c|2485| <<memory_region_add_eventfd>> ioeventfd_update_pending |= mr->enabled;
++     *   - softmmu/memory.c|2520| <<memory_region_del_eventfd>> ioeventfd_update_pending |= mr->enabled;
++     */
+     ioeventfd_update_pending |= mr->enabled;
+     memory_region_transaction_commit();
+ }
+ 
++/*
++ * called by:
++ *   - hw/misc/ivshmem.c|375| <<ivshmem_del_eventfd>> memory_region_del_eventfd(&s->ivshmem_mmio,
++ *   - hw/misc/pci-testdev.c|127| <<pci_testdev_stop>> memory_region_del_eventfd(test->mr,
++ *   - hw/nvme/ctrl.c|4312| <<nvme_free_sq>> memory_region_del_eventfd(&n->iomem,
++ *   - hw/nvme/ctrl.c|4703| <<nvme_free_cq>> memory_region_del_eventfd(&n->iomem,
++ *   - hw/vfio/pci-quirks.c|292| <<vfio_ioeventfd_exit>> memory_region_del_eventfd(ioeventfd->mr, ioeventfd->addr, ioeventfd->size,
++ *   - hw/virtio/virtio-mmio.c|55| <<virtio_mmio_ioeventfd_assign>> memory_region_del_eventfd(&proxy->iomem, VIRTIO_MMIO_QUEUE_NOTIFY, 4,
++ *   - hw/virtio/virtio-pci.c|269| <<virtio_pci_ioeventfd_assign>> memory_region_del_eventfd(modern_mr, modern_addr, 0,
++ *   - hw/virtio/virtio-pci.c|272| <<virtio_pci_ioeventfd_assign>> memory_region_del_eventfd(modern_mr, modern_addr, 2,
++ *   - hw/virtio/virtio-pci.c|276| <<virtio_pci_ioeventfd_assign>> memory_region_del_eventfd(modern_notify_mr, 0, 2,
++ *   - hw/virtio/virtio-pci.c|281| <<virtio_pci_ioeventfd_assign>> memory_region_del_eventfd(legacy_mr, legacy_addr, 2,
++ */
+ void memory_region_del_eventfd(MemoryRegion *mr,
+                                hwaddr addr,
+                                unsigned size,
+@@ -2999,6 +3187,20 @@ void address_space_remove_listeners(AddressSpace *as)
+     }
+ }
+ 
++/*
++ * 被特别多调用,几个特殊的例子:
++ *   - hw/i386/amd_iommu.c|1443| <<amdvi_host_dma_iommu>> address_space_init(&amdvi_dev_as->as, &amdvi_dev_as->root, name);
++ *   - hw/i386/intel_iommu.c|3459| <<vtd_find_add_as>> address_space_init(&vtd_dev_as->as, &vtd_dev_as->root, "vtd-root");
++ *   - hw/pci/pci.c|1143| <<do_pci_register_device>> address_space_init(&pci_dev->bus_master_as,
++ *   - hw/remote/iommu.c|57| <<remote_iommu_find_add_as>> address_space_init(&elem->as, elem->mr, NULL);
++ *   - hw/s390x/s390-pci-bus.c|618| <<s390_pci_get_iommu>> address_space_init(&iommu->as, &iommu->mr, as_name);
++ *   - hw/scsi/lsi53c895a.c|2305| <<lsi_scsi_realize>> address_space_init(&s->pci_io_as, pci_address_space_io(dev), "lsi-pci-io");
++ *   - hw/virtio/virtio-iommu.c|409| <<virtio_iommu_find_add_as>> address_space_init(&sdev->as, &sdev->root, TYPE_VIRTIO_IOMMU);
++ *   - softmmu/physmem.c|748| <<cpu_address_space_init>> address_space_init(as, mr, as_name);
++ *   - softmmu/physmem.c|2680| <<memory_map_init>> address_space_init(&address_space_memory, system_memory, "memory");
++ *   - softmmu/physmem.c|2685| <<memory_map_init>> address_space_init(&address_space_io, system_io, "I/O");
++ *   - target/i386/kvm/kvm.c|2416| <<register_smram_listener>> address_space_init(&smram_address_space, &smram_as_root, "KVM-SMRAM");
++ */
+ void address_space_init(AddressSpace *as, MemoryRegion *root, const char *name)
+ {
+     memory_region_ref(root);
+diff --git a/softmmu/physmem.c b/softmmu/physmem.c
+index dc3c3e5f2..e4e44cda4 100644
+--- a/softmmu/physmem.c
++++ b/softmmu/physmem.c
+@@ -736,6 +736,16 @@ translate_fail:
+     return &d->map.sections[PHYS_SECTION_UNASSIGNED];
+ }
+ 
++/*
++ * called by:
++ *   - softmmu/cpus.c|634| <<qemu_init_vcpu>> cpu_address_space_init(cpu, 0, "cpu-memory", cpu->memory);
++ *   - target/arm/cpu.c|2025| <<arm_cpu_realizefn>> cpu_address_space_init(cs, ARMASIdx_S, "cpu-secure-memory",
++ *   - target/arm/cpu.c|2030| <<arm_cpu_realizefn>> cpu_address_space_init(cs, ARMASIdx_TagNS, "cpu-tag-memory",
++ *   - target/arm/cpu.c|2033| <<arm_cpu_realizefn>> cpu_address_space_init(cs, ARMASIdx_TagS, "cpu-tag-memory",
++ *   - target/arm/cpu.c|2038| <<arm_cpu_realizefn>> cpu_address_space_init(cs, ARMASIdx_NS, "cpu-memory", cs->memory);
++ *   - target/i386/tcg/sysemu/tcg-cpu.c|76| <<tcg_cpu_realizefn>> cpu_address_space_init(cs, 0, "cpu-memory", cs->memory);
++ *   - target/i386/tcg/sysemu/tcg-cpu.c|77| <<tcg_cpu_realizefn>> cpu_address_space_init(cs, 1, "cpu-smm", cpu->cpu_as_root);
++ */
+ void cpu_address_space_init(CPUState *cpu, int asidx,
+                             const char *prefix, MemoryRegion *mr)
+ {
+@@ -774,6 +784,14 @@ void cpu_address_space_init(CPUState *cpu, int asidx,
+     }
+ }
+ 
++/*
++ * called by:
++ *   - hw/arm/armv7m.c|591| <<armv7m_load_kernel>> as = cpu_get_address_space(cs, asidx);
++ *   - hw/arm/boot.c|59| <<arm_boot_address_space>> return cpu_get_address_space(cs, asidx);
++ *   - target/arm/cpu.h|3327| <<arm_addressspace>> return cpu_get_address_space(cs, arm_asidx_from_attrs(cs, attrs));
++ *   - target/arm/mte_helper.c|206| <<allocation_tag_mem>> tag_as = cpu_get_address_space(env_cpu(env), tag_asi);
++ *   - target/i386/cpu.h|2103| <<cpu_addressspace>> return cpu_get_address_space(cs, cpu_asidx_from_attrs(cs, attrs));
++ */
+ AddressSpace *cpu_get_address_space(CPUState *cpu, int asidx)
+ {
+     /* Return the AddressSpace corresponding to the specified index */
+diff --git a/softmmu/vl.c b/softmmu/vl.c
+index 706bd7cff..02a1a9fbc 100644
+--- a/softmmu/vl.c
++++ b/softmmu/vl.c
+@@ -178,6 +178,12 @@ static const char *vga_model = NULL;
+ static DisplayOptions dpy;
+ static int num_serial_hds;
+ static Chardev **serial_hds;
++/*
++ * 在以下使用log_mask:
++ *   - softmmu/vl.c|2390| <<qemu_process_early_options>> if (log_mask) {
++ *   - softmmu/vl.c|2391| <<qemu_process_early_options>> mask = qemu_str_to_log_mask(log_mask);
++ *   - softmmu/vl.c|2900| <<qemu_init>> log_mask = optarg;
++ */
+ static const char *log_mask;
+ static const char *log_file;
+ static bool list_data_dirs;
+@@ -2355,6 +2361,10 @@ static int process_runstate_actions(void *opaque, QemuOpts *opts, Error **errp)
+     return 0;
+ }
+ 
++/*
++ * called by:
++ *   - softmmu/vl.c|3487| <<qemu_init>> qemu_process_early_options();
++ */
+ static void qemu_process_early_options(void)
+ {
+ #ifdef CONFIG_SECCOMP
+@@ -2396,6 +2406,10 @@ static void qemu_process_early_options(void)
+     qemu_add_default_firmwarepath();
+ }
+ 
++/*
++ * called by:
++ *   - softmmu/vl.c|3499| <<qemu_init>> qemu_process_help_options();
++ */
+ static void qemu_process_help_options(void)
+ {
+     /*
+diff --git a/target/i386/cpu.h b/target/i386/cpu.h
+index 82004b65b..01e1fce7c 100644
+--- a/target/i386/cpu.h
++++ b/target/i386/cpu.h
+@@ -2098,6 +2098,18 @@ static inline int x86_asidx_from_attrs(CPUState *cs, MemTxAttrs attrs)
+     return !!attrs.secure;
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/helper.c|602| <<x86_ldub_phys>> AddressSpace *as = cpu_addressspace(cs, attrs);
++ *   - target/i386/helper.c|612| <<x86_lduw_phys>> AddressSpace *as = cpu_addressspace(cs, attrs);
++ *   - target/i386/helper.c|622| <<x86_ldl_phys>> AddressSpace *as = cpu_addressspace(cs, attrs);
++ *   - target/i386/helper.c|632| <<x86_ldq_phys>> AddressSpace *as = cpu_addressspace(cs, attrs);
++ *   - target/i386/helper.c|642| <<x86_stb_phys>> AddressSpace *as = cpu_addressspace(cs, attrs);
++ *   - target/i386/helper.c|652| <<x86_stl_phys_notdirty>> AddressSpace *as = cpu_addressspace(cs, attrs);
++ *   - target/i386/helper.c|662| <<x86_stw_phys>> AddressSpace *as = cpu_addressspace(cs, attrs);
++ *   - target/i386/helper.c|672| <<x86_stl_phys>> AddressSpace *as = cpu_addressspace(cs, attrs);
++ *   - target/i386/helper.c|682| <<x86_stq_phys>> AddressSpace *as = cpu_addressspace(cs, attrs);
++ */
+ static inline AddressSpace *cpu_addressspace(CPUState *cs, MemTxAttrs attrs)
+ {
+     return cpu_get_address_space(cs, cpu_asidx_from_attrs(cs, attrs));
+diff --git a/util/aio-wait.c b/util/aio-wait.c
+index 98c5accd2..948ee021b 100644
+--- a/util/aio-wait.c
++++ b/util/aio-wait.c
+@@ -82,5 +82,22 @@ void aio_wait_bh_oneshot(AioContext *ctx, QEMUBHFunc *cb, void *opaque)
+     assert(qemu_get_current_aio_context() == qemu_get_aio_context());
+ 
+     aio_bh_schedule_oneshot(ctx, aio_wait_bh, &data);
++    /*
++     * AIO_WAIT_WHILE:
++     * @ctx: the aio context, or NULL if multiple aio contexts (for which the
++     *       caller does not hold a lock) are involved in the polling condition.
++     * @cond: wait while this conditional expression is true
++     *  
++     * Wait while a condition is true.  Use this to implement synchronous
++     * operations that require event loop activity.
++     *  
++     * The caller must be sure that something calls aio_wait_kick() when the value
++     * of @cond might have changed.
++     *
++     * The caller's thread must be the IOThread that owns @ctx or the main loop
++     * thread (with @ctx acquired exactly once).  This function cannot be used to
++     * wait on conditions between two IOThreads since that could lead to deadlock,
++     * go via the main loop instead.
++     */
+     AIO_WAIT_WHILE(ctx, !data.done);
+ }
+diff --git a/util/log.c b/util/log.c
+index d6eb0378c..912f580bc 100644
+--- a/util/log.c
++++ b/util/log.c
+@@ -186,6 +186,12 @@ valid_filename_template(const char *filename, bool per_thread, Error **errp)
+ }
+ 
+ /* enable or disable low levels log */
++/*
++ * called by:
++ *   - util/log.c|302| <<qemu_set_log>> return qemu_set_log_internal(NULL, false, log_flags, errp);
++ *   - util/log.c|307| <<qemu_set_log_filename>> return qemu_set_log_internal(filename, true, qemu_loglevel, errp);
++ *   - util/log.c|312| <<qemu_set_log_filename_flags>> return qemu_set_log_internal(name, true, flags, errp);
++ */
+ static bool qemu_set_log_internal(const char *filename, bool changed_name,
+                                   int log_flags, Error **errp)
+ {
+@@ -297,6 +303,16 @@ static bool qemu_set_log_internal(const char *filename, bool changed_name,
+     return true;
+ }
+ 
++/*
++ * called by:
++ *   - monitor/misc.c|445| <<hmp_log>> if (!qemu_set_log(mask, &err)) {
++ *   - qemu-img.c|5443| <<main>> qemu_set_log(LOG_TRACE, &error_fatal);
++ *   - qemu-io.c|638| <<main>> qemu_set_log(LOG_TRACE, &error_fatal);
++ *   - qemu-nbd.c|814| <<main>> qemu_set_log(LOG_TRACE, &error_fatal);
++ *   - scsi/qemu-pr-helper.c|1006| <<main>> qemu_set_log(LOG_TRACE, &error_fatal);
++ *   - storage-daemon/qemu-storage-daemon.c|419| <<main>> qemu_set_log(LOG_TRACE, &error_fatal);
++ *   - tests/unit/test-logging.c|124| <<test_logfile_write>> qemu_set_log(CPU_LOG_TB_OUT_ASM, &error_abort);
++ */
+ bool qemu_set_log(int log_flags, Error **errp)
+ {
+     return qemu_set_log_internal(NULL, false, log_flags, errp);
+@@ -449,6 +465,13 @@ const QEMULogItem qemu_log_items[] = {
+ };
+ 
+ /* takes a comma separated list of log masks. Return 0 if error. */
++/*
++ * called by:
++ *   - bsd-user/main.c|410| <<main>> mask = qemu_str_to_log_mask(log_mask);
++ *   - linux-user/main.c|250| <<handle_arg_log>> last_log_mask = qemu_str_to_log_mask(arg);
++ *   - monitor/misc.c|438| <<hmp_log>> mask = qemu_str_to_log_mask(items);
++ *   - softmmu/vl.c|2387| <<qemu_process_early_options>> mask = qemu_str_to_log_mask(log_mask);
++ */
+ int qemu_str_to_log_mask(const char *str)
+ {
+     const QEMULogItem *item;
+@@ -486,6 +509,12 @@ int qemu_str_to_log_mask(const char *str)
+     return 0;
+ }
+ 
++/*
++ * called by:
++ *   - bsd-user/main.c|412| <<main>> qemu_print_log_usage(stdout);
++ *   - linux-user/main.c|252| <<handle_arg_log>> qemu_print_log_usage(stdout);
++ *   - softmmu/vl.c|2399| <<qemu_process_early_options>> qemu_print_log_usage(stdout);
++ */
+ void qemu_print_log_usage(FILE *f)
+ {
+     const QEMULogItem *item;
+diff --git a/util/qemu-config.c b/util/qemu-config.c
+index 433488aa5..72fd3f8a0 100644
+--- a/util/qemu-config.c
++++ b/util/qemu-config.c
+@@ -241,6 +241,9 @@ static QemuOptsList machine_opts = {
+     }
+ };
+ 
++/*
++ * 只被qmp调用
++ */
+ CommandLineOptionInfoList *qmp_query_command_line_options(bool has_option,
+                                                           const char *option,
+                                                           Error **errp)
+diff --git a/util/qemu-option.c b/util/qemu-option.c
+index eedd08929..81e1bebf7 100644
+--- a/util/qemu-option.c
++++ b/util/qemu-option.c
+@@ -1122,6 +1122,35 @@ bool qemu_opts_validate(QemuOpts *opts, const QemuOptDesc *desc, Error **errp)
+  * When @func() returns non-zero, break the loop and return that value.
+  * Return zero when the loop completes.
+  */
++/*
++ * called by:
++ *   - block/blkdebug.c|309| <<read_config>> qemu_opts_foreach(&inject_error_opts, add_rule, &d, &local_err);
++ *   - block/blkdebug.c|317| <<read_config>> qemu_opts_foreach(&set_state_opts, add_rule, &d, &local_err);
++ *   - hw/core/numa.c|732| <<parse_numa_opts>> qemu_opts_foreach(qemu_find_opts("numa"), parse_numa, ms, &error_fatal);
++ *   - net/net.c|1570| <<net_init_clients>> if (qemu_opts_foreach(qemu_find_opts("netdev"),
++ *   - net/net.c|1575| <<net_init_clients>> if (qemu_opts_foreach(qemu_find_opts("nic"), net_param_nic, NULL, errp)) {
++ *   - net/net.c|1579| <<net_init_clients>> if (qemu_opts_foreach(qemu_find_opts("net"), net_init_client, NULL, errp)) {
++ *   - softmmu/tpm.c|166| <<tpm_init>> if (qemu_opts_foreach(qemu_find_opts("tpmdev"),
++ *   - softmmu/vl.c|710| <<configure_blockdev>> qemu_opts_foreach(qemu_find_opts("drive"), drive_enable_snapshot,
++ *   - softmmu/vl.c|713| <<configure_blockdev>> if (qemu_opts_foreach(qemu_find_opts("drive"), drive_init_func,
++ *   - softmmu/vl.c|1265| <<qemu_disable_default_devices>> qemu_opts_foreach(qemu_find_opts("device"),
++ *   - softmmu/vl.c|1267| <<qemu_disable_default_devices>> qemu_opts_foreach(qemu_find_opts("global"),
++ *   - softmmu/vl.c|1881| <<qemu_create_early_backends>> qemu_opts_foreach(qemu_find_opts("chardev"),
++ *   - softmmu/vl.c|1885| <<qemu_create_early_backends>> qemu_opts_foreach(qemu_find_opts("fsdev"),
++ *   - softmmu/vl.c|1921| <<qemu_create_late_backends>> qemu_opts_foreach(qemu_find_opts("mon"),
++ *   - softmmu/vl.c|2161| <<user_register_global_props>> qemu_opts_foreach(qemu_find_opts("global"),
++ *   - softmmu/vl.c|2218| <<configure_accelerators>> qemu_opts_foreach(qemu_find_opts("icount"),
++ *   - softmmu/vl.c|2268| <<configure_accelerators>> if (!qemu_opts_foreach(qemu_find_opts("accel"),
++ *   - softmmu/vl.c|2373| <<qemu_process_early_options>> qemu_opts_foreach(olist, parse_sandbox, NULL, &error_fatal);
++ *   - softmmu/vl.c|2377| <<qemu_process_early_options>> qemu_opts_foreach(qemu_find_opts("name"),
++ *   - softmmu/vl.c|2380| <<qemu_process_early_options>> if (qemu_opts_foreach(qemu_find_opts("action"),
++ *   - softmmu/vl.c|2386| <<qemu_process_early_options>> qemu_opts_foreach(qemu_find_opts("add-fd"),
++ *   - softmmu/vl.c|2389| <<qemu_process_early_options>> qemu_opts_foreach(qemu_find_opts("add-fd"),
++ *   - softmmu/vl.c|2422| <<qemu_process_help_options>> if (qemu_opts_foreach(qemu_find_opts("device"),
++ *   - softmmu/vl.c|2480| <<qemu_init_displays>> qemu_opts_foreach(qemu_find_opts("vnc"),
++ *   - softmmu/vl.c|2513| <<qemu_create_cli_devices>> qemu_opts_foreach(qemu_find_opts("fw_cfg"),
++ *   - softmmu/vl.c|2524| <<qemu_create_cli_devices>> qemu_opts_foreach(qemu_find_opts("device"),
++ */
+ int qemu_opts_foreach(QemuOptsList *list, qemu_opts_loopfunc func,
+                       void *opaque, Error **errp)
+ {
+-- 
+2.34.1
+
