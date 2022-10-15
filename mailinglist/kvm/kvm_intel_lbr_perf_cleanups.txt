@@ -1,0 +1,206 @@
+[PATCH v5 0/8] KVM: x86: Intel LBR related perf cleanups
+
+... from Sean Christopherson <seanjc@google.com> ...
+
+https://lore.kernel.org/all/20221006000314.73240-1-seanjc@google.com/
+
+-------------------
+
+Here is about Last Branch Records (LBR)
+
+https://easyperf.net/blog/2018/06/08/Advanced-profiling-topics-PEBS-and-LBR
+
+Intel CPUs have a feature called last branch records (LBR) where the CPU can
+continuously log branches to a set of model-specific registers (MSRs). The CPU
+hardware can do this in parallel while executing the program without causing
+any slowdown. There is some performance penalty for reading these registers,
+however.
+
+The LBRs log the “from” and “to” address of each branch along with some
+additional metadata. The registers act like a ring buffer that is continuously
+overwritten and provides only the most recent entries. There is also a TOS (top
+of stack) register to provide a pointer to the most recent branch. With LBRs we
+can sample branches, but during each sample look at the previous 8-32 branches
+that were executed. This gives reasonable coverage of the control flow in the
+hot code paths, but does not overwhelm us with too much information, as only a
+smaller number of the total branches are examined.
+
+Once we are able to sample LBRs it is possible to set up sampling of branch
+events at a frequency that does not slow down the workload unduly, and still
+create an useful histogram of hot branches. It is important to keep in mind
+that this is still sampling, so not every executed branch can be examined. CPUs
+generally execute too fast for that to be feasible.
+
+The last branch recording mechanism tracks not only branch instructions (like
+JMP, Jcc, LOOP and CALL instructions), but also other operations that cause a
+change in the instruction pointer (like external interrupts, traps and faults).
+The branch recording mechanisms generally employs a set of MSRs (Model Specific
+Registers), referred to as last branch record (LBR) stack. The size and exact
+locations of the LBR stack are generally model-specific. 
+
+-------------------
+
+[PATCH v5 1/8] perf/x86/core: Zero @lbr instead of returning -1 in x86_perf_get_lbr() stub
+
+KVM does not rely on the return value of x86_perf_get_lbr() to decide if "no LBR support". It relies on lbr.nr at line 1886.
+
+1875 /**
+1876  * x86_perf_get_lbr - get the LBR records information
+1877  *
+1878  * @lbr: the caller's memory to store the LBR records information
+1879  *
+1880  * Returns: 0 indicates the LBR info has been successfully obtained
+1881  */
+1882 int x86_perf_get_lbr(struct x86_pmu_lbr *lbr)
+1883 {
+1884         int lbr_fmt = x86_pmu.intel_cap.lbr_format;
+1885 
+1886         lbr->nr = x86_pmu.lbr_nr;
+1887         lbr->from = x86_pmu.lbr_from;
+1888         lbr->to = x86_pmu.lbr_to;
+1889         lbr->info = (lbr_fmt == LBR_FORMAT_INFO) ? x86_pmu.lbr_info : 0;
+1890 
+1891         return 0;
+1892 }
+1893 EXPORT_SYMBOL_GPL(x86_perf_get_lbr);
+
+And the stub function erroneously always returns unknown value in lbr.nr.
+
+571 static inline int x86_perf_get_lbr(struct x86_pmu_lbr *lbr)
+572 {
+573         return -1;
+574 }
+
+
+Therefore, the stub implementation should zap the lbr.
+
+-static inline int x86_perf_get_lbr(struct x86_pmu_lbr *lbr)
++static inline void x86_perf_get_lbr(struct x86_pmu_lbr *lbr)
+ {
+-	return -1;
++	memset(lbr, 0, sizeof(*lbr));
+ }
+
+-------------------
+
+[PATCH v5 2/8] KVM: VMX: Advertise PMU LBRs if and only if perf supports LBRs
+
+Do not declare that PMU_CAP_LBR_FMT is supported unless lbr.nr is not zero.
+
+Advertise LBR support to userspace via MSR_IA32_PERF_CAPABILITIES if and only
+if perf fully supports LBRs.  Perf may disable LBRs (by zeroing the number of
+LBRs) even on platforms the allegedly support LBRs, e.g. if probing any LBR
+MSRs during setup fails.
+
+diff --git a/arch/x86/kvm/vmx/capabilities.h b/arch/x86/kvm/vmx/capabilities.h
+index 87c4e46daf37..a6689bf06542 100644
+--- a/arch/x86/kvm/vmx/capabilities.h
++++ b/arch/x86/kvm/vmx/capabilities.h
+@@ -400,6 +400,7 @@ static inline bool vmx_pebs_supported(void)
+ static inline u64 vmx_get_perf_capabilities(void)
+ {
+ 	u64 perf_cap = PMU_CAP_FW_WRITES;
++	struct x86_pmu_lbr lbr;
+ 	u64 host_perf_cap = 0;
+ 
+ 	if (!enable_pmu)
+@@ -408,7 +409,9 @@ static inline u64 vmx_get_perf_capabilities(void)
+ 	if (boot_cpu_has(X86_FEATURE_PDCM))
+ 		rdmsrl(MSR_IA32_PERF_CAPABILITIES, host_perf_cap);
+ 
+-	perf_cap |= host_perf_cap & PMU_CAP_LBR_FMT;
++	x86_perf_get_lbr(&lbr);
++	if (lbr.nr)
++		perf_cap |= host_perf_cap & PMU_CAP_LBR_FMT;
+ 
+ 	if (vmx_pebs_supported()) {
+ 		perf_cap |= host_perf_cap & PERF_CAP_PEBS_MASK;
+
+-------------------
+
+[PATCH v5 3/8] KVM: VMX: Fold vmx_supported_debugctl() into vcpu_supported_debugctl()
+
+No functional change.
+
+vcpu_supported_debugctl() is the only caller of vmx_supported_debugctl().
+
+Therefore, fold vmx_supported_debugctl() into into vcpu_supported_debugctl().
+
+-------------------
+
+[PATCH v5 4/8] KVM: VMX: Ignore guest CPUID for host userspace writes to DEBUGCTL
+
+The core idea is to allow the QEMU userspace to have
+DEBUGCTLMSR_BUS_LOCK_DETECT returned, if the set msr request is from userspace,
+not VM side.
+
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 97fc873c37fa..e70ac91cd2fb 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -2021,16 +2021,16 @@ static u64 nested_vmx_truncate_sysenter_addr(struct kvm_vcpu *vcpu,
+ 	return (unsigned long)data;
+ }
+ 
+-static u64 vcpu_supported_debugctl(struct kvm_vcpu *vcpu)
++static u64 vmx_get_supported_debugctl(struct kvm_vcpu *vcpu, bool host_initiated)
+ {
+ 	u64 debugctl = 0;
+ 
+ 	if (boot_cpu_has(X86_FEATURE_BUS_LOCK_DETECT) &&
+-	    guest_cpuid_has(vcpu, X86_FEATURE_BUS_LOCK_DETECT))
++	    (host_initiated || guest_cpuid_has(vcpu, X86_FEATURE_BUS_LOCK_DETECT)))
+ 		debugctl |= DEBUGCTLMSR_BUS_LOCK_DETECT;
+ 
+ 	if ((vmx_get_perf_capabilities() & PMU_CAP_LBR_FMT) &&
+-	    intel_pmu_lbr_is_enabled(vcpu))
++	    (host_initiated || intel_pmu_lbr_is_enabled(vcpu)))
+ 		debugctl |= DEBUGCTLMSR_LBR | DEBUGCTLMSR_FREEZE_LBRS_ON_PMI;
+ 
+ 	return debugctl;
+@@ -2105,7 +2105,9 @@ static int vmx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 		vmcs_writel(GUEST_SYSENTER_ESP, data);
+ 		break;
+ 	case MSR_IA32_DEBUGCTLMSR: {
+-		u64 invalid = data & ~vcpu_supported_debugctl(vcpu);
++		u64 invalid;
++
++		invalid = data & ~vmx_get_supported_debugctl(vcpu, msr_info->host_initiated);
+ 		if (invalid & (DEBUGCTLMSR_BTF|DEBUGCTLMSR_LBR)) {
+ 			if (report_ignored_msrs)
+ 				vcpu_unimpl(vcpu, "%s: BTF|LBR in IA32_DEBUGCTLMSR 0x%llx, nop\n",
+
+-------------------
+
+[PATCH v5 5/8] KVM: x86: Track supported PERF_CAPABILITIES in kvm_caps
+
+Similar to a cleanup.
+
+Track KVM's supported PERF_CAPABILITIES in kvm_caps instead of computing the
+supported capabilities on the fly every time.  Using kvm_caps will also allow
+for future cleanups as the kvm_caps values can be used directly in common x86
+code.
+
+That is, to access kvm_caps.supported_perf_cap, but not
+vmx_get_perf_capabilities().
+
+-------------------
+
+[PATCH v5 6/8] KVM: x86: Init vcpu->arch.perf_capabilities in common x86 code
+
+No functional change. Just move
+"vcpu->arch.perf_capabilities = kvm_caps.supported_perf_cap;"
+from vmx vendor code to non-vendor code.
+
+-------------------
+
+[PATCH v5 7/8] KVM: x86: Handle PERF_CAPABILITIES in common x86's kvm_get_msr_feature()
+
+No functional change. Just move some code from vmx/svm vendor code to
+non-vendor code.
+
+-------------------
+
+[PATCH v5 8/8] KVM: x86: Directly query supported PERF_CAPABILITIES for WRMSR checks
+
+No functional change
