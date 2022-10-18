@@ -1,0 +1,99 @@
+[PATCH 0/9] Linear Address Masking (LAM) KVM Enabling
+
+... from Robert Hoo <robert.hu@linux.intel.com> ...
+
+https://lore.kernel.org/all/20221017070450.23031-1-robert.hu@linux.intel.com/
+
+The Linear-Address Masking (LAM) modifies the checking that is applied to
+64-bit linear addresses, allowing software to use of the untranslated address
+bits for metadata.
+
+In 64-bit mode, linear address have 64 bits and are translated either with
+4-level paging, which translates the low 48 bits of each linear address, or
+with 5-level paging, which translates 57 bits. The upper linear-address bits
+are reserved through the concept of canonicality. A linear address is 48-bit
+canonical if bits 63:47 of the addresses are identical; it is 57-bit canonical
+if bits 63:56 are identical. (Clearly, any linear address that is 48-bit
+canonical is also 57-bit canonical). When 4-level paging is active, the
+processor requires all linear addresses used to access memory to be 48-bit
+canonical; similarly, 5-level paging ensures that all linear addresses are
+57-bit canonical.
+
+Software usages that associate metadata with a pointer might benefit from being
+able to place metadata in the upper (untranslated) bits of the pointer itself.
+However, the canonicality enforcement mentioned earlier implies that software
+would have to mask the metadata bits in a pointer (making it canonical) before
+using it as a linear address to access memory. LAM allows software to use
+pointers with metadata without having to mask the metadata bits. With LAM
+enabled, the processor masks the metadata bits in a pointer before using it as
+a linear address to access memory.
+
+LAM is supported only in 64-bit mode and applies only addresses used for data
+accesses. LAM doe not apply to addresses used for instruction fetches or to
+those that specify the targets of jump and call instructions.
+
+
+For EPT, there is not change required, except to expose the feature via CPUID
+and cr4. If LAM enabled, CR4.LAM_SUP is owned by guest; otherwise, reserved.
+
+diff --git a/arch/x86/kvm/x86.h b/arch/x86/kvm/x86.h
+index 4473bc0ba0f1..c55d9e517d01 100644
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@ -470,6 +470,8 @@ bool kvm_msr_allowed(struct kvm_vcpu *vcpu, u32 index, u32 type);
+ 		__reserved_bits |= X86_CR4_VMXE;        \
+ 	if (!__cpu_has(__c, X86_FEATURE_PCID))          \
+ 		__reserved_bits |= X86_CR4_PCIDE;       \
++	if (!__cpu_has(__c, X86_FEATURE_LAM))		\
++		__reserved_bits |= X86_CR4_LAM_SUP;	\
+ 	__reserved_bits;                                \
+ })
+ 
+
+This primarily impacts Shadow Page Table. The core idea is below patch.
+
+[PATCH 8/9] KVM: x86: When guest set CR3, handle LAM bits semantics
+
+Do not allow new cr3 when the feature is not supported by KVM.
+
+@@ -1243,6 +1243,10 @@ int kvm_set_cr3(struct kvm_vcpu *vcpu, unsigned long cr3)
+ 	if (cr3 == kvm_read_cr3(vcpu) && !is_pae_paging(vcpu))
+ 		goto handle_tlb_flush;
+ 
++	if (!guest_cpuid_has(vcpu, X86_FEATURE_LAM) &&
++	    (cr3 & (X86_CR3_LAM_U48 | X86_CR3_LAM_U57)))
++		return	1;
++
+
+To mask out the un-related bits when creating new pgd.
+
+@@ -1254,8 +1258,22 @@ int kvm_set_cr3(struct kvm_vcpu *vcpu, unsigned long cr3)
+ 	if (is_pae_paging(vcpu) && !load_pdptrs(vcpu, cr3))
+ 		return 1;
+ 
+-	if (cr3 != kvm_read_cr3(vcpu))
+-		kvm_mmu_new_pgd(vcpu, cr3);
++	old_cr3 = kvm_read_cr3(vcpu);
++	if (cr3 != old_cr3) {
++		if ((cr3 ^ old_cr3) & CR3_ADDR_MASK) {
++			kvm_mmu_new_pgd(vcpu, cr3 & ~(X86_CR3_LAM_U48 |
++					X86_CR3_LAM_U57));
++		} else {
++			/* Only LAM conf changes, no tlb flush needed */
++			skip_tlb_flush = true;
++			/*
++			 * Though effective addr no change, mark the
++			 * request so that LAM bits will take effect
++			 * when enter guest.
++			 */
++			kvm_make_request(KVM_REQ_LOAD_MMU_PGD, vcpu);
++		}
++	}
+ 
+ 	vcpu->arch.cr3 = cr3;
+ 	kvm_register_mark_dirty(vcpu, VCPU_EXREG_CR3);
+
+
+Reference:
+
+Intel Architecture Instruction Set Extensions and Future Features, Programming Reference, September 2022, 319433-046
