@@ -1,0 +1,161 @@
+[RFC PATCH v5 0/8] Make balloon drivers' memory changes known to the rest of the kernel
+
+... from Alexander Atanasov <alexander.atanasov@virtuozzo.com> ...
+
+https://lore.kernel.org/all/20221019095620.124909-1-alexander.atanasov@virtuozzo.com/
+
+Currently balloon drivers (Virtio,XEN, HyperV, VMWare, ...) inflate and deflate
+the guest memory size but there is no way to know how much the memory size is
+changed by them.
+
+Make it possible for the drivers to report the values to mm core.
+
+Display reported InflatedTotal and InflatedFree in /proc/meminfo and print
+these values on OOM and sysrq from show_mem().i
+
+
+InflateTotal: Drivers that call adjust_managed_page_count
+InflateFree:  Drivers that do NOT call adjust_managed_page_count
+
+
+----------------------
+
+[RFC PATCH v5 1/8] mm: Make a place for a common balloon code
+
+No functional change. Almost nothing.
+
+----------------------
+
+[RFC PATCH v5 2/8] mm: Enable balloon drivers to report inflated memory
+
+Introduced below to mm/balloon.c.
+
+mem_balloon_inflated_total_kb and mem_balloon_inflated_free_kb ...
+... and the APIs to atomically edit them.
+
++atomic_long_t mem_balloon_inflated_total_kb = ATOMIC_LONG_INIT(0);
++atomic_long_t mem_balloon_inflated_free_kb = ATOMIC_LONG_INIT(0);
++
++void balloon_set_inflated_total(long inflated_kb)
++{
++	atomic_long_set(&mem_balloon_inflated_total_kb, inflated_kb);
++}
++EXPORT_SYMBOL(balloon_set_inflated_total);
++
++void balloon_set_inflated_free(long inflated_kb)
++{
++	atomic_long_set(&mem_balloon_inflated_free_kb, inflated_kb);
++}
++EXPORT_SYMBOL(balloon_set_inflated_free);
+
+----------------------
+
+[RFC PATCH v5 3/8] mm: Display inflated memory to users
+
+To print below in proc meminfo.
+
+     VmallocChunk:          0 kB
+     Percpu:            29312 kB
++    InflatedTotal:   2097152 kB
++    InflatedFree:          0 kB
+     HardwareCorrupted:     0 kB
+     AnonHugePages:   4149248 kB
+     ShmemHugePages:        0 kB
+
+
+The code is:
+
+@@ -155,6 +158,13 @@ static int meminfo_proc_show(struct seq_file *m, void *v)
+ 		    global_zone_page_state(NR_FREE_CMA_PAGES));
+ #endif
+ 
++#ifdef CONFIG_MEMORY_BALLOON
++	seq_printf(m,  "InflatedTotal:  %8ld kB\n",
++		atomic_long_read(&mem_balloon_inflated_total_kb));
++	seq_printf(m,  "InflatedFree:   %8ld kB\n",
++		atomic_long_read(&mem_balloon_inflated_free_kb));
++#endif
++
+ 	hugetlb_report_meminfo(m);
+ 
+ 	arch_report_meminfo(m);
+
+----------------------
+
+[RFC PATCH v5 4/8] mm: Display inflated memory in logs
+
+Show balloon mem in the log, when __show_mem() is called.
+
+ void __show_mem(unsigned int filter, nodemask_t *nodemask, int max_zone_idx)
+ {
+@@ -41,4 +44,9 @@ void __show_mem(unsigned int filter, nodemask_t *nodemask, int max_zone_idx)
+ #ifdef CONFIG_MEMORY_FAILURE
+ 	printk("%lu pages hwpoisoned\n", atomic_long_read(&num_poisoned_pages));
+ #endif
++#ifdef CONFIG_MEMORY_BALLOON
++	printk("Balloon InflatedTotal:%ldkB InflatedFree:%ldkB\n",
++		atomic_long_read(&mem_balloon_inflated_total_kb),
++		atomic_long_read(&mem_balloon_inflated_free_kb));
++#endif
+
+The __show_mem() is called by below.
+
+include/linux/mm.h|2597| <<show_mem>> __show_mem(flags, nodemask, MAX_NR_ZONES - 1);
+mm/oom_kill.c|464| <<dump_header>> __show_mem(SHOW_MEM_FILTER_NODES, oc->nodemask, gfp_zone(oc->gfp_mask));
+mm/page_alloc.c|4336| <<warn_alloc_show_mem>> __show_mem(filter, nodemask, gfp_zone(gfp_mask));
+
+The show_mem() is called by below.
+
+arch/powerpc/xmon/xmon.c|1089| <<cmds>> show_mem(0, NULL);
+drivers/tty/sysrq.c|345| <<sysrq_handle_showmem>> show_mem(0, NULL);
+drivers/tty/vt/keyboard.c|609| <<fn_show_mem>> show_mem(0, NULL);
+init/initramfs.c|66| <<panic_show_mem>> show_mem(0, NULL);
+kernel/panic.c|190| <<panic_print_sys_info>> show_mem(0, NULL);
+
+----------------------
+
+[RFC PATCH v5 5/8] drivers: virtio: balloon - report inflated memory
+
+Account balloon change in virtio-balloon.
+
+diff --git a/drivers/virtio/virtio_balloon.c b/drivers/virtio/virtio_balloon.c
+index d0c27c680721..e9c3642eef17 100644
+--- a/drivers/virtio/virtio_balloon.c
++++ b/drivers/virtio/virtio_balloon.c
+@@ -450,10 +450,15 @@ static void virtballoon_changed(struct virtio_device *vdev)
+ static void update_balloon_size(struct virtio_balloon *vb)
+ {
+ 	u32 actual = vb->num_pages;
++	long inflated_kb = actual << (VIRTIO_BALLOON_PFN_SHIFT - 10);
+
+ 	/* Legacy balloon config space is LE, unlike all other devices. */
+ 	virtio_cwrite_le(vb->vdev, struct virtio_balloon_config, actual,
+ 			 &actual);
++	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_DEFLATE_ON_OOM))
++		balloon_set_inflated_free(inflated_kb);
++	else
++		balloon_set_inflated_total(inflated_kb);
+ }
+
+----------------------
+
+[RFC PATCH v5 6/8] drivers: vmware: balloon - report inflated memory
+
+Account balloon change in vmware.
+
+diff --git a/drivers/misc/vmw_balloon.c b/drivers/misc/vmw_balloon.c
+index 91d4d2a285c5..3bfd845898f5 100644
+--- a/drivers/misc/vmw_balloon.c
++++ b/drivers/misc/vmw_balloon.c
+@@ -1507,6 +1507,7 @@ static void vmballoon_work(struct work_struct *work)
+ 	queue_delayed_work(system_freezable_wq,
+ 			   dwork, round_jiffies_relative(HZ));
+ 
++	balloon_set_inflated_free(atomic64_read(&b->size) << 2);
+ }
+
+----------------------
+
+[RFC PATCH v5 7/8] drivers: hyperv: balloon - report inflated memory
+
+[RFC PATCH v5 8/8] documentation: create a document about how balloon drivers operate

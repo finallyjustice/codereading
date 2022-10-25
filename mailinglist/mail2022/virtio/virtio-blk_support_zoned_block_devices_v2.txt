@@ -1,0 +1,82 @@
+[PATCH v2 0/2] virtio-blk: support zoned block devices
+
+... from Dmitry Fomichev <dmitry.fomichev@wdc.com> ...
+
+https://lore.kernel.org/all/20221016034127.330942-1-dmitry.fomichev@wdc.com/
+
+The use case:
+
+The host side disk supports ZBDs while the virtio-blk at VM side does not. As a
+result, this will not benefit from ZBDs.
+
+The host-managed drive is recognized by the virtio driver as a regular,
+non-zoned drive that will operate erroneously under the most common write
+workloads. Host-aware ZBDs are currently usable, but their performance may not
+be optimal because the driver can only see them as non-zoned block devices.
+
+To fix this, the virtio-blk protocol needs to be extended to add the
+capabilities to convey the zone characteristics of ZBDs at the device side to
+the driver and to provide support for ZBD-specific commands - Report Zones,
+four zone operations (Open, Close, Finish and Reset) and (optionally) Zone
+Append.
+
+The required virtio-blk protocol extensions are currently under review at OASIS
+Technical Committee and the specification patch is linked at
+
+https://github.com/oasis-tcs/virtio-spec/issues/143 .
+
+The QEMU zoned device code that implements these protocol extensions has been
+developed by Sam Li, an intern, as a part of Outreachy community mentorship
+initiative. The latest version of the QEMU patchset can be found here:
+
+https://lists.gnu.org/archive/html/qemu-devel/2022-09/msg01469.html
+
+-----------------------------
+
+[PATCH v2 1/2] virtio-blk: use a helper to handle request queuing errors
+
+No functional change. To create a new helper for error handling.
+
+-----------------------------
+
+[PATCH v2 2/2] virtio-blk: add support for zoned block devices
+
+The core ideas are:
+
+1. Add below commands mapping in virtblk_setup_cmd() when preparing requests.
+
+REQ_OP_ZONE_OPEN      : VIRTIO_BLK_T_ZONE_OPEN;
+REQ_OP_ZONE_CLOSE     : VIRTIO_BLK_T_ZONE_CLOSE;
+REQ_OP_ZONE_FINISH    : VIRTIO_BLK_T_ZONE_FINISH;
+REQ_OP_ZONE_APPEND    : VIRTIO_BLK_T_ZONE_APPEND;
+REQ_OP_ZONE_RESET     : VIRTIO_BLK_T_ZONE_RESET;
+REQ_OP_ZONE_RESET_ALL : VIRTIO_BLK_T_ZONE_RESET_ALL;
+
+
+2. Recalculate req->__sector during completion for REQ_OP_ZONE_APPEND.
+
+ static inline void virtblk_request_done(struct request *req)
+ {
+ 	struct virtblk_req *vbr = blk_mq_rq_to_pdu(req);
++	int status = virtblk_result(vbr->status);
+ 
+ 	virtblk_unmap_data(req, vbr);
+ 	virtblk_cleanup_cmd(req);
+-	blk_mq_end_request(req, virtblk_result(vbr));
++
++	if (req_op(req) == REQ_OP_ZONE_APPEND)
++		req->__sector = le64_to_cpu(vbr->zone_append_in_hdr.append_sector);
++
++	blk_mq_end_request(req, status);
+ }
+
+
+3. Implement virtblk_probe()-->virtblk_probe_zoned_device()
+
+4. Implement block_device_operations.report_zones.
+
+@@ -524,6 +851,7 @@ static const struct block_device_operations virtblk_fops = {
+ 	.owner  	= THIS_MODULE,
+ 	.getgeo		= virtblk_getgeo,
+ 	.free_disk	= virtblk_free_disk,
++	.report_zones	= virtblk_report_zones,

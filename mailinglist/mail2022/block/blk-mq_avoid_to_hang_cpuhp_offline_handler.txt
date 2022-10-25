@@ -1,0 +1,62 @@
+[PATCH] blk-mq: avoid to hang in the cpuhp offline handler
+
+... from Ming Lei <ming.lei@redhat.com> ...
+
+https://lore.kernel.org/all/20220920021724.1841850-1-ming.lei@redhat.com/
+
+The core idea of the patch is to avoid the permanent loop.
+
+There will be deadlock between cpu_write_lock() and cpu_read_lock().
+
+blk_mq_hctx_notify_offline() is waiting for inflight requests, then
+cpu_write_lock() is held since it is cpuhp code path.
+
+Meantime nvme reset grabs dev->shutdown_lock, then calls
+pci_alloc_irq_vectors_affinity()->irq_build_affinity_masks() which is waiting
+for cpu_read_lock().
+
+Meantime nvme_dev_disable() can't move on for handling any io timeout because
+dev->shutdown_lock is held by nvme reset. Then in-flight IO can't be drained by
+blk_mq_hctx_notify_offline()
+
+One real IO deadlock between cpuhp and nvme_reset.
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index c96c8c4f751b..4585985b8537 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -3301,6 +3301,7 @@ static inline bool blk_mq_last_cpu_in_hctx(unsigned int cpu,
+ 	return true;
+ }
+
++#define BLK_MQ_MAX_OFFLINE_WAIT_MSECS 3000
+ static int blk_mq_hctx_notify_offline(unsigned int cpu, struct hlist_node *node)
+ {
+ 	struct blk_mq_hw_ctx *hctx = hlist_entry_safe(node,
+@@ -3326,8 +3327,13 @@ static int blk_mq_hctx_notify_offline(unsigned int cpu, struct hlist_node *node)
+ 	 * frozen and there are no requests.
+ 	 */
+ 	if (percpu_ref_tryget(&hctx->queue->q_usage_counter)) {
+-		while (blk_mq_hctx_has_requests(hctx))
++		unsigned int wait_ms = 0;
++
++		while (blk_mq_hctx_has_requests(hctx) && wait_ms <
++				BLK_MQ_MAX_OFFLINE_WAIT_MSECS) {
+ 			msleep(5);
++			wait_ms += 5;
++		}
+ 		percpu_ref_put(&hctx->queue->q_usage_counter);
+ 	}
+
+
+
+John Garry does not agree.
+
+I don't think that that this is a good idea - that is because often
+drivers cannot safely handle scenario of timeout of an IO which has
+actually completed. NVMe timeout handler may poll for completion, but
+SCSI does not.
+
+Indeed, if we were going to allow the timeout handler handle these
+in-flight IO then there is no point in having this hotplug handler in
+the first place.
