@@ -1,0 +1,135 @@
+[PATCH 0/4] KVM: API to block and resume all running vcpus in a vm
+
+... from Emanuele Giuseppe Esposito <eesposit@redhat.com> ...
+
+https://lore.kernel.org/all/20221022154819.1823133-1-eesposit@redhat.com/
+
+
+The QEMU side implementation:
+
+https://lore.kernel.org/all/20221022154823.1823193-1-eesposit@redhat.com/
+
+
+This patchset adds two APIs:
+
+- KVM_KICK_ALL_RUNNING_VCPUS : stop all running vcpus
+- KVM_RESUME_ALL_KICKED_VCPUS: resume all vcpus
+
+This new API allows the userspace to stop all running vcpus using
+KVM_KICK_ALL_RUNNING_VCPUS ioctl, and resume them with
+KVM_RESUME_ALL_KICKED_VCPUS.  A "running" vcpu is a vcpu that is executing the
+KVM_RUN ioctl.
+
+This serie is especially helpful to userspace hypervisors like QEMU when they
+need to perform operations on memslots without the risk of having a vcpu
+reading them in the meanwhile.  With "memslots operations" we mean grow,
+shrink, merge and split memslots, which are not "atomic" because there is a
+time window between the DELETE memslot operation and the CREATE one.
+Currently, each memslot operation is performed with one or more ioctls.
+
+For example, merging two memslots into one would imply:
+
+DELETE(m1)
+DELETE(m2)
+CREATE(m1+m2)
+
+And a vcpu could attempt to read m2 right after it is deleted, but before the
+new one is created.
+
+Therefore the simplest solution is to pause all vcpus in the kvm side, so that:
+
+- userspace just needs to call the new API before making memslots changes,
+keeping modifications to the minimum
+
+- dirty page updates are also performed when vcpus are blocked, so there is no
+time window between the dirty page ioctl and memslots modifications, since
+vcpus are all stopped.
+
+- no need to modify the existing memslots API
+
+
+-----------------------------------
+
+[PATCH 1/4] linux-headers/linux/kvm.h: introduce kvm_userspace_memory_region_list ioctl
+
+Define KVM_KICK_ALL_RUNNING_VCPUS and KVM_RESUME_ALL_KICKED_VCPUS.
+
+- KVM_KICK_ALL_RUNNING_VCPUS : stop all running vcpus
+- KVM_RESUME_ALL_KICKED_VCPUS: resume all vcpus
+
+-----------------------------------
+
+[PATCH 2/4] KVM: introduce kvm_clear_all_cpus_request
+
+Introduce the API to clear req for all vcpus.
+
++void kvm_clear_all_cpus_request(struct kvm *kvm, unsigned int req)
++{
++	unsigned long i;
++	struct kvm_vcpu *vcpu;
++
++	kvm_for_each_vcpu(i, vcpu, kvm)
++		kvm_clear_request(req, vcpu);
++}
++EXPORT_SYMBOL_GPL(kvm_clear_all_cpus_request);
+
+-----------------------------------
+
+[PATCH 3/4] KVM: introduce memory transaction semaphore
+
+To use memory_transaction to control if all vcpus passed kvm_arch_vcpu_ioctl_run().
+
+@@ -119,6 +119,8 @@ static const struct file_operations stat_fops_per_vm;
+ 
+ static struct file_operations kvm_chardev_ops;
+ 
++static DECLARE_RWSEM(memory_transaction);
++
+ static long kvm_vcpu_ioctl(struct file *file, unsigned int ioctl,
+ 			   unsigned long arg);
+ #ifdef CONFIG_KVM_COMPAT
+@@ -4074,7 +4076,19 @@ static long kvm_vcpu_ioctl(struct file *filp,
+ 				synchronize_rcu();
+ 			put_pid(oldpid);
+ 		}
++		/*
++		 * Notify that a vcpu wants to run, and thus could be reading
++		 * memslots.
++		 * If KVM_KICK_ALL_RUNNING_VCPUS runs afterwards, it will have
++		 * to wait that KVM_RUN exited and up_read() is called.
++		 * If KVM_KICK_ALL_RUNNING_VCPUS already returned but
++		 * KVM_RESUME_ALL_KICKED_VCPUS didn't start yet, then there
++		 * is a request pending for the vcpu that will cause it to
++		 * exit KVM_RUN.
++		 */
++		down_read(&memory_transaction);
+ 		r = kvm_arch_vcpu_ioctl_run(vcpu);
++		up_read(&memory_transaction);
+ 		trace_kvm_userspace_exit(vcpu->run->exit_reason, r);
+ 		break;
+ 	}
+
+-----------------------------------
+
+[PATCH 4/4] KVM: use signals to abort enter_guest/blocking and retry
+
+Do not allow vcpu to into vpcu mode any longer.
+
++	case KVM_KICK_ALL_RUNNING_VCPUS: {
++		/*
++		 * Notify all running vcpus that they have to stop.
++		 * Caught in kvm_arch_vcpu_ioctl_run()
++		 */
++		kvm_make_all_cpus_request(kvm, KVM_REQ_USERSPACE_KICK);
++
++		/*
++		 * Use wr semaphore to wait for all vcpus to exit from KVM_RUN.
++		 */
++		down_write(&memory_transaction);
++		up_write(&memory_transaction);
++		break;
++	}
++	case KVM_RESUME_ALL_KICKED_VCPUS: {
++		/* Remove all requests sent with KVM_KICK_ALL_RUNNING_VCPUS */
++		kvm_clear_all_cpus_request(kvm, KVM_REQ_USERSPACE_KICK);
++		break;
