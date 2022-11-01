@@ -1,17 +1,18 @@
-From 389f762a88d2c8f44fc55417a65dd139c9abf555 Mon Sep 17 00:00:00 2001
+From 71a2f639eb688acb853f95361137e3deebfb85b9 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Mon, 24 Oct 2022 21:38:35 -0700
+Date: Mon, 31 Oct 2022 16:36:01 -0700
 Subject: [PATCH 1/1] qemu for v7.1.0
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
  block/block-backend.c           |   7 +
  hw/i386/acpi-build.c            |  20 +++
+ hw/i386/intel_iommu.c           |  19 +++
  hw/scsi/virtio-scsi-dataplane.c |  70 ++++++++++
  hw/scsi/virtio-scsi.c           |  11 ++
  hw/virtio/virtio-bus.c          |  52 +++++++
  hw/virtio/virtio-pci.c          |  19 +++
- hw/virtio/virtio.c              |   7 +
+ hw/virtio/virtio.c              |  72 ++++++++++
  include/exec/memory.h           |  46 +++++++
  include/hw/core/cpu.h           |  11 ++
  include/hw/virtio/virtio-bus.h  |  21 +++
@@ -26,7 +27,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  util/log.c                      |  29 ++++
  util/qemu-config.c              |   3 +
  util/qemu-option.c              |  29 ++++
- 21 files changed, 674 insertions(+)
+ 22 files changed, 758 insertions(+)
 
 diff --git a/block/block-backend.c b/block/block-backend.c
 index d4a5df2ac..afb5077df 100644
@@ -98,6 +99,50 @@ index 0355bd3dd..76cfcef32 100644
  void acpi_setup(void)
  {
      PCMachineState *pcms = PC_MACHINE(qdev_get_machine());
+diff --git a/hw/i386/intel_iommu.c b/hw/i386/intel_iommu.c
+index 2162394e0..a05f0889f 100644
+--- a/hw/i386/intel_iommu.c
++++ b/hw/i386/intel_iommu.c
+@@ -1590,6 +1590,13 @@ static bool vtd_as_pt_enabled(VTDAddressSpace *as)
+ }
+ 
+ /* Return whether the device is using IOMMU translation. */
++/*
++ * called by:
++ *   - hw/i386/intel_iommu.c|1645| <<vtd_switch_address_space_all>> vtd_switch_address_space(vtd_bus->dev_as[i]);
++ *   - hw/i386/intel_iommu.c|1705| <<vtd_pt_enable_fast_path>> if (vtd_switch_address_space(vtd_as) == false) {
++ *   - hw/i386/intel_iommu.c|1950| <<vtd_context_device_invalidate>> vtd_switch_address_space(vtd_as);
++ *   - hw/i386/intel_iommu.c|3505| <<vtd_find_add_as>> vtd_switch_address_space(vtd_dev_as);
++ */
+ static bool vtd_switch_address_space(VTDAddressSpace *as)
+ {
+     bool use_iommu;
+@@ -3425,6 +3432,13 @@ static const MemoryRegionOps vtd_mem_ir_ops = {
+     },
+ };
+ 
++/*
++ * called by:
++ *   - hw/i386/intel_iommu.c|3798| <<vtd_host_dma_iommu>> vtd_as = vtd_find_add_as(s, bus, devfn);
++ *
++ * 注释: Find the VTD Address space associated with the given bus pointer,
++ * create a new one if none exists
++ */
+ VTDAddressSpace *vtd_find_add_as(IntelIOMMUState *s, PCIBus *bus, int devfn)
+ {
+     uintptr_t key = (uintptr_t)bus;
+@@ -3788,6 +3802,11 @@ static void vtd_reset(DeviceState *dev)
+     vtd_address_space_refresh_all(s);
+ }
+ 
++/*
++ * called by:
++ *   - hw/i386/intel_iommu.c|3905| <<vtd_realize>> pci_setup_iommu(bus, vtd_host_dma_iommu, dev);
++ *   - hw/i386/intel_iommu.c|3907| <<vtd_realize>> x86ms->ioapic_as = vtd_host_dma_iommu(bus, s, Q35_PSEUDO_DEVFN_IOAPIC);
++ */
+ static AddressSpace *vtd_host_dma_iommu(PCIBus *bus, void *opaque, int devfn)
+ {
+     IntelIOMMUState *s = opaque;
 diff --git a/hw/scsi/virtio-scsi-dataplane.c b/hw/scsi/virtio-scsi-dataplane.c
 index 20bb91766..1927c9600 100644
 --- a/hw/scsi/virtio-scsi-dataplane.c
@@ -395,10 +440,114 @@ index a50c5a57d..01ae42b78 100644
                                            false, n, notifier);
              }
 diff --git a/hw/virtio/virtio.c b/hw/virtio/virtio.c
-index 5d607aeaa..d021275f9 100644
+index 5d607aeaa..2ae295558 100644
 --- a/hw/virtio/virtio.c
 +++ b/hw/virtio/virtio.c
-@@ -3597,6 +3597,13 @@ void virtio_queue_aio_attach_host_notifier_no_poll(VirtQueue *vq, AioContext *ct
+@@ -101,10 +101,34 @@ struct VirtQueue
+ 
+     /* Next head to pop */
+     uint16_t last_avail_idx;
++    /*
++     * 在以下使用VirtQueue->last_avail_wrap_counter:
++     *   - w/virtio/virtio.c|2697| <<global>> VMSTATE_BOOL(last_avail_wrap_counter, struct VirtQueue),
++     *   - hw/virtio/virtio.c|694| <<virtio_queue_packed_empty_rcu>> return !is_desc_avail(desc.flags, vq->last_avail_wrap_counter);
++     *   - hw/virtio/virtio.c|762| <<virtqueue_packed_rewind>> vq->last_avail_wrap_counter ^= 1;
++     *   - hw/virtio/virtio.c|1182| <<virtqueue_packed_get_avail_bytes>> wrap_counter = vq->last_avail_wrap_counter;
++     *   - hw/virtio/virtio.c|1706| <<virtqueue_packed_pop>> vq->last_avail_wrap_counter ^= 1;
++     *   - hw/virtio/virtio.c|1710| <<virtqueue_packed_pop>> vq->shadow_avail_wrap_counter = vq->last_avail_wrap_counter;
++     *   - hw/virtio/virtio.c|1764| <<virtqueue_packed_drop_all>> if (!is_desc_avail(desc.flags, vq->last_avail_wrap_counter)) {
++     *   - hw/virtio/virtio.c|1782| <<virtqueue_packed_drop_all>> vq->last_avail_wrap_counter ^= 1;
++     *   - hw/virtio/virtio.c|2059| <<virtio_reset>> vdev->vq[i].last_avail_wrap_counter = true;
++     *   - hw/virtio/virtio.c|3174| <<virtio_load>> vdev->vq[i].last_avail_wrap_counter;
++     *   - hw/virtio/virtio.c|3400| <<virtio_queue_packed_get_last_avail_idx>> avail |= ((uint16_t)vdev->vq[n].last_avail_wrap_counter) << 15;
++     *   - hw/virtio/virtio.c|3429| <<virtio_queue_packed_set_last_avail_idx>> vq->last_avail_wrap_counter =
++     */
+     bool last_avail_wrap_counter;
+ 
+     /* Last avail_idx read from VQ. */
+     uint16_t shadow_avail_idx;
++    /*
++     * 在以下使用VirtQueue->shadow_avail_wrap_counter:
++     *   - hw/virtio/virtio.c|523| <<virtio_queue_packed_set_notification>> off_wrap = vq->shadow_avail_idx | vq->shadow_avail_wrap_counter << 15;
++     *   - hw/virtio/virtio.c|1278| <<virtqueue_packed_get_avail_bytes>> vq->shadow_avail_wrap_counter = wrap_counter;
++     *   - hw/virtio/virtio.c|1725| <<virtqueue_packed_pop>> vq->shadow_avail_wrap_counter = vq->last_avail_wrap_counter;
++     *   - hw/virtio/virtio.c|2075| <<virtio_reset>> vdev->vq[i].shadow_avail_wrap_counter = true;
++     *   - hw/virtio/virtio.c|3188| <<virtio_load>> vdev->vq[i].shadow_avail_wrap_counter = vdev->vq[i].last_avail_wrap_counter;
++     *   - hw/virtio/virtio.c|3445| <<virtio_queue_packed_set_last_avail_idx>> vq->shadow_avail_wrap_counter = !!(idx & 0x8000);
++     */
+     bool shadow_avail_wrap_counter;
+ 
+     uint16_t used_idx;
+@@ -488,6 +512,10 @@ static void virtio_queue_split_set_notification(VirtQueue *vq, int enable)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - hw/virtio/virtio.c|562| <<virtio_queue_set_notification>> virtio_queue_packed_set_notification(vq, enable);
++ */
+ static void virtio_queue_packed_set_notification(VirtQueue *vq, int enable)
+ {
+     uint16_t off_wrap;
+@@ -502,6 +530,10 @@ static void virtio_queue_packed_set_notification(VirtQueue *vq, int enable)
+ 
+     vring_packed_event_read(vq->vdev, &caches->used, &e);
+ 
++    /*
++     * disable: 设置VRING_PACKED_EVENT_FLAG_DISABLE
++     * enable:  设置VRING_PACKED_EVENT_FLAG_DESC或者VRING_PACKED_EVENT_FLAG_ENABLE
++     */
+     if (!enable) {
+         e.flags = VRING_PACKED_EVENT_FLAG_DISABLE;
+     } else if (virtio_vdev_has_feature(vq->vdev, VIRTIO_RING_F_EVENT_IDX)) {
+@@ -526,6 +558,35 @@ bool virtio_queue_get_notification(VirtQueue *vq)
+     return vq->notification;
+ }
+ 
++/*
++ * called by:
++ *   - hw/block/virtio-blk.c|782| <<virtio_blk_handle_vq>> virtio_queue_set_notification(vq, 0);
++ *   - hw/block/virtio-blk.c|794| <<virtio_blk_handle_vq>> virtio_queue_set_notification(vq, 1);
++ *   - hw/net/virtio-net.c|414| <<virtio_net_set_status>> virtio_queue_set_notification(q->tx_vq, 1);
++ *   - hw/net/virtio-net.c|1542| <<virtio_net_has_buffers>> virtio_queue_set_notification(q->rx_vq, 1);
++ *   - hw/net/virtio-net.c|1555| <<virtio_net_has_buffers>> virtio_queue_set_notification(q->rx_vq, 0);
++ *   - hw/net/virtio-net.c|2535| <<virtio_net_tx_complete>> virtio_queue_set_notification(q->tx_vq, 1);
++ *   - hw/net/virtio-net.c|2552| <<virtio_net_flush_tx>> virtio_queue_set_notification(q->tx_vq, 0);
++ *   - hw/net/virtio-net.c|2618| <<virtio_net_flush_tx>> virtio_queue_set_notification(q->tx_vq, 0);
++ *   - hw/net/virtio-net.c|2652| <<virtio_net_handle_tx_timer>> virtio_queue_set_notification(vq, 1);
++ *   - hw/net/virtio-net.c|2662| <<virtio_net_handle_tx_timer>> virtio_queue_set_notification(vq, 0);
++ *   - hw/net/virtio-net.c|2684| <<virtio_net_handle_tx_bh>> virtio_queue_set_notification(vq, 0);
++ *   - hw/net/virtio-net.c|2707| <<virtio_net_tx_timer>> virtio_queue_set_notification(q->tx_vq, 1);
++ *   - hw/net/virtio-net.c|2749| <<virtio_net_tx_bh>> virtio_queue_set_notification(q->tx_vq, 1);
++ *   - hw/net/virtio-net.c|2754| <<virtio_net_tx_bh>> virtio_queue_set_notification(q->tx_vq, 0);
++ *   - hw/scsi/virtio-scsi.c|735| <<virtio_scsi_handle_cmd_vq>> virtio_queue_set_notification(vq, 0);
++ *   - hw/scsi/virtio-scsi.c|756| <<virtio_scsi_handle_cmd_vq>> virtio_queue_set_notification(vq, 1);
++ *   - hw/virtio/vhost-shadow-virtqueue.c|293| <<vhost_handle_guest_kick>> virtio_queue_set_notification(svq->vq, false);
++ *   - hw/virtio/vhost-shadow-virtqueue.c|335| <<vhost_handle_guest_kick>> virtio_queue_set_notification(svq->vq, true);
++ *   - hw/virtio/virtio-balloon.c|563| <<virtio_ballloon_get_free_page_hints>> virtio_queue_set_notification(vq, 0);
++ *   - hw/virtio/virtio-balloon.c|573| <<virtio_ballloon_get_free_page_hints>> virtio_queue_set_notification(vq, 1);
++ *   - hw/virtio/virtio-crypto.c|912| <<virtio_crypto_dataq_bh>> virtio_queue_set_notification(q->dataq, 1);
++ *   - hw/virtio/virtio-crypto.c|919| <<virtio_crypto_dataq_bh>> virtio_queue_set_notification(q->dataq, 0);
++ *   - hw/virtio/virtio-crypto.c|934| <<virtio_crypto_handle_dataq_bh>> virtio_queue_set_notification(vq, 0);
++ *   - hw/virtio/virtio.c|1782| <<virtqueue_packed_drop_all>> virtio_queue_set_notification(vq, 0);
++ *   - hw/virtio/virtio.c|3578| <<virtio_queue_host_notifier_aio_poll_begin>> virtio_queue_set_notification(vq, 0);
++ *   - hw/virtio/virtio.c|3601| <<virtio_queue_host_notifier_aio_poll_end>> virtio_queue_set_notification(vq, 1);
++ */
+ void virtio_queue_set_notification(VirtQueue *vq, int enable)
+ {
+     vq->notification = enable;
+@@ -1585,6 +1646,10 @@ err_undo_map:
+     goto done;
+ }
+ 
++/*
++ * called by:
++ *   - hw/virtio/virtio.c|1745| <<virtqueue_pop>> return virtqueue_packed_pop(vq, sz);
++ */
+ static void *virtqueue_packed_pop(VirtQueue *vq, size_t sz)
+ {
+     unsigned int i, max;
+@@ -3597,6 +3662,13 @@ void virtio_queue_aio_attach_host_notifier_no_poll(VirtQueue *vq, AioContext *ct
                             NULL, NULL);
  }
  
