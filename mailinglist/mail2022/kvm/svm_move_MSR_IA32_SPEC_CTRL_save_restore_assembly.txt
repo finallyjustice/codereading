@@ -1,0 +1,103 @@
+[RFC PATCH 0/7] KVM: SVM: move MSR_IA32_SPEC_CTRL save/restore to assembly
+
+... from Paolo Bonzini <pbonzini@redhat.com> ...
+
+https://lore.kernel.org/kvm/20221028230723.3254250-1-pbonzini@redhat.com/
+
+This patchset is to move all the SPEC_CTRL handling to assembly code. Currently
+it is in C as below.
+
+1. At line 4008-4009, configure the spec ctrl registers for VM.
+
+2. Enter into VM at line 4011.
+
+3. Conditionally obtain the change of spec ctrl registers by VM side, at line 4028-4030.
+
+4. At 4035-4036, restore the config at host side.
+
+3950 static __no_kcsan fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
+3951 {
+... ...
+4002         /*
+4003          * If this vCPU has touched SPEC_CTRL, restore the guest's value if
+4004          * it's non-zero. Since vmentry is serialising on affected CPUs, there
+4005          * is no need to worry about the conditional branch over the wrmsr
+4006          * being speculatively taken.
+4007          */
+4008         if (!static_cpu_has(X86_FEATURE_V_SPEC_CTRL))
+4009                 x86_spec_ctrl_set_guest(svm->spec_ctrl, svm->virt_spec_ctrl);
+4010 
+4011         svm_vcpu_enter_exit(vcpu);
+4012 
+4013         /*
+4014          * We do not use IBRS in the kernel. If this vCPU has used the
+4015          * SPEC_CTRL MSR it may have left it on; save the value and
+4016          * turn it off. This is much more efficient than blindly adding
+4017          * it to the atomic save/restore list. Especially as the former
+4018          * (Saving guest MSRs on vmexit) doesn't even exist in KVM.
+4019          *
+4020          * For non-nested case:
+4021          * If the L01 MSR bitmap does not intercept the MSR, then we need to
+4022          * save it.
+4023          *
+4024          * For nested case:
+4025          * If the L02 MSR bitmap does not intercept the MSR, then we need to
+4026          * save it.
+4027          */
+4028         if (!static_cpu_has(X86_FEATURE_V_SPEC_CTRL) &&
+4029             unlikely(!msr_write_intercepted(vcpu, MSR_IA32_SPEC_CTRL)))
+4030                 svm->spec_ctrl = native_read_msr(MSR_IA32_SPEC_CTRL);
+4031 
+4032         if (!sev_es_guest(vcpu->kvm))
+4033                 reload_tss(vcpu);
+4034 
+4035         if (!static_cpu_has(X86_FEATURE_V_SPEC_CTRL))
+4036                 x86_spec_ctrl_restore_host(svm->spec_ctrl, svm->virt_spec_ctrl);
+
+-------------------------
+
+[PATCH 1/7] KVM: VMX: remove regs argument of __vmx_vcpu_run
+
+Remove the parameter of "vcpu->arch.regs" from __vmx_vcpu_run().
+
+No functional change.
+
+-------------------------
+
+[PATCH 2/7] KVM: VMX: more cleanups to __vmx_vcpu_run
+
+Change the assembly code to change which registers are used.
+
+-------------------------
+
+[PATCH 3/7] KVM: SVM: extract VMCB accessors to a new file
+
+Having inline functions confuses the compilation of asm-offsets.c,
+which cannot find kvm_cache_regs.h because arch/x86/kvm is not in
+asm-offset.c's include path.
+
+Move many functions from arch/x86/kvm/svm/svm.h to arch/x86/kvm/svm/vmcb.h.
+
+-------------------------
+
+[PATCH 4/7] KVM: SVM: replace argument of __svm_vcpu_run with vcpu_svm
+
+Similar to the 1st patch, use "struct vcpu_svm *svm" as arg.
+
+-void __svm_vcpu_run(unsigned long vmcb_pa, unsigned long *regs);
++void __svm_vcpu_run(unsigned long vmcb_pa, struct vcpu_svm *svm);
+
+-------------------------
+
+[PATCH 5/7] KVM: SVM: adjust register allocation for __svm_vcpu_run
+
+Similar to the 2nd patch.
+
+In preparation for moving SPEC_CTRL access to __svm_vcpu_run, keep the pointer
+to the struct vcpu_svm in %rdi, which is not used by rdmsr/wrmsr.
+
+-------------------------
+
+[PATCH 6/7] KVM: SVM: move MSR_IA32_SPEC_CTRL save/restore to assembly
+
+-------------------------
