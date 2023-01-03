@@ -1,0 +1,74 @@
+[PATCH v2] virtio_net: Fix probe failed when modprobe virtio_net
+
+... from Li Zetao <lizetao1@huawei.com> ...
+
+https://lore.kernel.org/all/20221122150046.3910638-1-lizetao1@huawei.com/
+
+This is how to reproduce the issue.
+
+1. Suppose there is error when register_netdevice(). Unfortunately, the
+vp_modern_set_queue_enable() has already enabled the queues. The error handler
+of the error returned by register_netdevice() does not reset the queue to
+disable queues.
+
+virtnet_probe()
+-> init_vqs()
+   -> virtnet_find_vqs()
+      -> virtio_find_vqs_ctx()
+         -> vdev->config->find_vqs = vp_modern_find_vqs()
+            -> vp_modern_set_queue_enable()
+            -> register_netdevice()
+
+594 void vp_modern_set_queue_enable(struct virtio_pci_modern_device *mdev,
+595                                 u16 index, bool enable)
+596 {
+597         vp_iowrite16(index, &mdev->common->queue_select);
+598         vp_iowrite16(enable, &mdev->common->queue_enable);
+599 }
+600 EXPORT_SYMBOL_GPL(vp_modern_set_queue_enable);
+
+
+2. When we probe the 2nd time, since the queues are already enabled (line 323),
+the virtnet_probe-->setup_vq() returns -ENOENT.
+
+virtnet_probe()
+-> init_vqs()
+   -> virtnet_find_vqs()
+      -> virtio_find_vqs_ctx()
+         -> vdev->config->find_vqs = vp_modern_find_vqs()
+            -> vp_find_vqs()
+               -> vp_find_vqs_msix()
+                  -> vp_setup_vq()
+                     -> vp_dev->setup_vq = setup_vq()
+
+304 static struct virtqueue *setup_vq(struct virtio_pci_device *vp_dev,
+305                                   struct virtio_pci_vq_info *info,
+306                                   unsigned int index,
+307                                   void (*callback)(struct virtqueue *vq),
+308                                   const char *name,
+309                                   bool ctx,
+310                                   u16 msix_vec)
+311 {
+312 
+313         struct virtio_pci_modern_device *mdev = &vp_dev->mdev;
+314         struct virtqueue *vq;
+315         u16 num;
+316         int err;
+317 
+318         if (index >= vp_modern_get_num_queues(mdev))
+319                 return ERR_PTR(-ENOENT);
+320 
+321         /* Check if queue is either not available or already active. */
+322         num = vp_modern_get_queue_size(mdev, index);
+323         if (!num || vp_modern_get_queue_enable(mdev, index))
+324                 return ERR_PTR(-ENOENT);
+325 
+326         if (num & (num - 1)) {
+327                 dev_warn(&vp_dev->pci_dev->dev, "bad queue size %u", num);
+328                 return ERR_PTR(-EINVAL);
+329         }
+
+Fix it by reset virtio device on error handling path. This makes error handling
+follow the same order as normal device cleanup in virtnet_remove() which does:
+unregister, destroy failover, then reset. And that flow is better tested than
+error handling so we can be reasonably sure it works well.
