@@ -1,0 +1,211 @@
+
+以前给virtualization的list发过下面的邮件.
+
+Hello,
+
+May I have a question on vq->signalled_used and vq->signalled_used_valid?
+
+According to comments at line 2395, "If the driver never bothers to signal in a
+very long while, used index might wrap around. If that happens, invalidate
+signalled_used index we stored."
+
+(BTW, I see QEMU-7.0 uses int16_t at something like line 2399 and I am thinking
+about why)
+
+2372 static int __vhost_add_used_n(struct vhost_virtqueue *vq,
+2373                             struct vring_used_elem *heads,
+2374                             unsigned count)
+2375 {
+2376         vring_used_elem_t __user *used;
+2377         u16 old, new;
+2378         int start;
+2379
+2380         start = vq->last_used_idx & (vq->num - 1);
+2381         used = vq->used->ring + start;
+2382         if (vhost_put_used(vq, heads, start, count)) {
+2383                 vq_err(vq, "Failed to write used");
+2384                 return -EFAULT;
+2385         }
+2386         if (unlikely(vq->log_used)) {
+2387                 /* Make sure data is seen before log. */
+2388                 smp_wmb();
+2389                 /* Log used ring entry write. */
+2390                 log_used(vq, ((void __user *)used - (void __user *)vq->used),
+2391                          count * sizeof *used);
+2392         }
+2393         old = vq->last_used_idx;
+2394         new = (vq->last_used_idx += count);
+2395         /* If the driver never bothers to signal in a very long while,
+2396          * used index might wrap around. If that happens, invalidate
+2397          * signalled_used index we stored. TODO: make sure driver
+2398          * signals at least once in 2^16 and remove this. */
+2399         if (unlikely((u16)(new - vq->signalled_used) < (u16)(new - old)))
+2400                 vq->signalled_used_valid = false;
+2401         return 0;
+2402 }
+
+However, although the vhost signals the frontend virtio *conditionally*, the
+vq->signalled_used is always updated at the end of vhost_notify() at line 2465,
+no matter whether line 2475 returns true/false.
+
+I did some tests but never see line 2399 returns true.
+
+2441 static bool vhost_notify(struct vhost_dev *dev, struct vhost_virtqueue *vq)
+2442 {
+2443         __u16 old, new;
+2444         __virtio16 event;
+2445         bool v;
+2446         /* Flush out used index updates. This is paired
+2447          * with the barrier that the Guest executes when enabling
+2448          * interrupts. */
+2449         smp_mb();
+2450
+2451         if (vhost_has_feature(vq, VIRTIO_F_NOTIFY_ON_EMPTY) &&
+2452             unlikely(vq->avail_idx == vq->last_avail_idx))
+2453                 return true;
+2454
+2455         if (!vhost_has_feature(vq, VIRTIO_RING_F_EVENT_IDX)) {
+2456                 __virtio16 flags;
+2457                 if (vhost_get_avail_flags(vq, &flags)) {
+2458                         vq_err(vq, "Failed to get flags");
+2459                         return true;
+2460                 }
+2461                 return !(flags & cpu_to_vhost16(vq,
+VRING_AVAIL_F_NO_INTERRUPT));
+2462         }
+2463         old = vq->signalled_used;
+2464         v = vq->signalled_used_valid;
+2465         new = vq->signalled_used = vq->last_used_idx;
+2466         vq->signalled_used_valid = true;
+2467
+2468         if (unlikely(!v))
+2469                 return true;
+2470
+2471         if (vhost_get_used_event(vq, &event)) {
+2472                 vq_err(vq, "Failed to get used event idx");
+2473                 return true;
+2474         }
+2475         return vring_need_event(vhost16_to_cpu(vq, event), new, old);
+2476 }
+
+
+Therefore, would you mind helping me understand what does "If the driver never
+bothers to signal in a very long while" indicate?
+
+How the vhost driver "never bothers to signal in a very long while" as
+vq->signalled_used is always updated?
+
+About the naming, why not use "vq->added_used" because the value is always
+updated after something is added to the vring buffer?
+
+Perhaps this is a silly question. Sorry that currently I am stuck on it :)
+
+Thank you very much!
+
+===================================
+
+感觉signalled_used和signalled_used_valid的使用有问题.
+
+以linux-6.0的vhost-scsi为例子.
+
+1. vhost_scsi_complete_cmd_work()会在一个list loop里调用vhost_add_used(). 最终调用__vhost_add_used_n().
+
+2. 在__vhost_add_used_n()会增加vq->last_used_idx.
+
+3. 我认为line 2399-2400永远不会执行.
+
+4. 因为可以调用多次__vhost_add_used_n(), 所以在以下决定是不是要signal.
+
+vhost_scsi_complete_cmd_work()
+-> vhost_add_used()
+   -> vhost_add_used_n()
+      -> __vhost_add_used_n()
+-> vhost_signal()
+   -> vhost_notify()
+
+2372 static int __vhost_add_used_n(struct vhost_virtqueue *vq,
+2373                             struct vring_used_elem *heads,
+2374                             unsigned count)
+2375 {
+2376         vring_used_elem_t __user *used;
+2377         u16 old, new;
+2378         int start;
+2379
+2380         start = vq->last_used_idx & (vq->num - 1);
+2381         used = vq->used->ring + start;
+2382         if (vhost_put_used(vq, heads, start, count)) {
+2383                 vq_err(vq, "Failed to write used");
+2384                 return -EFAULT;
+2385         }
+2386         if (unlikely(vq->log_used)) {
+2387                 /* Make sure data is seen before log. */
+2388                 smp_wmb();
+2389                 /* Log used ring entry write. */
+2390                 log_used(vq, ((void __user *)used - (void __user *)vq->used),
+2391                          count * sizeof *used);
+2392         }
+2393         old = vq->last_used_idx;
+2394         new = (vq->last_used_idx += count);
+2395         /* If the driver never bothers to signal in a very long while,
+2396          * used index might wrap around. If that happens, invalidate
+2397          * signalled_used index we stored. TODO: make sure driver
+2398          * signals at least once in 2^16 and remove this. */
+2399         if (unlikely((u16)(new - vq->signalled_used) < (u16)(new - old)))
+2400                 vq->signalled_used_valid = false;
+2401         return 0;
+2402 }
+
+因为前面__vhost_add_used_n()已经在line 2382把ring的used index更新了, 所以frontend要么还在处理旧的,要们已经到这个used index了.
+
+line 2475实际是: new - event <= new - old
+
+核心思想是: 如果frontend比较慢(event), 就不用inject irq, 否则要inject.
+
+也就是说, 如果frontend处理到的"等于或者大于"上一次的virtual inject的last used, 则要inject一个irq.
+否则不用, 只是一个virtual inject.
+
+2441 static bool vhost_notify(struct vhost_dev *dev, struct vhost_virtqueue *vq)
+2442 {
+2443         __u16 old, new;
+2444         __virtio16 event;
+2445         bool v;
+2446         /* Flush out used index updates. This is paired
+2447          * with the barrier that the Guest executes when enabling
+2448          * interrupts. */
+2449         smp_mb();
+2450
+2451         if (vhost_has_feature(vq, VIRTIO_F_NOTIFY_ON_EMPTY) &&
+2452             unlikely(vq->avail_idx == vq->last_avail_idx))
+2453                 return true;
+2454
+2455         if (!vhost_has_feature(vq, VIRTIO_RING_F_EVENT_IDX)) {
+2456                 __virtio16 flags;
+2457                 if (vhost_get_avail_flags(vq, &flags)) {
+2458                         vq_err(vq, "Failed to get flags");
+2459                         return true;
+2460                 }
+2461                 return !(flags & cpu_to_vhost16(vq, VRING_AVAIL_F_NO_INTERRUPT));
+2462         }
+2463         old = vq->signalled_used;
+2464         v = vq->signalled_used_valid;
+2465         new = vq->signalled_used = vq->last_used_idx;
+2466         vq->signalled_used_valid = true;
+2467
+2468         if (unlikely(!v))
+2469                 return true;
+2470
+2471         if (vhost_get_used_event(vq, &event)) {
+2472                 vq_err(vq, "Failed to get used event idx");
+2473                 return true;
+2474         }
+2475         return vring_need_event(vhost16_to_cpu(vq, event), new, old);
+2476 }
+
+
+=============================
+
+vhost_virtqueue->last_used_idx应该是说下一个要用的 (一开始是0)
+
+VIRTIO_RING_F_EVENT_IDX:
+  后端用了used ring的最后一个元素,告诉前端驱动后端处理到哪个avail ring上的元素了,
+  同时前端使用avail ring的最后一个元素告诉后端,处理到那个used ring了

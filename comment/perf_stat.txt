@@ -1,0 +1,140 @@
+
+
+# perf --debug perf-event-open stat -v -e cycles  ./perfbug 10000
+
+cmd_stat()
+-> run_perf_stat()
+   -> create_perf_stat_counter()
+      -> evsel__open_per_thread()
+         -> evsel__open()
+            -> evsel__open_cpu()
+
+
+2080                         pr_debug2_peo("sys_perf_event_open: pid %d  cpu %d  group_fd %d  flags %#lx",
+2081                                 pid, perf_cpu_map__cpu(cpus, idx).cpu, group_fd, evsel->open_flags);
+2082 
+2083                         fd = sys_perf_event_open(&evsel->core.attr, pid,
+2084                                                 perf_cpu_map__cpu(cpus, idx).cpu,
+2085                                                 group_fd, evsel->open_flags);
+
+
+在__run_perf_stat()中打印下面的.
+
+orabug: __run_perf_stat() name=cycles, type=0, size=128, config=0x0, period=0
+
+
+------------------------------------------------------------
+perf_event_attr:
+  size                             128
+  sample_type                      IDENTIFIER
+  read_format                      TOTAL_TIME_ENABLED|TOTAL_TIME_RUNNING
+  disabled                         1
+  inherit                          1
+  enable_on_exec                   1
+  exclude_guest                    1
+------------------------------------------------------------
+sys_perf_event_open: pid 10002  cpu -1  group_fd -1  flags 0x8 = 3
+
+
+在line 1029的wait4()等待program的完成.
+
+1012         err = enable_counters();
+1013         if (err)
+1014                 return -1;
+1015
+1016         /* Exec the command, if any */
+1017         if (forks)
+1018                 evlist__start_workload(evsel_list);
+1019
+1020         t0 = rdclock();
+1021         clock_gettime(CLOCK_MONOTONIC, &ref_time);
+1022
+1023         if (forks) {
+1024                 if (interval || timeout || evlist__ctlfd_initialized(evsel_list))
+1025                         status = dispatch_events(forks, timeout, interval, &times);
+1026                 if (child_pid != -1) {
+1027                         if (timeout)
+1028                                 kill(child_pid, SIGTERM);
+1029                         wait4(child_pid, &status, 0, &stat_config.ru_data);
+1030                 }
+1031
+1032                 if (workload_exec_errno) {
+1033                         const char *emsg = str_error_r(workload_exec_errno, msg, sizeof(msg));
+1034                         pr_err("Workload failed: %s\n", emsg);
+1035                         return -1;
+1036                 }
+1037
+1038                 if (WIFSIGNALED(status))
+1039                         psignal(WTERMSIG(status), argv[0]);
+1040         } else {
+1041                 status = dispatch_events(forks, timeout, interval, &times);
+1042         }
+1043
+1044         disable_counters();
+
+
+
+结果""在line 1016的aggr->val
+
+1009 static void counter_aggr_cb(struct perf_stat_config *config __maybe_unused,
+1010                             struct evsel *counter, void *data,
+1011                             bool first __maybe_unused)
+1012 {
+1013         struct caggr_data *cd = data;
+1014         struct perf_counts_values *aggr = &counter->counts->aggr;
+1015
+1016         cd->avg += aggr->val;
+1017         cd->avg_enabled += aggr->ena;
+1018         cd->avg_running += aggr->run;
+1019 }
+
+1025 static void print_counter_aggr(struct perf_stat_config *config,
+1026                                struct evsel *counter, char *prefix)
+1027 {
+1028         bool metric_only = config->metric_only;
+1029         FILE *output = config->output;
+1030         double uval;
+1031         struct caggr_data cd = { .avg = 0.0 };
+1032
+1033         if (!collect_data(config, counter, counter_aggr_cb, &cd))
+1034                 return;
+1035
+1036         if (prefix && !metric_only)
+1037                 fprintf(output, "%s", prefix);
+1038
+1039         uval = cd.avg * counter->scale;
+1040         printout(config, aggr_cpu_id__empty(), 0, counter, uval, prefix, cd.avg_running,
+1041                  cd.avg_enabled, cd.avg, &rt_stat);
+1042         if (!metric_only)
+1043                 fprintf(output, "\n");
+1044 }
+
+
+数据是通过read_counters()中在perf_counts(counter->counts, idx, thread)读出的.
+实际是(struct perf_counts_values *) &counter->counts->values->contents[0 * counter->counts->values->row_size + 0 * counter->counts->values->entry_size];
+
+line 433.
+
+420 static int process_counter_maps(struct perf_stat_config *config,
+421                                 struct evsel *counter)
+422 {
+423         int nthreads = perf_thread_map__nr(counter->core.threads);
+424         int ncpus = evsel__nr_cpus(counter);
+425         int idx, thread;
+426
+427         if (counter->core.system_wide)
+428                 nthreads = 1;
+429
+430         for (thread = 0; thread < nthreads; thread++) {
+431                 for (idx = 0; idx < ncpus; idx++) {
+432                         if (process_counter_values(config, counter, idx, thread,
+433                                                    perf_counts(counter->counts, idx, thread)))
+434                                 return -1;
+435                 }
+436         }
+437
+438         return 0;
+439 }
+
+
+分配xyarray: evlist__alloc_stats

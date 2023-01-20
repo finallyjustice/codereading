@@ -1,0 +1,80 @@
+KVM: x86/mmu: Fix race condition in direct_page_fault
+
+... from Kazuki Takiguchi <takiguchi.kazuki171@gmail.com> ...
+
+https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=47b0c2e4c220f2251fd8dcfbb44479819c715e15
+
+This is a CVE that running L2 VM on top of L1 VM may trigger KVM memory race
+issue.
+
+A race condition in the x86 KVM subsystem in the Linux kernel through 6.1-rc6
+allows guest OS users to cause a denial of service (host OS crash or host OS
+memory corruption) when nested virtualisation and the TDP MMU are enabled.
+
+
+There might be below syslog.
+
+pte_list_remove: 00000000cd54fc10 many->many
+------------[ cut here ]------------
+kernel BUG at arch/x86/kvm/mmu/mmu.c:963!
+invalid opcode: 0000 [#1] PREEMPT SMP NOPTI
+RIP: 0010:pte_list_remove.cold+0x16/0x48 [kvm]
+Call Trace:
+ <TASK>
+ drop_spte+0xe0/0x180 [kvm]
+ mmu_page_zap_pte+0x4f/0x140 [kvm]
+ __kvm_mmu_prepare_zap_page+0x62/0x3e0 [kvm]
+ kvm_mmu_zap_oldest_mmu_pages+0x7d/0xf0 [kvm]
+ direct_page_fault+0x3cb/0x9b0 [kvm]
+ kvm_tdp_page_fault+0x2c/0xa0 [kvm]
+ kvm_mmu_page_fault+0x207/0x930 [kvm]
+ npf_interception+0x47/0xb0 [kvm_amd]
+ svm_invoke_exit_handler+0x13c/0x1a0 [kvm_amd]
+ svm_handle_exit+0xfc/0x2c0 [kvm_amd]
+ kvm_arch_vcpu_ioctl_run+0xa79/0x1780 [kvm]
+ kvm_vcpu_ioctl+0x29b/0x6f0 [kvm]
+ __x64_sys_ioctl+0x95/0xd0
+ do_syscall_64+0x5c/0x90
+
+general protection fault, probably for non-canonical address
+0xdead000000000122: 0000 [#1] PREEMPT SMP NOPTI
+RIP: 0010:kvm_mmu_commit_zap_page.part.0+0x4b/0xe0 [kvm]
+Call Trace:
+ <TASK>
+ kvm_mmu_zap_oldest_mmu_pages+0xae/0xf0 [kvm]
+ direct_page_fault+0x3cb/0x9b0 [kvm]
+ kvm_tdp_page_fault+0x2c/0xa0 [kvm]
+ kvm_mmu_page_fault+0x207/0x930 [kvm]
+ npf_interception+0x47/0xb0 [kvm_amd]
+
+
+or below:
+
+[497759.990069] RIP: 0010:__list_add_valid+0xa1/0x110
+... ...
+[497760.091662] Call Trace:
+[497760.094585]  <TASK>
+[497760.097138]  kvm_tdp_mmu_map+0x376/0x510 [kvm]
+[497760.103027]  direct_page_fault+0x2c1/0x350 [kvm]
+[497760.108717]  kvm_mmu_page_fault+0x65/0x1a0 [kvm]
+[497760.114434]  vmx_handle_exit+0xe/0x50 [kvm_intel]
+[497760.120079]  vcpu_enter_guest+0x867/0x1020 [kvm]
+[497760.126013]  vcpu_run+0x4c/0x240 [kvm]
+[497760.130707]  kvm_arch_vcpu_ioctl_run+0xc8/0x540 [kvm]
+[497760.136855]  kvm_vcpu_ioctl+0x2a8/0x6d0 [kvm]
+[497760.142348]  ? __seccomp_filter+0x55/0x4a2
+[497760.147240]  __x64_sys_ioctl+0x8f/0xce
+[497760.151630]  do_syscall_64+0x38/0x8d
+[497760.155815]  entry_SYSCALL_64_after_hwframe+0x63/0x0
+
+
+Taking linux 6.0 as example.
+
+direct_page_fault()                                             direct_page_fault()
+-> read_lock(&vcpu->kvm->mmu_lock);                             -> read_lock(&vcpu->kvm->mmu_lock);
+-> make_mmu_pages_available()
+   -> kvm_mmu_zap_oldest_mmu_pages()                            -> kvm_tdp_mmu_map()
+      -> list_for_each_entry_safe_reverse(sp, tmp,
+                        &kvm->arch.active_mmu_pages, link)
+      -> __kvm_mmu_prepare_zap_page()                              -> tdp_mmu_link_sp()
+-> read_unlock(&vcpu->kvm->mmu_lock);                           -> read_unlock(&vcpu->kvm->mmu_lock);
