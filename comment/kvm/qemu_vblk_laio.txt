@@ -1,0 +1,108 @@
+
+(gdb) bt
+ #0  submit_requests (blk=0x55555774d840, mrb=0x7fffef696650, start=0, num_reqs=4, niov=512) at ../hw/block/virtio-blk.c:390
+ #1  0x0000555555bc6563 in virtio_blk_submit_multireq (blk=0x55555774d840, mrb=0x7fffef696650) at ../hw/block/virtio-blk.c:497
+ #2  0x0000555555bc72e5 in virtio_blk_handle_vq (s=0x5555577489b0, vq=0x555557753d58) at ../hw/block/virtio-blk.c:799
+ #3  0x0000555555bc739b in virtio_blk_handle_output (vdev=0x5555577489b0, vq=0x555557753d58) at ../hw/block/virtio-blk.c:819
+ #4  0x0000555555c27448 in virtio_queue_notify_vq (vq=0x555557753d58) at ../hw/virtio/virtio.c:2365
+ #5  0x0000555555c2a566 in virtio_queue_host_notifier_read (n=0x555557753dcc) at ../hw/virtio/virtio.c:3612
+ #6  0x0000555555ee6f68 in aio_dispatch_handler (ctx=0x555556a67590, node=0x7ffe4805c8f0) at ../util/aio-posix.c:369
+ #7  0x0000555555ee705c in aio_dispatch_ready_handlers (ctx=0x555556a67590, ready_list=0x7fffef696880) at ../util/aio-posix.c:399
+ #8  0x0000555555ee7ac6 in aio_poll (ctx=0x555556a67590, blocking=true) at ../util/aio-posix.c:713
+ #9  0x0000555555d5cb66 in iothread_run (opaque=0x555556a67220) at ../iothread.c:67
+ #10 0x0000555555eec4de in qemu_thread_start (args=0x555556a67c00) at ../util/qemu-thread-posix.c:504
+ #11 0x00007ffff55eeea5 in start_thread () at /lib64/libpthread.so.0
+ #12 0x00007ffff53179fd in clone () at /lib64/libc.so.6
+
+
+submit_requests()调用read/write:
+
+blk_aio_pwritev(blk, sector_num << BDRV_SECTOR_BITS, qiov, 0, virtio_blk_rw_complete, mrb->reqs[start]);
+
+blk_aio_preadv(blk, sector_num << BDRV_SECTOR_BITS, qiov, 0, virtio_blk_rw_complete, mrb->reqs[start]);
+
+
+下面是流程, 一直到laio_co_submit().
+
+blk_aio_preadv()
+blk_aio_prwv
+co blk_aio_read_entry()
+blk_co_do_preadv_part()
+bdrv_co_preadv_part
+bdrv_aligned_preadv()
+bdrv_driver_preadv()
+drv->bdrv_co_preadv_part = qcow2_co_preadv_part()
+qcow2_add_task()
+qcow2_co_preadv_task_entry()
+qcow2_co_preadv_task()
+bdrv_co_preadv_part()
+bdrv_aligned_preadv()
+bdrv_driver_preadv()
+drv->bdrv_co_preadv = raw_co_preadv()
+raw_co_prw()
+laio_co_submit()
+
+下面是callstack.
+
+Thread 3 "IO iothread01" hit Breakpoint 1, qemu_coroutine_yield () at ../util/qemu-coroutine.c:197
+197      Coroutine *self = qemu_coroutine_self();
+(gdb) bt
+#0  qemu_coroutine_yield () at ../util/qemu-coroutine.c:197
+#1  0x0000555555e22421 in laio_co_submit (bs=0x555556a6b8a0, s=0x7ffe5814c8e0, fd=14, offset=8355229696, qiov=0x7fffe8008e38, type=2, dev_max_batch=0) at ../block/linux-aio.c:434
+#2  0x0000555555e16d8d in raw_co_prw (bs=0x555556a6b8a0, offset=8355229696, bytes=4096, qiov=0x7fffe8008e38, type=2) at ../block/file-posix.c:2091
+#3  0x0000555555e16eca in raw_co_pwritev (bs=0x555556a6b8a0, offset=8355229696, bytes=4096, qiov=0x7fffe8008e38, flags=0) at ../block/file-posix.c:2124
+#4  0x0000555555da233e in bdrv_driver_pwritev (bs=0x555556a6b8a0, offset=8355229696, bytes=4096, qiov=0x7fffe8008e38, qiov_offset=0, flags=0) at ../block/io.c:1233
+#5  0x0000555555da498d in bdrv_aligned_pwritev (child=0x555556a777e0, req=0x7ffe46cec940, offset=8355229696, bytes=4096, align=512, qiov=0x7fffe8008e38, qiov_offset=0, flags=0) at ../block/io.c:2097
+#6  0x0000555555da5296 in bdrv_co_pwritev_part (child=0x555556a777e0, offset=8355229696, bytes=4096, qiov=0x7fffe8008e38, qiov_offset=0, flags=0) at ../block/io.c:2289
+#7  0x0000555555dd6c30 in qcow2_co_pwritev_task (bs=0x555556a714b0, host_offset=8355229696, offset=6820900864, bytes=4096, qiov=0x7fffe8008e38, qiov_offset=0, l2meta=0x0) at ../block/qcow2.c:2567
+#8  0x0000555555dd6d5e in qcow2_co_pwritev_task_entry (task=0x7ffe46cecb40) at ../block/qcow2.c:2597
+#9  0x0000555555dd6100 in qcow2_add_task
+    (bs=0x555556a714b0, pool=0x0, func=0x555555dd6cd3 <qcow2_co_pwritev_task_entry>, subcluster_type=QCOW2_SUBCLUSTER_UNALLOCATED_PLAIN, host_offset=8355229696, offset=6820900864, bytes=4096,
+    qiov=0x7fffe8008e38, qiov_offset=0, l2meta=0x0) at ../block/qcow2.c:2252
+#10 0x0000555555dd6f33 in qcow2_co_pwritev_part (bs=0x555556a714b0, offset=6820900864, bytes=4096, qiov=0x7fffe8008e38, qiov_offset=0, flags=0) at ../block/qcow2.c:2648
+#11 0x0000555555da22a0 in bdrv_driver_pwritev (bs=0x555556a714b0, offset=6820900864, bytes=4096, qiov=0x7fffe8008e38, qiov_offset=0, flags=0) at ../block/io.c:1221
+#12 0x0000555555da498d in bdrv_aligned_pwritev (child=0x55555774dd00, req=0x7ffe46cece00, offset=6820900864, bytes=4096, align=1, qiov=0x7fffe8008e38, qiov_offset=0, flags=0) at ../block/io.c:2097
+#13 0x0000555555da5296 in bdrv_co_pwritev_part (child=0x55555774dd00, offset=6820900864, bytes=4096, qiov=0x7fffe8008e38, qiov_offset=0, flags=0) at ../block/io.c:2289
+#14 0x0000555555d90fe0 in blk_co_do_pwritev_part (blk=0x55555774d9b0, offset=6820900864, bytes=4096, qiov=0x7fffe8008e38, qiov_offset=0, flags=0) at ../block/block-backend.c:1388
+#15 0x0000555555d915a7 in blk_aio_write_entry (opaque=0x7fffe800a480) at ../block/block-backend.c:1568
+#16 0x0000555555f02abd in coroutine_trampoline (i0=-402632592, i1=32767) at ../util/coroutine-ucontext.c:177
+#17 0x00007ffff5261190 in __start_context () at /lib64/libc.so.6
+#18 0x00007fffef695cf0 in  ()
+#19 0x0000000000000000 in  ()
+
+
+因为IO没有完成, laio_co_submit()调用qemu_coroutine_yield()重新调度.
+
+
+等AIO的IO完成了, 会调用下面的callstack.
+
+(gdb) bt
+#0  qemu_laio_process_completions_and_submit (s=0x7ffe580f74e0) at ../block/linux-aio.c:235
+#1  0x0000555555e21ce1 in qemu_laio_poll_ready (opaque=0x7ffe580f74f0) at ../block/linux-aio.c:274
+#2  0x0000555555ee6ef1 in aio_dispatch_handler (ctx=0x555556a67590, node=0x7ffe580f7540) at ../util/aio-posix.c:356
+#3  0x0000555555ee705c in aio_dispatch_ready_handlers (ctx=0x555556a67590, ready_list=0x7fffef696880) at ../util/aio-posix.c:399
+#4  0x0000555555ee7ac6 in aio_poll (ctx=0x555556a67590, blocking=true) at ../util/aio-posix.c:713
+#5  0x0000555555d5cb66 in iothread_run (opaque=0x555556a67220) at ../iothread.c:67
+#6  0x0000555555eec4de in qemu_thread_start (args=0x555556a67c00) at ../util/qemu-thread-posix.c:504
+#7  0x00007ffff55eeea5 in start_thread () at /lib64/libpthread.so.0
+#8  0x00007ffff53179fd in clone () at /lib64/libc.so.6
+
+
+qemu_laio_process_completions_and_submit()会唤醒coroutine.
+
+qemu_laio_process_completions_and_submit()
+qemu_laio_process_completions()
+qemu_laio_process_completion()
+aio_co_wake()
+
+
+下面是write唤醒的例子
+
+(gdb) bt
+ #0  virtio_blk_rw_complete (opaque=0x7fffe80026c0, ret=0) at ../hw/block/virtio-blk.c:120
+ #1  0x0000555555d912e6 in blk_aio_complete (acb=0x7fffe8002800) at ../block/block-backend.c:1503
+ #2  0x0000555555d915ba in blk_aio_write_entry (opaque=0x7fffe8002800) at ../block/block-backend.c:1570
+ #3  0x0000555555f02abd in coroutine_trampoline (i0=-402628976, i1=32767) at ../util/coroutine-ucontext.c:177
+ #4  0x00007ffff5261190 in __start_context () at /lib64/libc.so.6
+ #5  0x00007fffef695cf0 in  ()
+ #6  0x0000000000000000 in  ()
