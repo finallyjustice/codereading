@@ -1,6 +1,6 @@
-From 9088650f1623760b30b506a17f1cd59ba56e62e7 Mon Sep 17 00:00:00 2001
+From f1c095dd38baf3514d2da9c9d970d7186f18231d Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Mon, 27 Feb 2023 08:27:27 -0800
+Date: Thu, 2 Mar 2023 00:55:32 -0800
 Subject: [PATCH 1/1] qemu for v7.1.0
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
@@ -8,15 +8,20 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  accel/accel-common.c                  |   3 +
  accel/kvm/kvm-accel-ops.c             |   4 +
  accel/kvm/kvm-all.c                   | 129 ++++++++++++
+ block.c                               | 131 ++++++++++++
  block/accounting.c                    |  34 +++
- block/aio_task.c                      |   9 +
- block/block-backend.c                 |  72 +++++++
+ block/aio_task.c                      |  18 ++
+ block/block-backend.c                 | 118 +++++++++++
  block/commit.c                        |   4 +
  block/file-posix.c                    |   8 +
- block/io.c                            |   3 +
- block/iscsi.c                         | 145 +++++++++++++
- block/qcow2.c                         |   6 +
- blockjob.c                            |  49 +++++
+ block/io.c                            |  16 ++
+ block/io_uring.c                      |   6 +
+ block/iscsi.c                         | 253 ++++++++++++++++++++++
+ block/linux-aio.c                     |  74 +++++++
+ block/mirror.c                        |  33 +++
+ block/qcow2.c                         |  27 +++
+ blockdev.c                            |  80 +++++++
+ blockjob.c                            |  77 +++++++
  hw/acpi/core.c                        |  10 +
  hw/acpi/cpu.c                         |   4 +
  hw/acpi/cpu_hotplug.c                 |   4 +
@@ -24,8 +29,9 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  hw/acpi/pci.c                         |   6 +
  hw/acpi/pcihp.c                       | 112 ++++++++++
  hw/acpi/piix4.c                       |  30 +++
- hw/block/virtio-blk.c                 |   3 +
+ hw/block/virtio-blk.c                 |  59 ++++++
  hw/core/loader.c                      |  85 ++++++++
+ hw/core/qdev-properties-system.c      |  20 ++
  hw/core/qdev.c                        |  54 +++++
  hw/core/reset.c                       |  13 ++
  hw/i386/acpi-build.c                  |  38 ++++
@@ -43,6 +49,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  hw/virtio/virtio-bus.c                |  82 +++++++
  hw/virtio/virtio-pci.c                |  55 +++++
  hw/virtio/virtio.c                    | 120 +++++++++++
+ include/block/block_int-common.h      |   8 +
  include/exec/memory.h                 |  46 ++++
  include/hw/core/accel-cpu.h           |  10 +
  include/hw/core/cpu.h                 |  11 +
@@ -55,10 +62,11 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  include/hw/virtio/virtio.h            |  22 ++
  include/sysemu/accel-ops.h            |  20 ++
  iothread.c                            |   4 +
+ job.c                                 |  18 ++
  monitor/hmp.c                         |  35 +++
  net/dump.c                            |   8 +
  qga/commands-posix.c                  |  28 +++
- qom/object.c                          |   7 +
+ qom/object.c                          |  29 +++
  softmmu/cpus.c                        |  20 ++
  softmmu/memory.c                      | 237 +++++++++++++++++++++
  softmmu/physmem.c                     |  18 ++
@@ -72,12 +80,13 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  target/i386/machine.c                 |  10 +
  util/aio-posix.c                      |  12 ++
  util/aio-wait.c                       |  17 ++
+ util/async.c                          |   4 +
  util/log.c                            |  29 +++
  util/qemu-config.c                    |   3 +
  util/qemu-option.c                    |  29 +++
  util/readline.c                       |  49 +++++
  util/thread-pool.c                    |  44 ++++
- 72 files changed, 2901 insertions(+)
+ 81 files changed, 3578 insertions(+)
 
 diff --git a/accel/accel-common.c b/accel/accel-common.c
 index 50035bda5..5312af961 100644
@@ -326,6 +335,183 @@ index 8d81ab74d..ac32f4e76 100644
      object_class_property_add(oc, "kernel-irqchip", "on|off|split",
          NULL, kvm_set_kernel_irqchip,
          NULL, NULL);
+diff --git a/block.c b/block.c
+index bc85f46ee..608f57eaa 100644
+--- a/block.c
++++ b/block.c
+@@ -1559,6 +1559,10 @@ static void update_options_from_flags(QDict *options, int flags)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - block.c|1614| <<bdrv_open_driver>> bdrv_assign_node_name(bs, node_name, &local_err);
++ */
+ static void bdrv_assign_node_name(BlockDriverState *bs,
+                                   const char *node_name,
+                                   Error **errp)
+@@ -2836,6 +2840,14 @@ uint64_t bdrv_qapi_perm_to_blk_perm(BlockPermission qapi_perm)
+  * free the BdrvChild themselves (this may be important in a
+  * transactional context, where it may only be freed on commit).
+  */
++/*
++ * called by:
++ *   - block.c|2384| <<bdrv_replace_child_abort>> bdrv_replace_child_noperm(&s->child, s->old_bs, true);
++ *   - block.c|2448| <<bdrv_replace_child_tran>> bdrv_replace_child_noperm(childp, new_bs, false);
++ *   - block.c|2959| <<bdrv_attach_child_common_abort>> bdrv_replace_child_noperm(s->child, NULL, false);
++ *   - block.c|3059| <<bdrv_attach_child_common>> bdrv_replace_child_noperm(&new_child, child_bs, true);
++ *   - block.c|3227| <<bdrv_detach_child>> bdrv_replace_child_noperm(childp, NULL, true);
++ */
+ static void bdrv_replace_child_noperm(BdrvChild **childp,
+                                       BlockDriverState *new_bs,
+                                       bool free_empty_child)
+@@ -2876,6 +2888,9 @@ static void bdrv_replace_child_noperm(BdrvChild **childp,
+         QLIST_REMOVE(child, next_parent);
+     }
+ 
++    /*
++     * 核心的一行
++     */
+     child->bs = new_bs;
+     if (!new_bs) {
+         *childp = NULL;
+@@ -3075,6 +3090,111 @@ static int bdrv_attach_child_common(BlockDriverState *child_bs,
+  *
+  * Function doesn't update permissions, caller is responsible for this.
+  */
++/*
++ * main thread
++ * (gdb) bt
++ * #0  bdrv_attach_child_noperm (parent_bs=0x55f93d710410, child_bs=0x55f93c9d4cb0, child_name=0x55f93b201894 "file", child_class=0x55f93b518d80 <child_of_bds>, child_role=19
++ * #1  0x000055f93ae88dc5 in bdrv_attach_child (parent_bs=0x55f93d710410, child_bs=0x55f93c9d4cb0, child_name=0x55f93b201894 "file"
++ * #2  0x000055f93ae89ccd in bdrv_open_child (filename=0x0, options=0x55f93d0f3400, bdref_key=0x55f93b201894 "file", parent=0x55f93d710410,
++ * #3  0x000055f93aef6428 in qcow2_open (bs=0x55f93d710410, options=0x55f93d0f3400, flags=8710, errp=0x7fb60a977aa0) at ../block/qcow2.c:1897
++ * #4  0x000055f93ae85919 in bdrv_open_driver (bs=0x55f93d710410, drv=0x55f93b899080 <bdrv_qcow2>, node_name=0x0, options=0x55f93d0f3400, open_flags=8710, errp=0x7fb60a977bb0) at ../block.c:1627
++ * #5  0x000055f93ae8636b in bdrv_open_common (bs=0x55f93d710410, file=0x55f93d04ce00, options=0x55f93d0f3400, errp=0x7fb60a977bb0) at ../block.c:1923
++ * #6  0x000055f93ae8aa35 in bdrv_open_inherit (filename=0x0, reference=0x0, options=0x55f93d0f3400, flags=8710, parent=0x0, child_class=0x0, child_role=0, errp=0x7fb60a977f38) at ../block.c:3992
++ * #7  0x000055f93ae8af9d in bdrv_open (filename=0x0, reference=0x0, options=0x55f93ce12200, flags=518, errp=0x7fb60a977f38) at ../block.c:4087
++ * #8  0x000055f93aeaff6b in blk_new_open (filename=0x0, reference=0x0, options=0x55f93ce12200, flags=518, errp=0x7fb60a977f38) at ../block/block-backend.c:454
++ * #9  0x000055f93aefa6ef in qcow2_co_create (create_options=0x55f93d1db260, errp=0x7fb60a977f38) at ../block/qcow2.c:3701
++ * #10 0x000055f93aefaef1 in qcow2_co_create_opts (drv=0x55f93b899080 <bdrv_qcow2>, filename=0x55f93d0ea620 "/tmp/overlay01.qcow2", opts=0x55f93d3b7ae0, errp=0x7fb60a977f38) at ../block/qcow2.c:3916
++ * #11 0x000055f93ae8339b in bdrv_create_co_entry (opaque=0x7ffdc69cca60) at ../block.c:534
++ * #12 0x000055f93b023abd in coroutine_trampoline (i0=1024266240, i1=22009) at ../util/coroutine-ucontext.c:177
++ * #13 0x00007fb610f44190 in __start_context () at /lib64/libc.so.6
++ * #14 0x00007ffdc69cc280 in  ()
++ * #15 0x0000000000000000 in  ()
++ *
++ * (gdb) bt
++ * #0  bdrv_attach_child_noperm (parent_bs=0x55f93c9d4cb0, child_bs=0x55f93d710410, child_name=0x55f93b201894 "file",
++ * #1  0x000055f93ae88dc5 in bdrv_attach_child (parent_bs=0x55f93c9d4cb0, child_bs=0x55f93d710410, child_name=0x55f93b201894 "file"
++ * #2  0x000055f93ae89ccd in bdrv_open_child (filename=0x0, options=0x55f93d124d50, bdref_key=0x55f93b201894 "file", parent=0x55f93c9d4cb0
++ * #3  0x000055f93aef6428 in qcow2_open (bs=0x55f93c9d4cb0, options=0x55f93d124d50, flags=8226, errp=0x7ffdc69cc930) at ../block/qcow2.c:1897
++ * #4  0x000055f93ae85919 in bdrv_open_driver (bs=0x55f93c9d4cb0, drv=0x55f93b899080 <bdrv_qcow2>, node_name=0x55f93c951970 "over01", options=0x55f93d124d50, open_flags=8226, errp=0x7ffdc69cca40)
++ * #5  0x000055f93ae8636b in bdrv_open_common (bs=0x55f93c9d4cb0, file=0x55f93d24fc20, options=0x55f93d124d50, errp=0x7ffdc69cca40) at ../block.c:1923
++ * #6  0x000055f93ae8aa35 in bdrv_open_inherit (filename=0x55f93d124cf0 "/tmp/overlay01.qcow2", reference=0x0, options=0x55f93d124d50, flags=8482, parent=0x0, child_class=0x0,
++ * #7  0x000055f93ae8af9d in bdrv_open (filename=0x55f93d124cf0 "/tmp/overlay01.qcow2", reference=0x0, options=0x55f93d24ec00, flags=8482, errp=0x7ffdc69ccc78) at ../block.c:4087
++ * #8  0x000055f93ae77b92 in external_snapshot_prepare (common=0x55f93d04f320, errp=0x7ffdc69ccc78) at ../blockdev.c:1535
++ * #9  0x000055f93ae79583 in qmp_transaction (dev_list=0x7ffdc69cccf0, has_props=false, props=0x55f93c932010, errp=0x7ffdc69cce48) at ../blockdev.c:2358
++ * #10 0x000055f93ae7697e in blockdev_do_action (action=0x7ffdc69ccd70, errp=0x7ffdc69cce48) at ../blockdev.c:1042
++ * #11 0x000055f93ae76a9a in qmp_blockdev_snapshot_sync (has_device=false, device=0x0, has_node_name=true, node_name=0x55f93d0ae920 "drive01",
++ *     snapshot_file=0x55f93d124cf0 "/tmp/overlay01.qcow2", has_snapshot_node_name=true, snapshot_node_name=0x55f93d3b9fc0 "over01", has_format=false, format=0x0,
++ *     has_mode=false, mode=NEW_IMAGE_MODE_EXISTING, errp=0x7ffdc69cce48) at ../blockdev.c:1070
++ * #12 0x000055f93af8345a in qmp_marshal_blockdev_snapshot_sync (args=0x7fb600003ad0, ret=0x7fb613cb5d98, errp=0x7fb613cb5d90) at qapi/qapi-commands-block-core.c:280
++ * #13 0x000055f93affb4fb in do_qmp_dispatch_bh (opaque=0x7fb613cb5e30) at ../qapi/qmp-dispatch.c:128
++ * #14 0x000055f93b020dcc in aio_bh_call (bh=0x55f93d1140f0) at ../util/async.c:150
++ * #15 0x000055f93b020ed6 in aio_bh_poll (ctx=0x55f93c71fd40) at ../util/async.c:178
++ * #16 0x000055f93b00816b in aio_dispatch (ctx=0x55f93c71fd40) at ../util/aio-posix.c:421
++ * #17 0x000055f93b021307 in aio_ctx_dispatch (source=0x55f93c71fd40, callback=0x0, user_data=0x0) at ../util/async.c:320
++ * #18 0x00007fb612923119 in g_main_context_dispatch () at /lib64/libglib-2.0.so.0
++ * #19 0x000055f93b033010 in glib_pollfds_poll () at ../util/main-loop.c:297
++ * #20 0x000055f93b03308a in os_host_main_loop_wait (timeout=0) at ../util/main-loop.c:320
++ * #21 0x000055f93b03318f in main_loop_wait (nonblocking=0) at ../util/main-loop.c:596
++ * #22 0x000055f93ab9b05e in qemu_main_loop () at ../softmmu/runstate.c:734
++ * #23 0x000055f93a940e62 in qemu_main (argc=32, argv=0x7ffdc69cd2b8, envp=0x0) at ../softmmu/main.c:38
++ * #24 0x000055f93a940e94 in main (argc=32, argv=0x7ffdc69cd2b8) at ../softmmu/main.c:47
++ *
++ * (gdb) bt
++ * #0  bdrv_attach_child_noperm (parent_bs=0x55f93c9d4cb0, child_bs=0x55f93c9495d0, child_name=0x55f93b1e8ff0 "backing", child_class=0x55f93b518d80 <child_of_bds>, child_role=8
++ * #1  0x000055f93ae8dc6a in bdrv_append (bs_new=0x55f93c9d4cb0, bs_top=0x55f93c9495d0, errp=0x7ffdc69ccc78) at ../block.c:5336
++ * #2  0x000055f93ae77d06 in external_snapshot_prepare (common=0x55f93d04f320, errp=0x7ffdc69ccc78) at ../blockdev.c:1568
++ * #3  0x000055f93ae79583 in qmp_transaction (dev_list=0x7ffdc69cccf0, has_props=false, props=0x55f93c932010, errp=0x7ffdc69cce48) at ../blockdev.c:2358
++ * #4  0x000055f93ae7697e in blockdev_do_action (action=0x7ffdc69ccd70, errp=0x7ffdc69cce48) at ../blockdev.c:1042
++ * #5  0x000055f93ae76a9a in qmp_blockdev_snapshot_sync (has_device=false, device=0x0, has_node_name=true, node_name=0x55f93d0ae920 "drive01",
++ *     snapshot_file=0x55f93d124cf0 "/tmp/overlay01.qcow2", has_snapshot_node_name=true, snapshot_node_name=0x55f93d3b9fc0 "over01", has_format=false, format=0x0,
++ *     has_mode=false, mode=NEW_IMAGE_MODE_EXISTING, errp=0x7ffdc69cce48) at ../blockdev.c:1070
++ * #6  0x000055f93af8345a in qmp_marshal_blockdev_snapshot_sync (args=0x7fb600003ad0, ret=0x7fb613cb5d98, errp=0x7fb613cb5d90) at qapi/qapi-commands-block-core.c:280
++ * #7  0x000055f93affb4fb in do_qmp_dispatch_bh (opaque=0x7fb613cb5e30) at ../qapi/qmp-dispatch.c:128
++ * #8  0x000055f93b020dcc in aio_bh_call (bh=0x55f93d1140f0) at ../util/async.c:150
++ * #9  0x000055f93b020ed6 in aio_bh_poll (ctx=0x55f93c71fd40) at ../util/async.c:178
++ * #10 0x000055f93b00816b in aio_dispatch (ctx=0x55f93c71fd40) at ../util/aio-posix.c:421
++ * #11 0x000055f93b021307 in aio_ctx_dispatch (source=0x55f93c71fd40, callback=0x0, user_data=0x0) at ../util/async.c:320
++ * #12 0x00007fb612923119 in g_main_context_dispatch () at /lib64/libglib-2.0.so.0
++ * #13 0x000055f93b033010 in glib_pollfds_poll () at ../util/main-loop.c:297
++ * #14 0x000055f93b03308a in os_host_main_loop_wait (timeout=0) at ../util/main-loop.c:320
++ * #15 0x000055f93b03318f in main_loop_wait (nonblocking=0) at ../util/main-loop.c:596
++ * #16 0x000055f93ab9b05e in qemu_main_loop () at ../softmmu/runstate.c:734
++ * #17 0x000055f93a940e62 in qemu_main (argc=32, argv=0x7ffdc69cd2b8, envp=0x0) at ../softmmu/main.c:38
++ * #18 0x000055f93a940e94 in main (argc=32, argv=0x7ffdc69cd2b8) at ../softmmu/main.c:47
++ *
++ * (gdb) bt
++ * #0  bdrv_attach_child_noperm (parent_bs=0x55f93d480410, child_bs=0x55f93c9d4cb0, child_name=0x55f93b1e8ff0 "backing", child_class=0x55f93b518d80 <child_of_bds>, child_role=20,
++ * #1  0x000055f93ae8dc6a in bdrv_append (bs_new=0x55f93d480410, bs_top=0x55f93c9d4cb0, errp=0x7ffdc69ccc90) at ../block.c:5336
++ * #2  0x000055f93aece199 in mirror_start_job (job_id=0x55f93d3b9fc0 "jobA", bs=0x55f93c9d4cb0, creation_flags=0, target=0x55f93c9495d0,
++ *     replaces=0x0, speed=0, granularity=65536, buf_size=16777216, backing_mode=MIRROR_LEAVE_BACKING_CHAIN, zero_target=false,
++ *     on_source_error=BLOCKDEV_ON_ERROR_REPORT, on_target_error=BLOCKDEV_ON_ERROR_REPORT, unmap=true, cb=0x0, opaque=0x0,
++ *     driver=0x55f93b525480 <commit_active_job_driver>, is_none_mode=false, base=0x55f93c9495d0, auto_complete=false, filter_node_name=0x0,
++ *     is_mirror=false, copy_mode=MIRROR_COPY_MODE_BACKGROUND, errp=0x7ffdc69ccc90) at ../block/mirror.c:1655
++ * #3  0x000055f93aecea50 in commit_active_start (job_id=0x55f93d3b9fc0 "jobA", bs=0x55f93c9d4cb0, base=0x55f93c9495d0, creation_flags=0, speed=0,
++ *     on_error=BLOCKDEV_ON_ERROR_REPORT, filter_node_name=0x0, cb=0x0, opaque=0x0, auto_complete=false, errp=0x7ffdc69ccc90) at ../block/mirror.c:1905
++ * #4  0x000055f93ae7a82c in qmp_block_commit (has_job_id=true, job_id=0x55f93d3b9fc0 "jobA", device=0x55f93d0ae920 "over01", has_base_node=false,
++ *     base_node=0x0, has_base=false, base=0x0, has_top_node=false, top_node=0x0, has_top=false, top=0x0, has_backing_file=false, backing_file=0x0,
++ *     has_speed=false, speed=0, has_on_error=false, on_error=BLOCKDEV_ON_ERROR_REPORT, has_filter_node_name=false, filter_node_name=0x0,
++ *     has_auto_finalize=false, auto_finalize=false, has_auto_dismiss=false, auto_dismiss=false, errp=0x7ffdc69ccdf8) at ../blockdev.c:2769
++ * #5  0x000055f93af83ce0 in qmp_marshal_block_commit (args=0x7fb600003a70, ret=0x7fb613cb5d98, errp=0x7fb613cb5d90) at qapi/qapi-commands-block-core.c:409
++ * #6  0x000055f93affb4fb in do_qmp_dispatch_bh (opaque=0x7fb613cb5e30) at ../qapi/qmp-dispatch.c:128
++ * #7  0x000055f93b020dcc in aio_bh_call (bh=0x55f93d1140f0) at ../util/async.c:150
++ * #8  0x000055f93b020ed6 in aio_bh_poll (ctx=0x55f93c71fd40) at ../util/async.c:178
++ * #9  0x000055f93b00816b in aio_dispatch (ctx=0x55f93c71fd40) at ../util/aio-posix.c:421
++ * #10 0x000055f93b021307 in aio_ctx_dispatch (source=0x55f93c71fd40, callback=0x0, user_data=0x0) at ../util/async.c:320
++ * #11 0x00007fb612923119 in g_main_context_dispatch () at /lib64/libglib-2.0.so.0
++ * #12 0x000055f93b033010 in glib_pollfds_poll () at ../util/main-loop.c:297
++ * #13 0x000055f93b03308a in os_host_main_loop_wait (timeout=0) at ../util/main-loop.c:320
++ * #14 0x000055f93b03318f in main_loop_wait (nonblocking=0) at ../util/main-loop.c:596
++ * #15 0x000055f93ab9b05e in qemu_main_loop () at ../softmmu/runstate.c:734
++ * #16 0x000055f93a940e62 in qemu_main (argc=32, argv=0x7ffdc69cd2b8, envp=0x0) at ../softmmu/main.c:38
++ * #17 0x000055f93a940e94 in main (argc=32, argv=0x7ffdc69cd2b8) at ../softmmu/main.c:47
++ *
++ * called by:
++ *   - block.c|3207| <<bdrv_attach_child>> ret = bdrv_attach_child_noperm(parent_bs, child_bs, child_name, child_class,
++ *   - block.c|3425| <<bdrv_set_file_or_backing_noperm>> ret = bdrv_attach_child_noperm(parent_bs, child_bs,
++ *   - block.c|5342| <<bdrv_append>> ret = bdrv_attach_child_noperm(bs_new, bs_top, "backing",
++ */
+ static int bdrv_attach_child_noperm(BlockDriverState *parent_bs,
+                                     BlockDriverState *child_bs,
+                                     const char *child_name,
+@@ -3143,6 +3263,12 @@ static void bdrv_detach_child(BdrvChild **childp)
+  * The caller must hold the AioContext lock @child_bs, but not that of @ctx
+  * (unless @child_bs is already in @ctx).
+  */
++/*
++ * called by:
++ *   - block/block-backend.c|460| <<blk_new_open>> blk->root = bdrv_root_attach_child(bs, "root", &child_root,
++ *   - block/block-backend.c|907| <<blk_insert_bs>> blk->root = bdrv_root_attach_child(bs, "root", &child_root,
++ *   - blockjob.c|280| <<block_job_add_bdrv>> c = bdrv_root_attach_child(bs, name, &child_job, 0, perm, shared_perm, job,
++ */
+ BdrvChild *bdrv_root_attach_child(BlockDriverState *child_bs,
+                                   const char *child_name,
+                                   const BdrvChildClass *child_class,
+@@ -5185,6 +5311,11 @@ static int bdrv_replace_node_noperm(BlockDriverState *from,
+     assert(to != NULL);
+     GLOBAL_STATE_CODE();
+ 
++    /*
++     * BlockDriverState *from:
++     * -> QLIST_HEAD(, BdrvChild) children;
++     * -> QLIST_HEAD(, BdrvChild) parents;
++     */
+     QLIST_FOREACH_SAFE(c, &from->parents, next_parent, next) {
+         assert(c->bs == from);
+         if (!should_update_child(c, to)) {
 diff --git a/block/accounting.c b/block/accounting.c
 index 2030851d7..965ea1c08 100644
 --- a/block/accounting.c
@@ -372,21 +558,30 @@ index 2030851d7..965ea1c08 100644
  {
      block_account_one_io(stats, cookie, false);
 diff --git a/block/aio_task.c b/block/aio_task.c
-index 9bd17ea2c..329753915 100644
+index 9bd17ea2c..6e53f0fba 100644
 --- a/block/aio_task.c
 +++ b/block/aio_task.c
-@@ -34,6 +34,10 @@ struct AioTaskPool {
+@@ -34,6 +34,19 @@ struct AioTaskPool {
      bool waiting;
  };
  
 +/*
++ * Thread 3 "IO iothread01" hit Breakpoint 1, aio_task_co (opaque=0x7f68a800f360) at ../block/aio_task.c:39
++ * 39	    AioTask *task = opaque;
++ * (gdb) bt
++ * #0  aio_task_co (opaque=0x7f68a800f360) at ../block/aio_task.c:39
++ * #1  0x0000561926f76ab8 in coroutine_trampoline (i0=-1476375376, i1=32616) at ../util/coroutine-ucontext.c:177
++ * #2  0x00007f68b318c190 in __start_context () at /lib64/libc.so.6
++ * #3  0x00007f68ad13acf0 in  ()
++ * #4  0x0000000000000000 in  ()
++ *
 + * 在以下使用aio_task_co():
 + *   - block/aio_task.c|94| <<aio_task_pool_start_task>> qemu_coroutine_enter(qemu_coroutine_create(aio_task_co, task));
 + */
  static void coroutine_fn aio_task_co(void *opaque)
  {
      AioTask *task = opaque;
-@@ -86,6 +90,11 @@ void coroutine_fn aio_task_pool_wait_all(AioTaskPool *pool)
+@@ -86,6 +99,11 @@ void coroutine_fn aio_task_pool_wait_all(AioTaskPool *pool)
      }
  }
  
@@ -399,10 +594,44 @@ index 9bd17ea2c..329753915 100644
  {
      aio_task_pool_wait_slot(pool);
 diff --git a/block/block-backend.c b/block/block-backend.c
-index d4a5df2ac..66e5d8dee 100644
+index d4a5df2ac..cb4e7771d 100644
 --- a/block/block-backend.c
 +++ b/block/block-backend.c
-@@ -1546,6 +1546,16 @@ static BlockAIOCB *blk_aio_prwv(BlockBackend *blk, int64_t offset,
+@@ -45,6 +45,10 @@ typedef struct BlockBackendAioNotifier {
+ struct BlockBackend {
+     char *name;
+     int refcnt;
++    /*
++     * 感觉BdrvChild->next挂的是file的
++     * BdrvChild->bs->children是overlay下面的原始的BdrvChild
++     */
+     BdrvChild *root;
+     AioContext *ctx;
+     DriveInfo *legacy_dinfo;    /* null unless created by drive_new() */
+@@ -1279,6 +1283,22 @@ static void coroutine_fn blk_wait_while_drained(BlockBackend *blk)
+     }
+ }
+ 
++/*
++ * Thread 3 "IO iothread01" hit Breakpoint 1, qcow2_co_preadv_part (bs=0x556b47200d40, offset=4811128832, bytes=4096, qiov=0x7fbc540096a8, qiov_offset=0, flags=0) at ../block/qcow2.c:2320
++ * 2320 {
++ * (gdb) bt
++ * #0  qcow2_co_preadv_part (bs=0x556b47200d40, offset=4811128832, bytes=4096, qiov=0x7fbc540096a8, qiov_offset=0, flags=0) at ../block/qcow2.c:2320
++ * #1  0x0000556b45012226 in bdrv_driver_preadv (bs=0x556b47200d40, offset=4811128832, bytes=4096, qiov=0x7fbc540096a8, qiov_offset=0, flags=0) at ../block/io.c:1150
++ * #2  0x0000556b4501340b in bdrv_aligned_preadv (child=0x556b4720da20, req=0x7fbaa6df4e00, offset=4811128832, bytes=4096, align=1, qiov=0x7fbc540096a8, qiov_offset=0, flags=0)
++ *     at ../block/io.c:1548
++ * #3  0x0000556b45013e42 in bdrv_co_preadv_part (child=0x556b4720da20, offset=4811128832, bytes=4096, qiov=0x7fbc540096a8, qiov_offset=0, flags=0) at ../block/io.c:1821
++ * #4  0x0000556b4500105b in blk_co_do_preadv_part (blk=0x556b472009f0, offset=4811128832, bytes=4096, qiov=0x7fbc540096a8, qiov_offset=0, flags=0) at ../block/block-backend.c:1311
++ * #5  0x0000556b450017cf in blk_aio_read_entry (opaque=0x7fbc5400bfc0) at ../block/block-backend.c:1556
++ * #6  0x0000556b45178ab8 in coroutine_trampoline (i0=1409340320, i1=32700) at ../util/coroutine-ucontext.c:177
++ * #7  0x00007fbc5f21e190 in __start_context () at /lib64/libc.so.6
++ * #8  0x00007fbc591cccf0 in  ()
++ * #9  0x0000000000000000 in  ()
++ */
+ /* To be called between exactly one pair of blk_inc/dec_in_flight() */
+ static int coroutine_fn
+ blk_co_do_preadv_part(BlockBackend *blk, int64_t offset, int64_t bytes,
+@@ -1546,6 +1566,16 @@ static BlockAIOCB *blk_aio_prwv(BlockBackend *blk, int64_t offset,
      return &acb->common;
  }
  
@@ -419,7 +648,19 @@ index d4a5df2ac..66e5d8dee 100644
  static void blk_aio_read_entry(void *opaque)
  {
      BlkAioEmAIOCB *acb = opaque;
-@@ -1609,6 +1619,40 @@ int64_t blk_nb_sectors(BlockBackend *blk)
+@@ -1558,6 +1588,11 @@ static void blk_aio_read_entry(void *opaque)
+     blk_aio_complete(acb);
+ }
+ 
++/*
++ * 在以下使用blk_aio_write_entry():
++ *   - block/block-backend.c|1604| <<blk_aio_pwrite_zeroes>> return blk_aio_prwv(blk, offset, bytes, NULL, blk_aio_write_entry,
++ *   - block/block-backend.c|1731| <<blk_aio_pwritev>> blk_aio_write_entry, flags, cb, opaque);
++ */
+ static void blk_aio_write_entry(void *opaque)
+ {
+     BlkAioEmAIOCB *acb = opaque;
+@@ -1609,6 +1644,61 @@ int64_t blk_nb_sectors(BlockBackend *blk)
      return bdrv_nb_sectors(blk_bs(blk));
  }
  
@@ -456,11 +697,32 @@ index d4a5df2ac..66e5d8dee 100644
 + *   5    Thread 0x7f9a7e204700 (LWP 23432) "CPU 1/KVM"       0x00007f9a85be5397 in ioctl () from /lib64/libc.so.6
 + *   6    Thread 0x7f9a7da03700 (LWP 23433) "CPU 2/KVM"       0x00007f9a85be5397 in ioctl () from /lib64/libc.so.6
 + *   7    Thread 0x7f9a7d202700 (LWP 23434) "CPU 3/KVM"       0x00007f9a85be5397 in ioctl () from /lib64/libc.so.6
++ *
++ * 一些调用的例子:
++ *   - hw/block/dataplane/xen-block.c|381| <<xen_block_do_aio>> blk_aio_preadv(dataplane->blk, request->start, &request->v, 0,
++ *   - hw/block/virtio-blk.c|430| <<submit_requests>> blk_aio_preadv(blk, sector_num << BDRV_SECTOR_BITS, qiov, 0,
++ *   - hw/ide/core.c|700| <<ide_buffered_readv>> aioreq = blk_aio_preadv(s->blk, sector_num << BDRV_SECTOR_BITS,
++ *   - hw/nvme/ctrl.c|1317| <<nvme_blk_read>> req->aiocb = blk_aio_preadv(blk, offset, &req->sg.iov, 0, cb, req);
++ *   - hw/nvme/ctrl.c|2163| <<nvme_verify_mdata_in_cb>> req->aiocb = blk_aio_preadv(blk, offset, &ctx->mdata.iov, 0,
++ *   - hw/nvme/ctrl.c|2319| <<nvme_compare_data_cb>> req->aiocb = blk_aio_preadv(blk, offset, &ctx->mdata.iov, 0,
++ *   - hw/nvme/ctrl.c|2570| <<nvme_verify>> req->aiocb = blk_aio_preadv(ns->blkconf.blk, offset, &ctx->data.iov, 0,
++ *   - hw/nvme/ctrl.c|2930| <<nvme_copy_in_cb>> iocb->aiocb = blk_aio_preadv(ns->blkconf.blk, nvme_moff(ns, slba),
++ *   - hw/nvme/ctrl.c|2993| <<nvme_copy_cb>> iocb->aiocb = blk_aio_preadv(ns->blkconf.blk, nvme_l2b(ns, slba),
++ *   - hw/nvme/ctrl.c|3158| <<nvme_compare>> req->aiocb = blk_aio_preadv(blk, offset, &ctx->data.iov, 0,
++ *   - hw/nvme/dif.c|506| <<nvme_dif_rw_mdata_in_cb>> req->aiocb = blk_aio_preadv(blk, offset, &ctx->mdata.iov, 0,
++ *   - hw/nvme/dif.c|655| <<nvme_dif_rw>> req->aiocb = blk_aio_preadv(ns->blkconf.blk, offset, &ctx->data.iov, 0,
++ *   - hw/scsi/scsi-disk.c|3084| <<scsi_dma_readv>> return blk_aio_preadv(s->qdev.conf.blk, offset, iov, 0, cb, cb_opaque);
++ *   - migration/block.c|336| <<mig_save_device_bulk>> blk->aiocb = blk_aio_preadv(bb, cur_sector * BDRV_SECTOR_SIZE, &blk->qiov,
++ *   - migration/block.c|561| <<mig_save_device_dirty>> blk->aiocb = blk_aio_preadv(bmds->blk,
++ *   - qemu-img.c|4339| <<bench_cb>> acb = blk_aio_preadv(b->blk, offset, b->qiov, 0, bench_cb, b);
++ *   - qemu-io-cmds.c|681| <<do_aio_readv>> blk_aio_preadv(blk, offset, qiov, 0, aio_rw_done, &async_ret);
++ *   - qemu-io-cmds.c|1535| <<aio_read_f>> blk_aio_preadv(blk, ctx->offset, &ctx->qiov, 0, aio_read_done, ctx);
++ *   - softmmu/dma-helpers.c|253| <<dma_blk_read_io_func>> return blk_aio_preadv(blk, offset, iov, 0, cb, cb_opaque);
 + */
  BlockAIOCB *blk_aio_preadv(BlockBackend *blk, int64_t offset,
                             QEMUIOVector *qiov, BdrvRequestFlags flags,
                             BlockCompletionFunc *cb, void *opaque)
-@@ -1619,6 +1663,27 @@ BlockAIOCB *blk_aio_preadv(BlockBackend *blk, int64_t offset,
+@@ -1619,6 +1709,27 @@ BlockAIOCB *blk_aio_preadv(BlockBackend *blk, int64_t offset,
                          blk_aio_read_entry, flags, cb, opaque);
  }
  
@@ -488,7 +750,7 @@ index d4a5df2ac..66e5d8dee 100644
  BlockAIOCB *blk_aio_pwritev(BlockBackend *blk, int64_t offset,
                              QEMUIOVector *qiov, BdrvRequestFlags flags,
                              BlockCompletionFunc *cb, void *opaque)
-@@ -1795,6 +1860,13 @@ void blk_drain(BlockBackend *blk)
+@@ -1795,6 +1906,13 @@ void blk_drain(BlockBackend *blk)
      }
  }
  
@@ -537,7 +799,7 @@ index 48cd09662..6693530fb 100644
  }
  
 diff --git a/block/io.c b/block/io.c
-index 0a8cbefe8..47e73de2f 100644
+index 0a8cbefe8..5101db699 100644
 --- a/block/io.c
 +++ b/block/io.c
 @@ -1187,6 +1187,9 @@ static int coroutine_fn bdrv_driver_preadv(BlockDriverState *bs,
@@ -550,8 +812,45 @@ index 0a8cbefe8..47e73de2f 100644
      ret = drv->bdrv_co_readv(bs, sector_num, nb_sectors, qiov);
  
  out:
+@@ -2050,6 +2053,19 @@ static int coroutine_fn bdrv_aligned_pwritev(BdrvChild *child,
+     int64_t align, QEMUIOVector *qiov, size_t qiov_offset,
+     BdrvRequestFlags flags)
+ {
++    /*
++     * struct BdrvChild {
++     *     BlockDriverState *bs;
++     *     char *name;
++     *     const BdrvChildClass *klass;
++     *     BdrvChildRole role;
++     *     void *opaque;
++     *     ... ...
++     *    QLIST_ENTRY(BdrvChild) next;
++     *    QLIST_ENTRY(BdrvChild) next_parent;
++     * };
++     *
++     */
+     BlockDriverState *bs = child->bs;
+     BlockDriver *drv = bs->drv;
+     int ret;
+diff --git a/block/io_uring.c b/block/io_uring.c
+index a1760152e..512a9c2ce 100644
+--- a/block/io_uring.c
++++ b/block/io_uring.c
+@@ -218,6 +218,12 @@ end:
+     qemu_bh_cancel(s->completion_bh);
+ }
+ 
++/*
++ * called by:
++ *   - block/io_uring.c|271| <<luring_process_completions_and_submit>> ioq_submit(s);
++ *   - block/io_uring.c|324| <<luring_io_unplug>> ioq_submit(s);
++ *   - block/io_uring.c|371| <<luring_do_submit>> ret = ioq_submit(s);
++ */
+ static int ioq_submit(LuringState *s)
+ {
+     int ret = 0;
 diff --git a/block/iscsi.c b/block/iscsi.c
-index d707d0b35..c5a3b8265 100644
+index d707d0b35..78a69da77 100644
 --- a/block/iscsi.c
 +++ b/block/iscsi.c
 @@ -70,7 +70,25 @@ typedef struct IscsiLun {
@@ -594,20 +893,60 @@ index d707d0b35..c5a3b8265 100644
      bool request_timed_out;
  } IscsiLun;
  
-@@ -187,6 +212,10 @@ static void iscsi_co_generic_bh_cb(void *opaque)
+@@ -179,6 +204,10 @@ iscsi_schedule_bh(IscsiAIOCB *acb)
+ 
+ #endif
+ 
++/*
++ * 在以下使用iscsi_co_generic_bh_cb():
++ *   - block/iscsi.c|379| <<iscsi_co_generic_cb>> replay_bh_schedule_oneshot_event(iTask->iscsilun->aio_context, iscsi_co_generic_bh_cb, iTask);
++ */
+ static void iscsi_co_generic_bh_cb(void *opaque)
+ {
+     struct IscsiTask *iTask = opaque;
+@@ -187,6 +216,10 @@ static void iscsi_co_generic_bh_cb(void *opaque)
      aio_co_wake(iTask->co);
  }
  
 +/*
 + * 在以下使用iscsi_retry_timer_expired():
-+ *   - block/iscsi.c|267| <<iscsi_co_generic_cb>> SCALE_MS, iscsi_retry_timer_expired, iTask);
++ *   - block/iscsi.c|267| <<iscsi_co_generic_cb>> aio_timer_init(iTask->iscsilun->aio_context, &iTask->retry_timer, QEMU_CLOCK_REALTIME,SCALE_MS, iscsi_retry_timer_expired, iTask);
 + */
  static void iscsi_retry_timer_expired(void *opaque)
  {
      struct IscsiTask *iTask = opaque;
-@@ -232,6 +261,41 @@ static int iscsi_translate_sense(struct scsi_sense *sense)
+@@ -231,7 +264,70 @@ static int iscsi_translate_sense(struct scsi_sense *sense)
+                                sense->ascq & 0xFF);
  }
  
++/*
++ * libiscsi的代码.
++ *
++ * 32 static void
++ * 33 iscsi_scsi_response_cb(struct iscsi_context *iscsi, int status,
++ * 34                        void *command_data _U_, void *private_data)
++ * 35 {
++ * 36         struct iscsi_scsi_cbdata *scsi_cbdata =
++ * 37           (struct iscsi_scsi_cbdata *)private_data;
++ * 38
++ * 39         switch (status) {
++ * 40         case SCSI_STATUS_RESERVATION_CONFLICT:
++ * 41         case SCSI_STATUS_CHECK_CONDITION:
++ * 42         case SCSI_STATUS_GOOD:
++ * 43         case SCSI_STATUS_BUSY:
++ * 44         case SCSI_STATUS_ERROR:
++ * 45         case SCSI_STATUS_CANCELLED:
++ * 46                 scsi_cbdata->callback(iscsi, status, scsi_cbdata->task,
++ * 47                                       scsi_cbdata->private_data);
++ * 48                 return;
++ * 49         default:
++ * 50                 iscsi_set_error(iscsi, "Cant handle  scsi status %d yet.",
++ * 51                                 status);
++ * 52                 scsi_cbdata->callback(iscsi, SCSI_STATUS_ERROR, scsi_cbdata->task,
++ * 53                                       scsi_cbdata->private_data);
++ * 54         }
++ * 55 }
++ */
  /* Called (via iscsi_service) with QemuMutex held.  */
 +/*
 + * (gdb) bt
@@ -647,9 +986,32 @@ index d707d0b35..c5a3b8265 100644
  static void
  iscsi_co_generic_cb(struct iscsi_context *iscsi, int status,
                          void *command_data, void *opaque)
-@@ -352,6 +416,16 @@ static void iscsi_process_read(void *arg);
+@@ -262,6 +358,9 @@ iscsi_co_generic_cb(struct iscsi_context *iscsi, int status,
+                              " (retry #%u in %u ms): %s",
+                              iTask->retries, retry_time,
+                              iscsi_get_error(iscsi));
++                /*
++		 * 只在此处使用iscsi_retry_timer_expired()
++		 */
+                 aio_timer_init(iTask->iscsilun->aio_context,
+                                &iTask->retry_timer, QEMU_CLOCK_REALTIME,
+                                SCALE_MS, iscsi_retry_timer_expired, iTask);
+@@ -351,11 +450,36 @@ static const AIOCBInfo iscsi_aiocb_info = {
+ static void iscsi_process_read(void *arg);
  static void iscsi_process_write(void *arg);
  
++/*
++ * 335 int
++ * 336 iscsi_which_events(struct iscsi_context *iscsi)
++ * 337 {
++ * 338         int events = iscsi->is_connected ? POLLIN : POLLOUT;
++ * 339
++ * 340         if (iscsi->outqueue_current != NULL || (iscsi->outqueue != NULL && iscsi_serial32_compare(iscsi->outqueue->cmdsn, iscsi->maxcmdsn) <= 0)) {
++ * 341                 events |= POLLOUT;
++ * 342         }
++ * 343         return events;
++ * 344 }
++ */
  /* Called with QemuMutex held.  */
 +/*
 + * called by:
@@ -664,7 +1026,14 @@ index d707d0b35..c5a3b8265 100644
  static void
  iscsi_set_events(IscsiLun *iscsilun)
  {
-@@ -369,6 +443,25 @@ iscsi_set_events(IscsiLun *iscsilun)
+     struct iscsi_context *iscsi = iscsilun->iscsi;
++    /*
++     * 返回POLLIN和POLLOUT的组合
++     */
+     int ev = iscsi_which_events(iscsi);
+ 
+     if (ev != iscsilun->events) {
+@@ -369,14 +493,51 @@ iscsi_set_events(IscsiLun *iscsilun)
      }
  }
  
@@ -690,7 +1059,75 @@ index d707d0b35..c5a3b8265 100644
  static void iscsi_timed_check_events(void *opaque)
  {
      IscsiLun *iscsilun = opaque;
-@@ -587,6 +680,16 @@ static inline bool iscsi_allocmap_is_valid(IscsiLun *iscsilun,
+ 
+     WITH_QEMU_LOCK_GUARD(&iscsilun->mutex) {
++        /*
++	 * 在以下使用iscsi_service():
++	 *   - block/iscsi.c|471| <<iscsi_timed_check_events>> iscsi_service(iscsilun->iscsi, 0);
++	 *   - block/iscsi.c|496| <<iscsi_process_read>> iscsi_service(iscsi, POLLIN);
++	 *   - block/iscsi.c|508| <<iscsi_process_write>> iscsi_service(iscsi, POLLOUT);
++	 *
++	 * Called to process the events when events become available for the iscsi
++	 * file descriptor.
++	 *
++	 * 处理完了每一个request在libiscsi调用iscsi_co_generic_cb()
++	 */
+         /* check for timed out requests */
+         iscsi_service(iscsilun->iscsi, 0);
+ 
++        /*
++	 * 在以下使用IscsiLun->request_timed_out:
++         *   - block/iscsi.c|263| <<iscsi_co_generic_cb>> iTask->iscsilun->request_timed_out = true;
++         *   - block/iscsi.c|384| <<iscsi_timed_check_events>> if (iscsilun->request_timed_out) {
++         *   - block/iscsi.c|385| <<iscsi_timed_check_events>> iscsilun->request_timed_out = false;
++         *   - block/iscsi.c|1428| <<iscsi_nop_timed_event>> iscsilun->request_timed_out = true;
++	 */
+         if (iscsilun->request_timed_out) {
+             iscsilun->request_timed_out = false;
+             iscsi_reconnect(iscsilun->iscsi);
+@@ -389,6 +550,15 @@ static void iscsi_timed_check_events(void *opaque)
+         iscsi_set_events(iscsilun);
+     }
+ 
++    /*
++     * 在以下使用IscsiLun->event_timer:
++     *   - block/iscsi.c|467| <<iscsi_timed_check_events>> timer_mod(iscsilun->event_timer,
++     *   - block/iscsi.c|1647| <<iscsi_detach_aio_context>> if (iscsilun->event_timer) {
++     *   - block/iscsi.c|1648| <<iscsi_detach_aio_context>> timer_free(iscsilun->event_timer);
++     *   - block/iscsi.c|1649| <<iscsi_detach_aio_context>> iscsilun->event_timer = NULL;
++     *   - block/iscsi.c|1670| <<iscsi_attach_aio_context>> iscsilun->event_timer = aio_timer_new(iscsilun->aio_context,
++     *   - block/iscsi.c|1673| <<iscsi_attach_aio_context>> timer_mod(iscsilun->event_timer,
++     */
+     timer_mod(iscsilun->event_timer,
+               qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + EVENT_INTERVAL);
+ }
+@@ -400,6 +570,12 @@ iscsi_process_read(void *arg)
+     struct iscsi_context *iscsi = iscsilun->iscsi;
+ 
+     qemu_mutex_lock(&iscsilun->mutex);
++    /*
++     * 在以下使用iscsi_service():
++     *   - block/iscsi.c|471| <<iscsi_timed_check_events>> iscsi_service(iscsilun->iscsi, 0);
++     *   - block/iscsi.c|496| <<iscsi_process_read>> iscsi_service(iscsi, POLLIN);
++     *   - block/iscsi.c|508| <<iscsi_process_write>> iscsi_service(iscsi, POLLOUT);
++     */
+     iscsi_service(iscsi, POLLIN);
+     iscsi_set_events(iscsilun);
+     qemu_mutex_unlock(&iscsilun->mutex);
+@@ -412,6 +588,12 @@ iscsi_process_write(void *arg)
+     struct iscsi_context *iscsi = iscsilun->iscsi;
+ 
+     qemu_mutex_lock(&iscsilun->mutex);
++    /*
++     * 在以下使用iscsi_service():
++     *   - block/iscsi.c|471| <<iscsi_timed_check_events>> iscsi_service(iscsilun->iscsi, 0);
++     *   - block/iscsi.c|496| <<iscsi_process_read>> iscsi_service(iscsi, POLLIN);
++     *   - block/iscsi.c|508| <<iscsi_process_write>> iscsi_service(iscsi, POLLOUT);
++     */
+     iscsi_service(iscsi, POLLOUT);
+     iscsi_set_events(iscsilun);
+     qemu_mutex_unlock(&iscsilun->mutex);
+@@ -587,6 +769,16 @@ static inline bool iscsi_allocmap_is_valid(IscsiLun *iscsilun,
                                 offset / iscsilun->cluster_size) == size);
  }
  
@@ -707,7 +1144,7 @@ index d707d0b35..c5a3b8265 100644
  static void coroutine_fn iscsi_co_wait_for_task(IscsiTask *iTask,
                                                  IscsiLun *iscsilun)
  {
-@@ -1404,6 +1507,32 @@ static char *get_initiator_name(QemuOpts *opts)
+@@ -1404,21 +1596,64 @@ static char *get_initiator_name(QemuOpts *opts)
      return iscsi_name;
  }
  
@@ -740,8 +1177,11 @@ index d707d0b35..c5a3b8265 100644
  static void iscsi_nop_timed_event(void *opaque)
  {
      IscsiLun *iscsilun = opaque;
-@@ -1411,6 +1540,13 @@ static void iscsi_nop_timed_event(void *opaque)
+ 
      QEMU_LOCK_GUARD(&iscsilun->mutex);
++    /*
++     * 检查有几个iscsi nop还没收到回复
++     */
      if (iscsi_get_nops_in_flight(iscsilun->iscsi) >= MAX_NOP_FAILURES) {
          error_report("iSCSI: NOP timeout. Reconnecting...");
 +        /*
@@ -753,8 +1193,23 @@ index d707d0b35..c5a3b8265 100644
 +	 */
          iscsilun->request_timed_out = true;
      } else if (iscsi_nop_out_async(iscsilun->iscsi, NULL, NULL, 0, NULL) != 0) {
++        /*
++	 * iscsi_nop_out_async()发送nop
++	 */
          error_report("iSCSI: failed to sent NOP-Out. Disabling NOP messages.");
-@@ -1555,6 +1691,15 @@ static void iscsi_attach_aio_context(BlockDriverState *bs,
+         return;
+     }
+ 
+     timer_mod(iscsilun->nop_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + NOP_INTERVAL);
+     iscsi_set_events(iscsilun);
++
++    /*
++     * 在libiscsi的iscsi_create_context()设置了很多debug
++     */
+ }
+ 
+ static void iscsi_readcapacity_sync(IscsiLun *iscsilun, Error **errp)
+@@ -1555,6 +1790,15 @@ static void iscsi_attach_aio_context(BlockDriverState *bs,
      iscsilun->aio_context = new_context;
      iscsi_set_events(iscsilun);
  
@@ -770,8 +1225,212 @@ index d707d0b35..c5a3b8265 100644
      /* Set up a timer for sending out iSCSI NOPs */
      iscsilun->nop_timer = aio_timer_new(iscsilun->aio_context,
                                          QEMU_CLOCK_REALTIME, SCALE_MS,
+@@ -1562,6 +1806,15 @@ static void iscsi_attach_aio_context(BlockDriverState *bs,
+     timer_mod(iscsilun->nop_timer,
+               qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + NOP_INTERVAL);
+ 
++    /*
++     * 在以下使用IscsiLun->event_timer:
++     *   - block/iscsi.c|467| <<iscsi_timed_check_events>> timer_mod(iscsilun->event_timer,
++     *   - block/iscsi.c|1647| <<iscsi_detach_aio_context>> if (iscsilun->event_timer) {
++     *   - block/iscsi.c|1648| <<iscsi_detach_aio_context>> timer_free(iscsilun->event_timer);
++     *   - block/iscsi.c|1649| <<iscsi_detach_aio_context>> iscsilun->event_timer = NULL;
++     *   - block/iscsi.c|1670| <<iscsi_attach_aio_context>> iscsilun->event_timer = aio_timer_new(iscsilun->aio_context,
++     *   - block/iscsi.c|1673| <<iscsi_attach_aio_context>> timer_mod(iscsilun->event_timer,
++     */
+     /* Set up a timer for periodic calls to iscsi_set_events and to
+      * scan for command timeout */
+     iscsilun->event_timer = aio_timer_new(iscsilun->aio_context,
+diff --git a/block/linux-aio.c b/block/linux-aio.c
+index d2cfb7f52..545bb9d97 100644
+--- a/block/linux-aio.c
++++ b/block/linux-aio.c
+@@ -230,6 +230,12 @@ static void qemu_laio_process_completions(LinuxAioState *s)
+     s->event_idx = 0;
+ }
+ 
++/*
++ * called by:
++ *   - block/linux-aio.c|248| <<qemu_laio_completion_bh>> qemu_laio_process_completions_and_submit(s);
++ *   - block/linux-aio.c|256| <<qemu_laio_completion_cb>> qemu_laio_process_completions_and_submit(s);
++ *   - block/linux-aio.c|274| <<qemu_laio_poll_ready>> qemu_laio_process_completions_and_submit(s);
++ */
+ static void qemu_laio_process_completions_and_submit(LinuxAioState *s)
+ {
+     aio_context_acquire(s->aio_context);
+@@ -257,6 +263,10 @@ static void qemu_laio_completion_cb(EventNotifier *e)
+     }
+ }
+ 
++/*
++ * 在以下使用qemu_laio_poll_cb():
++ *   - block/linux-aio.c|458| <<laio_attach_aio_context>> aio_set_event_notifier(new_context, &s->e, false, qemu_laio_completion_cb, qemu_laio_poll_cb, qemu_laio_poll_ready);
++ */
+ static bool qemu_laio_poll_cb(void *opaque)
+ {
+     EventNotifier *e = opaque;
+@@ -283,6 +293,12 @@ static void ioq_init(LaioQueue *io_q)
+     io_q->blocked = false;
+ }
+ 
++/*
++ * called by:
++ *   - block/linux-aio.c|245| <<qemu_laio_process_completions_and_submit>> ioq_submit(s);
++ *   - block/linux-aio.c|387| <<laio_io_unplug>> ioq_submit(s);
++ *   - block/linux-aio.c|418| <<laio_do_submit>> ioq_submit(s);
++ */
+ static void ioq_submit(LinuxAioState *s)
+ {
+     int ret, len;
+@@ -302,6 +318,9 @@ static void ioq_submit(LinuxAioState *s)
+             }
+         }
+ 
++	/*
++	 * 唯一调用io_submit()的地方
++	 */
+         ret = io_submit(s->ctx, len, iocbs);
+         if (ret == -EAGAIN) {
+             break;
+@@ -411,6 +430,53 @@ static int laio_do_submit(int fd, struct qemu_laiocb *laiocb, off_t offset,
+     return 0;
+ }
+ 
++/*
++ * Thread 3 "IO iothread01" hit Breakpoint 2, laio_co_submit (bs=0x561927f41620, s=0x7f67140f7430, fd=16, offset=414973952, qiov=0x7f6718de2c80, type=1, dev_max_batch=0)
++ *     at ../block/linux-aio.c:417
++ * 417	{
++ * (gdb) bt
++ * #0  laio_co_submit (bs=0x561927f41620, s=0x7f67140f7430, fd=16, offset=414973952, qiov=0x7f6718de2c80, type=1, dev_max_batch=0) at ../block/linux-aio.c:417
++ * #1  0x0000561926e85065 in raw_co_prw (bs=0x561927f41620, offset=414973952, bytes=24576, qiov=0x7f6718de2c80, type=1) at ../block/file-posix.c:2091
++ * #2  0x0000561926e85141 in raw_co_preadv (bs=0x561927f41620, offset=414973952, bytes=24576, qiov=0x7f6718de2c80, flags=0) at ../block/file-posix.c:2116
++ * #3  0x0000561926e102a3 in bdrv_driver_preadv (bs=0x561927f41620, offset=414973952, bytes=24576, qiov=0x7f6718de2c80, qiov_offset=53248, flags=0) at ../block/io.c:1160
++ * #4  0x0000561926e1140b in bdrv_aligned_preadv (child=0x561927f40430, req=0x7f6718de2dd0, offset=414973952, bytes=24576, align=512, qiov=0x7f68a8007a78, qiov_offset=53248, flags=0) at ../block/io.c:1548
++ * #5  0x0000561926e11e42 in bdrv_co_preadv_part (child=0x561927f40430, offset=414973952, bytes=24576, qiov=0x7f68a8007a78, qiov_offset=53248, flags=0) at ../block/io.c:1821
++ * #6  0x0000561926e445d2 in qcow2_co_preadv_task (bs=0x561927f39f50, subc_type=QCOW2_SUBCLUSTER_NORMAL, host_offset=414973952, offset=2218917888, bytes=24576, qiov=0x7f68a8007a78, qiov_offset=53248) at ../block/qcow2.c:2294
++ * #7  0x0000561926e44685 in qcow2_co_preadv_task_entry (task=0x7f68a800f360) at ../block/qcow2.c:2310
++ * #8  0x0000561926df5402 in aio_task_co (opaque=0x7f68a800f360) at ../block/aio_task.c:45
++ * #9  0x0000561926f76ab8 in coroutine_trampoline (i0=-1476375376, i1=32616) at ../util/coroutine-ucontext.c:177
++ * #10 0x00007f68b318c190 in __start_context () at /lib64/libc.so.6
++ * #11 0x00007f68ad13acf0 in  ()
++ * #12 0x0000000000000000 in  ()
++ *
++ *
++ * Thread 3 "IO iothread01" hit Breakpoint 1, laio_co_submit (bs=0x55c3ba450610, s=0x7fdf9c0790c0, fd=16, offset=7490646016, qiov=0x7fe12c008f58, type=2, dev_max_batch=0)
++ *     at ../block/linux-aio.c:417
++ * 417	{
++ * (gdb) bt
++ * #0  laio_co_submit (bs=0x55c3ba450610, s=0x7fdf9c0790c0, fd=16, offset=7490646016, qiov=0x7fe12c008f58, type=2, dev_max_batch=0) at ../block/linux-aio.c:417
++ * #1  0x000055c3b79c2065 in raw_co_prw (bs=0x55c3ba450610, offset=7490646016, bytes=4096, qiov=0x7fe12c008f58, type=2) at ../block/file-posix.c:2091
++ * #2  0x000055c3b79c21a2 in raw_co_pwritev (bs=0x55c3ba450610, offset=7490646016, bytes=4096, qiov=0x7fe12c008f58, flags=0) at ../block/file-posix.c:2124
++ * #3  0x000055c3b794d616 in bdrv_driver_pwritev (bs=0x55c3ba450610, offset=7490646016, bytes=4096, qiov=0x7fe12c008f58, qiov_offset=0, flags=0) at ../block/io.c:1233
++ * #4  0x000055c3b794fc65 in bdrv_aligned_pwritev (child=0x55c3ba456fe0, req=0x7fdf8a8e8940, offset=7490646016, bytes=4096, align=512, qiov=0x7fe12c008f58, qiov_offset=0, flags=0) at ../block/io.c:2097
++ * #5  0x000055c3b795056e in bdrv_co_pwritev_part (child=0x55c3ba456fe0, offset=7490646016, bytes=4096, qiov=0x7fe12c008f58, qiov_offset=0, flags=0) at ../block/io.c:2289
++ * #6  0x000055c3b7981f08 in qcow2_co_pwritev_task (bs=0x55c3ba448f40, host_offset=7490646016, offset=4810682368, bytes=4096, qiov=0x7fe12c008f58, qiov_offset=0, l2meta=0x0) at ../block/qcow2.c:2567
++ * #7  0x000055c3b7982036 in qcow2_co_pwritev_task_entry (task=0x7fdf8a8e8b40) at ../block/qcow2.c:2597
++ * #8  0x000055c3b79813d8 in qcow2_add_task (bs=0x55c3ba448f40, pool=0x0, func=0x55c3b7981fab <qcow2_co_pwritev_task_entry>, subcluster_type=QCOW2_SUBCLUSTER_UNALLOCATED_PLAIN, host_offset=7490646016, offset=4810682368, bytes=4096, qiov=0x7fe12c008f58, qiov_offset=0, l2meta=0x0) at ../block/qcow2.c:2252
++ * #9  0x000055c3b798220b in qcow2_co_pwritev_part (bs=0x55c3ba448f40, offset=4810682368, bytes=4096, qiov=0x7fe12c008f58, qiov_offset=0, flags=0) at ../block/qcow2.c:2648
++ * #10 0x000055c3b794d578 in bdrv_driver_pwritev (bs=0x55c3ba448f40, offset=4810682368, bytes=4096, qiov=0x7fe12c008f58, qiov_offset=0, flags=0) at ../block/io.c:1221
++ * #11 0x000055c3b794fc65 in bdrv_aligned_pwritev (child=0x55c3ba455bc0, req=0x7fdf8a8e8e00, offset=4810682368, bytes=4096, align=1, qiov=0x7fe12c008f58, qiov_offset=0, flags=0) at ../block/io.c:2097
++ * #12 0x000055c3b795056e in bdrv_co_pwritev_part (child=0x55c3ba455bc0, offset=4810682368, bytes=4096, qiov=0x7fe12c008f58, qiov_offset=0, flags=0) at ../block/io.c:2289
++ * #13 0x000055c3b793c2b8 in blk_co_do_pwritev_part (blk=0x55c3ba448bf0, offset=4810682368, bytes=4096, qiov=0x7fe12c008f58, qiov_offset=0, flags=0) at ../block/block-backend.c:1388
++ * #14 0x000055c3b793c87f in blk_aio_write_entry (opaque=0x7fe12c009be0) at ../block/block-backend.c:1568
++ * #15 0x000055c3b7ab3ab8 in coroutine_trampoline (i0=738215856, i1=32737) at ../util/coroutine-ucontext.c:177
++ * #16 0x00007fe138c0b190 in __start_context () at /lib64/libc.so.6
++ * #17 0x00007fe132bb9cf0 in  ()
++ * #18 0x0000000000000000 in  ()
++ *
++ * called by:
++ *   - block/file-posix.c|2099| <<raw_co_prw>> return laio_co_submit(bs, aio, s->fd, offset, qiov, type,
++ */
+ int coroutine_fn laio_co_submit(BlockDriverState *bs, LinuxAioState *s, int fd,
+                                 uint64_t offset, QEMUIOVector *qiov, int type,
+                                 uint64_t dev_max_batch)
+@@ -443,6 +509,10 @@ void laio_detach_aio_context(LinuxAioState *s, AioContext *old_context)
+     s->aio_context = NULL;
+ }
+ 
++/*
++ * called by:
++ *   - util/async.c|410| <<aio_setup_linux_aio>> laio_attach_aio_context(ctx->linux_aio, ctx);
++ */
+ void laio_attach_aio_context(LinuxAioState *s, AioContext *new_context)
+ {
+     s->aio_context = new_context;
+@@ -453,6 +523,10 @@ void laio_attach_aio_context(LinuxAioState *s, AioContext *new_context)
+                            qemu_laio_poll_ready);
+ }
+ 
++/*
++ * called by:
++ *   - util/async.c|408| <<aio_setup_linux_aio>> ctx->linux_aio = laio_init(errp);
++ */
+ LinuxAioState *laio_init(Error **errp)
+ {
+     int rc;
+diff --git a/block/mirror.c b/block/mirror.c
+index 3c4ab1159..5088c5d76 100644
+--- a/block/mirror.c
++++ b/block/mirror.c
+@@ -1453,9 +1453,31 @@ out:
+     return ret;
+ }
+ 
++/*
++ * (gdb) bt
++ * #0  bdrv_mirror_top_pwritev (bs=0x55cb1a64d410, offset=279934976, bytes=27136, qiov=0x7f588001f268, flags=0) at ../block/mirror.c:1458
++ * #1  0x000055cb18ac433e in bdrv_driver_pwritev (bs=0x55cb1a64d410, offset=279934976, bytes=27136, qiov=0x7f588001f268, qiov_offset=0, flags=0) at ../block/io.c:1233
++ * #2  0x000055cb18ac698d in bdrv_aligned_pwritev (child=0x55cb1a811fb0, req=0x7f55c85cce00, offset=279934976, bytes=27136, align=1, qiov=0x7f588001f268, qiov_offset=0, flags=0) at ../block/io.c:2097
++ * #3  0x000055cb18ac7296 in bdrv_co_pwritev_part (child=0x55cb1a811fb0, offset=279934976, bytes=27136, qiov=0x7f588001f268, qiov_offset=0, flags=0) at ../block/io.c:2289
++ * #4  0x000055cb18ab2fe0 in blk_co_do_pwritev_part (blk=0x55cb1a811c60, offset=279934976, bytes=27136, qiov=0x7f588001f268, qiov_offset=0, flags=0) at ../block/block-backend.c:1388
++ * #5  0x000055cb18ab35a7 in blk_aio_write_entry (opaque=0x7f588001e8b0) at ../block/block-backend.c:1568
++ * #6  0x000055cb18c24abd in coroutine_trampoline (i0=-2147322768, i1=32600) at ../util/coroutine-ucontext.c:177
++ * #7  0x00007f588c7e0190 in __start_context () at /lib64/libc.so.6
++ * #8  0x00007f5886c14cf0 in  ()
++ * #9  0x0000000000000000 in  ()
++ *
++ * BlockDriver bdrv_mirror_top.bdrv_co_pwritev = bdrv_mirror_top_pwritev()
++ */
+ static int coroutine_fn bdrv_mirror_top_pwritev(BlockDriverState *bs,
+     int64_t offset, int64_t bytes, QEMUIOVector *qiov, BdrvRequestFlags flags)
+ {
++    /*
++     * typedef struct MirrorBDSOpaque {
++     *     MirrorBlockJob *job;
++     *     bool stop;
++     *     bool is_commit;
++     * } MirrorBDSOpaque;
++     */
+     MirrorBDSOpaque *s = bs->opaque;
+     QEMUIOVector bounce_qiov;
+     void *bounce_buf;
+@@ -1580,6 +1602,11 @@ static BlockDriver bdrv_mirror_top = {
+     .is_filter                  = true,
+ };
+ 
++/*
++ * called by:
++ *   - block/mirror.c|1900| <<mirror_start>> mirror_start_job(job_id, bs, creation_flags, target, replaces,
++ *   - block/mirror.c|1927| <<commit_active_start>> job = mirror_start_job(
++ */
+ static BlockJob *mirror_start_job(
+                              const char *job_id, BlockDriverState *bs,
+                              int creation_flags, BlockDriverState *target,
+@@ -1882,6 +1909,12 @@ void mirror_start(const char *job_id, BlockDriverState *bs,
+                      filter_node_name, true, copy_mode, errp);
+ }
+ 
++/*
++ * called by:
++ *   - block/replication.c|740| <<replication_stop>> s->commit_job = commit_active_start(
++ *   - blockdev.c|2846| <<qmp_block_commit>> commit_active_start(job_id, top_bs, base_bs, job_flags, speed, on_error,
++ *   - qemu-img.c|1070| <<img_commit>> commit_active_start("commit", bs, base_bs, JOB_DEFAULT, rate_limit,
++ */
+ BlockJob *commit_active_start(const char *job_id, BlockDriverState *bs,
+                               BlockDriverState *base, int creation_flags,
+                               int64_t speed, BlockdevOnError on_error,
 diff --git a/block/qcow2.c b/block/qcow2.c
-index c6c6692fb..8a3975a60 100644
+index c6c6692fb..cfe2df8e3 100644
 --- a/block/qcow2.c
 +++ b/block/qcow2.c
 @@ -2217,6 +2217,12 @@ typedef struct Qcow2AioTask {
@@ -787,8 +1446,176 @@ index c6c6692fb..8a3975a60 100644
  static coroutine_fn int qcow2_add_task(BlockDriverState *bs,
                                         AioTaskPool *pool,
                                         AioTaskFunc func,
+@@ -2312,6 +2318,24 @@ static coroutine_fn int qcow2_co_preadv_task_entry(AioTask *task)
+                                 t->qiov, t->qiov_offset);
+ }
+ 
++/*
++ * Thread 3 "IO iothread01" hit Breakpoint 1, qcow2_co_preadv_part (bs=0x556b47200d40, offset=4811128832, bytes=4096, qiov=0x7fbc540096a8, qiov_offset=0, flags=0) at ../block/qcow2.c:2320
++ * 2320	{
++ * (gdb) bt
++ * #0  qcow2_co_preadv_part (bs=0x556b47200d40, offset=4811128832, bytes=4096, qiov=0x7fbc540096a8, qiov_offset=0, flags=0) at ../block/qcow2.c:2320
++ * #1  0x0000556b45012226 in bdrv_driver_preadv (bs=0x556b47200d40, offset=4811128832, bytes=4096, qiov=0x7fbc540096a8, qiov_offset=0, flags=0) at ../block/io.c:1150
++ * #2  0x0000556b4501340b in bdrv_aligned_preadv (child=0x556b4720da20, req=0x7fbaa6df4e00, offset=4811128832, bytes=4096, align=1, qiov=0x7fbc540096a8, qiov_offset=0, flags=0)
++ *     at ../block/io.c:1548
++ * #3  0x0000556b45013e42 in bdrv_co_preadv_part (child=0x556b4720da20, offset=4811128832, bytes=4096, qiov=0x7fbc540096a8, qiov_offset=0, flags=0) at ../block/io.c:1821
++ * #4  0x0000556b4500105b in blk_co_do_preadv_part (blk=0x556b472009f0, offset=4811128832, bytes=4096, qiov=0x7fbc540096a8, qiov_offset=0, flags=0) at ../block/block-backend.c:1311
++ * #5  0x0000556b450017cf in blk_aio_read_entry (opaque=0x7fbc5400bfc0) at ../block/block-backend.c:1556
++ * #6  0x0000556b45178ab8 in coroutine_trampoline (i0=1409340320, i1=32700) at ../util/coroutine-ucontext.c:177
++ * #7  0x00007fbc5f21e190 in __start_context () at /lib64/libc.so.6
++ * #8  0x00007fbc591cccf0 in  ()
++ * #9  0x0000000000000000 in  ()
++ *
++ * BlockDriver bdrv_qcow2.bdrv_co_preadv_part = qcow2_co_preadv_part()
++ */
+ static coroutine_fn int qcow2_co_preadv_part(BlockDriverState *bs,
+                                              int64_t offset, int64_t bytes,
+                                              QEMUIOVector *qiov,
+@@ -2351,6 +2375,9 @@ static coroutine_fn int qcow2_co_preadv_part(BlockDriverState *bs,
+             if (!aio && cur_bytes != bytes) {
+                 aio = aio_task_pool_new(QCOW2_MAX_WORKERS);
+             }
++            /*
++	     * AioTaskPool *aio = NULL;
++	     */
+             ret = qcow2_add_task(bs, aio, qcow2_co_preadv_task_entry, type,
+                                  host_offset, offset, cur_bytes,
+                                  qiov, qiov_offset, NULL);
+diff --git a/blockdev.c b/blockdev.c
+index 9230888e3..43134adbc 100644
+--- a/blockdev.c
++++ b/blockdev.c
+@@ -1042,6 +1042,27 @@ static void blockdev_do_action(TransactionAction *action, Error **errp)
+     qmp_transaction(&list, false, NULL, errp);
+ }
+ 
++/*
++ * blockdev-snapshot-sync node-name=drive01 snapshot-file=/tmp/overlay01.qcow2 snapshot-node-name=over01
++ *
++ * (gdb) bt
++ * #0  qmp_blockdev_snapshot_sync (has_device=false, device=0x0, has_node_name=true, node_name=0x556c8fb16a90 "drive01",
++ *     snapshot_file=0x556c8fbf3be0 "/tmp/overlay01.qcow2", has_snapshot_node_name=true, snapshot_node_name=0x556c8fb93fe0 "over01",
++ *     has_format=false, format=0x0, has_mode=false, mode=NEW_IMAGE_MODE_EXISTING, errp=0x7ffccc4ddf18) at ../blockdev.c:1052
++ * #1  0x0000556c8d20945a in qmp_marshal_blockdev_snapshot_sync (args=0x7f2d60003ad0, ret=0x7f2d7d430d98, errp=0x7f2d7d430d90) at qapi/qapi-commands-block-core.c:280
++ * #2  0x0000556c8d2814fb in do_qmp_dispatch_bh (opaque=0x7f2d7d430e30) at ../qapi/qmp-dispatch.c:128
++ * #3  0x0000556c8d2a6dcc in aio_bh_call (bh=0x556c90235f30) at ../util/async.c:150
++ * #4  0x0000556c8d2a6ed6 in aio_bh_poll (ctx=0x556c8f904d40) at ../util/async.c:178
++ * #5  0x0000556c8d28e16b in aio_dispatch (ctx=0x556c8f904d40) at ../util/aio-posix.c:421
++ * #6  0x0000556c8d2a7307 in aio_ctx_dispatch (source=0x556c8f904d40, callback=0x0, user_data=0x0) at ../util/async.c:320
++ * #7  0x00007f2d7c09e119 in g_main_context_dispatch () at /lib64/libglib-2.0.so.0
++ * #8  0x0000556c8d2b9010 in glib_pollfds_poll () at ../util/main-loop.c:297
++ * #9  0x0000556c8d2b908a in os_host_main_loop_wait (timeout=0) at ../util/main-loop.c:320
++ * #10 0x0000556c8d2b918f in main_loop_wait (nonblocking=0) at ../util/main-loop.c:596
++ * #11 0x0000556c8ce2105e in qemu_main_loop () at ../softmmu/runstate.c:734
++ * #12 0x0000556c8cbc6e62 in qemu_main (argc=32, argv=0x7ffccc4de388, envp=0x0) at ../softmmu/main.c:38
++ * #13 0x0000556c8cbc6e94 in main (argc=32, argv=0x7ffccc4de388) at ../softmmu/main.c:47
++ */
+ void qmp_blockdev_snapshot_sync(bool has_device, const char *device,
+                                 bool has_node_name, const char *node_name,
+                                 const char *snapshot_file,
+@@ -1406,6 +1427,28 @@ typedef struct ExternalSnapshotState {
+     bool overlay_appended;
+ } ExternalSnapshotState;
+ 
++/*
++ * blockdev-snapshot-sync node-name=drive01 snapshot-file=/tmp/overlay01.qcow2 snapshot-node-name=over01
++ *
++ * (gdb) bt
++ * #0  qmp_blockdev_snapshot_sync (has_device=false, device=0x0, has_node_name=true, node_name=0x556c8fb16a90 "drive01",
++ *     snapshot_file=0x556c8fbf3be0 "/tmp/overlay01.qcow2", has_snapshot_node_name=true, snapshot_node_name=0x556c8fb93fe0 "over01",
++ *     has_format=false, format=0x0, has_mode=false, mode=NEW_IMAGE_MODE_EXISTING, errp=0x7ffccc4ddf18) at ../blockdev.c:1052
++ * #1  0x0000556c8d20945a in qmp_marshal_blockdev_snapshot_sync (args=0x7f2d60003ad0, ret=0x7f2d7d430d98, errp=0x7f2d7d430d90) at qapi/qapi-commands-block-core.c:280
++ * #2  0x0000556c8d2814fb in do_qmp_dispatch_bh (opaque=0x7f2d7d430e30) at ../qapi/qmp-dispatch.c:128
++ * #3  0x0000556c8d2a6dcc in aio_bh_call (bh=0x556c90235f30) at ../util/async.c:150
++ * #4  0x0000556c8d2a6ed6 in aio_bh_poll (ctx=0x556c8f904d40) at ../util/async.c:178
++ * #5  0x0000556c8d28e16b in aio_dispatch (ctx=0x556c8f904d40) at ../util/aio-posix.c:421
++ * #6  0x0000556c8d2a7307 in aio_ctx_dispatch (source=0x556c8f904d40, callback=0x0, user_data=0x0) at ../util/async.c:320
++ * #7  0x00007f2d7c09e119 in g_main_context_dispatch () at /lib64/libglib-2.0.so.0
++ * #8  0x0000556c8d2b9010 in glib_pollfds_poll () at ../util/main-loop.c:297
++ * #9  0x0000556c8d2b908a in os_host_main_loop_wait (timeout=0) at ../util/main-loop.c:320
++ * #10 0x0000556c8d2b918f in main_loop_wait (nonblocking=0) at ../util/main-loop.c:596
++ * #11 0x0000556c8ce2105e in qemu_main_loop () at ../softmmu/runstate.c:734
++ * #12 0x0000556c8cbc6e62 in qemu_main (argc=32, argv=0x7ffccc4de388, envp=0x0) at ../softmmu/main.c:38
++ * #13 0x0000556c8cbc6e94 in main (argc=32, argv=0x7ffccc4de388) at ../softmmu/main.c:47
++ */
++
+ static void external_snapshot_prepare(BlkActionState *common,
+                                       Error **errp)
+ {
+@@ -1440,6 +1483,22 @@ static void external_snapshot_prepare(BlkActionState *common,
+         break;
+     case TRANSACTION_ACTION_KIND_BLOCKDEV_SNAPSHOT_SYNC:
+         {
++            /*
++	     * qmp_blockdev_snapshot_sync()的data的一个例子
++	     * BlockdevSnapshotSync snapshot = {
++             *     .has_device = has_device,
++	     *     .device = (char *) device,
++	     *     .has_node_name = has_node_name,
++	     *     .node_name = (char *) node_name,
++	     *     .snapshot_file = (char *) snapshot_file,
++	     *     .has_snapshot_node_name = has_snapshot_node_name,
++	     *     .snapshot_node_name = (char *) snapshot_node_name,
++	     *     .has_format = has_format,
++	     *     .format = (char *) format,
++	     *     .has_mode = has_mode,
++	     *     .mode = mode,
++	     * };
++	     */
+             BlockdevSnapshotSync *s = action->u.blockdev_snapshot_sync.data;
+             device = s->has_device ? s->device : NULL;
+             node_name = s->has_node_name ? s->node_name : NULL;
+@@ -1456,6 +1515,9 @@ static void external_snapshot_prepare(BlkActionState *common,
+         return;
+     }
+ 
++    /*
++     * ExternalSnapshotState *state
++     */
+     state->old_bs = bdrv_lookup_bs(device, node_name, errp);
+     if (!state->old_bs) {
+         return;
+@@ -1532,6 +1594,9 @@ static void external_snapshot_prepare(BlkActionState *common,
+         qdict_put_str(options, "driver", format);
+     }
+ 
++    /*
++     * 返回BlockDriverState
++     */
+     state->new_bs = bdrv_open(new_image_file, snapshot_ref, options, flags,
+                               errp);
+     /* We will manually add the backing_hd field to the bs later */
+@@ -1565,6 +1630,18 @@ static void external_snapshot_prepare(BlkActionState *common,
+         goto out;
+     }
+ 
++    /*
++     * Add new bs contents at the top of an image chain while the chain is
++5431  * live, while keeping required fields on the top layer.
++5432  *
++5433  * This will modify the BlockDriverState fields, and swap contents
++5434  * between bs_new and bs_top. Both bs_new and bs_top are modified.
++5435  *
++5436  * bs_new must not be attached to a BlockBackend and must not have backing
++5437  * child.
++5438  *
++5439  * This function does not create any image files.
++     */
+     ret = bdrv_append(state->new_bs, state->old_bs, errp);
+     if (ret < 0) {
+         goto out;
+@@ -2721,6 +2798,9 @@ void qmp_block_commit(bool has_job_id, const char *job_id, const char *device,
+ 
+     assert(bdrv_get_aio_context(base_bs) == aio_context);
+ 
++    /*
++     * BlockDriverState *base_bs, *top_bs;
++     */
+     for (iter = top_bs; iter != bdrv_filter_or_cow_bs(base_bs);
+          iter = bdrv_filter_or_cow_bs(iter))
+     {
 diff --git a/blockjob.c b/blockjob.c
-index 4868453d7..214472cdf 100644
+index 4868453d7..1412311d3 100644
 --- a/blockjob.c
 +++ b/blockjob.c
 @@ -221,6 +221,48 @@ bool block_job_has_bdrv(BlockJob *job, BlockDriverState *bs)
@@ -840,11 +1667,39 @@ index 4868453d7..214472cdf 100644
  int block_job_add_bdrv(BlockJob *job, const char *name, BlockDriverState *bs,
                         uint64_t perm, uint64_t shared_perm, Error **errp)
  {
-@@ -438,6 +480,13 @@ static void block_job_event_ready(Notifier *n, void *opaque)
+@@ -438,6 +480,41 @@ static void block_job_event_ready(Notifier *n, void *opaque)
   * declared in blockjob_int.h.
   */
  
 +/*
++ * * (gdb) bt
++ * #0  block_job_add_bdrv (job=0x563526791c30, name=0x5635241c4cc0 "main node", bs=0x563526663740, perm=1, shared_perm=7, errp=0x7ffdb00dbd68) at ../blockjob.c:229
++ * #1  0x0000563523e6e693 in block_job_create
++ *     (job_id=0x56352669eb30 "drive01", driver=0x5635244fe400 <mirror_job_driver>, txn=0x0, bs=0x563526663740, perm=1, shared_perm=7, speed=0, flags=0, cb=0x0, opaque=0x0, errp=0x7ffdb00dbd68) at ../blockjob.c:483
++ * #2  0x0000563523ea7209 in mirror_start_job
++ *     (job_id=0x0, bs=0x563526692110, creation_flags=0, target=0x56352743e410, replaces=0x0, speed=0, granularity=65536, buf_size=16777216, backing_mode=MIRROR_SOURCE_BACKING_CHAIN, zero_target=false, on_source_error=BLOCKDEV_ON_ERROR_REPORT, on_target_error=BLOCKDEV_ON_ERROR_REPORT, unmap=true, cb=0x0, opaque=0x0, driver=0x5635244fe400 <mirror_job_driver>, is_none_mode=false, base=0x0, auto_complete=false, filter_node_name=0x0, is_mirror=true, copy_mode=MIRROR_COPY_MODE_BACKGROUND, errp=0x7ffdb00dbd68) at ../block/mirror.c:1664
++ * #3  0x0000563523ea7962 in mirror_start
++ *     (job_id=0x0, bs=0x563526692110, target=0x56352743e410, replaces=0x0, creation_flags=0, speed=0, granularity=0, buf_size=0, mode=MIRROR_SYNC_MODE_FULL, backing_mode=MIRROR_SOURCE_BACKING_CHAIN, zero_target=false, on_source_error=BLOCKDEV_ON_ERROR_REPORT, on_target_error=BLOCKDEV_ON_ERROR_REPORT, unmap=true, filter_node_name=0x0, copy_mode=MIRROR_COPY_MODE_BACKGROUND, errp=0x7ffdb00dbd68) at ../block/mirror.c:1878
++ * #4  0x0000563523e544fe in blockdev_mirror_common (job_id=0x0, bs=0x563526692110, target=0x56352743e410, has_replaces=false, replaces=0x0, sync=MIRROR_SYNC_MODE_FULL, backing_mode=MIRROR_SOURCE_BACKING_CHAIN, zero_target=false, has_speed=false, speed=0, has_granularity=false, granularity=0, has_buf_size=false, buf_size=0, has_on_source_error=false, on_source_error=BLOCKDEV_ON_ERROR_REPORT, has_on_target_error=false, on_target_error=BLOCKDEV_ON_ERROR_REPORT, has_unmap=false, unmap=true, has_filter_node_name=false, filter_node_name=0x0, has_copy_mode=false, copy_mode=MIRROR_COPY_MODE_BACKGROUND, has_auto_finalize=false, auto_finalize=false, has_auto_dismiss=false, auto_dismiss=false, errp=0x7ffdb00dbd68) at ../blockdev.c:3072
++ * #5  0x0000563523e54c3b in qmp_drive_mirror (arg=0x7ffdb00dbd80, errp=0x7ffdb00dbd68) at ../blockdev.c:3217
++ * #6  0x0000563523b675ff in hmp_drive_mirror (mon=0x56352644b670, qdict=0x563526e17600) at ../block/monitor/block-hmp-cmds.c:256
++ * #7  0x0000563523bc6c3e in handle_hmp_command_exec (mon=0x56352644b670, cmd=0x5635247f33b0 <hmp_cmds+2320>, qdict=0x563526e17600) at ../monitor/hmp.c:1103
++ * #8  0x0000563523bc6e6b in handle_hmp_command (mon=0x56352644b670, cmdline=0x5635266ca0fd "drive01 mytest01.qcow2") at ../monitor/hmp.c:1155
++ * #9  0x0000563523bc4384 in monitor_command_cb (opaque=0x56352644b670, cmdline=0x5635266ca0f0 "drive_mirror drive01 mytest01.qcow2", readline_opaque=0x0) at ../monitor/hmp.c:49
++ * #10 0x00005635240135dd in readline_handle_byte (rs=0x5635266ca0f0, ch=13) at ../util/readline.c:411
++ * #11 0x0000563523bc79a8 in monitor_read (opaque=0x56352644b670, buf=0x7ffdb00dc080 "\r\300\r\260\375\177", size=1) at ../monitor/hmp.c:1393
++ * #12 0x0000563523f2b613 in qemu_chr_be_write_impl (s=0x56352666d040, buf=0x7ffdb00dc080 "\r\300\r\260\375\177", len=1) at ../chardev/char.c:201
++ * #13 0x0000563523f2b677 in qemu_chr_be_write (s=0x56352666d040, buf=0x7ffdb00dc080 "\r\300\r\260\375\177", len=1) at ../chardev/char.c:213
++ * #14 0x0000563523f2e0a4 in fd_chr_read (chan=0x56352666dfa0, cond=G_IO_IN, opaque=0x56352666d040) at ../chardev/char-fd.c:72
++ * #15 0x0000563523e2d5b4 in qio_channel_fd_source_dispatch (source=0x563526e2cb00, callback=0x563523f2df7a <fd_chr_read>, user_data=0x56352666d040) at ../io/channel-watch.c:84
++ * #16 0x00007feb17b65119 in g_main_context_dispatch () at /lib64/libglib-2.0.so.0
++ * #17 0x000056352400c010 in glib_pollfds_poll () at ../util/main-loop.c:297
++ * #18 0x000056352400c08a in os_host_main_loop_wait (timeout=499000000) at ../util/main-loop.c:320
++ * #19 0x000056352400c18f in main_loop_wait (nonblocking=0) at ../util/main-loop.c:596
++ * #20 0x0000563523b7405e in qemu_main_loop () at ../softmmu/runstate.c:734
++ * #21 0x0000563523919e62 in qemu_main (argc=30, argv=0x7ffdb00dd368, envp=0x0) at ../softmmu/main.c:38
++ * #22 0x0000563523919e94 in main (argc=30, argv=0x7ffdb00dd368) at ../softmmu/main.c:47
++ *
 + * called by:
 + *   - block/backup.c|467| <<backup_job_create>> job = block_job_create(job_id, &backup_job_driver, txn, cbw,
 + *   - block/commit.c|282| <<commit_start>> s = block_job_create(job_id, &commit_job_driver, NULL, bs, 0, BLK_PERM_ALL,
@@ -1185,10 +2040,23 @@ index 0a81f1ad9..7d75ec0f2 100644
  {
      PIIX4PMState *s = PIIX4_PM(obj);
 diff --git a/hw/block/virtio-blk.c b/hw/block/virtio-blk.c
-index e9ba752f6..c8ed2b03d 100644
+index e9ba752f6..3b3df23e9 100644
 --- a/hw/block/virtio-blk.c
 +++ b/hw/block/virtio-blk.c
-@@ -424,6 +424,9 @@ static inline void submit_requests(BlockBackend *blk, MultiReqBuffer *mrb,
+@@ -384,6 +384,12 @@ static void virtio_blk_handle_scsi(VirtIOBlockReq *req)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - hw/block/virtio-blk.c|460| <<virtio_blk_submit_multireq>> submit_requests(blk, mrb, 0, 1, -1);
++ *   - hw/block/virtio-blk.c|484| <<virtio_blk_submit_multireq>> submit_requests(blk, mrb, start, num_reqs, niov);
++ *   - hw/block/virtio-blk.c|500| <<virtio_blk_submit_multireq>> submit_requests(blk, mrb, start, num_reqs, niov);
++ */
+ static inline void submit_requests(BlockBackend *blk, MultiReqBuffer *mrb,
+                                    int start, int num_reqs, int niov)
+ {
+@@ -424,6 +430,9 @@ static inline void submit_requests(BlockBackend *blk, MultiReqBuffer *mrb,
          blk_aio_pwritev(blk, sector_num << BDRV_SECTOR_BITS, qiov, 0,
                          virtio_blk_rw_complete, mrb->reqs[start]);
      } else {
@@ -1198,6 +2066,122 @@ index e9ba752f6..c8ed2b03d 100644
          blk_aio_preadv(blk, sector_num << BDRV_SECTOR_BITS, qiov, 0,
                         virtio_blk_rw_complete, mrb->reqs[start]);
      }
+@@ -447,6 +456,13 @@ static int multireq_compare(const void *a, const void *b)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - hw/block/virtio-blk.c|515| <<virtio_blk_handle_flush>> virtio_blk_submit_multireq(s->blk, mrb);
++ *   - hw/block/virtio-blk.c|695| <<virtio_blk_handle_request>> virtio_blk_submit_multireq(s->blk, mrb);
++ *   - hw/block/virtio-blk.c|802| <<virtio_blk_handle_vq>> virtio_blk_submit_multireq(s->blk, &mrb);
++ *   - hw/block/virtio-blk.c|851| <<virtio_blk_process_queued_requests>> virtio_blk_submit_multireq(s->blk, &mrb);
++ */
+ static void virtio_blk_submit_multireq(BlockBackend *blk, MultiReqBuffer *mrb)
+ {
+     int i = 0, start = 0, num_reqs = 0, niov = 0, nb_sectors = 0;
+@@ -614,6 +630,11 @@ err:
+     return err_status;
+ }
+ 
++/*
++ * called by:
++ *   - hw/block/virtio-blk.c|806| <<virtio_blk_handle_vq>> if (virtio_blk_handle_request(req, &mrb)) {
++ *   - hw/block/virtio-blk.c|861| <<virtio_blk_process_queued_requests>> if (virtio_blk_handle_request(req, &mrb)) {
++ */
+ static int virtio_blk_handle_request(VirtIOBlockReq *req, MultiReqBuffer *mrb)
+ {
+     uint32_t type;
+@@ -768,12 +789,23 @@ static int virtio_blk_handle_request(VirtIOBlockReq *req, MultiReqBuffer *mrb)
+     return 0;
+ }
+ 
++/*
++ * called by:
++ *   - hw/block/virtio-blk.c|835| <<virtio_blk_handle_output>> virtio_blk_handle_vq(s, vq);
++ */
+ void virtio_blk_handle_vq(VirtIOBlock *s, VirtQueue *vq)
+ {
+     VirtIOBlockReq *req;
+     MultiReqBuffer mrb = {};
+     bool suppress_notifications = virtio_queue_get_notification(vq);
+ 
++    /*
++     * VirtIOBlock *s:
++     * -> VirtIODevice parent_obj;
++     * -> BlockBackend *blk;
++     *    -> BdrvChild *root;
++     *    -> AioContext *ctx;
++     */
+     aio_context_acquire(blk_get_aio_context(s->blk));
+     blk_io_plug(s->blk);
+ 
+@@ -803,6 +835,10 @@ void virtio_blk_handle_vq(VirtIOBlock *s, VirtQueue *vq)
+     aio_context_release(blk_get_aio_context(s->blk));
+ }
+ 
++/*
++ * 在以下使用virtio_blk_handle_output():
++ *   - hw/block/virtio-blk.c|1245| <<virtio_blk_device_realize>> virtio_add_queue(vdev, conf->queue_size, virtio_blk_handle_output);
++ */
+ static void virtio_blk_handle_output(VirtIODevice *vdev, VirtQueue *vq)
+ {
+     VirtIOBlock *s = (VirtIOBlock *)vdev;
+@@ -819,6 +855,11 @@ static void virtio_blk_handle_output(VirtIODevice *vdev, VirtQueue *vq)
+     virtio_blk_handle_vq(s, vq);
+ }
+ 
++/*called by:
++ *   - hw/block/dataplane/virtio-blk.c|241| <<virtio_blk_data_plane_start>> virtio_blk_process_queued_requests(vblk, false);
++ *   - hw/block/dataplane/virtio-blk.c|279| <<virtio_blk_data_plane_start>> virtio_blk_process_queued_requests(vblk, false);
++ *   - hw/block/virtio-blk.c|879| <<virtio_blk_dma_restart_bh>> virtio_blk_process_queued_requests(s, true);
++ */
+ void virtio_blk_process_queued_requests(VirtIOBlock *s, bool is_bh)
+ {
+     VirtIOBlockReq *req = s->rq;
+@@ -853,6 +894,10 @@ void virtio_blk_process_queued_requests(VirtIOBlock *s, bool is_bh)
+     aio_context_release(blk_get_aio_context(s->conf.conf.blk));
+ }
+ 
++/*
++ * 在以下使用virtio_blk_dma_restart_bh():
++ *   - hw/block/virtio-blk.c|899| <<virtio_blk_dma_restart_cb>> s->bh = aio_bh_new(blk_get_aio_context(s->conf.conf.blk), virtio_blk_dma_restart_bh, s);
++ */
+ static void virtio_blk_dma_restart_bh(void *opaque)
+ {
+     VirtIOBlock *s = opaque;
+@@ -863,6 +908,10 @@ static void virtio_blk_dma_restart_bh(void *opaque)
+     virtio_blk_process_queued_requests(s, true);
+ }
+ 
++/*
++ * 在以下使用virtio_blk_dma_restart_cb():
++ *   - hw/block/virtio-blk.c|1245| <<virtio_blk_device_realize>> s->change = qemu_add_vm_change_state_handler(virtio_blk_dma_restart_cb, s);
++ */
+ static void virtio_blk_dma_restart_cb(void *opaque, bool running,
+                                       RunState state)
+ {
+@@ -1139,10 +1188,20 @@ static void virtio_blk_device_realize(DeviceState *dev, Error **errp)
+ {
+     VirtIODevice *vdev = VIRTIO_DEVICE(dev);
+     VirtIOBlock *s = VIRTIO_BLK(dev);
++    /*
++     * 在set_drive()设置
++     */
+     VirtIOBlkConf *conf = &s->conf;
+     Error *err = NULL;
+     unsigned i;
+ 
++    /*
++     * VirtIOBlkConf *conf:
++     * -> BlockConf conf;
++     *    -> BlockBackend *blk;
++     *
++     * 在set_drive()设置
++     */
+     if (!conf->conf.blk) {
+         error_setg(errp, "drive property not set");
+         return;
 diff --git a/hw/core/loader.c b/hw/core/loader.c
 index 054883073..73bade68c 100644
 --- a/hw/core/loader.c
@@ -1330,6 +2314,37 @@ index 054883073..73bade68c 100644
          if (mr) {
              rom->mr = mr;
              snprintf(devpath, sizeof(devpath), "/rom@%s", file);
+diff --git a/hw/core/qdev-properties-system.c b/hw/core/qdev-properties-system.c
+index a91f60567..d9b8499d9 100644
+--- a/hw/core/qdev-properties-system.c
++++ b/hw/core/qdev-properties-system.c
+@@ -182,6 +182,26 @@ fail:
+     g_free(str);
+ }
+ 
++/*
++ * (gdb) bt
++ * #0  set_drive (obj=0x555557767e20, v=0x55555776cb40, name=0x555557768c00 "drive", opaque=0x5555566eaac0 <virtio_blk_properties>, errp=0x7fffffffd900) at ../hw/core/qdev-properties-system.c:188
++ * #1  0x0000555555d1d343 in field_prop_set (obj=0x555557767e20, v=0x55555776cb40, name=0x555557768c00 "drive", opaque=0x5555566eaac0 <virtio_blk_properties>, errp=0x7fffffffd900)
++ *                        at ../hw/core/qdev-properties.c:86
++ * #2  0x0000555555d289e7 in object_property_set (obj=0x555557767e20, name=0x555557768c00 "drive", v=0x55555776cb40, errp=0x7fffffffd900) at ../qom/object.c:1408
++ * #3  0x0000555555d2b8fe in property_set_alias (obj=0x55555775fa60, v=0x55555776c960, name=0x55555776c8f0 "drive", opaque=0x5555577683d0, errp=0x7fffffffd900) at ../qom/object.c:2714
++ * #4  0x0000555555d289e7 in object_property_set (obj=0x55555775fa60, name=0x55555776c8f0 "drive", v=0x55555776c960, errp=0x7fffffffd900) at ../qom/object.c:1408
++ * #5  0x0000555555d2bf71 in object_set_properties_from_qdict (obj=0x55555775fa60, qdict=0x55555776b880, v=0x55555776c960, errp=0x7fffffffd900) at ../qom/object_interfaces.c:55
++ * #6  0x0000555555d2c057 in object_set_properties_from_keyval (obj=0x55555775fa60, qdict=0x55555776b880, from_json=false, errp=0x7fffffffd900) at ../qom/object_interfaces.c:73
++ * #7  0x0000555555a77660 in qdev_device_add_from_qdict (opts=0x55555775ea40, from_json=false, errp=0x7fffffffd900) at ../softmmu/qdev-monitor.c:708
++ * #8  0x0000555555a7772c in qdev_device_add (opts=0x555556847560, errp=0x5555567d1640 <error_fatal>) at ../softmmu/qdev-monitor.c:733
++ * #9  0x0000555555a7cc07 in device_init_func (opaque=0x0, opts=0x555556847560, errp=0x5555567d1640 <error_fatal>) at ../softmmu/vl.c:1142
++ * #10 0x0000555555ef49df in qemu_opts_foreach (list=0x5555566d20e0 <qemu_device_opts>, func=0x555555a7cbe0 <device_init_func>, opaque=0x0, errp=0x5555567d1640 <error_fatal>) at ../util/qemu-option.c:1135
++ * #11 0x0000555555a800c7 in qemu_create_cli_devices () at ../softmmu/vl.c:2514
++ * #12 0x0000555555a80282 in qmp_x_exit_preconfig (errp=0x5555567d1640 <error_fatal>) at ../softmmu/vl.c:2582
++ * #13 0x0000555555a8290d in qemu_init (argc=32, argv=0x7fffffffdd58, envp=0x0) at ../softmmu/vl.c:3584
++ * #14 0x000055555581fe5d in qemu_main (argc=32, argv=0x7fffffffdd58, envp=0x0) at ../softmmu/main.c:37
++ * #15 0x000055555581fe94 in main (argc=32, argv=0x7fffffffdd58) at ../softmmu/main.c:47
++ */
+ static void set_drive(Object *obj, Visitor *v, const char *name, void *opaque,
+                       Error **errp)
+ {
 diff --git a/hw/core/qdev.c b/hw/core/qdev.c
 index 0806d8fca..eccef5c1a 100644
 --- a/hw/core/qdev.c
@@ -2550,6 +3565,32 @@ index 5d607aeaa..43216e9c7 100644
  void virtio_queue_aio_detach_host_notifier(VirtQueue *vq, AioContext *ctx)
  {
      aio_set_event_notifier(ctx, &vq->host_notifier, true, NULL, NULL, NULL);
+diff --git a/include/block/block_int-common.h b/include/block/block_int-common.h
+index 8947abab7..3bedd89a8 100644
+--- a/include/block/block_int-common.h
++++ b/include/block/block_int-common.h
+@@ -942,6 +942,10 @@ struct BdrvChildClass {
+ 
+ extern const BdrvChildClass child_of_bds;
+ 
++/*
++ * 感觉BdrvChild->next挂的是file的
++ * BdrvChild->bs->children是overlay下面的原始的BdrvChild
++ */
+ struct BdrvChild {
+     BlockDriverState *bs;
+     char *name;
+@@ -1103,6 +1107,10 @@ struct BlockDriverState {
+      * parent node of this node.
+      */
+     BlockDriverState *inherits_from;
++    /*
++     * 如果是snapshop, parents是自己, 是生成的snapshot, overlay的最上一次
++     * children是base
++     */
+     QLIST_HEAD(, BdrvChild) children;
+     QLIST_HEAD(, BdrvChild) parents;
+ 
 diff --git a/include/exec/memory.h b/include/exec/memory.h
 index bfb1de8ee..d652a7d75 100644
 --- a/include/exec/memory.h
@@ -2992,6 +4033,42 @@ index 529194a56..253db1a3e 100644
      return iothread->ctx;
  }
  
+diff --git a/job.c b/job.c
+index 075c6f3a2..e02708b83 100644
+--- a/job.c
++++ b/job.c
+@@ -968,6 +968,20 @@ static void coroutine_fn job_co_entry(void *opaque)
+     aio_bh_schedule_oneshot(qemu_get_aio_context(), job_exit, job);
+ }
+ 
++/*
++ * called by:
++ *   - block/amend.c|144| <<qmp_x_blockdev_amend>> job_start(&s->common);
++ *   - block/commit.c|400| <<commit_start>> job_start(&s->common.job);
++ *   - block/create.c|100| <<qmp_blockdev_create>> job_start(&s->common);
++ *   - block/mirror.c|1852| <<mirror_start_job>> job_start(&s->common.job);
++ *   - block/replication.c|603| <<replication_start>> job_start(&s->backup_job->job);
++ *   - block/stream.c|370| <<stream_start>> job_start(&s->common.job);
++ *   - blockdev.c|1903| <<drive_backup_commit>> job_start(&state->job->job);
++ *   - blockdev.c|2004| <<blockdev_backup_commit>> job_start(&state->job->job);
++ *   - migration/savevm.c|3268| <<qmp_snapshot_save>> job_start(&s->common);
++ *   - migration/savevm.c|3290| <<qmp_snapshot_load>> job_start(&s->common);
++ *   - migration/savevm.c|3310| <<qmp_snapshot_delete>> job_start(&s->common);
++ */
+ void job_start(Job *job)
+ {
+     assert(job && !job_started(job) && job->paused &&
+@@ -1073,6 +1087,10 @@ void job_complete(Job *job, Error **errp)
+         return;
+     }
+ 
++    /*
++     * Job *job:
++     * -> const JobDriver *driver;
++     */
+     job->driver->complete(job, errp);
+ }
+ 
 diff --git a/monitor/hmp.c b/monitor/hmp.c
 index 15ca04735..ce000ecc0 100644
 --- a/monitor/hmp.c
@@ -3118,10 +4195,46 @@ index 954efed01..c5ff4fd09 100644
  {
      const char *shutdown_flag;
 diff --git a/qom/object.c b/qom/object.c
-index d34608558..c9d8eb39c 100644
+index d34608558..5d61273dc 100644
 --- a/qom/object.c
 +++ b/qom/object.c
-@@ -2125,6 +2125,13 @@ Object *object_resolve_path_type(const char *path, const char *typename,
+@@ -854,6 +854,17 @@ bool object_set_propv(Object *obj,
+ 
+ Object *object_dynamic_cast(Object *obj, const char *typename)
+ {
++    /*
++     * 153 struct Object
++     * 154 {
++     * 155     // private:
++     * 156     ObjectClass *class;
++     * 157     ObjectFree *free;
++     * 158     GHashTable *properties;
++     * 159     uint32_t ref;
++     * 160     Object *parent;
++     * 161 };
++     */
+     if (obj && object_class_dynamic_cast(object_get_class(obj), typename)) {
+         return obj;
+     }
+@@ -1102,6 +1113,17 @@ static int do_object_child_foreach(Object *obj,
+     ObjectProperty *prop;
+     int ret = 0;
+ 
++    /*
++     * 153 struct Object
++     * 154 {
++     * 155     // private:
++     * 156     ObjectClass *class;
++     * 157     ObjectFree *free;
++     * 158     GHashTable *properties;
++     * 159     uint32_t ref;
++     * 160     Object *parent;
++     * 161 };
++     */
+     g_hash_table_iter_init(&iter, obj->properties);
+     while (g_hash_table_iter_next(&iter, NULL, (gpointer *)&prop)) {
+         if (object_property_is_child(prop)) {
+@@ -2125,6 +2147,13 @@ Object *object_resolve_path_type(const char *path, const char *typename,
      Object *obj;
      char **parts;
  
@@ -4707,6 +5820,21 @@ index 98c5accd2..948ee021b 100644
 +     */
      AIO_WAIT_WHILE(ctx, !data.done);
  }
+diff --git a/util/async.c b/util/async.c
+index 63434ddae..c2cf07802 100644
+--- a/util/async.c
++++ b/util/async.c
+@@ -402,6 +402,10 @@ ThreadPool *aio_get_thread_pool(AioContext *ctx)
+ }
+ 
+ #ifdef CONFIG_LINUX_AIO
++/*
++ * called by:
++ *   - block/file-posix.c|712| <<raw_open_common>> if (!aio_setup_linux_aio(bdrv_get_aio_context(bs), errp)) {
++ */
+ LinuxAioState *aio_setup_linux_aio(AioContext *ctx, Error **errp)
+ {
+     if (!ctx->linux_aio) {
 diff --git a/util/log.c b/util/log.c
 index d6eb0378c..912f580bc 100644
 --- a/util/log.c
