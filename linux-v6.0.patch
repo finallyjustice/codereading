@@ -1,6 +1,6 @@
-From 09ec3c25a678fb55dc291903e454a820db59ef3e Mon Sep 17 00:00:00 2001
+From 46d3fe26627382144e2489759001145b2eb9785f Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Mon, 3 Apr 2023 07:39:39 -0700
+Date: Wed, 5 Apr 2023 23:26:06 -0700
 Subject: [PATCH 1/1] linux v6.0
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
@@ -33,7 +33,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  arch/x86/kvm/cpuid.c                   |  56 ++
  arch/x86/kvm/cpuid.h                   |  74 +++
  arch/x86/kvm/kvm_cache_regs.h          |   7 +
- arch/x86/kvm/lapic.c                   |  14 +
+ arch/x86/kvm/lapic.c                   |  19 +
  arch/x86/kvm/mmu.h                     |   4 +
  arch/x86/kvm/mmu/mmu.c                 |  68 +++
  arch/x86/kvm/mmu/page_track.c          |  14 +
@@ -74,7 +74,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  drivers/virtio/virtio_pci_modern_dev.c |   7 +
  drivers/virtio/virtio_ring.c           | 601 +++++++++++++++++++++
  include/linux/clocksource.h            |   9 +
- include/linux/kvm_host.h               |  11 +
+ include/linux/kvm_host.h               |  18 +
  include/linux/perf_event.h             |  12 +
  include/linux/time_namespace.h         |   7 +
  include/linux/timekeeper_internal.h    |  66 +++
@@ -117,8 +117,9 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  tools/perf/util/stat-display.c         |  21 +
  tools/perf/util/stat.c                 |  32 ++
  tools/perf/util/synthetic-events.c     |  26 +
- virt/kvm/kvm_main.c                    |  22 +
- 113 files changed, 6222 insertions(+)
+ virt/kvm/eventfd.c                     |  12 +
+ virt/kvm/kvm_main.c                    |  72 +++
+ 114 files changed, 6296 insertions(+)
 
 diff --git a/arch/x86/events/amd/core.c b/arch/x86/events/amd/core.c
 index 9ac371841..328c9647f 100644
@@ -1992,10 +1993,22 @@ index 3febc3423..2f8f859ec 100644
  {
  	vcpu->arch.hflags &= ~HF_GUEST_MASK;
 diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
-index 9dda989a1..61b27c3b3 100644
+index 9dda989a1..fb7f1fefb 100644
 --- a/arch/x86/kvm/lapic.c
 +++ b/arch/x86/kvm/lapic.c
-@@ -2524,6 +2524,13 @@ int apic_has_pending_timer(struct kvm_vcpu *vcpu)
+@@ -1121,6 +1121,11 @@ bool kvm_intr_is_single_vcpu_fast(struct kvm *kvm, struct kvm_lapic_irq *irq,
+  * Add a pending IRQ into lapic.
+  * Return 1 if successfully added and 0 if discarded.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|660| <<kvm_apic_set_irq>> return __apic_accept_irq(apic, irq->delivery_mode, irq->vector,
++ *   - arch/x86/kvm/lapic.c|2543| <<kvm_apic_local_deliver>> return __apic_accept_irq(apic, mode, vector, 1, trig_mode,
++ */
+ static int __apic_accept_irq(struct kvm_lapic *apic, int delivery_mode,
+ 			     int vector, int level, int trig_mode,
+ 			     struct dest_map *dest_map)
+@@ -2524,6 +2529,13 @@ int apic_has_pending_timer(struct kvm_vcpu *vcpu)
  	return 0;
  }
  
@@ -2009,7 +2022,7 @@ index 9dda989a1..61b27c3b3 100644
  int kvm_apic_local_deliver(struct kvm_lapic *apic, int lvt_type)
  {
  	u32 reg = kvm_lapic_get_reg(apic, lvt_type);
-@@ -3020,6 +3027,13 @@ int kvm_lapic_set_pv_eoi(struct kvm_vcpu *vcpu, u64 data, unsigned long len)
+@@ -3020,6 +3032,13 @@ int kvm_lapic_set_pv_eoi(struct kvm_vcpu *vcpu, u64 data, unsigned long len)
  	return 0;
  }
  
@@ -7458,10 +7471,21 @@ index 1d42d4b17..4250d96f2 100644
  {
  	return ((u64) cycles * mult) >> shift;
 diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
-index f4519d368..eab1ab16f 100644
+index f4519d368..ae3f01b50 100644
 --- a/include/linux/kvm_host.h
 +++ b/include/linux/kvm_host.h
-@@ -745,6 +745,17 @@ struct kvm {
+@@ -741,10 +741,28 @@ struct kvm {
+ 		struct list_head  resampler_list;
+ 		struct mutex      resampler_lock;
+ 	} irqfds;
++	/*
++	 * 在以下使用kvm->ioeventfds:
++	 *   - virt/kvm/eventfd.c|532| <<kvm_eventfd_init>> INIT_LIST_HEAD(&kvm->ioeventfds);
++	 *   - virt/kvm/eventfd.c|783| <<ioeventfd_check_collision>> list_for_each_entry(_p, &kvm->ioeventfds, list)
++	 *   - virt/kvm/eventfd.c|851| <<kvm_assign_ioeventfd_idx>> list_add_tail(&p->list, &kvm->ioeventfds);
++	 *   - virt/kvm/eventfd.c|885| <<kvm_deassign_ioeventfd_idx>> list_for_each_entry_safe(p, tmp, &kvm->ioeventfds, list) {
++	 */
+ 	struct list_head ioeventfds;
  #endif
  	struct kvm_vm_stat stat;
  	struct kvm_arch arch;
@@ -11647,8 +11671,45 @@ index 538790758..ed8ed2a4b 100644
  int perf_event__synthesize_thread_map(struct perf_tool *tool,
  				      struct perf_thread_map *threads,
  				      perf_event__handler_t process,
+diff --git a/virt/kvm/eventfd.c b/virt/kvm/eventfd.c
+index 2a3ed401c..b52f58036 100644
+--- a/virt/kvm/eventfd.c
++++ b/virt/kvm/eventfd.c
+@@ -743,6 +743,9 @@ ioeventfd_in_range(struct _ioeventfd *p, gpa_t addr, int len, const void *val)
+ 	return _val == p->datamatch;
+ }
+ 
++/*
++ * struct kvm_io_device_ops ioeventfd_ops.ioeventfd_write = ioeventfd_write()
++ */
+ /* MMIO/PIO writes trigger an event if the addr/val match */
+ static int
+ ioeventfd_write(struct kvm_vcpu *vcpu, struct kvm_io_device *this, gpa_t addr,
+@@ -769,6 +772,10 @@ ioeventfd_destructor(struct kvm_io_device *this)
+ 	ioeventfd_release(p);
+ }
+ 
++/*
++ * 在以下使用ioeventfd_ops():
++ *   - virt/kvm/eventfd.c|843| <<kvm_assign_ioeventfd_idx>> kvm_iodevice_init(&p->dev, &ioeventfd_ops);
++ */
+ static const struct kvm_io_device_ops ioeventfd_ops = {
+ 	.write      = ioeventfd_write,
+ 	.destructor = ioeventfd_destructor,
+@@ -801,6 +808,11 @@ static enum kvm_bus ioeventfd_bus_from_flags(__u32 flags)
+ 	return KVM_MMIO_BUS;
+ }
+ 
++/*
++ * called by:
++ *   - virt/kvm/eventfd.c|955| <<kvm_assign_ioeventfd>> ret = kvm_assign_ioeventfd_idx(kvm, bus_idx, args);
++ *   - virt/kvm/eventfd.c|963| <<kvm_assign_ioeventfd>> ret = kvm_assign_ioeventfd_idx(kvm, KVM_FAST_MMIO_BUS, args);
++ */
+ static int kvm_assign_ioeventfd_idx(struct kvm *kvm,
+ 				enum kvm_bus bus_idx,
+ 				struct kvm_ioeventfd *args)
 diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
-index 584a5bab3..7f017b95f 100644
+index 584a5bab3..344a6003c 100644
 --- a/virt/kvm/kvm_main.c
 +++ b/virt/kvm/kvm_main.c
 @@ -3298,6 +3298,23 @@ int kvm_clear_guest(struct kvm *kvm, gpa_t gpa, unsigned long len)
@@ -11687,6 +11748,91 @@ index 584a5bab3..7f017b95f 100644
  static long kvm_vm_ioctl_check_extension_generic(struct kvm *kvm, long arg)
  {
  	switch (arg) {
+@@ -5162,6 +5184,11 @@ static int kvm_io_bus_get_first_dev(struct kvm_io_bus *bus,
+ 	return off;
+ }
+ 
++/*
++ * called by:
++ *   - virt/kvm/kvm_main.c|5223| <<kvm_io_bus_write>> r = __kvm_io_bus_write(vcpu, bus, &range, val);
++ *   - virt/kvm/kvm_main.c|5255| <<kvm_io_bus_write_cookie>> return __kvm_io_bus_write(vcpu, bus, &range, val);
++ */
+ static int __kvm_io_bus_write(struct kvm_vcpu *vcpu, struct kvm_io_bus *bus,
+ 			      struct kvm_io_range *range, const void *val)
+ {
+@@ -5182,6 +5209,18 @@ static int __kvm_io_bus_write(struct kvm_vcpu *vcpu, struct kvm_io_bus *bus,
+ 	return -EOPNOTSUPP;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/mmio.c|166| <<io_mem_abort>> ret = kvm_io_bus_write(vcpu, KVM_MMIO_BUS, fault_ipa, len,
++ *   - arch/mips/kvm/emulate.c|1254| <<kvm_mips_emulate_store>> r = kvm_io_bus_write(vcpu, KVM_MMIO_BUS,
++ *   - arch/powerpc/kvm/book3s.c|993| <<kvmppc_h_logical_ci_store>> ret = kvm_io_bus_write(vcpu, KVM_MMIO_BUS, addr, size, &buf);
++ *   - arch/powerpc/kvm/book3s_64_mmu_hv.c|442| <<kvmppc_hv_emulate_mmio>> ret = kvm_io_bus_write(vcpu, KVM_FAST_MMIO_BUS, (gpa_t) gpa, 0,
++ *   - arch/powerpc/kvm/powerpc.c|1398| <<kvmppc_handle_store>> ret = kvm_io_bus_write(vcpu, KVM_MMIO_BUS, run->mmio.phys_addr,
++ *   - arch/riscv/kvm/vcpu_insn.c|679| <<kvm_riscv_vcpu_mmio_store>> if (!kvm_io_bus_write(vcpu, KVM_MMIO_BUS,
++ *   - arch/x86/kvm/vmx/vmx.c|5692| <<handle_ept_misconfig>> !kvm_io_bus_write(vcpu, KVM_FAST_MMIO_BUS, gpa, 0, NULL)) {
++ *   - arch/x86/kvm/x86.c|7573| <<vcpu_mmio_write>> && kvm_io_bus_write(vcpu, KVM_MMIO_BUS, addr, n, v))
++ *   - arch/x86/kvm/x86.c|8202| <<emulator_pio_in_out>> r = kvm_io_bus_write(vcpu, KVM_PIO_BUS, port, size, data);
++ */
+ /* kvm_io_bus_write - called under kvm->slots_lock */
+ int kvm_io_bus_write(struct kvm_vcpu *vcpu, enum kvm_bus bus_idx, gpa_t addr,
+ 		     int len, const void *val)
+@@ -5195,6 +5234,19 @@ int kvm_io_bus_write(struct kvm_vcpu *vcpu, enum kvm_bus bus_idx, gpa_t addr,
+ 		.len = len,
+ 	};
+ 
++	/*
++	 * enum kvm_bus {
++	 *     KVM_MMIO_BUS,
++	 *     KVM_PIO_BUS,
++	 *     KVM_VIRTIO_CCW_NOTIFY_BUS,
++	 *     KVM_FAST_MMIO_BUS,
++	 *     KVM_NR_BUSES
++	 * };
++	 *
++	 * struct kvm_vcpu *vcpu:
++	 * -> struct kvm *kvm;
++	 *    -> struct kvm_io_bus __rcu *buses[KVM_NR_BUSES];
++	 */
+ 	bus = srcu_dereference(vcpu->kvm->buses[bus_idx], &vcpu->kvm->srcu);
+ 	if (!bus)
+ 		return -ENOMEM;
+@@ -5203,6 +5255,10 @@ int kvm_io_bus_write(struct kvm_vcpu *vcpu, enum kvm_bus bus_idx, gpa_t addr,
+ }
+ EXPORT_SYMBOL_GPL(kvm_io_bus_write);
+ 
++/*
++ * called by:
++ *   - arch/s390/kvm/diag.c|265| <<__diag_virtio_hypercall>> ret = kvm_io_bus_write_cookie(vcpu, KVM_VIRTIO_CCW_NOTIFY_BUS,
++ */
+ /* kvm_io_bus_write_cookie - called under kvm->slots_lock */
+ int kvm_io_bus_write_cookie(struct kvm_vcpu *vcpu, enum kvm_bus bus_idx,
+ 			    gpa_t addr, int len, const void *val, long cookie)
+@@ -5273,6 +5329,22 @@ int kvm_io_bus_read(struct kvm_vcpu *vcpu, enum kvm_bus bus_idx, gpa_t addr,
+ 	return r < 0 ? r : 0;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/vgic/vgic-its.c|1877| <<vgic_register_its_iodev>> ret = kvm_io_bus_register_dev(kvm, KVM_MMIO_BUS, iodev->base_addr,
++ *   - arch/arm64/kvm/vgic/vgic-mmio-v3.c|803| <<vgic_register_redist_iodev>> ret = kvm_io_bus_register_dev(kvm, KVM_MMIO_BUS, rd_base,
++ *   - arch/arm64/kvm/vgic/vgic-mmio.c|1115| <<vgic_register_dist_iodev>> ret = kvm_io_bus_register_dev(kvm, KVM_MMIO_BUS, dist_base_address,
++ *   - arch/mips/kvm/loongson_ipi.c|209| <<kvm_init_loongson_ipi>> kvm_io_bus_register_dev(kvm, KVM_MMIO_BUS, addr, 0x400, device);
++ *   - arch/powerpc/kvm/mpic.c|1449| <<map_mmio>> kvm_io_bus_register_dev(opp->kvm, KVM_MMIO_BUS,
++ *   - arch/x86/kvm/i8254.c|706| <<kvm_create_pit>> ret = kvm_io_bus_register_dev(kvm, KVM_PIO_BUS, KVM_PIT_BASE_ADDRESS,
++ *   - arch/x86/kvm/i8254.c|713| <<kvm_create_pit>> ret = kvm_io_bus_register_dev(kvm, KVM_PIO_BUS,
++ *   - arch/x86/kvm/i8259.c|607| <<kvm_pic_init>> ret = kvm_io_bus_register_dev(kvm, KVM_PIO_BUS, 0x20, 2,
++ *   - arch/x86/kvm/i8259.c|612| <<kvm_pic_init>> ret = kvm_io_bus_register_dev(kvm, KVM_PIO_BUS, 0xa0, 2, &s->dev_slave);
++ *   - arch/x86/kvm/i8259.c|616| <<kvm_pic_init>> ret = kvm_io_bus_register_dev(kvm, KVM_PIO_BUS, 0x4d0, 2, &s->dev_elcr);
++ *   - arch/x86/kvm/ioapic.c|698| <<kvm_ioapic_init>> ret = kvm_io_bus_register_dev(kvm, KVM_MMIO_BUS, ioapic->base_address,
++ *   - virt/kvm/coalesced_mmio.c|156| <<kvm_vm_ioctl_register_coalesced_mmio>> ret = kvm_io_bus_register_dev(kvm,
++ *   - virt/kvm/eventfd.c|845| <<kvm_assign_ioeventfd_idx>> ret = kvm_io_bus_register_dev(kvm, bus_idx, p->addr, p->length,
++ */
+ /* Caller must hold slots_lock. */
+ int kvm_io_bus_register_dev(struct kvm *kvm, enum kvm_bus bus_idx, gpa_t addr,
+ 			    int len, struct kvm_io_device *dev)
 -- 
 2.34.1
 
