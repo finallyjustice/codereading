@@ -1,0 +1,140 @@
+
+1267 static struct clocksource clocksource_tsc = {
+1268         .name                   = "tsc",
+1269         .rating                 = 300,
+1270         .read                   = read_tsc,
+1271         .mask                   = CLOCKSOURCE_MASK(64),
+1272         .flags                  = CLOCK_SOURCE_IS_CONTINUOUS |
+1273                                   CLOCK_SOURCE_VALID_FOR_HRES |
+1274                                   CLOCK_SOURCE_MUST_VERIFY |
+1275                                   CLOCK_SOURCE_VERIFY_PERCPU,
+1276         .vdso_clock_mode        = VDSO_CLOCKMODE_TSC,
+1277         .enable                 = tsc_cs_enable,
+1278         .resume                 = tsc_resume,
+1279         .mark_unstable          = tsc_cs_mark_unstable,
+1280         .tick_stable            = tsc_cs_tick_stable,
+1281         .list                   = LIST_HEAD_INIT(clocksource_tsc.list),
+1282 };
+
+来自cycles_2_ns()
+
+ 137 /*
+ 138  * Accelerators for sched_clock()
+ 139  * convert from cycles(64bits) => nanoseconds (64bits)
+ 140  *  basic equation:
+ 141  *              ns = cycles / (freq / ns_per_sec)
+ 142  *              ns = cycles * (ns_per_sec / freq)
+ 143  *              ns = cycles * (10^9 / (cpu_khz * 10^3))
+ 144  *              ns = cycles * (10^6 / cpu_khz)
+ 145  *
+ 146  *      Then we use scaling math (suggested by george@mvista.com) to get:
+ 147  *              ns = cycles * (10^6 * SC / cpu_khz) / SC
+ 148  *              ns = cycles * cyc2ns_scale / SC
+ 149  *
+ 150  *      And since SC is a constant power of two, we can convert the div
+ 151  *  into a shift. The larger SC is, the more accurate the conversion, but
+ 152  *  cyc2ns_scale needs to be a 32-bit value so that 32-bit multiplication
+ 153  *  (64-bit result) can be used.
+ 154  *
+ 155  *  We can use khz divisor instead of mhz to keep a better precision.
+ 156  *  (mathieu.desnoyers@polymtl.ca)
+ 157  *
+ 158  *                      -johnstul@us.ibm.com "math is hard, lets go shopping!"
+ 159  */
+
+
+--------------------------------
+
+对于普通的tsc, 在clocks_calc_mult_shift()中计算mult和shift.
+这里的例子只针对tsc.
+
+tsc_to_ns
+= cycles / tsc_hz * 10^9
+= cycles * (10^9 / tsc_hz)
+= cycles * (10^9 / (tsc_khz * 10^3))
+= cycles * (10^6 / tsc_khz)
+= cycles * (10^6 * SC / tsc_khz) / SC
+= (cycles * ((10^6 << shift) / tsc_khz)) >> shift
+
+mult  = (10^6 << shift) / tsc_khz
+shift = shift
+
+在clocks_calc_mult_shift()中:
+
+from = tsc_khz = 3392422
+to   = 10^6    = 1000000
+
+--------------------------------
+
+这是shift是负数的例子.
+
+对于kvm (from是tsc, to是ns)
+from = 3392422000
+to   = 1000000000
+
+计算mult和shift的是kvm_get_time_scale()
+使用mult和shift的是pvclock_scale_delta()
+
+从from(tsc)到to(ns)公式:
+
+from_2_to
+= cycles / from * to
+= cycles / (from / to)
+= cycles * (to / from)
+= cycles * (to / from * SC) / SC
+= cycles * (to / (from / SC)) / SC
+= (cycles * (to / (from >> shift))) >> shift
+= (cycles >> shift) * (to / (from >> shift))
+
+mult  = to / (from >> shift)
+shift = shift
+
+但是在实际的kvm_get_time_scale()中:
+
+mult = (to << 32) / (from >> shift)
+
+1. cycles先向右移动shift位(假设shift是负数)
+2. 乘以mult, 也就是乘以 (to << 32) / (from >> shift)
+3. 向右移动32位 (因为第二步乘以的mult是向左移动了32位的)
+
+上面的例子假设shift在kvm_get_time_scale()的结果是负数
+
+--------------------------------
+
+这是shift是正数的例子.
+
+对于kvm (from是tsc, to是ns)
+from = 3392422000
+to   = 1000000000
+
+计算mult和shift的是kvm_get_time_scale()
+使用mult和shift的是pvclock_scale_delta()
+
+从from(tsc)到to(ns)公式:
+
+from_2_to
+= cycles / from * to
+= cycles / (from / to)
+= cycles * (to / from)
+= cycles * (to / from / SC) * SC
+= cycles * (to / (from * SC)) * SC
+= cycles * (to / (from << shift)) << shift
+= (cycles << shift) * (to / (from << shift))
+
+mult = to / (from << shift)
+或者
+mult = (to >> shift) / from
+
+shift = shift
+
+但是在实际的kvm_get_time_scale()中:
+
+mult = (to << 32) / (from << shift)
+或者 
+mult = ((to >> shift) << 32) / from
+
+1. cycles先向左移动shift位(假设shift是正数)
+2. 乘以mult, 也就是乘以(to << 32) / (from << shift)或者((to >> shift) << 32) / from
+3. 向右移动32位 (因为第二步乘以的mult是向左移动了32位的)
+
+--------------------------------
