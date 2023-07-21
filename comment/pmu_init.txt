@@ -1,0 +1,144 @@
+kvm_get_supported_msrs()
+
+
+启动的时候, VM kernel会检测PMU的版本.
+
+2117 static int __init init_hw_perf_events(void)
+2118 {
+2119         struct x86_pmu_quirk *quirk;
+2120         int err;
+2121
+2122         pr_info("Performance Events: ");
+2123
+2124         switch (boot_cpu_data.x86_vendor) {
+2125         case X86_VENDOR_INTEL:
+2126                 err = intel_pmu_init();
+2127                 break;
+2128         case X86_VENDOR_AMD:
+2129                 err = amd_pmu_init();
+2130                 break;
+2131         case X86_VENDOR_HYGON:
+2132                 err = amd_pmu_init();
+2133                 x86_pmu.name = "HYGON";
+2134                 break;
+2135         case X86_VENDOR_ZHAOXIN:
+2136         case X86_VENDOR_CENTAUR:
+2137                 err = zhaoxin_pmu_init();
+2138                 break;
+2139         default:
+2140                 err = -ENOTSUPP;
+2141         }
+2142         if (err != 0) {
+2143                 pr_cont("no PMU driver, software events only.\n");
+2144                 err = 0;
+2145                 goto out_bad_pmu;
+2146         }
+2147
+2148         pmu_check_apic();
+2149
+2150         /* sanity check that the hardware exists or is emulated */
+2151         if (!check_hw_exists(&pmu, x86_pmu.num_counters, x86_pmu.num_counters_fixed))
+2152                 goto out_bad_pmu;
+2153
+2154         pr_cont("%s PMU driver.\n", x86_pmu.name);
+
+
+就算是通过了也会在line 2151试着写PMU的寄存器, 如果KVM不同意, 则:
+
+[    0.254944] PMU not available due to virtualization, using software events only.
+
+-------------------------------
+
+对于intel_pmu_init(), 主要看X86_FEATURE_ARCH_PERFMON设置了吗.
+
+5737         if (!cpu_has(&boot_cpu_data, X86_FEATURE_ARCH_PERFMON)) {
+5738                 switch (boot_cpu_data.x86) {
+5739                 case 0x6:
+5740                         return p6_pmu_init();
+5741                 case 0xb:
+5742                         return knc_pmu_init();
+5743                 case 0xf:
+5744                         return p4_pmu_init();
+5745                 }
+5746                 return -ENODEV;
+5747         }
+
+X86_FEATURE_ARCH_PERFMON是被VM设置的.
+
+在init_intel()设置的. 依靠cpuid 0xa
+  - arch/x86/kernel/cpu/intel.c|675| <<init_intel>> set_cpu_cap(c, X86_FEATURE_ARCH_PERFMON);
+
+671         if (c->cpuid_level > 9) {
+672                 unsigned eax = cpuid_eax(10);
+673                 // Check for version and the number of counters
+674                 if ((eax & 0xff) && (((eax>>8) & 0xff) > 1))
+675                         set_cpu_cap(c, X86_FEATURE_ARCH_PERFMON);
+676         }
+
+-------------------------------
+
+对于amd_pmu_init(), 只根据boot_cpu_data.x86判断是不是支持PMU.
+
+1474 __init int amd_pmu_init(void)
+1475 {
+1476         int ret;
+1477 
+1478         /* Performance-monitoring supported from K7 and later: */
+1479         /*
+1480          * 应该是在以下获得x86:
+1481          * 1929 void __init identify_boot_cpu(void)
+1482          * 1930 {
+1483          * 1931         identify_cpu(&boot_cpu_data);
+1484          */
+1485         if (boot_cpu_data.x86 < 6)
+1486                 return -ENODEV;
+1487 
+1488         /*
+1489          * static __initconst const struct x86_pmu amd_pmu = {
+1490          *     .name                   = "AMD",
+1491          *     .eventsel               = MSR_K7_EVNTSEL0,
+1492          *     .perfctr                = MSR_K7_PERFCTR0,
+1493          *     .num_counters           = AMD64_NUM_COUNTERS,
+1494          */
+1495         x86_pmu = amd_pmu;
+1496 
+1497         ret = amd_core_pmu_init();
+1498         if (ret)
+1499                 return ret;
+
+在line 1497是根据X86_FEATURE_PERFCTR_CORE判断支持的PMU寄存器的个数.
+
+关于X86_FEATURE_PERFCTR_CORE:
+
+160 /* More extended AMD flags: CPUID level 0x80000001, ECX, word 6 */
+... ...
+181 #define X86_FEATURE_PERFCTR_CORE        ( 6*32+23) /* Core performance counter extensions */
+
+
+在amd_core_pmu_init()还会根据X86_FEATURE_PERFMON_V2判断对PerfMonv2的支持.
+
+ 47         { X86_FEATURE_PERFMON_V2,       CPUID_EAX,  0, 0x80000022, 0 },
+
+
+1393         if (boot_cpu_has(X86_FEATURE_PERFMON_V2)) {
+1394                 /*
+1395                  * AMD Extended Performance Monitoring and Debug cpuid feature detection
+1396                  * #define EXT_PERFMON_DEBUG_FEATURES 0x80000022
+1397                  */
+1398                 ebx.full = cpuid_ebx(EXT_PERFMON_DEBUG_FEATURES);
+1399
+1400                 /* Update PMU version for later usage */
+1401                 x86_pmu.version = 2;
+1402
+1403                 /* Find the number of available Core PMCs */
+1404                 x86_pmu.num_counters = ebx.split.num_core_pmc;
+1405
+1406                 amd_pmu_global_cntr_mask = (1ULL << x86_pmu.num_counters) - 1;
+1407
+1408                 /* Update PMC handling functions */
+1409                 x86_pmu.enable_all = amd_pmu_v2_enable_all;
+1410                 x86_pmu.disable_all = amd_pmu_v2_disable_all;
+1411                 x86_pmu.enable = amd_pmu_v2_enable_event;
+1412                 x86_pmu.handle_irq = amd_pmu_v2_handle_irq;
+1413                 static_call_update(amd_pmu_test_overflow, amd_pmu_test_overflow_status);
+1414         }
