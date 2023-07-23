@@ -1,0 +1,176 @@
+[PATCH v7 00/12] KVM: x86: Add AMD Guest PerfMonV2 PMU support
+
+... from Like Xu <likexu@tencent.com> ...
+
+https://lore.kernel.org/all/20230603011058.1038821-1-seanjc@google.com/
+
+--------------------------
+
+[PATCH v7 01/12] KVM: x86/pmu: Rename global_ovf_ctrl_mask to global_status_mask
+
+把pmu->global_ovf_ctrl_mask的名字改成pmu->global_status_mask.
+
+
+>>>>>>> version 2:
+
+增加了3个fixed counter.
+
+IA32_FIXED_CTR0  在 0x309
+IA32_FIXED_CTR1  在 0x30a
+IA32_FIXED_CTR2  在 0x30b
+
+这3个对应的只要一个selector来控制就好了
+
+IA32_FIXED_CTR_CTRL在0x38d
+
+还有下面三个寄存器.
+
+IA32_PERF_GLOBAL_CTRL     : 控制fixed和gp的enable/disable
+IA32_PERF_GLOBAL_STATUS   : 负责query fixed和gp的overflow conditions
+IA32_PERF_GLOBAL_OVF_CTRL : 负责clear fixed和gp的overflow status
+
+>>>>>>> version 4:
+
+之前使用IA32_PERF_GLOBAL_OVF_CTRL来控制overflow status的clear.
+现在又有了IA32_PERF_GLOBAL_STATUS_RESET, 功能更多.
+
+--------------------------
+
+[PATCH v7 02/12] KVM: x86/pmu: Move reprogram_counters() to pmu.h
+
+把函数reprogram_counters()从intel vmx专用的代码移动到通用的kvm x86.c.
+
+--------------------------
+
+[PATCH v7 03/12] KVM: x86/pmu: Reject userspace attempts to set reserved GLOBAL_STATUS bits
+
+修复一个模拟的错误(不精确).
+
+写MSR_CORE_PERF_GLOBAL_STATUS不能写那些reserved的bits.
+
+--------------------------
+
+[PATCH v7 04/12] KVM: x86/pmu: Move handling PERF_GLOBAL_CTRL and friends to common x86
+
+把下面针对Intel的寄存器的处理都从vmx转到x86. 稍后给svm用.
+
+- MSR_CORE_PERF_GLOBAL_STATUS   : 负责query fixed和gp的overflow conditions
+- MSR_CORE_PERF_GLOBAL_CTRL     : 控制fixed和gp的enable/disable
+- MSR_CORE_PERF_GLOBAL_OVF_CTRL : 负责clear fixed和gp的overflow status
+
+--------------------------
+
+[PATCH v7 05/12] KVM: x86/pmu: Provide Intel PMU's pmc_is_enabled() as generic x86 code
+
+把Intel vmx特有的pmc_is_enabled()变成x86的pmc_is_globally_enabled(),
+用来检测pmc在PERF_GLOBAL_CONTROL是否设置了.
+
+--------------------------
+
+[PATCH v7 06/12] KVM: x86: Explicitly zero cpuid "0xa" leaf when PMU is disabled
+
+对于cpuid的0xa, 如果enable_pmu没设置, 就返回0.
+
+@@ -948,7 +948,7 @@ static inline int __do_cpuid_func(struct kvm_cpuid_array *array, u32 function)
+ 		union cpuid10_eax eax;
+ 		union cpuid10_edx edx;
+
+-		if (!static_cpu_has(X86_FEATURE_ARCH_PERFMON)) {
++		if (!enable_pmu || !static_cpu_has(X86_FEATURE_ARCH_PERFMON)) {
+ 			entry->eax = entry->ebx = entry->ecx = entry->edx = 0;
+ 			break;
+ 		}
+
+--------------------------
+
+[PATCH v7 07/12] KVM: x86/pmu: Disable vPMU if the minimum num of counters isn't met
+
+对于AMD, 如果虚拟的寄存器小于4个, 就要disable pmu (通过enable_pmu).
+
+--------------------------
+
+[PATCH v7 08/12] KVM: x86/pmu: Advertise PERFCTR_CORE iff the min nr of counters is met
+
+只在支持6个寄存器的时候支持PERFCTR_CORE.
+
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index ca32389f3c36..d9669e3cc00a 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -5025,9 +5025,18 @@ static __init void svm_set_cpu_caps(void)
+ 	    boot_cpu_has(X86_FEATURE_AMD_SSBD))
+ 		kvm_cpu_cap_set(X86_FEATURE_VIRT_SSBD);
+
+-	/* AMD PMU PERFCTR_CORE CPUID */
+-	if (enable_pmu && boot_cpu_has(X86_FEATURE_PERFCTR_CORE))
+-		kvm_cpu_cap_set(X86_FEATURE_PERFCTR_CORE);
++	if (enable_pmu) {
++		/*
++		 * Enumerate support for PERFCTR_CORE if and only if KVM has
++		 * access to enough counters to virtualize "core" support,
++		 * otherwise limit vPMU support to the legacy number of counters.
++		 */
++		if (kvm_pmu_cap.num_counters_gp < AMD64_NUM_COUNTERS_CORE)
++			kvm_pmu_cap.num_counters_gp = min(AMD64_NUM_COUNTERS,
++							  kvm_pmu_cap.num_counters_gp);
++		else
++			kvm_cpu_cap_check_and_set(X86_FEATURE_PERFCTR_CORE);
++	}
+
+ 	/* CPUID 0x8000001F (SME/SEV features) */
+ 	sev_set_cpu_caps();
+
+--------------------------
+
+[PATCH v7 09/12] KVM: x86/pmu: Constrain the num of guest counters with kvm_pmu_cap
+
+使用kvm_pmu_cap.num_counters_gp限制pmu->nr_arch_gp_counters.
+
+diff --git a/arch/x86/kvm/svm/pmu.c b/arch/x86/kvm/svm/pmu.c
+index e5c69062a909..c03958063a76 100644
+--- a/arch/x86/kvm/svm/pmu.c
++++ b/arch/x86/kvm/svm/pmu.c
+@@ -170,6 +170,9 @@ static void amd_pmu_refresh(struct kvm_vcpu *vcpu)
+ 	else
+ 		pmu->nr_arch_gp_counters = AMD64_NUM_COUNTERS;
+
++	pmu->nr_arch_gp_counters = min_t(unsigned int, pmu->nr_arch_gp_counters,
++					 kvm_pmu_cap.num_counters_gp);
++
+ 	pmu->counter_bitmask[KVM_PMC_GP] = ((u64)1 << 48) - 1;
+ 	pmu->reserved_bits = 0xfffffff000280000ull;
+ 	pmu->raw_event_mask = AMD64_RAW_EVENT_MASK;
+
+--------------------------
+
+[PATCH v7 10/12] KVM: x86/cpuid: Add a KVM-only leaf to redirect AMD PerfMonV2 flag
+
+建立X86_FEATURE_PERFMON_V2和KVM_X86_FEATURE_PERFMON_V2的关系.
+
+--------------------------
+
+[PATCH v7 11/12] KVM: x86/svm/pmu: Add AMD PerfMonV2 support
+
+添加AMD PerfMonV2的虚拟化.
+
+主要支持下面3个global寄存器.
+
+- MSR_AMD64_PERF_CNTR_GLOBAL_STATUS
+- MSR_AMD64_PERF_CNTR_GLOBAL_CTL
+- MSR_AMD64_PERF_CNTR_GLOBAL_STATUS_CLR
+
+此外, 还支持4/6之外的gp寄存器数目.
+
+1. 查看cpuid是否支持X86_FEATURE_PERFMON_V2.
+   如果支持, 根据0x80000022获取寄存器的数目.
+   此外, 3个global的也支持!
+   寄存器的base address和MSR_F15H_PERF_CTR5的一样(KVM svm其实限制了最多6个)
+2. 如果不是ver=2, 如果支持X86_FEATURE_PERFCTR_CORE,
+   就是6个寄存器
+3. 默认只支持4个
+
+--------------------------
+
+[PATCH v7 12/12] KVM: x86/cpuid: Add AMD CPUID ExtPerfMonAndDbg leaf 0x80000022
+
+对PATCH 10/12中的KVM_X86_FEATURE_PERFMON_V2应用
