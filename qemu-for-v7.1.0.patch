@@ -1,6 +1,6 @@
-From 4034deb01a68edcf312297e3070d89b74fb24729 Mon Sep 17 00:00:00 2001
+From d6cc5904443f396333bf6f8b71832b7fed6206ec Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Sat, 22 Jul 2023 22:11:19 -0700
+Date: Tue, 25 Jul 2023 23:08:22 -0700
 Subject: [PATCH 1/1] qemu for v7.1.0
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
@@ -86,31 +86,38 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  migration/socket.c                    |  12 +
  migration/vmstate.c                   |  28 ++
  monitor/hmp.c                         |  35 ++
+ monitor/monitor-internal.h            |  35 ++
+ monitor/monitor.c                     |  34 ++
+ monitor/qmp-cmds-control.c            |   4 +
+ monitor/qmp.c                         | 111 +++++
  net/dump.c                            |   8 +
+ qapi/qmp-dispatch.c                   |  44 ++
  qga/commands-posix.c                  |  28 ++
+ qobject/json-streamer.c               |   8 +
  qom/object.c                          |  29 ++
+ qom/qom-qmp-cmds.c                    |  46 +++
  softmmu/cpus.c                        |  64 +++
  softmmu/memory.c                      | 276 +++++++++++++
- softmmu/physmem.c                     |  18 +
+ softmmu/physmem.c                     |  27 ++
  softmmu/runstate.c                    |  10 +
  softmmu/vl.c                          |  77 ++++
  target/arm/cpu.c                      |   5 +
  target/arm/kvm.c                      |   4 +
  target/i386/cpu-dump.c                |   8 +
- target/i386/cpu.c                     | 257 ++++++++++++
+ target/i386/cpu.c                     | 273 +++++++++++++
  target/i386/cpu.h                     | 156 ++++++++
  target/i386/host-cpu.c                |  27 ++
  target/i386/kvm/kvm-cpu.c             |  33 ++
- target/i386/kvm/kvm.c                 | 357 +++++++++++++++++
+ target/i386/kvm/kvm.c                 | 376 +++++++++++++++++
  target/i386/machine.c                 |  10 +
  target/i386/xsave_helper.c            |  10 +
  ui/spice-core.c                       |   5 +
- util/aio-posix.c                      |  77 ++++
+ util/aio-posix.c                      |  81 ++++
  util/aio-wait.c                       |  17 +
- util/async.c                          |   4 +
+ util/async.c                          |  19 +
  util/coroutine-sigaltstack.c          |   4 +
  util/log.c                            |  29 ++
- util/main-loop.c                      |  33 ++
+ util/main-loop.c                      |  50 +++
  util/qemu-config.c                    |   3 +
  util/qemu-coroutine.c                 |  53 +++
  util/qemu-option.c                    |  29 ++
@@ -120,7 +127,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  util/rcu.c                            |  45 +++
  util/readline.c                       |  49 +++
  util/thread-pool.c                    |  56 +++
- 115 files changed, 6476 insertions(+)
+ 122 files changed, 6838 insertions(+)
 
 diff --git a/accel/accel-common.c b/accel/accel-common.c
 index 50035bda5..5312af961 100644
@@ -7955,6 +7962,331 @@ index 15ca04735..ce000ecc0 100644
  static void monitor_find_completion_by_table(MonitorHMP *mon,
                                               const HMPCommand *cmd_table,
                                               char **args,
+diff --git a/monitor/monitor-internal.h b/monitor/monitor-internal.h
+index caa2e90ef..a13971946 100644
+--- a/monitor/monitor-internal.h
++++ b/monitor/monitor-internal.h
+@@ -144,13 +144,48 @@ typedef struct {
+      */
+     const QmpCommandList *commands;
+     bool capab_offered[QMP_CAPABILITY__MAX]; /* capabilities offered */
++    /*
++     * 在以下使用MonitorQMP->capab[QMP_CAPABILITY__MAX]:
++     *   - monitor/qmp-cmds-control.c|47| <<qmp_caps_accept>> bool capab[QMP_CAPABILITY__MAX];
++     *   - monitor/qmp-cmds-control.c|49| <<qmp_caps_accept>> memset(capab, 0, sizeof(capab));
++     *   - monitor/qmp-cmds-control.c|60| <<qmp_caps_accept>> capab[list->value] = true;
++     *   - monitor/qmp-cmds-control.c|69| <<qmp_caps_accept>> memcpy(mon->capab, capab, sizeof(capab));
++     *   - monitor/qmp.c|52| <<qmp_oob_enabled>> return mon->capab[QMP_CAPABILITY_OOB];
++     *   - monitor/qmp.c|62| <<monitor_qmp_caps_reset>> memset(mon->capab, 0, sizeof(mon->capab));
++     */
+     bool capab[QMP_CAPABILITY__MAX];         /* offered and accepted */
+     /*
+      * Protects qmp request/response queue.
+      * Take monitor_lock first when you need both.
+      */
++    /*
++     * 在以下使用MonitorQMP->qmp_queue_lock:
++     *   - monitor/qmp.c|88| <<monitor_qmp_cleanup_queue_and_resume>> QEMU_LOCK_GUARD(&mon->qmp_queue_lock);
++     *   - monitor/qmp.c|203| <<monitor_qmp_requests_pop_any_with_lock>> qemu_mutex_lock(&qmp_mon->qmp_queue_lock);
++     *   - monitor/qmp.c|209| <<monitor_qmp_requests_pop_any_with_lock>> qemu_mutex_unlock(&qmp_mon->qmp_queue_lock);
++     *   - monitor/qmp.c|305| <<monitor_qmp_dispatcher_co>> qemu_mutex_unlock(&mon->qmp_queue_lock);
++     *   - monitor/qmp.c|424| <<handle_qmp_command>> WITH_QEMU_LOCK_GUARD(&mon->qmp_queue_lock) {
++     *   - monitor/qmp.c|528| <<monitor_data_destroy_qmp>> qemu_mutex_destroy(&mon->qmp_queue_lock);
++     *   - monitor/qmp.c|563| <<monitor_init_qmp>> qemu_mutex_init(&mon->qmp_queue_lock);
++     */
+     QemuMutex qmp_queue_lock;
+     /* Input queue that holds all the parsed QMP requests */
++    /*
++     * 在以下使用MonitorQMP->qmp_requests:
++     *   - monitor/qmp.c|81| <<monitor_qmp_cleanup_req_queue_locked>> while (!g_queue_is_empty(mon->qmp_requests)) {
++     *   - monitor/qmp.c|82| <<monitor_qmp_cleanup_req_queue_locked>> qmp_request_free(g_queue_pop_head(mon->qmp_requests));
++     *   - monitor/qmp.c|97| <<monitor_qmp_cleanup_queue_and_resume>> mon->qmp_requests->length == QMP_REQ_QUEUE_LEN_MAX)
++     *   - monitor/qmp.c|98| <<monitor_qmp_cleanup_queue_and_resume>> && !g_queue_is_empty(mon->qmp_requests);
++     *   - monitor/qmp.c|204| <<monitor_qmp_requests_pop_any_with_lock>> req_obj = g_queue_pop_head(qmp_mon->qmp_requests);
++     *   - monitor/qmp.c|276| <<monitor_qmp_dispatcher_co>> req_obj->mon->qmp_requests->length);
++     *   - monitor/qmp.c|297| <<monitor_qmp_dispatcher_co>> && mon->qmp_requests->length == QMP_REQ_QUEUE_LEN_MAX - 1) {
++     *   - monitor/qmp.c|434| <<handle_qmp_command>> mon->qmp_requests->length == QMP_REQ_QUEUE_LEN_MAX - 1) {
++     *   - monitor/qmp.c|444| <<handle_qmp_command>> mon->qmp_requests->length);
++     *   - monitor/qmp.c|445| <<handle_qmp_command>> assert(mon->qmp_requests->length < QMP_REQ_QUEUE_LEN_MAX);
++     *   - monitor/qmp.c|446| <<handle_qmp_command>> g_queue_push_tail(mon->qmp_requests, req_obj);
++     *   - monitor/qmp.c|530| <<monitor_data_destroy_qmp>> g_queue_free(mon->qmp_requests);
++     *   - monitor/qmp.c|564| <<monitor_init_qmp>> mon->qmp_requests = g_queue_new();
++     */
+     GQueue *qmp_requests;
+ } MonitorQMP;
+ 
+diff --git a/monitor/monitor.c b/monitor/monitor.c
+index 86949024f..e44603ab9 100644
+--- a/monitor/monitor.c
++++ b/monitor/monitor.c
+@@ -51,9 +51,33 @@ typedef struct {
+ } MonitorQAPIEventConf;
+ 
+ /* Shared monitor I/O thread */
++/*
++ * 在以下使用mon_iothread:
++ *   - monitor/monitor.c|54| <<global>> IOThread *mon_iothread;
++ *   - monitor/monitor.c|534| <<monitor_suspend>> aio_notify(iothread_get_aio_context(mon_iothread));
++ *   - monitor/monitor.c|558| <<monitor_resume>> ctx = iothread_get_aio_context(mon_iothread);
++ *   - monitor/monitor.c|604| <<monitor_iothread_init>> mon_iothread = iothread_create("mon_iothread", &error_abort);
++ *   - monitor/monitor.c|610| <<monitor_data_init>> if (use_io_thread && !mon_iothread) {
++ *   - monitor/monitor.c|665| <<monitor_cleanup>> if (mon_iothread) {
++ *   - monitor/monitor.c|666| <<monitor_cleanup>> iothread_stop(mon_iothread);
++ *   - monitor/monitor.c|684| <<monitor_cleanup>> if (mon_iothread) {
++ *   - monitor/monitor.c|685| <<monitor_cleanup>> iothread_destroy(mon_iothread);
++ *   - monitor/monitor.c|686| <<monitor_cleanup>> mon_iothread = NULL;
++ *   - monitor/qmp.c|500| <<monitor_qmp_setup_handlers_bh>> context = iothread_get_g_main_context(mon_iothread);
++ *   - monitor/qmp.c|539| <<monitor_init_qmp>> aio_bh_schedule_oneshot(iothread_get_aio_context(mon_iothread),
++ */
+ IOThread *mon_iothread;
+ 
+ /* Coroutine to dispatch the requests received from I/O thread */
++/*
++ * 在以下使用qmp_dispatcher_co:
++ *   - monitor/monitor.c|652| <<monitor_cleanup>> aio_co_wake(qmp_dispatcher_co);
++ *   - monitor/monitor.c|707| <<monitor_init_globals_core>> qmp_dispatcher_co = qemu_coroutine_create(monitor_qmp_dispatcher_co, NULL);
++ *   - monitor/monitor.c|709| <<monitor_init_globals_core>> aio_co_schedule(iohandler_get_aio_context(), qmp_dispatcher_co);
++ *   - monitor/qmp.c|309| <<monitor_qmp_dispatcher_co>> aio_co_schedule(qemu_get_aio_context(), qmp_dispatcher_co);
++ *   - monitor/qmp.c|345| <<monitor_qmp_dispatcher_co>> aio_co_schedule(iohandler_get_aio_context(), qmp_dispatcher_co);
++ *   - monitor/qmp.c|417| <<handle_qmp_command>> aio_co_wake(qmp_dispatcher_co);
++ */
+ Coroutine *qmp_dispatcher_co;
+ 
+ /* Set to true when the dispatcher coroutine should terminate */
+@@ -693,6 +717,11 @@ static void monitor_qapi_event_init(void)
+                                                 qapi_event_throttle_equal);
+ }
+ 
++/*
++ * called by:
++ *   - monitor/misc.c|1983| <<monitor_init_globals>> monitor_init_globals_core();
++ *   - storage-daemon/qemu-storage-daemon.c|413| <<main>> monitor_init_globals_core();
++ */
+ void monitor_init_globals_core(void)
+ {
+     monitor_qapi_event_init();
+@@ -709,6 +738,11 @@ void monitor_init_globals_core(void)
+     aio_co_schedule(iohandler_get_aio_context(), qmp_dispatcher_co);
+ }
+ 
++/*
++ * called by:
++ *   - monitor/monitor.c|766| <<monitor_init_opts>> ret = monitor_init(options, true, errp);
++ *   - storage-daemon/qemu-storage-daemon.c|332| <<process_options>> monitor_init(monitor, false, &error_fatal);
++ */
+ int monitor_init(MonitorOptions *opts, bool allow_hmp, Error **errp)
+ {
+     Chardev *chr;
+diff --git a/monitor/qmp-cmds-control.c b/monitor/qmp-cmds-control.c
+index 6e581713a..89dc7cfd0 100644
+--- a/monitor/qmp-cmds-control.c
++++ b/monitor/qmp-cmds-control.c
+@@ -40,6 +40,10 @@
+  * On success, set mon->qmp.capab[], and return true.
+  * On error, set @errp, and return false.
+  */
++/*
++ * called by:
++ *   - monitor/qmp-cmds-control.c|89| <<qmp_qmp_capabilities>> if (!qmp_caps_accept(mon, enable, errp)) {
++ */
+ static bool qmp_caps_accept(MonitorQMP *mon, QMPCapabilityList *list,
+                             Error **errp)
+ {
+diff --git a/monitor/qmp.c b/monitor/qmp.c
+index 092c527b6..57e5d9428 100644
+--- a/monitor/qmp.c
++++ b/monitor/qmp.c
+@@ -52,10 +52,19 @@ static bool qmp_oob_enabled(MonitorQMP *mon)
+     return mon->capab[QMP_CAPABILITY_OOB];
+ }
+ 
++/*
++ * called by:
++ *   - monitor/qmp.c|462| <<monitor_qmp_event>> monitor_qmp_caps_reset(mon);
++ */
+ static void monitor_qmp_caps_reset(MonitorQMP *mon)
+ {
+     memset(mon->capab_offered, 0, sizeof(mon->capab_offered));
+     memset(mon->capab, 0, sizeof(mon->capab));
++    /*
++     * 在以下使用QMP_CAPABILITY_OOB:
++     *   - monitor/qmp.c|52| <<qmp_oob_enabled>> return mon->capab[QMP_CAPABILITY_OOB];
++     *   - monitor/qmp.c|59| <<monitor_qmp_caps_reset>> mon->capab_offered[QMP_CAPABILITY_OOB] = mon->common.use_io_thread;
++     */
+     mon->capab_offered[QMP_CAPABILITY_OOB] = mon->common.use_io_thread;
+ }
+ 
+@@ -136,11 +145,24 @@ static void monitor_qmp_respond(MonitorQMP *mon, QDict *rsp)
+  * Runs outside of coroutine context for OOB commands, but in
+  * coroutine context for everything else.
+  */
++/*
++ * called by:
++ *   - monitor/qmp.c|318| <<monitor_qmp_dispatcher_co>> monitor_qmp_dispatch(mon, req_obj->req);
++ *   - monitor/qmp.c|369| <<handle_qmp_command>> monitor_qmp_dispatch(mon, req);
++ */
+ static void monitor_qmp_dispatch(MonitorQMP *mon, QObject *req)
+ {
+     QDict *rsp;
+     QDict *error;
+ 
++    /*
++     * called by:
++     *   - monitor/qmp.c|144| <<monitor_qmp_dispatch>> rsp = qmp_dispatch(mon->commands, req, qmp_oob_enabled(mon),
++     *   - qga/main.c|576| <<process_event>> rsp = qmp_dispatch(&ga_commands, obj, false, NULL);
++     *   - tests/unit/test-qmp-cmds.c|153| <<do_qmp_dispatch>> resp = qmp_dispatch(&qmp_commands, QOBJECT(req), allow_oob, NULL);
++     *   - tests/unit/test-qmp-cmds.c|176| <<do_qmp_dispatch_error>> resp = qmp_dispatch(&qmp_commands, QOBJECT(req), allow_oob, NULL);
++     *   - tests/unit/test-qmp-cmds.c|232| <<test_dispatch_cmd_success_response>> resp = qmp_dispatch(&qmp_commands, QOBJECT(req), false, NULL);
++     */
+     rsp = qmp_dispatch(mon->commands, req, qmp_oob_enabled(mon),
+                        &mon->common);
+ 
+@@ -172,6 +194,10 @@ static void monitor_qmp_dispatch(MonitorQMP *mon, QObject *req)
+  * be with qmp_mon->qmp_queue_lock held, and the caller is responsible
+  * to release it.
+  */
++/*
++ * called by:
++ *   - monitor/qmp.c|250| <<monitor_qmp_dispatcher_co>> while (!(req_obj = monitor_qmp_requests_pop_any_with_lock())) {
++ */
+ static QMPRequest *monitor_qmp_requests_pop_any_with_lock(void)
+ {
+     QMPRequest *req_obj = NULL;
+@@ -187,6 +213,22 @@ static QMPRequest *monitor_qmp_requests_pop_any_with_lock(void)
+ 
+         qmp_mon = container_of(mon, MonitorQMP, common);
+         qemu_mutex_lock(&qmp_mon->qmp_queue_lock);
++        /*
++	 * 在以下使用MonitorQMP->qmp_requests:
++	 *   - monitor/qmp.c|81| <<monitor_qmp_cleanup_req_queue_locked>> while (!g_queue_is_empty(mon->qmp_requests)) {
++	 *   - monitor/qmp.c|82| <<monitor_qmp_cleanup_req_queue_locked>> qmp_request_free(g_queue_pop_head(mon->qmp_requests));
++	 *   - monitor/qmp.c|97| <<monitor_qmp_cleanup_queue_and_resume>> mon->qmp_requests->length == QMP_REQ_QUEUE_LEN_MAX)
++	 *   - monitor/qmp.c|98| <<monitor_qmp_cleanup_queue_and_resume>> && !g_queue_is_empty(mon->qmp_requests);
++	 *   - monitor/qmp.c|204| <<monitor_qmp_requests_pop_any_with_lock>> req_obj = g_queue_pop_head(qmp_mon->qmp_requests);
++	 *   - monitor/qmp.c|276| <<monitor_qmp_dispatcher_co>> req_obj->mon->qmp_requests->length);
++	 *   - monitor/qmp.c|297| <<monitor_qmp_dispatcher_co>> && mon->qmp_requests->length == QMP_REQ_QUEUE_LEN_MAX - 1) {
++	 *   - monitor/qmp.c|434| <<handle_qmp_command>> mon->qmp_requests->length == QMP_REQ_QUEUE_LEN_MAX - 1) {
++	 *   - monitor/qmp.c|444| <<handle_qmp_command>> mon->qmp_requests->length);
++	 *   - monitor/qmp.c|445| <<handle_qmp_command>> assert(mon->qmp_requests->length < QMP_REQ_QUEUE_LEN_MAX);
++	 *   - monitor/qmp.c|446| <<handle_qmp_command>> g_queue_push_tail(mon->qmp_requests, req_obj);
++	 *   - monitor/qmp.c|530| <<monitor_data_destroy_qmp>> g_queue_free(mon->qmp_requests);
++	 *   - monitor/qmp.c|564| <<monitor_init_qmp>> mon->qmp_requests = g_queue_new();
++	 */
+         req_obj = g_queue_pop_head(qmp_mon->qmp_requests);
+         if (req_obj) {
+             /* With the lock of corresponding queue held */
+@@ -207,6 +249,10 @@ static QMPRequest *monitor_qmp_requests_pop_any_with_lock(void)
+     return req_obj;
+ }
+ 
++/*
++ * 在以下使用monitor_qmp_dispatcher_co():
++ *   - monitor/monitor.c|707| <<monitor_init_globals_core>> qmp_dispatcher_co = qemu_coroutine_create(monitor_qmp_dispatcher_co, NULL);
++ */
+ void coroutine_fn monitor_qmp_dispatcher_co(void *data)
+ {
+     QMPRequest *req_obj = NULL;
+@@ -315,6 +361,11 @@ void coroutine_fn monitor_qmp_dispatcher_co(void *data)
+                 trace_monitor_qmp_cmd_in_band(id_json->str);
+                 g_string_free(id_json, true);
+             }
++            /*
++	     * called by:
++	     *   - monitor/qmp.c|318| <<monitor_qmp_dispatcher_co>> monitor_qmp_dispatch(mon, req_obj->req);
++	     *   - monitor/qmp.c|369| <<handle_qmp_command>> monitor_qmp_dispatch(mon, req);
++	     */
+             monitor_qmp_dispatch(mon, req_obj->req);
+         } else {
+             assert(req_obj->err);
+@@ -342,9 +393,35 @@ void coroutine_fn monitor_qmp_dispatcher_co(void *data)
+     }
+ }
+ 
++/*
++ * (gdb) bt
++ * #0  handle_qmp_command (opaque=0x5555567fb9a0, req=0x7fffe0003740, err=0x0) at ../monitor/qmp.c:346
++ * #1  0x0000555555d27063 in json_message_process_token (lexer=lexer@entry=0x5555567fba60, input=0x555556777720, type=<optimized out>, x=<optimized out>, y=<optimized out>) at ../qobject/json-streamer.c:99
++ * #2  0x0000555555d57fbf in json_lexer_feed_char (lexer=lexer@entry=0x5555567fba60, ch=125 '}', flush=flush@entry=false) at ../qobject/json-lexer.c:313
++ * #3  0x0000555555d58119 in json_lexer_feed (lexer=0x5555567fba60, buffer=<optimized out>, size=<optimized out>) at ../qobject/json-lexer.c:350
++ * #4  0x0000555555c9a07e in tcp_chr_read (chan=<optimized out>, cond=<optimized out>, opaque=<optimized out>) at ../chardev/char-socket.c:508
++ * #5  0x00007ffff6c40119 in g_main_context_dispatch () at /lib64/libglib-2.0.so.0
++ * #6  0x00007ffff6c40478 in g_main_context_iterate.isra () at /lib64/libglib-2.0.so.0
++ * #7  0x00007ffff6c4074a in g_main_loop_run () at /lib64/libglib-2.0.so.0
++ * #8  0x0000555555bfb9c9 in iothread_run (opaque=opaque@entry=0x5555567fbb00) at ../iothread.c:74
++ * #9  0x0000555555d2fd09 in qemu_thread_start (args=0x7fffee5ef950) at ../util/qemu-thread-posix.c:504
++ * #10 0x00007ffff53d0ea5 in start_thread () at /lib64/libpthread.so.0
++ * #11 0x00007ffff50f99fd in clone () at /lib64/libc.so.6
++ *
++ * called by:
++ *   - monitor/qmp.c|463| <<monitor_qmp_event>> json_message_parser_init(&mon->parser, handle_qmp_command,
++ *   - monitor/qmp.c|517| <<monitor_init_qmp>> json_message_parser_init(&mon->parser, handle_qmp_command, mon, NULL);
++ */
+ static void handle_qmp_command(void *opaque, QObject *req, Error *err)
+ {
+     MonitorQMP *mon = opaque;
++    /*
++     * struct QDict {
++     *     struct QObjectBase_ base;
++     *     size_t size;
++     *     QLIST_HEAD(,QDictEntry) table[QDICT_BUCKET_MAX];
++     * };
++     */
+     QDict *qdict = qobject_to(QDict, req);
+     QMPRequest *req_obj;
+ 
+@@ -399,11 +476,40 @@ static void handle_qmp_command(void *opaque, QObject *req, Error *err)
+         trace_monitor_qmp_in_band_enqueue(req_obj, mon,
+                                           mon->qmp_requests->length);
+         assert(mon->qmp_requests->length < QMP_REQ_QUEUE_LEN_MAX);
++        /*
++	 * 在以下使用MonitorQMP->qmp_requests:
++	 *   - monitor/qmp.c|81| <<monitor_qmp_cleanup_req_queue_locked>> while (!g_queue_is_empty(mon->qmp_requests)) {
++	 *   - monitor/qmp.c|82| <<monitor_qmp_cleanup_req_queue_locked>> qmp_request_free(g_queue_pop_head(mon->qmp_requests));
++	 *   - monitor/qmp.c|97| <<monitor_qmp_cleanup_queue_and_resume>> mon->qmp_requests->length == QMP_REQ_QUEUE_LEN_MAX)
++	 *   - monitor/qmp.c|98| <<monitor_qmp_cleanup_queue_and_resume>> && !g_queue_is_empty(mon->qmp_requests);
++	 *   - monitor/qmp.c|204| <<monitor_qmp_requests_pop_any_with_lock>> req_obj = g_queue_pop_head(qmp_mon->qmp_requests);
++	 *   - monitor/qmp.c|276| <<monitor_qmp_dispatcher_co>> req_obj->mon->qmp_requests->length);
++	 *   - monitor/qmp.c|297| <<monitor_qmp_dispatcher_co>> && mon->qmp_requests->length == QMP_REQ_QUEUE_LEN_MAX - 1) {
++	 *   - monitor/qmp.c|434| <<handle_qmp_command>> mon->qmp_requests->length == QMP_REQ_QUEUE_LEN_MAX - 1) {
++	 *   - monitor/qmp.c|444| <<handle_qmp_command>> mon->qmp_requests->length);
++	 *   - monitor/qmp.c|445| <<handle_qmp_command>> assert(mon->qmp_requests->length < QMP_REQ_QUEUE_LEN_MAX);
++	 *   - monitor/qmp.c|446| <<handle_qmp_command>> g_queue_push_tail(mon->qmp_requests, req_obj);
++	 *   - monitor/qmp.c|530| <<monitor_data_destroy_qmp>> g_queue_free(mon->qmp_requests);
++	 *   - monitor/qmp.c|564| <<monitor_init_qmp>> mon->qmp_requests = g_queue_new();
++	 */
+         g_queue_push_tail(mon->qmp_requests, req_obj);
+     }
+ 
+     /* Kick the dispatcher routine */
+     if (!qatomic_xchg(&qmp_dispatcher_co_busy, true)) {
++        /*
++	 * 在以下使用qmp_dispatcher_co:
++	 *   - monitor/monitor.c|652| <<monitor_cleanup>> aio_co_wake(qmp_dispatcher_co);
++	 *   - monitor/monitor.c|707| <<monitor_init_globals_core>> qmp_dispatcher_co = qemu_coroutine_create(monitor_qmp_dispatcher_co, NULL);
++	 *   - monitor/monitor.c|709| <<monitor_init_globals_core>> aio_co_schedule(iohandler_get_aio_context(), qmp_dispatcher_co);
++	 *   - monitor/qmp.c|309| <<monitor_qmp_dispatcher_co>> aio_co_schedule(qemu_get_aio_context(), qmp_dispatcher_co);
++	 *   - monitor/qmp.c|345| <<monitor_qmp_dispatcher_co>> aio_co_schedule(iohandler_get_aio_context(), qmp_dispatcher_co);
++	 *   - monitor/qmp.c|417| <<handle_qmp_command>> aio_co_wake(qmp_dispatcher_co);
++	 *
++	 * Coroutine to dispatch the requests received from I/O thread
++	 *
++	 * 调用monitor_qmp_dispatcher_co()
++	 */
+         aio_co_wake(qmp_dispatcher_co);
+     }
+ }
+@@ -437,6 +543,11 @@ static QDict *qmp_greeting(MonitorQMP *mon)
+         ver, cap_list);
+ }
+ 
++/*
++ * 在以下使用monitor_qmp_event():
++ *   - monitor/qmp.c|507| <<monitor_qmp_setup_handlers_bh>> qemu_chr_fe_set_handlers(&mon->common.chr, monitor_can_read, monitor_qmp_read, monitor_qmp_event, NULL, &mon->common, context, true);
++ *   - monitor/qmp.c|548| <<monitor_init_qmp>> qemu_chr_fe_set_handlers(&mon->common.chr, monitor_can_read, monitor_qmp_read, monitor_qmp_event, NULL, &mon->common, NULL, true);
++ */
+ static void monitor_qmp_event(void *opaque, QEMUChrEvent event)
+ {
+     QDict *data;
 diff --git a/net/dump.c b/net/dump.c
 index 6a63b1535..f7b45b63f 100644
 --- a/net/dump.c
@@ -7981,6 +8313,75 @@ index 6a63b1535..f7b45b63f 100644
  static ssize_t filter_dump_receive_iov(NetFilterState *nf, NetClientState *sndr,
                                         unsigned flags, const struct iovec *iov,
                                         int iovcnt, NetPacketSent *sent_cb)
+diff --git a/qapi/qmp-dispatch.c b/qapi/qmp-dispatch.c
+index 0990873ec..b21fc73dd 100644
+--- a/qapi/qmp-dispatch.c
++++ b/qapi/qmp-dispatch.c
+@@ -41,6 +41,10 @@ Visitor *qobject_output_visitor_new_qmp(QObject **result)
+     return v;
+ }
+ 
++/*
++ * called by:
++ *   - qapi/qmp-dispatch.c|181| <<qmp_dispatch>> if (!qmp_dispatch_check_obj(dict, allow_oob, &err)) {
++ */
+ static QDict *qmp_dispatch_check_obj(QDict *dict, bool allow_oob,
+                                      Error **errp)
+ {
+@@ -119,6 +123,10 @@ typedef struct QmpDispatchBH {
+     Coroutine *co;
+ } QmpDispatchBH;
+ 
++/*
++ * 在以下使用do_qmp_dispatch_bh():
++ *   - qapi/qmp-dispatch.c|253| <<qmp_dispatch>> aio_bh_schedule_oneshot(qemu_get_aio_context(), do_qmp_dispatch_bh, &data);
++ */
+ static void do_qmp_dispatch_bh(void *opaque)
+ {
+     QmpDispatchBH *data = opaque;
+@@ -134,6 +142,42 @@ static void do_qmp_dispatch_bh(void *opaque)
+  * Runs outside of coroutine context for OOB commands, but in coroutine
+  * context for everything else.
+  */
++/*
++ * (gdb) bt
++ * #0  qmp_dispatch (cmds=0x5555565525a0 <qmp_cap_negotiation_commands>, request=0x7fffe0003740, allow_oob=false, cur_mon=0x5555567fb9a0)
++ *                   at ../qapi/qmp-dispatch.c:139
++ * #1  0x0000555555ca2414 in monitor_qmp_dispatch (mon=0x5555567fb9a0, req=<optimized out>) at ../monitor/qmp.c:144
++ * #2  0x0000555555ca2df2 in monitor_qmp_dispatcher_co (data=<optimized out>) at ../monitor/qmp.c:318
++ * #3  0x0000555555d41c2b in coroutine_trampoline (i0=<optimized out>, i1=<optimized out>) at ../util/coroutine-ucontext.c:177
++ * #4  0x00007ffff5043190 in __start_context () at /lib64/libc.so.6
++ * #5  0x00007fffffffd1b0 in  ()
++ * #6  0x0000000000000000 in  ()
++ *
++ * 在json的message换成oob的样子.
++ *
++ * (gdb) bt
++ * #0  qmp_dispatch (cmds=0x5555565525b0 <qmp_commands>, request=0x7fffe0003710, allow_oob=false, cur_mon=cur_mon@entry=0x5555567fb9a0) at ../qapi/qmp-dispatch.c:141
++ * #1  0x0000555555ca2414 in monitor_qmp_dispatch (mon=0x5555567fb9a0, req=<optimized out>) at ../monitor/qmp.c:144
++ * #2  0x0000555555ca2756 in handle_qmp_command (opaque=0x5555567fb9a0, req=0x7fffe0003710, err=<optimized out>) at ../monitor/qmp.c:371
++ * #3  0x0000555555d27103 in json_message_process_token (lexer=lexer@entry=0x5555567fba60, input=0x555556777720, type=<optimized out>, x=<optimized out>, y=<optimized out>) at ../qobject/json-streamer.c:99
++ * #4  0x0000555555d5805f in json_lexer_feed_char (lexer=lexer@entry=0x5555567fba60, ch=125 '}', flush=flush@entry=false) at ../qobject/json-lexer.c:313
++ * #5  0x0000555555d581b9 in json_lexer_feed (lexer=0x5555567fba60, buffer=<optimized out>, size=<optimized out>) at ../qobject/json-lexer.c:350
++ * #6  0x0000555555c9a07e in tcp_chr_read (chan=<optimized out>, cond=<optimized out>, opaque=<optimized out>) at ../chardev/char-socket.c:508
++ * #7  0x00007ffff6c40119 in g_main_context_dispatch () at /lib64/libglib-2.0.so.0
++ * #8  0x00007ffff6c40478 in g_main_context_iterate.isra () at /lib64/libglib-2.0.so.0
++ * #9  0x00007ffff6c4074a in g_main_loop_run () at /lib64/libglib-2.0.so.0
++ * #10 0x0000555555bfb9c9 in iothread_run (opaque=opaque@entry=0x5555567fbb00) at ../iothread.c:74
++ * #11 0x0000555555d2fda9 in qemu_thread_start (args=0x7fffee5ef950) at ../util/qemu-thread-posix.c:504
++ * #12 0x00007ffff53d0ea5 in start_thread () at /lib64/libpthread.so.0
++ * #13 0x00007ffff50f99fd in clone () at /lib64/libc.so.6
++ *
++ * called by:
++ *   - monitor/qmp.c|144| <<monitor_qmp_dispatch>> rsp = qmp_dispatch(mon->commands, req, qmp_oob_enabled(mon),
++ *   - qga/main.c|576| <<process_event>> rsp = qmp_dispatch(&ga_commands, obj, false, NULL);
++ *   - tests/unit/test-qmp-cmds.c|153| <<do_qmp_dispatch>> resp = qmp_dispatch(&qmp_commands, QOBJECT(req), allow_oob, NULL);
++ *   - tests/unit/test-qmp-cmds.c|176| <<do_qmp_dispatch_error>> resp = qmp_dispatch(&qmp_commands, QOBJECT(req), allow_oob, NULL);
++ *   - tests/unit/test-qmp-cmds.c|232| <<test_dispatch_cmd_success_response>> resp = qmp_dispatch(&qmp_commands, QOBJECT(req), false, NULL);
++ */
+ QDict *qmp_dispatch(const QmpCommandList *cmds, QObject *request,
+                     bool allow_oob, Monitor *cur_mon)
+ {
 diff --git a/qga/commands-posix.c b/qga/commands-posix.c
 index 954efed01..c5ff4fd09 100644
 --- a/qga/commands-posix.c
@@ -8020,6 +8421,25 @@ index 954efed01..c5ff4fd09 100644
  void qmp_guest_shutdown(bool has_mode, const char *mode, Error **errp)
  {
      const char *shutdown_flag;
+diff --git a/qobject/json-streamer.c b/qobject/json-streamer.c
+index b93d97b99..ef408b053 100644
+--- a/qobject/json-streamer.c
++++ b/qobject/json-streamer.c
+@@ -99,6 +99,14 @@ out_emit:
+     parser->emit(parser->opaque, json, err);
+ }
+ 
++/*
++ * called by:
++ *   - monitor/qmp.c|477| <<monitor_qmp_event>> json_message_parser_init(&mon->parser, handle_qmp_command,
++ *   - monitor/qmp.c|531| <<monitor_init_qmp>> json_message_parser_init(&mon->parser, handle_qmp_command, mon, NULL);
++ *   - qga/main.c|1342| <<initialize_agent>> json_message_parser_init(&s->parser, process_event, s, NULL);
++ *   - qobject/qjson.c|67| <<qobject_from_jsonv>> json_message_parser_init(&state.parser, consume_json, &state, ap);
++ *   - tests/qtest/libqmp.c|67| <<qmp_fd_receive>> json_message_parser_init(&qmp.parser, qmp_response, &qmp, NULL);
++ */
+ void json_message_parser_init(JSONMessageParser *parser,
+                               void (*emit)(void *opaque, QObject *json,
+                                            Error *err),
 diff --git a/qom/object.c b/qom/object.c
 index d34608558..5d61273dc 100644
 --- a/qom/object.c
@@ -8074,6 +8494,63 @@ index d34608558..5d61273dc 100644
      parts = g_strsplit(path, "/", 0);
      assert(parts);
  
+diff --git a/qom/qom-qmp-cmds.c b/qom/qom-qmp-cmds.c
+index 2e63a4c18..bc0adbf8f 100644
+--- a/qom/qom-qmp-cmds.c
++++ b/qom/qom-qmp-cmds.c
+@@ -75,6 +75,52 @@ void qmp_qom_set(const char *path, const char *property, QObject *value,
+     object_property_set_qobject(obj, property, value, errp);
+ }
+ 
++/*
++ * 使用oob的时候
++ *
++ * { "execute": "qmp_capabilities", "arguments": { "enable": ["oob"] } }
++ * { "exec-oob": "qom-get", "arguments": { "path": "/machine/peripheral-anon/device[0]", "property": "queue-size" } }
++ *
++ * (gdb) bt
++ * #0  qmp_qom_get (path=0x7fffe0004ab0 "/machine/peripheral-anon/device[0]", property=0x7fffe00027c0 "queue-size", errp=errp@entry=0x7fffee5ee538) at ../qom/qom-qmp-cmds.c:82
++ * #1  0x0000555555cfe9cb in qmp_marshal_qom_get (args=<optimized out>, ret=0x7fffee5ee5d8, errp=0x7fffee5ee5d0) at qapi/qapi-commands-qom.c:131
++ * #2  0x0000555555d23c8c in qmp_dispatch (cmds=0x5555565525b0 <qmp_commands>, request=<optimized out>, allow_oob=<optimized out>, cur_mon=cur_mon@entry=0x5555567fb9a0) at ../qapi/qmp-dispatch.c:212
++ * #3  0x0000555555ca2414 in monitor_qmp_dispatch (mon=0x5555567fb9a0, req=<optimized out>) at ../monitor/qmp.c:145
++ * #4  0x0000555555ca2756 in handle_qmp_command (opaque=0x5555567fb9a0, req=0x7fffe00027e0, err=<optimized out>) at ../monitor/qmp.c:372
++ * #5  0x0000555555d27143 in json_message_process_token (lexer=lexer@entry=0x5555567fba60, input=0x555556777720, type=<optimized out>, x=<optimized out>, y=<optimized out>) at ../qobject/json-streamer.c:99
++ * #6  0x0000555555d5809f in json_lexer_feed_char (lexer=lexer@entry=0x5555567fba60, ch=125 '}', flush=flush@entry=false) at ../qobject/json-lexer.c:313
++ * #7  0x0000555555d581f9 in json_lexer_feed (lexer=0x5555567fba60, buffer=<optimized out>, size=<optimized out>) at ../qobject/json-lexer.c:350
++ * #8  0x0000555555c9a07e in tcp_chr_read (chan=<optimized out>, cond=<optimized out>, opaque=<optimized out>) at ../chardev/char-socket.c:508
++ * #9  0x00007ffff6c40119 in g_main_context_dispatch () at /lib64/libglib-2.0.so.0
++ * #10 0x00007ffff6c40478 in g_main_context_iterate.isra () at /lib64/libglib-2.0.so.0
++ * #11 0x00007ffff6c4074a in g_main_loop_run () at /lib64/libglib-2.0.so.0
++ * #12 0x0000555555bfb9c9 in iothread_run (opaque=opaque@entry=0x5555567fbb00) at ../iothread.c:74
++ * #13 0x0000555555d2fde9 in qemu_thread_start (args=0x7fffee5ef950) at ../util/qemu-thread-posix.c:504
++ * #14 0x00007ffff53d0ea5 in start_thread () at /lib64/libpthread.so.0
++ * #15 0x00007ffff50f99fd in clone () at /lib64/libc.so.6
++ *
++ * 不使用oob的时候
++ *
++ * { "execute": "qmp_capabilities" }
++ * { "execute": "qom-get", "arguments": { "path": "/machine/peripheral-anon/device[0]", "property": "queue-size" } }
++ *
++ * (gdb) bt
++ * #0  qmp_qom_get (path=0x555556c38880 "/machine/peripheral-anon/device[0]", property=0x555556d9e560 "queue-size", errp=errp@entry=0x7fffffffd8a8) at ../qom/qom-qmp-cmds.c:82
++ * #1  0x0000555555cfe9cb in qmp_marshal_qom_get (args=<optimized out>, ret=0x7ffff7fcbea8, errp=0x7ffff7fcbea0) at qapi/qapi-commands-qom.c:131
++ * #2  0x0000555555d23379 in do_qmp_dispatch_bh (opaque=0x7ffff7fcbeb0) at ../qapi/qmp-dispatch.c:130
++ * #3  0x0000555555d3ff84 in aio_bh_call (bh=0x555556c74520) at ../util/async.c:178
++ * #4  aio_bh_poll (ctx=ctx@entry=0x5555565cac30) at ../util/async.c:178
++ * #5  0x0000555555d2cc1e in aio_dispatch (ctx=0x5555565cac30) at ../util/aio-posix.c:421
++ * #6  0x0000555555d3fbee in aio_ctx_dispatch (source=<optimized out>, callback=<optimized out>, user_data=<optimized out>) at ../util/async.c:320
++ * #7  0x00007ffff6c40119 in g_main_context_dispatch () at /lib64/libglib-2.0.so.0
++ * #8  0x0000555555d4bea0 in glib_pollfds_poll () at ../util/main-loop.c:297
++ * #9  os_host_main_loop_wait (timeout=0) at ../util/main-loop.c:320
++ * #10 main_loop_wait (nonblocking=nonblocking@entry=0) at ../util/main-loop.c:596
++ * #11 0x00005555559d1181 in qemu_main_loop () at ../softmmu/runstate.c:734
++ * #12 0x0000555555825f5c in qemu_main (argc=<optimized out>, argv=<optimized out>, envp=<optimized out>) at ../softmmu/main.c:38
++ * #13 0x00007ffff501d555 in __libc_start_main () at /lib64/libc.so.6
++ * #14 0x0000555555825e8a in _start () at ../softmmu/main.c:47
++ */
+ QObject *qmp_qom_get(const char *path, const char *property, Error **errp)
+ {
+     Object *obj;
 diff --git a/softmmu/cpus.c b/softmmu/cpus.c
 index 23b30484b..65786724c 100644
 --- a/softmmu/cpus.c
@@ -8602,10 +9079,33 @@ index 7ba204883..7c96e13b2 100644
  {
      memory_region_ref(root);
 diff --git a/softmmu/physmem.c b/softmmu/physmem.c
-index dc3c3e5f2..e4e44cda4 100644
+index dc3c3e5f2..6c8d0a5ad 100644
 --- a/softmmu/physmem.c
 +++ b/softmmu/physmem.c
-@@ -736,6 +736,16 @@ translate_fail:
+@@ -170,6 +170,10 @@ struct DirtyBitmapSnapshot {
+     unsigned long dirty[];
+ };
+ 
++/*
++ * called by:
++ *   - softmmu/physmem.c|234| <<phys_page_set>> phys_map_node_reserve(&d->map, 3 * P_L2_LEVELS);
++ */
+ static void phys_map_node_reserve(PhysPageMap *map, unsigned nodes)
+ {
+     static unsigned alloc_hint = 16;
+@@ -226,6 +230,11 @@ static void phys_page_set_level(PhysPageMap *map, PhysPageEntry *lp,
+     }
+ }
+ 
++/*
++ * called by:
++ *   - softmmu/physmem.c|1244| <<register_subpage>> phys_page_set(d, base >> TARGET_PAGE_BITS, 1,
++ *   - softmmu/physmem.c|1266| <<register_multipage>> phys_page_set(d, start_addr >> TARGET_PAGE_BITS, num_pages, section_index);
++ */
+ static void phys_page_set(AddressSpaceDispatch *d,
+                           hwaddr index, uint64_t nb,
+                           uint16_t leaf)
+@@ -736,6 +745,16 @@ translate_fail:
      return &d->map.sections[PHYS_SECTION_UNASSIGNED];
  }
  
@@ -8622,7 +9122,7 @@ index dc3c3e5f2..e4e44cda4 100644
  void cpu_address_space_init(CPUState *cpu, int asidx,
                              const char *prefix, MemoryRegion *mr)
  {
-@@ -774,6 +784,14 @@ void cpu_address_space_init(CPUState *cpu, int asidx,
+@@ -774,6 +793,14 @@ void cpu_address_space_init(CPUState *cpu, int asidx,
      }
  }
  
@@ -8839,7 +9339,7 @@ index 08ac957e9..3769d44e2 100644
      if (env->hflags & HF_CS64_MASK) {
          qemu_fprintf(f, "%-3s=%04x %016" PRIx64 " %08x %08x", name,
 diff --git a/target/i386/cpu.c b/target/i386/cpu.c
-index 1db1278a5..9f8f70f69 100644
+index 1db1278a5..fa3585635 100644
 --- a/target/i386/cpu.c
 +++ b/target/i386/cpu.c
 @@ -673,6 +673,22 @@ void x86_cpu_vendor_words2str(char *dst, uint32_t vendor1,
@@ -9064,7 +9564,30 @@ index 1db1278a5..9f8f70f69 100644
  static void x86_cpu_reset(DeviceState *dev)
  {
      CPUState *s = CPU(dev);
-@@ -6379,9 +6538,79 @@ static void x86_cpu_hyperv_realize(X86CPU *cpu)
+@@ -6058,6 +6217,22 @@ static void x86_cpu_adjust_level(X86CPU *cpu, uint32_t *min, uint32_t value)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/cpu.c|6384| <<x86_cpu_expand_features>> x86_cpu_adjust_feat_level(cpu, FEAT_7_0_EBX);
++ *   - target/i386/cpu.c|6386| <<x86_cpu_expand_features>> x86_cpu_adjust_feat_level(cpu, FEAT_1_EDX);
++ *   - target/i386/cpu.c|6387| <<x86_cpu_expand_features>> x86_cpu_adjust_feat_level(cpu, FEAT_1_ECX);
++ *   - target/i386/cpu.c|6388| <<x86_cpu_expand_features>> x86_cpu_adjust_feat_level(cpu, FEAT_6_EAX);
++ *   - target/i386/cpu.c|6389| <<x86_cpu_expand_features>> x86_cpu_adjust_feat_level(cpu, FEAT_7_0_ECX);
++ *   - target/i386/cpu.c|6390| <<x86_cpu_expand_features>> x86_cpu_adjust_feat_level(cpu, FEAT_7_1_EAX);
++ *   - target/i386/cpu.c|6391| <<x86_cpu_expand_features>> x86_cpu_adjust_feat_level(cpu, FEAT_8000_0001_EDX);
++ *   - target/i386/cpu.c|6392| <<x86_cpu_expand_features>> x86_cpu_adjust_feat_level(cpu, FEAT_8000_0001_ECX);
++ *   - target/i386/cpu.c|6393| <<x86_cpu_expand_features>> x86_cpu_adjust_feat_level(cpu, FEAT_8000_0007_EDX);
++ *   - target/i386/cpu.c|6394| <<x86_cpu_expand_features>> x86_cpu_adjust_feat_level(cpu, FEAT_8000_0008_EBX);
++ *   - target/i386/cpu.c|6395| <<x86_cpu_expand_features>> x86_cpu_adjust_feat_level(cpu, FEAT_C000_0001_EDX);
++ *   - target/i386/cpu.c|6396| <<x86_cpu_expand_features>> x86_cpu_adjust_feat_level(cpu, FEAT_SVM);
++ *   - target/i386/cpu.c|6397| <<x86_cpu_expand_features>> x86_cpu_adjust_feat_level(cpu, FEAT_XSAVE);
++ */
+ /* Increase cpuid_min_{level,xlevel,xlevel2} automatically, if appropriate */
+ static void x86_cpu_adjust_feat_level(X86CPU *cpu, FeatureWord w)
+ {
+@@ -6379,9 +6554,79 @@ static void x86_cpu_hyperv_realize(X86CPU *cpu)
      cpu->hyperv_limits[2] = 0;
  }
  
@@ -9144,7 +9667,7 @@ index 1db1278a5..9f8f70f69 100644
      X86CPU *cpu = X86_CPU(dev);
      X86CPUClass *xcc = X86_CPU_GET_CLASS(dev);
      CPUX86State *env = &cpu->env;
-@@ -6627,6 +6856,34 @@ out:
+@@ -6627,6 +6872,34 @@ out:
      }
  }
  
@@ -9514,7 +10037,7 @@ index 7237378a7..de88fc1fb 100644
      .name = ACCEL_CPU_NAME("kvm"),
  
 diff --git a/target/i386/kvm/kvm.c b/target/i386/kvm/kvm.c
-index f148a6d52..38f39a4da 100644
+index f148a6d52..41fdce39f 100644
 --- a/target/i386/kvm/kvm.c
 +++ b/target/i386/kvm/kvm.c
 @@ -119,11 +119,43 @@ static bool has_msr_core_capabs;
@@ -9937,11 +10460,30 @@ index f148a6d52..38f39a4da 100644
      if (has_msr_perf_capabs && cpu->enable_pmu) {
          kvm_msr_entry_add_perf(cpu, env->features);
      }
-@@ -3131,6 +3387,31 @@ static void kvm_init_msrs(X86CPU *cpu)
+@@ -3131,6 +3387,50 @@ static void kvm_init_msrs(X86CPU *cpu)
      assert(kvm_buf_set_msrs(cpu) == 0);
  }
  
 +/*
++ * 关于pmu enable:
++ *
++ * 1. 根据kernel的module param决定是不是disable了
++ * 2. 根据ioctl决定是不是支持cap (不支持可能是全局disable了)
++ * 3. 如果支持cap, 就disable
++ *
++ * host_cpu_vendor_fms()可获得vendor, 如果和vendor不一致, 直接disable pmu
++ * CPUState vs. first_cpu
++ *
++ * 关于pmu reset
++ *
++ * 1. 查看cpuid是否支持X86_FEATURE_PERFMON_V2.
++ *    如果支持, 根据0x80000022获取寄存器的数目.
++ *    此外, 3个global的也支持!
++ *    寄存器的base address和MSR_F15H_PERF_CTR5的一样(KVM svm其实限制了最多6个)
++ * 2. 如果不是ver=2, 如果支持X86_FEATURE_PERFCTR_CORE,
++ *    就是6个寄存器
++ * 3. 默认只支持4个
++ *
 + * (gdb) bt
 + * #0  kvm_put_msrs (cpu=0x555556ae2360, level=2) at ../target/i386/kvm/kvm.c:3135
 + * #1  0x0000555555b1497a in kvm_arch_put_registers (cpu=0x555556ae2360, level=2) at ../target/i386/kvm/kvm.c:4559
@@ -9969,7 +10511,7 @@ index f148a6d52..38f39a4da 100644
  static int kvm_put_msrs(X86CPU *cpu, int level)
  {
      CPUX86State *env = &cpu->env;
-@@ -3224,6 +3505,28 @@ static int kvm_put_msrs(X86CPU *cpu, int level)
+@@ -3224,6 +3524,28 @@ static int kvm_put_msrs(X86CPU *cpu, int level)
              kvm_msr_entry_add(cpu, MSR_KVM_POLL_CONTROL, env->poll_control_msr);
          }
  
@@ -9998,7 +10540,7 @@ index f148a6d52..38f39a4da 100644
          if (has_architectural_pmu_version > 0) {
              if (has_architectural_pmu_version > 1) {
                  /* Stop the counter.  */
-@@ -3232,16 +3535,38 @@ static int kvm_put_msrs(X86CPU *cpu, int level)
+@@ -3232,16 +3554,38 @@ static int kvm_put_msrs(X86CPU *cpu, int level)
              }
  
              /* Set the counter values.  */
@@ -10037,7 +10579,7 @@ index f148a6d52..38f39a4da 100644
              if (has_architectural_pmu_version > 1) {
                  kvm_msr_entry_add(cpu, MSR_CORE_PERF_GLOBAL_STATUS,
                                    env->msr_global_status);
-@@ -3725,6 +4050,14 @@ static int kvm_get_msrs(X86CPU *cpu)
+@@ -3725,6 +4069,14 @@ static int kvm_get_msrs(X86CPU *cpu)
          for (i = 0; i < num_architectural_pmu_fixed_counters; i++) {
              kvm_msr_entry_add(cpu, MSR_CORE_PERF_FIXED_CTR0 + i, 0);
          }
@@ -10052,7 +10594,7 @@ index f148a6d52..38f39a4da 100644
          for (i = 0; i < num_architectural_pmu_gp_counters; i++) {
              kvm_msr_entry_add(cpu, MSR_P6_PERFCTR0 + i, 0);
              kvm_msr_entry_add(cpu, MSR_P6_EVNTSEL0 + i, 0);
-@@ -4177,6 +4510,20 @@ static int kvm_get_msrs(X86CPU *cpu)
+@@ -4177,6 +4529,20 @@ static int kvm_get_msrs(X86CPU *cpu)
      return 0;
  }
  
@@ -10073,7 +10615,7 @@ index f148a6d52..38f39a4da 100644
  static int kvm_put_mp_state(X86CPU *cpu)
  {
      struct kvm_mp_state mp_state = { .mp_state = cpu->env.mp_state };
-@@ -4505,6 +4852,12 @@ static int kvm_get_nested_state(X86CPU *cpu)
+@@ -4505,6 +4871,12 @@ static int kvm_get_nested_state(X86CPU *cpu)
      return ret;
  }
  
@@ -10086,7 +10628,7 @@ index f148a6d52..38f39a4da 100644
  int kvm_arch_put_registers(CPUState *cpu, int level)
  {
      X86CPU *x86_cpu = X86_CPU(cpu);
-@@ -4775,6 +5128,10 @@ MemTxAttrs kvm_arch_post_run(CPUState *cpu, struct kvm_run *run)
+@@ -4775,6 +5147,10 @@ MemTxAttrs kvm_arch_post_run(CPUState *cpu, struct kvm_run *run)
      return cpu_get_mem_attrs(env);
  }
  
@@ -10170,7 +10712,7 @@ index c3ac20ad4..fcb64d05e 100644
  {
      time_t lifetime, now = time(NULL);
 diff --git a/util/aio-posix.c b/util/aio-posix.c
-index 731f3826c..c95653ba7 100644
+index 731f3826c..3f2336397 100644
 --- a/util/aio-posix.c
 +++ b/util/aio-posix.c
 @@ -97,6 +97,53 @@ static bool aio_remove_fd_handler(AioContext *ctx, AioHandler *node)
@@ -10253,7 +10795,18 @@ index 731f3826c..c95653ba7 100644
  static bool aio_dispatch_handlers(AioContext *ctx)
  {
      AioHandler *node, *tmp;
-@@ -600,6 +659,24 @@ static bool try_poll_mode(AioContext *ctx, AioHandlerList *ready_list,
+@@ -415,6 +474,10 @@ static bool aio_dispatch_handlers(AioContext *ctx)
+     return progress;
+ }
+ 
++/*
++ * called by:
++ *   - util/async.c|320| <<aio_ctx_dispatch>> aio_dispatch(ctx);
++ */
+ void aio_dispatch(AioContext *ctx)
+ {
+     qemu_lockcnt_inc(&ctx->list_lock);
+@@ -600,6 +663,24 @@ static bool try_poll_mode(AioContext *ctx, AioHandlerList *ready_list,
      return false;
  }
  
@@ -10306,10 +10859,39 @@ index 98c5accd2..948ee021b 100644
      AIO_WAIT_WHILE(ctx, !data.done);
  }
 diff --git a/util/async.c b/util/async.c
-index 63434ddae..c2cf07802 100644
+index 63434ddae..10fe737b3 100644
 --- a/util/async.c
 +++ b/util/async.c
-@@ -402,6 +402,10 @@ ThreadPool *aio_get_thread_pool(AioContext *ctx)
+@@ -309,6 +309,17 @@ aio_ctx_check(GSource *source)
+     return aio_pending(ctx) || (timerlistgroup_deadline_ns(&ctx->tlg) == 0);
+ }
+ 
++/*
++ * 在以下使用:
++ *   - util/async.c|385| <<global>> aio_ctx_dispatch,
++ *
++ * 382 static GSourceFuncs aio_source_funcs = {
++ * 383     aio_ctx_prepare,
++ * 384     aio_ctx_check,
++ * 385     aio_ctx_dispatch,
++ * 386     aio_ctx_finalize
++ * 387 };
++ */
+ static gboolean
+ aio_ctx_dispatch(GSource     *source,
+                  GSourceFunc  callback,
+@@ -379,6 +390,10 @@ aio_ctx_finalize(GSource     *source)
+     aio_context_destroy(ctx);
+ }
+ 
++/*
++ * 在以下使用aio_source_funcs:
++ *   - util/async.c|538| <<aio_context_new>> ctx = (AioContext *) g_source_new(&aio_source_funcs, sizeof(AioContext));
++ */
+ static GSourceFuncs aio_source_funcs = {
+     aio_ctx_prepare,
+     aio_ctx_check,
+@@ -402,6 +417,10 @@ ThreadPool *aio_get_thread_pool(AioContext *ctx)
  }
  
  #ifdef CONFIG_LINUX_AIO
@@ -10397,14 +10979,31 @@ index d6eb0378c..912f580bc 100644
  {
      const QEMULogItem *item;
 diff --git a/util/main-loop.c b/util/main-loop.c
-index f00a25451..654ea6bd4 100644
+index f00a25451..3527577ab 100644
 --- a/util/main-loop.c
 +++ b/util/main-loop.c
-@@ -288,6 +288,21 @@ static void glib_pollfds_fill(int64_t *cur_timeout)
+@@ -288,6 +288,38 @@ static void glib_pollfds_fill(int64_t *cur_timeout)
      *cur_timeout = qemu_soonest_timeout(timeout_ns, *cur_timeout);
  }
  
 +/*
++ * (gdb) bt
++ * #0  qmp_qom_get (path=0x555556f1cb60 "/machine/peripheral-anon/device[0]", property=0x5555567e9b20 "queue-size", errp=errp@entry=0x7fffffffd8b8) at ../qom/qom-qmp-cmds.c:82
++ * #1  0x0000555555cfe93b in qmp_marshal_qom_get (args=<optimized out>, ret=0x7ffff7fcbea8, errp=0x7ffff7fcbea0) at qapi/qapi-commands-qom.c:131
++ * #2  0x0000555555d232e9 in do_qmp_dispatch_bh (opaque=0x7ffff7fcbeb0) at ../qapi/qmp-dispatch.c:128
++ * #3  0x0000555555d3fea4 in aio_bh_call (bh=0x5555567dc5a0) at ../util/async.c:178
++ * #4  aio_bh_poll (ctx=ctx@entry=0x5555565cadf0) at ../util/async.c:178
++ * #5  0x0000555555d2cb3e in aio_dispatch (ctx=0x5555565cadf0) at ../util/aio-posix.c:421
++ * #6  0x0000555555d3fb0e in aio_ctx_dispatch (source=<optimized out>, callback=<optimized out>, user_data=<optimized out>) at ../util/async.c:320
++ * #7  0x00007ffff6c40119 in g_main_context_dispatch () at /lib64/libglib-2.0.so.0
++ * #8  0x0000555555d4bdc0 in glib_pollfds_poll () at ../util/main-loop.c:297
++ * #9  os_host_main_loop_wait (timeout=0) at ../util/main-loop.c:320
++ * #10 main_loop_wait (nonblocking=nonblocking@entry=0) at ../util/main-loop.c:596
++ * #11 0x00005555559d1181 in qemu_main_loop () at ../softmmu/runstate.c:734
++ * #12 0x0000555555825f5c in qemu_main (argc=<optimized out>, argv=<optimized out>, envp=<optimized out>) at ../softmmu/main.c:38
++ * #13 0x00007ffff501d555 in __libc_start_main () at /lib64/libc.so.6
++ * #14 0x0000555555825e8a in _start () at ../softmmu/main.c:47
++ *
 + * (gdb) bt
 + * #0  iscsi_nop_timed_event (opaque=0x5562784d9560) at ../block/iscsi.c:1408
 + * #1  0x00005562769a610f in timerlist_run_timers (timer_list=0x556278288ec0) at ../util/qemu-timer.c:576
@@ -10422,7 +11021,7 @@ index f00a25451..654ea6bd4 100644
  static void glib_pollfds_poll(void)
  {
      GMainContext *context = g_main_context_default();
-@@ -300,6 +315,24 @@ static void glib_pollfds_poll(void)
+@@ -300,6 +332,24 @@ static void glib_pollfds_poll(void)
  
  #define MAX_MAIN_LOOP_SPIN (1000)
  
