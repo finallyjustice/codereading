@@ -1,0 +1,171 @@
+[PATCH v9 00/14] KVM: arm64: Add support for FEAT_TLBIRANGE
+
+... from Raghavendra Rao Ananta <rananta@google.com> ...
+
+https://lore.kernel.org/all/20230811045127.3308641-1-rananta@google.com/
+
+--------------------------
+
+In certain code paths, KVM/ARM currently invalidates the entire VM's
+page-tables instead of just invalidating a necessary range. For example,
+when collapsing a table PTE to a block PTE, instead of iterating over
+each PTE and flushing them, KVM uses 'vmalls12e1is' TLBI operation to
+flush all the entries. This is inefficient since the guest would have
+to refill the TLBs again, even for the addresses that aren't covered
+by the table entry. The performance impact would scale poorly if many
+addresses in the VM is going through this remapping.
+
+For architectures that implement FEAT_TLBIRANGE, KVM can replace such
+inefficient paths by performing the invalidations only on the range of
+addresses that are in scope. This series tries to achieve the same in
+the areas of stage-2 map, unmap and write-protecting the pages.
+
+--------------------------
+
+[PATCH v9 01/14] KVM: Rename kvm_arch_flush_remote_tlb() to kvm_arch_flush_remote_tlbs()
+
+No functional change intended.
+
+把函数名字的tlb换成tlbs, 表示可以是多个range.
+
+--------------------------
+
+[PATCH v9 02/14] KVM: Declare kvm_arch_flush_remote_tlbs() globally
+
+全局declare kvm_arch_flush_remote_tlbs()
+
+No functional change.
+
+--------------------------
+
+[PATCH v9 03/14] KVM: arm64: Use kvm_arch_flush_remote_tlbs()
+
+在arm使用kvm_arch_flush_remote_tlbs()
+
+diff --git a/arch/arm64/kvm/mmu.c b/arch/arm64/kvm/mmu.c
+index 6db9ef288ec38..0ac721fa27f18 100644
+--- a/arch/arm64/kvm/mmu.c
++++ b/arch/arm64/kvm/mmu.c
+@@ -161,15 +161,15 @@ static bool memslot_is_logging(struct kvm_memory_slot *memslot)
+ }
+ 
+ /**
+- * kvm_flush_remote_tlbs() - flush all VM TLB entries for v7/8
++ * kvm_arch_flush_remote_tlbs() - flush all VM TLB entries for v7/8
+  * @kvm:	pointer to kvm structure.
+  *
+  * Interface to HYP function to flush all VM TLB entries
+  */
+-void kvm_flush_remote_tlbs(struct kvm *kvm)
++int kvm_arch_flush_remote_tlbs(struct kvm *kvm)
+ {
+-	++kvm->stat.generic.remote_tlb_flush_requests;
+ 	kvm_call_hyp(__kvm_tlb_flush_vmid, &kvm->arch.mmu);
++	return 0;
+ }
+
+--------------------------
+
+[PATCH v9 04/14] KVM: Remove CONFIG_HAVE_KVM_ARCH_TLB_FLUSH_ALL
+
+--------------------------
+
+[PATCH v9 05/14] KVM: Allow range-based TLB invalidation from common code
+
+允许在common code的virt/kvm/kvm_main.c中使用kvm_flush_remote_tlbs_range()-->kvm_arch_flush_remote_tlbs_range().
+
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index d6b0507861550..26e91000f579d 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -366,6 +366,19 @@ void kvm_flush_remote_tlbs(struct kvm *kvm)
+ }
+ EXPORT_SYMBOL_GPL(kvm_flush_remote_tlbs);
+
++void kvm_flush_remote_tlbs_range(struct kvm *kvm, gfn_t gfn, u64 nr_pages)
++{
++	if (!kvm_arch_flush_remote_tlbs_range(kvm, gfn, nr_pages))
++		return;
++
++	/*
++	 * Fall back to a flushing entire TLBs if the architecture range-based
++	 * TLB invalidation is unsupported or can't be performed for whatever
++	 * reason.
++	 */
++	kvm_flush_remote_tlbs(kvm);
++}
++
+
+--------------------------
+
+[PATCH v9 06/14] KVM: Move kvm_arch_flush_remote_tlbs_memslot() to common code
+
+把kvm_arch_flush_remote_tlbs_memslot()也变成common code virt/kvm/kvm_main.c的函数.
+
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 26e91000f579d..5d4d2e051aa09 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -379,6 +379,20 @@ void kvm_flush_remote_tlbs_range(struct kvm *kvm, gfn_t gfn, u64 nr_pages)
+ 	kvm_flush_remote_tlbs(kvm);
+ }
+
++void kvm_flush_remote_tlbs_memslot(struct kvm *kvm,
++				   const struct kvm_memory_slot *memslot)
++{
++	/*
++	 * All current use cases for flushing the TLBs for a specific memslot
++	 * are related to dirty logging, and many do the TLB flush out of
++	 * mmu_lock. The interaction between the various operations on memslot
++	 * must be serialized by slots_locks to ensure the TLB flush from one
++	 * operation is observed by any other operation on the same memslot.
++	 */
++	lockdep_assert_held(&kvm->slots_lock);
++	kvm_flush_remote_tlbs_range(kvm, memslot->base_gfn, memslot->npages);
++}
+
+--------------------------
+
+[PATCH v9 07/14] arm64: tlb: Refactor the core flush algorithm of __flush_tlb_range
+
+Refactor __flush_tlb_range().
+
+No functional change.
+
+--------------------------
+
+[PATCH v9 08/14] arm64: tlb: Implement __flush_s2_tlb_range_op()
+
+定义__flush_s2_tlb_range_op()来用作EPT(arm64上叫stage-2 specific range-based TLBI
+operations).
+
+Define __flush_s2_tlb_range_op(), as a wrapper over
+__flush_tlb_range_op(), for stage-2 specific range-based TLBI
+operations that doesn't necessarily have to deal with 'asid'
+and 'tlbi_user' arguments.
+
+--------------------------
+
+[PATCH v9 09/14] KVM: arm64: Implement  __kvm_tlb_flush_vmid_range()
+
+定义__kvm_tlb_flush_vmid_range().
+
+Define  __kvm_tlb_flush_vmid_range() (for VHE and nVHE)
+to flush a range of stage-2 page-tables using IPA in one go.
+If the system supports FEAT_TLBIRANGE, the following patches
+would conveniently replace global TLBI such as vmalls12e1is
+in the map, unmap, and dirty-logging paths with ripas2e1is
+instead.
+
+--------------------------
+
+[PATCH v9 10/14] KVM: arm64: Define kvm_tlb_flush_vmid_range()
+
+定义kvm_tlb_flush_vmid_range()
+
+Implement the helper kvm_tlb_flush_vmid_range() that acts
+as a wrapper for range-based TLB invalidations. For the
+given VMID, use the range-based TLBI instructions to do
+the job or fallback to invalidating all the TLB entries.
+
+--------------------------

@@ -1,14 +1,308 @@
-From abcdcfb9540ba748dde8b9c2a025bc390143db90 Mon Sep 17 00:00:00 2001
+From 9470c3953a74b1b69aae83caf9c240d754305bf7 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Sat, 22 Jul 2023 22:12:30 -0700
+Date: Wed, 23 Aug 2023 10:54:23 -0700
 Subject: [PATCH 1/1] qemu for v8.0.0
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
- dump/dump.c              | 85 ++++++++++++++++++++++++++++++++++++++++
- softmmu/memory_mapping.c |  7 ++++
- 2 files changed, 92 insertions(+)
+ accel/accel-blocker.c    | 133 +++++++++++++++++++++++++++++++++++++++
+ accel/kvm/kvm-all.c      |  41 ++++++++++++
+ dump/dump.c              |  85 +++++++++++++++++++++++++
+ include/sysemu/kvm_int.h |  10 +++
+ softmmu/memory.c         |  30 +++++++++
+ softmmu/memory_mapping.c |   7 +++
+ 6 files changed, 306 insertions(+)
 
+diff --git a/accel/accel-blocker.c b/accel/accel-blocker.c
+index 1e7f42346..b06244e81 100644
+--- a/accel/accel-blocker.c
++++ b/accel/accel-blocker.c
+@@ -30,25 +30,83 @@
+ #include "hw/core/cpu.h"
+ #include "sysemu/accel-blocker.h"
+ 
++/*
++ * 在以下使用&accel_in_ioctl_lock:
++ *   - accel/accel-blocker.c|38| <<accel_blocker_init>> qemu_lockcnt_init(&accel_in_ioctl_lock);
++ *   - accel/accel-blocker.c|49| <<accel_ioctl_begin>> qemu_lockcnt_inc(&accel_in_ioctl_lock);
++ *   - accel/accel-blocker.c|58| <<accel_ioctl_end>> qemu_lockcnt_dec(&accel_in_ioctl_lock);
++ *   - accel/accel-blocker.c|97| <<accel_has_to_wait>> return needs_to_wait || qemu_lockcnt_count(&accel_in_ioctl_lock);
++ *   - accel/accel-blocker.c|114| <<accel_ioctl_inhibit_begin>> qemu_lockcnt_lock(&accel_in_ioctl_lock);
++ *   - accel/accel-blocker.c|149| <<accel_ioctl_inhibit_end>> qemu_lockcnt_unlock(&accel_in_ioctl_lock);
++ */
+ static QemuLockCnt accel_in_ioctl_lock;
++/*
++ * 在以下使用accel_in_ioctl_event:
++ *   - accel/accel-blocker.c|39| <<accel_blocker_init>> qemu_event_init(&accel_in_ioctl_event, false);
++ *   - accel/accel-blocker.c|60| <<accel_ioctl_end>> qemu_event_set(&accel_in_ioctl_event);
++ *   - accel/accel-blocker.c|81| <<accel_cpu_ioctl_end>> qemu_event_set(&accel_in_ioctl_event);
++ *   - accel/accel-blocker.c|120| <<accel_ioctl_inhibit_begin>> qemu_event_reset(&accel_in_ioctl_event);
++ *   - accel/accel-blocker.c|137| <<accel_ioctl_inhibit_begin>> qemu_event_wait(&accel_in_ioctl_event);
++ */
+ static QemuEvent accel_in_ioctl_event;
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|2401| <<kvm_init>> accel_blocker_init();
++ */
+ void accel_blocker_init(void)
+ {
+     qemu_lockcnt_init(&accel_in_ioctl_lock);
+     qemu_event_init(&accel_in_ioctl_event, false);
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|3106| <<kvm_vm_ioctl>> accel_ioctl_begin();
++ *   - accel/kvm/kvm-all.c|3146| <<kvm_device_ioctl>> accel_ioctl_begin();
++ *
++ * accel_{cpu_}ioctl_begin/end:
++ * Mark when ioctl is about to run or just finished.
++ *
++ * accel_{cpu_}ioctl_begin will block after accel_ioctl_inhibit_begin() is
++ * called, preventing new ioctls to run. They will continue only after
++ * accel_ioctl_inibith_end().
++ *
++ * 是给vm的ioctl的时候用的
++ */
+ void accel_ioctl_begin(void)
+ {
+     if (likely(qemu_mutex_iothread_locked())) {
+         return;
+     }
+ 
++    /*
++     * 在以下使用&accel_in_ioctl_lock:
++     *   - accel/accel-blocker.c|38| <<accel_blocker_init>> qemu_lockcnt_init(&accel_in_ioctl_lock);
++     *   - accel/accel-blocker.c|49| <<accel_ioctl_begin>> qemu_lockcnt_inc(&accel_in_ioctl_lock);
++     *   - accel/accel-blocker.c|58| <<accel_ioctl_end>> qemu_lockcnt_dec(&accel_in_ioctl_lock);
++     *   - accel/accel-blocker.c|97| <<accel_has_to_wait>> return needs_to_wait || qemu_lockcnt_count(&accel_in_ioctl_lock);
++     *   - accel/accel-blocker.c|114| <<accel_ioctl_inhibit_begin>> qemu_lockcnt_lock(&accel_in_ioctl_lock);
++     *   - accel/accel-blocker.c|149| <<accel_ioctl_inhibit_end>> qemu_lockcnt_unlock(&accel_in_ioctl_lock);
++     */
+     /* block if lock is taken in kvm_ioctl_inhibit_begin() */
+     qemu_lockcnt_inc(&accel_in_ioctl_lock);
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|3108| <<kvm_vm_ioctl>> accel_ioctl_end();
++ *   - accel/kvm/kvm-all.c|3148| <<kvm_device_ioctl>> accel_ioctl_end();
++ *
++ * accel_{cpu_}ioctl_begin/end:
++ * Mark when ioctl is about to run or just finished.
++ *
++ * accel_{cpu_}ioctl_begin will block after accel_ioctl_inhibit_begin() is
++ * called, preventing new ioctls to run. They will continue only after
++ * accel_ioctl_inibith_end().
++ *
++ * 是给vm的ioctl的时候用的
++ */
+ void accel_ioctl_end(void)
+ {
+     if (likely(qemu_mutex_iothread_locked())) {
+@@ -60,6 +118,19 @@ void accel_ioctl_end(void)
+     qemu_event_set(&accel_in_ioctl_event);
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|3126| <<kvm_vcpu_ioctl>> accel_cpu_ioctl_begin(cpu);
++ *
++ * accel_{cpu_}ioctl_begin/end:
++ * Mark when ioctl is about to run or just finished.
++ *
++ * accel_{cpu_}ioctl_begin will block after accel_ioctl_inhibit_begin() is
++ * called, preventing new ioctls to run. They will continue only after
++ * accel_ioctl_inibith_end().
++ *
++ * 是给vcpu的ioctl的时候用的
++ */
+ void accel_cpu_ioctl_begin(CPUState *cpu)
+ {
+     if (unlikely(qemu_mutex_iothread_locked())) {
+@@ -70,6 +141,19 @@ void accel_cpu_ioctl_begin(CPUState *cpu)
+     qemu_lockcnt_inc(&cpu->in_ioctl_lock);
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|3128| <<kvm_vcpu_ioctl>> accel_cpu_ioctl_end(cpu);
++ *
++ * accel_{cpu_}ioctl_begin/end:
++ * Mark when ioctl is about to run or just finished.
++ *
++ * accel_{cpu_}ioctl_begin will block after accel_ioctl_inhibit_begin() is
++ * called, preventing new ioctls to run. They will continue only after
++ * accel_ioctl_inibith_end().
++ *
++ * 是给vcpu的ioctl的时候用的
++ */
+ void accel_cpu_ioctl_end(CPUState *cpu)
+ {
+     if (unlikely(qemu_mutex_iothread_locked())) {
+@@ -81,6 +165,10 @@ void accel_cpu_ioctl_end(CPUState *cpu)
+     qemu_event_set(&accel_in_ioctl_event);
+ }
+ 
++/*
++ * called by:
++ *   - accel/accel-blocker.c|122| <<accel_ioctl_inhibit_begin>> if (accel_has_to_wait()) {
++ */
+ static bool accel_has_to_wait(void)
+ {
+     CPUState *cpu;
+@@ -94,9 +182,34 @@ static bool accel_has_to_wait(void)
+         }
+     }
+ 
++    /*
++     * 在以下使用&accel_in_ioctl_lock:
++     *   - accel/accel-blocker.c|38| <<accel_blocker_init>> qemu_lockcnt_init(&accel_in_ioctl_lock);
++     *   - accel/accel-blocker.c|49| <<accel_ioctl_begin>> qemu_lockcnt_inc(&accel_in_ioctl_lock);
++     *   - accel/accel-blocker.c|58| <<accel_ioctl_end>> qemu_lockcnt_dec(&accel_in_ioctl_lock);
++     *   - accel/accel-blocker.c|97| <<accel_has_to_wait>> return needs_to_wait || qemu_lockcnt_count(&accel_in_ioctl_lock);
++     *   - accel/accel-blocker.c|114| <<accel_ioctl_inhibit_begin>> qemu_lockcnt_lock(&accel_in_ioctl_lock);
++     *   - accel/accel-blocker.c|149| <<accel_ioctl_inhibit_end>> qemu_lockcnt_unlock(&accel_in_ioctl_lock);
++     */
+     return needs_to_wait || qemu_lockcnt_count(&accel_in_ioctl_lock);
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|1527| <<kvm_region_commit>> accel_ioctl_inhibit_begin();
++ *
++ * accel_ioctl_inhibit_begin: start critical section
++ *
++ * This function makes sure that:
++ * 1) incoming accel_{cpu_}ioctl_begin() calls block
++ * 2) wait that all ioctls that were already running reach
++ *    accel_{cpu_}ioctl_end(), kicking vcpus if necessary.
++ *
++ * This allows the caller to access shared data or perform operations without
++ * worrying of concurrent vcpus accesses.
++ *
++ * 修改内存的时候用的
++ */
+ void accel_ioctl_inhibit_begin(void)
+ {
+     CPUState *cpu;
+@@ -111,6 +224,15 @@ void accel_ioctl_inhibit_begin(void)
+     CPU_FOREACH(cpu) {
+         qemu_lockcnt_lock(&cpu->in_ioctl_lock);
+     }
++    /*
++     * 在以下使用&accel_in_ioctl_lock:
++     *   - accel/accel-blocker.c|38| <<accel_blocker_init>> qemu_lockcnt_init(&accel_in_ioctl_lock);
++     *   - accel/accel-blocker.c|49| <<accel_ioctl_begin>> qemu_lockcnt_inc(&accel_in_ioctl_lock);
++     *   - accel/accel-blocker.c|58| <<accel_ioctl_end>> qemu_lockcnt_dec(&accel_in_ioctl_lock);
++     *   - accel/accel-blocker.c|97| <<accel_has_to_wait>> return needs_to_wait || qemu_lockcnt_count(&accel_in_ioctl_lock);
++     *   - accel/accel-blocker.c|114| <<accel_ioctl_inhibit_begin>> qemu_lockcnt_lock(&accel_in_ioctl_lock);
++     *   - accel/accel-blocker.c|149| <<accel_ioctl_inhibit_end>> qemu_lockcnt_unlock(&accel_in_ioctl_lock);
++     */
+     qemu_lockcnt_lock(&accel_in_ioctl_lock);
+ 
+     /* Keep waiting until there are running ioctls */
+@@ -142,6 +264,17 @@ void accel_ioctl_inhibit_begin(void)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|1551| <<kvm_region_commit>> accel_ioctl_inhibit_end();
++ *
++ * accel_ioctl_inhibit_end: end critical section started by
++ * accel_ioctl_inhibit_begin()
++ *
++ * This function allows blocked accel_{cpu_}ioctl_begin() to continue.
++ *
++ * 修改内存的时候用的
++ */
+ void accel_ioctl_inhibit_end(void)
+ {
+     CPUState *cpu;
+diff --git a/accel/kvm/kvm-all.c b/accel/kvm/kvm-all.c
+index cf3a88d90..98f9eedb5 100644
+--- a/accel/kvm/kvm-all.c
++++ b/accel/kvm/kvm-all.c
+@@ -131,8 +131,25 @@ typedef struct KVMResampleFd KVMResampleFd;
+ static QLIST_HEAD(, KVMResampleFd) kvm_resample_fd_list =
+     QLIST_HEAD_INITIALIZER(kvm_resample_fd_list);
+ 
++/*
++ * 在以下使用kml_slots_lock:
++ *   - accel/kvm/kvm-all.c|136| <<kvm_slots_lock>> #define kvm_slots_lock() qemu_mutex_lock(&kml_slots_lock)
++ *   - accel/kvm/kvm-all.c|137| <<kvm_slots_unlock>> #define kvm_slots_unlock() qemu_mutex_unlock(&kml_slots_lock)
++ *   - accel/kvm/kvm-all.c|2388| <<kvm_init>> qemu_mutex_init(&kml_slots_lock);
++ */
+ static QemuMutex kml_slots_lock;
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|205| <<kvm_has_free_slot>> kvm_slots_lock();
++ *   - accel/kvm/kvm-all.c|273| <<kvm_physical_memory_addr_from_host>> kvm_slots_lock();
++ *   - accel/kvm/kvm-all.c|502| <<kvm_section_update_flags>> kvm_slots_lock();
++ *   - accel/kvm/kvm-all.c|772| <<kvm_dirty_ring_reap>> kvm_slots_lock();
++ *   - accel/kvm/kvm-all.c|1003| <<kvm_physical_log_clear>> kvm_slots_lock();
++ *   - accel/kvm/kvm-all.c|1525| <<kvm_region_commit>> kvm_slots_lock();
++ *   - accel/kvm/kvm-all.c|1561| <<kvm_log_sync>> kvm_slots_lock();
++ *   - accel/kvm/kvm-all.c|1580| <<kvm_log_sync_global>> kvm_slots_lock();
++ */
+ #define kvm_slots_lock()    qemu_mutex_lock(&kml_slots_lock)
+ #define kvm_slots_unlock()  qemu_mutex_unlock(&kml_slots_lock)
+ 
+@@ -1467,6 +1484,16 @@ static void kvm_region_add(MemoryListener *listener,
+     update = g_new0(KVMMemoryUpdate, 1);
+     update->section = *section;
+ 
++    /*
++     * 在以下使用KVMMemoryListener->transaction_add:
++     *   - accel/kvm/kvm-all.c|1470| <<kvm_region_add>> QSIMPLEQ_INSERT_TAIL(&kml->transaction_add, update, next);
++     *   - accel/kvm/kvm-all.c|1492| <<kvm_region_commit>> if (QSIMPLEQ_EMPTY(&kml->transaction_add) &&
++     *   - accel/kvm/kvm-all.c|1505| <<kvm_region_commit>> u2 = QSIMPLEQ_FIRST(&kml->transaction_add);
++     *   - accel/kvm/kvm-all.c|1540| <<kvm_region_commit>> while (!QSIMPLEQ_EMPTY(&kml->transaction_add)) {
++     *   - accel/kvm/kvm-all.c|1541| <<kvm_region_commit>> u1 = QSIMPLEQ_FIRST(&kml->transaction_add);
++     *   - accel/kvm/kvm-all.c|1542| <<kvm_region_commit>> QSIMPLEQ_REMOVE_HEAD(&kml->transaction_add, next);
++     *   - accel/kvm/kvm-all.c|1697| <<kvm_memory_listener_register>> QSIMPLEQ_INIT(&kml->transaction_add);
++     */
+     QSIMPLEQ_INSERT_TAIL(&kml->transaction_add, update, next);
+ }
+ 
+@@ -1482,6 +1509,12 @@ static void kvm_region_del(MemoryListener *listener,
+     QSIMPLEQ_INSERT_TAIL(&kml->transaction_del, update, next);
+ }
+ 
++/*
++ * called by:
++ *   - softmmu/memory.c|1109| <<memory_region_transaction_commit>> MEMORY_LISTENER_CALL_GLOBAL(commit, Forward);
++ *   - softmmu/memory.c|2995| <<listener_add_address_space>> listener->commit(listener);
++ *   - softmmu/memory.c|3021| <<listener_del_address_space>> listener->commit(listener);
++ */
+ static void kvm_region_commit(MemoryListener *listener)
+ {
+     KVMMemoryListener *kml = container_of(listener, KVMMemoryListener,
+@@ -1524,6 +1557,9 @@ static void kvm_region_commit(MemoryListener *listener)
+ 
+     kvm_slots_lock();
+     if (need_inhibit) {
++        /*
++	 * 只在这里调用
++	 */
+         accel_ioctl_inhibit_begin();
+     }
+ 
+@@ -1682,6 +1718,11 @@ static void kvm_io_ioeventfd_del(MemoryListener *listener,
+     }
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|2702| <<kvm_init>> kvm_memory_listener_register(s, &s->memory_listener, &address_space_memory, 0, "kvm-memory");
++ *   - target/i386/kvm/kvm.c|2551| <<register_smram_listener>> kvm_memory_listener_register(kvm_state, &smram_listener, &smram_address_space, 1, "kvm-smram");
++ */
+ void kvm_memory_listener_register(KVMState *s, KVMMemoryListener *kml,
+                                   AddressSpace *as, int as_id, const char *name)
+ {
 diff --git a/dump/dump.c b/dump/dump.c
 index 1f1a6edca..fac289a08 100644
 --- a/dump/dump.c
@@ -215,6 +509,75 @@ index 1f1a6edca..fac289a08 100644
  static void *dump_thread(void *data)
  {
      DumpState *s = (DumpState *)data;
+diff --git a/include/sysemu/kvm_int.h b/include/sysemu/kvm_int.h
+index a641c974e..fcde39cbd 100644
+--- a/include/sysemu/kvm_int.h
++++ b/include/sysemu/kvm_int.h
+@@ -41,6 +41,16 @@ typedef struct KVMMemoryListener {
+     MemoryListener listener;
+     KVMSlot *slots;
+     int as_id;
++    /*
++     * 在以下使用KVMMemoryListener->transaction_add:
++     *   - accel/kvm/kvm-all.c|1470| <<kvm_region_add>> QSIMPLEQ_INSERT_TAIL(&kml->transaction_add, update, next);
++     *   - accel/kvm/kvm-all.c|1492| <<kvm_region_commit>> if (QSIMPLEQ_EMPTY(&kml->transaction_add) &&
++     *   - accel/kvm/kvm-all.c|1505| <<kvm_region_commit>> u2 = QSIMPLEQ_FIRST(&kml->transaction_add);
++     *   - accel/kvm/kvm-all.c|1540| <<kvm_region_commit>> while (!QSIMPLEQ_EMPTY(&kml->transaction_add)) {
++     *   - accel/kvm/kvm-all.c|1541| <<kvm_region_commit>> u1 = QSIMPLEQ_FIRST(&kml->transaction_add);
++     *   - accel/kvm/kvm-all.c|1542| <<kvm_region_commit>> QSIMPLEQ_REMOVE_HEAD(&kml->transaction_add, next);
++     *   - accel/kvm/kvm-all.c|1697| <<kvm_memory_listener_register>> QSIMPLEQ_INIT(&kml->transaction_add);
++     */
+     QSIMPLEQ_HEAD(, KVMMemoryUpdate) transaction_add;
+     QSIMPLEQ_HEAD(, KVMMemoryUpdate) transaction_del;
+ } KVMMemoryListener;
+diff --git a/softmmu/memory.c b/softmmu/memory.c
+index b1a6cae6f..63b9c40f7 100644
+--- a/softmmu/memory.c
++++ b/softmmu/memory.c
+@@ -2965,6 +2965,10 @@ void memory_global_dirty_log_stop(unsigned int flags)
+     memory_global_dirty_log_do_stop(flags);
+ }
+ 
++/*
++ * called by:
++ *   - softmmu/memory.c|3058| <<memory_listener_register>> listener_add_address_space(listener, as);
++ */
+ static void listener_add_address_space(MemoryListener *listener,
+                                        AddressSpace *as)
+ {
+@@ -3023,6 +3027,32 @@ static void listener_del_address_space(MemoryListener *listener,
+     flatview_unref(view);
+ }
+ 
++/*
++ * called by:
++ *   - accel/hvf/hvf-accel-ops.c|338| <<hvf_accel_init>> memory_listener_register(&hvf_memory_listener, &address_space_memory);
++ *   - accel/kvm/kvm-all.c|1750| <<kvm_memory_listener_register>> memory_listener_register(&kml->listener, as);
++ *   - accel/kvm/kvm-all.c|2710| <<kvm_init>> memory_listener_register(&kvm_io_listener,
++ *   - accel/kvm/kvm-all.c|2713| <<kvm_init>> memory_listener_register(&kvm_coalesced_pio_listener,
++ *   - hw/i386/xen/xen-hvm.c|1498| <<xen_hvm_init_pc>> memory_listener_register(&state->memory_listener, &address_space_memory);
++ *   - hw/i386/xen/xen-hvm.c|1502| <<xen_hvm_init_pc>> memory_listener_register(&state->io_listener, &address_space_io);
++ *   - hw/intc/openpic_kvm.c|238| <<kvm_openpic_realize>> memory_listener_register(&opp->mem_listener, &address_space_memory);
++ *   - hw/remote/proxy-memory-listener.c|223| <<proxy_memory_listener_configure>> memory_listener_register(&proxy_listener->listener,
++ *   - hw/vfio/common.c|1470| <<vfio_dirty_tracking_init>> memory_listener_register(&dirty.listener,
++ *   - hw/vfio/common.c|2617| <<vfio_connect_container>> memory_listener_register(&container->prereg_listener,
++ *   - hw/vfio/common.c|2675| <<vfio_connect_container>> memory_listener_register(&container->listener, container->space->as);
++ *   - hw/virtio/vhost-vdpa.c|1166| <<vhost_vdpa_dev_start>> memory_listener_register(&v->listener, &address_space_memory);
++ *   - hw/virtio/vhost.c|1496| <<vhost_dev_init>> memory_listener_register(&hdev->memory_listener, &address_space_memory);
++ *   - hw/virtio/vhost.c|1938| <<vhost_dev_start>> memory_listener_register(&hdev->iommu_listener, vdev->dma_as);
++ *   - hw/virtio/virtio.c|3621| <<virtio_device_realize>> memory_listener_register(&vdev->listener, vdev->dma_as);
++ *   - hw/xen/xen_pt.c|910| <<xen_pt_realize>> memory_listener_register(&s->memory_listener, &address_space_memory);
++ *   - hw/xen/xen_pt.c|911| <<xen_pt_realize>> memory_listener_register(&s->io_listener, &address_space_io);
++ *   - softmmu/memory_mapping.c|297| <<guest_phys_blocks_append>> memory_listener_register(&g.listener, &address_space_memory);
++ *   - softmmu/physmem.c|774| <<cpu_address_space_init>> memory_listener_register(&newas->tcg_as_listener, as);
++ *   - target/arm/kvm.c|398| <<kvm_arm_register_device>> memory_listener_register(&devlistener, &address_space_memory);
++ *   - target/i386/hax/hax-mem.c|322| <<hax_memory_init>> memory_listener_register(&hax_memory_listener, &address_space_memory);
++ *   - target/i386/nvmm/nvmm-all.c|1201| <<nvmm_accel_init>> memory_listener_register(&nvmm_memory_listener, &address_space_memory);
++ *   - target/i386/whpx/whpx-all.c|2435| <<whpx_memory_init>> memory_listener_register(&whpx_memory_listener, &address_space_memory);
++ */
+ void memory_listener_register(MemoryListener *listener, AddressSpace *as)
+ {
+     MemoryListener *other = NULL;
 diff --git a/softmmu/memory_mapping.c b/softmmu/memory_mapping.c
 index d7f1d096e..a137bcf19 100644
 --- a/softmmu/memory_mapping.c

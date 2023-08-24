@@ -1,0 +1,128 @@
+[PATCH v5 00/12] KVM: arm64: PMU: Allow userspace to limit the number of PMCs on vCPU
+
+... from Raghavendra Rao Ananta <rananta@google.com> ...
+
+https://lore.kernel.org/all/20230817003029.3073210-1-rananta@google.com/
+
+--------------------------
+
+1. aarch64的KVM的PMCR_EL0.N决定了PMU寄存器数量.
+
+2. 尽管userspace可以通过KVM_SET_ONE_REG设置VM的PMCR_EL0.N,
+但是实际和没有一样. vcpu reset的时候又设置成了host的数量.
+
+3. 迁移的时候每个机器支持的PMU寄存器数量不一样.
+
+patchset的目的是允许userspace配置PMCR_EL0.N, 这样就能在不同数目的机器migrate了.
+
+--------------------------
+
+[PATCH v5 01/12] KVM: arm64: PMU: Introduce a helper to set the guest's PMU
+
+No functional change.
+
+把一些代码放进并引入kvm_arm_set_vm_pmu(), 设置kvm->arch.arm_pmu.
+如果没有指定, 用kvm_pmu_probe_armpmu()获得的.
+
+--------------------------
+
+[PATCH v5 02/12] KVM: arm64: PMU: Set the default PMU for the guest on vCPU reset
+
+后续的patch想通过kvm->arch.arm_pmu的寄存器的数量在vcpu reset的时候设置VM的寄存器的数量.
+
+然而, 一种scenario是在reset的时候kvm->arch.arm_pmu还没有设置.
+
+所以把一些代码从kvm_arm_pmu_v3_set_attr()转移到了kvm_reset_vcpu()早期, 在kvm_pmu_vcpu_reset()之前.
+
+这样在kvm_pmu_vcpu_reset()的时候就可以用kvm->arch.arm_pmu了.
+
+我觉得这个patch不能算是no functional change.
+
+--------------------------
+
+[PATCH v5 03/12] KVM: arm64: PMU: Clear PM{C,I}NTEN{SET,CLR} and PMOVS{SET,CLR} on vCPU reset
+
+在vcpu reset的时候, 对于下面的寄存器
+
+- PMCNTEN{SET,CLR}_EL0
+- PMINTEN{SET,CLR}_EL1
+- PMOVS{SET,CLR}_EL1
+
+会用reset_pmu_reg()使用host的信息配置VM的PMU信息.
+
+换成reset_val().
+
+--------------------------
+
+[PATCH v5 04/12] KVM: arm64: PMU: Don't define the sysreg reset() for PM{USERENR,CCFILTR}_EL0
+
+No functional.
+
+上面PATCH 03已经用reset_val()了.
+对于一些用PMU_SYS_REG定义的寄存器不用再单独设置了.
+
+--------------------------
+
+[PATCH v5 05/12] KVM: arm64: PMU: Simplify extracting PMCR_EL0.N
+
+引入心的macro来帮助获取host的PMCR_EL0.N.
+
+No functional.
+
+--------------------------
+
+[PATCH v5 06/12] KVM: arm64: PMU: Add a helper to read a vCPU's PMCR_EL0
+
+引入kvm_vcpu_read_pmcr()作为helper帮助read a vCPU's PMCR_EL0.
+
++u64 kvm_vcpu_read_pmcr(struct kvm_vcpu *vcpu)
++{
++	return __vcpu_sys_reg(vcpu, PMCR_EL0);
++}
+
+
+No functional.
+
+--------------------------
+
+[PATCH v5 07/12] KVM: arm64: PMU: Set PMCR_EL0.N for vCPU based on the associated PMU
+
+对于heterogeneous, 每次reset的时候, vcpu的PMCR_EL0.N都会根据当前的pcpu的PMCR_EL0.N设置.
+
+引入新的field kvm->arch.pmcr_n, 确保VM的PMCR_EL0.N总是相同的.
+
+@@ -887,6 +890,13 @@ int kvm_arm_set_vm_pmu(struct kvm *kvm, struct arm_pmu *arm_pmu)
+
+ 	kvm->arch.arm_pmu = arm_pmu;
+
++	/*
++	 * Both the num_events and PMCR_EL0.N indicates the number of
++	 * PMU event counters, but the former includes the cycle counter
++	 * while the latter does not.
++	 */
++	kvm->arch.pmcr_n = arm_pmu->num_events - 1;
++
+
+--------------------------
+
+[PATCH v5 08/12] KVM: arm64: PMU: Allow userspace to limit PMCR_EL0.N for the guest
+
+允许userspace修改PMCR_EL0.N
+
+@@ -2147,8 +2192,8 @@ static const struct sys_reg_desc sys_reg_descs[] = {
+ 	{ SYS_DESC(SYS_CTR_EL0), access_ctr },
+ 	{ SYS_DESC(SYS_SVCR), undef_access },
+
+-	{ PMU_SYS_REG(PMCR_EL0), .access = access_pmcr,
+-	  .reset = reset_pmcr, .reg = PMCR_EL0, .get_user = get_pmcr },
++	{ PMU_SYS_REG(PMCR_EL0), .access = access_pmcr, .reset = reset_pmcr,
++	  .reg = PMCR_EL0, .get_user = get_pmcr, .set_user = set_pmcr },
+
+
+新的set_pmcr()应该是通过以下调用的.
+
+kvm_arch_vcpu_ioctl(KVM_SET_ONE_REG)
+-> kvm_arm_set_reg()
+   -> kvm_arm_sys_reg_set_reg()
+      -> kvm_sys_reg_set_user()
+         -> r->set_user = set_pmcr()
