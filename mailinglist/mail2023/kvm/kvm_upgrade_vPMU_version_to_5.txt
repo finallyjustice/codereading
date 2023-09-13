@@ -1,0 +1,194 @@
+[PATCH 0/9] Upgrade vPMU version to 5
+
+... from Xiong Zhang <xiong.y.zhang@intel.com> ...
+
+https://lore.kernel.org/all/20230901072809.640175-1-xiong.y.zhang@intel.com/
+
+--------------------------
+
+目前KVM对vPMU支持到ver=2. 这个patchset升级到ver=5 (3, 4 and 5).
+
+Go through PMU features from version 3 to 5, the following features are
+supported by this patchset:
+
+1. Streamlined Freeze LBR on PMI on version 4. This feature adds a new
+bit IA32_MSR_PERF_GLOBAL_STATUS.LBR_FRZ[58], it will be set when PMI
+happens and LBR stack is forzen. This bit also serves as a control to
+enable LBR stack. SW should clear this bit at the end of PMI handler
+to enable LBR stack.
+
+
+2. IA32_PERF_GLOBAL_STATUS_RESET MSR on version 4. its address is
+inherited from  IA32_PERF_GLOBAL_OVF_CTRL MSR, and they have the same
+function to clear individual bits in IA32_PERF_GLOBAL_STATUS MSR.
+
+
+3. IA32_PERF_GLOBAL_STATUS_SET MSR on version 4. it allows software to
+set individual bits in IA32_PERF_GLOBAL_STATUS MSR.
+
+
+4. IA32_PERF_GLOBAL_INUSE MSR on version 4. It provides an "InUse" bit
+for each programmable performance counter and fixed counter in the
+processor. Additionally, it includes an indicator if the PMI mechanisam
+has been used.
+
+
+5. Fixed Counter Enumeration on version 5. CPUID.0AH.ECX provides a bit
+mask which enumerates the supported Fixed Counters in a processor.
+
+--------------------------
+
+[PATCH 1/9] KVM: x86/PMU: Don't release vLBR caused by PMI
+
+Considering this serial:
+1. vPMC overflow, KVM injects vPMI and clears guest LBR_EN
+2. guest handles PMI, and reads LBR records.
+3. vCPU is sched-out, later sched-in, vLBR event is released.
+4. Guest continue reading LBR records, KVM creates vLBR event again,
+the vLBR event is the only LBR user on host now, host PMU driver will
+reset HW LBR facility at vLBR creataion.
+5. Guest gets the remain LBR records with reset state.
+This is conflict with FREEZE_LBR_ON_PMI meaning, so vLBR event can
+not be release on PMI.
+
+在PMI handler的时候把LBR_EN clear是必须的操作.
+但是有上面的bug会不小心把event给release了.
+
+增加一个field防止不小心release.
+
+@@ -761,7 +763,8 @@ void vmx_passthrough_lbr_msrs(struct kvm_vcpu *vcpu)
+
+ static void intel_pmu_cleanup(struct kvm_vcpu *vcpu)
+ {
+-	if (!(vmcs_read64(GUEST_IA32_DEBUGCTL) & DEBUGCTLMSR_LBR))
++	if (!(vmcs_read64(GUEST_IA32_DEBUGCTL) & DEBUGCTLMSR_LBR) &&
++	    !vcpu_to_lbr_desc(vcpu)->freeze_on_pmi)
+ 		intel_pmu_release_guest_lbr_event(vcpu);
+ }
+
+--------------------------
+
+[PATCH 2/9] KVM: x85/pmu: Add Streamlined FREEZE_LBR_ON_PMI for vPMU v4
+
+实现新的featureFREEZE_LBR_ON_PMI. 似乎上面的使用GUEST_IA32_DEBUGCTL来clear,
+这里是用IA32_PERF_GLOBAL_STATUS.
+
+The sequence of streamlined freeze LBR is:
+1. Profiling agent set IA32_DEBUGCTL.FREEZE_LBR_ON_PMI, and enable
+a performance counter to generate PMI on overflow.
+2. Processor generates PMI and sets IA32_PERF_GLOBAL_STATUS.LBR_FRZ,
+then LBR stack is forzen.
+3. Profiling agent PMI handler handles overflow, and clears
+IA32_PERF_GLOBAL_STATUS.
+4. When IA32_PERF_GLOBAL_STATUS.LBR_FRZ is cleared in step 3,
+processor resume LBR stack, and new LBR records can be filled
+again.
+
+@@ -684,6 +726,8 @@ static void intel_pmu_deliver_pmi(struct kvm_vcpu *vcpu)
+
+ 	if (version > 1 && version < 4)
+ 		intel_pmu_legacy_freezing_lbrs_on_pmi(vcpu);
++	else if (version >= 4)
++		intel_pmu_streamlined_freezing_lbrs_on_pmi(vcpu);
+
+--------------------------
+
+[PATCH 3/9] KVM: x86/pmu: Add PERF_GLOBAL_STATUS_SET MSR emulation
+
+感觉commit message和实现没直接关系.
+
+PERF_GLOBAL_STATUS_SET可以用来修改只读的IA32_PERF_GLOBAL_STATUS寄存器.
+
+--------------------------
+
+[PATCH 4/9] KVM: x86/pmu: Add MSR_PERF_GLOBAL_INUSE emulation
+
+对MSR_PERF_GLOBAL_INUSE寄存器的模拟
+
+--------------------------
+
+[PATCH 5/9] KVM: x86/pmu: Check CPUID.0AH.ECX consistency
+
+With Arch PMU V5, register CPUID.0AH.ECX indicates Fixed Counter
+enumeration. It is a bit mask which enumerates the supported Fixed
+counters.
+
+这个patch是增加对cpuid的支持.
+
+--------------------------
+
+[PATCH 6/9] KVM: x86/pmu: Add Intel PMU supported fixed counters mask
+
+Per Intel SDM, fixed-function performance counter 'i' is supported:
+
+	FxCtr[i]_is_supported := ECX[i] || (EDX[4:0] > i);
+if pmu.version >=5, ECX is supported fixed counters bit mask.
+if 1 < pmu.version < 5, EDX[4:0] is number of contiguous fixed-function
+performance counters starting from 0.
+
+which means that the KVM user space can use EDX to limit the number of
+fixed counters starting from 0 and at the same time, using ECX to enable
+part of other KVM supported fixed counters. i.e: pmu.version = 5,
+ECX= 0x5, EDX[4:0]=1, FxCtrl[2, 0] are supported, FxCtrl[1] isn't
+supported.
+
+ver=5增加了新的cpuid来允许report那些不连续的fixed counter.
+
++static inline bool fixed_ctr_is_supported(struct kvm_pmu *pmu, unsigned int idx)
++{
++	return test_bit(INTEL_PMC_IDX_FIXED + idx, pmu->all_valid_pmc_idx);
++}
+
+--------------------------
+
+[PATCH 7/9] KVM: x86/pmu: Add fixed counter enumeration for pmu v5
+
+根据是否是ver=5和是否支持不连续的fixed counter, 返回ecx的值.
+
+diff --git a/arch/x86/kvm/cpuid.c b/arch/x86/kvm/cpuid.c
+index 95dc5e8847e0..2bffed010c9e 100644
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@ -1028,7 +1028,10 @@ static inline int __do_cpuid_func(struct kvm_cpuid_array *array, u32 function)
+
+ 		entry->eax = eax.full;
+ 		entry->ebx = kvm_pmu_cap.events_mask;
+-		entry->ecx = 0;
++		if (kvm_pmu_cap.version < 5)
++			entry->ecx = 0;
++		else
++			entry->ecx = (1ULL << kvm_pmu_cap.num_counters_fixed) - 1;
+ 		entry->edx = edx.full;
+ 		break;
+ 	}
+
+With Arch PMU v5, CPUID.0AH.ECX is a bit mask which enumerates the
+supported Fixed Counters. If bit 'i' is set, it implies that Fixed
+Counter 'i' is supported.
+
+This commit adds CPUID.0AH.ECX emulation for vPMU version 5, KVM
+supports Fixed Counter enumeration starting from 0 by default,
+user can modify it through SET_CPUID2 ioctl.
+
+--------------------------
+
+[PATCH 8/9] KVM: x86/pmu: Upgrade pmu version to 5 on intel processor
+
+diff --git a/arch/x86/kvm/pmu.h b/arch/x86/kvm/pmu.h
+index 4bab4819ea6c..8e6bc9b1a747 100644
+--- a/arch/x86/kvm/pmu.h
++++ b/arch/x86/kvm/pmu.h
+@@ -215,7 +215,10 @@ static inline void kvm_init_pmu_capability(const struct kvm_pmu_ops *pmu_ops)
+ 		return;
+ 	}
+
+-	kvm_pmu_cap.version = min(kvm_pmu_cap.version, 2);
++	if (is_intel)
++		kvm_pmu_cap.version = min(kvm_pmu_cap.version, 5);
++	else
++		kvm_pmu_cap.version = min(kvm_pmu_cap.version, 2);
+ 	kvm_pmu_cap.num_counters_gp = min(kvm_pmu_cap.num_counters_gp,
+ 					  pmu_ops->MAX_NR_GP_COUNTERS);
+ 	kvm_pmu_cap.num_counters_fixed = min(kvm_pmu_cap.num_counters_fixed,
+
+--------------------------

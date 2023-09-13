@@ -1,0 +1,92 @@
+[PATCH v3 00/16] virtio-mem: Expose device memory through multiple memslots
+
+... from  David Hildenbrand <david@redhat.com>...
+
+https://lore.kernel.org/all/20230908142136.403541-1-david@redhat.com/
+
+---------------------------
+
+Quoting from patch #14:
+
+    Having large virtio-mem devices that only expose little memory to a VM
+    is currently a problem: we map the whole sparse memory region into the
+    guest using a single memslot, resulting in one gigantic memslot in KVM.
+    KVM allocates metadata for the whole memslot, which can result in quite
+    some memory waste.
+
+    Assuming we have a 1 TiB virtio-mem device and only expose little (e.g.,
+    1 GiB) memory, we would create a single 1 TiB memslot and KVM has to
+    allocate metadata for that 1 TiB memslot: on x86, this implies allocating
+    a significant amount of memory for metadata:
+
+    (1) RMAP: 8 bytes per 4 KiB, 8 bytes per 2 MiB, 8 bytes per 1 GiB
+        -> For 1 TiB: 2147483648 + 4194304 + 8192 = ~ 2 GiB (0.2 %)
+
+        With the TDP MMU (cat /sys/module/kvm/parameters/tdp_mmu) this gets
+        allocated lazily when required for nested VMs
+    (2) gfn_track: 2 bytes per 4 KiB
+        -> For 1 TiB: 536870912 = ~512 MiB (0.05 %)
+    (3) lpage_info: 4 bytes per 2 MiB, 4 bytes per 1 GiB
+        -> For 1 TiB: 2097152 + 4096 = ~2 MiB (0.0002 %)
+    (4) 2x dirty bitmaps for tracking: 2x 1 bit per 4 KiB page
+        -> For 1 TiB: 536870912 = 64 MiB (0.006 %)
+
+    So we primarily care about (1) and (2). The bad thing is, that the
+    memory consumption doubles once SMM is enabled, because we create the
+    memslot once for !SMM and once for SMM.
+
+    Having a 1 TiB memslot without the TDP MMU consumes around:
+    * With SMM: 5 GiB
+    * Without SMM: 2.5 GiB
+    Having a 1 TiB memslot with the TDP MMU consumes around:
+    * With SMM: 1 GiB
+    * Without SMM: 512 MiB
+
+    ... and that's really something we want to optimize, to be able to just
+    start a VM with small boot memory (e.g., 4 GiB) and a virtio-mem device
+    that can grow very large (e.g., 1 TiB).
+
+    Consequently, using multiple memslots and only mapping the memslots we
+    really need can significantly reduce memory waste and speed up
+    memslot-related operations. Let's expose the sparse RAM memory region using
+    multiple memslots, mapping only the memslots we currently need into our
+    device memory region container.
+
+The hyper-v balloon driver has similar demands [1].
+
+For virtio-mem, this has to be turned manually on ("multiple-memslots=on"),
+due to the interaction with vhost (below).
+
+If we have less than 509 memslots available, we always default to a single
+memslot. Otherwise, we automatically decide how many memslots to use
+based on a simple heuristic (see patch #12), and try not to use more than
+256 memslots across all memory devices: our historical DIMM limit.
+
+As soon as any memory devices automatically decided on using more than
+one memslot, vhost devices that support less than 509 memslots (e.g.,
+currently most vhost-user devices like with virtiofsd) can no longer be
+plugged as a precaution.
+
+Quoting from patch #12:
+
+    Plugging vhost devices with less than 509 memslots available while we
+    have memory devices plugged that consume multiple memslots due to
+    automatic decisions can be problematic. Most configurations might just fail
+    due to "limit < used + reserved", however, it can also happen that these
+    memory devices would suddenly consume memslots that would actually be
+    required by other memslot consumers (boot, PCI BARs) later. Note that this
+    has always been sketchy with vhost devices that support only a small number
+    of memslots; but we don't want to make it any worse.So let's keep it simple
+    and simply reject plugging such vhost devices in such a configuration.
+
+    Eventually, all vhost devices that want to be fully compatible with such
+    memory devices should support a decent number of memslots (>= 509).
+
+
+The recommendation is to plug such vhost devices before the virtio-mem
+decides, or to not set "multiple-memslots=on". As soon as these devices
+support a reasonable number of memslots (>= 509), this will start working
+automatically.
+
+I run some tests on x86_64, now also including vfio tests. Seems to work
+as expected, even when multiple memslots are used.
