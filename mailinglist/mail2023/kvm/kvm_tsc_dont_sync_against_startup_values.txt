@@ -1,0 +1,106 @@
+[PATCH v6] KVM: x86/tsc: Don't sync user-written TSC against startup values
+
+... from Like Xu <likexu@tencent.com> ...
+
+https://lore.kernel.org/all/20230913103729.51194-1-likexu@tencent.com/
+
+--------------------
+
+https://bugzilla.kernel.org/show_bug.cgi?id=217423
+
+bug filer的场景很特别, 都是在1-second内完成的.
+
+VM是lightweight VM还要做snapshot(在启动后100ms+左右).
+
+核心的symptom是:
+
+1. 启动lightweight VM.
+2. 等待运行100ms+.
+3. Stop and save VM.
+4. Restore VM.
+
+奇怪的是, VM的tsc是从0开始,而不是大概的100ms+.
+这样会造成注册的lapic timer多等100ms+ timeout.
+
+这是因为如果tsc synchronization的时间差小于1s,tsc就用初始化的,
+比如说0 (在这个save/restore的case).
+
+Below are the steps in detail, I traced them via bpftrace, to simplify the
+analysis, the preemption timer on host is disabled, guest is running with
+TSC timer deadline mode.
+
+TSC changes before save VM:
+1 create VM/VCPU, guest TSC start from 0 (VCPU initial value)
+  host_tsc0 = 0 + offset0
+2 pause VM after guest start finished (about 200ms)
+  host_tsc1 = guest_tsc1 + offset0
+  guest_tsc1_deadline = guest_tsc1 + expire1
+3 save VM state
+  save guest_tsc1 by reading MSR_IA32_TSC
+  save guest_tsc1_deadline by reading MSR_IA32_TSC_DEADLINE
+
+TSC changes in restore VM (to simplify the analysis, step 4
+and step 5 ignore the host TSC changes in restore process):
+4 create VM/VCPU, guest TSC start from 0 (VCPU initial value)
+  host_tsc3 = 0 + offset1
+5 restore VM state
+  set MSR_IA32_TSC by guest_tsc1
+  set MSR_IA32_TSC_DEADLINE by guest_tsc1_deadline
+6 start VM
+  VCPU_RUN
+
+In step 5 setting MSR_IA32_TSC, because the guest_tsc1 is within 1 second,
+KVM will take this update as TSC synchronize, then skip update offset1.
+This means the guest TSC is still at 0 (initialize value).
+
+In step 5 setting MSR_IA32_TSC_DEADLINE, VMM just want setup hrtimer after
+expire1, but KVM will get the current guest TSC is 0, and then calculate
+the expire time as (guest_tsc1_deadline - 0), then the hrtimer introduce
+guest_tsc1 latency (the guest kernel stopped if it will only kick by loapic
+timer).
+
+
+===================
+
+That commit message definitely needs work. Oliver gave you some
+verbiage which made a lot more sense to me. Let me try again...
+
+================
+
+[PATCH] KVM: x86/tsc: Don't sync user-written TSC against startup values
+
+The legacy API for setting the TSC is fundamentally broken, and only
+allows userspace to set a TSC "now", without any way to account for
+time lost to preemption between the calculation of the value, and the
+kernel eventually handling the ioctl.
+
+To work around this we have had a hack which, if a TSC is set with a
+value which is within a second's worth of a previous vCPU, assumes that
+userspace actually intended them to be in sync and adjusts the newly-
+written TSC value accordingly.
+
+Thus, when a VMM restores a guest after suspend or migration using the
+legacy API, the TSCs aren't necessarily *right*, but at least they're
+in sync.
+
+This trick falls down when restoring a guest which genuinely has been
+running for less time than the 1 second of imprecision which we allow
+for in the legacy API. On *creation* the first vCPU starts its TSC
+counting from zero, and the subsequent vCPUs synchronize to that. But
+then when the VMM tries to set the intended TSC value, because that's
+within a second of what the last TSC synced to, it just adjusts it to
+match that.
+
+The correct answer is for the VMM not to use the legacy API of course.
+
+But we can pile further hacks onto our existing hackish ABI, and
+declare that the *first* value written by userspace (on any vCPU)
+should not be subject to this 'correction' to make it sync up with
+values that only from from the kernel's default vCPU creation.
+
+To that end: Add a flag in kvm->arch.user_set_tsc, protected by
+kvm->arch.tsc_write_lock, to record that a TSC for at least one vCPU in
+this KVM *has* been set by userspace. Make the 1-second slop hack only
+trigger if that flag is already set.
+
+===================
