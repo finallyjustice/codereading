@@ -1,0 +1,108 @@
+[PATCH 1/2] KVM: x86: Synthesize at most one PMI per VM-exit
+
+... from Jim Mattson <jmattson@google.com> ...
+
+https://lore.kernel.org/all/20230901185646.2823254-1-jmattson@google.com/
+
+
+这组patchset其实有两个patch.
+
+[PATCH 1/2] KVM: x86: Synthesize at most one PMI per VM-exit
+
+[PATCH 2/2] KVM: x86: Mask LVTPC when handling a PMI
+
+第一个patch的symptom是, 在一些特殊的条件下, 会有两个NMI插入到VM.
+
+自从commit 9cd803d496e7 ("KVM: x86: Update vPMCs when retiring instructions")后,
+在kvm_skip_emulated_instruction()也会触发NMI的 inject
+
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 9ddad9493cb8..4fbde3a9b9d0 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -7990,6 +7990,8 @@ int kvm_skip_emulated_instruction(struct kvm_vcpu *vcpu)
+        if (unlikely(!r))
+                return 0;
+ 
++       kvm_pmu_trigger_event(vcpu, PERF_COUNT_HW_INSTRUCTIONS);
++
+        /*
+         * rflags is the old, "raw" value of the flags.  The new value has
+         * not been saved yet.
+@@ -8252,6 +8254,7 @@ int x86_emulate_instruction(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
+                vcpu->arch.emulate_regs_need_sync_to_vcpu = false;
+                if (!ctxt->have_exception ||
+                    exception_type(ctxt->exception.vector) == EXCPT_TRAP) {
++                       kvm_pmu_trigger_event(vcpu, PERF_COUNT_HW_INSTRUCTIONS);
+                        kvm_rip_write(vcpu, ctxt->eip);
+                        if (r && (ctxt->tf || (vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP)))
+                                r = kvm_vcpu_do_singlestep(vcpu);
+
+
+第一个patch的fix是在KVM避免这种情况.
+
+第二个patch是mask第二个NMI.
+
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index a983a16163b1..1a79ec54ae1e 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -2743,6 +2743,8 @@ int kvm_apic_local_deliver(struct kvm_lapic *apic, int lvt_type)
+ 		vector = reg & APIC_VECTOR_MASK;
+ 		mode = reg & APIC_MODE_MASK;
+ 		trig_mode = reg & APIC_LVT_LEVEL_TRIGGER;
++		if (lvt_type == APIC_LVTPC)
++			kvm_lapic_set_reg(apic, lvt_type, reg | APIC_LVT_MASKED);
+ 		return __apic_accept_irq(apic, mode, vector, 1, trig_mode,
+ 					NULL);
+
+=======================
+
+这里是关于怎么repro的.
+
+https://lore.kernel.org/all/ZKCD30QrE5g9XGIh@google.com/
+
+Command I am using inside VM:
+/usr/bin/perf record -N -B -T --sample-cpu  --compression-level=1 --threads --clockid=CLOCK_MONOTONIC_RAW -e $events
+
+Events:
+cpu/period=0xcdfe60,event=0x3c,name='CPU_CLK_UNHALTED.THREAD'/Duk
+cpu/period=0xcdfe60,umask=0x3,name='CPU_CLK_UNHALTED.REF_TSC'/Duk
+cpu/period=0xcdfe60,event=0xc0,name='INST_RETIRED.ANY'/Duk
+cpu/period=0xcdfe60,event=0xc0,name='INST_RETIRED.ANY'/Duk
+cpu/period=0xcdfe60,event=0xc0,name='INST_RETIRED.ANY'/Duk
+cpu/period=0xcdfe60,event=0xc0,name='INST_RETIRED.ANY'/Duk
+cpu/period=0xcdfe60,event=0xc0,name='INST_RETIRED.ANY'/Duk
+cpu/period=0xcdfe60,event=0xc0,name='INST_RETIRED.ANY'/Duk
+cpu/period=0xcdfe60,event=0xc0,name='INST_RETIRED.ANY'/Duk
+cpu/period=0xcdfe60,event=0xec,umask=0x2,name='CPU_CLK_UNHALTED.DISTRIBUTED'/uk
+cpu/period=0x98968f,event=0x3c,name='CPU_CLK_UNHALTED.THREAD_P'/uk
+cpu/period=0x98968f,event=0xa6,umask=0x21,cmask=0x5,name='EXE_ACTIVITY.BOUND_ON_LOADS'/uk
+cpu/period=0x4c4b4f,event=0x9c,umask=0x1,name='IDQ_UOPS_NOT_DELIVERED.CORE'/uk
+cpu/period=0x4c4b4f,event=0xad,umask=0x10,name='INT_MISC.UOP_DROPPING'/uk
+cpu/period=0x4c4b4f,event=0x47,umask=0x5,cmask=0x5,name='MEMORY_ACTIVITY.STALLS_L2_MISS'/uk
+cpu/period=0x7a143,event=0xd1,umask=0x40,name='MEM_LOAD_RETIRED.FB_HIT'/uk
+cpu/period=0xf424f,event=0xd1,umask=0x8,name='MEM_LOAD_RETIRED.L1_MISS'/uk
+cpu/period=0x4c4b4f,event=0x20,umask=0x8,cmask=0x4,name='OFFCORE_REQUESTS_OUTSTANDING.ALL_DATA_RD_cmask_4'/uk
+cpu/period=0x2faf090,event=0xa4,umask=0x2,name='TOPDOWN.BACKEND_BOUND_SLOTS'/uk
+cpu/period=0x2faf090,event=0xa4,umask=0x10,name='TOPDOWN.MEMORY_BOUND_SLOTS'/uk
+cpu/period=0x98968f,event=0xc2,umask=0x2,name='UOPS_RETIRED.SLOTS'/uk
+cpu/period=0x7a12f,event=0xd0,umask=0x82,name='MEM_INST_RETIRED.ALL_STORES'/uk
+cpu/period=0x7a12f,event=0xd0,umask=0x81,name='MEM_INST_RETIRED.ALL_LOADS'/uk
+
+In addition, I noticed a periodic performance overhead at the host level
+(invisible to guest). It seems all vCPU threads are spending 60% of the
+time on the mutex inside perf_event_contex. So a significant amount of
+time was spend on kvm_pmu_handle_event() and in particular
+perf_event_ctx_lock{,_nested}() and perf_event_ctx_unlock() for a couple
+of seconds periodically.
+
+Looking deeper, the perf_event_context might be
+the perf_cpu_context->task_ctx. But still I cannot convince myself that
+all vCPU threads may be competing against this one, since it is still
+should be a per task_struct mutext...
+
+Anyway, the performance issue may be off the current topic but it
+persist across many kernel versions when using vPMU with the above event
+set in sampling mode.
+
