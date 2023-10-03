@@ -1,32 +1,212 @@
-From 8943e8ade025fc2607f5fe254a372bd2467e5c5b Mon Sep 17 00:00:00 2001
+From 154d2bc0b49dff0dfe24dbfd1d94378501461912 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Tue, 19 Sep 2023 07:38:19 -0700
+Date: Mon, 2 Oct 2023 23:57:06 -0700
 Subject: [PATCH 1/1] qemu for v8.1.0
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
- accel/kvm/kvm-all.c            | 11 +++++
- block/block-backend.c          | 21 ++++++++
- block/monitor/block-hmp-cmds.c | 90 ++++++++++++++++++++++++++++++++++
- block/qapi.c                   | 25 ++++++++++
- hw/intc/arm_gicv3_its_common.c |  3 ++
- hw/intc/arm_gicv3_its_kvm.c    | 10 ++++
- hw/net/igb.c                   | 11 +++++
- hw/net/igbvf.c                 |  6 +++
- hw/nvme/ctrl.c                 | 21 ++++++++
- hw/nvme/dif.c                  |  5 ++
- hw/nvme/ns.c                   | 13 +++++
- hw/nvme/nvme.h                 | 61 +++++++++++++++++++++++
- hw/pci/pcie_sriov.c            | 73 +++++++++++++++++++++++++++
- hw/vfio/common.c               |  4 ++
- migration/migration-stats.c    | 32 ++++++++++++
- migration/migration.c          | 32 ++++++++++++
- migration/migration.h          | 10 ++++
- softmmu/balloon.c              |  4 ++
- softmmu/dma-helpers.c          |  9 ++++
- target/arm/kvm64.c             |  4 ++
- 20 files changed, 445 insertions(+)
+ accel/accel-blocker.c          |  92 +++++++++++++++++++++++
+ accel/kvm/kvm-all.c            |  11 +++
+ block/block-backend.c          |  21 ++++++
+ block/monitor/block-hmp-cmds.c |  90 +++++++++++++++++++++++
+ block/qapi.c                   |  25 +++++++
+ hw/intc/arm_gicv3_its.c        |   7 ++
+ hw/intc/arm_gicv3_its_common.c |   3 +
+ hw/intc/arm_gicv3_its_kvm.c    |  10 +++
+ hw/net/igb.c                   |  11 +++
+ hw/net/igbvf.c                 |   6 ++
+ hw/nvme/ctrl.c                 |  21 ++++++
+ hw/nvme/dif.c                  |   5 ++
+ hw/nvme/ns.c                   |  13 ++++
+ hw/nvme/nvme.h                 |  61 ++++++++++++++++
+ hw/pci/pcie_sriov.c            |  73 +++++++++++++++++++
+ hw/vfio/common.c               |   4 +
+ include/hw/core/cpu.h          |  10 +++
+ include/qemu/futex.h           |  18 +++++
+ migration/migration-stats.c    |  32 ++++++++
+ migration/migration.c          |  32 ++++++++
+ migration/migration.h          |  10 +++
+ softmmu/balloon.c              |   4 +
+ softmmu/dma-helpers.c          |   9 +++
+ target/arm/kvm64.c             |   4 +
+ target/i386/kvm/kvm.c          |   4 +
+ util/lockcnt.c                 |  52 +++++++++++++
+ util/qemu-thread-posix.c       | 129 +++++++++++++++++++++++++++++++++
+ 27 files changed, 757 insertions(+)
 
+diff --git a/accel/accel-blocker.c b/accel/accel-blocker.c
+index 1e7f42346..24e422582 100644
+--- a/accel/accel-blocker.c
++++ b/accel/accel-blocker.c
+@@ -30,25 +30,67 @@
+ #include "hw/core/cpu.h"
+ #include "sysemu/accel-blocker.h"
+ 
++/*
++ * 在以下使用accel_in_ioctl_lock:
++ *   - accel/accel-blocker.c|38| <<accel_blocker_init>> qemu_lockcnt_init(&accel_in_ioctl_lock);
++ *   - accel/accel-blocker.c|49| <<accel_ioctl_begin>> qemu_lockcnt_inc(&accel_in_ioctl_lock);
++ *   - accel/accel-blocker.c|58| <<accel_ioctl_end>> qemu_lockcnt_dec(&accel_in_ioctl_lock);
++ *   - accel/accel-blocker.c|97| <<accel_has_to_wait>> return needs_to_wait || qemu_lockcnt_count(&accel_in_ioctl_lock);
++ *   - accel/accel-blocker.c|114| <<accel_ioctl_inhibit_begin>> qemu_lockcnt_lock(&accel_in_ioctl_lock);
++ *   - accel/accel-blocker.c|149| <<accel_ioctl_inhibit_end>> qemu_lockcnt_unlock(&accel_in_ioctl_lock);
++ */
+ static QemuLockCnt accel_in_ioctl_lock;
++/*
++ * 在以下使用accel_in_ioctl_event:
++ *   - accel/accel-blocker.c|39| <<accel_blocker_init>> qemu_event_init(&accel_in_ioctl_event, false);
++ *   - accel/accel-blocker.c|60| <<accel_ioctl_end>> qemu_event_set(&accel_in_ioctl_event);
++ *   - accel/accel-blocker.c|81| <<accel_cpu_ioctl_end>> qemu_event_set(&accel_in_ioctl_event);
++ *   - accel/accel-blocker.c|120| <<accel_ioctl_inhibit_begin>> qemu_event_reset(&accel_in_ioctl_event);
++ *   - accel/accel-blocker.c|137| <<accel_ioctl_inhibit_begin>> qemu_event_wait(&accel_in_ioctl_event);
++ */
+ static QemuEvent accel_in_ioctl_event;
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|2488| <<kvm_init>> accel_blocker_init();
++ */
+ void accel_blocker_init(void)
+ {
++    /*
++     * 设置成0
++     */
+     qemu_lockcnt_init(&accel_in_ioctl_lock);
+     qemu_event_init(&accel_in_ioctl_event, false);
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|3167| <<kvm_vm_ioctl>> accel_ioctl_begin();
++ *   - accel/kvm/kvm-all.c|3207| <<kvm_device_ioctl>> accel_ioctl_begin();
++ */
+ void accel_ioctl_begin(void)
+ {
+     if (likely(qemu_mutex_iothread_locked())) {
+         return;
+     }
+ 
++    /*
++     * struct QemuLockCnt {
++     * #ifndef CONFIG_LINUX
++     *     QemuMutex mutex;
++     * #endif
++     *     unsigned count;
++     * };
++     */
+     /* block if lock is taken in kvm_ioctl_inhibit_begin() */
+     qemu_lockcnt_inc(&accel_in_ioctl_lock);
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|3169| <<kvm_vm_ioctl>> accel_ioctl_end();
++ *   - accel/kvm/kvm-all.c|3209| <<kvm_device_ioctl>> accel_ioctl_end();
++ */
+ void accel_ioctl_end(void)
+ {
+     if (likely(qemu_mutex_iothread_locked())) {
+@@ -60,6 +102,10 @@ void accel_ioctl_end(void)
+     qemu_event_set(&accel_in_ioctl_event);
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|3187| <<kvm_vcpu_ioctl>> accel_cpu_ioctl_begin(cpu);
++ */
+ void accel_cpu_ioctl_begin(CPUState *cpu)
+ {
+     if (unlikely(qemu_mutex_iothread_locked())) {
+@@ -70,6 +116,10 @@ void accel_cpu_ioctl_begin(CPUState *cpu)
+     qemu_lockcnt_inc(&cpu->in_ioctl_lock);
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|3189| <<kvm_vcpu_ioctl>> accel_cpu_ioctl_end(cpu);
++ */
+ void accel_cpu_ioctl_end(CPUState *cpu)
+ {
+     if (unlikely(qemu_mutex_iothread_locked())) {
+@@ -81,12 +131,33 @@ void accel_cpu_ioctl_end(CPUState *cpu)
+     qemu_event_set(&accel_in_ioctl_event);
+ }
+ 
++/*
++ * called by:
++ *   - accel/accel-blocker.c|122| <<accel_ioctl_inhibit_begin>> if (accel_has_to_wait()) {
++ */
+ static bool accel_has_to_wait(void)
+ {
+     CPUState *cpu;
+     bool needs_to_wait = false;
+ 
+     CPU_FOREACH(cpu) {
++        /*
++	 * qemu_lockcnt_count: query a LockCnt's count.
++	 * @lockcnt: the lockcnt to query.
++	 *
++	 * Note that the count can change at any time.  Still, while the
++	 * lockcnt is locked, one can usefully check whether the count
++	 * is non-zero.
++	 *
++	 * 在以下使用CPUState->in_ioctl_lock:
++	 *   - accel/accel-blocker.c|116| <<accel_cpu_ioctl_begin>> qemu_lockcnt_inc(&cpu->in_ioctl_lock);
++	 *   - accel/accel-blocker.c|129| <<accel_cpu_ioctl_end>> qemu_lockcnt_dec(&cpu->in_ioctl_lock);
++	 *   - accel/accel-blocker.c|144| <<accel_has_to_wait>> if (qemu_lockcnt_count(&cpu->in_ioctl_lock)) {
++	 *   - accel/accel-blocker.c|170| <<accel_ioctl_inhibit_begin>> qemu_lockcnt_lock(&cpu->in_ioctl_lock);
++	 *   - accel/accel-blocker.c|217| <<accel_ioctl_inhibit_end>> qemu_lockcnt_unlock(&cpu->in_ioctl_lock);
++	 *   - hw/core/cpu-common.c|238| <<cpu_common_initfn>> qemu_lockcnt_init(&cpu->in_ioctl_lock);
++	 *   - hw/core/cpu-common.c|250| <<cpu_common_finalize>> qemu_lockcnt_destroy(&cpu->in_ioctl_lock);
++	 */
+         if (qemu_lockcnt_count(&cpu->in_ioctl_lock)) {
+             /* exit the ioctl, if vcpu is running it */
+             qemu_cpu_kick(cpu);
+@@ -94,9 +165,22 @@ static bool accel_has_to_wait(void)
+         }
+     }
+ 
++    /*
++     * 在以下使用accel_in_ioctl_lock:
++     *   - accel/accel-blocker.c|38| <<accel_blocker_init>> qemu_lockcnt_init(&accel_in_ioctl_lock);
++     *   - accel/accel-blocker.c|49| <<accel_ioctl_begin>> qemu_lockcnt_inc(&accel_in_ioctl_lock);
++     *   - accel/accel-blocker.c|58| <<accel_ioctl_end>> qemu_lockcnt_dec(&accel_in_ioctl_lock);
++     *   - accel/accel-blocker.c|97| <<accel_has_to_wait>> return needs_to_wait || qemu_lockcnt_count(&accel_in_ioctl_lock);
++     *   - accel/accel-blocker.c|114| <<accel_ioctl_inhibit_begin>> qemu_lockcnt_lock(&accel_in_ioctl_lock);
++     *   - accel/accel-blocker.c|149| <<accel_ioctl_inhibit_end>> qemu_lockcnt_unlock(&accel_in_ioctl_lock);
++     */
+     return needs_to_wait || qemu_lockcnt_count(&accel_in_ioctl_lock);
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|1597| <<kvm_region_commit>> accel_ioctl_inhibit_begin();
++ */
+ void accel_ioctl_inhibit_begin(void)
+ {
+     CPUState *cpu;
+@@ -119,6 +203,10 @@ void accel_ioctl_inhibit_begin(void)
+         /* Reset event to FREE. */
+         qemu_event_reset(&accel_in_ioctl_event);
+ 
++	/*
++	 * called by:
++	 *   - accel/accel-blocker.c|122| <<accel_ioctl_inhibit_begin>> if (accel_has_to_wait()) {
++	 */
+         if (accel_has_to_wait()) {
+             /*
+              * If event is still FREE, and there are ioctls still in progress,
+@@ -142,6 +230,10 @@ void accel_ioctl_inhibit_begin(void)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|1621| <<kvm_region_commit>> accel_ioctl_inhibit_end();
++ */
+ void accel_ioctl_inhibit_end(void)
+ {
+     CPUState *cpu;
 diff --git a/accel/kvm/kvm-all.c b/accel/kvm/kvm-all.c
 index 7b3da8dc3..37faac95e 100644
 --- a/accel/kvm/kvm-all.c
@@ -260,6 +440,24 @@ index f34f95e0e..c18ef612c 100644
  BlockStatsList *qmp_query_blockstats(bool has_query_nodes,
                                       bool query_nodes,
                                       Error **errp)
+diff --git a/hw/intc/arm_gicv3_its.c b/hw/intc/arm_gicv3_its.c
+index 43dfd7a35..57118e5e8 100644
+--- a/hw/intc/arm_gicv3_its.c
++++ b/hw/intc/arm_gicv3_its.c
+@@ -360,6 +360,13 @@ out:
+  * The string @who is purely for the LOG_GUEST_ERROR messages,
+  * and should indicate the name of the calling function or similar.
+  */
++/*
++ * called by:
++ *   - hw/intc/arm_gicv3_its.c|525| <<do_process_its_cmd>> cmdres = lookup_ite(s, __func__, devid, eventid, &ite, &dte);
++ *   - hw/intc/arm_gicv3_its.c|903| <<process_movi>> cmdres = lookup_ite(s, __func__, devid, eventid, &old_ite, &dte);
++ *   - hw/intc/arm_gicv3_its.c|1114| <<process_vmovi>> cmdres = lookup_ite(s, __func__, devid, eventid, &ite, &dte);
++ *   - hw/intc/arm_gicv3_its.c|1203| <<process_inv>> cmdres = lookup_ite(s, __func__, devid, eventid, &ite, &dte);
++ */
+ static ItsCmdResult lookup_ite(GICv3ITSState *s, const char *who,
+                                uint32_t devid, uint32_t eventid, ITEntry *ite,
+                                DTEntry *dte)
 diff --git a/hw/intc/arm_gicv3_its_common.c b/hw/intc/arm_gicv3_its_common.c
 index abaf77057..53869f748 100644
 --- a/hw/intc/arm_gicv3_its_common.c
@@ -715,6 +913,61 @@ index 9aac21abb..bab853252 100644
  static int vfio_devices_dma_logging_start(VFIOContainer *container)
  {
      struct vfio_device_feature *feature;
+diff --git a/include/hw/core/cpu.h b/include/hw/core/cpu.h
+index fdcbe8735..54221cc23 100644
+--- a/include/hw/core/cpu.h
++++ b/include/hw/core/cpu.h
+@@ -402,6 +402,16 @@ struct CPUState {
+     uint64_t dirty_pages;
+     int kvm_vcpu_stats_fd;
+ 
++    /*
++     * 在以下使用CPUState->in_ioctl_lock:
++     *   - accel/accel-blocker.c|116| <<accel_cpu_ioctl_begin>> qemu_lockcnt_inc(&cpu->in_ioctl_lock);
++     *   - accel/accel-blocker.c|129| <<accel_cpu_ioctl_end>> qemu_lockcnt_dec(&cpu->in_ioctl_lock);
++     *   - accel/accel-blocker.c|144| <<accel_has_to_wait>> if (qemu_lockcnt_count(&cpu->in_ioctl_lock)) {
++     *   - accel/accel-blocker.c|170| <<accel_ioctl_inhibit_begin>> qemu_lockcnt_lock(&cpu->in_ioctl_lock);
++     *   - accel/accel-blocker.c|217| <<accel_ioctl_inhibit_end>> qemu_lockcnt_unlock(&cpu->in_ioctl_lock);
++     *   - hw/core/cpu-common.c|238| <<cpu_common_initfn>> qemu_lockcnt_init(&cpu->in_ioctl_lock);
++     *   - hw/core/cpu-common.c|250| <<cpu_common_finalize>> qemu_lockcnt_destroy(&cpu->in_ioctl_lock);
++     */
+     /* Use by accel-block: CPU is executing an ioctl() */
+     QemuLockCnt in_ioctl_lock;
+ 
+diff --git a/include/qemu/futex.h b/include/qemu/futex.h
+index 91ae88966..af55aefb4 100644
+--- a/include/qemu/futex.h
++++ b/include/qemu/futex.h
+@@ -19,11 +19,29 @@
+ 
+ #define qemu_futex(...)              syscall(__NR_futex, __VA_ARGS__)
+ 
++/*
++ * called by:
++ *   - tests/unit/test-aio-multithread.c|331| <<mcs_mutex_unlock>> qemu_futex_wake(&nodes[next].locked, 1);
++ *   - util/lockcnt.c|116| <<lockcnt_wake>> qemu_futex_wake(&lockcnt->count, 1);
++ *   - util/qemu-thread-posix.c|413| <<qemu_event_set>> qemu_futex_wake(ev, INT_MAX);
++ *
++ * FUTEX_WAIT: 如果futex word中仍然保存着参数val给定的值,
++ * 那么当前线程则进入睡眠,等待FUTEX_WAKE的操作唤醒它.
++ *
++ * FUTEX_WAKE: 最多唤醒val个等待在futex word上的线程.
++ * Val或者等于1(唤醒1个等待线程)或者等于INT_MAX(唤醒全部等待线程)
++ */
+ static inline void qemu_futex_wake(void *f, int n)
+ {
+     qemu_futex(f, FUTEX_WAKE, n, NULL, NULL, 0);
+ }
+ 
++/*
++ * called by:
++ *   - tests/unit/test-aio-multithread.c|308| <<mcs_mutex_lock>> qemu_futex_wait(&nodes[id].locked, 1);
++ *   - util/lockcnt.c|102| <<qemu_lockcnt_cmpxchg_or_wait>> qemu_futex_wait(&lockcnt->count, *val);
++ *   - util/qemu-thread-posix.c|474| <<qemu_event_wait>> qemu_futex_wait(ev, EV_BUSY);
++ */
+ static inline void qemu_futex_wait(void *f, unsigned val)
+ {
+     while (qemu_futex(f, FUTEX_WAIT, (int) val, NULL, NULL, 0)) {
 diff --git a/migration/migration-stats.c b/migration/migration-stats.c
 index 095d6d75b..b1c94341b 100644
 --- a/migration/migration-stats.c
@@ -916,6 +1169,321 @@ index 94bbd9661..91f676373 100644
  int kvm_arch_get_registers(CPUState *cs)
  {
      struct kvm_one_reg reg;
+diff --git a/target/i386/kvm/kvm.c b/target/i386/kvm/kvm.c
+index ebfaf3d24..57244954e 100644
+--- a/target/i386/kvm/kvm.c
++++ b/target/i386/kvm/kvm.c
+@@ -4419,6 +4419,10 @@ static int kvm_get_apic(X86CPU *cpu)
+     return 0;
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|4788| <<kvm_arch_put_registers>> ret = kvm_put_vcpu_events(x86_cpu, level);
++ */
+ static int kvm_put_vcpu_events(X86CPU *cpu, int level)
+ {
+     CPUState *cs = CPU(cpu);
+diff --git a/util/lockcnt.c b/util/lockcnt.c
+index 5da36946b..17037b2a3 100644
+--- a/util/lockcnt.c
++++ b/util/lockcnt.c
+@@ -30,6 +30,14 @@
+ 
+ void qemu_lockcnt_init(QemuLockCnt *lockcnt)
+ {
++    /*
++     * struct QemuLockCnt {
++     * #ifndef CONFIG_LINUX
++     *     QemuMutex mutex;
++     * #endif
++     *     unsigned count;
++     * };
++     */
+     lockcnt->count = 0;
+ }
+ 
+@@ -53,6 +61,13 @@ void qemu_lockcnt_destroy(QemuLockCnt *lockcnt)
+  * is set the caller has effectively acquired the lock.  If it returns
+  * with the lock not taken, it must wake another futex waiter.
+  */
++/*
++ * called by:
++ *   - util/lockcnt.c|139| <<qemu_lockcnt_inc>> if (qemu_lockcnt_cmpxchg_or_wait(lockcnt, &val, QEMU_LOCKCNT_COUNT_STEP,
++ *   - util/lockcnt.c|184| <<qemu_lockcnt_dec_and_lock>> if (qemu_lockcnt_cmpxchg_or_wait(lockcnt, &val, locked_state, &waited)) {
++ *   - util/lockcnt.c|225| <<qemu_lockcnt_dec_if_lock>> if (qemu_lockcnt_cmpxchg_or_wait(lockcnt, &val, locked_state, &waited)) {
++ *   - util/lockcnt.c|259| <<qemu_lockcnt_lock>> while (!qemu_lockcnt_cmpxchg_or_wait(lockcnt, &val, val + step, &waited)) {
++ */
+ static bool qemu_lockcnt_cmpxchg_or_wait(QemuLockCnt *lockcnt, int *val,
+                                          int new_if_free, bool *waited)
+ {
+@@ -61,6 +76,11 @@ static bool qemu_lockcnt_cmpxchg_or_wait(QemuLockCnt *lockcnt, int *val,
+         int expected = *val;
+ 
+         trace_lockcnt_fast_path_attempt(lockcnt, expected, new_if_free);
++        /*
++	 * 将old和ptr指向的内容比较,
++	 * 如果相等,则将new写入到ptr中,返回old,
++	 * 如果不相等,则返回ptr指向的内容.
++         */
+         *val = qatomic_cmpxchg(&lockcnt->count, expected, new_if_free);
+         if (*val == expected) {
+             trace_lockcnt_fast_path_success(lockcnt, expected, new_if_free);
+@@ -91,6 +111,16 @@ static bool qemu_lockcnt_cmpxchg_or_wait(QemuLockCnt *lockcnt, int *val,
+         if ((*val & QEMU_LOCKCNT_STATE_MASK) == QEMU_LOCKCNT_STATE_WAITING) {
+             *waited = true;
+             trace_lockcnt_futex_wait(lockcnt, *val);
++            /*
++	     * QemuLockCnt *lockcnt
++	     *
++	     * struct QemuLockCnt {
++	     * #ifndef CONFIG_LINUX
++	     *     QemuMutex mutex;
++	     * #endif
++	     *     unsigned count;
++	     * };
++	     */
+             qemu_futex_wait(&lockcnt->count, *val);
+             *val = qatomic_read(&lockcnt->count);
+             trace_lockcnt_futex_wait_resume(lockcnt, *val);
+@@ -102,6 +132,14 @@ static bool qemu_lockcnt_cmpxchg_or_wait(QemuLockCnt *lockcnt, int *val,
+     return false;
+ }
+ 
++/*
++ * called by:
++ *   - util/lockcnt.c|153| <<qemu_lockcnt_inc>> lockcnt_wake(lockcnt);
++ *   - util/lockcnt.c|204| <<qemu_lockcnt_dec_and_lock>> lockcnt_wake(lockcnt);
++ *   - util/lockcnt.c|244| <<qemu_lockcnt_dec_if_lock>> lockcnt_wake(lockcnt);
++ *   - util/lockcnt.c|283| <<qemu_lockcnt_inc_and_unlock>> lockcnt_wake(lockcnt);
++ *   - util/lockcnt.c|301| <<qemu_lockcnt_unlock>> lockcnt_wake(lockcnt);
++ */
+ static void lockcnt_wake(QemuLockCnt *lockcnt)
+ {
+     trace_lockcnt_futex_wake(lockcnt);
+@@ -289,6 +327,20 @@ void qemu_lockcnt_unlock(QemuLockCnt *lockcnt)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - accel/accel-blocker.c|144| <<accel_has_to_wait>> if (qemu_lockcnt_count(&cpu->in_ioctl_lock)) {
++ *   - accel/accel-blocker.c|151| <<accel_has_to_wait>> return needs_to_wait || qemu_lockcnt_count(&accel_in_ioctl_lock);
++ *   - util/aio-posix.c|87| <<aio_remove_fd_handler>> if (qemu_lockcnt_count(&ctx->list_lock)) {
++ *   - util/aio-posix.c|528| <<run_poll_handlers>> assert(qemu_lockcnt_count(&ctx->list_lock) > 0);
++ *
++ * qemu_lockcnt_count: query a LockCnt's count.
++ * @lockcnt: the lockcnt to query.
++ *
++ * Note that the count can change at any time.  Still, while the
++ * lockcnt is locked, one can usefully check whether the count
++ * is non-zero.
++ */
+ unsigned qemu_lockcnt_count(QemuLockCnt *lockcnt)
+ {
+     return qatomic_read(&lockcnt->count) >> QEMU_LOCKCNT_COUNT_SHIFT;
+diff --git a/util/qemu-thread-posix.c b/util/qemu-thread-posix.c
+index b2e26e212..27fb4e665 100644
+--- a/util/qemu-thread-posix.c
++++ b/util/qemu-thread-posix.c
+@@ -361,6 +361,18 @@ static inline void qemu_futex_wait(QemuEvent *ev, unsigned val)
+ #define EV_FREE        1
+ #define EV_BUSY       -1
+ 
++/*
++ * called by:
++ *   - accel/accel-blocker.c|63| <<accel_blocker_init>> qemu_event_init(&accel_in_ioctl_event, false);
++ *   - migration/colo.c|648| <<migrate_start_colo_process>> qemu_event_init(&s->colo_checkpoint_event, false);
++ *   - migration/migration.c|149| <<migration_object_init>> qemu_event_init(&current_incoming->main_thread_load_event, false);
++ *   - tests/unit/test-aio-multithread.c|75| <<create_aio_contexts>> qemu_event_init(&done_event, false);
++ *   - tests/unit/test-bdrv-drain.c|2056| <<main>> qemu_event_init(&done_event, false);
++ *   - util/qemu-timer.c|104| <<timerlist_new>> qemu_event_init(&timer_list->timers_done_ev, true);
++ *   - util/rcu.c|343| <<drain_call_rcu>> qemu_event_init(&rcu_drain.drain_complete_event, false);
++ *   - util/rcu.c|408| <<rcu_init_complete>> qemu_event_init(&rcu_gp_event, true);
++ *   - util/rcu.c|410| <<rcu_init_complete>> qemu_event_init(&rcu_call_ready_event, false);
++ */
+ void qemu_event_init(QemuEvent *ev, bool init)
+ {
+ #ifndef __linux__
+@@ -368,10 +380,26 @@ void qemu_event_init(QemuEvent *ev, bool init)
+     pthread_cond_init(&ev->cond, NULL);
+ #endif
+ 
++    /*
++     * struct QemuEvent {
++     * #ifndef __linux__
++     *     pthread_mutex_t lock;
++     *     pthread_cond_t cond;
++     * #endif
++     *     unsigned value;
++     *     bool initialized;
++     * };
++     */
+     ev->value = (init ? EV_SET : EV_FREE);
+     ev->initialized = true;
+ }
+ 
++/*
++ * called by:
++ *   - migration/colo.c|632| <<colo_process_checkpoint>> qemu_event_destroy(&s->colo_checkpoint_event);
++ *   - tests/unit/test-aio-multithread.c|96| <<join_aio_contexts>> qemu_event_destroy(&done_event);
++ *   - tests/unit/test-bdrv-drain.c|2118| <<main>> qemu_event_destroy(&done_event);
++ */
+ void qemu_event_destroy(QemuEvent *ev)
+ {
+     assert(ev->initialized);
+@@ -382,6 +410,35 @@ void qemu_event_destroy(QemuEvent *ev)
+ #endif
+ }
+ 
++/*
++ * called by:
++ *   - accel/accel-blocker.c|91| <<accel_ioctl_end>> qemu_event_set(&accel_in_ioctl_event);
++ *   - accel/accel-blocker.c|120| <<accel_cpu_ioctl_end>> qemu_event_set(&accel_in_ioctl_event);
++ *   - include/qemu/rcu.h|117| <<rcu_read_unlock>> qemu_event_set(&rcu_gp_event);
++ *   - migration/colo.c|71| <<colo_checkpoint_notify>> qemu_event_set(&s->colo_checkpoint_event);
++ *   - migration/colo.c|808| <<colo_shutdown>> qemu_event_set(&s->colo_checkpoint_event);
++ *   - migration/savevm.c|2832| <<qemu_loadvm_state>> qemu_event_set(&mis->main_thread_load_event);
++ *   - tests/unit/test-aio-multithread.c|42| <<ctx_run_bh_cb>> qemu_event_set(&done_event);
++ *   - tests/unit/test-bdrv-drain.c|504| <<test_iothread_aio_cb>> qemu_event_set(&done_event);
++ *   - util/qemu-timer.c|584| <<timerlist_run_timers>> qemu_event_set(&timer_list->timers_done_ev);
++ *   - util/rcu.c|313| <<call_rcu1>> qemu_event_set(&rcu_call_ready_event);
++ *   - util/rcu.c|325| <<drain_rcu_callback>> qemu_event_set(&event->drain_complete_event);
++ *
++ * struct QemuEvent {
++ * #ifndef __linux__
++ *     pthread_mutex_t lock;
++ *     pthread_cond_t cond;
++ * #endif
++ *     unsigned value;
++ *     bool initialized;
++ * };
++ *
++ * 核心思想:
++ * 如果已经是EV_SET了, 目的达到了, 什么也不用做.
++ * 如果不是EV_SET, 用xchg换成EV_SET:
++ *   - 如果旧的是EV_FREE, 什么也不做
++ *   - 如果旧的是EV_BUSY, wake up!
++ */
+ void qemu_event_set(QemuEvent *ev)
+ {
+     assert(ev->initialized);
+@@ -393,18 +450,53 @@ void qemu_event_set(QemuEvent *ev)
+      * ev->value we need a full memory barrier here.
+      */
+     smp_mb();
++    /*
++     * #define EV_SET         0
++     * #define EV_FREE        1
++     * #define EV_BUSY       -1
++     */
+     if (qatomic_read(&ev->value) != EV_SET) {
+         int old = qatomic_xchg(&ev->value, EV_SET);
+ 
+         /* Pairs with memory barrier in kernel futex_wait system call.  */
+         smp_mb__after_rmw();
++        /*
++	 * #define EV_SET         0
++	 * #define EV_FREE        1
++	 * #define EV_BUSY       -1
++	 */
+         if (old == EV_BUSY) {
++            /*
++	     * FUTEX_WAIT: 如果futex word中仍然保存着参数val给定的值,
++	     * 那么当前线程则进入睡眠,等待FUTEX_WAKE的操作唤醒它.
++	     *
++	     * FUTEX_WAKE: 最多唤醒val个等待在futex word上的线程.
++	     * Val或者等于1(唤醒1个等待线程)或者等于INT_MAX(唤醒全部等待线程)
++	     *
++	     * called by:
++	     *   - tests/unit/test-aio-multithread.c|331| <<mcs_mutex_unlock>> qemu_futex_wake(&nodes[next].locked, 1);
++	     *   - util/lockcnt.c|116| <<lockcnt_wake>> qemu_futex_wake(&lockcnt->count, 1);
++	     *   - util/qemu-thread-posix.c|413| <<qemu_event_set>> qemu_futex_wake(ev, INT_MAX);
++	     */
+             /* There were waiters, wake them up.  */
+             qemu_futex_wake(ev, INT_MAX);
+         }
+     }
+ }
+ 
++/*
++ * called by:
++ *   - accel/accel-blocker.c|178| <<accel_ioctl_inhibit_begin>> qemu_event_reset(&accel_in_ioctl_event);
++ *   - migration/colo.c|498| <<colo_do_checkpoint_transaction>> qemu_event_reset(&s->colo_checkpoint_event);
++ *   - migration/migration.c|257| <<migration_incoming_state_destroy>> qemu_event_reset(&mis->main_thread_load_event);
++ *   - tests/unit/test-aio-multithread.c|52| <<ctx_run>> qemu_event_reset(&done_event);
++ *   - tests/unit/test-bdrv-drain.c|562| <<test_iothread_common>> qemu_event_reset(&done_event);
++ *   - util/qemu-thread-win32.c|295| <<qemu_event_reset>> void qemu_event_reset(QemuEvent *ev)
++ *   - util/qemu-timer.c|513| <<timerlist_run_timers>> qemu_event_reset(&timer_list->timers_done_ev);
++ *   - util/rcu.c|84| <<wait_for_readers>> qemu_event_reset(&rcu_gp_event);
++ *   - util/rcu.c|272| <<call_rcu_thread>> qemu_event_reset(&rcu_call_ready_event);
++ *   - util/rcu.c|291| <<call_rcu_thread>> qemu_event_reset(&rcu_call_ready_event);
++ */
+ void qemu_event_reset(QemuEvent *ev)
+ {
+     assert(ev->initialized);
+@@ -422,6 +514,28 @@ void qemu_event_reset(QemuEvent *ev)
+     smp_mb__after_rmw();
+ }
+ 
++/*
++ * called by:
++ *   - accel/accel-blocker.c|196| <<accel_ioctl_inhibit_begin>> qemu_event_wait(&accel_in_ioctl_event);
++ *   - migration/colo.c|585| <<colo_process_checkpoint>> qemu_event_wait(&s->colo_checkpoint_event);
++ *   - migration/savevm.c|1956| <<postcopy_ram_listen_thread>> qemu_event_wait(&mis->main_thread_load_event);
++ *   - tests/unit/test-aio-multithread.c|54| <<ctx_run>> qemu_event_wait(&done_event);
++ *   - tests/unit/test-bdrv-drain.c|599| <<test_iothread_common>> qemu_event_wait(&done_event);
++ *   - util/qemu-timer.c|167| <<qemu_clock_enable>> qemu_event_wait(&tl->timers_done_ev);
++ *   - util/rcu.c|136| <<wait_for_readers>> qemu_event_wait(&rcu_gp_event);
++ *   - util/rcu.c|278| <<call_rcu_thread>> qemu_event_wait(&rcu_call_ready_event);
++ *   - util/rcu.c|294| <<call_rcu_thread>> qemu_event_wait(&rcu_call_ready_event);
++ *   - util/rcu.c|364| <<drain_call_rcu>> qemu_event_wait(&rcu_drain.drain_complete_event);
++ *
++ * struct QemuEvent {
++ * #ifndef __linux__
++ *     pthread_mutex_t lock;
++ *     pthread_cond_t cond;
++ * #endif
++ *     unsigned value;
++ *     bool initialized;
++ * };
++ */
+ void qemu_event_wait(QemuEvent *ev)
+ {
+     unsigned value;
+@@ -438,6 +552,11 @@ void qemu_event_wait(QemuEvent *ev)
+      * qemu_futex_wait() will ensure the check is done correctly.
+      */
+     value = qatomic_load_acquire(&ev->value);
++    /*
++     * #define EV_SET         0
++     * #define EV_FREE        1
++     * #define EV_BUSY       -1
++     */
+     if (value != EV_SET) {
+         if (value == EV_FREE) {
+             /*
+@@ -452,10 +571,20 @@ void qemu_event_wait(QemuEvent *ev)
+              * like the load above.
+              */
+             if (qatomic_cmpxchg(&ev->value, EV_FREE, EV_BUSY) == EV_SET) {
++                /*
++		 * 这里多名ev->value又被设置成EV_SET了, 什么也不用做了
++		 */
+                 return;
+             }
+         }
+ 
++	/*
++	 * FUTEX_WAIT: 如果futex word中仍然保存着参数val给定的值,
++	 * 那么当前线程则进入睡眠,等待FUTEX_WAKE的操作唤醒它.
++	 *
++	 * FUTEX_WAKE: 最多唤醒val个等待在futex word上的线程.
++	 * Val或者等于1(唤醒1个等待线程)或者等于INT_MAX(唤醒全部等待线程)
++	 */
+         /*
+          * This is the final check for a concurrent set, so it does need
+          * a smp_mb() pairing with the second barrier of qemu_event_set().
 -- 
 2.34.1
 
