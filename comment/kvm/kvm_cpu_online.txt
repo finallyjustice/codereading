@@ -1,0 +1,242 @@
+
+kvm_vcpu_ioctl()通过用户空间KVM_RUN不停的调用kvm_arch_vcpu_ioctl_run().
+
+因为状态还是KVM_MP_STATE_UNINITIALIZED, 每次就会返回-EAGAIN. 然后重新进入.
+
+11097 int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
+11098 {
+11099         struct kvm_queued_exception *ex = &vcpu->arch.exception;
+11100         struct kvm_run *kvm_run = vcpu->run;
+11101         int r;
+11102
+11103         vcpu_load(vcpu);
+11104         kvm_sigset_activate(vcpu);
+11105         kvm_run->flags = 0;
+11106         kvm_load_guest_fpu(vcpu);
+11107
+11108         kvm_vcpu_srcu_read_lock(vcpu);
+11109         if (unlikely(vcpu->arch.mp_state == KVM_MP_STATE_UNINITIALIZED)) {
+11110                 if (kvm_run->immediate_exit) {
+11111                         r = -EINTR;
+11112                         goto out;
+11113                 }
+11114                 /*
+11115                  * It should be impossible for the hypervisor timer to be in
+11116                  * use before KVM has ever run the vCPU.
+11117                  */
+11118                 WARN_ON_ONCE(kvm_lapic_hv_timer_in_use(vcpu));
+11119
+11120                 kvm_vcpu_srcu_read_unlock(vcpu);
+11121                 kvm_vcpu_block(vcpu);
+11122                 kvm_vcpu_srcu_read_lock(vcpu);
+11123
+11124                 if (kvm_apic_accept_events(vcpu) < 0) {
+11125                         r = 0;
+11126                         goto out;
+11127                 }
+11128                 r = -EAGAIN;
+11129                 if (signal_pending(current)) {
+11130                         r = -EINTR;
+11131                         kvm_run->exit_reason = KVM_EXIT_INTR;
+11132                         ++vcpu->stat.signal_exits;
+11133                 }
+11134                 goto out;
+11135         }
+
+
+如果有其他的vCPU在__apic_accept_irq()发送了APIC_DM_INIT和APIC_DM_STARTUP (line 1382和line1338) ...
+
+1267 static int __apic_accept_irq(struct kvm_lapic *apic, int delivery_mode,
+1268                              int vector, int level, int trig_mode,
+1269                              struct dest_map *dest_map)
+1270 {
+... ...
+1328         case APIC_DM_INIT:
+1329                 if (!trig_mode || level) {
+1330                         result = 1;
+1331                         /* assumes that there are only KVM_APIC_INIT/SIPI */
+1332                         apic->pending_events = (1UL << KVM_APIC_INIT);
+1333                         kvm_make_request(KVM_REQ_EVENT, vcpu);
+1334                         kvm_vcpu_kick(vcpu);
+1335                 }
+1336                 break;
+1337 
+1338         case APIC_DM_STARTUP:
+1339                 result = 1;
+1340                 apic->sipi_vector = vector;
+1341                 /* make sure sipi_vector is visible for the receiver */
+1342                 smp_wmb();
+1343                 set_bit(KVM_APIC_SIPI, &apic->pending_events);
+1344                 kvm_make_request(KVM_REQ_EVENT, vcpu);
+1345                 kvm_vcpu_kick(vcpu);
+1346                 break;
+
+
+... 一开始提到的kvm_arch_vcpu_ioctl_run()-->kvm_apic_accept_events() (line 11124)就会处理APIC_DM_INIT和APIC_DM_STARTUP.
+
+3231 int kvm_apic_accept_events(struct kvm_vcpu *vcpu)
+3232 {
+3233         struct kvm_lapic *apic = vcpu->arch.apic;
+3234         u8 sipi_vector;
+3235         int r;
+3236 
+3237         if (!kvm_apic_has_pending_init_or_sipi(vcpu))
+3238                 return 0;
+... ...
+... ...
+3262         if (test_and_clear_bit(KVM_APIC_INIT, &apic->pending_events)) {
+3263                 kvm_vcpu_reset(vcpu, true);
+3264                 if (kvm_vcpu_is_bsp(apic->vcpu))
+3265                         vcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;
+3266                 else
+3267                         vcpu->arch.mp_state = KVM_MP_STATE_INIT_RECEIVED;
+3268         }
+3269         if (test_and_clear_bit(KVM_APIC_SIPI, &apic->pending_events)) {
+3270                 if (vcpu->arch.mp_state == KVM_MP_STATE_INIT_RECEIVED) {
+3271                         /* evaluate pending_events before reading the vector */
+3272                         smp_rmb();
+3273                         sipi_vector = apic->sipi_vector;
+3274                         static_call(kvm_x86_vcpu_deliver_sipi_vector)(vcpu, sipi_vector);
+3275                         vcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;
+3276                 }
+3277         }
+
+但是, 用4.14的VM会看到在__apic_accept_irq()中SIPI接收了两次. 这里不明白为什么.
+
+1. __apic_accept_irq() line 1328. --> APIC_DM_INIT
+
+2. __apic_accept_irq() line 1332. --> APIC_DM_INIT
+
+3. kvm_apic_accept_events() line 3267. --> APIC_DM_INIT
+
+4. __apic_accept_irq() line 1328. --> APIC_DM_INIT (这次没有 line 1332)
+
+5. __apic_accept_irq() line 1343. --> APIC_DM_STARTUP
+
+6. kvm_apic_accept_events() line 3275. --> APIC_DM_STARTUP
+
+7. __apic_accept_irq() line 1343. --> APIC_DM_STARTUP
+
+8. __apic_accept_irq() line 1343. --> APIC_DM_STARTUP
+
+
+在4.14的VM那里, 代码的改动和v6.0应该差不多.
+
+[ 3589.611151] smpboot: ++++++++++++++++++++=_---CPU UP  2
+[ 3589.611228] smpboot: Booting Node 0 Processor 2 APIC 0x2
+[ 3589.618378] smpboot: Setting warm reset code and vector.
+[ 3589.618398] smpboot: Asserting INIT
+[ 3589.618405] smpboot: Waiting for send to finish...
+[ 3589.618409] smpboot: Deasserting INIT
+[ 3589.618416] smpboot: Waiting for send to finish...
+[ 3589.618417] smpboot: #startup loops: 2
+[ 3589.618418] smpboot: Sending STARTUP #1
+[ 3589.618422] smpboot: After apic_write
+[ 3589.618436] smpboot: Startup point 1
+[ 3589.618437] smpboot: Waiting for send to finish...
+[ 3589.618453] smpboot: Sending STARTUP #2
+[ 3589.618457] smpboot: After apic_write
+[ 3589.618473] smpboot: Startup point 1
+[ 3589.618474] smpboot: Waiting for send to finish...
+[ 3589.618488] smpboot: After Startup
+[ 3589.621400] Initializing CPU#2
+[ 3589.621463] kvm-clock: cpu 2, msr 148601081, secondary cpu clock
+[ 3589.621969] smpboot: Stack at about ffffbf04c31abf30
+[ 3589.624220] KVM setup async PF for cpu 2
+[ 3589.625524] kvm-stealtime: cpu 2, msr 7ffd24040
+
+
+不知道为什么, 会发送两次INIT(第一次不生效)和两次SIPI.
+
+=============================
+
+Here is the analysis of how the secondary CPU is onlined, based on linux-6.0.
+
+1. The master CPU calls do_boot_cpu() to online the secondary CPU.
+
+unsigned long start_ip = real_mode_header->trampoline_start;
+idle->thread.sp = (unsigned long)task_pt_regs(idle);
+early_gdt_descr.address = (unsigned long)get_cpu_gdt_rw(cpu);
+initial_code = (unsigned long)start_secondary;
+initial_stack  = idle->thread.sp;
+boot_error = wakeup_cpu_via_init_nmi(cpu, start_ip, apicid, cpu0_nmi_registered);
+
+
+The context of the secondary CPU is initialized as the above. As a summary:
+
+(1) The start_ip is real_mode_header->trampoline_start.
+
+(2) The initial_code is start_secondary().
+
+
+2. The real_mode_header->trampoline_start is defined at arch/x86/realmode/rm/header.S.
+
+17 SYM_DATA_START(real_mode_header)
+18         .long   pa_text_start
+19         .long   pa_ro_end
+20         /* SMP trampoline */
+21         .long   pa_trampoline_start
+22         .long   pa_trampoline_header
+
+
+Its implementation is at arch/x86/realmode/rm/trampoline_64.S.
+
+ 41 SYM_CODE_START(trampoline_start)
+ 42         cli                     # We should be safe anyway
+ 43         wbinvd
+... ...
+ 76         # flush prefetch and jump to startup_32
+ 77         ljmpl   $__KERNEL32_CS, $pa_startup_32
+
+
+The 16-bit trampoline_start() jumps to the 32-bit startup_32.
+
+108 SYM_CODE_START(startup_32)
+109         movl    %edx, %ss
+110         addl    $pa_real_mode_base, %esp
+... ...
+166         /*
+167          * At this point we're in long mode but in 32bit compatibility mode
+168          * with EFER.LME = 1, CS.L = 0, CS.D = 1 (and in turn
+169          * EFER.LMA = 1). Now we want to jump in 64bit mode, to do that we use
+170          * the new gdt/idt that has __KERNEL_CS with CS.L = 1.
+171          */
+172         ljmpl   $__KERNEL_CS, $pa_startup_64
+
+
+The 32-bit startup_32() jumps to the 64-bit startup_64. According to my test, the EIP becomes RIP since line 192.
+
+191 SYM_CODE_START(startup_64)
+192         # Now jump into the kernel using virtual addresses
+193         jmpq    *tr_start(%rip)
+194 SYM_CODE_END(startup_64)
+
+
+3. The tr_start() is in the trampoline_header. It is secondary_startup_64().
+
+239 SYM_DATA_START(trampoline_header)
+240         SYM_DATA_LOCAL(tr_start,        .space 8)
+241         SYM_DATA(tr_efer,               .space 8)
+242         SYM_DATA(tr_cr4,                .space 4)
+243         SYM_DATA(tr_flags,              .space 4)
+244 SYM_DATA_END(trampoline_header)
+
+
+ 93 static void __init setup_real_mode(void)
+ 94 {
+... ...
+155         trampoline_header->start = (u64) secondary_startup_64;
+
+
+4. The secondary_startup_64() calls initial_cide, which is
+
+129 SYM_CODE_START(secondary_startup_64)
+130         UNWIND_HINT_EMPTY
+131         ANNOTATE_NOENDBR
+... ...
+355         movq    initial_code(%rip), %rax
+356         pushq   $__KERNEL_CS    # set correct cs
+357         pushq   %rax            # target address in negative space
+358         lretq
+
+The initial_code is start_secondary() in this case.
