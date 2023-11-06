@@ -1,0 +1,661 @@
+From a433843cdded9aa682ccbfe2b81e25e4200dc160 Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Mon, 6 Nov 2023 07:25:41 -0800
+Subject: [PATCH 1/1] linux-v4.14.35-2047.532.1
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ arch/x86/kernel/cpu/common.c    |  29 ++++++
+ arch/x86/kernel/cpu/mtrr/main.c | 106 ++++++++++++++++++++++
+ arch/x86/kernel/smpboot.c       |  75 +++++++++++++++
+ kernel/stop_machine.c           | 156 ++++++++++++++++++++++++++++++++
+ kernel/time/timekeeping.c       |   4 +
+ 5 files changed, 370 insertions(+)
+
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index 65dabda36279..a4b881c7659e 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -62,6 +62,19 @@ u32 elf_hwcap2 __read_mostly;
+ 
+ /* all of these masks are initialized in setup_cpu_local_masks() */
+ cpumask_var_t cpu_initialized_mask;
++/*
++ * 在以下使用cpu_callout_mask:
++ *   - arch/x86/kernel/cpu/common.c|83| <<setup_cpu_local_masks>> alloc_bootmem_cpumask_var(&cpu_callout_mask);
++ *   - arch/x86/kernel/cpu/common.c|1837| <<wait_for_master_cpu>> while (!cpumask_test_cpu(cpu, cpu_callout_mask))
++ *   - arch/x86/kernel/cpu/mtrr/main.c|286| <<set_mtrr_from_inactive_cpu>> cpu_callout_mask);
++ *   - arch/x86/kernel/smp.c|152| <<native_send_call_func_ipi>> cpumask_equal(cpu_online_mask, cpu_callout_mask))
++ *   - arch/x86/kernel/smpboot.c|699| <<impress_friends>> if (cpumask_test_cpu(cpu, cpu_callout_mask))
++ *   - arch/x86/kernel/smpboot.c|1134| <<do_boot_cpu>> cpumask_set_cpu(cpu, cpu_callout_mask);
++ *   - arch/x86/kernel/smpboot.c|1475| <<native_smp_prepare_boot_cpu>> cpumask_set_cpu(me, cpu_callout_mask);
++ *   - arch/x86/kernel/smpboot.c|1649| <<remove_cpu_from_maps>> cpumask_clear_cpu(cpu, cpu_callout_mask);
++ *   - arch/x86/xen/smp_pv.c|288| <<cpu_initialize_context>> cpumask_set_cpu(cpu, cpu_callout_mask);
++ *   - arch/x86/xen/smp_pv.c|295| <<cpu_initialize_context>> cpumask_clear_cpu(cpu, cpu_callout_mask);
++ */
+ cpumask_var_t cpu_callout_mask;
+ cpumask_var_t cpu_callin_mask;
+ 
+@@ -1602,6 +1615,22 @@ void __init identify_boot_cpu(void)
+ 	tsx_init();
+ }
+ 
++/*
++ * start_secondary()
++ * -> cpu_init()
++ *    -> pr_debug("Initializing CPU#%d\n", cpu);
++ * -> x86_cpuinit.early_percpu_clock_init = kvm_setup_secondary_clock()
++ *    -> pr_info("kvm-clock: cpu %d, msr %llx, %s", smp_processor_id(), pa, txt);
++ * -> smp_callin()
++ *    -> smp_store_cpu_info()
++ *       -> identify_secondary_cpu()
++ *          -> mtrr_ap_init()
++ *             -> set_mtrr_from_inactive_cpu()
++ *                 -> stop_machine_from_inactive_cpu()
++ *
++ * called by:
++ *   - arch/x86/kernel/smpboot.c|386| <<smp_store_cpu_info>> identify_secondary_cpu(c);
++ */
+ void identify_secondary_cpu(struct cpuinfo_x86 *c)
+ {
+ 	BUG_ON(c == &boot_cpu_data);
+diff --git a/arch/x86/kernel/cpu/mtrr/main.c b/arch/x86/kernel/cpu/mtrr/main.c
+index 7468de429087..2432484fbbcf 100644
+--- a/arch/x86/kernel/cpu/mtrr/main.c
++++ b/arch/x86/kernel/cpu/mtrr/main.c
+@@ -59,10 +59,22 @@
+ #define MTRR_TO_PHYS_WC_OFFSET 1000
+ 
+ u32 num_var_ranges;
++/*
++ * 在以下使用__mtrr_enabled:
++ *   - arch/x86/kernel/cpu/mtrr/main.c|66| <<mtrr_enabled>> return __mtrr_enabled;
++ *   - arch/x86/kernel/cpu/mtrr/main.c|820| <<mtrr_bp_init>> __mtrr_enabled = true;
++ *   - arch/x86/kernel/cpu/mtrr/main.c|825| <<mtrr_bp_init>> __mtrr_enabled = get_mtrr_state();
++ */
+ static bool __mtrr_enabled;
+ 
+ static bool mtrr_enabled(void)
+ {
++	/*
++	 * 在以下使用__mtrr_enabled:
++	 *   - arch/x86/kernel/cpu/mtrr/main.c|66| <<mtrr_enabled>> return __mtrr_enabled;
++	 *   - arch/x86/kernel/cpu/mtrr/main.c|820| <<mtrr_bp_init>> __mtrr_enabled = true;
++	 *   - arch/x86/kernel/cpu/mtrr/main.c|825| <<mtrr_bp_init>> __mtrr_enabled = get_mtrr_state();
++	 */
+ 	return __mtrr_enabled;
+ }
+ 
+@@ -70,6 +82,14 @@ unsigned int mtrr_usage_table[MTRR_MAX_VAR_RANGES];
+ static DEFINE_MUTEX(mtrr_mutex);
+ 
+ u64 size_or_mask, size_and_mask;
++/*
++ * 在以下使用mtrr_aps_delayed_init:
++ *   - arch/x86/kernel/cpu/mtrr/main.c|180| <<mtrr_rendezvous_handler>> } else if (mtrr_aps_delayed_init || !cpu_online(smp_processor_id())) {
++ *   - arch/x86/kernel/cpu/mtrr/main.c|850| <<mtrr_ap_init>> if (!use_intel() || mtrr_aps_delayed_init)
++ *   - arch/x86/kernel/cpu/mtrr/main.c|889| <<set_mtrr_aps_delayed_init>> mtrr_aps_delayed_init = true;
++ *   - arch/x86/kernel/cpu/mtrr/main.c|905| <<mtrr_aps_init>> if (!mtrr_aps_delayed_init)
++ *   - arch/x86/kernel/cpu/mtrr/main.c|909| <<mtrr_aps_init>> mtrr_aps_delayed_init = false;
++ */
+ static bool mtrr_aps_delayed_init;
+ 
+ static const struct mtrr_ops *mtrr_ops[X86_VENDOR_NUM] __ro_after_init;
+@@ -178,6 +198,9 @@ static int mtrr_rendezvous_handler(void *info)
+ 		mtrr_if->set(data->smp_reg, data->smp_base,
+ 			     data->smp_size, data->smp_type);
+ 	} else if (mtrr_aps_delayed_init || !cpu_online(smp_processor_id())) {
++		/*
++		 * generic_set_all()
++		 */
+ 		mtrr_if->set_all();
+ 	}
+ 	return 0;
+@@ -225,6 +248,11 @@ static inline int types_compatible(mtrr_type type1, mtrr_type type2)
+  * Note that the mechanism is the same for UP systems, too; all the SMP stuff
+  * becomes nops.
+  */
++/*
++ * called by:
++ *   - arch/x86/kernel/cpu/mtrr/main.c|705| <<mtrr_restore>> set_mtrr(i, mtrr_value[i].lbase,
++ *   - arch/x86/kernel/cpu/mtrr/main.c|908| <<mtrr_aps_init>> set_mtrr(~0U, 0, 0, 0);
++ */
+ static void
+ set_mtrr(unsigned int reg, unsigned long base, unsigned long size, mtrr_type type)
+ {
+@@ -249,15 +277,52 @@ static void set_mtrr_cpuslocked(unsigned int reg, unsigned long base,
+ 	stop_machine_cpuslocked(mtrr_rendezvous_handler, &data, cpu_online_mask);
+ }
+ 
++/*
++ * start_secondary()
++ * -> cpu_init()
++ *    -> pr_debug("Initializing CPU#%d\n", cpu);
++ * -> x86_cpuinit.early_percpu_clock_init = kvm_setup_secondary_clock()
++ *    -> pr_info("kvm-clock: cpu %d, msr %llx, %s", smp_processor_id(), pa, txt);
++ * -> smp_callin()
++ *    -> smp_store_cpu_info()
++ *       -> identify_secondary_cpu()
++ *          -> mtrr_ap_init()
++ *             -> set_mtrr_from_inactive_cpu()
++ *                 -> stop_machine_from_inactive_cpu()
++ *
++ * called by:
++ *   - arch/x86/kernel/cpu/mtrr/main.c|809| <<mtrr_ap_init>> set_mtrr_from_inactive_cpu(~0U, 0, 0, 0);
++ *
++ * set_mtrr_from_inactive_cpu(~0U, 0, 0, 0);
++ */
+ static void set_mtrr_from_inactive_cpu(unsigned int reg, unsigned long base,
+ 				      unsigned long size, mtrr_type type)
+ {
++	/*
++	 * reg  = ~0U
++	 * base = 0
++	 * size = 0
++	 * type = 0
++	 */
+ 	struct set_mtrr_data data = { .smp_reg = reg,
+ 				      .smp_base = base,
+ 				      .smp_size = size,
+ 				      .smp_type = type
+ 				    };
+ 
++	/*
++	 * 在以下使用cpu_callout_mask:
++	 *   - arch/x86/kernel/cpu/common.c|83| <<setup_cpu_local_masks>> alloc_bootmem_cpumask_var(&cpu_callout_mask);
++	 *   - arch/x86/kernel/cpu/common.c|1837| <<wait_for_master_cpu>> while (!cpumask_test_cpu(cpu, cpu_callout_mask))
++	 *   - arch/x86/kernel/cpu/mtrr/main.c|286| <<set_mtrr_from_inactive_cpu>> cpu_callout_mask);
++	 *   - arch/x86/kernel/smp.c|152| <<native_send_call_func_ipi>> cpumask_equal(cpu_online_mask, cpu_callout_mask))
++	 *   - arch/x86/kernel/smpboot.c|699| <<impress_friends>> if (cpumask_test_cpu(cpu, cpu_callout_mask))
++	 *   - arch/x86/kernel/smpboot.c|1134| <<do_boot_cpu>> cpumask_set_cpu(cpu, cpu_callout_mask);
++	 *   - arch/x86/kernel/smpboot.c|1475| <<native_smp_prepare_boot_cpu>> cpumask_set_cpu(me, cpu_callout_mask);
++	 *   - arch/x86/kernel/smpboot.c|1649| <<remove_cpu_from_maps>> cpumask_clear_cpu(cpu, cpu_callout_mask);
++	 *   - arch/x86/xen/smp_pv.c|288| <<cpu_initialize_context>> cpumask_set_cpu(cpu, cpu_callout_mask);
++	 *   - arch/x86/xen/smp_pv.c|295| <<cpu_initialize_context>> cpumask_clear_cpu(cpu, cpu_callout_mask);
++	 */
+ 	stop_machine_from_inactive_cpu(mtrr_rendezvous_handler, &data,
+ 				       cpu_callout_mask);
+ }
+@@ -297,6 +362,13 @@ static void set_mtrr_from_inactive_cpu(unsigned int reg, unsigned long base,
+  * BUGS: Needs a quiet flag for the cases where drivers do not mind
+  * failures and do not wish system log messages to be sent.
+  */
++/*
++ * called by:
++ *   - arch/x86/kernel/cpu/mtrr/if.c|57| <<mtrr_file_add>> reg = mtrr_add_page(base, size, type, true);
++ *   - arch/x86/kernel/cpu/mtrr/if.c|157| <<mtrr_write>> err = mtrr_add_page((unsigned long )base, (unsigned long )size, i, true);
++ *   - arch/x86/kernel/cpu/mtrr/if.c|303| <<mtrr_ioctl>> mtrr_add_page(sentry.base, sentry.size, sentry.type, false);
++ *   - arch/x86/kernel/cpu/mtrr/main.c|500| <<mtrr_add>> return mtrr_add_page(base >> PAGE_SHIFT, size >> PAGE_SHIFT, type,
++ */
+ int mtrr_add_page(unsigned long base, unsigned long size,
+ 		  unsigned int type, bool increment)
+ {
+@@ -786,11 +858,35 @@ void __init mtrr_bp_init(void)
+ 	}
+ }
+ 
++/*
++ * start_secondary()
++ * -> cpu_init()
++ *    -> pr_debug("Initializing CPU#%d\n", cpu);
++ * -> x86_cpuinit.early_percpu_clock_init = kvm_setup_secondary_clock()
++ *    -> pr_info("kvm-clock: cpu %d, msr %llx, %s", smp_processor_id(), pa, txt);
++ * -> smp_callin()
++ *    -> smp_store_cpu_info()
++ *       -> identify_secondary_cpu()
++ *          -> mtrr_ap_init()
++ *             -> set_mtrr_from_inactive_cpu()
++ *                 -> stop_machine_from_inactive_cpu()
++ *
++ * called by:
++ *   - arch/x86/kernel/cpu/common.c|1612| <<identify_secondary_cpu>> mtrr_ap_init();
++ */
+ void mtrr_ap_init(void)
+ {
+ 	if (!mtrr_enabled())
+ 		return;
+ 
++	/*
++	 * 在以下使用mtrr_aps_delayed_init:
++	 *   - arch/x86/kernel/cpu/mtrr/main.c|180| <<mtrr_rendezvous_handler>> } else if (mtrr_aps_delayed_init || !cpu_online(smp_processor_id())) {
++	 *   - arch/x86/kernel/cpu/mtrr/main.c|850| <<mtrr_ap_init>> if (!use_intel() || mtrr_aps_delayed_init)
++	 *   - arch/x86/kernel/cpu/mtrr/main.c|889| <<set_mtrr_aps_delayed_init>> mtrr_aps_delayed_init = true;
++	 *   - arch/x86/kernel/cpu/mtrr/main.c|905| <<mtrr_aps_init>> if (!mtrr_aps_delayed_init)
++	 *   - arch/x86/kernel/cpu/mtrr/main.c|909| <<mtrr_aps_init>> mtrr_aps_delayed_init = false;
++	 */
+ 	if (!use_intel() || mtrr_aps_delayed_init)
+ 		return;
+ 	/*
+@@ -823,6 +919,11 @@ void mtrr_save_state(void)
+ 	smp_call_function_single(first_cpu, mtrr_save_fixed_ranges, NULL, 1);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kernel/smpboot.c|1450| <<native_smp_prepare_cpus>> set_mtrr_aps_delayed_init();
++ *   - arch/x86/kernel/smpboot.c|1459| <<arch_enable_nonboot_cpus_begin>> set_mtrr_aps_delayed_init();
++ */
+ void set_mtrr_aps_delayed_init(void)
+ {
+ 	if (!mtrr_enabled())
+@@ -836,6 +937,11 @@ void set_mtrr_aps_delayed_init(void)
+ /*
+  * Delayed MTRR initialization for all AP's
+  */
++/*
++ * called by:
++ *   - arch/x86/kernel/smpboot.c|1468| <<arch_enable_nonboot_cpus_end>> mtrr_aps_init();
++ *   - arch/x86/kernel/smpboot.c|1508| <<native_smp_cpus_done>> mtrr_aps_init();
++ */
+ void mtrr_aps_init(void)
+ {
+ 	if (!use_intel() || !mtrr_enabled())
+diff --git a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
+index 7e9e2b957a76..a52dc322f0b6 100644
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@ -164,6 +164,22 @@ static inline void smpboot_restore_warm_reset_vector(void)
+  * Report back to the Boot Processor during boot time or to the caller processor
+  * during CPU online.
+  */
++/*
++ * start_secondary()
++ * -> cpu_init()
++ *    -> pr_debug("Initializing CPU#%d\n", cpu);
++ * -> x86_cpuinit.early_percpu_clock_init = kvm_setup_secondary_clock()
++ *    -> pr_info("kvm-clock: cpu %d, msr %llx, %s", smp_processor_id(), pa, txt);
++ * -> smp_callin()
++ *    -> smp_store_cpu_info()
++ *       -> identify_secondary_cpu()
++ *          -> mtrr_ap_init()
++ *             -> set_mtrr_from_inactive_cpu()
++ *                 -> stop_machine_from_inactive_cpu()
++ *
++ * called by:
++ *   - arch/x86/kernel/smpboot.c|253| <<start_secondary>> smp_callin();
++ */
+ static void smp_callin(void)
+ {
+ 	int cpuid, phys_id;
+@@ -226,6 +242,19 @@ static int enable_start_cpu0;
+ /*
+  * Activate a secondary processor.
+  */
++/*
++ * start_secondary()
++ * -> cpu_init()
++ *    -> pr_debug("Initializing CPU#%d\n", cpu);
++ * -> x86_cpuinit.early_percpu_clock_init = kvm_setup_secondary_clock()
++ *    -> pr_info("kvm-clock: cpu %d, msr %llx, %s", smp_processor_id(), pa, txt);
++ * -> smp_callin()
++ *    -> smp_store_cpu_info()
++ *       -> identify_secondary_cpu()
++ *          -> mtrr_ap_init()
++ *             -> set_mtrr_from_inactive_cpu()
++ *                 -> stop_machine_from_inactive_cpu()
++ */
+ static void notrace start_secondary(void *unused)
+ {
+ 	/*
+@@ -247,7 +276,15 @@ static void notrace start_secondary(void *unused)
+ 	__flush_tlb_all();
+ #endif
+ 	load_current_idt();
++	/*
++	 * cpu_init()
++	 *    -> pr_debug("Initializing CPU#%d\n", cpu);
++	 */
+ 	cpu_init();
++	/*
++	 * x86_cpuinit.early_percpu_clock_init = kvm_setup_secondary_clock()
++	 * -> pr_info("kvm-clock: cpu %d, msr %llx, %s", smp_processor_id(), pa, txt);
++	 */
+ 	x86_cpuinit.early_percpu_clock_init();
+ 	preempt_disable();
+ 	smp_callin();
+@@ -356,6 +393,19 @@ int topology_update_package_map(unsigned int pkg, unsigned int cpu)
+ 	return 0;
+ }
+ 
++/*
++ * start_secondary()
++ * -> cpu_init()
++ *    -> pr_debug("Initializing CPU#%d\n", cpu);
++ * -> x86_cpuinit.early_percpu_clock_init = kvm_setup_secondary_clock()
++ *    -> pr_info("kvm-clock: cpu %d, msr %llx, %s", smp_processor_id(), pa, txt);
++ * -> smp_callin()
++ *    -> smp_store_cpu_info()
++ *       -> identify_secondary_cpu()
++ *          -> mtrr_ap_init()
++ *             -> set_mtrr_from_inactive_cpu()
++ *                 -> stop_machine_from_inactive_cpu()
++ */
+ void __init smp_store_boot_cpu_info(void)
+ {
+ 	int id = 0; /* CPU 0 */
+@@ -371,6 +421,23 @@ void __init smp_store_boot_cpu_info(void)
+  * The bootstrap kernel entry code has set these up. Save them for
+  * a given CPU
+  */
++/*
++ * start_secondary()
++ * -> cpu_init()
++ *    -> pr_debug("Initializing CPU#%d\n", cpu);
++ * -> x86_cpuinit.early_percpu_clock_init = kvm_setup_secondary_clock()
++ *    -> pr_info("kvm-clock: cpu %d, msr %llx, %s", smp_processor_id(), pa, txt);
++ * -> smp_callin()
++ *    -> smp_store_cpu_info()
++ *       -> identify_secondary_cpu()
++ *          -> mtrr_ap_init()
++ *             -> set_mtrr_from_inactive_cpu()
++ *                 -> stop_machine_from_inactive_cpu()
++ *
++ * called by:
++ *   - arch/x86/kernel/smpboot.c|196| <<smp_callin>> smp_store_cpu_info(cpuid);
++ *   - arch/x86/xen/smp_pv.c|70| <<cpu_bringup>> smp_store_cpu_info(cpu);
++ */
+ void smp_store_cpu_info(int id)
+ {
+ 	struct cpuinfo_x86 *c = &cpu_data(id);
+@@ -1387,11 +1454,19 @@ void __init native_smp_prepare_cpus(unsigned int max_cpus)
+ 	speculative_store_bypass_ht_init();
+ }
+ 
++/*
++ * called by:
++ *   - kernel/cpu.c|1319| <<enable_nonboot_cpus>> arch_enable_nonboot_cpus_begin();
++ */
+ void arch_enable_nonboot_cpus_begin(void)
+ {
+ 	set_mtrr_aps_delayed_init();
+ }
+ 
++/*
++ * called by:
++ *   - kernel/cpu.c|1332| <<enable_nonboot_cpus>> arch_enable_nonboot_cpus_end();
++ */
+ void arch_enable_nonboot_cpus_end(void)
+ {
+ 	mtrr_aps_init();
+diff --git a/kernel/stop_machine.c b/kernel/stop_machine.c
+index 067cb83f37ea..7f102a6a1b4f 100644
+--- a/kernel/stop_machine.c
++++ b/kernel/stop_machine.c
+@@ -48,6 +48,16 @@ static DEFINE_PER_CPU(struct cpu_stopper, cpu_stopper);
+ static bool stop_machine_initialized = false;
+ 
+ /* static data for stop_cpus */
++/*
++ * 在以下使用stop_cpus_mutex:
++ *   - kernel/stop_machine.c|51| <<global>> static DEFINE_MUTEX(stop_cpus_mutex);
++ *   - kernel/stop_machine.c|437| <<stop_cpus>> mutex_lock(&stop_cpus_mutex);
++ *   - kernel/stop_machine.c|439| <<stop_cpus>> mutex_unlock(&stop_cpus_mutex);
++ *   - kernel/stop_machine.c|466| <<try_stop_cpus>> if (!mutex_trylock(&stop_cpus_mutex))
++ *   - kernel/stop_machine.c|469| <<try_stop_cpus>> mutex_unlock(&stop_cpus_mutex);
++ *   - kernel/stop_machine.c|682| <<stop_machine_from_inactive_cpu>> while (!mutex_trylock(&stop_cpus_mutex))
++ *   - kernel/stop_machine.c|696| <<stop_machine_from_inactive_cpu>> mutex_unlock(&stop_cpus_mutex);
++ */
+ static DEFINE_MUTEX(stop_cpus_mutex);
+ static bool stop_cpus_in_progress;
+ 
+@@ -162,6 +172,13 @@ struct multi_stop_data {
+ 	atomic_t		thread_ack;
+ };
+ 
++/*
++ * called by:
++ *   - kernel/stop_machine.c|188| <<ack_state>> set_state(msdata, msdata->state + 1);
++ *   - kernel/stop_machine.c|337| <<stop_two_cpus>> set_state(&msdata, MULTI_STOP_PREPARE);
++ *   - kernel/stop_machine.c|666| <<stop_machine_cpuslocked>> set_state(&msdata, MULTI_STOP_PREPARE);
++ *   - kernel/stop_machine.c|795| <<stop_machine_from_inactive_cpu>> set_state(&msdata, MULTI_STOP_PREPARE);
++ */
+ static void set_state(struct multi_stop_data *msdata,
+ 		      enum multi_stop_state newstate)
+ {
+@@ -171,6 +188,10 @@ static void set_state(struct multi_stop_data *msdata,
+ 	msdata->state = newstate;
+ }
+ 
++/*
++ * called by:
++ *   - kernel/stop_machine.c|229| <<multi_cpu_stop>> ack_state(msdata);
++ */
+ /* Last one to ack a state moves to the next state. */
+ static void ack_state(struct multi_stop_data *msdata)
+ {
+@@ -210,6 +231,9 @@ static int multi_cpu_stop(void *data)
+ 				hard_irq_disable();
+ 				break;
+ 			case MULTI_STOP_RUN:
++				/*
++				 * mtrr_rendezvous_handler()
++				 */
+ 				if (is_active)
+ 					err = msdata->fn(msdata->data);
+ 				break;
+@@ -360,6 +384,11 @@ bool stop_one_cpu_nowait(unsigned int cpu, cpu_stop_fn_t fn, void *arg,
+ 	return cpu_stop_queue_work(cpu, work_buf);
+ }
+ 
++/*
++ * calle dby:
++ *   - kernel/stop_machine.c|427| <<__stop_cpus>> if (!queue_stop_cpus_work(cpumask, fn, arg, &done))
++ *   - kernel/stop_machine.c|823| <<stop_machine_from_inactive_cpu>> queue_stop_cpus_work(cpu_active_mask, multi_cpu_stop, &msdata,
++ */
+ static bool queue_stop_cpus_work(const struct cpumask *cpumask,
+ 				 cpu_stop_fn_t fn, void *arg,
+ 				 struct cpu_stop_done *done)
+@@ -389,6 +418,11 @@ static bool queue_stop_cpus_work(const struct cpumask *cpumask,
+ 	return queued;
+ }
+ 
++/*
++ * called by:
++ *   - kernel/stop_machine.c|438| <<stop_cpus>> ret = __stop_cpus(cpumask, fn, arg);
++ *   - kernel/stop_machine.c|468| <<try_stop_cpus>> ret = __stop_cpus(cpumask, fn, arg);
++ */
+ static int __stop_cpus(const struct cpumask *cpumask,
+ 		       cpu_stop_fn_t fn, void *arg)
+ {
+@@ -429,10 +463,25 @@ static int __stop_cpus(const struct cpumask *cpumask,
+  * @cpumask were offline; otherwise, 0 if all executions of @fn
+  * returned 0, any non zero return value if any returned non zero.
+  */
++/*
++ * called by:
++ *   - include/linux/stop_machine.h|95| <<try_stop_cpus>> return stop_cpus(cpumask, fn, arg);
++ *   - kernel/stop_machine.c|616| <<stop_machine_cpuslocked>> return stop_cpus(cpu_online_mask, multi_cpu_stop, &msdata);
++ */
+ int stop_cpus(const struct cpumask *cpumask, cpu_stop_fn_t fn, void *arg)
+ {
+ 	int ret;
+ 
++	/*
++	 * 在以下使用stop_cpus_mutex:
++	 *   - kernel/stop_machine.c|51| <<global>> static DEFINE_MUTEX(stop_cpus_mutex);
++	 *   - kernel/stop_machine.c|437| <<stop_cpus>> mutex_lock(&stop_cpus_mutex);
++	 *   - kernel/stop_machine.c|439| <<stop_cpus>> mutex_unlock(&stop_cpus_mutex);
++	 *   - kernel/stop_machine.c|466| <<try_stop_cpus>> if (!mutex_trylock(&stop_cpus_mutex))
++	 *   - kernel/stop_machine.c|469| <<try_stop_cpus>> mutex_unlock(&stop_cpus_mutex);
++	 *   - kernel/stop_machine.c|682| <<stop_machine_from_inactive_cpu>> while (!mutex_trylock(&stop_cpus_mutex))
++	 *   - kernel/stop_machine.c|696| <<stop_machine_from_inactive_cpu>> mutex_unlock(&stop_cpus_mutex);
++	 */
+ 	/* static works are used, process one request at a time */
+ 	mutex_lock(&stop_cpus_mutex);
+ 	ret = __stop_cpus(cpumask, fn, arg);
+@@ -458,10 +507,23 @@ int stop_cpus(const struct cpumask *cpumask, cpu_stop_fn_t fn, void *arg)
+  * offline; otherwise, 0 if all executions of @fn returned 0, any non
+  * zero return value if any returned non zero.
+  */
++/*
++ * 没人调用!!!
++ */
+ int try_stop_cpus(const struct cpumask *cpumask, cpu_stop_fn_t fn, void *arg)
+ {
+ 	int ret;
+ 
++	/*
++	 * 在以下使用stop_cpus_mutex:
++	 *   - kernel/stop_machine.c|51| <<global>> static DEFINE_MUTEX(stop_cpus_mutex);
++	 *   - kernel/stop_machine.c|437| <<stop_cpus>> mutex_lock(&stop_cpus_mutex);
++	 *   - kernel/stop_machine.c|439| <<stop_cpus>> mutex_unlock(&stop_cpus_mutex);
++	 *   - kernel/stop_machine.c|466| <<try_stop_cpus>> if (!mutex_trylock(&stop_cpus_mutex))
++	 *   - kernel/stop_machine.c|469| <<try_stop_cpus>> mutex_unlock(&stop_cpus_mutex);
++	 *   - kernel/stop_machine.c|682| <<stop_machine_from_inactive_cpu>> while (!mutex_trylock(&stop_cpus_mutex))
++	 *   - kernel/stop_machine.c|696| <<stop_machine_from_inactive_cpu>> mutex_unlock(&stop_cpus_mutex);
++	 */
+ 	/* static works are used, process one request at a time */
+ 	if (!mutex_trylock(&stop_cpus_mutex))
+ 		return -EAGAIN;
+@@ -580,6 +642,14 @@ static int __init cpu_stop_init(void)
+ }
+ early_initcall(cpu_stop_init);
+ 
++/*
++ * called by:
++ *   - arch/x86/kernel/cpu/microcode/core.c|658| <<microcode_reload_late>> ret = stop_machine_cpuslocked(__reload_late, NULL, cpu_online_mask);
++ *   - arch/x86/kernel/cpu/mtrr/main.c|249| <<set_mtrr_cpuslocked>> stop_machine_cpuslocked(mtrr_rendezvous_handler, &data, cpu_online_mask);
++ *   - include/linux/stop_machine.h|155| <<stop_machine>> return stop_machine_cpuslocked(fn, data, cpus);
++ *   - kernel/cpu.c|931| <<takedown_cpu>> err = stop_machine_cpuslocked(take_cpu_down, NULL, cpumask_of(cpu));
++ *   - kernel/stop_machine.c|665| <<stop_machine>> ret = stop_machine_cpuslocked(fn, data, cpus);
++ */
+ int stop_machine_cpuslocked(cpu_stop_fn_t fn, void *data,
+ 			    const struct cpumask *cpus)
+ {
+@@ -613,9 +683,41 @@ int stop_machine_cpuslocked(cpu_stop_fn_t fn, void *data,
+ 
+ 	/* Set the initial state and stop all online cpus. */
+ 	set_state(&msdata, MULTI_STOP_PREPARE);
++	/*
++	 * called by:
++	 *   - include/linux/stop_machine.h|95| <<try_stop_cpus>> return stop_cpus(cpumask, fn, arg);
++	 *   - kernel/stop_machine.c|616| <<stop_machine_cpuslocked>> return stop_cpus(cpu_online_mask, multi_cpu_stop, &msdata);
++	 */
+ 	return stop_cpus(cpu_online_mask, multi_cpu_stop, &msdata);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm/kernel/ftrace.c|47| <<arch_ftrace_update_code>> stop_machine(__ftrace_modify_code, &command, NULL);
++ *   - arch/arm/mm/init.c|745| <<fix_kernmem_perms>> stop_machine(__fix_kernmem_perms, NULL, NULL);
++ *   - arch/arm/mm/init.c|759| <<mark_rodata_ro>> stop_machine(__mark_rodata_ro, NULL, NULL);
++ *   - arch/arm64/kernel/alternative.c|213| <<apply_alternatives_all>> stop_machine(__apply_alternatives_multi_stop, NULL, cpu_online_mask);
++ *   - arch/arm64/kernel/cpufeature.c|1457| <<__enable_cpu_capabilities>> stop_machine(__enable_cpu_capability,
++ *   - arch/powerpc/lib/feature-fixups.c|247| <<do_stf_barrier_fixups>> stop_machine(__do_stf_barrier_fixups, &types, NULL);
++ *   - arch/powerpc/lib/feature-fixups.c|365| <<do_entry_flush_fixups>> stop_machine(__do_entry_flush_fixups, &types, NULL);
++ *   - arch/powerpc/mm/numa.c|1462| <<numa_update_cpu_topology>> stop_machine(update_cpu_topology, &updates[0], &updated_cpus);
++ *   - arch/powerpc/mm/numa.c|1473| <<numa_update_cpu_topology>> stop_machine(update_lookup_table, &updates[0],
++ *   - arch/powerpc/mm/pgtable-radix.c|764| <<split_kernel_mapping>> stop_machine(stop_machine_change_mapping, &params, NULL);
++ *   - arch/x86/kernel/cpu/mtrr/main.c|237| <<set_mtrr>> stop_machine(mtrr_rendezvous_handler, &data, cpu_online_mask);
++ *   - drivers/char/hw_random/intel-rng.c|372| <<mod_init>> err = stop_machine(intel_rng_hw_init, intel_rng_hw, NULL);
++ *   - drivers/edac/octeon_edac-lmc.c|315| <<octeon_lmc_inject_ecc_write>> stop_machine(*inject_lmc_ecc_fn, lmc, NULL);
++ *   - drivers/edac/thunderx_edac.c|428| <<thunderx_lmc_inject_ecc_write>> stop_machine(inject_ecc_fn, lmc, NULL);
++ *   - drivers/gpu/drm/i915/i915_gem.c|3186| <<i915_gem_set_wedged>> stop_machine(__i915_gem_set_wedged_BKL, dev_priv, NULL);
++ *   - drivers/gpu/drm/i915/i915_gem_gtt.c|2236| <<bxt_vtd_ggtt_insert_page__BKL>> stop_machine(bxt_vtd_ggtt_insert_page__cb, &arg, NULL);
++ *   - drivers/gpu/drm/i915/i915_gem_gtt.c|2263| <<bxt_vtd_ggtt_insert_entries__BKL>> stop_machine(bxt_vtd_ggtt_insert_entries__cb, &arg, NULL);
++ *   - drivers/gpu/drm/i915/i915_gem_gtt.c|2288| <<bxt_vtd_ggtt_clear_range__BKL>> stop_machine(bxt_vtd_ggtt_clear_range__cb, &arg, NULL);
++ *   - drivers/gpu/drm/i915/i915_gpu_error.c|1735| <<i915_capture_gpu_state>> stop_machine(capture, error, NULL);
++ *   - drivers/xen/manage.c|135| <<do_suspend>> err = stop_machine(xen_suspend, &si, cpumask_of(0));
++ *   - include/linux/stop_machine.h|153| <<stop_machine>> stop_machine(cpu_stop_fn_t fn, void *data, const struct cpumask *cpus)
++ *   - include/linux/stop_machine.h|162| <<stop_machine_from_inactive_cpu>> return stop_machine(fn, data, cpus);
++ *   - kernel/time/timekeeping.c|1374| <<timekeeping_notify>> stop_machine(change_clocksource, clock, NULL);
++ *   - kernel/trace/ftrace.c|2706| <<ftrace_run_stop_machine>> stop_machine(__ftrace_modify_code, &command, NULL);
++ */
+ int stop_machine(cpu_stop_fn_t fn, void *data, const struct cpumask *cpus)
+ {
+ 	int ret;
+@@ -650,11 +752,48 @@ EXPORT_SYMBOL_GPL(stop_machine);
+  * 0 if all executions of @fn returned 0, any non zero return value if any
+  * returned non zero.
+  */
++/*
++ * start_secondary()
++ * -> cpu_init()
++ *    -> pr_debug("Initializing CPU#%d\n", cpu);
++ * -> x86_cpuinit.early_percpu_clock_init = kvm_setup_secondary_clock()
++ *    -> pr_info("kvm-clock: cpu %d, msr %llx, %s", smp_processor_id(), pa, txt);
++ * -> smp_callin()
++ *    -> smp_store_cpu_info()
++ *       -> identify_secondary_cpu()
++ *          -> mtrr_ap_init()
++ *             -> set_mtrr_from_inactive_cpu()
++ *                 -> stop_machine_from_inactive_cpu()
++ *
++ * called by:
++ *   - arch/x86/kernel/cpu/mtrr/main.c|261| <<set_mtrr_from_inactive_cpu>> stop_machine_from_inactive_cpu(mtrr_rendezvous_handler, &data,
++ *
++ * stop_machine_from_inactive_cpu(mtrr_rendezvous_handler, &data, cpu_callout_mask);
++ */
+ int stop_machine_from_inactive_cpu(cpu_stop_fn_t fn, void *data,
+ 				  const struct cpumask *cpus)
+ {
++	/*
++	 * struct multi_stop_data {
++	 *     cpu_stop_fn_t           fn;
++	 *     void                    *data;
++	 *     // Like num_online_cpus(), but hotplug cpu uses us, so we need this.
++	 *     unsigned int            num_threads;
++	 *     const struct cpumask    *active_cpus;
++	 *
++	 *     enum multi_stop_state   state;
++	 *     atomic_t                thread_ack;
++	 * };
++	 */
+ 	struct multi_stop_data msdata = { .fn = fn, .data = data,
+ 					    .active_cpus = cpus };
++	/*
++	 * struct cpu_stop_done {
++	 *     atomic_t                nr_todo;        // nr left to execute
++	 *     int                     ret;            // collected return value
++	 *     struct completion       completion;     // fired if nr_todo reaches 0
++	 * };
++	 */
+ 	struct cpu_stop_done done;
+ 	int ret;
+ 
+@@ -662,10 +801,27 @@ int stop_machine_from_inactive_cpu(cpu_stop_fn_t fn, void *data,
+ 	BUG_ON(cpu_active(raw_smp_processor_id()));
+ 	msdata.num_threads = num_active_cpus() + 1;	/* +1 for local */
+ 
++	/*
++	 * 在以下使用stop_cpus_mutex:
++	 *   - kernel/stop_machine.c|51| <<global>> static DEFINE_MUTEX(stop_cpus_mutex);
++	 *   - kernel/stop_machine.c|437| <<stop_cpus>> mutex_lock(&stop_cpus_mutex);
++	 *   - kernel/stop_machine.c|439| <<stop_cpus>> mutex_unlock(&stop_cpus_mutex);
++	 *   - kernel/stop_machine.c|466| <<try_stop_cpus>> if (!mutex_trylock(&stop_cpus_mutex))
++	 *   - kernel/stop_machine.c|469| <<try_stop_cpus>> mutex_unlock(&stop_cpus_mutex);
++	 *   - kernel/stop_machine.c|682| <<stop_machine_from_inactive_cpu>> while (!mutex_trylock(&stop_cpus_mutex))
++	 *   - kernel/stop_machine.c|696| <<stop_machine_from_inactive_cpu>> mutex_unlock(&stop_cpus_mutex);
++	 */
+ 	/* No proper task established and can't sleep - busy wait for lock. */
+ 	while (!mutex_trylock(&stop_cpus_mutex))
+ 		cpu_relax();
+ 
++	/*
++	 * called by:
++	 *   - kernel/stop_machine.c|188| <<ack_state>> set_state(msdata, msdata->state + 1);
++	 *   - kernel/stop_machine.c|337| <<stop_two_cpus>> set_state(&msdata, MULTI_STOP_PREPARE);
++	 *   - kernel/stop_machine.c|666| <<stop_machine_cpuslocked>> set_state(&msdata, MULTI_STOP_PREPARE);
++	 *   - kernel/stop_machine.c|795| <<stop_machine_from_inactive_cpu>> set_state(&msdata, MULTI_STOP_PREPARE);
++	 */
+ 	/* Schedule work on other CPUs and execute directly for local CPU */
+ 	set_state(&msdata, MULTI_STOP_PREPARE);
+ 	cpu_stop_init_done(&done, num_active_cpus());
+diff --git a/kernel/time/timekeeping.c b/kernel/time/timekeeping.c
+index 745121e1ab9c..cf7e025755a4 100644
+--- a/kernel/time/timekeeping.c
++++ b/kernel/time/timekeeping.c
+@@ -1365,6 +1365,10 @@ static int change_clocksource(void *data)
+  * This function is called from clocksource.c after a new, better clock
+  * source has been registered. The caller holds the clocksource_mutex.
+  */
++/*
++ * called by:
++ *   - kernel/time/clocksource.c|638| <<__clocksource_select>> if (curr_clocksource != best && !timekeeping_notify(best)) {
++ */
+ int timekeeping_notify(struct clocksource *clock)
+ {
+ 	struct timekeeper *tk = &tk_core.timekeeper;
+-- 
+2.34.1
+
