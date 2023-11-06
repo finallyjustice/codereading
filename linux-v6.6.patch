@@ -1,0 +1,1905 @@
+From 05505e802b06a959e27862f357d1ba2bcf5576c4 Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Mon, 6 Nov 2023 07:05:57 -0800
+Subject: [PATCH 1/1] linux-v6.6
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ arch/arm64/include/asm/arch_timer.h           |   3 +
+ arch/arm64/include/asm/kvm_emulate.h          |   6 +
+ arch/arm64/include/asm/kvm_host.h             |   9 +
+ arch/arm64/include/asm/kvm_mmu.h              |  33 ++
+ arch/arm64/kernel/process.c                   |  12 +
+ arch/arm64/kvm/arch_timer.c                   | 285 ++++++++++++++++++
+ arch/arm64/kvm/arm.c                          |  16 +
+ arch/arm64/kvm/hyp/include/hyp/switch.h       |  32 ++
+ arch/arm64/kvm/hyp/include/hyp/sysreg-sr.h    |  10 +
+ arch/arm64/kvm/hyp/include/nvhe/mem_protect.h |   7 +
+ arch/arm64/kvm/hyp/nvhe/timer-sr.c            |  18 ++
+ arch/arm64/kvm/hyp/vhe/switch.c               |  44 +++
+ arch/arm64/kvm/hyp/vhe/sysreg-sr.c            |  24 ++
+ arch/arm64/kvm/hyp/vhe/tlb.c                  |  13 +
+ arch/arm64/kvm/mmu.c                          |  17 ++
+ arch/arm64/kvm/sys_regs.c                     |  22 ++
+ arch/arm64/kvm/vgic/vgic-mmio-v3.c            |   4 +
+ arch/arm64/kvm/vgic/vgic.c                    |   8 +
+ arch/x86/include/asm/kvm_host.h               |  87 ++++++
+ arch/x86/kvm/lapic.c                          |  33 ++
+ arch/x86/kvm/pmu.c                            |  56 ++++
+ arch/x86/kvm/x86.c                            | 107 +++++++
+ arch/x86/kvm/xen.c                            |  71 +++++
+ drivers/clocksource/arm_arch_timer.c          |  38 +++
+ .../kvm/memslot_modification_stress_test.c    |   4 +
+ 25 files changed, 959 insertions(+)
+
+diff --git a/arch/arm64/include/asm/arch_timer.h b/arch/arm64/include/asm/arch_timer.h
+index 934c658ee..090dcc5ec 100644
+--- a/arch/arm64/include/asm/arch_timer.h
++++ b/arch/arm64/include/asm/arch_timer.h
+@@ -201,6 +201,9 @@ static __always_inline u64 __arch_counter_get_cntvct(void)
+ {
+ 	u64 cnt;
+ 
++	/*
++	 * 虚拟化应该是PhysicalCountInt() - CNTVOFF_EL2
++	 */
+ 	asm volatile(ALTERNATIVE("isb\n mrs %0, cntvct_el0",
+ 				 "nop\n" __mrs_s("%0", SYS_CNTVCTSS_EL0),
+ 				 ARM64_HAS_ECV)
+diff --git a/arch/arm64/include/asm/kvm_emulate.h b/arch/arm64/include/asm/kvm_emulate.h
+index 3d6725ff0..5a2f7d4e9 100644
+--- a/arch/arm64/include/asm/kvm_emulate.h
++++ b/arch/arm64/include/asm/kvm_emulate.h
+@@ -294,6 +294,12 @@ static inline bool vcpu_mode_priv(const struct kvm_vcpu *vcpu)
+ 
+ static __always_inline u64 kvm_vcpu_get_esr(const struct kvm_vcpu *vcpu)
+ {
++	/*
++	 * ESR_EL2, Exception Syndrome Register (EL2)
++	 * EC, bits [31:26]
++	 *   Exception Class. Indicates the reason for the exception
++	 *   that this register holds information about.
++	 */
+ 	return vcpu->arch.fault.esr_el2;
+ }
+ 
+diff --git a/arch/arm64/include/asm/kvm_host.h b/arch/arm64/include/asm/kvm_host.h
+index af06ccb7e..c039a8c97 100644
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@ -155,6 +155,15 @@ struct kvm_s2_mmu {
+ 	 * for vEL1/EL0 with vHCR_EL2.VM == 0.  In that case, we use the
+ 	 * canonical stage-2 page tables.
+ 	 */
++	/*
++	 * 在以下使用kvm_s2_mmu->pgd_phys:
++	 *   - arch/arm64/include/asm/kvm_mmu.h|289| <<kvm_get_vttbr>> baddr = mmu->pgd_phys;
++	 *   - arch/arm64/kvm/hyp/nvhe/mem_protect.c|157| <<kvm_host_prepare_stage2>> mmu->pgd_phys = __hyp_pa(host_mmu.pgt.pgd);
++	 *   - arch/arm64/kvm/hyp/nvhe/mem_protect.c|264| <<kvm_guest_prepare_stage2>> vm->kvm.arch.mmu.pgd_phys = __hyp_pa(vm->pgt.pgd);
++	 *   - arch/arm64/kvm/hyp/nvhe/mem_protect.c|276| <<reclaim_guest_pages>> vm->kvm.arch.mmu.pgd_phys = 0ULL;
++	 *   - arch/arm64/kvm/mmu.c|925| <<kvm_init_stage2_mmu>> mmu->pgd_phys = __pa(pgt->pgd);
++	 *   - arch/arm64/kvm/mmu.c|1017| <<kvm_free_stage2_pgd>> mmu->pgd_phys = 0;
++	 */
+ 	phys_addr_t	pgd_phys;
+ 	struct kvm_pgtable *pgt;
+ 
+diff --git a/arch/arm64/include/asm/kvm_mmu.h b/arch/arm64/include/asm/kvm_mmu.h
+index 96a80e8f6..ea3a65d15 100644
+--- a/arch/arm64/include/asm/kvm_mmu.h
++++ b/arch/arm64/include/asm/kvm_mmu.h
+@@ -280,12 +280,21 @@ static inline int kvm_write_guest_lock(struct kvm *kvm, gpa_t gpa,
+  * path, we rely on a previously issued DSB so that page table updates
+  * and VMID reads are correctly ordered.
+  */
++/*
++ * called by:
++ *   - arch/arm64/include/asm/kvm_mmu.h|303| <<__load_stage2>> write_sysreg(kvm_get_vttbr(mmu), vttbr_el2);
++ *   - arch/arm64/kvm/hyp/nvhe/mem_protect.c|297| <<__pkvm_prot_finalize>> params->vttbr = kvm_get_vttbr(mmu);
++ */
+ static __always_inline u64 kvm_get_vttbr(struct kvm_s2_mmu *mmu)
+ {
+ 	struct kvm_vmid *vmid = &mmu->vmid;
+ 	u64 vmid_field, baddr;
+ 	u64 cnp = system_supports_cnp() ? VTTBR_CNP_BIT : 0;
+ 
++	/*
++	 * struct kvm_s2_mmu *mmu:
++	 * -> phys_addr_t pgd_phys;
++	 */
+ 	baddr = mmu->pgd_phys;
+ 	vmid_field = atomic64_read(&vmid->id) << VTTBR_VMID_SHIFT;
+ 	vmid_field &= VTTBR_VMID_MASK(kvm_arm_vmid_bits);
+@@ -296,10 +305,34 @@ static __always_inline u64 kvm_get_vttbr(struct kvm_s2_mmu *mmu)
+  * Must be called from hyp code running at EL2 with an updated VTTBR
+  * and interrupts disabled.
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/include/nvhe/mem_protect.h|89| <<__load_host_stage2>> __load_stage2(&host_mmu.arch.mmu, &host_mmu.arch);
++ *   - arch/arm64/kvm/hyp/nvhe/mem_protect.c|310| <<__pkvm_prot_finalize>> __load_stage2(&host_mmu.arch.mmu, &host_mmu.arch);
++ *   - arch/arm64/kvm/hyp/nvhe/switch.c|306| <<__kvm_vcpu_run>> __load_stage2(mmu, kern_hyp_va(mmu->arch));
++ *   - arch/arm64/kvm/hyp/nvhe/tlb.c|65| <<__tlb_switch_to_guest>> __load_stage2(mmu, kern_hyp_va(mmu->arch));
++ *   - arch/arm64/kvm/hyp/vhe/switch.c|227| <<__kvm_vcpu_run_vhe>> __load_stage2(vcpu->arch.hw_mmu, vcpu->arch.hw_mmu->arch);
++ *   - arch/arm64/kvm/hyp/vhe/tlb.c|56| <<__tlb_switch_to_guest>> __load_stage2(mmu, mmu->arch);
++ */
+ static __always_inline void __load_stage2(struct kvm_s2_mmu *mmu,
+ 					  struct kvm_arch *arch)
+ {
++	/*
++	 * struct kvm_arch *arch:
++	 * -> u64 vtcr
++	 */
+ 	write_sysreg(arch->vtcr, vtcr_el2);
++	/*
++	 * called by:
++	 *   - arch/arm64/include/asm/kvm_mmu.h|303| <<__load_stage2>> write_sysreg(kvm_get_vttbr(mmu), vttbr_el2);
++	 *   - arch/arm64/kvm/hyp/nvhe/mem_protect.c|297| <<__pkvm_prot_finalize>> params->vttbr = kvm_get_vttbr(mmu);
++	 *
++	 * 在以下使用vttbr_el2:
++	 *   - arch/arm64/include/asm/el2_setup.h|113| <<global>> .macro __init_el2_stage2 msr vttbr_el2, xzr
++	 *   - arch/arm64/include/asm/kvm_mmu.h|303| <<__load_stage2>> write_sysreg(kvm_get_vttbr(mmu), vttbr_el2);
++	 *   - arch/arm64/kvm/hyp/include/nvhe/mem_protect.h|91| <<__load_host_stage2>> write_sysreg(0, vttbr_el2);
++	 *   - arch/arm64/kvm/hyp/vhe/tlb.c|69| <<__tlb_switch_to_host>> write_sysreg(0, vttbr_el2);
++	 */
+ 	write_sysreg(kvm_get_vttbr(mmu), vttbr_el2);
+ 
+ 	/*
+diff --git a/arch/arm64/kernel/process.c b/arch/arm64/kernel/process.c
+index 0fcc4eb1a..cef5caffc 100644
+--- a/arch/arm64/kernel/process.c
++++ b/arch/arm64/kernel/process.c
+@@ -155,6 +155,10 @@ static const char *const btypes[] = {
+ };
+ #undef bstr
+ 
++/*
++ * called by:
++ *   - arch/arm64/kernel/process.c|216| <<__show_regs>> print_pstate(regs);
++ */
+ static void print_pstate(struct pt_regs *regs)
+ {
+ 	u64 pstate = regs->pstate;
+@@ -197,6 +201,14 @@ static void print_pstate(struct pt_regs *regs)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kernel/entry-common.c|297| <<__panic_unhandled>> __show_regs(regs);
++ *   - arch/arm64/kernel/process.c|245| <<show_regs>> __show_regs(regs);
++ *   - arch/arm64/kernel/traps.c|263| <<arm64_show_signal>> __show_regs(regs);
++ *   - arch/arm64/kernel/traps.c|943| <<panic_bad_stack>> __show_regs(regs);
++ *   - arch/arm64/kernel/traps.c|961| <<arm64_serror_panic>> __show_regs(regs);
++ */
+ void __show_regs(struct pt_regs *regs)
+ {
+ 	int i, top_reg;
+diff --git a/arch/arm64/kvm/arch_timer.c b/arch/arm64/kvm/arch_timer.c
+index a1e24228a..ba84e00bf 100644
+--- a/arch/arm64/kvm/arch_timer.c
++++ b/arch/arm64/kvm/arch_timer.c
+@@ -24,13 +24,25 @@
+ #include "trace.h"
+ 
+ static struct timecounter *timecounter;
++/*
++ * 在以下设置host_vtimer_irq:
++ *   - arch/arm64/kvm/arch_timer.c|1332| <<kvm_irq_init>> host_vtimer_irq = info->virtual_irq;
++ */
+ static unsigned int host_vtimer_irq;
++/*
++ * 在以下设置host_ptimer_irq:
++ *   - arch/arm64/kvm/arch_timer.c|1359| <<kvm_irq_init>> host_ptimer_irq = info->physical_irq;
++ */
+ static unsigned int host_ptimer_irq;
+ static u32 host_vtimer_irq_flags;
+ static u32 host_ptimer_irq_flags;
+ 
+ static DEFINE_STATIC_KEY_FALSE(has_gic_active_state);
+ 
++/*
++ * 在以下使用default_ppi[]:
++ *   - arch/arm64/kvm/arch_timer.c|1034| <<kvm_timer_init_vm>> kvm->arch.timer_data.ppi[i] = default_ppi[i];
++ */
+ static const u8 default_ppi[] = {
+ 	[TIMER_PTIMER]  = 30,
+ 	[TIMER_VTIMER]  = 27,
+@@ -63,6 +75,13 @@ static int nr_timers(struct kvm_vcpu *vcpu)
+ 	return NR_KVM_TIMERS;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/arch_timer.c|283| <<kvm_timer_irq_can_fire>> ((timer_get_ctl(timer_ctx) &
++ *   - arch/arm64/kvm/arch_timer.c|626| <<timer_restore_state>> write_sysreg_el0(timer_get_ctl(ctx), SYS_CNTV_CTL);
++ *   - arch/arm64/kvm/arch_timer.c|636| <<timer_restore_state>> write_sysreg_el0(timer_get_ctl(ctx), SYS_CNTP_CTL);
++ *   - arch/arm64/kvm/arch_timer.c|1102| <<read_timer_ctl>> u32 ctl = timer_get_ctl(timer);
++ */
+ u32 timer_get_ctl(struct arch_timer_context *ctxt)
+ {
+ 	struct kvm_vcpu *vcpu = ctxt->vcpu;
+@@ -82,6 +101,15 @@ u32 timer_get_ctl(struct arch_timer_context *ctxt)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/arch_timer.c|276| <<kvm_timer_compute_delta>> return kvm_counter_compute_delta(timer_ctx, timer_get_cval(timer_ctx));
++ *   - arch/arm64/kvm/arch_timer.c|417| <<kvm_timer_should_fire>> cval = timer_get_cval(timer_ctx);
++ *   - arch/arm64/kvm/arch_timer.c|624| <<timer_restore_state>> write_sysreg_el0(timer_get_cval(ctx), SYS_CNTV_CVAL);
++ *   - arch/arm64/kvm/arch_timer.c|630| <<timer_restore_state>> cval = timer_get_cval(ctx);
++ *   - arch/arm64/kvm/arch_timer.c|1143| <<kvm_arm_timer_read>> val = timer_get_cval(timer) - kvm_phys_timer_read() + timer_get_offset(timer);
++ *   - arch/arm64/kvm/arch_timer.c|1152| <<kvm_arm_timer_read>> val = timer_get_cval(timer);
++ */
+ u64 timer_get_cval(struct arch_timer_context *ctxt)
+ {
+ 	struct kvm_vcpu *vcpu = ctxt->vcpu;
+@@ -101,6 +129,18 @@ u64 timer_get_cval(struct arch_timer_context *ctxt)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/arch_timer.c|259| <<kvm_counter_compute_delta>> u64 now = kvm_phys_timer_read() - timer_get_offset(timer_ctx);
++ *   - arch/arm64/kvm/arch_timer.c|418| <<kvm_timer_should_fire>> now = kvm_phys_timer_read() - timer_get_offset(timer_ctx);
++ *   - arch/arm64/kvm/arch_timer.c|546| <<timer_save_state>> cval -= timer_get_offset(ctx);
++ *   - arch/arm64/kvm/arch_timer.c|623| <<timer_restore_state>> set_cntvoff(timer_get_offset(ctx));
++ *   - arch/arm64/kvm/arch_timer.c|631| <<timer_restore_state>> offset = timer_get_offset(ctx);
++ *   - arch/arm64/kvm/arch_timer.c|794| <<timer_set_traps>> if (!has_cntpoff() && timer_get_offset(map->direct_ptimer))
++ *   - arch/arm64/kvm/arch_timer.c|1143| <<kvm_arm_timer_read>> val = timer_get_cval(timer) - kvm_phys_timer_read() + timer_get_offset(timer);
++ *   - arch/arm64/kvm/arch_timer.c|1156| <<kvm_arm_timer_read>> val = kvm_phys_timer_read() - timer_get_offset(timer);
++ *   - arch/arm64/kvm/arch_timer.c|1202| <<kvm_arm_timer_write>> timer_set_cval(timer, kvm_phys_timer_read() - timer_get_offset(timer) + (s32)val);
++ */
+ static u64 timer_get_offset(struct arch_timer_context *ctxt)
+ {
+ 	u64 offset = 0;
+@@ -116,6 +156,13 @@ static u64 timer_get_offset(struct arch_timer_context *ctxt)
+ 	return offset;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/arch_timer.c|651| <<timer_save_state>> timer_set_ctl(ctx, read_sysreg_el0(SYS_CNTV_CTL));
++ *   - arch/arm64/kvm/arch_timer.c|677| <<timer_save_state>> timer_set_ctl(ctx, read_sysreg_el0(SYS_CNTP_CTL));
++ *   - arch/arm64/kvm/arch_timer.c|1114| <<kvm_timer_vcpu_reset>> timer_set_ctl(vcpu_get_timer(vcpu, i), 0);
++ *   - arch/arm64/kvm/arch_timer.c|1399| <<kvm_arm_timer_write>> timer_set_ctl(timer, val & ~ARCH_TIMER_CTRL_IT_STAT);
++ */
+ static void timer_set_ctl(struct arch_timer_context *ctxt, u32 ctl)
+ {
+ 	struct kvm_vcpu *vcpu = ctxt->vcpu;
+@@ -160,6 +207,13 @@ static void timer_set_cval(struct arch_timer_context *ctxt, u64 cval)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/arch_timer.c|1023| <<kvm_timer_vcpu_init>> timer_set_offset(vcpu_vtimer(vcpu), kvm_phys_timer_read());
++ *   - arch/arm64/kvm/arch_timer.c|1024| <<kvm_timer_vcpu_init>> timer_set_offset(vcpu_ptimer(vcpu), 0);
++ *   - arch/arm64/kvm/arch_timer.c|1064| <<kvm_arm_timer_set_reg>> timer_set_offset(timer, kvm_phys_timer_read() - value);
++ *   - arch/arm64/kvm/arch_timer.c|1079| <<kvm_arm_timer_set_reg>> timer_set_offset(timer, kvm_phys_timer_read() - value);
++ */
+ static void timer_set_offset(struct arch_timer_context *ctxt, u64 offset)
+ {
+ 	if (!ctxt->offset.vm_offset) {
+@@ -167,14 +221,48 @@ static void timer_set_offset(struct arch_timer_context *ctxt, u64 offset)
+ 		return;
+ 	}
+ 
++	/*
++	 * struct arch_timer_context *ctxt:
++	 * -> struct arch_timer_offset offset;
++	 *    -> u64     *vm_offset;
++	 *    -> u64     *vcpu_offset;
++	 */
+ 	WRITE_ONCE(*ctxt->offset.vm_offset, offset);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/arch_timer.c|259| <<kvm_counter_compute_delta>> u64 now = kvm_phys_timer_read() - timer_get_offset(timer_ctx);
++ *   - arch/arm64/kvm/arch_timer.c|418| <<kvm_timer_should_fire>> now = kvm_phys_timer_read() - timer_get_offset(timer_ctx);
++ *   - arch/arm64/kvm/arch_timer.c|1023| <<kvm_timer_vcpu_init>> timer_set_offset(vcpu_vtimer(vcpu), kvm_phys_timer_read());
++ *   - arch/arm64/kvm/arch_timer.c|1064| <<kvm_arm_timer_set_reg>> timer_set_offset(timer, kvm_phys_timer_read() - value);
++ *   - arch/arm64/kvm/arch_timer.c|1079| <<kvm_arm_timer_set_reg>> timer_set_offset(timer, kvm_phys_timer_read() - value);
++ *   - arch/arm64/kvm/arch_timer.c|1143| <<kvm_arm_timer_read>> val = timer_get_cval(timer) - kvm_phys_timer_read() + timer_get_offset(timer);
++ *   - arch/arm64/kvm/arch_timer.c|1156| <<kvm_arm_timer_read>> val = kvm_phys_timer_read() - timer_get_offset(timer);
++ *   - arch/arm64/kvm/arch_timer.c|1202| <<kvm_arm_timer_write>> timer_set_cval(timer, kvm_phys_timer_read() - timer_get_offset(timer) + (s32)val);
++ */
+ u64 kvm_phys_timer_read(void)
+ {
++	/*
++	 * static struct timecounter *timecounter;
++	 * -> const struct cyclecounter *cc;
++	 */
+ 	return timecounter->cc->read(timecounter->cc);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/arch_timer.c|302| <<kvm_arch_timer_handler>> get_timer_map(vcpu, &map);
++ *   - arch/arm64/kvm/arch_timer.c|667| <<kvm_timer_blocking>> get_timer_map(vcpu, &map);
++ *   - arch/arm64/kvm/arch_timer.c|936| <<kvm_timer_vcpu_load>> get_timer_map(vcpu, &map);
++ *   - arch/arm64/kvm/arch_timer.c|987| <<kvm_timer_vcpu_put>> get_timer_map(vcpu, &map);
++ *   - arch/arm64/kvm/arch_timer.c|1045| <<kvm_timer_vcpu_reset>> get_timer_map(vcpu, &map);
++ *   - arch/arm64/kvm/arch_timer.c|1298| <<kvm_arm_timer_read_sysreg>> get_timer_map(vcpu, &map);
++ *   - arch/arm64/kvm/arch_timer.c|1350| <<kvm_arm_timer_write_sysreg>> get_timer_map(vcpu, &map);
++ *   - arch/arm64/kvm/arch_timer.c|1670| <<kvm_timer_enable>> get_timer_map(vcpu, &map);
++ *   - arch/arm64/kvm/hyp/vhe/switch.c|54| <<__activate_traps>> get_timer_map(vcpu, &map);
++ *   - arch/arm64/kvm/hyp/vhe/switch.c|124| <<__deactivate_traps>> get_timer_map(vcpu, &map);
++ */
+ void get_timer_map(struct kvm_vcpu *vcpu, struct timer_map *map)
+ {
+ 	if (vcpu_has_nv(vcpu)) {
+@@ -190,7 +278,13 @@ void get_timer_map(struct kvm_vcpu *vcpu, struct timer_map *map)
+ 			map->emul_ptimer = vcpu_hptimer(vcpu);
+ 		}
+ 	} else if (has_vhe()) {
++		/*
++		 * (&(v)->arch.timer_cpu.timers[TIMER_VTIMER])
++		 */
+ 		map->direct_vtimer = vcpu_vtimer(vcpu);
++		/*
++		 * (&(v)->arch.timer_cpu.timers[TIMER_PTIMER])
++		 */
+ 		map->direct_ptimer = vcpu_ptimer(vcpu);
+ 		map->emul_vtimer = NULL;
+ 		map->emul_ptimer = NULL;
+@@ -210,6 +304,11 @@ static inline bool userspace_irqchip(struct kvm *kvm)
+ 		unlikely(!irqchip_in_kernel(kvm));
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/arch_timer.c|574| <<timer_emulate>> soft_timer_start(&ctx->hrtimer, kvm_timer_compute_delta(ctx));
++ *   - arch/arm64/kvm/arch_timer.c|684| <<kvm_timer_blocking>> soft_timer_start(&timer->bg_timer, kvm_timer_earliest_exp(vcpu));
++ */
+ static void soft_timer_start(struct hrtimer *hrt, u64 ns)
+ {
+ 	hrtimer_start(hrt, ktime_add_ns(ktime_get(), ns),
+@@ -221,6 +320,11 @@ static void soft_timer_cancel(struct hrtimer *hrt)
+ 	hrtimer_cancel(hrt);
+ }
+ 
++/*
++ * 在以下使用kvm_arch_timer_handler():
++ *   - arch/arm64/kvm/arch_timer.c|1389| <<kvm_timer_hyp_init>> err = request_percpu_irq(host_vtimer_irq, kvm_arch_timer_handler, "kvm guest vtimer", kvm_get_running_vcpus());
++ *   - arch/arm64/kvm/arch_timer.c|1413| <<kvm_timer_hyp_init>> err = request_percpu_irq(host_ptimer_irq, kvm_arch_timer_handler, "kvm guest ptimer", kvm_get_running_vcpus());
++ */
+ static irqreturn_t kvm_arch_timer_handler(int irq, void *dev_id)
+ {
+ 	struct kvm_vcpu *vcpu = *(struct kvm_vcpu **)dev_id;
+@@ -328,6 +432,10 @@ static u64 kvm_timer_earliest_exp(struct kvm_vcpu *vcpu)
+ 	return min_delta;
+ }
+ 
++/*
++ * bg_timer的到期执行函数,当需要调用kvm_vcpu_block让vcpu睡眠时,
++ * 需要先启动bg_timer,bg_timer到期时再将vcpu唤醒;
++ */
+ static enum hrtimer_restart kvm_bg_timer_expire(struct hrtimer *hrt)
+ {
+ 	struct arch_timer_cpu *timer;
+@@ -352,6 +460,15 @@ static enum hrtimer_restart kvm_bg_timer_expire(struct hrtimer *hrt)
+ 	return HRTIMER_NORESTART;
+ }
+ 
++/*
++ * 虚拟counter的中断被路由到el2层. 当VM执行时,时钟到期,虚拟counter的中断产生.
++ * 这时VM exit,由KVM处理该中断,执行中断的inject(把中断路由给vGIC).
++ * 然后再次进入guest时,就有中断了.
++ *
++ * 还有一种情况: guest side退出前设置一个timer,这时KVM需要维护这个timer,以在
++ * timer到期的时候(还在host mode)唤醒guest并inject irq.
++ * KVM注册了一个hrtimer来处理这种情况.
++ */
+ static enum hrtimer_restart kvm_hrtimer_expire(struct hrtimer *hrt)
+ {
+ 	struct arch_timer_context *ctx;
+@@ -443,6 +560,16 @@ void kvm_timer_update_run(struct kvm_vcpu *vcpu)
+ 		regs->device_irq_level |= KVM_ARM_DEV_EL1_PTIMER;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/arch_timer.c|247| <<kvm_arch_timer_handler>> kvm_timer_update_irq(vcpu, true, ctx);
++ *   - arch/arm64/kvm/arch_timer.c|377| <<kvm_hrtimer_expire>> kvm_timer_update_irq(vcpu, true, ctx);
++ *   - arch/arm64/kvm/arch_timer.c|472| <<timer_emulate>> kvm_timer_update_irq(ctx->vcpu, should_fire, ctx);
++ *   - arch/arm64/kvm/arch_timer.c|667| <<kvm_timer_vcpu_load_gic>> kvm_timer_update_irq(ctx->vcpu, kvm_timer_should_fire(ctx), ctx);
++ *   - arch/arm64/kvm/arch_timer.c|687| <<kvm_timer_vcpu_load_nogic>> kvm_timer_update_irq(vcpu, kvm_timer_should_fire(vtimer), vtimer);
++ *   - arch/arm64/kvm/arch_timer.c|920| <<unmask_vtimer_irq_user>> kvm_timer_update_irq(vcpu, false, vtimer);
++ *   - arch/arm64/kvm/arch_timer.c|969| <<kvm_timer_vcpu_reset>> kvm_timer_update_irq(vcpu, false,
++ */
+ static void kvm_timer_update_irq(struct kvm_vcpu *vcpu, bool new_level,
+ 				 struct arch_timer_context *timer_ctx)
+ {
+@@ -453,6 +580,14 @@ static void kvm_timer_update_irq(struct kvm_vcpu *vcpu, bool new_level,
+ 				   timer_ctx->irq.level);
+ 
+ 	if (!userspace_irqchip(vcpu->kvm)) {
++		/*
++		 * called by:
++		 *   - arch/arm64/kvm/arch_timer.c|456| <<kvm_timer_update_irq>> ret = kvm_vgic_inject_irq(vcpu->kvm, vcpu->vcpu_id,
++		 *   - arch/arm64/kvm/arm.c|1195| <<kvm_vm_ioctl_irq_line>> return kvm_vgic_inject_irq(kvm, vcpu->vcpu_id, irq_num, level, NULL);
++		 *   - arch/arm64/kvm/arm.c|1203| <<kvm_vm_ioctl_irq_line>> return kvm_vgic_inject_irq(kvm, 0, irq_num, level, NULL);
++		 *   - arch/arm64/kvm/pmu-emul.c|351| <<kvm_pmu_update_state>> int ret = kvm_vgic_inject_irq(vcpu->kvm, vcpu->vcpu_id,
++		 *   - arch/arm64/kvm/vgic/vgic-irqfd.c|26| <<vgic_irqfd_set_irq>> return kvm_vgic_inject_irq(kvm, 0, spi_id, level, NULL);
++		 */
+ 		ret = kvm_vgic_inject_irq(vcpu->kvm, vcpu->vcpu_id,
+ 					  timer_irq(timer_ctx),
+ 					  timer_ctx->irq.level,
+@@ -461,6 +596,12 @@ static void kvm_timer_update_irq(struct kvm_vcpu *vcpu, bool new_level,
+ 	}
+ }
+ 
++/*
++ * 似乎一般的硬件虚拟化是不用的:
++ *   - arch/arm64/kvm/arch_timer.c|955| <<kvm_timer_vcpu_load>> timer_emulate(map.emul_vtimer);
++ *   - arch/arm64/kvm/arch_timer.c|957| <<kvm_timer_vcpu_load>> timer_emulate(map.emul_ptimer);
++ *   - arch/arm64/kvm/arch_timer.c|1355| <<kvm_arm_timer_write_sysreg>> timer_emulate(timer);
++ */
+ /* Only called for a fully emulated timer */
+ static void timer_emulate(struct arch_timer_context *ctx)
+ {
+@@ -601,6 +742,13 @@ static void kvm_timer_unblocking(struct kvm_vcpu *vcpu)
+ 	soft_timer_cancel(&timer->bg_timer);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/arch_timer.c|850| <<kvm_timer_vcpu_load>> timer_restore_state(map.direct_vtimer);
++ *   - arch/arm64/kvm/arch_timer.c|852| <<kvm_timer_vcpu_load>> timer_restore_state(map.direct_ptimer);
++ *   - arch/arm64/kvm/arch_timer.c|1189| <<kvm_arm_timer_read_sysreg>> timer_restore_state(timer);
++ *   - arch/arm64/kvm/arch_timer.c|1240| <<kvm_arm_timer_write_sysreg>> timer_restore_state(timer);
++ */
+ static void timer_restore_state(struct arch_timer_context *ctx)
+ {
+ 	struct arch_timer_cpu *timer = vcpu_timer(ctx->vcpu);
+@@ -762,6 +910,10 @@ static void kvm_timer_vcpu_load_nested_switch(struct kvm_vcpu *vcpu,
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/arch_timer.c|1003| <<kvm_timer_vcpu_load>> timer_set_traps(vcpu, &map);
++ */
+ static void timer_set_traps(struct kvm_vcpu *vcpu, struct timer_map *map)
+ {
+ 	bool tpt, tpc;
+@@ -817,13 +969,62 @@ static void timer_set_traps(struct kvm_vcpu *vcpu, struct timer_map *map)
+ 	set = 0;
+ 	clr = 0;
+ 
++	/*
++	 * - EL0PCTEN, bit [0]
++	 *
++	 * When HCR_EL2.TGE is 0, this control does not cause any instructions to be
++	 * trapped.
++	 * When HCR_EL2.TGE is 1, traps EL0 accesses to the frequency register and
++	 * physical counter register to EL2, e.g., CNTPCT_EL0.
++	 *
++	 * - EL0VCTEN, bit [1]
++	 *
++	 * When HCR_EL2.TGE is 0, this control does not cause any instructions to be
++	 * trapped.
++	 * When HCR_EL2.TGE is 1, traps EL0 accesses to the frequency register and virtual
++	 * counter register to EL2, e.g., CNTVCT_EL0.
++	 */
+ 	assign_clear_set_bit(tpt, CNTHCTL_EL1PCEN << 10, set, clr);
+ 	assign_clear_set_bit(tpc, CNTHCTL_EL1PCTEN << 10, set, clr);
+ 
++	/*
++	 * 在以下使用cnthctl_el2:
++	 *   - arch/arm64/include/asm/el2_setup.h|56| <<global>> msr cnthctl_el2, x0
++	 *   - arch/arm64/kvm/arch_timer.c|1007| <<timer_set_traps>> sysreg_clear_set(cnthctl_el2, clr, set);
++	 *   - arch/arm64/kvm/arch_timer.c|1817| <<kvm_timer_init_vhe>> sysreg_clear_set(cnthctl_el2, 0, CNTHCTL_ECV);
++	 *   - arch/arm64/kvm/hyp/nvhe/timer-sr.c|31| <<__timer_disable_traps>> val = read_sysreg(cnthctl_el2);
++	 *   - arch/arm64/kvm/hyp/nvhe/timer-sr.c|33| <<__timer_disable_traps>> write_sysreg(val, cnthctl_el2);
++	 *   - arch/arm64/kvm/hyp/nvhe/timer-sr.c|61| <<__timer_enable_traps>> sysreg_clear_set(cnthctl_el2, clr, set);
++	 *
++	 * - EL1NVVCT, bit [16]
++	 * Traps EL1 accesses to the specified EL1 virtual timer registers
++	 * using the EL02 descriptors to EL2, when EL2 is enabled for the
++	 * current Security state.
++	 *
++	 * - EL1NVPCT, bit [15]
++	 * Traps EL1 accesses to the specified EL1 physical timer registers
++	 * using the EL02 descriptors to EL2, when EL2 is enabled for the
++	 * current Security state.
++	 *
++	 *
++	 * - EL1TVT: 如果是0就不会trap任何
++	 *
++	 * - EL1PTEN: 如果是1或者HCR_EL2.TGE=1, 就不会trap任何
++	 *            如果是0(没配置), 就会trap一些寄存器, 比如CNTP_CTL_EL0
++	 */
++
++	/*
++	 * Modify bits in a sysreg. Bits in the clear mask are zeroed, then bits in the
++	 * set mask are set. Other bits are left as-is.
++	 */
+ 	/* This only happens on VHE, so use the CNTHCTL_EL2 accessor. */
+ 	sysreg_clear_set(cnthctl_el2, clr, set);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/arm.c|465| <<kvm_arch_vcpu_load>> kvm_timer_vcpu_load(vcpu);
++ */
+ void kvm_timer_vcpu_load(struct kvm_vcpu *vcpu)
+ {
+ 	struct arch_timer_cpu *timer = vcpu_timer(vcpu);
+@@ -1091,6 +1292,10 @@ int kvm_arm_timer_set_reg(struct kvm_vcpu *vcpu, u64 regid, u64 value)
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/arch_timer.c|1308| <<kvm_arm_timer_read>> val = read_timer_ctl(timer);
++ */
+ static u64 read_timer_ctl(struct arch_timer_context *timer)
+ {
+ 	/*
+@@ -1132,6 +1337,25 @@ u64 kvm_arm_timer_get_reg(struct kvm_vcpu *vcpu, u64 regid)
+ 	return (u64)-1;
+ }
+ 
++/*
++ * enum kvm_arch_timer_regs {
++ *     TIMER_REG_CNT,
++ *     TIMER_REG_CVAL,
++ *     TIMER_REG_TVAL,
++ *     TIMER_REG_CTL, 
++ *     TIMER_REG_VOFF,
++ * };
++ *
++ * called by:
++ *   - arch/arm64/kvm/arch_timer.c|1114| <<kvm_arm_timer_get_reg(KVM_REG_ARM_TIMER_CTL)>> return kvm_arm_timer_read(vcpu, vcpu_vtimer(vcpu), TIMER_REG_CTL);
++ *   - arch/arm64/kvm/arch_timer.c|1117| <<kvm_arm_timer_get_reg(KVM_REG_ARM_TIMER_CNT)>> return kvm_arm_timer_read(vcpu, vcpu_vtimer(vcpu), TIMER_REG_CNT);
++ *   - arch/arm64/kvm/arch_timer.c|1120| <<kvm_arm_timer_get_reg(KVM_REG_ARM_TIMER_CVAL)>> return kvm_arm_timer_read(vcpu, vcpu_vtimer(vcpu), TIMER_REG_CVAL);
++ *   - arch/arm64/kvm/arch_timer.c|1123| <<kvm_arm_timer_get_reg(KVM_REG_ARM_PTIMER_CTL)>> return kvm_arm_timer_read(vcpu, vcpu_ptimer(vcpu), TIMER_REG_CTL);
++ *   - arch/arm64/kvm/arch_timer.c|1126| <<kvm_arm_timer_get_reg(KVM_REG_ARM_PTIMER_CNT)>> return kvm_arm_timer_read(vcpu, vcpu_ptimer(vcpu), TIMER_REG_CNT);
++ *   - arch/arm64/kvm/arch_timer.c|1129| <<kvm_arm_timer_get_reg(KVM_REG_ARM_PTIMER_CVAL)>> return kvm_arm_timer_read(vcpu, vcpu_ptimer(vcpu), TIMER_REG_CVAL);
++ *   - arch/arm64/kvm/arch_timer.c|1182| <<kvm_arm_timer_read_sysreg>> return kvm_arm_timer_read(vcpu, timer, treg);
++ *   - arch/arm64/kvm/arch_timer.c|1187| <<kvm_arm_timer_read_sysreg>> val = kvm_arm_timer_read(vcpu, timer, treg);
++ */
+ static u64 kvm_arm_timer_read(struct kvm_vcpu *vcpu,
+ 			      struct arch_timer_context *timer,
+ 			      enum kvm_arch_timer_regs treg)
+@@ -1192,6 +1416,15 @@ u64 kvm_arm_timer_read_sysreg(struct kvm_vcpu *vcpu,
+ 	return val;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/arch_timer.c|1199| <<kvm_arm_timer_set_reg>> kvm_arm_timer_write(vcpu, timer, TIMER_REG_CTL, value);
++ *   - arch/arm64/kvm/arch_timer.c|1210| <<kvm_arm_timer_set_reg>> kvm_arm_timer_write(vcpu, timer, TIMER_REG_CVAL, value);
++ *   - arch/arm64/kvm/arch_timer.c|1214| <<kvm_arm_timer_set_reg>> kvm_arm_timer_write(vcpu, timer, TIMER_REG_CTL, value);
++ *   - arch/arm64/kvm/arch_timer.c|1225| <<kvm_arm_timer_set_reg>> kvm_arm_timer_write(vcpu, timer, TIMER_REG_CVAL, value);
++ *   - arch/arm64/kvm/arch_timer.c|1394| <<kvm_arm_timer_write_sysreg>> kvm_arm_timer_write(vcpu, timer, treg, val);
++ *   - arch/arm64/kvm/arch_timer.c|1399| <<kvm_arm_timer_write_sysreg>> kvm_arm_timer_write(vcpu, timer, treg, val);
++ */
+ static void kvm_arm_timer_write(struct kvm_vcpu *vcpu,
+ 				struct arch_timer_context *timer,
+ 				enum kvm_arch_timer_regs treg,
+@@ -1219,6 +1452,10 @@ static void kvm_arm_timer_write(struct kvm_vcpu *vcpu,
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/sys_regs.c|1204| <<access_arch_timer>> kvm_arm_timer_write_sysreg(vcpu, tmr, treg, p->regval);
++ */
+ void kvm_arm_timer_write_sysreg(struct kvm_vcpu *vcpu,
+ 				enum kvm_arch_timers tmr,
+ 				enum kvm_arch_timer_regs treg,
+@@ -1319,6 +1556,10 @@ static void kvm_irq_fixup_flags(unsigned int virq, u32 *flags)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/arch_timer.c|1383| <<kvm_timer_hyp_init>> err = kvm_irq_init(info);
++ */
+ static int kvm_irq_init(struct arch_timer_kvm_info *info)
+ {
+ 	struct irq_domain *domain = NULL;
+@@ -1367,12 +1608,27 @@ static int kvm_irq_init(struct arch_timer_kvm_info *info)
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/arm.c|2059| <<init_subsystems>> err = kvm_timer_hyp_init(vgic_present);
++ */
+ int __init kvm_timer_hyp_init(bool has_gic)
+ {
+ 	struct arch_timer_kvm_info *info;
+ 	int err;
+ 
++	/*
++	 * struct arch_timer_kvm_info {
++	 *     struct timecounter timecounter;
++	 *     int virtual_irq;
++	 *     int physical_irq;
++	 * };
++	 */
+ 	info = arch_timer_get_kvm_info();
++	/*
++	 * 这个文件的静态变量
++	 * static struct timecounter *timecounter;
++	 */
+ 	timecounter = &info->timecounter;
+ 
+ 	if (!timecounter->cc) {
+@@ -1445,6 +1701,10 @@ int __init kvm_timer_hyp_init(bool has_gic)
+ 	return err;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/arm.c|416| <<kvm_arch_vcpu_destroy>> kvm_timer_vcpu_terminate(vcpu);
++ */
+ void kvm_timer_vcpu_terminate(struct kvm_vcpu *vcpu)
+ {
+ 	struct arch_timer_cpu *timer = vcpu_timer(vcpu);
+@@ -1506,6 +1766,10 @@ static bool kvm_arch_timer_get_input_level(int vintid)
+ 	return false;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/arm.c|632| <<kvm_arch_vcpu_run_pid_change>> ret = kvm_timer_enable(vcpu);
++ */
+ int kvm_timer_enable(struct kvm_vcpu *vcpu)
+ {
+ 	struct arch_timer_cpu *timer = vcpu_timer(vcpu);
+@@ -1552,9 +1816,26 @@ int kvm_timer_enable(struct kvm_vcpu *vcpu)
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/arm.c|1869| <<cpu_hyp_init_features>> kvm_timer_init_vhe();
++ */
+ /* If we have CNTPOFF, permanently set ECV to enable it */
+ void kvm_timer_init_vhe(void)
+ {
++	/*
++	 * 在以下使用cnthctl_el2:
++	 *   - arch/arm64/include/asm/el2_setup.h|56| <<global>> msr cnthctl_el2, x0
++	 *   - arch/arm64/kvm/arch_timer.c|1007| <<timer_set_traps>> sysreg_clear_set(cnthctl_el2, clr, set);
++	 *   - arch/arm64/kvm/arch_timer.c|1817| <<kvm_timer_init_vhe>> sysreg_clear_set(cnthctl_el2, 0, CNTHCTL_ECV);
++	 *   - arch/arm64/kvm/hyp/nvhe/timer-sr.c|31| <<__timer_disable_traps>> val = read_sysreg(cnthctl_el2);
++	 *   - arch/arm64/kvm/hyp/nvhe/timer-sr.c|33| <<__timer_disable_traps>> write_sysreg(val, cnthctl_el2);
++	 *   - arch/arm64/kvm/hyp/nvhe/timer-sr.c|61| <<__timer_enable_traps>> sysreg_clear_set(cnthctl_el2, clr, set);
++	 */
++	/*
++	 * Modify bits in a sysreg. Bits in the clear mask are zeroed, then bits in the
++	 * set mask are set. Other bits are left as-is.
++	 */
+ 	if (cpus_have_final_cap(ARM64_HAS_ECV_CNTPOFF))
+ 		sysreg_clear_set(cnthctl_el2, 0, CNTHCTL_ECV);
+ }
+@@ -1611,6 +1892,10 @@ int kvm_arm_timer_set_attr(struct kvm_vcpu *vcpu, struct kvm_device_attr *attr)
+ 	return ret;
+ }
+ 
++/*
++ * 处理KVM_ARM_SET_COUNTER_OFFSET:
++ *   - arch/arm64/kvm/arm.c|1634| <<kvm_arch_vm_ioctl>> return kvm_vm_ioctl_set_counter_offset(kvm, &offset);
++ */
+ int kvm_arm_timer_get_attr(struct kvm_vcpu *vcpu, struct kvm_device_attr *attr)
+ {
+ 	int __user *uaddr = (int __user *)(long)attr->addr;
+diff --git a/arch/arm64/kvm/arm.c b/arch/arm64/kvm/arm.c
+index 4866b3f7b..2dd62aa5b 100644
+--- a/arch/arm64/kvm/arm.c
++++ b/arch/arm64/kvm/arm.c
+@@ -133,6 +133,10 @@ static int kvm_arm_default_max_vcpus(void)
+  * kvm_arch_init_vm - initializes a VM data structure
+  * @kvm:	pointer to the KVM struct
+  */
++/*
++ * called by:
++ *   - virt/kvm/kvm_main.c|1222| <<kvm_create_vm>> r = kvm_arch_init_vm(kvm, type);
++ */
+ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
+ {
+ 	int ret;
+@@ -161,6 +165,10 @@ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
+ 	}
+ 	cpumask_copy(kvm->arch.supported_cpus, cpu_possible_mask);
+ 
++	/*
++	 * called by:
++	 *   - arch/arm64/kvm/arm.c|164| <<kvm_arch_init_vm>> ret = kvm_init_stage2_mmu(kvm, &kvm->arch.mmu, type);
++	 */
+ 	ret = kvm_init_stage2_mmu(kvm, &kvm->arch.mmu, type);
+ 	if (ret)
+ 		goto err_free_cpumask;
+@@ -421,6 +429,14 @@ void kvm_arch_vcpu_unblocking(struct kvm_vcpu *vcpu)
+ 
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/emulate-nested.c|1947| <<kvm_emulate_nested_eret>> kvm_arch_vcpu_load(vcpu, smp_processor_id());
++ *   - arch/arm64/kvm/emulate-nested.c|2028| <<kvm_inject_nested>> kvm_arch_vcpu_load(vcpu, smp_processor_id());
++ *   - arch/arm64/kvm/reset.c|300| <<kvm_reset_vcpu>> kvm_arch_vcpu_load(vcpu, smp_processor_id());
++ *   - virt/kvm/kvm_main.c|216| <<vcpu_load>> kvm_arch_vcpu_load(vcpu, cpu);
++ *   - virt/kvm/kvm_main.c|5963| <<kvm_sched_in>> kvm_arch_vcpu_load(vcpu, cpu);
++ */
+ void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+ {
+ 	struct kvm_s2_mmu *mmu;
+diff --git a/arch/arm64/kvm/hyp/include/hyp/switch.h b/arch/arm64/kvm/hyp/include/hyp/switch.h
+index 9cfe6bd1d..1d4d7bce8 100644
+--- a/arch/arm64/kvm/hyp/include/hyp/switch.h
++++ b/arch/arm64/kvm/hyp/include/hyp/switch.h
+@@ -154,6 +154,10 @@ static inline void __activate_traps_hfgxtr(struct kvm_vcpu *vcpu)
+ 	write_sysreg_s(w_val, SYS_HDFGWTR_EL2);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/include/hyp/switch.h|233| <<__deactivate_traps_common>> __deactivate_traps_hfgxtr(vcpu);
++ */
+ static inline void __deactivate_traps_hfgxtr(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_cpu_context *hctxt = &this_cpu_ptr(&kvm_host_data)->host_ctxt;
+@@ -214,6 +218,11 @@ static inline void __activate_traps_common(struct kvm_vcpu *vcpu)
+ 	__activate_traps_hfgxtr(vcpu);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/nvhe/switch.c|107| <<__deactivate_traps>> __deactivate_traps_common(vcpu);
++ *   - arch/arm64/kvm/hyp/vhe/switch.c|179| <<deactivate_traps_vhe_put>> __deactivate_traps_common(vcpu);
++ */
+ static inline void __deactivate_traps_common(struct kvm_vcpu *vcpu)
+ {
+ 	write_sysreg(vcpu->arch.mdcr_el2_host, mdcr_el2);
+@@ -233,8 +242,20 @@ static inline void __deactivate_traps_common(struct kvm_vcpu *vcpu)
+ 	__deactivate_traps_hfgxtr(vcpu);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/nvhe/switch.c|43| <<__activate_traps>> ___activate_traps(vcpu);
++ *   - arch/arm64/kvm/hyp/vhe/switch.c|40| <<__activate_traps>> ___activate_traps(vcpu);
++ */
+ static inline void ___activate_traps(struct kvm_vcpu *vcpu)
+ {
++	/*
++	 * struct kvm_vcpu *vcpu:
++	 * -> struct kvm_vcpu_arch arch;
++	 *    -> u64 hcr_el2;
++	 *    -> u64 mdcr_el2;
++	 *    -> u64 cptr_el2;
++	 */
+ 	u64 hcr = vcpu->arch.hcr_el2;
+ 
+ 	if (cpus_have_final_cap(ARM64_WORKAROUND_CAVIUM_TX2_219_TVM))
+@@ -522,6 +543,17 @@ static bool handle_ampere1_tcr(struct kvm_vcpu *vcpu)
+ 	return true;
+ }
+ 
++/*
++ * 处理ESR_ELx_EC_SYS64.
++ * EC == 0b011000
++ * When AArch64 is supported: Trapped MSR, MRS or System instruction execution
++ * in AArch64 state, that is not reported using EC 0b000000, 0b000001 or
++ * 0b000111.
++ * This includes all instructions that cause exceptions that are part of the
++ * encoding space defined in System instruction class encoding overview on page
++ * C5-731, except for those exceptions reported using EC values 0b000000,
++ * 0b000001, or 0b000111.
++ */
+ static bool kvm_hyp_handle_sysreg(struct kvm_vcpu *vcpu, u64 *exit_code)
+ {
+ 	if (cpus_have_final_cap(ARM64_WORKAROUND_CAVIUM_TX2_219_TVM) &&
+diff --git a/arch/arm64/kvm/hyp/include/hyp/sysreg-sr.h b/arch/arm64/kvm/hyp/include/hyp/sysreg-sr.h
+index bb6b571ec..731bc676e 100644
+--- a/arch/arm64/kvm/hyp/include/hyp/sysreg-sr.h
++++ b/arch/arm64/kvm/hyp/include/hyp/sysreg-sr.h
+@@ -37,6 +37,11 @@ static inline bool ctxt_has_mte(struct kvm_cpu_context *ctxt)
+ 	return kvm_has_mte(kern_hyp_va(vcpu->kvm));
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/nvhe/sysreg-sr.c|23| <<__sysreg_save_state_nvhe>> __sysreg_save_el1_state(ctxt);
++ *   - arch/arm64/kvm/hyp/vhe/sysreg-sr.c|118| <<kvm_vcpu_put_sysregs_vhe>> __sysreg_save_el1_state(guest_ctxt);
++ */
+ static inline void __sysreg_save_el1_state(struct kvm_cpu_context *ctxt)
+ {
+ 	ctxt_sys_reg(ctxt, SCTLR_EL1)	= read_sysreg_el1(SYS_SCTLR);
+@@ -97,6 +102,11 @@ static inline void __sysreg_restore_user_state(struct kvm_cpu_context *ctxt)
+ 	write_sysreg(ctxt_sys_reg(ctxt, TPIDRRO_EL0),	tpidrro_el0);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/nvhe/sysreg-sr.c|31| <<__sysreg_restore_state_nvhe>> __sysreg_restore_el1_state(ctxt);
++ *   - arch/arm64/kvm/hyp/vhe/sysreg-sr.c|92| <<kvm_vcpu_load_sysregs_vhe>> __sysreg_restore_el1_state(guest_ctxt);
++ */
+ static inline void __sysreg_restore_el1_state(struct kvm_cpu_context *ctxt)
+ {
+ 	write_sysreg(ctxt_sys_reg(ctxt, MPIDR_EL1),	vmpidr_el2);
+diff --git a/arch/arm64/kvm/hyp/include/nvhe/mem_protect.h b/arch/arm64/kvm/hyp/include/nvhe/mem_protect.h
+index 0972faccc..083ef237e 100644
+--- a/arch/arm64/kvm/hyp/include/nvhe/mem_protect.h
++++ b/arch/arm64/kvm/hyp/include/nvhe/mem_protect.h
+@@ -85,6 +85,13 @@ int refill_memcache(struct kvm_hyp_memcache *mc, unsigned long min_pages,
+ 
+ static __always_inline void __load_host_stage2(void)
+ {
++	/*
++	 * 在以下使用vttbr_el2:
++	 *   - arch/arm64/include/asm/el2_setup.h|113| <<global>> .macro __init_el2_stage2 msr vttbr_el2, xzr
++	 *   - arch/arm64/include/asm/kvm_mmu.h|303| <<__load_stage2>> write_sysreg(kvm_get_vttbr(mmu), vttbr_el2);
++	 *   - arch/arm64/kvm/hyp/include/nvhe/mem_protect.h|91| <<__load_host_stage2>> write_sysreg(0, vttbr_el2);
++	 *   - arch/arm64/kvm/hyp/vhe/tlb.c|69| <<__tlb_switch_to_host>> write_sysreg(0, vttbr_el2);
++	 */
+ 	if (static_branch_likely(&kvm_protected_mode_initialized))
+ 		__load_stage2(&host_mmu.arch.mmu, &host_mmu.arch);
+ 	else
+diff --git a/arch/arm64/kvm/hyp/nvhe/timer-sr.c b/arch/arm64/kvm/hyp/nvhe/timer-sr.c
+index 3aaab20ae..8236e15d1 100644
+--- a/arch/arm64/kvm/hyp/nvhe/timer-sr.c
++++ b/arch/arm64/kvm/hyp/nvhe/timer-sr.c
+@@ -27,6 +27,15 @@ void __timer_disable_traps(struct kvm_vcpu *vcpu)
+ 	if (has_hvhe())
+ 		shift = 10;
+ 
++	/*
++	 * 在以下使用cnthctl_el2:
++	 *   - arch/arm64/include/asm/el2_setup.h|56| <<global>> msr cnthctl_el2, x0
++	 *   - arch/arm64/kvm/arch_timer.c|1007| <<timer_set_traps>> sysreg_clear_set(cnthctl_el2, clr, set);
++	 *   - arch/arm64/kvm/arch_timer.c|1817| <<kvm_timer_init_vhe>> sysreg_clear_set(cnthctl_el2, 0, CNTHCTL_ECV);
++	 *   - arch/arm64/kvm/hyp/nvhe/timer-sr.c|31| <<__timer_disable_traps>> val = read_sysreg(cnthctl_el2);
++	 *   - arch/arm64/kvm/hyp/nvhe/timer-sr.c|33| <<__timer_disable_traps>> write_sysreg(val, cnthctl_el2);
++	 *   - arch/arm64/kvm/hyp/nvhe/timer-sr.c|61| <<__timer_enable_traps>> sysreg_clear_set(cnthctl_el2, clr, set);
++	 */
+ 	/* Allow physical timer/counter access for the host */
+ 	val = read_sysreg(cnthctl_el2);
+ 	val |= (CNTHCTL_EL1PCTEN | CNTHCTL_EL1PCEN) << shift;
+@@ -58,5 +67,14 @@ void __timer_enable_traps(struct kvm_vcpu *vcpu)
+ 		set <<= 10;
+ 	}
+ 
++	/*
++	 * 在以下使用cnthctl_el2:
++	 *   - arch/arm64/include/asm/el2_setup.h|56| <<global>> msr cnthctl_el2, x0
++	 *   - arch/arm64/kvm/arch_timer.c|1007| <<timer_set_traps>> sysreg_clear_set(cnthctl_el2, clr, set);
++	 *   - arch/arm64/kvm/arch_timer.c|1817| <<kvm_timer_init_vhe>> sysreg_clear_set(cnthctl_el2, 0, CNTHCTL_ECV);
++	 *   - arch/arm64/kvm/hyp/nvhe/timer-sr.c|31| <<__timer_disable_traps>> val = read_sysreg(cnthctl_el2);
++	 *   - arch/arm64/kvm/hyp/nvhe/timer-sr.c|33| <<__timer_disable_traps>> write_sysreg(val, cnthctl_el2);
++	 *   - arch/arm64/kvm/hyp/nvhe/timer-sr.c|61| <<__timer_enable_traps>> sysreg_clear_set(cnthctl_el2, clr, set);
++	 */
+ 	sysreg_clear_set(cnthctl_el2, clr, set);
+ }
+diff --git a/arch/arm64/kvm/hyp/vhe/switch.c b/arch/arm64/kvm/hyp/vhe/switch.c
+index 448b17080..8123e452e 100644
+--- a/arch/arm64/kvm/hyp/vhe/switch.c
++++ b/arch/arm64/kvm/hyp/vhe/switch.c
+@@ -31,12 +31,32 @@
+ /* VHE specific context */
+ DEFINE_PER_CPU(struct kvm_host_data, kvm_host_data);
+ DEFINE_PER_CPU(struct kvm_cpu_context, kvm_hyp_ctxt);
++/*
++ * 在以下使用percpu的kvm_hyp_vector:
++ *   - arch/arm64/include/asm/kvm_hyp.h|16| <<global>> DECLARE_PER_CPU(unsigned long , kvm_hyp_vector);
++ *   - arch/arm64/kvm/arm.c|50| <<global>> DECLARE_KVM_HYP_PER_CPU(unsigned long , kvm_hyp_vector);
++ *   - arch/arm64/kvm/hyp/nvhe/switch.c|35| <<global>> DEFINE_PER_CPU(unsigned long , kvm_hyp_vector);
++ *   - arch/arm64/kvm/hyp/vhe/switch.c|34| <<global>> DEFINE_PER_CPU(unsigned long , kvm_hyp_vector);
++ *   - arch/arm64/kvm/arm.c|1850| <<cpu_set_hyp_vector>> *this_cpu_ptr_hyp_sym(kvm_hyp_vector) = (unsigned long )vector;
++ *   - arch/arm64/kvm/hyp/nvhe/mm.c|205| <<pkvm_cpu_set_vector>> *this_cpu_ptr(&kvm_hyp_vector) = (unsigned long )vector;
++ *   - arch/arm64/kvm/hyp/nvhe/switch.c|67| <<__activate_traps>> write_sysreg(__this_cpu_read(kvm_hyp_vector), vbar_el2);
++ *   - arch/arm64/kvm/hyp/vhe/switch.c|97| <<__activate_traps>> write_sysreg(__this_cpu_read(kvm_hyp_vector), vbar_el1);
++ */
+ DEFINE_PER_CPU(unsigned long, kvm_hyp_vector);
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/vhe/switch.c|228| <<__kvm_vcpu_run_vhe>> __activate_traps(vcpu);
++ */
+ static void __activate_traps(struct kvm_vcpu *vcpu)
+ {
+ 	u64 val;
+ 
++	/*
++	 * called by:
++	 *   - arch/arm64/kvm/hyp/nvhe/switch.c|43| <<__activate_traps>> ___activate_traps(vcpu);
++	 *   - arch/arm64/kvm/hyp/vhe/switch.c|40| <<__activate_traps>> ___activate_traps(vcpu);
++	 */
+ 	___activate_traps(vcpu);
+ 
+ 	if (has_cntpoff()) {
+@@ -89,12 +109,23 @@ static void __activate_traps(struct kvm_vcpu *vcpu)
+ }
+ NOKPROBE_SYMBOL(__activate_traps);
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/vhe/switch.c|249| <<__kvm_vcpu_run_vhe>> __deactivate_traps(vcpu);
++ *   - arch/arm64/kvm/hyp/vhe/switch.c|304| <<__hyp_call_panic>> __deactivate_traps(vcpu);
++ */
+ static void __deactivate_traps(struct kvm_vcpu *vcpu)
+ {
+ 	const char *host_vectors = vectors;
+ 
+ 	___deactivate_traps(vcpu);
+ 
++	/*
++	 * 在以下使用HCR_HOST_VHE_FLAGS:
++	 *   - arch/arm64/include/asm/kvm_arm.h|103| <<global>> #define HCR_HOST_VHE_FLAGS (HCR_RW | HCR_TGE | HCR_E2H)
++	 *   - arch/arm64/kvm/hyp/vhe/switch.c|98| <<__deactivate_traps>> write_sysreg(HCR_HOST_VHE_FLAGS, hcr_el2);
++	 *   - arch/arm64/kvm/hyp/vhe/tlb.c|77| <<__tlb_switch_to_host>> write_sysreg(HCR_HOST_VHE_FLAGS, hcr_el2);
++	 */
+ 	write_sysreg(HCR_HOST_VHE_FLAGS, hcr_el2);
+ 
+ 	if (has_cntpoff()) {
+@@ -224,7 +255,15 @@ static int __kvm_vcpu_run_vhe(struct kvm_vcpu *vcpu)
+ 	 * __load_stage2 configures stage 2 translation, and
+ 	 * __activate_traps clear HCR_EL2.TGE (among other things).
+ 	 */
++	/*
++	 * 按照上面的erratum, 之前:
++	 * kvm_arch_vcpu_load()
++	 * -> kvm_vcpu_load_sysregs_vhe()
++	 */
+ 	__load_stage2(vcpu->arch.hw_mmu, vcpu->arch.hw_mmu->arch);
++	/*
++	 * 只在这里调用
++	 */
+ 	__activate_traps(vcpu);
+ 
+ 	__kvm_adjust_pc(vcpu);
+@@ -246,6 +285,11 @@ static int __kvm_vcpu_run_vhe(struct kvm_vcpu *vcpu)
+ 
+ 	sysreg_save_guest_state_vhe(guest_ctxt);
+ 
++	/*
++	 * called by:
++	 *   - arch/arm64/kvm/hyp/vhe/switch.c|249| <<__kvm_vcpu_run_vhe>> __deactivate_traps(vcpu);
++	 *   - arch/arm64/kvm/hyp/vhe/switch.c|304| <<__hyp_call_panic>> __deactivate_traps(vcpu);
++	 */
+ 	__deactivate_traps(vcpu);
+ 
+ 	sysreg_restore_host_state_vhe(host_ctxt);
+diff --git a/arch/arm64/kvm/hyp/vhe/sysreg-sr.c b/arch/arm64/kvm/hyp/vhe/sysreg-sr.c
+index b35a178e7..6bccde4db 100644
+--- a/arch/arm64/kvm/hyp/vhe/sysreg-sr.c
++++ b/arch/arm64/kvm/hyp/vhe/sysreg-sr.c
+@@ -62,8 +62,28 @@ NOKPROBE_SYMBOL(sysreg_restore_guest_state_vhe);
+  * and loading system register state early avoids having to load them on
+  * every entry to the VM.
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/arm.c|459| <<kvm_arch_vcpu_load>> kvm_vcpu_load_sysregs_vhe(vcpu);
++ */
+ void kvm_vcpu_load_sysregs_vhe(struct kvm_vcpu *vcpu)
+ {
++	/*
++	 * struct kvm_cpu_context {
++	 *     struct user_pt_regs regs;       // sp = sp_el0
++	 *
++	 *     u64     spsr_abt;
++	 *     u64     spsr_und;
++	 *     u64     spsr_irq;
++	 *     u64     spsr_fiq;
++	 *     
++	 *     struct user_fpsimd_state fp_regs;
++	 *
++	 *     u64 sys_regs[NR_SYS_REGS];
++	 *
++	 *     struct kvm_vcpu *__hyp_running_vcpu;
++	 * };
++	 */
+ 	struct kvm_cpu_context *guest_ctxt = &vcpu->arch.ctxt;
+ 	struct kvm_cpu_context *host_ctxt;
+ 
+@@ -107,6 +127,10 @@ void kvm_vcpu_load_sysregs_vhe(struct kvm_vcpu *vcpu)
+  * and deferring saving system register state until we're no longer running the
+  * VCPU avoids having to save them on every exit from the VM.
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/arm.c|483| <<kvm_arch_vcpu_put>> kvm_vcpu_put_sysregs_vhe(vcpu);
++ */
+ void kvm_vcpu_put_sysregs_vhe(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_cpu_context *guest_ctxt = &vcpu->arch.ctxt;
+diff --git a/arch/arm64/kvm/hyp/vhe/tlb.c b/arch/arm64/kvm/hyp/vhe/tlb.c
+index 46bd43f61..3de722ffa 100644
+--- a/arch/arm64/kvm/hyp/vhe/tlb.c
++++ b/arch/arm64/kvm/hyp/vhe/tlb.c
+@@ -66,7 +66,20 @@ static void __tlb_switch_to_host(struct tlb_inv_context *cxt)
+ 	 * We're done with the TLB operation, let's restore the host's
+ 	 * view of HCR_EL2.
+ 	 */
++	/*
++	 * 在以下使用vttbr_el2:
++	 *   - arch/arm64/include/asm/el2_setup.h|113| <<global>> .macro __init_el2_stage2 msr vttbr_el2, xzr
++	 *   - arch/arm64/include/asm/kvm_mmu.h|303| <<__load_stage2>> write_sysreg(kvm_get_vttbr(mmu), vttbr_el2);
++	 *   - arch/arm64/kvm/hyp/include/nvhe/mem_protect.h|91| <<__load_host_stage2>> write_sysreg(0, vttbr_el2);
++	 *   - arch/arm64/kvm/hyp/vhe/tlb.c|69| <<__tlb_switch_to_host>> write_sysreg(0, vttbr_el2);
++	 */
+ 	write_sysreg(0, vttbr_el2);
++	/*
++	 * 在以下使用HCR_HOST_VHE_FLAGS:
++	 *   - arch/arm64/include/asm/kvm_arm.h|103| <<global>> #define HCR_HOST_VHE_FLAGS (HCR_RW | HCR_TGE | HCR_E2H)
++	 *   - arch/arm64/kvm/hyp/vhe/switch.c|98| <<__deactivate_traps>> write_sysreg(HCR_HOST_VHE_FLAGS, hcr_el2);
++	 *   - arch/arm64/kvm/hyp/vhe/tlb.c|77| <<__tlb_switch_to_host>> write_sysreg(HCR_HOST_VHE_FLAGS, hcr_el2);
++	 */
+ 	write_sysreg(HCR_HOST_VHE_FLAGS, hcr_el2);
+ 	isb();
+ 
+diff --git a/arch/arm64/kvm/mmu.c b/arch/arm64/kvm/mmu.c
+index 482280fe2..9ba835be3 100644
+--- a/arch/arm64/kvm/mmu.c
++++ b/arch/arm64/kvm/mmu.c
+@@ -863,6 +863,10 @@ static struct kvm_pgtable_mm_ops kvm_s2_mm_ops = {
+  * Note we don't need locking here as this is only called when the VM is
+  * created, which can only be done once.
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/arm.c|164| <<kvm_arch_init_vm>> ret = kvm_init_stage2_mmu(kvm, &kvm->arch.mmu, type);
++ */
+ int kvm_init_stage2_mmu(struct kvm *kvm, struct kvm_s2_mmu *mmu, unsigned long type)
+ {
+ 	u32 kvm_ipa_limit = get_kvm_ipa_limit();
+@@ -899,6 +903,10 @@ int kvm_init_stage2_mmu(struct kvm *kvm, struct kvm_s2_mmu *mmu, unsigned long t
+ 		return -EINVAL;
+ 	}
+ 
++	/*
++	 * struct kvm_pgtable *pgt;
++	 * -> kvm_pteref_t pgd;
++	 */
+ 	pgt = kzalloc(sizeof(*pgt), GFP_KERNEL_ACCOUNT);
+ 	if (!pgt)
+ 		return -ENOMEM;
+@@ -922,6 +930,15 @@ int kvm_init_stage2_mmu(struct kvm *kvm, struct kvm_s2_mmu *mmu, unsigned long t
+ 	mmu->split_page_cache.gfp_zero = __GFP_ZERO;
+ 
+ 	mmu->pgt = pgt;
++	/*
++	 * 在以下使用kvm_s2_mmu->pgd_phys:
++	 *   - arch/arm64/include/asm/kvm_mmu.h|289| <<kvm_get_vttbr>> baddr = mmu->pgd_phys;
++	 *   - arch/arm64/kvm/hyp/nvhe/mem_protect.c|157| <<kvm_host_prepare_stage2>> mmu->pgd_phys = __hyp_pa(host_mmu.pgt.pgd);
++	 *   - arch/arm64/kvm/hyp/nvhe/mem_protect.c|264| <<kvm_guest_prepare_stage2>> vm->kvm.arch.mmu.pgd_phys = __hyp_pa(vm->pgt.pgd);
++	 *   - arch/arm64/kvm/hyp/nvhe/mem_protect.c|276| <<reclaim_guest_pages>> vm->kvm.arch.mmu.pgd_phys = 0ULL;
++	 *   - arch/arm64/kvm/mmu.c|925| <<kvm_init_stage2_mmu>> mmu->pgd_phys = __pa(pgt->pgd);
++	 *   - arch/arm64/kvm/mmu.c|1017| <<kvm_free_stage2_pgd>> mmu->pgd_phys = 0;
++	 */
+ 	mmu->pgd_phys = __pa(pgt->pgd);
+ 	return 0;
+ 
+diff --git a/arch/arm64/kvm/sys_regs.c b/arch/arm64/kvm/sys_regs.c
+index 0afd6136e..df62d5f1f 100644
+--- a/arch/arm64/kvm/sys_regs.c
++++ b/arch/arm64/kvm/sys_regs.c
+@@ -295,6 +295,15 @@ static bool access_actlr(struct kvm_vcpu *vcpu,
+  * The cp15_64 code makes sure this automatically works
+  * for both AArch64 and AArch32 accesses.
+  */
++/*
++ * 在以下使用access_gic_sgi():
++ *   - arch/arm64/kvm/sys_regs.c|2156| <<global>> { SYS_DESC(SYS_ICC_SGI1R_EL1), access_gic_sgi },
++ *   - arch/arm64/kvm/sys_regs.c|2157| <<global>> { SYS_DESC(SYS_ICC_ASGI1R_EL1), access_gic_sgi },
++ *   - arch/arm64/kvm/sys_regs.c|2158| <<global>> { SYS_DESC(SYS_ICC_SGI0R_EL1), access_gic_sgi },
++ *   - arch/arm64/kvm/sys_regs.c|2758| <<global>> { Op1( 0), CRn( 0), CRm(12), Op2( 0), access_gic_sgi },
++ *   - arch/arm64/kvm/sys_regs.c|2761| <<global>> { Op1( 1), CRn( 0), CRm(12), Op2( 0), access_gic_sgi },
++ *   - arch/arm64/kvm/sys_regs.c|2762| <<global>> { Op1( 2), CRn( 0), CRm(12), Op2( 0), access_gic_sgi },
++ */
+ static bool access_gic_sgi(struct kvm_vcpu *vcpu,
+ 			   struct sys_reg_params *p,
+ 			   const struct sys_reg_desc *r)
+@@ -1164,6 +1173,19 @@ static unsigned int ptrauth_visibility(const struct kvm_vcpu *vcpu,
+ 	__PTRAUTH_KEY(k ## KEYLO_EL1),					\
+ 	__PTRAUTH_KEY(k ## KEYHI_EL1)
+ 
++/*
++ * 在以下使用access_arch_timer():
++ *   - arch/arm64/kvm/sys_regs.c|2285| <<global>> { SYS_DESC(SYS_CNTPCT_EL0), access_arch_timer },
++ *   - arch/arm64/kvm/sys_regs.c|2286| <<global>> { SYS_DESC(SYS_CNTPCTSS_EL0), access_arch_timer },
++ *   - arch/arm64/kvm/sys_regs.c|2287| <<global>> { SYS_DESC(SYS_CNTP_TVAL_EL0), access_arch_timer },
++ *   - arch/arm64/kvm/sys_regs.c|2288| <<global>> { SYS_DESC(SYS_CNTP_CTL_EL0), access_arch_timer },
++ *   - arch/arm64/kvm/sys_regs.c|2289| <<global>> { SYS_DESC(SYS_CNTP_CVAL_EL0), access_arch_timer },
++ *   - arch/arm64/kvm/sys_regs.c|2663| <<global>> { SYS_DESC(SYS_AARCH32_CNTP_TVAL), access_arch_timer },
++ *   - arch/arm64/kvm/sys_regs.c|2664| <<global>> { SYS_DESC(SYS_AARCH32_CNTP_CTL), access_arch_timer },
++ *   - arch/arm64/kvm/sys_regs.c|2746| <<global>> { SYS_DESC(SYS_AARCH32_CNTPCT), access_arch_timer },
++ *   - arch/arm64/kvm/sys_regs.c|2750| <<global>> { SYS_DESC(SYS_AARCH32_CNTP_CVAL), access_arch_timer },
++ *   - arch/arm64/kvm/sys_regs.c|2751| <<global>> { SYS_DESC(SYS_AARCH32_CNTPCTSS), access_arch_timer },
++ */
+ static bool access_arch_timer(struct kvm_vcpu *vcpu,
+ 			      struct sys_reg_params *p,
+ 			      const struct sys_reg_desc *r)
+diff --git a/arch/arm64/kvm/vgic/vgic-mmio-v3.c b/arch/arm64/kvm/vgic/vgic-mmio-v3.c
+index 188d2187e..36eeeb17d 100644
+--- a/arch/arm64/kvm/vgic/vgic-mmio-v3.c
++++ b/arch/arm64/kvm/vgic/vgic-mmio-v3.c
+@@ -1066,6 +1066,10 @@ static int match_mpidr(u64 sgi_aff, u16 sgi_cpu_mask, struct kvm_vcpu *vcpu)
+  * check for matching ones. If this bit is set, we signal all, but not the
+  * calling VCPU.
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/sys_regs.c|338| <<access_gic_sgi>> vgic_v3_dispatch_sgi(vcpu, p->regval, g1);
++ */
+ void vgic_v3_dispatch_sgi(struct kvm_vcpu *vcpu, u64 reg, bool allow_group1)
+ {
+ 	struct kvm *kvm = vcpu->kvm;
+diff --git a/arch/arm64/kvm/vgic/vgic.c b/arch/arm64/kvm/vgic/vgic.c
+index 8be4c1ebd..c348ab1ec 100644
+--- a/arch/arm64/kvm/vgic/vgic.c
++++ b/arch/arm64/kvm/vgic/vgic.c
+@@ -436,6 +436,14 @@ bool vgic_queue_irq_unlock(struct kvm *kvm, struct vgic_irq *irq,
+  * level-sensitive interrupts.  You can think of the level parameter as 1
+  * being HIGH and 0 being LOW and all devices being active-HIGH.
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/arch_timer.c|456| <<kvm_timer_update_irq>> ret = kvm_vgic_inject_irq(vcpu->kvm, vcpu->vcpu_id,
++ *   - arch/arm64/kvm/arm.c|1195| <<kvm_vm_ioctl_irq_line>> return kvm_vgic_inject_irq(kvm, vcpu->vcpu_id, irq_num, level, NULL);
++ *   - arch/arm64/kvm/arm.c|1203| <<kvm_vm_ioctl_irq_line>> return kvm_vgic_inject_irq(kvm, 0, irq_num, level, NULL);
++ *   - arch/arm64/kvm/pmu-emul.c|351| <<kvm_pmu_update_state>> int ret = kvm_vgic_inject_irq(vcpu->kvm, vcpu->vcpu_id,
++ *   - arch/arm64/kvm/vgic/vgic-irqfd.c|26| <<vgic_irqfd_set_irq>> return kvm_vgic_inject_irq(kvm, 0, spi_id, level, NULL);
++ */
+ int kvm_vgic_inject_irq(struct kvm *kvm, int cpuid, unsigned int intid,
+ 			bool level, void *owner)
+ {
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 70d139406..04fa3dcc8 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -79,8 +79,38 @@
+ #define KVM_REQ_EVENT			KVM_ARCH_REQ(6)
+ #define KVM_REQ_APF_HALT		KVM_ARCH_REQ(7)
+ #define KVM_REQ_STEAL_UPDATE		KVM_ARCH_REQ(8)
++/*
++ * 在以下使用KVM_REQ_NMI:
++ *   - arch/x86/kvm/x86.c|821| <<kvm_inject_nmi>> kvm_make_request(KVM_REQ_NMI, vcpu);
++ *   - arch/x86/kvm/x86.c|5301| <<kvm_vcpu_ioctl_x86_set_vcpu_events>> kvm_make_request(KVM_REQ_NMI, vcpu);
++ *   - arch/x86/kvm/x86.c|10615| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_NMI, vcpu))
++ *   - arch/x86/kvm/x86.c|12866| <<kvm_vcpu_has_events>> if (kvm_test_request(KVM_REQ_NMI, vcpu) ||
++ *   - arch/x86/kvm/x86.c|12919| <<kvm_arch_dy_runnable>> if (kvm_test_request(KVM_REQ_NMI, vcpu) ||
++ *
++ * process_nmi()
++ */
+ #define KVM_REQ_NMI			KVM_ARCH_REQ(9)
++/*
++ * 在以下使用KVM_REQ_PMU:
++ *   - arch/x86/kvm/pmu.c|139| <<kvm_perf_overflow>> kvm_make_request(KVM_REQ_PMU, pmc->vcpu);
++ *   - arch/x86/kvm/pmu.c|888| <<kvm_vm_ioctl_set_pmu_event_filter>> kvm_make_all_cpus_request(kvm, KVM_REQ_PMU);
++ *   - arch/x86/kvm/pmu.h|226| <<kvm_pmu_request_counter_reprogram>> kvm_make_request(KVM_REQ_PMU, pmc->vcpu);
++ *   - arch/x86/kvm/pmu.h|238| <<reprogram_counters>> kvm_make_request(KVM_REQ_PMU, pmu_to_vcpu(pmu));
++ *   - arch/x86/kvm/x86.c|10617| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_PMU, vcpu))
++ *   - arch/x86/kvm/x86.c|12319| <<kvm_arch_sched_in>> kvm_make_request(KVM_REQ_PMU, vcpu);
++ *
++ * kvm_pmu_handle_event()
++ */
+ #define KVM_REQ_PMU			KVM_ARCH_REQ(10)
++/*
++ * 在以下使用KVM_REQ_PMI:
++ *   - arch/x86/kvm/pmu.c|120| <<__kvm_perf_overflow>> kvm_make_request(KVM_REQ_PMI, pmc->vcpu);
++ *   - arch/x86/kvm/vmx/vmx.c|8362| <<vmx_handle_intel_pt_intr>> kvm_make_request(KVM_REQ_PMI, vcpu);
++ *   - arch/x86/kvm/x86.c|10619| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_PMI, vcpu))
++ *   - arch/x86/kvm/x86.c|12878| <<kvm_vcpu_has_events>> if (kvm_test_request(KVM_REQ_PMI, vcpu))
++ *
++ * kvm_pmu_deliver_pmi()
++ */
+ #define KVM_REQ_PMI			KVM_ARCH_REQ(11)
+ #ifdef CONFIG_KVM_SMM
+ #define KVM_REQ_SMI			KVM_ARCH_REQ(12)
+@@ -890,7 +920,37 @@ struct kvm_vcpu_arch {
+ 	u64 l1_tsc_scaling_ratio;
+ 	u64 tsc_scaling_ratio; /* current scaling ratio */
+ 
++	/*
++	 * called by:
++	 *   - arch/x86/kvm/x86.c|825| <<kvm_inject_nmi>> atomic_inc(&vcpu->arch.nmi_queued);
++	 *   - arch/x86/kvm/x86.c|5315| <<kvm_vcpu_ioctl_x86_set_vcpu_events>> atomic_set(&vcpu->arch.nmi_queued, events->nmi.pending);
++	 *   - arch/x86/kvm/x86.c|10312| <<process_nmi>> vcpu->arch.nmi_pending += atomic_xchg(&vcpu->arch.nmi_queued, 0);
++	 *   - arch/x86/kvm/x86.c|12110| <<kvm_vcpu_reset>> atomic_set(&vcpu->arch.nmi_queued, 0);
++	 */
+ 	atomic_t nmi_queued;  /* unprocessed asynchronous NMIs */
++	/*
++	 * 在以下使用kvm_vcpu_arch->nmi_pending:
++	 *   - arch/x86/kvm/svm/nested.c|671| <<nested_vmcb02_prepare_control>> svm->vcpu.arch.nmi_pending++;
++	 *   - arch/x86/kvm/svm/nested.c|1092| <<nested_svm_vmexit>> if (vcpu->arch.nmi_pending) {
++	 *   - arch/x86/kvm/svm/nested.c|1093| <<nested_svm_vmexit>> vcpu->arch.nmi_pending--;
++	 *   - arch/x86/kvm/svm/nested.c|1487| <<svm_check_nested_events>> if (vcpu->arch.nmi_pending && !svm_nmi_blocked(vcpu)) {
++	 *   - arch/x86/kvm/svm/svm.c|2438| <<svm_set_gif>> svm->vcpu.arch.nmi_pending ||
++	 *   - arch/x86/kvm/vmx/nested.c|4162| <<vmx_check_nested_events>> if (vcpu->arch.nmi_pending && !vmx_nmi_blocked(vcpu)) {
++	 *   - arch/x86/kvm/vmx/nested.c|4175| <<vmx_check_nested_events>> vcpu->arch.nmi_pending = 0;
++	 *   - arch/x86/kvm/vmx/vmx.c|6528| <<__vmx_handle_exit>> vcpu->arch.nmi_pending) {
++	 *   - arch/x86/kvm/x86.c|5314| <<kvm_vcpu_ioctl_x86_set_vcpu_events>> vcpu->arch.nmi_pending = 0;
++	 *   - arch/x86/kvm/x86.c|10222| <<kvm_check_and_inject_events>> if (vcpu->arch.nmi_pending) {
++	 *   - arch/x86/kvm/x86.c|10227| <<kvm_check_and_inject_events>> --vcpu->arch.nmi_pending;
++	 *   - arch/x86/kvm/x86.c|10233| <<kvm_check_and_inject_events>> if (vcpu->arch.nmi_pending)
++	 *   - arch/x86/kvm/x86.c|10309| <<process_nmi>> vcpu->arch.nmi_pending += atomic_xchg(&vcpu->arch.nmi_queued, 0);
++	 *   - arch/x86/kvm/x86.c|10310| <<process_nmi>> vcpu->arch.nmi_pending = min(vcpu->arch.nmi_pending, limit);
++	 *   - arch/x86/kvm/x86.c|10312| <<process_nmi>> if (vcpu->arch.nmi_pending &&
++	 *   - arch/x86/kvm/x86.c|10314| <<process_nmi>> vcpu->arch.nmi_pending--;
++	 *   - arch/x86/kvm/x86.c|10316| <<process_nmi>> if (vcpu->arch.nmi_pending)
++	 *   - arch/x86/kvm/x86.c|10323| <<kvm_get_nr_pending_nmis>> return vcpu->arch.nmi_pending +
++	 *   - arch/x86/kvm/x86.c|12098| <<kvm_vcpu_reset>> vcpu->arch.nmi_pending = 0;
++	 *   - arch/x86/kvm/x86.c|12907| <<kvm_vcpu_has_events>> (vcpu->arch.nmi_pending &&
++	 */
+ 	/* Number of NMIs pending injection, not including hardware vNMIs. */
+ 	unsigned int nmi_pending;
+ 	bool nmi_injected;    /* Trying to inject an NMI this entry */
+@@ -1131,8 +1191,35 @@ struct kvm_xen {
+ 	u32 xen_version;
+ 	bool long_mode;
+ 	bool runstate_update_flag;
++	/*
++	 * 在以下使用kvm_xen->upcall_vector:
++	 *   - arch/x86/kvm/irq.c|122| <<kvm_cpu_get_extint>> return v->kvm->arch.xen.upcall_vector;
++	 *   - arch/x86/kvm/xen.c|632| <<kvm_xen_hvm_set_attr>> kvm->arch.xen.upcall_vector = data->u.vector;
++	 *   - arch/x86/kvm/xen.c|688| <<kvm_xen_hvm_get_attr>> data->u.vector = kvm->arch.xen.upcall_vector;
++	 *   - arch/x86/kvm/xen.h|56| <<kvm_xen_has_interrupt>> vcpu->kvm->arch.xen.upcall_vector)
++	 *
++	 * 在以下使用kvm_vcpu_xen->upcall_vector:
++	 *   - arch/x86/kvm/xen.c|480| <<kvm_xen_inject_vcpu_vector>> irq.vector = v->arch.xen.upcall_vector;
++	 *   - arch/x86/kvm/xen.c|549| <<kvm_xen_inject_pending_events>> if (v->arch.xen.upcall_vector)
++	 *   - arch/x86/kvm/xen.c|936| <<kvm_xen_vcpu_set_attr>> vcpu->arch.xen.upcall_vector = data->u.vector;
++	 *   - arch/x86/kvm/xen.c|1029| <<kvm_xen_vcpu_get_attr>> data->u.vector = vcpu->arch.xen.upcall_vector;
++	 *   - arch/x86/kvm/xen.c|1643| <<kvm_xen_set_evtchn_fast>> if (kick_vcpu && vcpu->arch.xen.upcall_vector) {
++	 */
+ 	u8 upcall_vector;
+ 	struct gfn_to_pfn_cache shinfo_cache;
++	/*
++	 * 在以下使用kvm_xen->evtchn_ports:
++	 *   - arch/x86/kvm/xen.c|1828| <<kvm_xen_eventfd_update>> evtchnfd = idr_find(&kvm->arch.xen.evtchn_ports, port);
++	 *   - arch/x86/kvm/xen.c|1922| <<kvm_xen_eventfd_assign>> ret = idr_alloc(&kvm->arch.xen.evtchn_ports, evtchnfd, port, port + 1,
++	 *   - arch/x86/kvm/xen.c|1943| <<kvm_xen_eventfd_deassign>> evtchnfd = idr_remove(&kvm->arch.xen.evtchn_ports, port);
++	 *   - arch/x86/kvm/xen.c|1969| <<kvm_xen_eventfd_reset>> idr_for_each_entry(&kvm->arch.xen.evtchn_ports, evtchnfd, i)
++	 *   - arch/x86/kvm/xen.c|1979| <<kvm_xen_eventfd_reset>> idr_for_each_entry(&kvm->arch.xen.evtchn_ports, evtchnfd, i) {
++	 *   - arch/x86/kvm/xen.c|1981| <<kvm_xen_eventfd_reset>> idr_remove(&kvm->arch.xen.evtchn_ports, evtchnfd->send_port);
++	 *   - arch/x86/kvm/xen.c|2036| <<kvm_xen_hcall_evtchn_send>> evtchnfd = idr_find(&vcpu->kvm->arch.xen.evtchn_ports, send.port);
++	 *   - arch/x86/kvm/xen.c|2109| <<kvm_xen_init_vm>> idr_init(&kvm->arch.xen.evtchn_ports);
++	 *   - arch/x86/kvm/xen.c|2120| <<kvm_xen_destroy_vm>> idr_for_each_entry(&kvm->arch.xen.evtchn_ports, evtchnfd, i) {
++	 *   - arch/x86/kvm/xen.c|2125| <<kvm_xen_destroy_vm>> idr_destroy(&kvm->arch.xen.evtchn_ports);
++	 */
+ 	struct idr evtchn_ports;
+ 	unsigned long poll_mask[BITS_TO_LONGS(KVM_MAX_VCPUS)];
+ };
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 3e977dbbf..4fbc5308d 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -817,6 +817,17 @@ static int __apic_accept_irq(struct kvm_lapic *apic, int delivery_mode,
+ 			     int vector, int level, int trig_mode,
+ 			     struct dest_map *dest_map);
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/hyperv.c|839| <<stimer_notify_direct>> return !kvm_apic_set_irq(vcpu, &irq, NULL);
++ *   - arch/x86/kvm/hyperv.c|2161| <<kvm_hv_send_ipi_to_many>> kvm_apic_set_irq(vcpu, &irq, NULL);
++ *   - arch/x86/kvm/irq_comm.c|77| <<kvm_irq_delivery_to_apic>> r += kvm_apic_set_irq(vcpu, irq, dest_map);
++ *   - arch/x86/kvm/irq_comm.c|99| <<kvm_irq_delivery_to_apic>> r = kvm_apic_set_irq(lowest, irq, dest_map);
++ *   - arch/x86/kvm/lapic.c|842| <<__pv_send_ipi>> count += kvm_apic_set_irq(vcpu, irq, NULL);
++ *   - arch/x86/kvm/lapic.c|1221| <<kvm_irq_delivery_to_apic_fast>> *r = kvm_apic_set_irq(src->vcpu, irq, dest_map);
++ *   - arch/x86/kvm/lapic.c|1234| <<kvm_irq_delivery_to_apic_fast>> *r += kvm_apic_set_irq(dst[i]->vcpu, irq, dest_map);
++ *   - arch/x86/kvm/x86.c|13185| <<kvm_arch_async_page_present>> kvm_apic_set_irq(vcpu, &irq, NULL);
++ */
+ int kvm_apic_set_irq(struct kvm_vcpu *vcpu, struct kvm_lapic_irq *irq,
+ 		     struct dest_map *dest_map)
+ {
+@@ -1285,6 +1296,11 @@ bool kvm_intr_is_single_vcpu_fast(struct kvm *kvm, struct kvm_lapic_irq *irq,
+  * Add a pending IRQ into lapic.
+  * Return 1 if successfully added and 0 if discarded.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|825| <<kvm_apic_set_irq>> return __apic_accept_irq(apic, irq->delivery_mode, irq->vector, irq->level, irq->trig_mode, dest_map);
++ *   - arch/x86/kvm/lapic.c|2769| <<kvm_apic_local_deliver>> r = __apic_accept_irq(apic, mode, vector, 1, trig_mode, NULL);
++ */
+ static int __apic_accept_irq(struct kvm_lapic *apic, int delivery_mode,
+ 			     int vector, int level, int trig_mode,
+ 			     struct dest_map *dest_map)
+@@ -1342,6 +1358,11 @@ static int __apic_accept_irq(struct kvm_lapic *apic, int delivery_mode,
+ 
+ 	case APIC_DM_NMI:
+ 		result = 1;
++		/*
++		 * called by:
++		 *   - arch/x86/kvm/lapic.c|1345| <<__apic_accept_irq>> kvm_inject_nmi(vcpu);
++		 *   - arch/x86/kvm/x86.c|5009| <<kvm_vcpu_ioctl_nmi>> kvm_inject_nmi(vcpu);
++		 */
+ 		kvm_inject_nmi(vcpu);
+ 		kvm_vcpu_kick(vcpu);
+ 		break;
+@@ -2755,6 +2776,13 @@ int apic_has_pending_timer(struct kvm_vcpu *vcpu)
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|1881| <<kvm_apic_inject_pending_timer_irqs>> kvm_apic_local_deliver(apic, APIC_LVTT);
++ *   - arch/x86/kvm/lapic.c|2782| <<kvm_apic_nmi_wd_deliver>> kvm_apic_local_deliver(apic, APIC_LVT0);
++ *   - arch/x86/kvm/pmu.c|531| <<kvm_pmu_deliver_pmi>> kvm_apic_local_deliver(vcpu->arch.apic, APIC_LVTPC);
++ *   - arch/x86/kvm/x86.c|5084| <<kvm_vcpu_x86_set_ucna>> kvm_apic_local_deliver(vcpu->arch.apic, APIC_LVTCMCI);
++ */
+ int kvm_apic_local_deliver(struct kvm_lapic *apic, int lvt_type)
+ {
+ 	u32 reg = kvm_lapic_get_reg(apic, lvt_type);
+@@ -2766,6 +2794,11 @@ int kvm_apic_local_deliver(struct kvm_lapic *apic, int lvt_type)
+ 		mode = reg & APIC_MODE_MASK;
+ 		trig_mode = reg & APIC_LVT_LEVEL_TRIGGER;
+ 
++		/*
++		 * called by:
++		 *   - arch/x86/kvm/lapic.c|825| <<kvm_apic_set_irq>> return __apic_accept_irq(apic, irq->delivery_mode, irq->vector, irq->level, irq->trig_mode, dest_map);
++		 *   - arch/x86/kvm/lapic.c|2769| <<kvm_apic_local_deliver>> r = __apic_accept_irq(apic, mode, vector, 1, trig_mode, NULL);
++		 */
+ 		r = __apic_accept_irq(apic, mode, vector, 1, trig_mode, NULL);
+ 		if (r && lvt_type == APIC_LVTPC)
+ 			kvm_lapic_set_reg(apic, APIC_LVTPC, reg | APIC_LVT_MASKED);
+diff --git a/arch/x86/kvm/pmu.c b/arch/x86/kvm/pmu.c
+index 9ae07db6f..a49b69c74 100644
+--- a/arch/x86/kvm/pmu.c
++++ b/arch/x86/kvm/pmu.c
+@@ -93,6 +93,11 @@ void kvm_pmu_ops_update(const struct kvm_pmu_ops *pmu_ops)
+ #undef __KVM_X86_PMU_OP
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/pmu.c|137| <<kvm_perf_overflow>> __kvm_perf_overflow(pmc, true);
++ *   - arch/x86/kvm/pmu.c|403| <<reprogram_counter>> __kvm_perf_overflow(pmc, false);
++ */
+ static inline void __kvm_perf_overflow(struct kvm_pmc *pmc, bool in_pmi)
+ {
+ 	struct kvm_pmu *pmu = pmc_to_pmu(pmc);
+@@ -116,10 +121,23 @@ static inline void __kvm_perf_overflow(struct kvm_pmc *pmc, bool in_pmi)
+ 		__set_bit(pmc->idx, (unsigned long *)&pmu->global_status);
+ 	}
+ 
++	/*
++	 * 在以下使用KVM_REQ_PMI:
++	 *   - arch/x86/kvm/pmu.c|120| <<__kvm_perf_overflow>> kvm_make_request(KVM_REQ_PMI, pmc->vcpu);
++	 *   - arch/x86/kvm/vmx/vmx.c|8362| <<vmx_handle_intel_pt_intr>> kvm_make_request(KVM_REQ_PMI, vcpu);
++	 *   - arch/x86/kvm/x86.c|10619| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_PMI, vcpu))
++	 *   - arch/x86/kvm/x86.c|12878| <<kvm_vcpu_has_events>> if (kvm_test_request(KVM_REQ_PMI, vcpu))
++	 *
++	 * kvm_pmu_deliver_pmi()
++	 */
+ 	if (pmc->intr && !skip_pmi)
+ 		kvm_make_request(KVM_REQ_PMI, pmc->vcpu);
+ }
+ 
++/*
++ * 在以下使用kvm_perf_overflow():
++ *   - arch/x86/kvm/pmu.c|213| <<pmc_reprogram_counter>> event = perf_event_create_kernel_counter(&attr, -1, current, kvm_perf_overflow, pmc);
++ */
+ static void kvm_perf_overflow(struct perf_event *perf_event,
+ 			      struct perf_sample_data *data,
+ 			      struct pt_regs *regs)
+@@ -136,6 +154,15 @@ static void kvm_perf_overflow(struct perf_event *perf_event,
+ 
+ 	__kvm_perf_overflow(pmc, true);
+ 
++	/*
++	 * 在以下使用KVM_REQ_PMU:
++	 *   - arch/x86/kvm/pmu.c|139| <<kvm_perf_overflow>> kvm_make_request(KVM_REQ_PMU, pmc->vcpu);
++	 *   - arch/x86/kvm/pmu.c|888| <<kvm_vm_ioctl_set_pmu_event_filter>> kvm_make_all_cpus_request(kvm, KVM_REQ_PMU);
++	 *   - arch/x86/kvm/pmu.h|226| <<kvm_pmu_request_counter_reprogram>> kvm_make_request(KVM_REQ_PMU, pmc->vcpu);
++	 *   - arch/x86/kvm/pmu.h|238| <<reprogram_counters>> kvm_make_request(KVM_REQ_PMU, pmu_to_vcpu(pmu));
++	 *   - arch/x86/kvm/x86.c|10617| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_PMU, vcpu))
++	 *   - arch/x86/kvm/x86.c|12319| <<kvm_arch_sched_in>> kvm_make_request(KVM_REQ_PMU, vcpu);
++	 */
+ 	kvm_make_request(KVM_REQ_PMU, pmc->vcpu);
+ }
+ 
+@@ -378,6 +405,10 @@ static bool pmc_event_is_allowed(struct kvm_pmc *pmc)
+ 	       check_pmu_event_filter(pmc);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/pmu.c|458| <<kvm_pmu_handle_event>> reprogram_counter(pmc);
++ */
+ static void reprogram_counter(struct kvm_pmc *pmc)
+ {
+ 	struct kvm_pmu *pmu = pmc_to_pmu(pmc);
+@@ -524,10 +555,35 @@ int kvm_pmu_rdpmc(struct kvm_vcpu *vcpu, unsigned idx, u64 *data)
+ 	return 0;
+ }
+ 
++/*
++ * 在以下使用KVM_REQ_PMI:
++ *   - arch/x86/kvm/pmu.c|120| <<__kvm_perf_overflow>> kvm_make_request(KVM_REQ_PMI, pmc->vcpu);
++ *   - arch/x86/kvm/vmx/vmx.c|8362| <<vmx_handle_intel_pt_intr>> kvm_make_request(KVM_REQ_PMI, vcpu);
++ *   - arch/x86/kvm/x86.c|10619| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_PMI, vcpu))
++ *   - arch/x86/kvm/x86.c|12878| <<kvm_vcpu_has_events>> if (kvm_test_request(KVM_REQ_PMI, vcpu))
++ *
++ * called by:
++ *   - arch/x86/kvm/x86.c|10620| <<vcpu_enter_guest(KVM_REQ_PMI)>> kvm_pmu_deliver_pmi(vcpu);
++ */
+ void kvm_pmu_deliver_pmi(struct kvm_vcpu *vcpu)
+ {
+ 	if (lapic_in_kernel(vcpu)) {
++		/*
++		 * svm似乎没有intel_pmu_deliver_pmi()
++		 */
+ 		static_call_cond(kvm_x86_pmu_deliver_pmi)(vcpu);
++		/*
++		 * LVT Performance Counter Register (FEE0 0340H) -
++		 * Specifies interrupt delivery when a performance counter
++		 * generates an interrupt on overflow (see Section 19.6.3.5.8,
++		 * "Generating an Interrupt on Overflow") or when Intel PT
++		 * signals a ToPA PMI (see Section 32.2.7.2). This LVT entry
++		 * is implementation specific, not architectural. If
++		 * implemented, it is not guaranteed to be at base address
++		 * FEE0 0340H.
++		 *
++		 * APIC_DM_NMI
++		 */
+ 		kvm_apic_local_deliver(vcpu->arch.apic, APIC_LVTPC);
+ 	}
+ }
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 41cce5031..8b3265087 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -815,9 +815,24 @@ void kvm_inject_emulated_page_fault(struct kvm_vcpu *vcpu,
+ }
+ EXPORT_SYMBOL_GPL(kvm_inject_emulated_page_fault);
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|1345| <<__apic_accept_irq>> kvm_inject_nmi(vcpu);
++ *   - arch/x86/kvm/x86.c|5009| <<kvm_vcpu_ioctl_nmi>> kvm_inject_nmi(vcpu);
++ */
+ void kvm_inject_nmi(struct kvm_vcpu *vcpu)
+ {
+ 	atomic_inc(&vcpu->arch.nmi_queued);
++	/*
++	 * 在以下使用KVM_REQ_NMI:
++	 *   - arch/x86/kvm/x86.c|821| <<kvm_inject_nmi>> kvm_make_request(KVM_REQ_NMI, vcpu);
++	 *   - arch/x86/kvm/x86.c|5301| <<kvm_vcpu_ioctl_x86_set_vcpu_events>> kvm_make_request(KVM_REQ_NMI, vcpu);
++	 *   - arch/x86/kvm/x86.c|10615| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_NMI, vcpu))
++	 *   - arch/x86/kvm/x86.c|12866| <<kvm_vcpu_has_events>> if (kvm_test_request(KVM_REQ_NMI, vcpu) ||
++	 *   - arch/x86/kvm/x86.c|12919| <<kvm_arch_dy_runnable>> if (kvm_test_request(KVM_REQ_NMI, vcpu) ||
++	 *
++	 * process_nmi()
++	 */
+ 	kvm_make_request(KVM_REQ_NMI, vcpu);
+ }
+ 
+@@ -4801,6 +4816,14 @@ static bool need_emulate_wbinvd(struct kvm_vcpu *vcpu)
+ 	return kvm_arch_has_noncoherent_dma(vcpu->kvm);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/emulate-nested.c|1947| <<kvm_emulate_nested_eret>> kvm_arch_vcpu_load(vcpu, smp_processor_id());
++ *   - arch/arm64/kvm/emulate-nested.c|2028| <<kvm_inject_nested>> kvm_arch_vcpu_load(vcpu, smp_processor_id());
++ *   - arch/arm64/kvm/reset.c|300| <<kvm_reset_vcpu>> kvm_arch_vcpu_load(vcpu, smp_processor_id());
++ *   - virt/kvm/kvm_main.c|216| <<vcpu_load>> kvm_arch_vcpu_load(vcpu, cpu);
++ *   - virt/kvm/kvm_main.c|5963| <<kvm_sched_in>> kvm_arch_vcpu_load(vcpu, cpu);
++ */
+ void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+ {
+ 	/* Address WBINVD may be executed by guest */
+@@ -10018,6 +10041,9 @@ static void kvm_inject_exception(struct kvm_vcpu *vcpu)
+ 				vcpu->arch.exception.error_code,
+ 				vcpu->arch.exception.injected);
+ 
++	/*
++	 * vmx_inject_exception()
++	 */
+ 	static_call(kvm_x86_inject_exception)(vcpu);
+ }
+ 
+@@ -10060,6 +10086,10 @@ static void kvm_inject_exception(struct kvm_vcpu *vcpu)
+  * ordering between that side effect, the instruction completing, _and_ the
+  * delivery of the asynchronous event.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|10736| <<vcpu_enter_guest(KVM_REQ_EVENT)>> r = kvm_check_and_inject_events(vcpu, &req_immediate_exit);
++ */
+ static int kvm_check_and_inject_events(struct kvm_vcpu *vcpu,
+ 				       bool *req_immediate_exit)
+ {
+@@ -10211,6 +10241,10 @@ static int kvm_check_and_inject_events(struct kvm_vcpu *vcpu,
+ 		if (r) {
+ 			--vcpu->arch.nmi_pending;
+ 			vcpu->arch.nmi_injected = true;
++			/*
++			 * vmx_inject_nmi
++			 * svm_inject_nmi
++			 */
+ 			static_call(kvm_x86_inject_nmi)(vcpu);
+ 			can_inject = false;
+ 			WARN_ON(static_call(kvm_x86_nmi_allowed)(vcpu, true) < 0);
+@@ -10265,6 +10299,20 @@ static int kvm_check_and_inject_events(struct kvm_vcpu *vcpu,
+ 	return r;
+ }
+ 
++/*
++ * 在以下使用KVM_REQ_NMI:
++ *   - arch/x86/kvm/x86.c|821| <<kvm_inject_nmi>> kvm_make_request(KVM_REQ_NMI, vcpu);
++ *   - arch/x86/kvm/x86.c|5301| <<kvm_vcpu_ioctl_x86_set_vcpu_events>> kvm_make_request(KVM_REQ_NMI, vcpu);
++ *   - arch/x86/kvm/x86.c|10615| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_NMI, vcpu))
++ *   - arch/x86/kvm/x86.c|12866| <<kvm_vcpu_has_events>> if (kvm_test_request(KVM_REQ_NMI, vcpu) ||
++ *   - arch/x86/kvm/x86.c|12919| <<kvm_arch_dy_runnable>> if (kvm_test_request(KVM_REQ_NMI, vcpu) ||
++ *
++ *
++ * called by:
++ *   - arch/x86/kvm/x86.c|5162| <<kvm_vcpu_ioctl_x86_get_vcpu_events>> process_nmi(vcpu);
++ *   - arch/x86/kvm/x86.c|5283| <<kvm_vcpu_ioctl_x86_set_vcpu_events>> process_nmi(vcpu);
++ *   - arch/x86/kvm/x86.c|10644| <<vcpu_enter_guest(KVM_REQ_NMI)>> process_nmi(vcpu);
++ */
+ static void process_nmi(struct kvm_vcpu *vcpu)
+ {
+ 	unsigned int limit;
+@@ -10492,6 +10540,27 @@ void __kvm_request_immediate_exit(struct kvm_vcpu *vcpu)
+ }
+ EXPORT_SYMBOL_GPL(__kvm_request_immediate_exit);
+ 
++/*
++ * 4.14上handle_external_intr()的例子.
++ *
++ * [0] bnxt_rx_pages
++ * [0] bnxt_rx_pkt
++ * [0] __bnxt_poll_work
++ * [0] bnxt_poll
++ * [0] net_rx_action
++ * [0] __softirqentry_text_start
++ * [0] irq_exit
++ * [0] do_IRQ
++ * --- <IRQ stack> ---
++ * [0] ret_from_intr
++ * [0] vmx_handle_external_intr
++ * [0] kvm_arch_vcpu_ioctl_run
++ * [0] __dta_kvm_vcpu_ioctl
++ * [0] do_vfs_ioctl
++ * [0] sys_ioctl
++ * [0] do_syscall_64
++ * [0] entry_SYSCALL_64_after_hwframe
++ */
+ /*
+  * Called within kvm->srcu read side.
+  * Returns 1 to let vcpu_run() continue the guest execution loop without
+@@ -10591,10 +10660,36 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 		if (kvm_check_request(KVM_REQ_SMI, vcpu))
+ 			process_smi(vcpu);
+ #endif
++		/*
++		 * 在以下使用KVM_REQ_NMI:
++		 *   - arch/x86/kvm/x86.c|821| <<kvm_inject_nmi>> kvm_make_request(KVM_REQ_NMI, vcpu);
++		 *   - arch/x86/kvm/x86.c|5301| <<kvm_vcpu_ioctl_x86_set_vcpu_events>> kvm_make_request(KVM_REQ_NMI, vcpu);
++		 *   - arch/x86/kvm/x86.c|10615| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_NMI, vcpu))
++		 *   - arch/x86/kvm/x86.c|12866| <<kvm_vcpu_has_events>> if (kvm_test_request(KVM_REQ_NMI, vcpu) ||
++		 *   - arch/x86/kvm/x86.c|12919| <<kvm_arch_dy_runnable>> if (kvm_test_request(KVM_REQ_NMI, vcpu) ||
++		 *
++		 * process_nmi()
++		 */
+ 		if (kvm_check_request(KVM_REQ_NMI, vcpu))
+ 			process_nmi(vcpu);
++		/*
++		 * 在以下使用KVM_REQ_PMU:
++		 *   - arch/x86/kvm/pmu.c|139| <<kvm_perf_overflow>> kvm_make_request(KVM_REQ_PMU, pmc->vcpu);
++		 *   - arch/x86/kvm/pmu.c|888| <<kvm_vm_ioctl_set_pmu_event_filter>> kvm_make_all_cpus_request(kvm, KVM_REQ_PMU);
++		 *   - arch/x86/kvm/pmu.h|226| <<kvm_pmu_request_counter_reprogram>> kvm_make_request(KVM_REQ_PMU, pmc->vcpu);
++		 *   - arch/x86/kvm/pmu.h|238| <<reprogram_counters>> kvm_make_request(KVM_REQ_PMU, pmu_to_vcpu(pmu));
++		 *   - arch/x86/kvm/x86.c|10617| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_PMU, vcpu))
++		 *   - arch/x86/kvm/x86.c|12319| <<kvm_arch_sched_in>> kvm_make_request(KVM_REQ_PMU, vcpu);
++		 */
+ 		if (kvm_check_request(KVM_REQ_PMU, vcpu))
+ 			kvm_pmu_handle_event(vcpu);
++		/*
++		 * 在以下使用KVM_REQ_PMI:
++		 *   - arch/x86/kvm/pmu.c|120| <<__kvm_perf_overflow>> kvm_make_request(KVM_REQ_PMI, pmc->vcpu);
++		 *   - arch/x86/kvm/vmx/vmx.c|8362| <<vmx_handle_intel_pt_intr>> kvm_make_request(KVM_REQ_PMI, vcpu);
++		 *   - arch/x86/kvm/x86.c|10619| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_PMI, vcpu))
++		 *   - arch/x86/kvm/x86.c|12878| <<kvm_vcpu_has_events>> if (kvm_test_request(KVM_REQ_PMI, vcpu))
++		 */
+ 		if (kvm_check_request(KVM_REQ_PMI, vcpu))
+ 			kvm_pmu_deliver_pmi(vcpu);
+ 		if (kvm_check_request(KVM_REQ_IOAPIC_EOI_EXIT, vcpu)) {
+@@ -10655,6 +10750,9 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 			static_call(kvm_x86_update_cpu_dirty_logging)(vcpu);
+ 	}
+ 
++	/*
++	 * 非常非常重要的KVM_REQ_EVENT!!!
++	 */
+ 	if (kvm_check_request(KVM_REQ_EVENT, vcpu) || req_int_win ||
+ 	    kvm_xen_has_interrupt(vcpu)) {
+ 		++vcpu->stat.req_event;
+@@ -12295,6 +12393,15 @@ void kvm_arch_sched_in(struct kvm_vcpu *vcpu, int cpu)
+ 	vcpu->arch.l1tf_flush_l1d = true;
+ 	if (pmu->version && unlikely(pmu->event_count)) {
+ 		pmu->need_cleanup = true;
++		/*
++		 * 在以下使用KVM_REQ_PMU:
++		 *   - arch/x86/kvm/pmu.c|139| <<kvm_perf_overflow>> kvm_make_request(KVM_REQ_PMU, pmc->vcpu);
++		 *   - arch/x86/kvm/pmu.c|888| <<kvm_vm_ioctl_set_pmu_event_filter>> kvm_make_all_cpus_request(kvm, KVM_REQ_PMU);
++		 *   - arch/x86/kvm/pmu.h|226| <<kvm_pmu_request_counter_reprogram>> kvm_make_request(KVM_REQ_PMU, pmc->vcpu);
++		 *   - arch/x86/kvm/pmu.h|238| <<reprogram_counters>> kvm_make_request(KVM_REQ_PMU, pmu_to_vcpu(pmu));
++		 *   - arch/x86/kvm/x86.c|10617| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_PMU, vcpu))
++		 *   - arch/x86/kvm/x86.c|12319| <<kvm_arch_sched_in>> kvm_make_request(KVM_REQ_PMU, vcpu);
++		 */
+ 		kvm_make_request(KVM_REQ_PMU, vcpu);
+ 	}
+ 	static_call(kvm_x86_sched_in)(vcpu, cpu);
+diff --git a/arch/x86/kvm/xen.c b/arch/x86/kvm/xen.c
+index 40edf4d19..19d1cc9d1 100644
+--- a/arch/x86/kvm/xen.c
++++ b/arch/x86/kvm/xen.c
+@@ -32,8 +32,25 @@ static int kvm_xen_set_evtchn(struct kvm_xen_evtchn *xe, struct kvm *kvm);
+ static int kvm_xen_setattr_evtchn(struct kvm *kvm, struct kvm_xen_hvm_attr *data);
+ static bool kvm_xen_hcall_evtchn_send(struct kvm_vcpu *vcpu, u64 param, u64 *r);
+ 
++/*
++ * 在以下使用kvm_xen_enabled:
++ *   - arch/x86/kvm/xen.c|35| <<global>> DEFINE_STATIC_KEY_DEFERRED_FALSE(kvm_xen_enabled, HZ);
++ *   - arch/x86/kvm/x86.c|9621| <<kvm_x86_vendor_exit>> static_key_deferred_flush(&kvm_xen_enabled);
++ *   - arch/x86/kvm/x86.c|9622| <<kvm_x86_vendor_exit>> WARN_ON(static_branch_unlikely(&kvm_xen_enabled.key));
++ *   - arch/x86/kvm/xen.c|1133| <<kvm_xen_hvm_config>> static_branch_inc(&kvm_xen_enabled.key);
++ *   - arch/x86/kvm/xen.c|1135| <<kvm_xen_hvm_config>> static_branch_slow_dec_deferred(&kvm_xen_enabled);
++ *   - arch/x86/kvm/xen.c|2128| <<kvm_xen_destroy_vm>> static_branch_slow_dec_deferred(&kvm_xen_enabled);
++ *   - arch/x86/kvm/xen.h|41| <<kvm_xen_msr_enabled>> return static_branch_unlikely(&kvm_xen_enabled.key) &&
++ *   - arch/x86/kvm/xen.h|47| <<kvm_xen_hypercall_enabled>> return static_branch_unlikely(&kvm_xen_enabled.key) &&
++ *   - arch/x86/kvm/xen.h|54| <<kvm_xen_has_interrupt>> if (static_branch_unlikely(&kvm_xen_enabled.key) &&
++ *   - arch/x86/kvm/xen.h|64| <<kvm_xen_has_pending_events>> return static_branch_unlikely(&kvm_xen_enabled.key) &&
++ */
+ DEFINE_STATIC_KEY_DEFERRED_FALSE(kvm_xen_enabled, HZ);
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/xen.c|623| <<kvm_xen_hvm_set_attr>> r = kvm_xen_shared_info_init(kvm, data->u.shared_info.gfn);
++ */
+ static int kvm_xen_shared_info_init(struct kvm *kvm, gfn_t gfn)
+ {
+ 	struct gfn_to_pfn_cache *gpc = &kvm->arch.xen.shinfo_cache;
+@@ -113,6 +130,10 @@ static int kvm_xen_shared_info_init(struct kvm *kvm, gfn_t gfn)
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/irq.c|151| <<kvm_inject_pending_timer_irqs>> kvm_xen_inject_timer_irqs(vcpu);
++ */
+ void kvm_xen_inject_timer_irqs(struct kvm_vcpu *vcpu)
+ {
+ 	if (atomic_read(&vcpu->arch.xen.timer_pending) > 0) {
+@@ -173,6 +194,12 @@ static void kvm_xen_init_timer(struct kvm_vcpu *vcpu)
+ 	vcpu->arch.xen.timer.function = xen_timer_callback;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/xen.c|471| <<kvm_xen_update_runstate>> kvm_xen_update_runstate_guest(v, state == RUNSTATE_runnable);
++ *   - arch/x86/kvm/xen.c|800| <<kvm_xen_vcpu_set_attr>> kvm_xen_update_runstate_guest(vcpu, false);
++ *   - arch/x86/kvm/xen.c|896| <<kvm_xen_vcpu_set_attr>> kvm_xen_update_runstate_guest(vcpu, false);
++ */
+ static void kvm_xen_update_runstate_guest(struct kvm_vcpu *v, bool atomic)
+ {
+ 	struct kvm_vcpu_xen *vx = &v->arch.xen;
+@@ -440,6 +467,13 @@ static void kvm_xen_update_runstate_guest(struct kvm_vcpu *v, bool atomic)
+ 		mark_page_dirty_in_slot(v->kvm, gpc2->memslot, gpc2->gpa >> PAGE_SHIFT);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/xen.c|813| <<kvm_xen_vcpu_set_attr>> kvm_xen_update_runstate(vcpu, data->u.runstate.state);
++ *   - arch/x86/kvm/xen.c|894| <<kvm_xen_vcpu_set_attr>> kvm_xen_update_runstate(vcpu, data->u.runstate.state);
++ *   - arch/x86/kvm/xen.h|157| <<kvm_xen_runstate_set_running>> kvm_xen_update_runstate(vcpu, RUNSTATE_running);
++ *   - arch/x86/kvm/xen.h|172| <<kvm_xen_runstate_set_preempted>> kvm_xen_update_runstate(vcpu, RUNSTATE_runnable);
++ */
+ void kvm_xen_update_runstate(struct kvm_vcpu *v, int state)
+ {
+ 	struct kvm_vcpu_xen *vx = &v->arch.xen;
+@@ -471,6 +505,11 @@ void kvm_xen_update_runstate(struct kvm_vcpu *v, int state)
+ 		kvm_xen_update_runstate_guest(v, state == RUNSTATE_runnable);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/xen.c|550| <<kvm_xen_inject_pending_events>> kvm_xen_inject_vcpu_vector(v);
++ *   - arch/x86/kvm/xen.c|1644| <<kvm_xen_set_evtchn_fast>> kvm_xen_inject_vcpu_vector(vcpu);
++ */
+ static void kvm_xen_inject_vcpu_vector(struct kvm_vcpu *v)
+ {
+ 	struct kvm_lapic_irq irq = { };
+@@ -601,6 +640,10 @@ int __kvm_xen_has_interrupt(struct kvm_vcpu *v)
+ 	return rc;
+ }
+ 
++/*
++ * 处理KVM_XEN_HVM_SET_ATTR:
++ *   - arch/x86/kvm/x86.c|7003| <<kvm_arch_vm_ioctl(KVM_XEN_HVM_SET_ATTR)>> r = kvm_xen_hvm_set_attr(kvm, &xha);
++ */
+ int kvm_xen_hvm_set_attr(struct kvm *kvm, struct kvm_xen_hvm_attr *data)
+ {
+ 	int r = -ENOENT;
+@@ -711,6 +754,10 @@ int kvm_xen_hvm_get_attr(struct kvm *kvm, struct kvm_xen_hvm_attr *data)
+ 	return r;
+ }
+ 
++/*
++ * 处理KVM_XEN_VCPU_SET_ATTR:
++ *   - arch/x86/kvm/x86.c|6044| <<kvm_arch_vcpu_ioctl(KVM_XEN_VCPU_SET_ATTR)>> r = kvm_xen_vcpu_set_attr(vcpu, &xva);
++ */
+ int kvm_xen_vcpu_set_attr(struct kvm_vcpu *vcpu, struct kvm_xen_vcpu_attr *data)
+ {
+ 	int idx, r = -ENOENT;
+@@ -1038,6 +1085,10 @@ int kvm_xen_vcpu_get_attr(struct kvm_vcpu *vcpu, struct kvm_xen_vcpu_attr *data)
+ 	return r;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|3635| <<kvm_set_msr_common>> return kvm_xen_write_hypercall_page(vcpu, data);
++ */
+ int kvm_xen_write_hypercall_page(struct kvm_vcpu *vcpu, u64 data)
+ {
+ 	struct kvm *kvm = vcpu->kvm;
+@@ -1109,6 +1160,10 @@ int kvm_xen_write_hypercall_page(struct kvm_vcpu *vcpu, u64 data)
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|6983| <<kvm_arch_vm_ioctl(KVM_XEN_HVM_CONFIG)>> r = kvm_xen_hvm_config(kvm, &xhc);
++ */
+ int kvm_xen_hvm_config(struct kvm *kvm, struct kvm_xen_hvm_config *xhc)
+ {
+ 	/* Only some feature flags need to be *enabled* by userspace */
+@@ -1146,6 +1201,10 @@ static int kvm_xen_hypercall_set_result(struct kvm_vcpu *vcpu, u64 result)
+ 	return kvm_skip_emulated_instruction(vcpu);
+ }
+ 
++/*
++ * 在以下使用kvm_xen_hypercall_complete_userspace():
++ *   - vcpu->arch.complete_userspace_io = kvm_xen_hypercall_complete_userspace;
++ */
+ static int kvm_xen_hypercall_complete_userspace(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_run *run = vcpu->run;
+@@ -1431,6 +1490,10 @@ static bool kvm_xen_hcall_set_timer_op(struct kvm_vcpu *vcpu, uint64_t timeout,
+ 	return true;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|9823| <<kvm_emulate_hypercall>> return kvm_xen_hypercall(vcpu);
++ */
+ int kvm_xen_hypercall(struct kvm_vcpu *vcpu)
+ {
+ 	bool longmode;
+@@ -2103,6 +2166,10 @@ void kvm_xen_update_tsc_info(struct kvm_vcpu *vcpu)
+ 		entry->eax = vcpu->arch.hw_tsc_khz;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|12361| <<kvm_arch_init_vm>> kvm_xen_init_vm(kvm);
++ */
+ void kvm_xen_init_vm(struct kvm *kvm)
+ {
+ 	mutex_init(&kvm->arch.xen.xen_lock);
+@@ -2110,6 +2177,10 @@ void kvm_xen_init_vm(struct kvm *kvm)
+ 	kvm_gpc_init(&kvm->arch.xen.shinfo_cache, kvm, NULL, KVM_HOST_USES_PFN);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|12508| <<kvm_arch_destroy_vm>> kvm_xen_destroy_vm(kvm);
++ */
+ void kvm_xen_destroy_vm(struct kvm *kvm)
+ {
+ 	struct evtchnfd *evtchnfd;
+diff --git a/drivers/clocksource/arm_arch_timer.c b/drivers/clocksource/arm_arch_timer.c
+index 7dd2c615b..df8cde5af 100644
+--- a/drivers/clocksource/arm_arch_timer.c
++++ b/drivers/clocksource/arm_arch_timer.c
+@@ -59,6 +59,12 @@
+  */
+ #define MIN_ROLLOVER_SECS	(40ULL * 365 * 24 * 3600)
+ 
++/*
++ * 在以下修改arch_timers_present:
++ *   - drivers/clocksource/arm_arch_timer.c|1409| <<arch_timer_of_init>> arch_timers_present |= ARCH_TIMER_TYPE_CP15;
++ *   - drivers/clocksource/arm_arch_timer.c|1566| <<arch_timer_mem_frame_register>> arch_timers_present |= ARCH_TIMER_TYPE_MEM;
++ *   - drivers/clocksource/arm_arch_timer.c|1734| <<arch_timer_acpi_init>> arch_timers_present |= ARCH_TIMER_TYPE_CP15
++ */
+ static unsigned arch_timers_present __initdata;
+ 
+ struct arch_timer {
+@@ -83,6 +89,17 @@ static const char *arch_timer_ppi_names[ARCH_TIMER_MAX_TIMER_PPI] = {
+ 
+ static struct clock_event_device __percpu *arch_timer_evt;
+ 
++/*
++ * 5.4的例子.
++ *
++ * crash> arch_timer_uses_ppi
++ * arch_timer_uses_ppi = $1 = ARCH_TIMER_HYP_PPI
++ *
++ * 在以下使用arch_timer_uses_ppi:
++ *   - drivers/clocksource/arm_arch_timer.c|1438| <<arch_timer_of_init>> arch_timer_uses_ppi = ARCH_TIMER_PHYS_SECURE_PPI;
++ *   - drivers/clocksource/arm_arch_timer.c|1440| <<arch_timer_of_init>> arch_timer_uses_ppi = arch_timer_select_ppi();
++ *   - drivers/clocksource/arm_arch_timer.c|1762| <<arch_timer_acpi_init>> arch_timer_uses_ppi = arch_timer_select_ppi();
++ */
+ static enum arch_timer_ppi_nr arch_timer_uses_ppi __ro_after_init = ARCH_TIMER_VIRT_PPI;
+ static bool arch_timer_c3stop __ro_after_init;
+ static bool arch_timer_mem_use_virtual __ro_after_init;
+@@ -662,6 +679,13 @@ static bool arch_timer_counter_has_wa(void)
+ #define arch_timer_counter_has_wa()			({false;})
+ #endif /* CONFIG_ARM_ARCH_TIMER_OOL_WORKAROUND */
+ 
++/*
++ * called by:
++ *   - drivers/clocksource/arm_arch_timer.c|685| <<arch_timer_handler_virt>> return timer_handler(ARCH_TIMER_VIRT_ACCESS, evt);
++ *   - drivers/clocksource/arm_arch_timer.c|692| <<arch_timer_handler_phys>> return timer_handler(ARCH_TIMER_PHYS_ACCESS, evt);
++ *   - drivers/clocksource/arm_arch_timer.c|699| <<arch_timer_handler_phys_mem>> return timer_handler(ARCH_TIMER_MEM_PHYS_ACCESS, evt);
++ *   - drivers/clocksource/arm_arch_timer.c|706| <<arch_timer_handler_virt_mem>> return timer_handler(ARCH_TIMER_MEM_VIRT_ACCESS, evt);
++ */
+ static __always_inline irqreturn_t timer_handler(const int access,
+ 					struct clock_event_device *evt)
+ {
+@@ -738,6 +762,11 @@ static int arch_timer_shutdown_phys_mem(struct clock_event_device *clk)
+ 	return arch_timer_shutdown(ARCH_TIMER_MEM_PHYS_ACCESS, clk);
+ }
+ 
++/*
++ * 在以下使用set_next_event():
++ *   - drivers/clocksource/arm_arch_timer.c|787| <<arch_timer_set_next_event_virt>> set_next_event(ARCH_TIMER_VIRT_ACCESS, evt, clk);
++ *   - drivers/clocksource/arm_arch_timer.c|794| <<arch_timer_set_next_event_phys>> set_next_event(ARCH_TIMER_PHYS_ACCESS, evt, clk);
++ */
+ static __always_inline void set_next_event(const int access, unsigned long evt,
+ 					   struct clock_event_device *clk)
+ {
+@@ -1097,6 +1126,10 @@ struct arch_timer_kvm_info *arch_timer_get_kvm_info(void)
+ 	return &arch_timer_kvm_info;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/clocksource/arm_arch_timer.c|1355| <<arch_timer_common_init>> arch_counter_register(arch_timers_present);
++ */
+ static void __init arch_counter_register(unsigned type)
+ {
+ 	u64 (*scr)(void);
+@@ -1225,6 +1258,11 @@ static int __init arch_timer_register(void)
+ 	}
+ 
+ 	ppi = arch_timer_ppi[arch_timer_uses_ppi];
++	/*
++	 * 5.4的KVM的例子.
++	 * crash> arch_timer_uses_ppi
++	 * arch_timer_uses_ppi = $4 = ARCH_TIMER_HYP_PPI
++	 */
+ 	switch (arch_timer_uses_ppi) {
+ 	case ARCH_TIMER_VIRT_PPI:
+ 		err = request_percpu_irq(ppi, arch_timer_handler_virt,
+diff --git a/tools/testing/selftests/kvm/memslot_modification_stress_test.c b/tools/testing/selftests/kvm/memslot_modification_stress_test.c
+index 9855c41ca..7e1dfb69d 100644
+--- a/tools/testing/selftests/kvm/memslot_modification_stress_test.c
++++ b/tools/testing/selftests/kvm/memslot_modification_stress_test.c
+@@ -62,6 +62,10 @@ struct memslot_antagonist_args {
+ 	uint64_t nr_modifications;
+ };
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/memslot_modification_stress_test.c|108| <<run_test>> add_remove_memslot(vm, p->delay, p->nr_iterations);
++ */
+ static void add_remove_memslot(struct kvm_vm *vm, useconds_t delay,
+ 			       uint64_t nr_modifications)
+ {
+-- 
+2.34.1
+

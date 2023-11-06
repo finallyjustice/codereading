@@ -1,0 +1,161 @@
+https://lore.kernel.org/qemu-devel/20231005092926.56231-1-vsementsov@yandex-team.ru/
+
+... from Vladimir Sementsov-Ogievskiy <vsementsov@yandex-team.ru> ...
+
+https://lore.kernel.org/qemu-devel/20231005092926.56231-1-vsementsov@yandex-team.ru/
+
+---------------------------
+
+patchset的核心思想是两件事情:
+
+1. 引入新的qmp query来访问PCI设备的状态, 可以知道hotplug的进度.
+
+2. 引入新的event, 通知host.
+
+---------------------------
+
+[PATCH v8 1/4] qapi/qdev.json: unite DEVICE_* event data into single structure
+
+过去DEVICE_DELETED的类型是分开返回的: str + str.
+
+引入新的类型返回str + str
+
++{ 'struct': 'DeviceAndPath',
++  'data': { '*device': 'str', 'path': 'str' } }
+
+-{ 'event': 'DEVICE_DELETED',
+-  'data': { '*device': 'str', 'path': 'str' } }
++{ 'event': 'DEVICE_DELETED', 'data': 'DeviceAndPath' }
+
+下面的patch应该用到DeviceAndPath (这个patch只修改qapi/qdev.json)
+
+---------------------------
+
+[PATCH v8 2/4] qapi: add DEVICE_ON and query-hotplug infrastructure
+
+主要分为两个部分.
+
+
+1. 引入qmp_x_query_hotplug()返回当前hot-add的状态.
+
++HotplugInfo *qmp_x_query_hotplug(const char *id, Error **errp)
++{
++    DeviceState *dev = find_device_state(id, errp);
++    HotplugHandler *hotplug_ctrl;
++
++    if (!dev) {
++        return NULL;
++    }
++
++    if (dev->parent_bus && !qbus_is_hotpluggable(dev->parent_bus)) {
++        error_setg(errp, QERR_BUS_NO_HOTPLUG, dev->parent_bus->name);
++        return NULL;
++    }
++
++    if (!DEVICE_GET_CLASS(dev)->hotpluggable) {
++        error_setg(errp, QERR_DEVICE_NO_HOTPLUG,
++                   object_get_typename(OBJECT(dev)));
++        return NULL;
++    }
++
++    hotplug_ctrl = qdev_get_hotplug_handler(dev);
++    /*
++     * hotpluggable device MUST have HotplugHandler, if it doesn't
++     * then something is very wrong with it.
++     */
++    g_assert(hotplug_ctrl);
++
++    return hotplug_handler_get_state(hotplug_ctrl, dev, errp);
++}
+
+
+2. 引入心的API (以后的patch调用), 发送QEMU EVENT 'X_EVENT_ON'来通知让host知道"guest是不是on了设备".
+
+Emitted whenever the device insertion completion is acknowledged by
+the guest.  For now only emitted for SHPC and PCIe-native hotplug.
+
++void qdev_hotplug_device_on_event(DeviceState *dev)
++{
++    if (dev->device_on_event_sent) {
++        return;
++    }
++
++    dev->device_on_event_sent = true;
++    qapi_event_send_x_device_on(dev->id, dev->canonical_path);
++}
+
++# @X_DEVICE_ON:
++#
++# Emitted whenever the device insertion completion is acknowledged by
++# the guest.  For now only emitted for SHPC and PCIe-native hotplug.
++#
++# Since: 8.2
++##
++{ 'event': 'X_DEVICE_ON', 'data': 'DeviceAndPath' }
+
+---------------------------
+
+[PATCH v8 3/4] shpc: implement DEVICE_ON event and query-hotplug
+
+这个patch主要为SHPC(Standard Hot Plug Controller)干两个工作.
+
+1. 实现hc->get_hotplug_state().
+
+diff --git a/hw/pci-bridge/pcie_pci_bridge.c b/hw/pci-bridge/pcie_pci_bridge.c
+index 2301b2ca0b..959b536303 100644
+--- a/hw/pci-bridge/pcie_pci_bridge.c
++++ b/hw/pci-bridge/pcie_pci_bridge.c
+@@ -157,6 +157,7 @@ static void pcie_pci_bridge_class_init(ObjectClass *klass, void *data)
+     hc->plug = pci_bridge_dev_plug_cb;
+     hc->unplug = pci_bridge_dev_unplug_cb;
+     hc->unplug_request = pci_bridge_dev_unplug_request_cb;
++    hc->get_hotplug_state = pci_bridge_dev_get_hotplug_state;
+ }
+
+2. 在shpc_slot_command()调用qdev_hotplug_device_on_event()
+
+@@ -313,6 +358,12 @@ static void shpc_slot_command(PCIDevice *d, uint8_t target,
+             SHPC_SLOT_EVENT_MRL |
+             SHPC_SLOT_EVENT_PRESENCE;
+     }
++
++    if (!shpc_slot_is_on(old_state, old_power, old_attn) &&
++        shpc_slot_is_on(state, power, attn) && child_dev)
++    {
++        qdev_hotplug_device_on_event(child_dev);
++    }
+ }
+
+---------------------------
+
+[PATCH v8 4/4] pcie: implement DEVICE_ON event and query-hotplug
+
+这个patch主要为PCIe slot干两个工作.
+
+1. 实现hc->get_hotplug_state()
+
+diff --git a/hw/pci/pcie_port.c b/hw/pci/pcie_port.c
+index 20ff2b39e8..91e53c269c 100644
+--- a/hw/pci/pcie_port.c
++++ b/hw/pci/pcie_port.c
+@@ -234,6 +234,7 @@ static void pcie_slot_class_init(ObjectClass *oc, void *data)
+     hc->unplug = pcie_cap_slot_unplug_cb;
+     hc->unplug_request = pcie_cap_slot_unplug_request_cb;
+     hc->is_hotpluggable_bus = pcie_slot_is_hotpluggbale_bus;
++    hc->get_hotplug_state = pcie_cap_slot_get_hotplug_state;
+ }
+
+2. 在pcie_cap_slot_write_config()调用qdev_hotplug_device_on_event()
+
+@@ -779,6 +829,12 @@ void pcie_cap_slot_write_config(PCIDevice *dev,
+                         sltsta);
+     }
+
++    if ((sltsta & PCI_EXP_SLTSTA_PDS) && pcie_sltctl_powered_on(val) &&
++        !pcie_sltctl_powered_on(old_slt_ctl) && child_dev)
++    {
++        qdev_hotplug_device_on_event(child_dev);
++    }
++
+
+---------------------------
