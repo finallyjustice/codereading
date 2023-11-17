@@ -1,0 +1,165 @@
+[PATCH v2 0/6] KVM: x86/pmu: Clean up emulated PMC event handling
+
+... from Sean Christopherson <seanjc@google.com> ...
+
+https://lore.kernel.org/all/20231103230541.352265-1-seanjc@google.com/
+
+--------------------------
+
+The ultimate goal of this series is to track emulated counter events using
+a dedicated variable instead of trying to track the previous counter value.
+Tracking the previous counter value is flawed as it takes a snapshot at
+every emulated event, but only checks for overflow prior to VM-Enter, i.e.
+KVM could miss an overflow if KVM ever supports emulating event types that
+can occur multiple times in a single VM-Exit.
+
+--------------------------
+
+[PATCH v2 1/6] KVM: x86/pmu: Move PMU reset logic to common x86 code
+
+把amd和intel共同的code放进kvm_pmu_reset(),
+最后再通过static_call_cond(kvm_x86_pmu_reset)(vcpu)调用那些不共同的code.
+
+ void kvm_pmu_reset(struct kvm_vcpu *vcpu)
+ {
+-	static_call(kvm_x86_pmu_reset)(vcpu);
++	struct kvm_pmu *pmu = vcpu_to_pmu(vcpu);
++	struct kvm_pmc *pmc;
++	int i;
++
++	bitmap_zero(pmu->reprogram_pmi, X86_PMC_IDX_MAX);
++
++	for_each_set_bit(i, pmu->all_valid_pmc_idx, X86_PMC_IDX_MAX) {
++		pmc = static_call(kvm_x86_pmu_pmc_idx_to_pmc)(pmu, i);
++		if (!pmc)
++			continue;
++
++		pmc_stop_counter(pmc);
++		pmc->counter = 0;
++
++		if (pmc_is_gp(pmc))
++			pmc->eventsel = 0;
++	}
++
++	pmu->fixed_ctr_ctrl = pmu->global_ctrl = pmu->global_status = 0;
++
++	static_call_cond(kvm_x86_pmu_reset)(vcpu);
+ }
+
+--------------------------
+
+[PATCH v2 2/6] KVM: x86/pmu: Reset the PMU, i.e. stop counters, before refreshing
+
+核心思想是在kvm_pmu_refresh()中别忘记了kvm_pmu_reset()
+
++void kvm_pmu_refresh(struct kvm_vcpu *vcpu)
++{
++	if (KVM_BUG_ON(kvm_vcpu_has_run(vcpu), vcpu->kvm))
++		return;
++
++	/*
++	 * Stop/release all existing counters/events before realizing the new
++	 * vPMU model.
++	 */
++	kvm_pmu_reset(vcpu);
++
++	bitmap_zero(vcpu_to_pmu(vcpu)->all_valid_pmc_idx, X86_PMC_IDX_MAX);
++	static_call(kvm_x86_pmu_refresh)(vcpu);
++}
+
+记得设置pmu->need_cleanup = false. 否则可能会有corner case.
+
+ void kvm_pmu_reset(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_pmu *pmu = vcpu_to_pmu(vcpu);
+ 	struct kvm_pmc *pmc;
+ 	int i;
+
++	pmu->need_cleanup = false;
++
+ 	bitmap_zero(pmu->reprogram_pmi, X86_PMC_IDX_MAX);
+
+--------------------------
+
+[PATCH v2 3/6] KVM: x86/pmu: Stop calling kvm_pmu_reset() at RESET (it's redundant)
+
+核心思想是不在kvm_vcpu_reset() reset pmu了.
+
+@@ -12207,7 +12207,6 @@ void kvm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
+ 	}
+
+ 	if (!init_event) {
+-		kvm_pmu_reset(vcpu);
+ 		vcpu->arch.smbase = 0x30000;
+
+ 		vcpu->arch.msr_misc_features_enables = 0;
+
+--------------------------
+
+[PATCH v2 4/6] KVM: x86/pmu: Remove manual clearing of fields in kvm_pmu_init()
+
+kvm_x86_pmu_init()应该是不会修改pmu->event_count或者pmu->need_cleanup的.
+
+否则是bug.
+
+diff --git a/arch/x86/kvm/pmu.c b/arch/x86/kvm/pmu.c
+index 458e836c6efe..c06090196b00 100644
+--- a/arch/x86/kvm/pmu.c
++++ b/arch/x86/kvm/pmu.c
+@@ -710,8 +710,6 @@ void kvm_pmu_init(struct kvm_vcpu *vcpu)
+
+ 	memset(pmu, 0, sizeof(*pmu));
+ 	static_call(kvm_x86_pmu_init)(vcpu);
+-	pmu->event_count = 0;
+-	pmu->need_cleanup = false;
+ 	kvm_pmu_refresh(vcpu);
+ }
+
+--------------------------
+
+[PATCH v2 5/6] KVM: x86/pmu: Update sample period in pmc_write_counter()
+
+过去有几个地方调用pmc_update_sample_period(pmc), 现在都放进pmc_write_counter().
+
+这些过去的caller都调用pmc_write_counter().
+
++void pmc_write_counter(struct kvm_pmc *pmc, u64 val)
++{
++	pmc->counter += val - pmc_read_counter(pmc);
++	pmc->counter &= pmc_bitmask(pmc);
++	pmc_update_sample_period(pmc);
++}
++EXPORT_SYMBOL_GPL(pmc_write_counter);
+
+--------------------------
+
+[PATCH v2 6/6] KVM: x86/pmu: Track emulated counter events instead of previous counter
+
+把prev_counter换成emulated_counter, 用于记录有多少个counter是emulate instruction产生的.
+
+@@ -500,8 +500,23 @@ struct kvm_pmc {
+ 	u8 idx;
+ 	bool is_paused;
+ 	bool intr;
++	/*
++	 * Base value of the PMC counter, relative to the *consumed* count in
++	 * the associated perf_event.  This value includes counter updates from
++	 * the perf_event and emulated_count since the last time the counter
++	 * was reprogrammed, but it is *not* the current value as seen by the
++	 * guest or userspace.
++	 *
++	 * The count is relative to the associated perf_event so that KVM
++	 * doesn't need to reprogram the perf_event every time the guest writes
++	 * to the counter.
++	 */
+ 	u64 counter;
+-	u64 prev_counter;
++	/*
++	 * PMC events triggered by KVM emulation that haven't been fully
++	 * processed, i.e. haven't undergone overflow detection.
++	 */
++	u64 emulated_counter;
+
+--------------------------
+
+
