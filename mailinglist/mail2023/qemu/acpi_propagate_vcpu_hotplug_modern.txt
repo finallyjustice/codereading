@@ -1,0 +1,70 @@
+[PATCH] hw/acpi: propagate vcpu hotplug after switch to modern interface
+
+... from Aaron Young <Aaron.Young@oracle.com> ...
+
+https://lore.kernel.org/all/0e8a9baebbb29f2a6c87fd08e43dc2ac4019759a.1702398644.git.Aaron.Young@oracle.com/
+
+---------------------------
+
+猜测patch是要修复UEFI的使用hotplug的问题. 那个时候应该还是用legacy, 但是因为超过了255个vCPU, 不支持.
+
+所以在acpi_set_cpu_present_bit()传出来一个参数. 如果是modern,就用hotplug_handler_plug()
+
+
+ void legacy_acpi_cpu_plug_cb(HotplugHandler *hotplug_dev,
+                              AcpiCpuHotplug *g, DeviceState *dev, Error **errp)
+ {
+-    acpi_set_cpu_present_bit(g, CPU(dev));
+-    acpi_send_event(DEVICE(hotplug_dev), ACPI_CPU_HOTPLUG_STATUS);
++    bool swtchd_to_modern;
++    Error *local_err = NULL;
++
++    acpi_set_cpu_present_bit(g, CPU(dev), &swtchd_to_modern);
++    if (swtchd_to_modern) {
++        /* propagate the hotplug to the modern interface */
++        hotplug_handler_plug(hotplug_dev, dev, &local_err);
++    } else {
++        acpi_send_event(DEVICE(hotplug_dev), ACPI_CPU_HOTPLUG_STATUS);
++    }
+ }
+
+
+因为没用UEFI, 所以用modern收了个callback.
+
+在acpi_set_cpu_present_bit()设置了break, 但是没有生效.
+
+只能在acpi_cpu_plug_cb()上break modern的方式.
+
+(gdb) bt
+#0  acpi_cpu_plug_cb (hotplug_dev=0x55555726e350, cpu_st=0x55555726fb90, dev=0x555556d8c520, errp=0x7fffffffc438) at ../hw/acpi/cpu.c:255
+#1  0x00005555558ca4d7 in ich9_pm_device_plug_cb (hotplug_dev=0x55555726e350, dev=0x555556d8c520, errp=0x7fffffffc438) at ../hw/acpi/ich9.c:514
+#2  0x0000555555db4fa9 in hotplug_handler_plug (plug_handler=0x55555726e350, plugged_dev=0x555556d8c520, errp=0x7fffffffc438) at ../hw/core/hotplug.c:34
+#3  0x0000555555be65c7 in x86_cpu_plug (hotplug_dev=0x555556c45bf0, dev=0x555556d8c520, errp=0x7fffffffc530) at ../hw/i386/x86.c:207
+#4  0x0000555555c106a0 in pc_machine_device_plug_cb (hotplug_dev=0x555556c45bf0, dev=0x555556d8c520, errp=0x7fffffffc530) at ../hw/i386/pc.c:1533
+#5  0x0000555555db4fa9 in hotplug_handler_plug (plug_handler=0x555556c45bf0, plugged_dev=0x555556d8c520, errp=0x7fffffffc530) at ../hw/core/hotplug.c:34
+#6  0x0000555555db0d98 in device_set_realized (obj=0x555556d8c520, value=true, errp=0x7fffffffc870) at ../hw/core/qdev.c:567
+#7  0x0000555555dba87e in property_set_bool (obj=0x555556d8c520, v=0x5555572fdab0, name=0x5555561c8379 "realized", opaque=0x555556a108b0, errp=0x7fffffffc870) at ../qom/object.c:2285
+#8  0x0000555555db88c5 in object_property_set (obj=0x555556d8c520, name=0x5555561c8379 "realized", v=0x5555572fdab0, errp=0x7fffffffc870) at ../qom/object.c:1420
+#9  0x0000555555dbcc70 in object_property_set_qobject (obj=0x555556d8c520, name=0x5555561c8379 "realized", value=0x5555572fd960, errp=0x7fffffffc870) at ../qom/qom-qobject.c:28
+#10 0x0000555555db8c2a in object_property_set_bool (obj=0x555556d8c520, name=0x5555561c8379 "realized", value=true, errp=0x7fffffffc870) at ../qom/object.c:1489
+#11 0x0000555555db0395 in qdev_realize (dev=0x555556d8c520, bus=0x0, errp=0x7fffffffc870) at ../hw/core/qdev.c:292
+#12 0x0000555555b2d627 in qdev_device_add_from_qdict (opts=0x555556cae200, from_json=false, errp=0x7fffffffc870) at ../softmmu/qdev-monitor.c:714
+#13 0x0000555555b2d6c5 in qdev_device_add (opts=0x55555766e360, errp=0x7fffffffc870) at ../softmmu/qdev-monitor.c:733
+#14 0x0000555555b2dcd9 in qmp_device_add (qdict=0x555556ca9600, ret_data=0x0, errp=0x7fffffffc870) at ../softmmu/qdev-monitor.c:855
+#15 0x0000555555b2e0e9 in hmp_device_add (mon=0x555556c631d0, qdict=0x555556ca9600) at ../softmmu/qdev-monitor.c:963
+#16 0x0000555555b84d21 in handle_hmp_command_exec (mon=0x555556c631d0, cmd=0x55555689eda0 <hmp_cmds+1920>, qdict=0x555556ca9600) at ../monitor/hmp.c:1106
+#17 0x0000555555b84f4e in handle_hmp_command (mon=0x555556c631d0, cmdline=0x555556c962fb "host-x86_64-cpu,id=core6,socket-id=0,core-id=6,thread-id=0") at ../monitor/hmp.c:1158
+#18 0x0000555555b8243a in monitor_command_cb (opaque=0x555556c631d0, cmdline=0x555556c962f0 "device_add host-x86_64-cpu,id=core6,socket-id=0,core-id=6,thread-id=0", readline_opaque=0x0) at ../monitor/hmp.c:47
+#19 0x0000555555fcd18c in readline_handle_byte (rs=0x555556c962f0, ch=13) at ../util/readline.c:419
+#20 0x0000555555b859f9 in monitor_read (opaque=0x555556c631d0, buf=0x7fffffffcad0 "\r\320\377\377\377\177", size=1) at ../monitor/hmp.c:1390
+#21 0x0000555555ed4e59 in qemu_chr_be_write_impl (s=0x555556c59fe0, buf=0x7fffffffcad0 "\r\320\377\377\377\177", len=1) at ../chardev/char.c:202
+#22 0x0000555555ed4ebd in qemu_chr_be_write (s=0x555556c59fe0, buf=0x7fffffffcad0 "\r\320\377\377\377\177", len=1) at ../chardev/char.c:214
+#23 0x0000555555ed786a in fd_chr_read (chan=0x555556c5a0a0, cond=G_IO_IN, opaque=0x555556c59fe0) at ../chardev/char-fd.c:72
+#24 0x0000555555dc9a0c in qio_channel_fd_source_dispatch (source=0x5555573140d0, callback=0x555555ed7740 <fd_chr_read>, user_data=0x555556c59fe0) at ../io/channel-watch.c:84
+#25 0x00007ffff69ef119 in g_main_context_dispatch () at /lib64/libglib-2.0.so.0
+#26 0x0000555555fb664b in glib_pollfds_poll () at ../util/main-loop.c:290
+#27 0x0000555555fb66c5 in os_host_main_loop_wait (timeout=499000000) at ../util/main-loop.c:313
+#28 0x0000555555fb67ca in main_loop_wait (nonblocking=0) at ../util/main-loop.c:592
+#29 0x0000555555b33a12 in qemu_main_loop () at ../softmmu/runstate.c:732
+#30 0x0000555555dac6a1 in qemu_default_main () at ../softmmu/main.c:37
+#31 0x0000555555dac6d7 in main (argc=20, argv=0x7fffffffdd98) at ../softmmu/main.c:48
