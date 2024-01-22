@@ -1,0 +1,1412 @@
+From 5a1e1726a739c3002bb4baf04bbcbcccc7250746 Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Sun, 21 Jan 2024 20:48:37 -0800
+Subject: [PATCH 1/1] linux-v6.7
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ arch/x86/include/asm/kvm_host.h               |  82 ++++++++
+ arch/x86/kvm/emulate.c                        |   4 +
+ arch/x86/kvm/lapic.c                          |  33 +++
+ arch/x86/kvm/mmu.h                            |  12 ++
+ arch/x86/kvm/mmu/mmu.c                        |  17 ++
+ arch/x86/kvm/mmu/tdp_mmu.c                    |   9 +
+ arch/x86/kvm/mmu/tdp_mmu.h                    |   9 +
+ arch/x86/kvm/smm.c                            | 190 ++++++++++++++++++
+ arch/x86/kvm/smm.h                            |  49 +++++
+ arch/x86/kvm/vmx/vmcs.h                       |  10 +
+ arch/x86/kvm/vmx/vmx.c                        |  34 ++++
+ arch/x86/kvm/x86.c                            | 135 +++++++++++++
+ arch/x86/kvm/x86.h                            |   9 +
+ kernel/smp.c                                  |   6 +
+ lib/nmi_backtrace.c                           |  21 ++
+ .../selftests/kvm/lib/x86_64/processor.c      |   9 +
+ tools/testing/selftests/kvm/x86_64/smm_test.c |  63 ++++++
+ virt/kvm/kvm_main.c                           |  15 ++
+ 18 files changed, 707 insertions(+)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index d70369823..df16e0984 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -91,6 +91,16 @@
+ #define KVM_REQ_PMU			KVM_ARCH_REQ(10)
+ #define KVM_REQ_PMI			KVM_ARCH_REQ(11)
+ #ifdef CONFIG_KVM_SMM
++/*
++ * 在以下使用KVM_REQ_SMI:
++ *   - arch/x86/kvm/smm.h|163| <<kvm_inject_smi>> kvm_make_request(KVM_REQ_SMI, vcpu);
++ *   - arch/x86/kvm/x86.c|5257| <<kvm_vcpu_ioctl_x86_get_vcpu_events>> if (kvm_check_request(KVM_REQ_SMI, vcpu))
++ *   - arch/x86/kvm/x86.c|10740| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_SMI, vcpu))
++ *   - arch/x86/kvm/x86.c|12998| <<kvm_vcpu_has_events>> if (kvm_test_request(KVM_REQ_SMI, vcpu) ||
++ *   - arch/x86/kvm/x86.c|13047| <<kvm_arch_dy_runnable>> kvm_test_request(KVM_REQ_SMI, vcpu) ||
++ *
++ * 处理的函数是process_smi()
++ */
+ #define KVM_REQ_SMI			KVM_ARCH_REQ(12)
+ #endif
+ #define KVM_REQ_MASTERCLOCK_UPDATE	KVM_ARCH_REQ(13)
+@@ -751,7 +761,32 @@ struct kvm_vcpu_arch {
+ 	int32_t apic_arb_prio;
+ 	int mp_state;
+ 	u64 ia32_misc_enable_msr;
++	/*
++	 * 在以下使用kvm_vcpu_arch->smbase:
++	 *   - arch/x86/kvm/smm.c|114| <<kvm_smm_changed>> trace_kvm_smm_transition(vcpu->vcpu_id, vcpu->arch.smbase, entering_smm);
++	 *   - arch/x86/kvm/smm.c|224| <<enter_smm_save_state_32>> smram->smbase = vcpu->arch.smbase;
++	 *   - arch/x86/kvm/smm.c|253| <<enter_smm_save_state_64>> smram->smbase = vcpu->arch.smbase;
++	 *   - arch/x86/kvm/smm.c|312| <<enter_smm>> if (kvm_vcpu_write_guest(vcpu, vcpu->arch.smbase + 0xfe00, &smram, sizeof(smram)))
++	 *   - arch/x86/kvm/smm.c|337| <<enter_smm>> cs.selector = (vcpu->arch.smbase >> 4) & 0xffff;
++	 *   - arch/x86/kvm/smm.c|338| <<enter_smm>> cs.base = vcpu->arch.smbase;
++	 *   - arch/x86/kvm/smm.c|579| <<emulator_leave_smm>> smbase = vcpu->arch.smbase;
++	 *   - arch/x86/kvm/smm.c|581| <<emulator_leave_smm>> ret = kvm_vcpu_read_guest(vcpu, smbase + 0xfe00, smram.bytes, sizeof(smram));
++	 *
++	 * 在以下设置kvm_vcpu_arch->smbase:
++	 *   - arch/x86/kvm/smm.c|503| <<rsm_load_state_32>> vcpu->arch.smbase = smstate->smbase;
++	 *   - arch/x86/kvm/smm.c|536| <<rsm_load_state_64>> vcpu->arch.smbase = smstate->smbase;
++	 *   - arch/x86/kvm/x86.c|3879| <<kvm_set_msr_common(MSR_IA32_SMBASE)>> vcpu->arch.smbase = data;
++	 *   - arch/x86/kvm/x86.c|4279| <<kvm_get_msr_common(MSR_IA32_SMBASE)>> msr_info->data = vcpu->arch.smbase;
++	 *   - arch/x86/kvm/x86.c|12211| <<kvm_vcpu_reset>> vcpu->arch.smbase = 0x30000;
++	 */
+ 	u64 smbase;
++	/*
++	 * 在以下使用kvm_vcpu_arch->smi_count:
++	 *   - arch/x86/kvm/x86.c|3910| <<kvm_set_msr_common(MSR_SMI_COUNT)>> vcpu->arch.smi_count = data;
++	 *   - arch/x86/kvm/x86.c|4282| <<kvm_get_msr_common(MSR_SMI_COUNT)>> msr_info->data = vcpu->arch.smi_count;
++	 *   - arch/x86/kvm/x86.c|10318| <<kvm_check_and_inject_events>> ++vcpu->arch.smi_count;
++	 *   - arch/x86/kvm/x86.c|12166| <<kvm_vcpu_reset>> vcpu->arch.smi_count = 0;
++	 */
+ 	u64 smi_count;
+ 	bool at_instruction_boundary;
+ 	bool tpr_access_reporting;
+@@ -900,10 +935,57 @@ struct kvm_vcpu_arch {
+ 	u64 l1_tsc_scaling_ratio;
+ 	u64 tsc_scaling_ratio; /* current scaling ratio */
+ 
++	/*
++	 * 在以下使用kvm_vcpu_arch->nmi_queued:
++	 *   - arch/x86/kvm/x86.c|820| <<kvm_inject_nmi>> atomic_inc(&vcpu->arch.nmi_queued);
++	 *   - arch/x86/kvm/x86.c|5412| <<kvm_vcpu_ioctl_x86_set_vcpu_events>> atomic_set(&vcpu->arch.nmi_queued, events->nmi.pending);
++	 *   - arch/x86/kvm/x86.c|10439| <<process_nmi>> vcpu->arch.nmi_pending += atomic_xchg(&vcpu->arch.nmi_queued, 0);
++	 *   - arch/x86/kvm/x86.c|12193| <<kvm_vcpu_reset>> atomic_set(&vcpu->arch.nmi_queued, 0);
++	 */
+ 	atomic_t nmi_queued;  /* unprocessed asynchronous NMIs */
+ 	/* Number of NMIs pending injection, not including hardware vNMIs. */
++	/*
++	 * 在以下设置kvm_vcpu_arch->nmi_pending:
++	 *   - arch/x86/kvm/svm/nested.c|671| <<nested_vmcb02_prepare_control>> svm->vcpu.arch.nmi_pending++;
++	 *   - arch/x86/kvm/svm/nested.c|1093| <<nested_svm_vmexit>> vcpu->arch.nmi_pending--;
++	 *   - arch/x86/kvm/vmx/nested.c|4175| <<vmx_check_nested_events>> vcpu->arch.nmi_pending = 0;
++	 *   - arch/x86/kvm/x86.c|5418| <<kvm_vcpu_ioctl_x86_set_vcpu_events>> vcpu->arch.nmi_pending = 0;
++	 *   - arch/x86/kvm/x86.c|10375| <<kvm_check_and_inject_events>> --vcpu->arch.nmi_pending;
++	 *   - arch/x86/kvm/x86.c|10471| <<process_nmi>> vcpu->arch.nmi_pending += atomic_xchg(&vcpu->arch.nmi_queued, 0);
++	 *   - arch/x86/kvm/x86.c|10472| <<process_nmi>> vcpu->arch.nmi_pending = min(vcpu->arch.nmi_pending, limit);
++	 *   - arch/x86/kvm/x86.c|10479| <<process_nmi>> vcpu->arch.nmi_pending--;
++	 *   - arch/x86/kvm/x86.c|12240| <<kvm_vcpu_reset>> vcpu->arch.nmi_pending = 0;
++	 */
+ 	unsigned int nmi_pending;
++	/*
++	 * 在以下使用kvm_vcpu_arch->nmi_injected:
++	 *   - arch/x86/kvm/svm/nested.c|1156| <<nested_svm_vmexit>> svm->vcpu.arch.nmi_injected = false;
++	 *   - arch/x86/kvm/svm/svm.c|2519| <<task_switch_interception>> vcpu->arch.nmi_injected = false;
++	 *   - arch/x86/kvm/svm/svm.c|4024| <<svm_complete_interrupts>> vcpu->arch.nmi_injected = false;
++	 *   - arch/x86/kvm/svm/svm.c|4041| <<svm_complete_interrupts>> vcpu->arch.nmi_injected = true;
++	 *   - arch/x86/kvm/vmx/nested.c|4803| <<nested_vmx_vmexit>> vcpu->arch.nmi_injected = false;
++	 *   - arch/x86/kvm/vmx/vmx.c|5699| <<handle_task_switch>> vcpu->arch.nmi_injected = false;
++	 *   - arch/x86/kvm/vmx/vmx.c|7068| <<__vmx_complete_interrupts>> vcpu->arch.nmi_injected = false;
++	 *   - arch/x86/kvm/vmx/vmx.c|7082| <<__vmx_complete_interrupts>> vcpu->arch.nmi_injected = true;
++	 *   - arch/x86/kvm/x86.c|5416| <<kvm_vcpu_ioctl_x86_set_vcpu_events>> vcpu->arch.nmi_injected = events->nmi.injected;
++	 *   - arch/x86/kvm/x86.c|10376| <<kvm_check_and_inject_events>> vcpu->arch.nmi_injected = true;
++	 *   - arch/x86/kvm/x86.c|12241| <<kvm_vcpu_reset>> vcpu->arch.nmi_injected = false;
++	 */
+ 	bool nmi_injected;    /* Trying to inject an NMI this entry */
++	/*
++	 * 在以下使用kvm_vcpu_arch->smi_pending:
++	 *   - arch/x86/kvm/smm.c|161| <<process_smi>> vcpu->arch.smi_pending = true;
++	 *   - arch/x86/kvm/svm/nested.c|1477| <<svm_check_nested_events>> if (vcpu->arch.smi_pending && !svm_smi_blocked(vcpu)) {
++	 *   - arch/x86/kvm/svm/svm.c|2421| <<svm_set_gif>> if (svm->vcpu.arch.smi_pending ||
++	 *   - arch/x86/kvm/vmx/nested.c|4156| <<vmx_check_nested_events>> if (vcpu->arch.smi_pending && !is_smm(vcpu)) {
++	 *   - arch/x86/kvm/x86.c|5325| <<kvm_vcpu_ioctl_x86_get_vcpu_events>> events->smi.pending = vcpu->arch.smi_pending;
++	 *   - arch/x86/kvm/x86.c|5423| <<kvm_vcpu_ioctl_x86_set_vcpu_events>> vcpu->arch.smi_pending = events->smi.pending;
++	 *   - arch/x86/kvm/x86.c|10316| <<kvm_check_and_inject_events>> if (vcpu->arch.smi_pending) {
++	 *   - arch/x86/kvm/x86.c|10321| <<kvm_check_and_inject_events>> vcpu->arch.smi_pending = false;
++	 *   - arch/x86/kvm/x86.c|11561| <<kvm_arch_vcpu_ioctl_set_mpstate>> if ((!kvm_apic_init_sipi_allowed(vcpu) || vcpu->arch.smi_pending) &&
++	 *   - arch/x86/kvm/x86.c|12176| <<kvm_vcpu_reset>> vcpu->arch.smi_pending = 0;
++	 *   - arch/x86/kvm/x86.c|12984| <<kvm_vcpu_has_events>> (vcpu->arch.smi_pending &&
++	 */
+ 	bool smi_pending;    /* SMI queued after currently running handler */
+ 	u8 handling_intr_from_guest;
+ 
+diff --git a/arch/x86/kvm/emulate.c b/arch/x86/kvm/emulate.c
+index 2673cd5c4..4ff672f7d 100644
+--- a/arch/x86/kvm/emulate.c
++++ b/arch/x86/kvm/emulate.c
+@@ -5134,6 +5134,10 @@ void init_decode_cache(struct x86_emulate_ctxt *ctxt)
+ 	ctxt->mem_read.end = 0;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|9116| <<x86_emulate_instruction>> r = x86_emulate_insn(ctxt);
++ */
+ int x86_emulate_insn(struct x86_emulate_ctxt *ctxt)
+ {
+ 	const struct x86_emulate_ops *ops = ctxt->ops;
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 245b20973..61aa0852d 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -817,6 +817,17 @@ static int __apic_accept_irq(struct kvm_lapic *apic, int delivery_mode,
+ 			     int vector, int level, int trig_mode,
+ 			     struct dest_map *dest_map);
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/hyperv.c|841| <<stimer_notify_direct>> return !kvm_apic_set_irq(vcpu, &irq, NULL);
++ *   - arch/x86/kvm/hyperv.c|2163| <<kvm_hv_send_ipi_to_many>> kvm_apic_set_irq(vcpu, &irq, NULL);
++ *   - arch/x86/kvm/irq_comm.c|77| <<kvm_irq_delivery_to_apic>> r += kvm_apic_set_irq(vcpu, irq, dest_map);
++ *   - arch/x86/kvm/irq_comm.c|99| <<kvm_irq_delivery_to_apic>> r = kvm_apic_set_irq(lowest, irq, dest_map);
++ *   - arch/x86/kvm/lapic.c|842| <<__pv_send_ipi>> count += kvm_apic_set_irq(vcpu, irq, NULL);
++ *   - arch/x86/kvm/lapic.c|1221| <<kvm_irq_delivery_to_apic_fast>> *r = kvm_apic_set_irq(src->vcpu, irq, dest_map);
++ *   - arch/x86/kvm/lapic.c|1234| <<kvm_irq_delivery_to_apic_fast>> *r += kvm_apic_set_irq(dst[i]->vcpu, irq, dest_map);
++ *   - arch/x86/kvm/x86.c|13381| <<kvm_arch_async_page_present>> kvm_apic_set_irq(vcpu, &irq, NULL);
++ */
+ int kvm_apic_set_irq(struct kvm_vcpu *vcpu, struct kvm_lapic_irq *irq,
+ 		     struct dest_map *dest_map)
+ {
+@@ -1202,6 +1213,12 @@ static inline bool kvm_apic_map_get_dest_lapic(struct kvm *kvm,
+ 	return true;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/irq_comm.c|55| <<kvm_irq_delivery_to_apic>> if (kvm_irq_delivery_to_apic_fast(kvm, src, irq, &r, dest_map))
++ *   - arch/x86/kvm/irq_comm.c|176| <<kvm_arch_set_irq_inatomic>> if (kvm_irq_delivery_to_apic_fast(kvm, NULL, &irq, &r, NULL))
++ *   - arch/x86/kvm/xen.c|509| <<kvm_xen_inject_vcpu_vector>> WARN_ON_ONCE(!kvm_irq_delivery_to_apic_fast(v->kvm, NULL, &irq, &r, NULL));
++ */
+ bool kvm_irq_delivery_to_apic_fast(struct kvm *kvm, struct kvm_lapic *src,
+ 		struct kvm_lapic_irq *irq, int *r, struct dest_map *dest_map)
+ {
+@@ -1285,6 +1302,11 @@ bool kvm_intr_is_single_vcpu_fast(struct kvm *kvm, struct kvm_lapic_irq *irq,
+  * Add a pending IRQ into lapic.
+  * Return 1 if successfully added and 0 if discarded.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|825| <<kvm_apic_set_irq>> return __apic_accept_irq(apic, irq->delivery_mode, irq->vector, irq->level, irq->trig_mode, dest_map);
++ *   - arch/x86/kvm/lapic.c|2771| <<kvm_apic_local_deliver>> r = __apic_accept_irq(apic, mode, vector, 1, trig_mode, NULL);
++ */
+ static int __apic_accept_irq(struct kvm_lapic *apic, int delivery_mode,
+ 			     int vector, int level, int trig_mode,
+ 			     struct dest_map *dest_map)
+@@ -1322,6 +1344,10 @@ static int __apic_accept_irq(struct kvm_lapic *apic, int delivery_mode,
+ 						       apic->regs + APIC_TMR);
+ 		}
+ 
++		/*
++		 * vmx_deliver_interrupt()
++		 * svm_deliver_interrupt()
++		 */
+ 		static_call(kvm_x86_deliver_interrupt)(apic, delivery_mode,
+ 						       trig_mode, vector);
+ 		break;
+@@ -2757,6 +2783,13 @@ int apic_has_pending_timer(struct kvm_vcpu *vcpu)
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|1881| <<kvm_apic_inject_pending_timer_irqs>> kvm_apic_local_deliver(apic, APIC_LVTT);
++ *   - arch/x86/kvm/lapic.c|2784| <<kvm_apic_nmi_wd_deliver>> kvm_apic_local_deliver(apic, APIC_LVT0);
++ *   - arch/x86/kvm/pmu.c|531| <<kvm_pmu_deliver_pmi>> kvm_apic_local_deliver(vcpu->arch.apic, APIC_LVTPC);
++ *   - arch/x86/kvm/x86.c|5198| <<kvm_vcpu_x86_set_ucna>> kvm_apic_local_deliver(vcpu->arch.apic, APIC_LVTCMCI);
++ */
+ int kvm_apic_local_deliver(struct kvm_lapic *apic, int lvt_type)
+ {
+ 	u32 reg = kvm_lapic_get_reg(apic, lvt_type);
+diff --git a/arch/x86/kvm/mmu.h b/arch/x86/kvm/mmu.h
+index bb8c86eef..707982ed0 100644
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@ -124,6 +124,11 @@ void kvm_mmu_sync_prev_roots(struct kvm_vcpu *vcpu);
+ void kvm_mmu_track_write(struct kvm_vcpu *vcpu, gpa_t gpa, const u8 *new,
+ 			 int bytes);
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu/mmu.c|4251| <<kvm_arch_async_page_ready>> r = kvm_mmu_reload(vcpu);
++ *   - arch/x86/kvm/x86.c|10929| <<vcpu_enter_guest>> r = kvm_mmu_reload(vcpu);
++ */
+ static inline int kvm_mmu_reload(struct kvm_vcpu *vcpu)
+ {
+ 	if (likely(vcpu->arch.mmu->root.hpa != INVALID_PAGE))
+@@ -302,6 +307,13 @@ static inline void kvm_update_page_stats(struct kvm *kvm, int level, int count)
+ gpa_t translate_nested_gpa(struct kvm_vcpu *vcpu, gpa_t gpa, u64 access,
+ 			   struct x86_exception *exception);
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu/mmu.c|4061| <<nonpaging_gva_to_gpa>> return kvm_translate_gpa(vcpu, mmu, vaddr, access, exception);
++ *   - arch/x86/kvm/mmu/paging_tmpl.h|379| <<FNAME(walk_addr_generic)>> real_gpa = kvm_translate_gpa(vcpu, mmu, gfn_to_gpa(table_gfn),
++ *   - arch/x86/kvm/mmu/paging_tmpl.h|448| <<FNAME(walk_addr_generic)>> real_gpa = kvm_translate_gpa(vcpu, mmu, gfn_to_gpa(gfn), access, &walker->fault);
++ *   - arch/x86/kvm/x86.c|891| <<load_pdptrs>> real_gpa = kvm_translate_gpa(vcpu, mmu, gfn_to_gpa(pdpt_gfn),
++ */
+ static inline gpa_t kvm_translate_gpa(struct kvm_vcpu *vcpu,
+ 				      struct kvm_mmu *mmu,
+ 				      gpa_t gpa, u64 access,
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index c57e181bb..f7ae1c93e 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -5459,6 +5459,19 @@ void kvm_mmu_after_set_cpuid(struct kvm_vcpu *vcpu)
+ 	KVM_BUG_ON(kvm_vcpu_has_run(vcpu), vcpu->kvm);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu/mmu.c|5453| <<kvm_mmu_after_set_cpuid>> kvm_mmu_reset_context(vcpu);
++ *   - arch/x86/kvm/smm.c|132| <<kvm_smm_changed>> kvm_mmu_reset_context(vcpu);
++ *   - arch/x86/kvm/smm.c|369| <<enter_smm>> kvm_mmu_reset_context(vcpu);
++ *   - arch/x86/kvm/vmx/nested.c|4661| <<nested_vmx_restore_host_state>> kvm_mmu_reset_context(vcpu);
++ *   - arch/x86/kvm/x86.c|962| <<kvm_post_set_cr0>> kvm_mmu_reset_context(vcpu);
++ *   - arch/x86/kvm/x86.c|1153| <<kvm_post_set_cr4>> kvm_mmu_reset_context(vcpu);
++ *   - arch/x86/kvm/x86.c|1780| <<set_efer>> kvm_mmu_reset_context(vcpu);
++ *   - arch/x86/kvm/x86.c|11698| <<__set_sregs>> kvm_mmu_reset_context(vcpu);
++ *   - arch/x86/kvm/x86.c|11742| <<__set_sregs2>> kvm_mmu_reset_context(vcpu);
++ *   - arch/x86/kvm/x86.c|12269| <<kvm_vcpu_reset>> kvm_mmu_reset_context(vcpu);
++ */
+ void kvm_mmu_reset_context(struct kvm_vcpu *vcpu)
+ {
+ 	kvm_mmu_unload(vcpu);
+@@ -5466,6 +5479,10 @@ void kvm_mmu_reset_context(struct kvm_vcpu *vcpu)
+ }
+ EXPORT_SYMBOL_GPL(kvm_mmu_reset_context);
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu.h|132| <<kvm_mmu_reload>> return kvm_mmu_load(vcpu);
++ */
+ int kvm_mmu_load(struct kvm_vcpu *vcpu)
+ {
+ 	int r;
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+index 6cd4dd631..e936e6a01 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -18,6 +18,15 @@ void kvm_mmu_init_tdp_mmu(struct kvm *kvm)
+ 	spin_lock_init(&kvm->arch.tdp_mmu_pages_lock);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu/tdp_mmu.c|79| <<kvm_tdp_mmu_put_root>> kvm_lockdep_assert_mmu_lock_held(kvm, shared);
++ *   - arch/x86/kvm/mmu/tdp_mmu.c|154| <<__for_each_tdp_mmu_root_yield_safe>> if (kvm_lockdep_assert_mmu_lock_held(_kvm, _shared) && \
++ *   - arch/x86/kvm/mmu/tdp_mmu.c|165| <<for_each_tdp_mmu_root_yield_safe>> if (!kvm_lockdep_assert_mmu_lock_held(_kvm, _shared)) { \
++ *   - arch/x86/kvm/mmu/tdp_mmu.c|177| <<for_each_tdp_mmu_root>> if (kvm_lockdep_assert_mmu_lock_held(_kvm, false) && \
++ *   - arch/x86/kvm/mmu/tdp_mmu.c|743| <<tdp_mmu_zap_root>> kvm_lockdep_assert_mmu_lock_held(kvm, shared);
++ *   - arch/x86/kvm/mmu/tdp_mmu.c|1498| <<kvm_tdp_mmu_try_split_huge_pages>> kvm_lockdep_assert_mmu_lock_held(kvm, shared);
++ */
+ /* Arbitrarily returns true so that this may be used in if statements. */
+ static __always_inline bool kvm_lockdep_assert_mmu_lock_held(struct kvm *kvm,
+ 							     bool shared)
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.h b/arch/x86/kvm/mmu/tdp_mmu.h
+index 733a3aef3..52af17ef9 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.h
++++ b/arch/x86/kvm/mmu/tdp_mmu.h
+@@ -12,6 +12,11 @@ void kvm_mmu_uninit_tdp_mmu(struct kvm *kvm);
+ 
+ hpa_t kvm_tdp_mmu_get_vcpu_root_hpa(struct kvm_vcpu *vcpu);
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu/tdp_mmu.c|125| <<tdp_mmu_next_root>> kvm_tdp_mmu_get_root(next_root))
++ *   - arch/x86/kvm/mmu/tdp_mmu.c|234| <<kvm_tdp_mmu_get_vcpu_root_hpa>> kvm_tdp_mmu_get_root(root))
++ */
+ __must_check static inline bool kvm_tdp_mmu_get_root(struct kvm_mmu_page *root)
+ {
+ 	return refcount_inc_not_zero(&root->tdp_mmu_root_count);
+@@ -59,6 +64,10 @@ static inline void kvm_tdp_mmu_walk_lockless_begin(void)
+ 	rcu_read_lock();
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu/mmu.c|671| <<walk_shadow_page_lockless_end>> kvm_tdp_mmu_walk_lockless_end();
++ */
+ static inline void kvm_tdp_mmu_walk_lockless_end(void)
+ {
+ 	rcu_read_unlock();
+diff --git a/arch/x86/kvm/smm.c b/arch/x86/kvm/smm.c
+index dc3d95fdc..b70478863 100644
+--- a/arch/x86/kvm/smm.c
++++ b/arch/x86/kvm/smm.c
+@@ -9,12 +9,25 @@
+ #include "cpuid.h"
+ #include "trace.h"
+ 
++/*
++ * SMM模式通过调用SMI进入,进入之后,SMI就会disable,不过系统会
++ * 暂存一个且只有一个SMI,当SMM模式退出时,检测到这个SMI会再次进入SMM模式.
++ *
++ * 进入SMM模式后,系统切换到SMRAM这个独立的环境中.
++ *
++ * RSM会使得系统离开SMM模式,RSM只有在SMM中才可以执行.
++ */
++
+ #define CHECK_SMRAM32_OFFSET(field, offset) \
+ 	ASSERT_STRUCT_OFFSET(struct kvm_smram_state_32, field, offset - 0xFE00)
+ 
+ #define CHECK_SMRAM64_OFFSET(field, offset) \
+ 	ASSERT_STRUCT_OFFSET(struct kvm_smram_state_64, field, offset - 0xFE00)
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/smm.c|288| <<enter_smm>> check_smram_offsets();
++ */
+ static void check_smram_offsets(void)
+ {
+ 	/* 32 bit SMRAM image */
+@@ -109,10 +122,25 @@ static void check_smram_offsets(void)
+ #undef CHECK_SMRAM32_OFFSET
+ 
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/smm.c|310| <<enter_smm>> kvm_smm_changed(vcpu, true);
++ *   - arch/x86/kvm/smm.c|588| <<emulator_leave_smm>> kvm_smm_changed(vcpu, false);
++ *   - arch/x86/kvm/x86.c|5420| <<kvm_vcpu_ioctl_x86_set_vcpu_events>> kvm_smm_changed(vcpu, events->smi.smm);
++ */
+ void kvm_smm_changed(struct kvm_vcpu *vcpu, bool entering_smm)
+ {
+ 	trace_kvm_smm_transition(vcpu->vcpu_id, vcpu->arch.smbase, entering_smm);
+ 
++	/*
++	 * 在以下使用HF_SMM_MASK:
++	 *   - arch/x86/include/asm/kvm_host.h|2133| <<global>> #define HF_SMM_MASK (1 << 1)
++	 *   - arch/x86/include/asm/kvm_host.h|2138| <<kvm_arch_vcpu_memslots_id>> #define kvm_arch_vcpu_memslots_id(vcpu) ((vcpu)->arch.hflags & HF_SMM_MASK ? 1 : 0)
++	 *   - arch/x86/kvm/smm.c|117| <<kvm_smm_changed>> vcpu->arch.hflags |= HF_SMM_MASK;
++	 *   - arch/x86/kvm/smm.c|119| <<kvm_smm_changed>> vcpu->arch.hflags &= ~(HF_SMM_MASK | HF_SMM_INSIDE_NMI_MASK);
++	 *   - arch/x86/kvm/smm.h|151| <<is_smm>> return vcpu->arch.hflags & HF_SMM_MASK;
++	 *   - arch/x86/kvm/x86.c|5418| <<kvm_vcpu_ioctl_x86_set_vcpu_events>> if (!!(vcpu->arch.hflags & HF_SMM_MASK) != events->smi.smm) {
++	 */
+ 	if (entering_smm) {
+ 		vcpu->arch.hflags |= HF_SMM_MASK;
+ 	} else {
+@@ -132,12 +160,36 @@ void kvm_smm_changed(struct kvm_vcpu *vcpu, bool entering_smm)
+ 	kvm_mmu_reset_context(vcpu);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|5258| <<kvm_vcpu_ioctl_x86_get_vcpu_events(KVM_REQ_SMI)>> process_smi(vcpu);
++ *   - arch/x86/kvm/x86.c|10715| <<vcpu_enter_guest(KVM_REQ_SMI)>> process_smi(vcpu);
++ */
+ void process_smi(struct kvm_vcpu *vcpu)
+ {
++	/*
++	 * 在以下使用kvm_vcpu_arch->smi_pending:
++	 *   - arch/x86/kvm/smm.c|161| <<process_smi>> vcpu->arch.smi_pending = true;
++	 *   - arch/x86/kvm/svm/nested.c|1477| <<svm_check_nested_events>> if (vcpu->arch.smi_pending && !svm_smi_blocked(vcpu)) {
++	 *   - arch/x86/kvm/svm/svm.c|2421| <<svm_set_gif>> if (svm->vcpu.arch.smi_pending ||
++	 *   - arch/x86/kvm/vmx/nested.c|4156| <<vmx_check_nested_events>> if (vcpu->arch.smi_pending && !is_smm(vcpu)) {
++	 *   - arch/x86/kvm/x86.c|5325| <<kvm_vcpu_ioctl_x86_get_vcpu_events>> events->smi.pending = vcpu->arch.smi_pending;
++	 *   - arch/x86/kvm/x86.c|5423| <<kvm_vcpu_ioctl_x86_set_vcpu_events>> vcpu->arch.smi_pending = events->smi.pending;
++	 *   - arch/x86/kvm/x86.c|10316| <<kvm_check_and_inject_events>> if (vcpu->arch.smi_pending) {
++	 *   - arch/x86/kvm/x86.c|10321| <<kvm_check_and_inject_events>> vcpu->arch.smi_pending = false;
++	 *   - arch/x86/kvm/x86.c|11561| <<kvm_arch_vcpu_ioctl_set_mpstate>> if ((!kvm_apic_init_sipi_allowed(vcpu) || vcpu->arch.smi_pending) &&
++	 *   - arch/x86/kvm/x86.c|12176| <<kvm_vcpu_reset>> vcpu->arch.smi_pending = 0;
++	 *   - arch/x86/kvm/x86.c|12984| <<kvm_vcpu_has_events>> (vcpu->arch.smi_pending &&
++	 */
+ 	vcpu->arch.smi_pending = true;
+ 	kvm_make_request(KVM_REQ_EVENT, vcpu);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/smm.c|165| <<enter_smm_save_seg_32>> state->flags = enter_smm_get_segment_flags(&seg);
++ *   - arch/x86/kvm/smm.c|177| <<enter_smm_save_seg_64>> state->attributes = enter_smm_get_segment_flags(&seg) >> 8;
++ */
+ static u32 enter_smm_get_segment_flags(struct kvm_segment *seg)
+ {
+ 	u32 flags = 0;
+@@ -152,6 +204,17 @@ static u32 enter_smm_get_segment_flags(struct kvm_segment *seg)
+ 	return flags;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/smm.c|241| <<enter_smm_save_state_32>> enter_smm_save_seg_32(vcpu, &smram->tr, &smram->tr_sel, VCPU_SREG_TR);
++ *   - arch/x86/kvm/smm.c|242| <<enter_smm_save_state_32>> enter_smm_save_seg_32(vcpu, &smram->ldtr, &smram->ldtr_sel, VCPU_SREG_LDTR);
++ *   - arch/x86/kvm/smm.c|252| <<enter_smm_save_state_32>> enter_smm_save_seg_32(vcpu, &smram->es, &smram->es_sel, VCPU_SREG_ES);
++ *   - arch/x86/kvm/smm.c|253| <<enter_smm_save_state_32>> enter_smm_save_seg_32(vcpu, &smram->cs, &smram->cs_sel, VCPU_SREG_CS);
++ *   - arch/x86/kvm/smm.c|254| <<enter_smm_save_state_32>> enter_smm_save_seg_32(vcpu, &smram->ss, &smram->ss_sel, VCPU_SREG_SS);
++ *   - arch/x86/kvm/smm.c|256| <<enter_smm_save_state_32>> enter_smm_save_seg_32(vcpu, &smram->ds, &smram->ds_sel, VCPU_SREG_DS);
++ *   - arch/x86/kvm/smm.c|257| <<enter_smm_save_state_32>> enter_smm_save_seg_32(vcpu, &smram->fs, &smram->fs_sel, VCPU_SREG_FS);
++ *   - arch/x86/kvm/smm.c|258| <<enter_smm_save_state_32>> enter_smm_save_seg_32(vcpu, &smram->gs, &smram->gs_sel, VCPU_SREG_GS);
++ */
+ static void enter_smm_save_seg_32(struct kvm_vcpu *vcpu,
+ 				  struct kvm_smm_seg_state_32 *state,
+ 				  u32 *selector, int n)
+@@ -165,6 +228,17 @@ static void enter_smm_save_seg_32(struct kvm_vcpu *vcpu,
+ 	state->flags = enter_smm_get_segment_flags(&seg);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/smm.c|300| <<enter_smm_save_state_64>> enter_smm_save_seg_64(vcpu, &smram->tr, VCPU_SREG_TR);
++ *   - arch/x86/kvm/smm.c|306| <<enter_smm_save_state_64>> enter_smm_save_seg_64(vcpu, &smram->ldtr, VCPU_SREG_LDTR);
++ *   - arch/x86/kvm/smm.c|312| <<enter_smm_save_state_64>> enter_smm_save_seg_64(vcpu, &smram->es, VCPU_SREG_ES);
++ *   - arch/x86/kvm/smm.c|313| <<enter_smm_save_state_64>> enter_smm_save_seg_64(vcpu, &smram->cs, VCPU_SREG_CS);
++ *   - arch/x86/kvm/smm.c|314| <<enter_smm_save_state_64>> enter_smm_save_seg_64(vcpu, &smram->ss, VCPU_SREG_SS);
++ *   - arch/x86/kvm/smm.c|315| <<enter_smm_save_state_64>> enter_smm_save_seg_64(vcpu, &smram->ds, VCPU_SREG_DS);
++ *   - arch/x86/kvm/smm.c|316| <<enter_smm_save_state_64>> enter_smm_save_seg_64(vcpu, &smram->fs, VCPU_SREG_FS);
++ *   - arch/x86/kvm/smm.c|317| <<enter_smm_save_state_64>> enter_smm_save_seg_64(vcpu, &smram->gs, VCPU_SREG_GS);
++ */
+ #ifdef CONFIG_X86_64
+ static void enter_smm_save_seg_64(struct kvm_vcpu *vcpu,
+ 				  struct kvm_smm_seg_state_64 *state,
+@@ -180,6 +254,10 @@ static void enter_smm_save_seg_64(struct kvm_vcpu *vcpu,
+ }
+ #endif
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/smm.c|347| <<enter_smm>> enter_smm_save_state_32(vcpu, &smram.smram32);
++ */
+ static void enter_smm_save_state_32(struct kvm_vcpu *vcpu,
+ 				    struct kvm_smram_state_32 *smram)
+ {
+@@ -223,10 +301,18 @@ static void enter_smm_save_state_32(struct kvm_vcpu *vcpu,
+ 	smram->smm_revision = 0x00020000;
+ 	smram->smbase = vcpu->arch.smbase;
+ 
++	/*
++	 * vmx_get_interrupt_shadow()
++	 * svm_get_interrupt_shadow()
++	 */
+ 	smram->int_shadow = static_call(kvm_x86_get_interrupt_shadow)(vcpu);
+ }
+ 
+ #ifdef CONFIG_X86_64
++/*
++ * called by:
++ *   - arch/x86/kvm/smm.c|340| <<enter_smm>> enter_smm_save_state_64(vcpu, &smram.smram64);
++ */
+ static void enter_smm_save_state_64(struct kvm_vcpu *vcpu,
+ 				    struct kvm_smram_state_64 *smram)
+ {
+@@ -274,10 +360,28 @@ static void enter_smm_save_state_64(struct kvm_vcpu *vcpu,
+ 	enter_smm_save_seg_64(vcpu, &smram->fs, VCPU_SREG_FS);
+ 	enter_smm_save_seg_64(vcpu, &smram->gs, VCPU_SREG_GS);
+ 
++	/*
++	 * 在以下使用kvm_smram_state_64->int_shadow:
++	 *   - arch/x86/kvm/smm.c|264| <<enter_smm_save_state_32>> smram->int_shadow = static_call(kvm_x86_get_interrupt_shadow)(vcpu);
++	 *   - arch/x86/kvm/smm.c|315| <<enter_smm_save_state_64>> smram->int_shadow = static_call(kvm_x86_get_interrupt_shadow)(vcpu);
++	 *   - arch/x86/kvm/smm.c|573| <<rsm_load_state_32>> ctxt->interruptibility = (u8)smstate->int_shadow;
++	 *   - arch/x86/kvm/smm.c|630| <<rsm_load_state_64>> ctxt->interruptibility = (u8)smstate->int_shadow;
++	 *
++	 * vmx_get_interrupt_shadow()
++	 * svm_get_interrupt_shadow()
++	 */
+ 	smram->int_shadow = static_call(kvm_x86_get_interrupt_shadow)(vcpu);
+ }
+ #endif
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|10319| <<kvm_check_and_inject_events>> enter_smm(vcpu);
++ *
++ * vcpu_enter_guest()
++ * -> kvm_check_and_inject_events()
++ *    -> enter_smm()
++ */
+ void enter_smm(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_segment cs, ds;
+@@ -285,6 +389,9 @@ void enter_smm(struct kvm_vcpu *vcpu)
+ 	unsigned long cr0;
+ 	union kvm_smram smram;
+ 
++	/*
++	 * 只在这里调用
++	 */
+ 	check_smram_offsets();
+ 
+ 	memset(smram.bytes, 0, sizeof(smram.bytes));
+@@ -304,11 +411,21 @@ void enter_smm(struct kvm_vcpu *vcpu)
+ 	 * Kill the VM in the unlikely case of failure, because the VM
+ 	 * can be in undefined state in this case.
+ 	 */
++	/*
++	 * vmx_enter_smm()
++	 * svm_enter_smm()
++	 */
+ 	if (static_call(kvm_x86_enter_smm)(vcpu, &smram))
+ 		goto error;
+ 
+ 	kvm_smm_changed(vcpu, true);
+ 
++	/*
++	 * struct kvm_vcpu:
++	 * -> struct kvm_vcpu_arch arch;
++	 *    -> u64 smbase;
++	 *    -> u64 smi_count;
++	 */
+ 	if (kvm_vcpu_write_guest(vcpu, vcpu->arch.smbase + 0xfe00, &smram, sizeof(smram)))
+ 		goto error;
+ 
+@@ -320,11 +437,21 @@ void enter_smm(struct kvm_vcpu *vcpu)
+ 	kvm_set_rflags(vcpu, X86_EFLAGS_FIXED);
+ 	kvm_rip_write(vcpu, 0x8000);
+ 
++	/*
++	 * vmx_set_interrupt_shadow()
++	 * svm_set_interrupt_shadow()
++	 *
++	 * 这里设置成0!!!
++	 */
+ 	static_call(kvm_x86_set_interrupt_shadow)(vcpu, 0);
+ 
+ 	cr0 = vcpu->arch.cr0 & ~(X86_CR0_PE | X86_CR0_EM | X86_CR0_TS | X86_CR0_PG);
+ 	static_call(kvm_x86_set_cr0)(vcpu, cr0);
+ 
++	/*
++	 * vmx_set_cr4()
++	 * svm_set_cr4()
++	 */
+ 	static_call(kvm_x86_set_cr4)(vcpu, 0);
+ 
+ 	/* Undocumented: IDT limit is set to zero on entry to SMM.  */
+@@ -372,6 +499,11 @@ void enter_smm(struct kvm_vcpu *vcpu)
+ 	kvm_vm_dead(vcpu->kvm);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/smm.c|459| <<rsm_load_seg_32>> rsm_set_desc_flags(&desc, state->flags);
++ *   - arch/x86/kvm/smm.c|473| <<rsm_load_seg_64>> rsm_set_desc_flags(&desc, state->attributes << 8);
++ */
+ static void rsm_set_desc_flags(struct kvm_segment *desc, u32 flags)
+ {
+ 	desc->g    = (flags >> 23) & 1;
+@@ -387,6 +519,17 @@ static void rsm_set_desc_flags(struct kvm_segment *desc, u32 flags)
+ 	desc->padding = 0;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/smm.c|602| <<rsm_load_state_32>> rsm_load_seg_32(vcpu, &smstate->tr, smstate->tr_sel, VCPU_SREG_TR);
++ *   - arch/x86/kvm/smm.c|603| <<rsm_load_state_32>> rsm_load_seg_32(vcpu, &smstate->ldtr, smstate->ldtr_sel, VCPU_SREG_LDTR);
++ *   - arch/x86/kvm/smm.c|613| <<rsm_load_state_32>> rsm_load_seg_32(vcpu, &smstate->es, smstate->es_sel, VCPU_SREG_ES);
++ *   - arch/x86/kvm/smm.c|614| <<rsm_load_state_32>> rsm_load_seg_32(vcpu, &smstate->cs, smstate->cs_sel, VCPU_SREG_CS);
++ *   - arch/x86/kvm/smm.c|615| <<rsm_load_state_32>> rsm_load_seg_32(vcpu, &smstate->ss, smstate->ss_sel, VCPU_SREG_SS);
++ *   - arch/x86/kvm/smm.c|617| <<rsm_load_state_32>> rsm_load_seg_32(vcpu, &smstate->ds, smstate->ds_sel, VCPU_SREG_DS);
++ *   - arch/x86/kvm/smm.c|618| <<rsm_load_state_32>> rsm_load_seg_32(vcpu, &smstate->fs, smstate->fs_sel, VCPU_SREG_FS);
++ *   - arch/x86/kvm/smm.c|619| <<rsm_load_state_32>> rsm_load_seg_32(vcpu, &smstate->gs, smstate->gs_sel, VCPU_SREG_GS);
++ */
+ static int rsm_load_seg_32(struct kvm_vcpu *vcpu,
+ 			   const struct kvm_smm_seg_state_32 *state,
+ 			   u16 selector, int n)
+@@ -403,6 +546,17 @@ static int rsm_load_seg_32(struct kvm_vcpu *vcpu,
+ 
+ #ifdef CONFIG_X86_64
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/smm.c|667| <<rsm_load_state_64>> rsm_load_seg_64(vcpu, &smstate->tr, VCPU_SREG_TR);
++ *   - arch/x86/kvm/smm.c|673| <<rsm_load_state_64>> rsm_load_seg_64(vcpu, &smstate->ldtr, VCPU_SREG_LDTR);
++ *   - arch/x86/kvm/smm.c|683| <<rsm_load_state_64>> rsm_load_seg_64(vcpu, &smstate->es, VCPU_SREG_ES);
++ *   - arch/x86/kvm/smm.c|684| <<rsm_load_state_64>> rsm_load_seg_64(vcpu, &smstate->cs, VCPU_SREG_CS);
++ *   - arch/x86/kvm/smm.c|685| <<rsm_load_state_64>> rsm_load_seg_64(vcpu, &smstate->ss, VCPU_SREG_SS);
++ *   - arch/x86/kvm/smm.c|686| <<rsm_load_state_64>> rsm_load_seg_64(vcpu, &smstate->ds, VCPU_SREG_DS);
++ *   - arch/x86/kvm/smm.c|687| <<rsm_load_state_64>> rsm_load_seg_64(vcpu, &smstate->fs, VCPU_SREG_FS);
++ *   - arch/x86/kvm/smm.c|688| <<rsm_load_state_64>> rsm_load_seg_64(vcpu, &smstate->gs, VCPU_SREG_GS);
++ */
+ static int rsm_load_seg_64(struct kvm_vcpu *vcpu,
+ 			   const struct kvm_smm_seg_state_64 *state,
+ 			   int n)
+@@ -418,6 +572,11 @@ static int rsm_load_seg_64(struct kvm_vcpu *vcpu,
+ }
+ #endif
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/smm.c|505| <<rsm_load_state_32>> r = rsm_enter_protected_mode(vcpu, smstate->cr0,
++ *   - arch/x86/kvm/smm.c|553| <<rsm_load_state_64>> r = rsm_enter_protected_mode(vcpu, smstate->cr0, smstate->cr3, smstate->cr4);
++ */
+ static int rsm_enter_protected_mode(struct kvm_vcpu *vcpu,
+ 				    u64 cr0, u64 cr3, u64 cr4)
+ {
+@@ -463,6 +622,10 @@ static int rsm_enter_protected_mode(struct kvm_vcpu *vcpu,
+ 	return X86EMUL_CONTINUE;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/smm.c|731| <<emulator_leave_smm>> return rsm_load_state_32(ctxt, &smram.smram32);
++ */
+ static int rsm_load_state_32(struct x86_emulate_ctxt *ctxt,
+ 			     const struct kvm_smram_state_32 *smstate)
+ {
+@@ -508,6 +671,10 @@ static int rsm_load_state_32(struct x86_emulate_ctxt *ctxt,
+ 	if (r != X86EMUL_CONTINUE)
+ 		return r;
+ 
++	/*
++	 * vmx_set_interrupt_shadow()
++	 * svm_set_interrupt_shadow()
++	 */
+ 	static_call(kvm_x86_set_interrupt_shadow)(vcpu, 0);
+ 	ctxt->interruptibility = (u8)smstate->int_shadow;
+ 
+@@ -515,6 +682,10 @@ static int rsm_load_state_32(struct x86_emulate_ctxt *ctxt,
+ }
+ 
+ #ifdef CONFIG_X86_64
++/*
++ * called by:
++ *   - arch/x86/kvm/smm.c|643| <<emulator_leave_smm>> return rsm_load_state_64(ctxt, &smram.smram64);
++ */
+ static int rsm_load_state_64(struct x86_emulate_ctxt *ctxt,
+ 			     const struct kvm_smram_state_64 *smstate)
+ {
+@@ -568,6 +739,12 @@ static int rsm_load_state_64(struct x86_emulate_ctxt *ctxt,
+ }
+ #endif
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/emulate.c|2322| <<em_rsm>> if (ctxt->ops->leave_smm(ctxt))
++ *
++ * struct x86_emulate_ops emulate_ops.leave_smm = emulator_leave_smm()
++ */
+ int emulator_leave_smm(struct x86_emulate_ctxt *ctxt)
+ {
+ 	struct kvm_vcpu *vcpu = ctxt->vcpu;
+@@ -582,6 +759,19 @@ int emulator_leave_smm(struct x86_emulate_ctxt *ctxt)
+ 	if (ret < 0)
+ 		return X86EMUL_UNHANDLEABLE;
+ 
++	/*
++	 * 在以下使用HF_SMM_INSIDE_NMI_MASK:
++	 *   - arch/x86/include/asm/kvm_host.h|2159| <<global>> #define HF_SMM_INSIDE_NMI_MASK (1 << 2)
++	 *   - arch/x86/kvm/smm.c|138| <<kvm_smm_changed>> vcpu->arch.hflags &= ~(HF_SMM_MASK | HF_SMM_INSIDE_NMI_MASK);
++	 *   - arch/x86/kvm/smm.c|363| <<enter_smm>> vcpu->arch.hflags |= HF_SMM_INSIDE_NMI_MASK;
++	 *   - arch/x86/kvm/smm.c|647| <<emulator_leave_smm>> if ((vcpu->arch.hflags & HF_SMM_INSIDE_NMI_MASK) == 0)
++	 *   - arch/x86/kvm/x86.c|5327| <<kvm_vcpu_ioctl_x86_get_vcpu_events>> !!(vcpu->arch.hflags & HF_SMM_INSIDE_NMI_MASK);
++	 *   - arch/x86/kvm/x86.c|5427| <<kvm_vcpu_ioctl_x86_set_vcpu_events>> vcpu->arch.hflags |= HF_SMM_INSIDE_NMI_MASK;
++	 *   - arch/x86/kvm/x86.c|5429| <<kvm_vcpu_ioctl_x86_set_vcpu_events>> vcpu->arch.hflags &= ~HF_SMM_INSIDE_NMI_MASK;
++	 *
++	 * vmx_set_nmi_mask()
++	 * svm_set_nmi_mask()
++	 */
+ 	if ((vcpu->arch.hflags & HF_SMM_INSIDE_NMI_MASK) == 0)
+ 		static_call(kvm_x86_set_nmi_mask)(vcpu, false);
+ 
+diff --git a/arch/x86/kvm/smm.h b/arch/x86/kvm/smm.h
+index a1cf2ac5b..bc8b80a08 100644
+--- a/arch/x86/kvm/smm.h
++++ b/arch/x86/kvm/smm.h
+@@ -98,6 +98,13 @@ struct kvm_smram_state_64 {
+ 	u8 io_inst_restart;
+ 	u8 auto_hlt_restart;
+ 	u8 amd_nmi_mask; /* Documented in AMD BKDG as NMI mask, not used by KVM */
++	/*
++	 * 在以下使用kvm_smram_state_64->int_shadow:
++	 *   - arch/x86/kvm/smm.c|264| <<enter_smm_save_state_32>> smram->int_shadow = static_call(kvm_x86_get_interrupt_shadow)(vcpu);
++	 *   - arch/x86/kvm/smm.c|315| <<enter_smm_save_state_64>> smram->int_shadow = static_call(kvm_x86_get_interrupt_shadow)(vcpu);
++	 *   - arch/x86/kvm/smm.c|573| <<rsm_load_state_32>> ctxt->interruptibility = (u8)smstate->int_shadow;
++	 *   - arch/x86/kvm/smm.c|630| <<rsm_load_state_64>> ctxt->interruptibility = (u8)smstate->int_shadow;
++	 */
+ 	u8 int_shadow;
+ 	u32 reserved2;
+ 
+@@ -113,6 +120,24 @@ struct kvm_smram_state_64 {
+ 
+ 	u32 reserved3[3];
+ 	u32 smm_revison;
++	/*
++	 * 在以下使用kvm_vcpu_arch->smbase:
++	 *   - arch/x86/kvm/smm.c|114| <<kvm_smm_changed>> trace_kvm_smm_transition(vcpu->vcpu_id, vcpu->arch.smbase, entering_smm);
++	 *   - arch/x86/kvm/smm.c|224| <<enter_smm_save_state_32>> smram->smbase = vcpu->arch.smbase;
++	 *   - arch/x86/kvm/smm.c|253| <<enter_smm_save_state_64>> smram->smbase = vcpu->arch.smbase;
++	 *   - arch/x86/kvm/smm.c|312| <<enter_smm>> if (kvm_vcpu_write_guest(vcpu, vcpu->arch.smbase + 0xfe00, &smram, sizeof(smram)))
++	 *   - arch/x86/kvm/smm.c|337| <<enter_smm>> cs.selector = (vcpu->arch.smbase >> 4) & 0xffff;
++	 *   - arch/x86/kvm/smm.c|338| <<enter_smm>> cs.base = vcpu->arch.smbase;
++	 *   - arch/x86/kvm/smm.c|579| <<emulator_leave_smm>> smbase = vcpu->arch.smbase;
++	 *   - arch/x86/kvm/smm.c|581| <<emulator_leave_smm>> ret = kvm_vcpu_read_guest(vcpu, smbase + 0xfe00, smram.bytes, sizeof(smram));
++	 *
++	 * 在以下设置kvm_vcpu_arch->smbase:
++	 *   - arch/x86/kvm/smm.c|503| <<rsm_load_state_32>> vcpu->arch.smbase = smstate->smbase;
++	 *   - arch/x86/kvm/smm.c|536| <<rsm_load_state_64>> vcpu->arch.smbase = smstate->smbase;
++	 *   - arch/x86/kvm/x86.c|3879| <<kvm_set_msr_common(MSR_IA32_SMBASE)>> vcpu->arch.smbase = data;
++	 *   - arch/x86/kvm/x86.c|4279| <<kvm_get_msr_common(MSR_IA32_SMBASE)>> msr_info->data = vcpu->arch.smbase;
++	 *   - arch/x86/kvm/x86.c|12211| <<kvm_vcpu_reset>> vcpu->arch.smbase = 0x30000;
++	 */
+ 	u32 smbase;
+ 	u32 reserved4[5];
+ 
+@@ -140,14 +165,38 @@ union kvm_smram {
+ 	u8 bytes[512];
+ };
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|1337| <<__apic_accept_irq(APIC_DM_SMI)>> if (!kvm_inject_smi(vcpu)) {
++ *   - arch/x86/kvm/x86.c|5830| <<kvm_arch_vcpu_ioctl(KVM_SMI)>> r = kvm_inject_smi(vcpu);
++ */
+ static inline int kvm_inject_smi(struct kvm_vcpu *vcpu)
+ {
++	/*
++	 * 在以下使用KVM_REQ_SMI:
++	 *   - arch/x86/kvm/smm.h|163| <<kvm_inject_smi>> kvm_make_request(KVM_REQ_SMI, vcpu);
++	 *   - arch/x86/kvm/x86.c|5257| <<kvm_vcpu_ioctl_x86_get_vcpu_events>> if (kvm_check_request(KVM_REQ_SMI, vcpu))
++	 *   - arch/x86/kvm/x86.c|10740| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_SMI, vcpu))
++	 *   - arch/x86/kvm/x86.c|12998| <<kvm_vcpu_has_events>> if (kvm_test_request(KVM_REQ_SMI, vcpu) ||
++	 *   - arch/x86/kvm/x86.c|13047| <<kvm_arch_dy_runnable>> kvm_test_request(KVM_REQ_SMI, vcpu) ||
++	 *
++	 * 处理的函数是process_smi()
++	 */
+ 	kvm_make_request(KVM_REQ_SMI, vcpu);
+ 	return 0;
+ }
+ 
+ static inline bool is_smm(struct kvm_vcpu *vcpu)
+ {
++	/*
++	 * 在以下使用HF_SMM_MASK:
++	 *   - arch/x86/include/asm/kvm_host.h|2133| <<global>> #define HF_SMM_MASK (1 << 1)
++	 *   - arch/x86/include/asm/kvm_host.h|2138| <<kvm_arch_vcpu_memslots_id>> #define kvm_arch_vcpu_memslots_id(vcpu) ((vcpu)->arch.hflags & HF_SMM_MASK ? 1 : 0)
++	 *   - arch/x86/kvm/smm.c|117| <<kvm_smm_changed>> vcpu->arch.hflags |= HF_SMM_MASK;
++	 *   - arch/x86/kvm/smm.c|119| <<kvm_smm_changed>> vcpu->arch.hflags &= ~(HF_SMM_MASK | HF_SMM_INSIDE_NMI_MASK);
++	 *   - arch/x86/kvm/smm.h|151| <<is_smm>> return vcpu->arch.hflags & HF_SMM_MASK;
++	 *   - arch/x86/kvm/x86.c|5418| <<kvm_vcpu_ioctl_x86_set_vcpu_events>> if (!!(vcpu->arch.hflags & HF_SMM_MASK) != events->smi.smm) {
++	 */
+ 	return vcpu->arch.hflags & HF_SMM_MASK;
+ }
+ 
+diff --git a/arch/x86/kvm/vmx/vmcs.h b/arch/x86/kvm/vmx/vmcs.h
+index 7c1996b43..e42242123 100644
+--- a/arch/x86/kvm/vmx/vmcs.h
++++ b/arch/x86/kvm/vmx/vmcs.h
+@@ -63,6 +63,16 @@ struct loaded_vmcs {
+ 	struct vmcs *shadow_vmcs;
+ 	int cpu;
+ 	bool launched;
++	/*
++	 * 在以下使用loaded_vmcs->nmi_known_unmasked:
++	 *   - arch/x86/kvm/vmx/nested.c|2397| <<prepare_vmcs02_early>> vmx->loaded_vmcs->nmi_known_unmasked = !(vmcs12->guest_interruptibility_info & GUEST_INTR_STATE_NMI);
++	 *   - arch/x86/kvm/vmx/vmx.c|4980| <<vmx_inject_nmi>> vmx->loaded_vmcs->nmi_known_unmasked = false;
++	 *   - arch/x86/kvm/vmx/vmx.c|5010| <<vmx_get_nmi_mask>> if (vmx->loaded_vmcs->nmi_known_unmasked)
++	 *   - arch/x86/kvm/vmx/vmx.c|5013| <<vmx_get_nmi_mask>> vmx->loaded_vmcs->nmi_known_unmasked = !masked;
++	 *   - arch/x86/kvm/vmx/vmx.c|5027| <<vmx_set_nmi_mask>> vmx->loaded_vmcs->nmi_known_unmasked = !masked;
++	 *   - arch/x86/kvm/vmx/vmx.c|7047| <<vmx_recover_nmi_blocking>> if (vmx->loaded_vmcs->nmi_known_unmasked)
++	 *   - arch/x86/kvm/vmx/vmx.c|7068| <<vmx_recover_nmi_blocking>> vmx->loaded_vmcs->nmi_known_unmasked = !(vmcs_read32(GUEST_INTERRUPTIBILITY_INFO) & GUEST_INTR_STATE_NMI);
++	 */
+ 	bool nmi_known_unmasked;
+ 	bool hv_timer_soft_disabled;
+ 	/* Support for vnmi-less CPUs */
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index be20a6004..d2cc95ee3 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -81,6 +81,11 @@ MODULE_DEVICE_TABLE(x86cpu, vmx_cpu_id);
+ bool __read_mostly enable_vpid = 1;
+ module_param_named(vpid, enable_vpid, bool, 0444);
+ 
++/*
++ * 在以下使用enable_vnmi:
++ *   - arch/x86/kvm/vmx/vmx.c|84| <<global>> static bool __read_mostly enable_vnmi = 1;
++ *   - arch/x86/kvm/vmx/vmx.c|8484| <<hardware_setup>> enable_vnmi = 0;
++ */
+ static bool __read_mostly enable_vnmi = 1;
+ module_param_named(vnmi, enable_vnmi, bool, 0444);
+ 
+@@ -4912,6 +4917,11 @@ static void vmx_enable_irq_window(struct kvm_vcpu *vcpu)
+ 
+ static void vmx_enable_nmi_window(struct kvm_vcpu *vcpu)
+ {
++	/*
++	 * 在以下使用enable_vnmi:
++	 *   - arch/x86/kvm/vmx/vmx.c|84| <<global>> static bool __read_mostly enable_vnmi = 1;
++	 *   - arch/x86/kvm/vmx/vmx.c|8484| <<hardware_setup>> enable_vnmi = 0;
++	 */
+ 	if (!enable_vnmi ||
+ 	    vmcs_read32(GUEST_INTERRUPTIBILITY_INFO) & GUEST_INTR_STATE_STI) {
+ 		vmx_enable_irq_window(vcpu);
+@@ -4925,6 +4935,15 @@ static void vmx_inject_irq(struct kvm_vcpu *vcpu, bool reinjected)
+ {
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+ 	uint32_t intr;
++	/*
++	 * struct kvm_vcpu *vcpu:
++	 * -> struct kvm_vcpu_arch arch;
++	 *      struct kvm_queued_interrupt {
++	 *          bool injected;
++	 *          bool soft;
++	 *          u8 nr;
++	 *	} interrupt;
++	 */
+ 	int irq = vcpu->arch.interrupt.nr;
+ 
+ 	trace_kvm_inj_virq(irq, vcpu->arch.interrupt.soft, reinjected);
+@@ -4974,6 +4993,16 @@ static void vmx_inject_nmi(struct kvm_vcpu *vcpu)
+ 		return;
+ 	}
+ 
++	/*
++	 * #define INTR_TYPE_EXT_INTR              (0 << 8) // external interrupt
++	 * #define INTR_TYPE_RESERVED              (1 << 8) // reserved
++	 * #define INTR_TYPE_NMI_INTR              (2 << 8) // NMI
++	 * #define INTR_TYPE_HARD_EXCEPTION        (3 << 8) // processor exception
++	 * #define INTR_TYPE_SOFT_INTR             (4 << 8) // software interrupt
++	 * #define INTR_TYPE_PRIV_SW_EXCEPTION     (5 << 8) // ICE breakpoint - undocumented
++	 * #define INTR_TYPE_SOFT_EXCEPTION        (6 << 8) // software exception
++	 * #define INTR_TYPE_OTHER_EVENT           (7 << 8) // other event
++	 */
+ 	vmcs_write32(VM_ENTRY_INTR_INFO_FIELD,
+ 			INTR_TYPE_NMI_INTR | INTR_INFO_VALID_MASK | NMI_VECTOR);
+ 
+@@ -7054,6 +7083,11 @@ static void vmx_recover_nmi_blocking(struct vcpu_vmx *vmx)
+ 					      vmx->loaded_vmcs->entry_time));
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|7133| <<vmx_complete_interrupts>> __vmx_complete_interrupts(&vmx->vcpu, vmx->idt_vectoring_info, VM_EXIT_INSTRUCTION_LEN, IDT_VECTORING_ERROR_CODE);
++ *   - arch/x86/kvm/vmx/vmx.c|7140| <<vmx_cancel_injection>> __vmx_complete_interrupts(vcpu, vmcs_read32(VM_ENTRY_INTR_INFO_FIELD), VM_ENTRY_INSTRUCTION_LEN, VM_ENTRY_EXCEPTION_ERROR_CODE);
++ */
+ static void __vmx_complete_interrupts(struct kvm_vcpu *vcpu,
+ 				      u32 idt_vectoring_info,
+ 				      int instr_len_field,
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 1a3aaa7da..afe5593fd 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -815,8 +815,20 @@ void kvm_inject_emulated_page_fault(struct kvm_vcpu *vcpu,
+ }
+ EXPORT_SYMBOL_GPL(kvm_inject_emulated_page_fault);
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|1345| <<__apic_accept_irq>> kvm_inject_nmi(vcpu);
++ *   - arch/x86/kvm/x86.c|5123| <<kvm_vcpu_ioctl_nmi>> kvm_inject_nmi(vcpu);
++ */
+ void kvm_inject_nmi(struct kvm_vcpu *vcpu)
+ {
++	/*
++	 * 在以下使用kvm_vcpu_arch->nmi_queued:
++	 *   - arch/x86/kvm/x86.c|820| <<kvm_inject_nmi>> atomic_inc(&vcpu->arch.nmi_queued);
++	 *   - arch/x86/kvm/x86.c|5412| <<kvm_vcpu_ioctl_x86_set_vcpu_events>> atomic_set(&vcpu->arch.nmi_queued, events->nmi.pending);
++	 *   - arch/x86/kvm/x86.c|10439| <<process_nmi>> vcpu->arch.nmi_pending += atomic_xchg(&vcpu->arch.nmi_queued, 0);
++	 *   - arch/x86/kvm/x86.c|12193| <<kvm_vcpu_reset>> atomic_set(&vcpu->arch.nmi_queued, 0);
++	 */
+ 	atomic_inc(&vcpu->arch.nmi_queued);
+ 	kvm_make_request(KVM_REQ_NMI, vcpu);
+ }
+@@ -5339,6 +5351,11 @@ static void kvm_vcpu_ioctl_x86_get_vcpu_events(struct kvm_vcpu *vcpu,
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|5934| <<kvm_arch_vcpu_ioctl(KVM_SET_VCPU_EVENTS)>> r = kvm_vcpu_ioctl_x86_set_vcpu_events(vcpu, &events);
++ *   - arch/x86/kvm/x86.c|11957| <<sync_regs>> if (kvm_vcpu_ioctl_x86_set_vcpu_events(vcpu, &events))
++ */
+ static int kvm_vcpu_ioctl_x86_set_vcpu_events(struct kvm_vcpu *vcpu,
+ 					      struct kvm_vcpu_events *events)
+ {
+@@ -5404,6 +5421,13 @@ static int kvm_vcpu_ioctl_x86_set_vcpu_events(struct kvm_vcpu *vcpu,
+ 	vcpu->arch.nmi_injected = events->nmi.injected;
+ 	if (events->flags & KVM_VCPUEVENT_VALID_NMI_PENDING) {
+ 		vcpu->arch.nmi_pending = 0;
++		/*
++		 * 在以下使用kvm_vcpu_arch->nmi_queued:
++		 *   - arch/x86/kvm/x86.c|820| <<kvm_inject_nmi>> atomic_inc(&vcpu->arch.nmi_queued);
++		 *   - arch/x86/kvm/x86.c|5412| <<kvm_vcpu_ioctl_x86_set_vcpu_events>> atomic_set(&vcpu->arch.nmi_queued, events->nmi.pending);
++		 *   - arch/x86/kvm/x86.c|10439| <<process_nmi>> vcpu->arch.nmi_pending += atomic_xchg(&vcpu->arch.nmi_queued, 0);
++		 *   - arch/x86/kvm/x86.c|12193| <<kvm_vcpu_reset>> atomic_set(&vcpu->arch.nmi_queued, 0);
++		 */
+ 		atomic_set(&vcpu->arch.nmi_queued, events->nmi.pending);
+ 		kvm_make_request(KVM_REQ_NMI, vcpu);
+ 	}
+@@ -5422,6 +5446,16 @@ static int kvm_vcpu_ioctl_x86_set_vcpu_events(struct kvm_vcpu *vcpu,
+ 
+ 		vcpu->arch.smi_pending = events->smi.pending;
+ 
++		/*
++		 * 在以下使用HF_SMM_INSIDE_NMI_MASK:
++		 *   - arch/x86/include/asm/kvm_host.h|2159| <<global>> #define HF_SMM_INSIDE_NMI_MASK (1 << 2)
++		 *   - arch/x86/kvm/smm.c|138| <<kvm_smm_changed>> vcpu->arch.hflags &= ~(HF_SMM_MASK | HF_SMM_INSIDE_NMI_MASK);
++		 *   - arch/x86/kvm/smm.c|363| <<enter_smm>> vcpu->arch.hflags |= HF_SMM_INSIDE_NMI_MASK;
++		 *   - arch/x86/kvm/smm.c|647| <<emulator_leave_smm>> if ((vcpu->arch.hflags & HF_SMM_INSIDE_NMI_MASK) == 0)
++		 *   - arch/x86/kvm/x86.c|5327| <<kvm_vcpu_ioctl_x86_get_vcpu_events>> !!(vcpu->arch.hflags & HF_SMM_INSIDE_NMI_MASK);
++		 *   - arch/x86/kvm/x86.c|5427| <<kvm_vcpu_ioctl_x86_set_vcpu_events>> vcpu->arch.hflags |= HF_SMM_INSIDE_NMI_MASK;
++		 *   - arch/x86/kvm/x86.c|5429| <<kvm_vcpu_ioctl_x86_set_vcpu_events>> vcpu->arch.hflags &= ~HF_SMM_INSIDE_NMI_MASK;
++		 */
+ 		if (events->smi.smm) {
+ 			if (events->smi.smm_inside_nmi)
+ 				vcpu->arch.hflags |= HF_SMM_INSIDE_NMI_MASK;
+@@ -8478,6 +8512,10 @@ static const struct x86_emulate_ops emulate_ops = {
+ 	.set_xcr             = emulator_set_xcr,
+ };
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|9183| <<x86_emulate_instruction>> toggle_interruptibility(vcpu, ctxt->interruptibility);
++ */
+ static void toggle_interruptibility(struct kvm_vcpu *vcpu, u32 mask)
+ {
+ 	u32 int_shadow = static_call(kvm_x86_get_interrupt_shadow)(vcpu);
+@@ -8510,6 +8548,10 @@ static void inject_emulated_exception(struct kvm_vcpu *vcpu)
+ 		kvm_queue_exception(vcpu, ctxt->exception.vector);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|12092| <<kvm_arch_vcpu_create>> if (!alloc_emulate_ctxt(vcpu))
++ */
+ static struct x86_emulate_ctxt *alloc_emulate_ctxt(struct kvm_vcpu *vcpu)
+ {
+ 	struct x86_emulate_ctxt *ctxt;
+@@ -8988,6 +9030,12 @@ int x86_decode_emulated_instruction(struct kvm_vcpu *vcpu, int emulation_type,
+ }
+ EXPORT_SYMBOL_GPL(x86_decode_emulated_instruction);
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu/mmu.c|5791| <<kvm_mmu_page_fault>> return x86_emulate_instruction(vcpu, cr2_or_gpa, emulation_type, insn, insn_len);
++ *   - arch/x86/kvm/x86.c|9219| <<kvm_emulate_instruction>> return x86_emulate_instruction(vcpu, 0, emulation_type, NULL, 0);
++ *   - arch/x86/kvm/x86.c|9226| <<kvm_emulate_instruction_from_buffer>> return x86_emulate_instruction(vcpu, 0, 0, insn, insn_len);
++ */
+ int x86_emulate_instruction(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
+ 			    int emulation_type, void *insn, int insn_len)
+ {
+@@ -9176,6 +9224,26 @@ int x86_emulate_instruction(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
+ 	return r;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/svm/avic.c|713| <<avic_unaccelerated_access_interception>> ret = kvm_emulate_instruction(vcpu, 0);
++ *   - arch/x86/kvm/svm/svm.c|391| <<__svm_skip_emulated_instruction>> if (!kvm_emulate_instruction(vcpu, EMULTYPE_SKIP))
++ *   - arch/x86/kvm/svm/svm.c|2228| <<io_interception>> return kvm_emulate_instruction(vcpu, 0);
++ *   - arch/x86/kvm/svm/svm.c|2391| <<gp_interception>> return kvm_emulate_instruction(vcpu,
++ *   - arch/x86/kvm/svm/svm.c|2585| <<invlpg_interception>> return kvm_emulate_instruction(vcpu, 0);
++ *   - arch/x86/kvm/svm/svm.c|2593| <<emulate_on_interception>> return kvm_emulate_instruction(vcpu, 0);
++ *   - arch/x86/kvm/vmx/vmx.c|1735| <<skip_emulated_instruction>> if (!kvm_emulate_instruction(vcpu, EMULTYPE_SKIP)) 
++ *   - arch/x86/kvm/vmx/vmx.c|5159| <<handle_rmode_exception>> if (kvm_emulate_instruction(vcpu, 0)) {
++ *   - arch/x86/kvm/vmx/vmx.c|5253| <<handle_exception_nmi>> return kvm_emulate_instruction(vcpu, EMULTYPE_VMWARE_GP);
++ *   - arch/x86/kvm/vmx/vmx.c|5393| <<handle_io>> return kvm_emulate_instruction(vcpu, 0);
++ *   - arch/x86/kvm/vmx/vmx.c|5466| <<handle_desc>> return kvm_emulate_instruction(vcpu, 0);
++ *   - arch/x86/kvm/vmx/vmx.c|5679| <<handle_apic_access>> return kvm_emulate_instruction(vcpu, 0);
++ *   - arch/x86/kvm/vmx/vmx.c|5815| <<handle_ept_violation>> return kvm_emulate_instruction(vcpu, 0);
++ *   - arch/x86/kvm/vmx/vmx.c|5877| <<handle_invalid_guest_state>> if (!kvm_emulate_instruction(vcpu, 0))
++ *   - arch/x86/kvm/x86.c|775| <<complete_emulated_insn_gp>> return kvm_emulate_instruction(vcpu, EMULTYPE_NO_DECODE | EMULTYPE_SKIP |
++ *   - arch/x86/kvm/x86.c|7663| <<handle_ud>> return kvm_emulate_instruction(vcpu, emul_type);
++ *   - arch/x86/kvm/x86.c|11230| <<complete_emulated_io>> return kvm_emulate_instruction(vcpu, EMULTYPE_NO_DECODE);
++ */
+ int kvm_emulate_instruction(struct kvm_vcpu *vcpu, int emulation_type)
+ {
+ 	return x86_emulate_instruction(vcpu, 0, emulation_type, NULL, 0);
+@@ -10179,6 +10247,10 @@ static void kvm_inject_exception(struct kvm_vcpu *vcpu)
+  * ordering between that side effect, the instruction completing, _and_ the
+  * delivery of the asynchronous event.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|10790| <<vcpu_enter_guest>> r = kvm_check_and_inject_events(vcpu, &req_immediate_exit);
++ */
+ static int kvm_check_and_inject_events(struct kvm_vcpu *vcpu,
+ 				       bool *req_immediate_exit)
+ {
+@@ -10218,6 +10290,13 @@ static int kvm_check_and_inject_events(struct kvm_vcpu *vcpu,
+ 	 * *previous* instruction and must be serviced prior to recognizing any
+ 	 * new events in order to fully complete the previous instruction.
+ 	 */
++	/*
++	 * vmx_inject_nmi()
++	 * svm_inject_nmi()
++	 *
++	 * vmx_inject_irq()
++	 * svm_inject_irq()
++	 */
+ 	if (vcpu->arch.exception.injected)
+ 		kvm_inject_exception(vcpu);
+ 	else if (kvm_is_exception_pending(vcpu))
+@@ -10315,6 +10394,13 @@ static int kvm_check_and_inject_events(struct kvm_vcpu *vcpu,
+ 			goto out;
+ 		if (r) {
+ 			vcpu->arch.smi_pending = false;
++			/*
++			 * 在以下使用kvm_vcpu_arch->smi_count:
++			 *   - arch/x86/kvm/x86.c|3910| <<kvm_set_msr_common(MSR_SMI_COUNT)>> vcpu->arch.smi_count = data;
++			 *   - arch/x86/kvm/x86.c|4282| <<kvm_get_msr_common(MSR_SMI_COUNT)>> msr_info->data = vcpu->arch.smi_count;
++			 *   - arch/x86/kvm/x86.c|10318| <<kvm_check_and_inject_events>> ++vcpu->arch.smi_count;
++			 *   - arch/x86/kvm/x86.c|12166| <<kvm_vcpu_reset>> vcpu->arch.smi_count = 0;
++			 */
+ 			++vcpu->arch.smi_count;
+ 			enter_smm(vcpu);
+ 			can_inject = false;
+@@ -10324,16 +10410,28 @@ static int kvm_check_and_inject_events(struct kvm_vcpu *vcpu,
+ #endif
+ 
+ 	if (vcpu->arch.nmi_pending) {
++		/*
++		 * vmx_nmi_allowed()
++		 * svm_nmi_allowed()
++		 */
+ 		r = can_inject ? static_call(kvm_x86_nmi_allowed)(vcpu, true) : -EBUSY;
+ 		if (r < 0)
+ 			goto out;
+ 		if (r) {
+ 			--vcpu->arch.nmi_pending;
+ 			vcpu->arch.nmi_injected = true;
++			/*
++			 * vmx_inject_nmi()
++			 * svm_inject_nmi()
++			 */
+ 			static_call(kvm_x86_inject_nmi)(vcpu);
+ 			can_inject = false;
+ 			WARN_ON(static_call(kvm_x86_nmi_allowed)(vcpu, true) < 0);
+ 		}
++		/*
++		 * vmx_enable_nmi_window()
++		 * svm_enable_nmi_window()
++		 */
+ 		if (vcpu->arch.nmi_pending)
+ 			static_call(kvm_x86_enable_nmi_window)(vcpu);
+ 	}
+@@ -10384,6 +10482,12 @@ static int kvm_check_and_inject_events(struct kvm_vcpu *vcpu,
+ 	return r;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|5261| <<kvm_vcpu_ioctl_x86_get_vcpu_events>> process_nmi(vcpu);
++ *   - arch/x86/kvm/x86.c|5387| <<kvm_vcpu_ioctl_x86_set_vcpu_events>> process_nmi(vcpu);
++ *   - arch/x86/kvm/x86.c|10783| <<vcpu_enter_guest(KVM_REQ_NMI)>> process_nmi(vcpu);
++ */
+ static void process_nmi(struct kvm_vcpu *vcpu)
+ {
+ 	unsigned int limit;
+@@ -10398,6 +10502,10 @@ static void process_nmi(struct kvm_vcpu *vcpu)
+ 	 * blocks NMIs).  KVM will immediately inject one of the two NMIs, and
+ 	 * will request an NMI window to handle the second NMI.
+ 	 */
++	/*
++	 * vmx_get_nmi_mask()
++	 * svm_get_nmi_mask()
++	 */
+ 	if (static_call(kvm_x86_get_nmi_mask)(vcpu) || vcpu->arch.nmi_injected)
+ 		limit = 1;
+ 	else
+@@ -10407,12 +10515,25 @@ static void process_nmi(struct kvm_vcpu *vcpu)
+ 	 * Adjust the limit to account for pending virtual NMIs, which aren't
+ 	 * tracked in vcpu->arch.nmi_pending.
+ 	 */
++	/*
++	 * svm_is_vnmi_pending()
++	 */
+ 	if (static_call(kvm_x86_is_vnmi_pending)(vcpu))
+ 		limit--;
+ 
++	/*
++	 * 在以下使用kvm_vcpu_arch->nmi_queued:
++	 *   - arch/x86/kvm/x86.c|820| <<kvm_inject_nmi>> atomic_inc(&vcpu->arch.nmi_queued);
++	 *   - arch/x86/kvm/x86.c|5412| <<kvm_vcpu_ioctl_x86_set_vcpu_events>> atomic_set(&vcpu->arch.nmi_queued, events->nmi.pending);
++	 *   - arch/x86/kvm/x86.c|10439| <<process_nmi>> vcpu->arch.nmi_pending += atomic_xchg(&vcpu->arch.nmi_queued, 0);
++	 *   - arch/x86/kvm/x86.c|12193| <<kvm_vcpu_reset>> atomic_set(&vcpu->arch.nmi_queued, 0);
++	 */
+ 	vcpu->arch.nmi_pending += atomic_xchg(&vcpu->arch.nmi_queued, 0);
+ 	vcpu->arch.nmi_pending = min(vcpu->arch.nmi_pending, limit);
+ 
++	/*
++	 * svm_set_vnmi_pending()
++	 */
+ 	if (vcpu->arch.nmi_pending &&
+ 	    (static_call(kvm_x86_set_vnmi_pending)(vcpu)))
+ 		vcpu->arch.nmi_pending--;
+@@ -10421,6 +10542,10 @@ static void process_nmi(struct kvm_vcpu *vcpu)
+ 		kvm_make_request(KVM_REQ_EVENT, vcpu);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|5325| <<kvm_vcpu_ioctl_x86_get_vcpu_events>> events->nmi.pending = kvm_get_nr_pending_nmis(vcpu);
++ */
+ /* Return total number of NMIs pending injection to the VM */
+ int kvm_get_nr_pending_nmis(struct kvm_vcpu *vcpu)
+ {
+@@ -10843,6 +10968,9 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 	 * status, KVM doesn't update assigned devices when APICv is inhibited,
+ 	 * i.e. they can post interrupts even if APICv is temporarily disabled.
+ 	 */
++	/*
++	 * vmx_sync_pir_to_irr()
++	 */
+ 	if (kvm_lapic_enabled(vcpu))
+ 		static_call_cond(kvm_x86_sync_pir_to_irr)(vcpu);
+ 
+@@ -12164,6 +12292,13 @@ void kvm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
+ 
+ 	vcpu->arch.smi_pending = 0;
+ 	vcpu->arch.smi_count = 0;
++	/*
++	 * 在以下使用kvm_vcpu_arch->nmi_queued:
++	 *   - arch/x86/kvm/x86.c|820| <<kvm_inject_nmi>> atomic_inc(&vcpu->arch.nmi_queued);
++	 *   - arch/x86/kvm/x86.c|5412| <<kvm_vcpu_ioctl_x86_set_vcpu_events>> atomic_set(&vcpu->arch.nmi_queued, events->nmi.pending);
++	 *   - arch/x86/kvm/x86.c|10439| <<process_nmi>> vcpu->arch.nmi_pending += atomic_xchg(&vcpu->arch.nmi_queued, 0);
++	 *   - arch/x86/kvm/x86.c|12193| <<kvm_vcpu_reset>> atomic_set(&vcpu->arch.nmi_queued, 0);
++	 */
+ 	atomic_set(&vcpu->arch.nmi_queued, 0);
+ 	vcpu->arch.nmi_pending = 0;
+ 	vcpu->arch.nmi_injected = false;
+diff --git a/arch/x86/kvm/x86.h b/arch/x86/kvm/x86.h
+index 5184fde1d..32c135b2e 100644
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@ -111,6 +111,15 @@ static inline void kvm_clear_exception_queue(struct kvm_vcpu *vcpu)
+ 	vcpu->arch.exception_vmexit.pending = false;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/svm/svm.c|4059| <<svm_complete_interrupts>> kvm_queue_interrupt(vcpu, vector, false);
++ *   - arch/x86/kvm/svm/svm.c|4062| <<svm_complete_interrupts>> kvm_queue_interrupt(vcpu, vector, true);
++ *   - arch/x86/kvm/vmx/vmx.c|7129| <<__vmx_complete_interrupts>> kvm_queue_interrupt(vcpu, vector, type == INTR_TYPE_SOFT_INTR);
++ *   - arch/x86/kvm/x86.c|5106| <<kvm_vcpu_ioctl_interrupt>> kvm_queue_interrupt(vcpu, irq->irq, false);
++ *   - arch/x86/kvm/x86.c|10414| <<kvm_check_and_inject_events>> kvm_queue_interrupt(vcpu, irq, false);
++ *   - arch/x86/kvm/x86.c|11799| <<__set_sregs>> kvm_queue_interrupt(vcpu, pending_vec, false);
++ */
+ static inline void kvm_queue_interrupt(struct kvm_vcpu *vcpu, u8 vector,
+ 	bool soft)
+ {
+diff --git a/kernel/smp.c b/kernel/smp.c
+index f085ebcdf..3d79e3c75 100644
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@ -46,6 +46,12 @@ static DEFINE_PER_CPU_ALIGNED(struct call_function_data, cfd_data);
+ 
+ static DEFINE_PER_CPU_SHARED_ALIGNED(struct llist_head, call_single_queue);
+ 
++/*
++ * 在以下使用trigger_backtrace:
++ *   - kernel/smp.c|49| <<global>> static DEFINE_PER_CPU(atomic_t, trigger_backtrace) = ATOMIC_INIT(1);
++ *   - kernel/smp.c|269| <<csd_lock_wait_toolong>> if (atomic_cmpxchg_acquire(&per_cpu(trigger_backtrace, cpu), 1, 0))
++ *   - kernel/smp.c|456| <<__flush_smp_call_function_queue>> tbt = this_cpu_ptr(&trigger_backtrace);
++ */
+ static DEFINE_PER_CPU(atomic_t, trigger_backtrace) = ATOMIC_INIT(1);
+ 
+ static void __flush_smp_call_function_queue(bool warn_cpu_offline);
+diff --git a/lib/nmi_backtrace.c b/lib/nmi_backtrace.c
+index 33c154264..191efd818 100644
+--- a/lib/nmi_backtrace.c
++++ b/lib/nmi_backtrace.c
+@@ -22,8 +22,29 @@
+ 
+ #ifdef arch_trigger_cpumask_backtrace
+ /* For reliability, we're prepared to waste bits here. */
++/*
++ * 在以下使用backtrace_mask:
++ *   - lib/nmi_backtrace.c|25| <<DECLARE_BITMAP>> static DECLARE_BITMAP(backtrace_mask, NR_CPUS) __read_mostly;
++ *   - lib/nmi_backtrace.c|51| <<nmi_trigger_cpumask_backtrace>> cpumask_copy(to_cpumask(backtrace_mask), mask);
++ *   - lib/nmi_backtrace.c|53| <<nmi_trigger_cpumask_backtrace>> cpumask_clear_cpu(exclude_cpu, to_cpumask(backtrace_mask));
++ *   - lib/nmi_backtrace.c|61| <<nmi_trigger_cpumask_backtrace>> if (cpumask_test_cpu(this_cpu, to_cpumask(backtrace_mask)))
++ *   - lib/nmi_backtrace.c|64| <<nmi_trigger_cpumask_backtrace>> if (!cpumask_empty(to_cpumask(backtrace_mask))) {
++ *   - lib/nmi_backtrace.c|66| <<nmi_trigger_cpumask_backtrace>> this_cpu, nr_cpumask_bits, to_cpumask(backtrace_mask));
++ *   - lib/nmi_backtrace.c|67| <<nmi_trigger_cpumask_backtrace>> nmi_backtrace_stall_snap(to_cpumask(backtrace_mask));
++ *   - lib/nmi_backtrace.c|68| <<nmi_trigger_cpumask_backtrace>> raise(to_cpumask(backtrace_mask));
++ *   - lib/nmi_backtrace.c|73| <<nmi_trigger_cpumask_backtrace>> if (cpumask_empty(to_cpumask(backtrace_mask)))
++ *   - lib/nmi_backtrace.c|78| <<nmi_trigger_cpumask_backtrace>> nmi_backtrace_stall_check(to_cpumask(backtrace_mask));
++ *   - lib/nmi_backtrace.c|99| <<nmi_cpu_backtrace>> if (cpumask_test_cpu(cpu, to_cpumask(backtrace_mask))) {
++ *   - lib/nmi_backtrace.c|116| <<nmi_cpu_backtrace>> cpumask_clear_cpu(cpu, to_cpumask(backtrace_mask));
++ */
+ static DECLARE_BITMAP(backtrace_mask, NR_CPUS) __read_mostly;
+ 
++/*
++ * 在以下使用backtrace_flag:
++ *   - lib/nmi_backtrace.c|28| <<DECLARE_BITMAP>> static unsigned long backtrace_flag;
++ *   - lib/nmi_backtrace.c|42| <<nmi_trigger_cpumask_backtrace>> if (test_and_set_bit(0, &backtrace_flag)) {
++ *   - lib/nmi_backtrace.c|86| <<nmi_trigger_cpumask_backtrace>> clear_bit_unlock(0, &backtrace_flag);
++ */
+ /* "in progress" flag of arch_trigger_cpumask_backtrace */
+ static unsigned long backtrace_flag;
+ 
+diff --git a/tools/testing/selftests/kvm/lib/x86_64/processor.c b/tools/testing/selftests/kvm/lib/x86_64/processor.c
+index d82883740..dcd4fe16d 100644
+--- a/tools/testing/selftests/kvm/lib/x86_64/processor.c
++++ b/tools/testing/selftests/kvm/lib/x86_64/processor.c
+@@ -1006,6 +1006,15 @@ struct kvm_x86_state *vcpu_save_state(struct kvm_vcpu *vcpu)
+ 	return state;
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/amx_test.c|323| <<main>> vcpu_load_state(vcpu, state);
++ *   - tools/testing/selftests/kvm/x86_64/hyperv_evmcs.c|222| <<save_restore_vm>> vcpu_load_state(vcpu, state);
++ *   - tools/testing/selftests/kvm/x86_64/smm_test.c|212| <<main>> vcpu_load_state(vcpu, state);
++ *   - tools/testing/selftests/kvm/x86_64/state_test.c|289| <<main>> vcpu_load_state(vcpu, state);
++ *   - tools/testing/selftests/kvm/x86_64/sync_regs_test.c|196| <<race_sync_regs>> vcpu_load_state(vcpu, state);
++ *   - tools/testing/selftests/kvm/x86_64/vmx_preemption_timer_test.c|234| <<main>> vcpu_load_state(vcpu, state);
++ */
+ void vcpu_load_state(struct kvm_vcpu *vcpu, struct kvm_x86_state *state)
+ {
+ 	vcpu_sregs_set(vcpu, &state->sregs);
+diff --git a/tools/testing/selftests/kvm/x86_64/smm_test.c b/tools/testing/selftests/kvm/x86_64/smm_test.c
+index e18b86666..47af798db 100644
+--- a/tools/testing/selftests/kvm/x86_64/smm_test.c
++++ b/tools/testing/selftests/kvm/x86_64/smm_test.c
+@@ -19,6 +19,15 @@
+ #include "vmx.h"
+ #include "svm_util.h"
+ 
++/*
++ * SMM模式通过调用SMI进入,进入之后,SMI就会disable,不过系统会
++ * 暂存一个且只有一个SMI,当SMM模式退出时,检测到这个SMI会再次进入SMM模式.
++ *
++ * 进入SMM模式后,系统切换到SMRAM这个独立的环境中.
++ *
++ * RSM会使得系统离开SMM模式,RSM只有在SMM中才可以执行.
++ */
++
+ #define SMRAM_SIZE 65536
+ #define SMRAM_MEMSLOT ((1 << 16) | 1)
+ #define SMRAM_PAGES (SMRAM_SIZE / PAGE_SIZE)
+@@ -37,20 +46,49 @@
+  * independent subset of asm here.
+  * SMI handler always report back fixed stage SMRAM_STAGE.
+  */
++/*
++ * 在以下使用smi_handler[]:
++ *   - tools/testing/selftests/kvm/x86_64/smm_test.c|158| <<main>> memcpy(addr_gpa2hva(vm, SMRAM_GPA) + 0x8000, smi_handler, sizeof(smi_handler));
++ */
+ uint8_t smi_handler[] = {
+ 	0xb0, SMRAM_STAGE,    /* mov $SMRAM_STAGE, %al */
+ 	0xe4, SYNC_PORT,      /* in $SYNC_PORT, %al */
+ 	0x0f, 0xaa,           /* rsm */
+ };
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/smm_test.c|68| <<l2_guest_code>> sync_with_host(8);
++ *   - tools/testing/selftests/kvm/x86_64/smm_test.c|70| <<l2_guest_code>> sync_with_host(10);
++ *   - tools/testing/selftests/kvm/x86_64/smm_test.c|83| <<guest_code>> sync_with_host(1);
++ *   - tools/testing/selftests/kvm/x86_64/smm_test.c|87| <<guest_code>> sync_with_host(2);
++ *   - tools/testing/selftests/kvm/x86_64/smm_test.c|91| <<guest_code>> sync_with_host(4);
++ *   - tools/testing/selftests/kvm/x86_64/smm_test.c|104| <<guest_code>> sync_with_host(5);
++ *   - tools/testing/selftests/kvm/x86_64/smm_test.c|108| <<guest_code>> sync_with_host(7);
++ *   - tools/testing/selftests/kvm/x86_64/smm_test.c|119| <<guest_code>> sync_with_host(12);
++ *   - tools/testing/selftests/kvm/x86_64/smm_test.c|122| <<guest_code>> sync_with_host(DONE);
++ */
+ static inline void sync_with_host(uint64_t phase)
+ {
+ 	asm volatile("in $" XSTR(SYNC_PORT)", %%al \n"
+ 		     : "+a" (phase));
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/smm_test.c|89| <<guest_code>> self_smi();
++ *   - tools/testing/selftests/kvm/x86_64/smm_test.c|106| <<guest_code>> self_smi();
++ */
+ static void self_smi(void)
+ {
++	/*
++	 * 在以下使用APIC_DM_SMI:
++	 *   - arch/x86/include/asm/apicdef.h|86| <<global>> #define APIC_DM_SMI 0x00200
++	 *   - tools/testing/selftests/kvm/include/x86_64/apic.h|54| <<global>> #define APIC_DM_SMI 0x00200
++	 *   - arch/x86/kvm/lapic.c|1336| <<__apic_accept_irq>> case APIC_DM_SMI:
++	 *   - drivers/thermal/intel/therm_throt.c|747| <<intel_init_thermal>> if ((l & MSR_IA32_MISC_ENABLE_TM1) && (h & APIC_DM_SMI)) {
++	 *   - tools/testing/selftests/kvm/x86_64/smm_test.c|55| <<self_smi>> APIC_DEST_SELF | APIC_INT_ASSERT | APIC_DM_SMI);
++	 */
+ 	x2apic_write_reg(APIC_ICR,
+ 			 APIC_DEST_SELF | APIC_INT_ASSERT | APIC_DM_SMI);
+ }
+@@ -114,6 +152,11 @@ static void guest_code(void *arg)
+ 	sync_with_host(DONE);
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/smm_test.c|197| <<main (stage 8)>> inject_smi(vcpu);
++ *   - tools/testing/selftests/kvm/x86_64/smm_test.c|206| <<main (stage 10)>> inject_smi(vcpu);
++ */
+ void inject_smi(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_vcpu_events events;
+@@ -141,12 +184,18 @@ int main(int argc, char *argv[])
+ 	/* Create VM */
+ 	vm = vm_create_with_one_vcpu(&vcpu, guest_code);
+ 
++	/*
++	 * #define SMRAM_GPA 0x1000000
++	 */
+ 	vm_userspace_mem_region_add(vm, VM_MEM_SRC_ANONYMOUS, SMRAM_GPA,
+ 				    SMRAM_MEMSLOT, SMRAM_PAGES, 0);
+ 	TEST_ASSERT(vm_phy_pages_alloc(vm, SMRAM_PAGES, SMRAM_GPA, SMRAM_MEMSLOT)
+ 		    == SMRAM_GPA, "could not allocate guest physical addresses?");
+ 
+ 	memset(addr_gpa2hva(vm, SMRAM_GPA), 0x0, SMRAM_SIZE);
++	/*
++	 * 根据smm虚拟化代码, 进入的ip是0x8000
++	 */
+ 	memcpy(addr_gpa2hva(vm, SMRAM_GPA) + 0x8000, smi_handler,
+ 	       sizeof(smi_handler));
+ 
+@@ -171,11 +220,25 @@ int main(int argc, char *argv[])
+ 		memset(&regs, 0, sizeof(regs));
+ 		vcpu_regs_get(vcpu, &regs);
+ 
++		/*
++		 * 例子:
++		 * #define SMRAM_STAGE 0xfe
++		 *
++		 * mov $SMRAM_STAGE, %al
++		 *
++		 * 0xfe = 11111110
++		 * 0xff = 11111111
++		 * and后是11111110
++		 */
+ 		stage_reported = regs.rax & 0xff;
+ 
+ 		if (stage_reported == DONE)
+ 			goto done;
+ 
++		/*
++		 * 这里判断用到了SMRAM_STAGE,
++		 * 说明是smi handler来的
++		 */
+ 		TEST_ASSERT(stage_reported == stage ||
+ 			    stage_reported == SMRAM_STAGE,
+ 			    "Unexpected stage: #%x, got %x",
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 7db96875a..3b43271f7 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -3175,6 +3175,21 @@ int kvm_write_guest(struct kvm *kvm, gpa_t gpa, const void *data,
+ }
+ EXPORT_SYMBOL_GPL(kvm_write_guest);
+ 
++/*
++ * called by:
++ *   - arch/powerpc/kvm/book3s_hv_nested.c|248| <<kvmhv_write_guest_state_and_regs>> return kvm_vcpu_write_guest(vcpu, hv_ptr, l2_hv, size) ||
++ *   - arch/powerpc/kvm/book3s_hv_nested.c|249| <<kvmhv_write_guest_state_and_regs>> kvm_vcpu_write_guest(vcpu, regs_ptr, l2_regs, sizeof(struct pt_regs));
++ *   - arch/powerpc/kvm/book3s_hv_nested.c|628| <<kvmhv_copy_tofrom_guest_nested>> rc = kvm_vcpu_write_guest(vcpu, gp_to, buf, n);
++ *   - arch/powerpc/kvm/powerpc.c|1246| <<kvmppc_complete_mmio_load>> kvm_vcpu_write_guest(vcpu, vcpu->arch.nested_io_gpr, &gpr, sizeof(gpr));
++ *   - arch/x86/kvm/hyperv.c|1377| <<kvm_hv_set_msr_pw>> if (kvm_vcpu_write_guest(vcpu, addr, instructions, i))
++ *   - arch/x86/kvm/smm.c|416| <<enter_smm>> if (kvm_vcpu_write_guest(vcpu, vcpu->arch.smbase + 0xfe00, &smram, sizeof(smram)))
++ *   - arch/x86/kvm/vmx/nested.c|1011| <<nested_vmx_store_msr>> if (kvm_vcpu_write_guest(vcpu, gpa + i * sizeof(e) + offsetof(struct vmx_msr_entry, value), &data, sizeof(data))) {
++ *   - arch/x86/kvm/vmx/nested.c|5319| <<handle_vmclear>> (void )kvm_vcpu_write_guest(vcpu, vmptr + offsetof(struct vmcs12, launch_state), &zero, sizeof(zero));
++ *   - arch/x86/kvm/x86.c|7587| <<kvm_write_guest_virt_helper>> ret = kvm_vcpu_write_guest(vcpu, gpa, data, towrite);
++ *   - arch/x86/kvm/x86.c|7712| <<emulator_write_phys>> ret = kvm_vcpu_write_guest(vcpu, gpa, val, bytes);
++ *   - arch/x86/kvm/xen.c|1127| <<kvm_xen_write_hypercall_page>> if (kvm_vcpu_write_guest(vcpu, page_addr + (i * sizeof(instructions)), instructions, sizeof(instructions)))
++ *   - arch/x86/kvm/xen.c|1153| <<kvm_xen_write_hypercall_page>> ret = kvm_vcpu_write_guest(vcpu, page_addr, page, PAGE_SIZE);
++ */
+ int kvm_vcpu_write_guest(struct kvm_vcpu *vcpu, gpa_t gpa, const void *data,
+ 		         unsigned long len)
+ {
+-- 
+2.34.1
+
