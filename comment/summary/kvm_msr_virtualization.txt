@@ -1,0 +1,515 @@
+
+所有的MSR应该先分为两类.
+
+一类是必须trap到KVM的, 由KVM进行处理.
+
+一类不需要trap到KVM, 可以直接允许guest进行修改. 这个叫做passthrough.
+
+需要注意的是, 不是说host/guest共享msr就叫passthrough. PMU的寄存器共享了, 很多仍然要trap/intercept到KVM.
+
+这是允许passthrough的16个寄存器. 正如comment里说的, 还有x2apic和PT的msr会单独处理passthrough.
+
+ 159 /*
+ 160  * List of MSRs that can be directly passed to the guest.
+ 161  * In addition to these x2apic and PT MSRs are handled specially.
+ 162  */
+ 163 static u32 vmx_possible_passthrough_msrs[MAX_POSSIBLE_PASSTHROUGH_MSRS] = {
+ 164         MSR_IA32_SPEC_CTRL,
+ 165         MSR_IA32_PRED_CMD,
+ 166         MSR_IA32_FLUSH_CMD,
+ 167         MSR_IA32_TSC,
+ 168 #ifdef CONFIG_X86_64
+ 169         MSR_FS_BASE,
+ 170         MSR_GS_BASE,
+ 171         MSR_KERNEL_GS_BASE,
+ 172         MSR_IA32_XFD,
+ 173         MSR_IA32_XFD_ERR,
+ 174 #endif
+ 175         MSR_IA32_SYSENTER_CS,
+ 176         MSR_IA32_SYSENTER_ESP,
+ 177         MSR_IA32_SYSENTER_EIP,
+ 178         MSR_CORE_C1_RES,
+ 179         MSR_CORE_C3_RESIDENCY,
+ 180         MSR_CORE_C6_RESIDENCY,
+ 181         MSR_CORE_C7_RESIDENCY,
+ 182 };
+
+总之, 上面是按照intercept来分类.
+
+============================================
+
+还有一种分类方式是按照加载的方式分类, 有4类.
+
+1. 第一类应该是没有实际的状态, 数据都在一些结构里. 比如TSC的配置.
+
+状态随着数据结构就加载了.
+
+2. 第二类是可以由VMCS里的control bit来控制自动的load/store.
+
+3. 第三类可以通过VMCS里的load/store bitmap来控制.
+
+4. 第四类直接在entry/exit之前/后手动的load/save.
+
+这种分类方式并没有说会不会intercept.
+
+----------------------------------------
+
+第二种 2. 有几个特殊的MSR的load/save.
+
+# vm exit control VMCS:
+
+* Save IA32_PERF_GLOBAL_CTL: This control determines whether the IA32_PERF_GLOBAL_CTL MSR is saved on VM exit.
+* Load IA32_PERF_GLOBAL_CTRL:  This control determines whether the IA32_PERF_GLOBAL_CTRL MSR is loaded on VM exit.
+* Save IA32_EFER: This control determines whether the IA32_EFER MSR is saved on VM exit.
+* Load IA32_EFER: This control determines whether the IA32_EFER MSR is loaded on VM exit.
+
+# vm entry control VMCS:
+
+* Load IA32_PERF_GLOBA_CTRL: This control determines whether the IA32_PERF_GLOBAL_CTRL MSR is loaded on VM entry.
+* Load IA32_EFER: This control determines whether the IA32_EFER MSR is loaded on VM entry.
+
+还有单独的VMCS.
+
+# Guest State:
+
+IA32_PERF_GLOBAL_CTRL (64 bits): This field is supported only on processors
+that support the 1-setting of the "load IA32_PERF_GLOBAL_CTRL" VM-entry
+control.
+
+IA32_EFER (64 bits): This field is supported only on processors that support
+either the 1-setting of the "load IA32_EFER" VM-entry control or that of the
+"save IA32_EFER" VM-exit control.
+
+对应下面的VMCS.
+
+GUEST_IA32_EFER                 = 0x00002806,
+GUEST_IA32_EFER_HIGH            = 0x00002807,
+GUEST_IA32_PERF_GLOBAL_CTRL     = 0x00002808,
+GUEST_IA32_PERF_GLOBAL_CTRL_HIGH= 0x00002809,
+
+# Host State:
+
+IA32_PERF_GLOBAL_CTRL (64 bits): This field is supported only on processors
+that support the 1-setting of the "load IA32_PERF_GLOBAL_CTRL" VM-exit control.
+
+IA32_EFER (64 bits): This field is supported only on processors that support
+the 1-setting of the "load IA32_EFER" VM-exit control.
+
+对应下面的VMCS.
+
+HOST_IA32_EFER                  = 0x00002c02,
+HOST_IA32_EFER_HIGH             = 0x00002c03,
+HOST_IA32_PERF_GLOBAL_CTRL      = 0x00002c04,
+HOST_IA32_PERF_GLOBAL_CTRL_HIGH = 0x00002c05,
+
+
+使用EFER当例子, 这是一个MSR.
+
+当进入VM的时候:
+- 自动把VMCS:GUEST_IA32_EFER加载到VM的执行中
+
+当退出VM的时候:
+- 自动把VM环境中的EFER MSR进入VMCS:GUEST_IA32_EFER
+- 自动把之前在VMCS:HOST_IA32_EFER加载到执行中
+
+因为MSR_EFER/MSR_CORE_PERF_GLOBAL_CTRL是直接有对应的GUEST/HOST VMCS的,
+所以可以用上面的方法.
+
+1030 static void add_atomic_switch_msr(struct vcpu_vmx *vmx, unsigned msr,
+1031                                   u64 guest_val, u64 host_val, bool entry_only)
+1032 {
+1033         int i, j = 0;
+1034         struct msr_autoload *m = &vmx->msr_autoload;
+1035 
+1036         switch (msr) {
+1037         case MSR_EFER:
+1038                 if (cpu_has_load_ia32_efer()) {
+1039                         add_atomic_switch_msr_special(vmx,
+1040                                         VM_ENTRY_LOAD_IA32_EFER,
+1041                                         VM_EXIT_LOAD_IA32_EFER,
+1042                                         GUEST_IA32_EFER,
+1043                                         HOST_IA32_EFER,
+1044                                         guest_val, host_val);
+1045                         return;
+1046                 }
+1047                 break;
+1048         case MSR_CORE_PERF_GLOBAL_CTRL:
+1049                 if (cpu_has_load_perf_global_ctrl()) {
+1050                         add_atomic_switch_msr_special(vmx,
+1051                                         VM_ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL,
+1052                                         VM_EXIT_LOAD_IA32_PERF_GLOBAL_CTRL,
+1053                                         GUEST_IA32_PERF_GLOBAL_CTRL,
+1054                                         HOST_IA32_PERF_GLOBAL_CTRL,
+1055                                         guest_val, host_val);
+1056                         return;
+1057                 }
+1058                 break;
+
+比如进入VM的时候, 只需要把guest环境的MSR准备好就可以了.
+再就是准备好exit的时候要恢复的host的值.
+
+等到真的要退出VM的时候, guest的好说,
+主要在恢复host的值.
+
+所以进入VM的时候, 没必要把当前的MSR的值备份到VMCS:HOST_IA32_EFER, 因为已经这样做了.
+
+1. 只有VMCS:GUEST和VMCS:HOST
+2. 提前写好VMCS:GUEST和VMCS:HOST
+3. entry的时候, 把VMCS:GUEST加载, 所以只有一个配置
+4. exit的时候, 既要把当前的值保存到VMCS:GUEST, 又要把VMCS:HOST的值加载到当前值,
+所以需要两个配置.
+
+----------------------------------------
+
+第三种 3. 还有一个是general的auto load/save.
+
+# vm exit:
+
+The following VM-exit control fields determine how MSRs are stored on VM exits:
+
+- VM-exit MSR-store count (32 bits): This field specifies the number of MSRs to
+be stored on VM exit. It is recommended that this count not exceed 512. 1
+Otherwise, unpredictable processor behavior (including a machine check) may
+result during VM exit.
+
+- VM-exit MSR-store address (64 bits): This field contains the physical address
+of the VM-exit MSR-store area.  The area is a table of entries, 16 bytes per
+entry, where the number of entries is given by the VM-exit MSR- store count.
+The format of each entry is given in Table 25-15. If the VM-exit MSR-store
+count is not zero, the address must be 16-byte aligned.
+
+The following VM-exit control fields determine how MSRs are loaded on VM exits:
+
+- VM-exit MSR-load count (32 bits). This field contains the number of MSRs to
+be loaded on VM exit. It is recommended that this count not exceed 512.
+Otherwise, unpredictable processor behavior (including a machine check) may
+result during VM exit.
+
+- VM-exit MSR-load address (64 bits). This field contains the physical address
+of the VM-exit MSR-load area.  The area is a table of entries, 16 bytes per
+entry, where the number of entries is given by the VM-exit MSR-load count (see
+Table 25-15). If the VM-exit MSR-load count is not zero, the address must be
+16-byte aligned.
+
+# vm entry:
+
+A VMM may specify a list of MSRs to be loaded on VM entries:
+ 
+- VM-entry MSR-load count (32 bits). This field contains the number of MSRs to
+be loaded on VM entry. It is recommended that this count not exceed 512.
+Otherwise, unpredictable processor behavior (including a machine check) may
+result during VM entry.
+
+- VM-entry MSR-load address (64 bits). This field contains the physical address
+of the VM-entry MSR-load area. The area is a table of entries, 16 bytes per
+entry, where the number of entries is given by the VM-entry MSR-load count. The
+format of entries is described in Table 25-15. If the VM-entry MSR-load count
+is not zero, the address must be 16-byte aligned.
+
+362         struct msr_autoload {
+363                 struct vmx_msrs guest;
+364                 struct vmx_msrs host;
+365         } msr_autoload;
+366
+367         struct msr_autostore {
+368                 struct vmx_msrs guest;
+369         } msr_autostore;
+
+ 33 struct vmx_msrs {
+ 34         unsigned int            nr;
+ 35         struct vmx_msr_entry    val[MAX_NR_LOADSTORE_MSRS];
+ 36 };
+
+----------------------------------------
+
+第四种情况, 是指定的把一些MSR进入VM的时候设置, exit的时候恢复备份.
+
+比如kvm的exit IP是vmx_vmexit.
+vmcs_writel(HOST_RIP, (unsigned long)vmx_vmexit);
+
+
+在进入guest的时候, 设置MSR: line 129. 
+
+ 79 SYM_FUNC_START(__vmx_vcpu_run)
+... ...
+113         /*
+114          * SPEC_CTRL handling: if the guest's SPEC_CTRL value differs from the
+115          * host's, write the MSR.
+116          *
+117          * IMPORTANT: To avoid RSB underflow attacks and any other nastiness,
+118          * there must not be any returns or indirect branches between this code
+119          * and vmentry.
+120          */
+121         mov 2*WORD_SIZE(%_ASM_SP), %_ASM_DI
+122         movl VMX_spec_ctrl(%_ASM_DI), %edi
+123         movl PER_CPU_VAR(x86_spec_ctrl_current), %esi
+124         cmp %edi, %esi
+125         je .Lspec_ctrl_done
+126         mov $MSR_IA32_SPEC_CTRL, %ecx
+127         xor %edx, %edx
+128         mov %edi, %eax
+129         wrmsr
+
+vm exit的时候, 恢复MSR: line 273.
+
+190 SYM_INNER_LABEL_ALIGN(vmx_vmexit, SYM_L_GLOBAL)
+191
+192         /* Restore unwind state from before the VMRESUME/VMLAUNCH. */
+193         UNWIND_HINT_RESTORE
+194         ENDBR
+... ...
+270         pop %_ASM_ARG2  /* @flags */
+271         pop %_ASM_ARG1  /* @vmx */
+272
+273         call vmx_spec_ctrl_restore_host
+274
+275         /* Put return value in AX */
+276         mov %_ASM_BX, %_ASM_AX
+277
+278         pop %_ASM_BX
+279 #ifdef CONFIG_X86_64
+280         pop %r12
+281         pop %r13
+282         pop %r14
+283         pop %r15
+284 #else
+285         pop %esi
+286         pop %edi
+287 #endif
+288         pop %_ASM_BP
+289         RET
+
+============================================
+
+说完了intercept和load/store, 还有一些feature.
+
+filtered msr.
+
+QEMU的userspace可以通过KVM_X86_SET_MSR_FILTER设定不允许READ/WRITE的msr.
+
+1. 当trap这些msr的read/write的时候
+2. 当决定是不是需要intercept这些msr的时候
+
+会参考kvm_msr_allowed().
+
+
+
+此外, ignore_msrs可以控制对于非法的msr的操作是否返回1(错误).
+可以直接返回0, VM注意不到.
+
+根据Sean在mailing list的讨论.
+
+The whole point of ignore_msrs was so that KVM could run _guest_ code that isn't
+aware it's running in a VM, and so attempts to access MSRs that the _guest_ thinks
+are always available.
+
+The feature MSRs API is used only by userspace which obviously should know that
+it's dealing with KVM.  Ignoring bad access from the host is just asinine.
+
+
+还有一个就是允许userspace配置当遇到访问错误的时候怎么办.
+是返回1(GP), 还是给QEMU的userspace?
+
+ 2030 static int kvm_msr_user_space(struct kvm_vcpu *vcpu, u32 index,
+ 2031                               u32 exit_reason, u64 data,
+ 2032                               int (*completion)(struct kvm_vcpu *vcpu),
+ 2033                               int r)
+ 2034 {
+ 2035         u64 msr_reason = kvm_msr_reason(r);
+ 2036
+ 2037         /* Check if the user wanted to know about this MSR fault */
+ 2038         if (!(vcpu->kvm->arch.user_space_msr_mask & msr_reason))
+ 2039                 return 0;
+ 2040
+ 2041         vcpu->run->exit_reason = exit_reason;
+ 2042         vcpu->run->msr.error = 0;
+ 2043         memset(vcpu->run->msr.pad, 0, sizeof(vcpu->run->msr.pad));
+ 2044         vcpu->run->msr.reason = msr_reason;
+ 2045         vcpu->run->msr.index = index;
+ 2046         vcpu->run->msr.data = data;
+ 2047         vcpu->arch.complete_userspace_io = completion;
+ 2048
+ 2049         return 1;
+ 2050 }
+
+============================================
+
+最后是很重要的feature, user_return_msrs.
+
+不停的在guest/host context switch的时候msr read/write非常消耗性能.
+
+有一些msr只在host的userspace使用, 于是从guest退出到host的时候完全不需要设置host的msr.
+完全可以等到去userspace的时候再设置.
+
+分为x86的部分和vmx/svm的部分.
+
+对于x86, generally有下面的结构.
+
+kvm_nr_uret_msrs是支持uret msr的数目.
+
+kvm_uret_msrs_list[KVM_MAX_NR_USER_RETURN_MSRS]是存大所有支持uret的msr.
+
+percpu的user_return_msrs是当前CPU关于uret的host/VM的msr的配置.
+
+  203 /*
+  204  * Restoring the host value for MSRs that are only consumed when running in
+  205  * usermode, e.g. SYSCALL MSRs and TSC_AUX, can be deferred until the CPU
+  206  * returns to userspace, i.e. the kernel can run with the guest's value.
+  207  */
+  208 #define KVM_MAX_NR_USER_RETURN_MSRS 16
+  209
+  210 struct kvm_user_return_msrs {
+  211         struct user_return_notifier urn;
+  212         bool registered;
+  213         struct kvm_user_return_msr_values {
+  214                 u64 host;
+  215                 u64 curr;
+  216         } values[KVM_MAX_NR_USER_RETURN_MSRS];
+  217 };
+  218
+  219 u32 __read_mostly kvm_nr_uret_msrs;
+  220 EXPORT_SYMBOL_GPL(kvm_nr_uret_msrs);
+  221 static u32 __read_mostly kvm_uret_msrs_list[KVM_MAX_NR_USER_RETURN_MSRS];
+  222 static struct kvm_user_return_msrs __percpu *user_return_msrs;
+
+1. kvm_uret_msrs_list[KVM_MAX_NR_USER_RETURN_MSRS]是用以下添加的.
+
+vmx: vmx_setup_user_return_msrs()
+svm: svm_hardware_setup()
+
+以vmx为例子, 支持8376到8382这些的msr.
+
+8365 static __init void vmx_setup_user_return_msrs(void)
+8366 {
+8367
+8368         /*
+8369          * Though SYSCALL is only supported in 64-bit mode on Intel CPUs, kvm
+8370          * will emulate SYSCALL in legacy mode if the vendor string in guest
+8371          * CPUID.0:{EBX,ECX,EDX} is "AuthenticAMD" or "AMDisbetter!" To
+8372          * support this emulation, MSR_STAR is included in the list for i386,
+8373          * but is never loaded into hardware.  MSR_CSTAR is also never loaded
+8374          * into hardware and is here purely for emulation purposes.
+8375          */
+8376         const u32 vmx_uret_msrs_list[] = {
+8377         #ifdef CONFIG_X86_64
+8378                 MSR_SYSCALL_MASK, MSR_LSTAR, MSR_CSTAR,
+8379         #endif
+8380                 MSR_EFER, MSR_TSC_AUX, MSR_STAR,
+8381                 MSR_IA32_TSX_CTRL,
+8382         };
+8383         int i;
+8384
+8385         BUILD_BUG_ON(ARRAY_SIZE(vmx_uret_msrs_list) != MAX_NR_USER_RETURN_MSRS);
+8386
+8387         for (i = 0; i < ARRAY_SIZE(vmx_uret_msrs_list); ++i)
+8388                 kvm_add_user_return_msr(vmx_uret_msrs_list[i]);
+8389 }
+
+要进入guest的时候, 会调用下面的API准备guest的msr, 并且注册callback.
+
+  442 int kvm_set_user_return_msr(unsigned slot, u64 value, u64 mask)
+  443 {      
+  444         unsigned int cpu = smp_processor_id();
+  445         struct kvm_user_return_msrs *msrs = per_cpu_ptr(user_return_msrs, cpu);
+  446         int err;
+  447 
+  448         value = (value & mask) | (msrs->values[slot].host & ~mask);
+  449         if (value == msrs->values[slot].curr)
+  450                 return 0;
+  451         err = wrmsrl_safe(kvm_uret_msrs_list[slot], value);
+  452         if (err)
+  453                 return 1;
+  454        
+  455         msrs->values[slot].curr = value;
+  456         if (!msrs->registered) {
+  457                 msrs->urn.on_user_return = kvm_on_user_return;
+  458                 user_return_notifier_register(&msrs->urn);
+  459                 msrs->registered = true;
+  460         }
+  461         return 0;
+  462 }
+  463 EXPORT_SYMBOL_GPL(kvm_set_user_return_msr);
+
+假设caller是vmx的:
+
+1280 void vmx_prepare_switch_to_guest(struct kvm_vcpu *vcpu)
+1281 {
+1282         struct vcpu_vmx *vmx = to_vmx(vcpu);
+... ...
+1298         if (!vmx->guest_uret_msrs_loaded) {
+1299                 vmx->guest_uret_msrs_loaded = true;
+1300                 for (i = 0; i < kvm_nr_uret_msrs; ++i) {
+1301                         if (!vmx->guest_uret_msrs[i].load_into_hardware)
+1302                                 continue;
+1303 
+1304                         kvm_set_user_return_msr(i,
+1305                                                 vmx->guest_uret_msrs[i].data,
+1306                                                 vmx->guest_uret_msrs[i].mask);
+1307                 }
+1308         }
+
+struct vcpu_vmx下有两个:
+- struct vmx_uret_msr   guest_uret_msrs[MAX_NR_USER_RETURN_MSRS]; ---> 记录所有为guest准备的msr的value, 在trap一些msr修改的时候会更新
+- bool                  guest_uret_msrs_loaded; ---> 记录为guest准备的msr是否全部加载到寄存器了.
+
+============================================
+
+有一些msr可以被多个feature使用.
+
+用VMCS的auto load/store肯定更快, 所以我们先试着用VMCS的auto办法, 不行再用uret.
+
+1096 static bool update_transition_efer(struct vcpu_vmx *vmx)
+1097 {
+1098         u64 guest_efer = vmx->vcpu.arch.efer;
+1099         u64 ignore_bits = 0;
+1100         int i;
+1101
+1102         /* Shadow paging assumes NX to be available.  */
+1103         if (!enable_ept)
+1104                 guest_efer |= EFER_NX;
+1105
+1106         /*
+1107          * LMA and LME handled by hardware; SCE meaningless outside long mode.
+1108          */
+1109         ignore_bits |= EFER_SCE;
+1110 #ifdef CONFIG_X86_64
+1111         ignore_bits |= EFER_LMA | EFER_LME;
+1112         /* SCE is meaningful only in long mode on Intel */
+1113         if (guest_efer & EFER_LMA)
+1114                 ignore_bits &= ~(u64)EFER_SCE;
+1115 #endif
+1116
+1117         /*
+1118          * On EPT, we can't emulate NX, so we must switch EFER atomically.
+1119          * On CPUs that support "load IA32_EFER", always switch EFER
+1120          * atomically, since it's faster than switching it manually.
+1121          */
+1122         if (cpu_has_load_ia32_efer() ||
+1123             (enable_ept && ((vmx->vcpu.arch.efer ^ host_efer) & EFER_NX))) {
+1124                 if (!(guest_efer & EFER_LMA))
+1125                         guest_efer &= ~EFER_LME;
+1126                 if (guest_efer != host_efer)
+1127                         add_atomic_switch_msr(vmx, MSR_EFER,
+1128                                               guest_efer, host_efer, false);
+1129                 else
+1130                         clear_atomic_switch_msr(vmx, MSR_EFER);
+1131                 return false;
+1132         }
+1133
+1134         i = kvm_find_user_return_msr(MSR_EFER);
+1135         if (i < 0)
+1136                 return false;
+1137
+1138         clear_atomic_switch_msr(vmx, MSR_EFER);
+1139
+1140         guest_efer &= ~ignore_bits;
+1141         guest_efer |= host_efer & ignore_bits;
+1142
+1143         vmx->guest_uret_msrs[i].data = guest_efer;
+1144         vmx->guest_uret_msrs[i].mask = ~ignore_bits;
+1145
+1146         return true;
+1147 }
+
+
+[1] https://juejin.cn/post/7287907234704457740

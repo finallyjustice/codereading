@@ -1,0 +1,92 @@
+[PATCH v2] KVM: x86: nSVM/nVMX: Fix handling triple fault on RSM instruction
+
+... from Michal Wilczynski <michal.wilczynski@intel.com> ...
+
+https://lore.kernel.org/all/20240123001555.4168188-1-michal.wilczynski@intel.com/
+
+--------------------
+
+The issue can reproduce with the below code.
+
+https://lore.kernel.org/all/CAMhUBjmXMYsEoVYw_M8hSZjBMHh24i88QYm-RY6HDta5YZ7Wgw@mail.gmail.com/
+
+[   15.032353][  T210] ------------[ cut here ]------------
+[   15.032721][  T210] WARNING: CPU: 1 PID: 210 at
+arch/x86/kvm/vmx/nested.c:4733 nested_vmx_vmexit+0x2056/0x3770
+[   15.033364][  T210] Modules linked in:
+[   15.033587][  T210] CPU: 1 PID: 210 Comm: poc Not tainted 6.6.0+ #7
+[   15.033937][  T210] Hardware name: QEMU Standard PC (i440FX + PIIX,
+1996), BIOS rel-1.16.2-0-gea1b7a073390-prebuilt.qemu.org 04/01/2014
+[   15.034526][  T210] RIP: 0010:nested_vmx_vmexit+0x2056/0x3770
+[   15.043358][  T210]  vcpu_enter_guest+0x571/0x4930
+[   15.044476][  T210]  kvm_arch_vcpu_ioctl_run+0x70b/0x29b0
+[   15.045423][  T210]  kvm_vcpu_ioctl+0x55f/0xe90
+[   15.047243][  T210]  do_syscall_64+0x43/0xf0
+[   15.047438][  T210]  entry_SYSCALL_64_after_hwframe+0x6f/0x77
+[   15.050852][  T210] ---[ end trace 0000000000000000 ]---
+
+
+1. To enter into nested L2 VM mode.
+
+2. Trigger SMI to L1.
+
+3. The L1 switched to SMM (in parallel with L2 VM).
+
+4. Now run rsm to leave SMM at L1.
+
+2317 static int em_rsm(struct x86_emulate_ctxt *ctxt)
+2318 {
+2319         if (!ctxt->ops->is_smm(ctxt))
+2320                 return emulate_ud(ctxt);
+2321
+2322         if (ctxt->ops->leave_smm(ctxt))
+2323                 ctxt->ops->triple_fault(ctxt);
+2324
+2325         return emulator_recalc_and_set_mode(ctxt);
+2326 }
+
+em_rsm()
+-> ctxt->ops->leave_smm(ctxt) = emulator_leave_smm()
+   -> static_call(kvm_x86_leave_smm)(vcpu, &smram) = vmx_leave_smm()
+      -> nested_vmx_enter_non_root_mode()
+      -> vmx->nested.nested_run_pending = 1 ---> set to one!!!!
+   -> rsm_load_state_64()
+-> ctxt->ops->triple_fault(ctxt) = emulator_triple_fault()
+   -> kvm_make_request(KVM_REQ_TRIPLE_FAULT, emul_to_vcpu(ctxt));
+
+
+11107                 if (kvm_test_request(KVM_REQ_TRIPLE_FAULT, vcpu)) {
+11108                         if (is_guest_mode(vcpu))
+11109                                 kvm_x86_ops.nested_ops->triple_fault(vcpu);
+11110
+11111                         if (kvm_check_request(KVM_REQ_TRIPLE_FAULT, vcpu)) {
+11112                                 vcpu->run->exit_reason = KVM_EXIT_SHUTDOWN;
+11113                                 vcpu->mmio_needed = 0;
+11114                                 r = 0;
+11115                                 goto out;
+11116                         }
+11117                 }
+
+4940 static void nested_vmx_triple_fault(struct kvm_vcpu *vcpu)
+4941 {
+4942         kvm_clear_request(KVM_REQ_TRIPLE_FAULT, vcpu);
+4943         nested_vmx_vmexit(vcpu, EXIT_REASON_TRIPLE_FAULT, 0, 0);
+4944 }
+
+5. The nested_run_pending is already set to 1.
+
+However, nested_vmx_triple_fault() triggers WARNING on nested_run_pending=1.
+
+
+kvm_smm_transition: vcpu 0: entering SMM, smbase 0x30000
+kvm_entry: vcpu 0, rip 0x8000
+kvm_entry: vcpu 0, rip 0x8000
+kvm_entry: vcpu 0, rip 0x8002
+kvm_smm_transition: vcpu 0: leaving SMM, smbase 0x30000
+kvm_nested_vmenter: rip: 0x0000000000008002 vmcs: 0x0000000000007000
+                    nested_rip: 0x0000000000000000 int_ctl: 0x00000000
+		    event_inj: 0x00000000 nested_ept=n guest
+		    cr3: 0x0000000000002000
+kvm_nested_vmexit_inject: reason: TRIPLE_FAULT ext_inf1: 0x0000000000000000
+                          ext_inf2: 0x0000000000000000 ext_int: 0x00000000
+			  ext_int_err: 0x00000000

@@ -1,0 +1,94 @@
+[PATCH v2 0/4] KVM: x86/mmu: Clean up indirect_shadow_pages usage
+
+... Sean Christopherson <seanjc@google.com> ...
+
+https://lore.kernel.org/all/20240203002343.383056-1-seanjc@google.com/
+
+--------------------------
+
+[PATCH v2 1/4] KVM: x86/mmu: Don't acquire mmu_lock when using indirect_shadow_pages as a heuristic
+
+这里的indirect_shadow_pages只是一个coarse-grained heuristic, 用write lock影响性能.
+
+如果有了race造成的false positive/negative可以自己恢复.
+
+A false positive simply means that KVM will try to unprotect shadow pages that
+have already been zapped.
+
+A false negative means that KVM will resume the guest without unprotecting the
+gfn, i.e. if a shadow page was _just_ created, the vCPU will hit the same page
+fault and do the whole dance all over again, and detect and unprotect the
+shadow page the second time around (or not, if something else zaps it first).
+
+
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index c339d9f95b4b..2ec3e1851f2f 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -8787,13 +8787,7 @@ static bool reexecute_instruction(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
+
+ 	/* The instructions are well-emulated on direct mmu. */
+ 	if (vcpu->arch.mmu->root_role.direct) {
+-		unsigned int indirect_shadow_pages;
+-
+-		write_lock(&vcpu->kvm->mmu_lock);
+-		indirect_shadow_pages = vcpu->kvm->arch.indirect_shadow_pages;
+-		write_unlock(&vcpu->kvm->mmu_lock);
+-
+-		if (indirect_shadow_pages)
++		if (vcpu->kvm->arch.indirect_shadow_pages)
+ 			kvm_mmu_unprotect_page(vcpu->kvm, gpa_to_gfn(gpa));
+
+ 		return true;
+
+但是这里不太理解的是, 到底什么情况会用到这里??
+经过测试, nested virtualization会遇到.
+
+crash> kvm ffffc9000cd8d000 | grep indirect_shadow
+    indirect_shadow_pages = 579,
+
+
+这里是commit message的注释.
+
+首先, kvm_mmu_unprotect_page()的功能是:
+心思想是zap那些不满足下面条件(或/or)的影子sp (必须相同的gfn)
+- (_sp)->gfn != (_gfn), 或者
+- !sp_has_gptes(_sp) --> 是direct
+
+于是, 在reexecute_instruction的时候是否要unprotect这个gfn (影子).
+
+Drop KVM's completely pointless acquisition of mmu_lock when deciding
+whether or not to unprotect any shadow pages residing at the gfn before
+resuming the guest to let it retry an instruction that KVM failed to
+emulated.  In this case, indirect_shadow_pages is used as a coarse-grained
+heuristic to check if there is any chance of there being a relevant shadow
+page to unprotected.  But acquiring mmu_lock largely defeats any benefit
+to the heuristic, as taking mmu_lock for write is likely far more costly
+to the VM as a whole than unnecessarily walking mmu_page_hash.
+
+Furthermore, the current code is already prone to false negatives and
+false positives, as it drops mmu_lock before checking the flag and
+unprotecting shadow pages.  And as evidenced by the lack of bug reports,
+
+--> 现在的代码本来就是先drop mmu_lock, 然后在reexecute_instruction()再
+拿一遍了. 没见过有bug
+
+neither false positives nor false negatives are problematic.  A false
+positive simply means that KVM will try to unprotect shadow pages that
+have already been zapped.  And a false negative means that KVM will
+resume the guest without unprotecting the gfn, i.e. if a shadow page was
+_just_ created, the vCPU will hit the same page fault and do the whole
+dance all over again, and detect and unprotect the shadow page the second
+time around (or not, if something else zaps it first).
+
+--------------------------
+
+[PATCH v2 2/4] KVM: x86: Drop dedicated logic for direct MMUs in reexecute_instruction()
+
+核心思想是永远使用heuristic.
+
+不知道下面那句什么意思
+Well, unless the instruction used a direct hugepage with 2-level paging
+for its code page, 
+
+--------------------------

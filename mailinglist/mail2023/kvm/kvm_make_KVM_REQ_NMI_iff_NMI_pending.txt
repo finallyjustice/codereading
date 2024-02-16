@@ -1,0 +1,91 @@
+[PATCH] KVM: x86: make KVM_REQ_NMI request iff NMI pending for vcpu
+
+... Prasad Pandit <ppandit@redhat.com> ...
+
+https://lore.kernel.org/all/20240103075343.549293-1-ppandit@redhat.com/#t
+
+--------------------------
+
+Here is my understanding.
+
+1. During the VM creation, the mp_state of AP (non-BSP) is always
+KVM_MP_STATE_UNINITIALIZED, until INIT/SIPI.
+
+2. Ideally, AP should block at below. That is, line 3775 is always false.
+
+3760 bool kvm_vcpu_block(struct kvm_vcpu *vcpu)
+3761 {
+3762         struct rcuwait *wait = kvm_arch_vcpu_get_wait(vcpu);
+3763         bool waited = false;
+3764
+3765         vcpu->stat.generic.blocking = 1;
+3766
+3767         preempt_disable();
+3768         kvm_arch_vcpu_blocking(vcpu);
+3769         prepare_to_rcuwait(wait);
+3770         preempt_enable();
+3771
+3772         for (;;) {
+3773                 set_current_state(TASK_INTERRUPTIBLE);
+3774
+3775                 if (kvm_vcpu_check_block(vcpu) < 0)
+3776                         break;
+3777
+3778                 waited = true;
+3779                 schedule();
+3780         }
+
+3. Unfortunately, the issue may set KVM_REQ_NMI for AP.
+
+4. This leads to the kvm_vcpu_check_block() to return.
+
+kvm_arch_vcpu_ioctl_run()
+-> kvm_vcpu_block()
+   -> kvm_vcpu_check_block()
+      -> kvm_arch_vcpu_runnable()
+         -> kvm_vcpu_has_events()
+            -> kvm_test_request(KVM_REQ_NMI, vcpu)
+
+
+5. The kvm_arch_vcpu_ioctl_run() returns to QEMU with -EAGAIN.
+
+6. The QEMU side is not able to handle -EAGAIN, but to goto line 2984 to
+return.
+
+It aquires the global mutext at line 2976 (release before entering into guest
+again).
+
+2808 int kvm_cpu_exec(CPUState *cpu)
+2809 {
+... ...
+2868         if (run_ret < 0) {
+2869             if (run_ret == -EINTR || run_ret == -EAGAIN) {
+2870                 trace_kvm_io_window_exit();
+2871                 kvm_eat_signals(cpu);
+2872                 ret = EXCP_INTERRUPT;
+2873                 break;
+2874             }
+... ...
+2973     } while (ret == 0);
+2974
+2975     cpu_exec_end(cpu);
+2976     bql_lock();
+2977
+2978     if (ret < 0) {
+2979         cpu_dump_state(cpu, stderr, CPU_DUMP_CODE);
+2980         vm_stop(RUN_STATE_INTERNAL_ERROR);
+2981     }
+2982
+2983     qatomic_set(&cpu->exit_request, 0);
+2984     return ret;
+2985 }
+
+
+7. The QEMU AP vCPU thread enters into KVM_RUN again. Same flow as step 4, goto
+step 4, again and again.
+
+The lock has been frequently acquired/released. The vCPU 0 is unhappy with it,
+especially when the number of APs is large!
+
+I guess it is not an issue after VM reboot (without QEMU instance re-creation
+because the mpstate is not KVM_MP_STATE_UNINITIALIZED any longer).

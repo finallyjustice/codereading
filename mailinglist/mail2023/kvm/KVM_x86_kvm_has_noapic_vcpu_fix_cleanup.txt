@@ -1,0 +1,102 @@
+[PATCH 0/2] KVM: x86: kvm_has_noapic_vcpu fix/cleanup
+
+... from Sean Christopherson <seanjc@google.com> ...
+
+https://lore.kernel.org/all/20240209222047.394389-1-seanjc@google.com/
+
+--------------------------
+
+[PATCH 1/2] KVM: x86: Move "KVM no-APIC vCPU" key management into local APIC code
+
+1. Inc the &kvm_has_noapic_vcpu at line 12505.
+
+2. Memory allocation is failed at line 12551.
+
+3. However, kvm_has_noapic_vcpu is not decremented.
+
+12465 int kvm_arch_vcpu_create(struct kvm_vcpu *vcpu)
+12466 {
+12467         struct page *page;
+12468         int r;
+12469
+12470         vcpu->arch.last_vmentry_cpu = -1;
+12471         vcpu->arch.regs_avail = ~0;
+12472         vcpu->arch.regs_dirty = ~0;
+12473
+12474         kvm_gpc_init(&vcpu->arch.pv_time, vcpu->kvm, vcpu, KVM_HOST_USES_PFN);
+12475
+12476         if (!irqchip_in_kernel(vcpu->kvm) || kvm_vcpu_is_reset_bsp(vcpu))
+12477                 vcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;
+12478         else
+12479                 vcpu->arch.mp_state = KVM_MP_STATE_UNINITIALIZED;
+12480
+12481         r = kvm_mmu_create(vcpu);
+12482         if (r < 0)
+12483                 return r;
+12484
+12485         if (irqchip_in_kernel(vcpu->kvm)) {
+12486                 r = kvm_create_lapic(vcpu, lapic_timer_advance_ns);
+12487                 if (r < 0)
+12488                         goto fail_mmu_destroy;
+12489
+12490                 /*
+12491                  * Defer evaluating inhibits until the vCPU is first run, as
+12492                  * this vCPU will not get notified of any changes until this
+12493                  * vCPU is visible to other vCPUs (marked online and added to
+12494                  * the set of vCPUs).  Opportunistically mark APICv active as
+12495                  * VMX in particularly is highly unlikely to have inhibits.
+12496                  * Ignore the current per-VM APICv state so that vCPU creation
+12497                  * is guaranteed to run with a deterministic value, the request
+12498                  * will ensure the vCPU gets the correct state before VM-Entry.
+12499                  */
+12500                 if (enable_apicv) {
+12501                         vcpu->arch.apic->apicv_active = true;
+12502                         kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
+12503                 }
+12504         } else
+12505                 static_branch_inc(&kvm_has_noapic_vcpu);
+12506
+12507         r = -ENOMEM;
+... ...
+... ...
+12551         r = static_call(kvm_x86_vcpu_create)(vcpu);
+12552         if (r)
+12553                 goto free_guest_fpu;
+12554
+12555         vcpu->arch.arch_capabilities = kvm_get_arch_capabilities();
+12556         vcpu->arch.msr_platform_info = MSR_PLATFORM_INFO_CPUID_FAULT;
+12557         kvm_xen_init_vcpu(vcpu);
+12558         kvm_vcpu_mtrr_init(vcpu);
+12559         vcpu_load(vcpu);
+12560         kvm_set_tsc_khz(vcpu, vcpu->kvm->arch.default_tsc_khz);
+12561         kvm_vcpu_reset(vcpu, false);
+12562         kvm_init_mmu(vcpu);
+12563         vcpu_put(vcpu);
+12564         return 0;
+12565
+12566 free_guest_fpu:
+12567         fpu_free_guest_fpstate(&vcpu->arch.guest_fpu);
+12568 free_emulate_ctxt:
+12569         kmem_cache_free(x86_emulator_cache, vcpu->arch.emulate_ctxt);
+12570 free_wbinvd_dirty_mask:
+12571         free_cpumask_var(vcpu->arch.wbinvd_dirty_mask);
+12572 fail_free_mce_banks:
+12573         kfree(vcpu->arch.mce_banks);
+12574         kfree(vcpu->arch.mci_ctl2_banks);
+12575         free_page((unsigned long)vcpu->arch.pio_data);
+12576 fail_free_lapic:
+12577         kvm_free_lapic(vcpu);
+12578 fail_mmu_destroy:
+12579         kvm_mmu_destroy(vcpu);
+12580         return r;
+12581 }
+
+
+The bad thing is: there is performance overhead (trivia).
+
+204 static inline bool lapic_in_kernel(struct kvm_vcpu *vcpu)
+205 {
+206         if (static_branch_unlikely(&kvm_has_noapic_vcpu))
+207                 return vcpu->arch.apic;
+208         return true;
+209 }
