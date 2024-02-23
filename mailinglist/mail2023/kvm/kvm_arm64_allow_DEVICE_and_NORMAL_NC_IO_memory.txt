@@ -1,0 +1,98 @@
+[PATCH v8 0/4] kvm: arm64: allow the VM to select DEVICE_* and NORMAL_NC for IO memory
+
+... Ankit Agrawal <ankita@nvidia.com> ...
+
+https://lore.kernel.org/all/20240220072926.6466-1-ankita@nvidia.com/
+
+--------------------------
+
+Currently, the stage 2 always maps device mapping as DEVICE_nGnRE. The bad
+thing is: the stage 2 overrides stage 1 attribute. As a result, the stage 1 VM
+side will not be able to decide the memory attribute: e.g., Normal-NC.
+
+This patchset allows to relax the device memory attr for VFIO only device
+mapping.
+--------------------------
+
+[PATCH v8 1/4] kvm: arm64: introduce new flag for non-cacheable IO memory
+
+Modify the stage2_set_prot_attr() to allow the caller to specify NORMAL_NC
+attr: Non-Cacheable IO memory!
+
+--------------------------
+
+[PATCH v8 2/4] mm: introduce new flag to indicate wc safe
+
+Introduce new flags used later.
+
++/*
++ * This flag is used to connect VFIO to arch specific KVM code. It
++ * indicates that the memory under this VMA is safe for use with any
++ * non-cachable memory type inside KVM. Some VFIO devices, on some
++ * platforms, are thought to be unsafe and can cause machine crashes
++ * if KVM does not lock down the memory type.
++ */
++#ifdef CONFIG_64BIT
++#define VM_ALLOW_ANY_UNCACHED_BIT	39
++#define VM_ALLOW_ANY_UNCACHED		BIT(VM_ALLOW_ANY_UNCACHED_BIT)
++#else
++#define VM_ALLOW_ANY_UNCACHED		VM_NONE
++#endif
++
+
+--------------------------
+
+[PATCH v8 3/4] kvm: arm64: set io memory s2 pte as normalnc for vfio pci device
+
+As in the code, use  KVM_PGTABLE_PROT_NORMAL_NC for VFIO devices, depending on
+if VM_ALLOW_ANY_UNCACHED is set in vma flags.
+
+@@ -1557,10 +1559,14 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
+ 	if (exec_fault)
+ 		prot |= KVM_PGTABLE_PROT_X;
+
+-	if (device)
+-		prot |= KVM_PGTABLE_PROT_DEVICE;
+-	else if (cpus_have_final_cap(ARM64_HAS_CACHE_DIC))
++	if (device) {
++		if (vfio_allow_any_uc)
++			prot |= KVM_PGTABLE_PROT_NORMAL_NC;
++		else
++			prot |= KVM_PGTABLE_PROT_DEVICE;
++	} else if (cpus_have_final_cap(ARM64_HAS_CACHE_DIC)) {
+ 		prot |= KVM_PGTABLE_PROT_X;
++	}
+
+--------------------------
+
+[PATCH v8 4/4] vfio: convey kvm that the vfio-pci device is wc safe
+
+Set VM_ALLOW_ANY_UNCACHED for VFIO mapping!
+
+@@ -1862,8 +1862,24 @@ int vfio_pci_core_mmap(struct vfio_device *core_vdev, struct vm_area_struct *vma
+ 	/*
+ 	 * See remap_pfn_range(), called from vfio_pci_fault() but we can't
+ 	 * change vm_flags within the fault handler.  Set them now.
++	 *
++	 * VM_ALLOW_ANY_UNCACHED: The VMA flag is implemented for ARM64,
++	 * allowing KVM stage 2 device mapping attributes to use Normal-NC
++	 * rather than DEVICE_nGnRE, which allows guest mappings
++	 * supporting combining attributes (WC). ARM does not
++	 * architecturally guarantee this is safe, and indeed some MMIO
++	 * regions like the GICv2 VCPU interface can trigger uncontained
++	 * faults if Normal-NC is used.
++	 *
++	 * To safely use VFIO in KVM the platform must guarantee full
++	 * safety in the guest where no action taken against a MMIO
++	 * mapping can trigger an uncontained failure. We belive that
++	 * most VFIO PCI platforms support this for both mapping types,
++	 * at least in common flows, based on some expectations of how
++	 * PCI IP is integrated. So set VM_ALLOW_ANY_UNCACHED in VMA flags.
+ 	 */
+-	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
++	vm_flags_set(vma, VM_ALLOW_ANY_UNCACHED | VM_IO | VM_PFNMAP |
++			VM_DONTEXPAND | VM_DONTDUMP);
+ 	vma->vm_ops = &vfio_pci_mmap_ops;
+
+ 	return 0;
+--------------------------

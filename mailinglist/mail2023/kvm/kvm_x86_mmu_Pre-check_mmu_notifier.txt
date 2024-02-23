@@ -1,0 +1,134 @@
+[PATCH v4 0/4] KVM: x86/mmu: Pre-check for mmu_notifier retry
+
+... from Sean Christopherson <seanjc@google.com> ...
+
+https://lore.kernel.org/all/20240209222858.396696-1-seanjc@google.com/
+
+--------------------------
+
+[PATCH v4 1/4] KVM: x86/mmu: Retry fault before acquiring mmu_lock if mapping is changing
+
+The below code is similar to when doing
+kvm_mmu_notifier_invalidate_range_start() and
+kvm_mmu_notifier_invalidate_range_end().
+
+Let's use the below as example.
+
+6331 void kvm_zap_gfn_range(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_end)
+6332 {
+6333         bool flush;
+6334
+6335         if (WARN_ON_ONCE(gfn_end <= gfn_start))
+6336                 return;
+6337
+6338         write_lock(&kvm->mmu_lock);
+6339
+6340         kvm_mmu_invalidate_begin(kvm);
+6341
+6342         kvm_mmu_invalidate_range_add(kvm, gfn_start, gfn_end);
+6343
+6344         flush = kvm_rmap_zap_gfn_range(kvm, gfn_start, gfn_end);
+6345
+6346         if (tdp_mmu_enabled)
+6347                 flush = kvm_tdp_mmu_zap_leafs(kvm, gfn_start, gfn_end, flush);
+6348
+6349         if (flush)
+6350                 kvm_flush_remote_tlbs_range(kvm, gfn_start, gfn_end - gfn_start);
+6351
+6352         kvm_mmu_invalidate_end(kvm);
+6353
+6354         write_unlock(&kvm->mmu_lock);
+6355 }
+
+When invalidating the range, the write mmu_lock will be acquired.
+Unfortunately, there is a chance to resched for the write lock, e.g.,: at
+tdp_mmu_iter_cond_resched().
+
+ 648 static inline bool __must_check tdp_mmu_iter_cond_resched(struct kvm *kvm,
+ 649                                                           struct tdp_iter *iter,
+ 650                                                           bool flush, bool shared)
+ 651 {
+ 652         WARN_ON_ONCE(iter->yielded);
+ 653
+ 654         /* Ensure forward progress has been made before yielding. */
+ 655         if (iter->next_last_level_gfn == iter->yielded_gfn)
+ 656                 return false;
+ 657
+ 658         if (need_resched() || rwlock_needbreak(&kvm->mmu_lock)) {
+ 659                 if (flush)
+ 660                         kvm_flush_remote_tlbs(kvm);
+ 661
+ 662                 rcu_read_unlock();
+ 663
+ 664                 if (shared)
+ 665                         cond_resched_rwlock_read(&kvm->mmu_lock);
+ 666                 else
+ 667                         cond_resched_rwlock_write(&kvm->mmu_lock);
+ 668
+ 669                 rcu_read_lock();
+ 670
+ 671                 WARN_ON_ONCE(iter->gfn > iter->next_last_level_gfn);
+ 672
+ 673                 iter->yielded = true;
+ 674         }
+ 675
+ 676         return iter->yielded;
+ 677 }
+
+
+As a result, something bad may happen.
+
+1. Retry page faults without acquiring mmu_lock, and without even faulting the
+page into the primary MMU, if the resolved gfn is covered by an active
+invalidation.  Contending for mmu_lock is especially problematic on preemptible
+kernels as the mmu_notifier invalidation task will yield mmu_lock (see
+		rwlock_needbreak()), delay the in-progress invalidation, and
+ultimately increase the latency of resolving the page fault.  And in the worst
+case scenario, yielding will be accompanied by a remote TLB flush, e.g. if the
+invalidation covers a large range of memory and vCPUs are accessing addresses
+that were already zapped.
+
+2. Faulting the page into the primary MMU is similarly problematic, as doing so
+may acquire locks that need to be taken for the invalidation to complete (the
+primary MMU has finer grained locks than KVM's MMU), and/or may cause
+unnecessary churn (getting/putting pages, marking them accessed, etc).
+
+
+3. Alternatively, the yielding issue could be mitigated by teaching KVM's MMU
+iterators to perform more work before yielding, but that wouldn't solve the
+lock contention and would negatively affect scenarios where a vCPU is trying to
+fault in an address that is NOT covered by the in-progress invalidation.
+
+page fault handler等的更久, 在addr不在range的时候.
+
+--------------------------
+
+[PATCH v4 2/4] KVM: x86/mmu: Move private vs. shared check above slot validity checks
+
+There is something with English I cannot understand well. I would say:
+
+We expect KVM to exit to userspace if there is no memslot, but NOT emulate
+accesses to the APIC access page even if the attributes mismatch.
+
+--------------------------
+
+[PATCH v4 3/4] KVM: x86/mmu: Move slot checks from __kvm_faultin_pfn() to kvm_faultin_pfn()
+
+This allows emulating accesses to the APIC access page, which don't need to
+resolve a pfn, even if there is a relevant in-progress mmu_notifier
+invalidation.
+
+Otherwise, if this is APIC access emulation, we may still need to contend for
+lock at the below.
+
+4430         if (!slot &&
+4431             mmu_invalidate_retry_gfn_unsafe(vcpu->kvm, fault->mmu_seq, fault->gfn))
+4432                 return RET_PF_RETRY;
+4433 
+4434         ret = __kvm_faultin_pfn(vcpu, fault);
+4435         if (ret != RET_PF_CONTINUE)
+4436                 return ret;
+
+--------------------------
+--------------------------
+

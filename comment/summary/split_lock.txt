@@ -1,0 +1,283 @@
+split lock的定义: split lock是一个operation, 不是一个lock.
+
+A split lock is any atomic operation whose operand crosses two cache lines.
+Since the operand spans two cache lines and the operation must be atomic,
+the system locks the bus while the CPU accesses the two cache lines.
+
+有两种方式可以acquire bus lock (我们不希望acquire bus lock):
+
+A bus lock is acquired through either split locked access to writeback (WB)
+memory or any locked access to non-WB memory. This is typically thousands of
+cycles slower than an atomic operation within a cache line. It also disrupts
+performance on other cores and brings the whole system to its knees.
+
+根据Intel SDM, "These processors will assert a bus lock for a locked access in
+either of the following situations: (1) the access is to multiple cache lines
+(a split lock); or (2) the access uses a memory type other than WB (a UC
+lock)."
+
+1. Split lock exception (#AC) 和bus lock exception (#DB) 的前提都是一个lock
+access.
+
+2. 如果这个lock access跨越了cache line (不知道UC的叫做across cache line吗),
+触发split lock exception (#AC).
+
+3. 如果这个lock access访问的不是WB的内存(比如UC), 触发bus lock exception (#DB).
+
+4. 我的问题是, 如果是又across了cache line, 又不是WB呢(比如WT)?
+
+---
+
+根据这个链接:https://lwn.net/Articles/790464/, 一个cross cache
+line的内存操作会被分成两个operation, 即使这个是硬件非透明的.
+
+With a split lock, the value needs to be kept coherent between different CPUs,
+which means assuring that the two cache lines change together. As this is an
+uncommon operation, the hardware design needs to take a special path; as a
+result, split locks may have important consequences as described in the cover
+letter of Yu's patch set. Intel's choice was to lock the whole memory bus to
+solve the coherency problem; the processor locks the bus for the duration of
+the operation, meaning that no other CPUs or devices can access it. The split
+lock blocks not only the CPU performing the access, but also all others in the
+system. Configuring the bus-locking protocol itself also adds significant
+overhead to the system as a whole.
+
+On the other hand, if the atomic operation operand fits into a single cache
+line, the processor will use a less expensive cache lock. This all means that
+developers may increase performance and avoid split locks by actions like
+simply correctly aligning their variables.
+
+有些arch根本不支持这个操作, 但是x86支持. 这个带来的问题是, cloud的资源隔离问题.
+一个VM可能会影响其他VM的性能.
+
+To date the designers have been unable to deploy these solutions as they have
+no way to prevent the "untrusted" user code from generating split lock and bus
+lock to block the hard real time code to access memory during bus locking.
+
+In the cloud case, one user process from a guest system may block other cores
+from accessing memory and cause performance degradation across the whole
+system. In a similar way, malicious code may try to slow down the system
+deliberately in a denial-of-service attack.
+
+---
+
+Kernel的doc里提到了下面的.
+
+#AC是在acquire bus lock之前发生的.
+
+#DB是在acquire bus lock之后发生的.
+
+#AC exception for split lock detection
+--------------------------------------
+
+Beginning with the Tremont Atom CPU split lock operations may raise an
+Alignment Check (#AC) exception when a split lock operation is attempted. ---> lock之前!
+
+#DB exception for bus lock detection
+------------------------------------
+
+Some CPUs have the ability to notify the kernel by an #DB trap after a user
+instruction acquires a bus lock and is executed. This allows the kernel to ---> lock之后!
+terminate the application or to enforce throttling.
+
+---
+
+我的测试里, 机器只支持split lock exception, 不支持bus lock exception.
+
+$ cpuid -1 -l 7 | grep bus
+      bus lock detection                       = false
+
+
+下面的文章提供了测试的例子.
+
+Notes about split lock detect
+https://liujunming.top/2022/01/13/split-lock-and-its-virtualization/
+
+1. 一段c代码.
+
+#include<stdio.h>
+#include <sys/mman.h>
+
+//https://gcc.gnu.org/onlinedocs/gcc-4.4.4/gcc/Structure_002dPacking-Pragmas.html
+#pragma pack(push,2)
+struct counter
+{
+	char buf[62];
+	long long c;
+};
+#pragma pack(pop)
+
+int main () {
+    struct counter *p;
+    int size = sizeof(struct counter);
+    int prot = PROT_READ | PROT_WRITE;
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+
+    p = (struct counter *) mmap(0, size, prot, flags, -1, 0);
+
+    while(1) {
+    	__sync_fetch_and_add(&p->c, 1);
+    }
+
+	return 0;
+}
+
+2. kvm-unit-tests的例子:
+
+https://lore.kernel.org/kvm/20220124111444.12548-1-junming.liu@intel.com/
+
+diff --git a/x86/cstart.S b/x86/cstart.S
+index 2c0eec7..6db6a38 100644
+--- a/x86/cstart.S
++++ b/x86/cstart.S
+@@ -143,6 +143,7 @@ ap_init:
+ online_cpus:
+ 	.fill (max_cpus + 7) / 8, 1, 0
+ 
++.align 2
+ cpu_online_count:	.word 1
+ 
+ .code16
+diff --git a/x86/cstart64.S b/x86/cstart64.S
+index ff79ae7..7272452 100644
+--- a/x86/cstart64.S
++++ b/x86/cstart64.S
+@@ -256,4 +256,5 @@ ap_init:
+ 	jne 1b
+ 	ret
+ 
++.align 2
+ cpu_online_count:	.word 1
+
+---
+
+当在VM的userspace触发split lock的时候, exception并没有被KVM插入VM, 而是在host处理了.
+
+经过测试:
+
+vmx_get_cpl(vcpu) == 3  --> true
+kvm_is_cr0_bit_set(vcpu, X86_CR0_AM) --> true
+(kvm_get_rflags(vcpu) & X86_EFLAGS_AC) --> false
+
+5850 bool vmx_guest_inject_ac(struct kvm_vcpu *vcpu)
+5851 {
+5852         if (!boot_cpu_has(X86_FEATURE_SPLIT_LOCK_DETECT))
+5853                 return true;
+5854
+5855         return vmx_get_cpl(vcpu) == 3 && kvm_is_cr0_bit_set(vcpu, X86_CR0_AM) &&
+5856                (kvm_get_rflags(vcpu) & X86_EFLAGS_AC);
+5857 }
+
+通过改KVM的代码强行把#AC插入VM, 会在VM得到下面的. (可以用来帮助调试)
+
+[   13.489632] x86/split lock detection: #AC: split_lock_test/1398 took a split_lock trap at address: 0x401173
+[   13.490564] unchecked MSR access error: WRMSR to 0x33 (tried to write 0x0000000000000000) at rIP: 0xffffffffae496a24 (native_write_msr+0x4/0x28)
+[   13.491793] Call Trace:
+[   13.492037]  <TASK>
+[   13.492240]  split_lock_warn+0x38/0x8c
+[   13.492605]  handle_user_split_lock+0x25/0x31
+[   13.493017]  exc_alignment_check+0x57/0xac
+[   13.493412]  asm_exc_alignment_check+0x22/0x27
+[   13.493835] RIP: 0033:0x401173
+... ...
+[   13.495855] RSP: 002b:00007ffc4bb666d0 EFLAGS: 00010202
+[   13.496350] RAX: 00007f81ed56903e RBX: 0000000000000000 RCX: 00007f81ed46efe7
+[   13.497012] RDX: 0000000000000003 RSI: 0000000000000046 RDI: 0000000000000000
+[   13.497681] RBP: 00007ffc4bb666f0 R08: 00000000ffffffff R09: 0000000000000000
+[   13.498353] R10: 0000000000000022 R11: 0000000000000246 R12: 00007ffc4bb66808
+[   13.499013] R13: 0000000000401126 R14: 0000000000403e08 R15: 00007f81ed56c000
+[   13.499683]  </TASK>
+[   13.499900] Call Trace:
+[   13.500135]  <TASK>
+[   13.500338]  switch_to_sld+0x2f/0x4c
+[   13.500677]  __switch_to+0x248/0x423
+[   13.501017]  __schedule+0x224/0x588
+[   13.501347]  schedule+0x5f/0xdf
+[   13.501645]  worker_thread+0xd0/0x3e4
+[   13.501998]  ? process_one_work.cold+0x46/0x3c
+[   13.502416]  kthread+0x124/0x144
+[   13.502724]  ? set_kthread_struct+0x60/0x52
+[   13.503118]  ret_from_fork+0x1f/0x2d
+[   13.503458]  </TASK>
+[   13.503675] Call Trace:
+[   13.503945]  <TASK>
+[   13.504157]  switch_to_sld+0x2f/0x4c
+[   13.504509]  __switch_to+0x248/0x423
+[   13.504865]  __schedule+0x224/0x588
+[   13.505209]  schedule+0x5f/0xdf
+[   13.505520]  exit_to_user_mode_loop+0x79/0x1b1
+[   13.505956]  exit_to_user_mode_prepare+0xc3/0x13a
+[   13.506414]  irqentry_exit_to_user_mode+0x5/0x23
+[   13.506867]  asm_exc_alignment_check+0x22/0x27
+[   13.507301] RIP: 0033:0x401173
+
+---
+
+一些enable split lock的patchset.
+
+1. 最早的时候应该是下面这个patch搭建好了split lock detection的框架.
+
+[PATCH v10 0/6] Enable split lock detection for real time and debug
+https://lore.kernel.org/all/1574297603-198156-1-git-send-email-fenghua.yu@intel.com/
+
+后来把所有的patchset合并成了v11.
+
+[PATCH v11] x86/split_lock: Enable split lock detection by kernel parameter
+https://lore.kernel.org/all/20191213000908.22813-1-tony.luck@intel.com/
+
+一直到了v17.
+
+[PATCH v17] x86/split_lock: Enable split lock detection by kernel
+https://lore.kernel.org/all/20200126200535.GB30377@agluck-desk2.amr.corp.intel.com/
+
+2. Thomas Gleixner加入了更多了handling.
+
+[patch 0/3] x86/kvm: Basic split lock #AC handling
+https://lore.kernel.org/all/20200410115517.176308876@linutronix.de/T/#mc943a7e3d3f280855ae94e34b3d1748268785c0a
+
+其中下面的patch还提到了 ...
+
+[patch 3/3] KVM: VMX: Extend VMXs #AC interceptor to handle split lock #AC in guest
+https://lore.kernel.org/all/20200410115517.176308876@linutronix.de/T/#mda0def124bed5caeca5ffa93b0cf6f27407e4aa2
+
+... 提到了为什么有以下的代码. 下面的三个条件应该是针对legacy alignment exception的.
+
++/*
++ * If the host has split lock detection disabled, then #AC is
++ * unconditionally injected into the guest, which is the pre split lock
++ * detection behaviour.
++ *
++ * If the host has split lock detection enabled then #AC is
++ * only injected into the guest when:
++ *  - Guest CPL == 3 (user mode)
++ *  - Guest has #AC detection enabled in CR0
++ *  - Guest EFLAGS has AC bit set
++ */
++static inline bool guest_inject_ac(struct kvm_vcpu *vcpu)
++{
++	if (!boot_cpu_has(X86_FEATURE_SPLIT_LOCK_DETECT))
++		return true;
++
++	return vmx_get_cpl(vcpu) == 3 && kvm_read_cr0_bits(vcpu, X86_CR0_AM) &&
++	       (kvm_get_rflags(vcpu) & X86_EFLAGS_AC);
++}
+
+
+3. Fenghua Yu又加入了bus lock exception的支持.
+
+[PATCH v6 0/3] x86/bus_lock: Enable bus lock detection
+https://lore.kernel.org/all/20210322135325.682257-1-fenghua.yu@intel.com/
+
+如果使用了bus lock exception, kernel就不使用split lock exception了.
+
+
+4. Fenghua Yu有加入了用ratelimit的方式来限制malicious code触发bus lock的频率.
+
+[PATCH 0/4] x86/bus_lock: Set rate limit for bus lock
+https://lore.kernel.org/all/20210419214958.4035512-1-fenghua.yu@intel.com/
+
+
+5. 针对split lock的虚拟化, 但是没见到合并到mainline.
+
+[PATCH v10 0/9] KVM: Add virtualization support of split lock detection
+https://lore.kernel.org/kvm/20200819064707.1033569-1-xiaoyao.li@intel.com/

@@ -1,0 +1,88 @@
+
+很多vma会设置下面的两个bit.
+
+VM_IO     : Memory mapped I/O or similar
+VM_PFNMAP : Page-ranges managed without "struct page", just pure PFN
+
+比如下面的函数, 分配的时候没有使用__GFP_COMP, 但是vma又带有VM_IO|VM_PFNMAP.
+
+static struct page *ttm_pool_alloc_page(struct ttm_pool *pool, gfp_t gfp_flags,
+					unsigned int order)
+{
+	unsigned long attr = DMA_ATTR_FORCE_CONTIGUOUS;
+	struct ttm_pool_dma *dma;
+	struct page *p;
+	void *vaddr;
+
+	/* Don't set the __GFP_COMP flag for higher order allocations.
+	 * Mapping pages directly into an userspace process and calling
+	 * put_page() on a TTM allocated page is illegal.
+	 */
+	if (order)
+		gfp_flags |= __GFP_NOMEMALLOC | __GFP_NORETRY | __GFP_NOWARN |
+			__GFP_KSWAPD_RECLAIM;
+
+	if (!pool->use_dma_alloc) {
+		p = alloc_pages(gfp_flags, order);
+		if (p)
+			p->private = order;
+		return p;
+	}
+
+
+因此, 在GUP的时候, check_vma_flags()返回-EFAULT.
+
+static int check_vma_flags(struct vm_area_struct *vma, unsigned long gup_flags)
+{
+	vm_flags_t vm_flags = vma->vm_flags;
+	int write = (gup_flags & FOLL_WRITE);
+	int foreign = (gup_flags & FOLL_REMOTE);
+
+	if (vm_flags & (VM_IO | VM_PFNMAP))
+		return -EFAULT;
+
+于是, hva_to_pfn_slow()会返回-EFAULT. 进行到hva_to_pfn_remapped().
+
+static kvm_pfn_t hva_to_pfn(unsigned long addr, bool atomic, bool *async,
+			bool write_fault, bool *writable)
+{
+	struct vm_area_struct *vma;
+	kvm_pfn_t pfn = 0;
+	int npages, r;
+
+	/* we can do it either atomically or asynchronously, not both */
+	BUG_ON(atomic && async);
+
+	if (hva_to_pfn_fast(addr, write_fault, writable, &pfn))
+		return pfn;
+
+	if (atomic)
+		return KVM_PFN_ERR_FAULT;
+
+	npages = hva_to_pfn_slow(addr, async, write_fault, writable, &pfn);
+	if (npages == 1)
+		return pfn;
+
+	mmap_read_lock(current->mm);
+	if (npages == -EHWPOISON ||
+	      (!async && check_user_page_hwpoison(addr))) {
+		pfn = KVM_PFN_ERR_HWPOISON;
+		goto exit;
+	}
+
+retry:
+	vma = find_vma_intersection(current->mm, addr, addr + 1);
+
+	if (vma == NULL)
+		pfn = KVM_PFN_ERR_FAULT;
+	else if (vma->vm_flags & (VM_IO | VM_PFNMAP)) {
+		r = hva_to_pfn_remapped(vma, addr, async, write_fault, writable, &pfn);
+
+----------------------------------------
+
+最早有了这个security的问题, 用下面的patch disable了. 不能用non-compound的IO memory了.
+
+https://lore.kernel.org/all/20240103084327.19955-1-yan.y.zhao@intel.com/
+
+
+Reference: https://github.com/google/security-research/security/advisories/GHSA-7wq5-phmq-m584
