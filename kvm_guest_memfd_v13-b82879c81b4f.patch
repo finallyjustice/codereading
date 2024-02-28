@@ -1,0 +1,1343 @@
+From e17c2dcbc34f2eccd4c0cd37616fb91af49366e9 Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang@oracle.com>
+Date: Mon, 26 Feb 2024 15:02:41 -0800
+Subject: [PATCH 1/1] kvm_guest_memfd_v13-b82879c81b4f
+
+On top of kvm-x86:next:
+
+commit b82879c81b4f09d040e365f9eb7ca036d86dcdfd (tag: kvm-x86-next-2024.02.23)
+Merge: dce17f5f232a 003d914220c9
+Author: Sean Christopherson <seanjc@google.com>
+Date:   Fri Feb 23 21:29:04 2024 +0000
+
+    Merge branch 'xen'
+
+    * xen: (29 commits)
+      KVM: x86/xen: allow vcpu_info content to be 'safely' copied
+      KVM: pfncache: check the need for invalidation under read lock first
+      KVM: x86/xen: advertize the KVM_XEN_HVM_CONFIG_SHARED_INFO_HVA capability
+      KVM: selftests: re-map Xen's vcpu_info using HVA rather than GPA
+      KVM: selftests: map Xen's shared_info page using HVA rather than GFN
+      KVM: x86/xen: allow vcpu_info to be mapped by fixed HVA
+      KVM: x86/xen: allow shared_info to be mapped by fixed HVA
+      KVM: x86/xen: re-initialize shared_info if guest (32/64-bit) mode is set
+      KVM: x86/xen: separate initialization of shared_info cache and content
+      KVM: pfncache: allow a cache to be activated with a fixed (userspace) HVA
+      KVM: s390: Refactor kvm_is_error_gpa() into kvm_is_gpa_in_memslot()
+      KVM: pfncache: include page offset in uhva and use it consistently
+      KVM: pfncache: stop open-coding offset_in_page()
+      KVM: pfncache: remove KVM_GUEST_USES_PFN usage
+      KVM: pfncache: add a mark-dirty helper
+      KVM: x86/xen: mark guest pages dirty with the pfncache lock held
+      KVM: pfncache: remove unnecessary exports
+      KVM: pfncache: Add a map helper function
+      KVM: remove unnecessary #ifdef
+      KVM: define __KVM_HAVE_GUEST_DEBUG unconditionally
+      ...
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ arch/x86/kvm/mmu/mmu.c                        |  26 +++
+ arch/x86/kvm/mmu/mmu_internal.h               |   8 +
+ arch/x86/kvm/mmu/tdp_mmu.c                    |   4 +
+ arch/x86/kvm/x86.c                            |   5 +
+ include/linux/kvm_host.h                      |  41 ++++
+ .../testing/selftests/kvm/guest_memfd_test.c  |  36 +++
+ .../selftests/kvm/include/kvm_util_base.h     |  18 ++
+ tools/testing/selftests/kvm/lib/kvm_util.c    |  29 +++
+ .../kvm/x86_64/private_mem_conversions_test.c | 122 ++++++++++
+ .../kvm/x86_64/private_mem_kvm_exits_test.c   |  30 +++
+ virt/kvm/guest_memfd.c                        | 219 ++++++++++++++++++
+ virt/kvm/kvm_main.c                           | 109 +++++++++
+ 12 files changed, 647 insertions(+)
+
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index e4cc7f764980..bcef176daede 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -4309,6 +4309,12 @@ static inline u8 kvm_max_level_for_order(int order)
+ 	return PG_LEVEL_4K;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu/mmu.c|4330| <<kvm_faultin_pfn_private>> kvm_mmu_prepare_memory_fault_exit(vcpu, fault);
++ *   - arch/x86/kvm/mmu/mmu.c|4337| <<kvm_faultin_pfn_private>> kvm_mmu_prepare_memory_fault_exit(vcpu, fault);
++ *   - arch/x86/kvm/mmu/mmu.c|4389| <<__kvm_faultin_pfn>> kvm_mmu_prepare_memory_fault_exit(vcpu, fault);
++ */
+ static void kvm_mmu_prepare_memory_fault_exit(struct kvm_vcpu *vcpu,
+ 					      struct kvm_page_fault *fault)
+ {
+@@ -4317,6 +4323,10 @@ static void kvm_mmu_prepare_memory_fault_exit(struct kvm_vcpu *vcpu,
+ 				      fault->is_private);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu/mmu.c|4382| <<__kvm_faultin_pfn>> return kvm_faultin_pfn_private(vcpu, fault);
++ */
+ static int kvm_faultin_pfn_private(struct kvm_vcpu *vcpu,
+ 				   struct kvm_page_fault *fault)
+ {
+@@ -4373,11 +4383,27 @@ static int __kvm_faultin_pfn(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
+ 			return RET_PF_EMULATE;
+ 	}
+ 
++	/*
++	 * 在以下使用kvm_page_fault->is_private:
++	 *   - arch/x86/kvm/mmu/mmu.c|3202| <<kvm_mmu_hugepage_adjust>> fault->req_level = __kvm_mmu_max_mapping_level(vcpu->kvm, slot, fault->gfn, fault->max_level, fault->is_private);
++	 *   - arch/x86/kvm/mmu/mmu.c|4317| <<kvm_mmu_prepare_memory_fault_exit>> kvm_prepare_memory_fault_exit(vcpu, fault->gfn << PAGE_SHIFT, PAGE_SIZE, fault->write, fault->exec, fault->is_private);
++	 *   - arch/x86/kvm/mmu/mmu.c|4376| <<__kvm_faultin_pfn>> if (fault->is_private != kvm_mem_is_private(vcpu->kvm, fault->gfn)) {
++	 *   - arch/x86/kvm/mmu/mmu.c|4381| <<__kvm_faultin_pfn>> if (fault->is_private)
++	 *   - arch/x86/kvm/mmu/mmu_internal.h|301| <<kvm_mmu_do_page_fault>> .is_private = kvm_mem_is_private(vcpu->kvm, cr2_or_gpa >> PAGE_SHIFT),
++	 */
+ 	if (fault->is_private != kvm_mem_is_private(vcpu->kvm, fault->gfn)) {
+ 		kvm_mmu_prepare_memory_fault_exit(vcpu, fault);
+ 		return -EFAULT;
+ 	}
+ 
++	/*
++	 * 在以下使用kvm_page_fault->is_private:
++	 *   - arch/x86/kvm/mmu/mmu.c|3202| <<kvm_mmu_hugepage_adjust>> fault->req_level = __kvm_mmu_max_mapping_level(vcpu->kvm, slot, fault->gfn, fault->max_level, fault->is_private);
++	 *   - arch/x86/kvm/mmu/mmu.c|4317| <<kvm_mmu_prepare_memory_fault_exit>> kvm_prepare_memory_fault_exit(vcpu, fault->gfn << PAGE_SHIFT, PAGE_SIZE, fault->write, fault->exec, fault->is_private);
++	 *   - arch/x86/kvm/mmu/mmu.c|4376| <<__kvm_faultin_pfn>> if (fault->is_private != kvm_mem_is_private(vcpu->kvm, fault->gfn)) {
++	 *   - arch/x86/kvm/mmu/mmu.c|4381| <<__kvm_faultin_pfn>> if (fault->is_private)
++	 *   - arch/x86/kvm/mmu/mmu_internal.h|301| <<kvm_mmu_do_page_fault>> .is_private = kvm_mem_is_private(vcpu->kvm, cr2_or_gpa >> PAGE_SHIFT),
++	 */
+ 	if (fault->is_private)
+ 		return kvm_faultin_pfn_private(vcpu, fault);
+ 
+diff --git a/arch/x86/kvm/mmu/mmu_internal.h b/arch/x86/kvm/mmu/mmu_internal.h
+index 0669a8a668ca..5344b2f5eefa 100644
+--- a/arch/x86/kvm/mmu/mmu_internal.h
++++ b/arch/x86/kvm/mmu/mmu_internal.h
+@@ -202,6 +202,14 @@ struct kvm_page_fault {
+ 
+ 	/* Derived from mmu and global state.  */
+ 	const bool is_tdp;
++	/*
++	 * 在以下使用kvm_page_fault->is_private:
++	 *   - arch/x86/kvm/mmu/mmu.c|3202| <<kvm_mmu_hugepage_adjust>> fault->req_level = __kvm_mmu_max_mapping_level(vcpu->kvm, slot, fault->gfn, fault->max_level, fault->is_private);
++	 *   - arch/x86/kvm/mmu/mmu.c|4317| <<kvm_mmu_prepare_memory_fault_exit>> kvm_prepare_memory_fault_exit(vcpu, fault->gfn << PAGE_SHIFT, PAGE_SIZE, fault->write, fault->exec, fault->is_private);
++	 *   - arch/x86/kvm/mmu/mmu.c|4376| <<__kvm_faultin_pfn>> if (fault->is_private != kvm_mem_is_private(vcpu->kvm, fault->gfn)) {
++	 *   - arch/x86/kvm/mmu/mmu.c|4381| <<__kvm_faultin_pfn>> if (fault->is_private)
++	 *   - arch/x86/kvm/mmu/mmu_internal.h|301| <<kvm_mmu_do_page_fault>> .is_private = kvm_mem_is_private(vcpu->kvm, cr2_or_gpa >> PAGE_SHIFT),
++	 */
+ 	const bool is_private;
+ 	const bool nx_huge_page_workaround_enabled;
+ 
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+index d078157e62aa..2ab5e91f4ba7 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -448,6 +448,10 @@ static void handle_changed_spte(struct kvm *kvm, int as_id, gfn_t gfn,
+ 	bool is_leaf = is_present && is_last_spte(new_spte, level);
+ 	bool pfn_changed = spte_to_pfn(old_spte) != spte_to_pfn(new_spte);
+ 
++	/*
++	 * 似乎private的test来了是1, 0, 1, 0, 1
++	 */
++
+ 	WARN_ON_ONCE(level > PT64_ROOT_MAX_LEVEL);
+ 	WARN_ON_ONCE(level < PG_LEVEL_4K);
+ 	WARN_ON_ONCE(gfn & (KVM_PAGES_PER_HPAGE(level) - 1));
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index f3f7405e0628..5e8e4e00a659 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -4576,6 +4576,11 @@ static int kvm_ioctl_get_supported_hv_cpuid(struct kvm_vcpu *vcpu,
+ }
+ #endif
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|4785| <<kvm_vm_ioctl_check_extension>> if (kvm_is_vm_type_supported(KVM_X86_SW_PROTECTED_VM))
++ *   - arch/x86/kvm/x86.c|12515| <<kvm_arch_init_vm>> if (!kvm_is_vm_type_supported(type))
++ */
+ static bool kvm_is_vm_type_supported(unsigned long type)
+ {
+ 	return type == KVM_X86_DEFAULT_VM ||
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 97afe4519772..006338c3719b 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -602,6 +602,11 @@ struct kvm_memory_slot {
+ #endif
+ };
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu/mmu.c|3174| <<kvm_mmu_max_mapping_level>> bool is_private = kvm_slot_can_be_private(slot) &&
++ *   - arch/x86/kvm/mmu/mmu.c|4325| <<kvm_faultin_pfn_private>> if (!kvm_slot_can_be_private(fault->slot)) {
++ */
+ static inline bool kvm_slot_can_be_private(const struct kvm_memory_slot *slot)
+ {
+ 	return slot && (slot->flags & KVM_MEM_GUEST_MEMFD);
+@@ -840,6 +845,15 @@ struct kvm {
+ 	struct notifier_block pm_notifier;
+ #endif
+ #ifdef CONFIG_KVM_GENERIC_MEMORY_ATTRIBUTES
++	/*
++	 * 在以下使用kvm->mem_attr_array:
++	 *   - include/linux/kvm_host.h|2412| <<kvm_get_memory_attributes>> return xa_to_value(xa_load(&kvm->mem_attr_array, gfn));
++	 *   - virt/kvm/kvm_main.c|1215| <<kvm_create_vm>> xa_init(&kvm->mem_attr_array);
++	 *   - virt/kvm/kvm_main.c|1397| <<kvm_destroy_vm>> xa_destroy(&kvm->mem_attr_array);
++	 *   - virt/kvm/kvm_main.c|2446| <<kvm_range_has_memory_attributes>> XA_STATE(xas, &kvm->mem_attr_array, start);
++	 *   - virt/kvm/kvm_main.c|2583| <<kvm_vm_set_mem_attributes>> r = xa_reserve(&kvm->mem_attr_array, i, GFP_KERNEL_ACCOUNT);
++	 *   - virt/kvm/kvm_main.c|2591| <<kvm_vm_set_mem_attributes>> r = xa_err(xa_store(&kvm->mem_attr_array, i, entry, GFP_KERNEL_ACCOUNT));
++	 */
+ 	/* Protected by slots_locks (for writes) and RCU (for reads) */
+ 	struct xarray mem_attr_array;
+ #endif
+@@ -2391,11 +2405,23 @@ static inline void kvm_account_pgtable_pages(void *virt, int nr)
+ /* Max number of entries allowed for each kvm dirty ring */
+ #define  KVM_DIRTY_RING_MAX_ENTRIES  65536
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu/mmu.c|4315| <<kvm_mmu_prepare_memory_fault_exit>> kvm_prepare_memory_fault_exit(vcpu, fault->gfn << PAGE_SHIFT,
++ */
+ static inline void kvm_prepare_memory_fault_exit(struct kvm_vcpu *vcpu,
+ 						 gpa_t gpa, gpa_t size,
+ 						 bool is_write, bool is_exec,
+ 						 bool is_private)
+ {
++	/*
++	 * 在以下使用KVM_EXIT_MEMORY_FAULT:
++	 *   - include/uapi/linux/kvm.h|180| <<global>> #define KVM_EXIT_MEMORY_FAULT 39
++	 *   - tools/include/uapi/linux/kvm.h|212| <<global>> #define KVM_EXIT_MEMORY_FAULT 39
++	 *   - tools/testing/selftests/kvm/x86_64/private_mem_kvm_exits_test.c|37| <<run_vcpu_get_exit_reason>> TEST_ASSERT_EQ(vcpu->run->exit_reason, KVM_EXIT_MEMORY_FAULT);
++	 *   - tools/testing/selftests/kvm/x86_64/private_mem_kvm_exits_test.c|77| <<test_private_access_memslot_deleted>> TEST_ASSERT_EQ(exit_reason, KVM_EXIT_MEMORY_FAULT);
++	 *   - tools/testing/selftests/kvm/x86_64/private_mem_kvm_exits_test.c|106| <<test_private_access_memslot_not_private>> TEST_ASSERT_EQ(exit_reason, KVM_EXIT_MEMORY_FAULT);
++	 */
+ 	vcpu->run->exit_reason = KVM_EXIT_MEMORY_FAULT;
+ 	vcpu->run->memory_fault.gpa = gpa;
+ 	vcpu->run->memory_fault.size = size;
+@@ -2407,8 +2433,23 @@ static inline void kvm_prepare_memory_fault_exit(struct kvm_vcpu *vcpu,
+ }
+ 
+ #ifdef CONFIG_KVM_GENERIC_MEMORY_ATTRIBUTES
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu/mmu.c|7362| <<hugepage_has_attrs>> attrs != kvm_get_memory_attributes(kvm, gfn))
++ *   - arch/x86/kvm/mmu/mmu.c|7461| <<kvm_mmu_init_memslot_memory_attributes>> unsigned long attrs = kvm_get_memory_attributes(kvm, gfn);
++ *   - include/linux/kvm_host.h|2425| <<kvm_mem_is_private>> kvm_get_memory_attributes(kvm, gfn) & KVM_MEMORY_ATTRIBUTE_PRIVATE;
++ */
+ static inline unsigned long kvm_get_memory_attributes(struct kvm *kvm, gfn_t gfn)
+ {
++	/*
++	 * 在以下使用kvm->mem_attr_array:
++	 *   - include/linux/kvm_host.h|2412| <<kvm_get_memory_attributes>> return xa_to_value(xa_load(&kvm->mem_attr_array, gfn));
++	 *   - virt/kvm/kvm_main.c|1215| <<kvm_create_vm>> xa_init(&kvm->mem_attr_array);
++	 *   - virt/kvm/kvm_main.c|1397| <<kvm_destroy_vm>> xa_destroy(&kvm->mem_attr_array);
++	 *   - virt/kvm/kvm_main.c|2446| <<kvm_range_has_memory_attributes>> XA_STATE(xas, &kvm->mem_attr_array, start);
++	 *   - virt/kvm/kvm_main.c|2583| <<kvm_vm_set_mem_attributes>> r = xa_reserve(&kvm->mem_attr_array, i, GFP_KERNEL_ACCOUNT);
++	 *   - virt/kvm/kvm_main.c|2591| <<kvm_vm_set_mem_attributes>> r = xa_err(xa_store(&kvm->mem_attr_array, i, entry, GFP_KERNEL_ACCOUNT));
++	 */
+ 	return xa_to_value(xa_load(&kvm->mem_attr_array, gfn));
+ }
+ 
+diff --git a/tools/testing/selftests/kvm/guest_memfd_test.c b/tools/testing/selftests/kvm/guest_memfd_test.c
+index c78a98c1a915..6b50170291c4 100644
+--- a/tools/testing/selftests/kvm/guest_memfd_test.c
++++ b/tools/testing/selftests/kvm/guest_memfd_test.c
+@@ -22,6 +22,10 @@
+ #include "test_util.h"
+ #include "kvm_util_base.h"
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/guest_memfd_test.c|191| <<main>> test_file_read_write(fd);
++ */
+ static void test_file_read_write(int fd)
+ {
+ 	char buf[64];
+@@ -36,6 +40,10 @@ static void test_file_read_write(int fd)
+ 		    "pwrite on a guest_mem fd should fail");
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/guest_memfd_test.c|192| <<main>> test_mmap(fd, page_size);
++ */
+ static void test_mmap(int fd, size_t page_size)
+ {
+ 	char *mem;
+@@ -44,6 +52,10 @@ static void test_mmap(int fd, size_t page_size)
+ 	TEST_ASSERT_EQ(mem, MAP_FAILED);
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/guest_memfd_test.c|193| <<main>> test_file_size(fd, page_size, total_size);
++ */
+ static void test_file_size(int fd, size_t page_size, size_t total_size)
+ {
+ 	struct stat sb;
+@@ -55,6 +67,10 @@ static void test_file_size(int fd, size_t page_size, size_t total_size)
+ 	TEST_ASSERT_EQ(sb.st_blksize, page_size);
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/guest_memfd_test.c|194| <<main>> test_fallocate(fd, page_size, total_size);
++ */
+ static void test_fallocate(int fd, size_t page_size, size_t total_size)
+ {
+ 	int ret;
+@@ -92,6 +108,10 @@ static void test_fallocate(int fd, size_t page_size, size_t total_size)
+ 	TEST_ASSERT(!ret, "fallocate to restore punched hole should succeed");
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/guest_memfd_test.c|195| <<main>> test_invalid_punch_hole(fd, page_size, total_size);
++ */
+ static void test_invalid_punch_hole(int fd, size_t page_size, size_t total_size)
+ {
+ 	struct {
+@@ -122,6 +142,10 @@ static void test_invalid_punch_hole(int fd, size_t page_size, size_t total_size)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/guest_memfd_test.c|186| <<main>> test_create_guest_memfd_invalid(vm);
++ */
+ static void test_create_guest_memfd_invalid(struct kvm_vm *vm)
+ {
+ 	size_t page_size = getpagesize();
+@@ -144,11 +168,23 @@ static void test_create_guest_memfd_invalid(struct kvm_vm *vm)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/guest_memfd_test.c|187| <<main>> test_create_guest_memfd_multiple(vm);
++ */
+ static void test_create_guest_memfd_multiple(struct kvm_vm *vm)
+ {
+ 	int fd1, fd2, ret;
+ 	struct stat st1, st2;
+ 
++	/*
++	 * called by:
++	 *   - tools/testing/selftests/kvm/guest_memfd_test.c|133| <<test_create_guest_memfd_invalid>> fd = __vm_create_guest_memfd(vm, size, 0);
++	 *   - tools/testing/selftests/kvm/guest_memfd_test.c|140| <<test_create_guest_memfd_invalid>> fd = __vm_create_guest_memfd(vm, page_size, flag);
++	 *   - tools/testing/selftests/kvm/guest_memfd_test.c|152| <<test_create_guest_memfd_multiple>> fd1 = __vm_create_guest_memfd(vm, 4096, 0);
++	 *   - tools/testing/selftests/kvm/guest_memfd_test.c|159| <<test_create_guest_memfd_multiple>> fd2 = __vm_create_guest_memfd(vm, 8192, 0);
++	 *   - tools/testing/selftests/kvm/include/kvm_util_base.h|546| <<vm_create_guest_memfd>> int fd = __vm_create_guest_memfd(vm, size, flags);
++	 */
+ 	fd1 = __vm_create_guest_memfd(vm, 4096, 0);
+ 	TEST_ASSERT(fd1 != -1, "memfd creation should succeed");
+ 
+diff --git a/tools/testing/selftests/kvm/include/kvm_util_base.h b/tools/testing/selftests/kvm/include/kvm_util_base.h
+index 070f250036fc..d3b2d6ccf28d 100644
+--- a/tools/testing/selftests/kvm/include/kvm_util_base.h
++++ b/tools/testing/selftests/kvm/include/kvm_util_base.h
+@@ -529,6 +529,14 @@ static inline uint64_t vm_get_stat(struct kvm_vm *vm, const char *stat_name)
+ 
+ void vm_create_irqchip(struct kvm_vm *vm);
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/guest_memfd_test.c|133| <<test_create_guest_memfd_invalid>> fd = __vm_create_guest_memfd(vm, size, 0);
++ *   - tools/testing/selftests/kvm/guest_memfd_test.c|140| <<test_create_guest_memfd_invalid>> fd = __vm_create_guest_memfd(vm, page_size, flag);
++ *   - tools/testing/selftests/kvm/guest_memfd_test.c|152| <<test_create_guest_memfd_multiple>> fd1 = __vm_create_guest_memfd(vm, 4096, 0);
++ *   - tools/testing/selftests/kvm/guest_memfd_test.c|159| <<test_create_guest_memfd_multiple>> fd2 = __vm_create_guest_memfd(vm, 8192, 0);
++ *   - tools/testing/selftests/kvm/include/kvm_util_base.h|546| <<vm_create_guest_memfd>> int fd = __vm_create_guest_memfd(vm, size, flags);
++ */
+ static inline int __vm_create_guest_memfd(struct kvm_vm *vm, uint64_t size,
+ 					uint64_t flags)
+ {
+@@ -540,6 +548,16 @@ static inline int __vm_create_guest_memfd(struct kvm_vm *vm, uint64_t size,
+ 	return __vm_ioctl(vm, KVM_CREATE_GUEST_MEMFD, &guest_memfd);
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/guest_memfd_test.c|189| <<main>> fd = vm_create_guest_memfd(vm, total_size, 0);
++ *   - tools/testing/selftests/kvm/lib/kvm_util.c|1081| <<vm_mem_add>> guest_memfd = vm_create_guest_memfd(vm, mem_size, guest_memfd_flags);
++ *   - tools/testing/selftests/kvm/set_memory_region_test.c|370| <<test_invalid_memory_region_flags>> int guest_memfd = vm_create_guest_memfd(vm, MEM_REGION_SIZE, 0);
++ *   - tools/testing/selftests/kvm/set_memory_region_test.c|475| <<test_add_private_memory_region>> memfd = vm_create_guest_memfd(vm2, MEM_REGION_SIZE, 0);
++ *   - tools/testing/selftests/kvm/set_memory_region_test.c|483| <<test_add_private_memory_region>> memfd = vm_create_guest_memfd(vm, MEM_REGION_SIZE, 0);
++ *   - tools/testing/selftests/kvm/set_memory_region_test.c|504| <<test_add_overlapping_private_memory_regions>> memfd = vm_create_guest_memfd(vm, MEM_REGION_SIZE * 4, 0);
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|422| <<test_mem_conversions>> memfd = vm_create_guest_memfd(vm, memfd_size, 0);
++ */
+ static inline int vm_create_guest_memfd(struct kvm_vm *vm, uint64_t size,
+ 					uint64_t flags)
+ {
+diff --git a/tools/testing/selftests/kvm/lib/kvm_util.c b/tools/testing/selftests/kvm/lib/kvm_util.c
+index 4994afbdab40..2cb87596e736 100644
+--- a/tools/testing/selftests/kvm/lib/kvm_util.c
++++ b/tools/testing/selftests/kvm/lib/kvm_util.c
+@@ -1014,6 +1014,26 @@ void vm_mem_add(struct kvm_vm *vm, enum vm_mem_backing_src_type src_type,
+ 			(uint64_t) region->region.memory_size);
+ 	}
+ 
++	/*
++	 * selftest自己的定义
++	 * struct userspace_mem_region {
++	 *     struct kvm_userspace_memory_region2 region;
++	 *     struct sparsebit *unused_phy_pages;
++	 *     int fd;
++	 *     off_t offset;
++	 *     enum vm_mem_backing_src_type backing_src_type;
++	 *     void *host_mem;
++	 *     void *host_alias;
++	 *     void *mmap_start;
++	 *     void *mmap_alias;
++	 *     size_t mmap_size;
++	 *     struct rb_node gpa_node;
++	 *     struct rb_node hva_node;
++	 *     struct hlist_node slot_node;
++	 * };
++	 *
++	 * struct userspace_mem_region *region;
++	 */
+ 	/* Allocate and initialize new mem region structure. */
+ 	region = calloc(1, sizeof(*region));
+ 	TEST_ASSERT(region != NULL, "Insufficient Memory");
+@@ -1090,6 +1110,9 @@ void vm_mem_add(struct kvm_vm *vm, enum vm_mem_backing_src_type src_type,
+ 			TEST_ASSERT(guest_memfd >= 0, __KVM_SYSCALL_ERROR("dup()", guest_memfd));
+ 		}
+ 
++		/*
++		 * guest_memfd_offset应该是在VM的物理offset?
++		 */
+ 		region->region.guest_memfd = guest_memfd;
+ 		region->region.guest_memfd_offset = guest_memfd_offset;
+ 	} else {
+@@ -1251,6 +1274,12 @@ void vm_mem_region_delete(struct kvm_vm *vm, uint32_t slot)
+ 	__vm_mem_region_delete(vm, memslot2region(vm, slot), true);
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/include/kvm_util_base.h|425| <<vm_guest_mem_punch_hole>> vm_guest_mem_fallocate(vm, gpa, size, true);
++ *   - tools/testing/selftests/kvm/include/kvm_util_base.h|431| <<vm_guest_mem_allocate>> vm_guest_mem_fallocate(vm, gpa, size, false);
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|401| <<handle_exit_hypercall>> vm_guest_mem_fallocate(vm, gpa, size, map_shared);
++ */
+ void vm_guest_mem_fallocate(struct kvm_vm *vm, uint64_t base, uint64_t size,
+ 			    bool punch_hole)
+ {
+diff --git a/tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c b/tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c
+index 65ad38b6be1f..9e806a3f5574 100644
+--- a/tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c
++++ b/tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c
+@@ -23,10 +23,34 @@
+ #include <kvm_util.h>
+ #include <processor.h>
+ 
++/*
++ * 在以下使用BASE_DATA_SLOT:
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|402| <<test_mem_conversions>> vm_mem_add(vm, src_type, BASE_DATA_GPA + slot_size * i,
++ *                                                        BASE_DATA_SLOT + i, slot_size / vm->page_size, KVM_MEM_GUEST_MEMFD, memfd, slot_size * i);
++ */
+ #define BASE_DATA_SLOT		10
++/*
++ * 4GB
++ */
+ #define BASE_DATA_GPA		((uint64_t)(1ull << 32))
++/*
++ * 2MB + 4K
++ */
+ #define PER_CPU_DATA_SIZE	((uint64_t)(SZ_2M + PAGE_SIZE))
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|132| <<guest_test_explicit_conversion>> memcmp_g(base_gpa, def_p, PER_CPU_DATA_SIZE);
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|135| <<guest_test_explicit_conversion>> memcmp_g(base_gpa, init_p, PER_CPU_DATA_SIZE);
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|173| <<guest_test_explicit_conversion>> memcmp_g(gpa, p2, size);
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|175| <<guest_test_explicit_conversion>> memcmp_g(base_gpa, init_p, gpa - base_gpa);
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|177| <<guest_test_explicit_conversion>> memcmp_g(gpa + size, init_p, (base_gpa + PER_CPU_DATA_SIZE) - (gpa + size));
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|189| <<guest_test_explicit_conversion>> memcmp_g(gpa + j, p3, PAGE_SIZE);
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|204| <<guest_test_explicit_conversion>> memcmp_g(gpa, p4, size);
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|257| <<guest_test_punch_hole>> memcmp_g(gpa, init_p, size);
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|260| <<guest_test_punch_hole>> memcmp_g(base_gpa, init_p, PER_CPU_DATA_SIZE);
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|268| <<guest_test_punch_hole>> memcmp_g(gpa, 0, size);
++ */
+ /* Horrific macro so that the line info is captured accurately :-( */
+ #define memcmp_g(gpa, pattern,  size)								\
+ do {												\
+@@ -39,6 +63,10 @@ do {												\
+ 			       pattern, i, gpa + i, mem[i]);					\
+ } while (0)
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|378| <<__test_mem_conversions>> memcmp_h(hva, gpa + i, uc.args[3], nr_bytes);
++ */
+ static void memcmp_h(uint8_t *mem, uint64_t gpa, uint8_t pattern, size_t size)
+ {
+ 	size_t i;
+@@ -64,6 +92,14 @@ static void memcmp_h(uint8_t *mem, uint64_t gpa, uint8_t pattern, size_t size)
+  *   userspace is again not able to access converted private regions.
+  */
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|140| <<global>> GUEST_STAGE(0, PAGE_SIZE),
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|141| <<global>> GUEST_STAGE(0, SZ_2M),
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|142| <<global>> GUEST_STAGE(PAGE_SIZE, PAGE_SIZE),
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|143| <<global>> GUEST_STAGE(PAGE_SIZE, SZ_2M),
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|144| <<global>> GUEST_STAGE(SZ_2M, PAGE_SIZE),
++ */
+ #define GUEST_STAGE(o, s) { .offset = o, .size = s }
+ 
+ enum ucall_syncs {
+@@ -74,11 +110,19 @@ enum ucall_syncs {
+ static void guest_sync_shared(uint64_t gpa, uint64_t size,
+ 			      uint8_t current_pattern, uint8_t new_pattern)
+ {
++	/*
++	 * 62 #define GUEST_SYNC5(arg0, arg1, arg2, arg3, arg4) \
++	 * 63                                 ucall(UCALL_SYNC, 5, arg0, arg1, arg2, arg3, arg4)
++	 */
+ 	GUEST_SYNC5(SYNC_SHARED, gpa, size, current_pattern, new_pattern);
+ }
+ 
+ static void guest_sync_private(uint64_t gpa, uint64_t size, uint8_t pattern)
+ {
++	/*
++	 *  60 #define GUEST_SYNC4(arg0, arg1, arg2, arg3) \
++	 *  61                                 ucall(UCALL_SYNC, 4, arg0, arg1, arg2, arg3)
++	 */
+ 	GUEST_SYNC4(SYNC_PRIVATE, gpa, size, pattern);
+ }
+ 
+@@ -87,6 +131,13 @@ static void guest_sync_private(uint64_t gpa, uint64_t size, uint8_t pattern)
+ #define MAP_GPA_SHARED		BIT(1)
+ #define MAP_GPA_DO_FALLOCATE	BIT(2)
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|128| <<guest_map_shared>> guest_map_mem(gpa, size, true, do_fallocate);
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|133| <<guest_map_private>> guest_map_mem(gpa, size, false, do_fallocate);
++ *
++ * 在guest调用的??
++ */
+ static void guest_map_mem(uint64_t gpa, uint64_t size, bool map_shared,
+ 			  bool do_fallocate)
+ {
+@@ -96,19 +147,42 @@ static void guest_map_mem(uint64_t gpa, uint64_t size, bool map_shared,
+ 		flags |= MAP_GPA_SHARED;
+ 	if (do_fallocate)
+ 		flags |= MAP_GPA_DO_FALLOCATE;
++	/*
++	 * 调用KVM_HC_MAP_GPA_RANGE
++	 */
+ 	kvm_hypercall_map_gpa_range(gpa, size, flags);
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|210| <<guest_test_explicit_conversion>> guest_map_shared(gpa + j, PAGE_SIZE, do_fallocate);
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|225| <<guest_test_explicit_conversion>> guest_map_shared(gpa, size, do_fallocate);
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|238| <<guest_test_explicit_conversion>> guest_map_shared(base_gpa, PER_CPU_DATA_SIZE, true);
++ */
+ static void guest_map_shared(uint64_t gpa, uint64_t size, bool do_fallocate)
+ {
+ 	guest_map_mem(gpa, size, true, do_fallocate);
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|183| <<guest_test_explicit_conversion>> guest_map_private(gpa, size, do_fallocate);
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|264| <<guest_test_punch_hole>> guest_map_private(base_gpa, PER_CPU_DATA_SIZE, false);
++ */
+ static void guest_map_private(uint64_t gpa, uint64_t size, bool do_fallocate)
+ {
+ 	guest_map_mem(gpa, size, false, do_fallocate);
+ }
+ 
++/*
++ * 在以下使用test_ranges[]:
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|161| <<guest_test_explicit_conversion>> for (i = 0; i < ARRAY_SIZE(test_ranges); i++) {
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|162| <<guest_test_explicit_conversion>> uint64_t gpa = base_gpa + test_ranges[i].offset;
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|163| <<guest_test_explicit_conversion>> uint64_t size = test_ranges[i].size;
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|266| <<guest_test_punch_hole>> for (i = 0; i < ARRAY_SIZE(test_ranges); i++) {
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|267| <<guest_test_punch_hole>> uint64_t gpa = base_gpa + test_ranges[i].offset;
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|268| <<guest_test_punch_hole>> uint64_t size = test_ranges[i].size;
++ */
+ struct {
+ 	uint64_t offset;
+ 	uint64_t size;
+@@ -120,6 +194,11 @@ struct {
+ 	GUEST_STAGE(SZ_2M, PAGE_SIZE),
+ };
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|302| <<guest_code>> guest_test_explicit_conversion(base_gpa, false);
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|303| <<guest_code>> guest_test_explicit_conversion(base_gpa, true);
++ */
+ static void guest_test_explicit_conversion(uint64_t base_gpa, bool do_fallocate)
+ {
+ 	const uint8_t def_p = 0xaa;
+@@ -132,6 +211,9 @@ static void guest_test_explicit_conversion(uint64_t base_gpa, bool do_fallocate)
+ 	memcmp_g(base_gpa, def_p, PER_CPU_DATA_SIZE);
+ 	guest_sync_shared(base_gpa, PER_CPU_DATA_SIZE, def_p, init_p);
+ 
++	/*
++	 * host会把shared的内存写成init_p
++	 */
+ 	memcmp_g(base_gpa, init_p, PER_CPU_DATA_SIZE);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(test_ranges); i++) {
+@@ -215,6 +297,11 @@ static void guest_test_explicit_conversion(uint64_t base_gpa, bool do_fallocate)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|276| <<guest_test_punch_hole>> guest_punch_hole(base_gpa, PER_CPU_DATA_SIZE);
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|291| <<guest_test_punch_hole>> guest_punch_hole(gpa, size);
++ */
+ static void guest_punch_hole(uint64_t gpa, uint64_t size)
+ {
+ 	/* "Mapping" memory shared via fallocate() is done via PUNCH_HOLE. */
+@@ -228,6 +315,11 @@ static void guest_punch_hole(uint64_t gpa, uint64_t size)
+  * proper conversion.  Freeing (PUNCH_HOLE) should zap SPTEs, and reallocating
+  * (subsequent fault) should zero memory.
+  */
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|309| <<guest_code>> guest_test_punch_hole(base_gpa, false);
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|310| <<guest_code>> guest_test_punch_hole(base_gpa, true);
++ */
+ static void guest_test_punch_hole(uint64_t base_gpa, bool precise)
+ {
+ 	const uint8_t init_p = 0xcc;
+@@ -287,6 +379,10 @@ static void guest_code(uint64_t base_gpa)
+ 	GUEST_DONE();
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|353| <<__test_mem_conversions>> handle_exit_hypercall(vcpu);
++ */
+ static void handle_exit_hypercall(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_run *run = vcpu->run;
+@@ -312,6 +408,16 @@ static void handle_exit_hypercall(struct kvm_vcpu *vcpu)
+ 
+ static bool run_vcpus;
+ 
++/*
++ * When mapping a gfn into the guest, KVM selects shared vs. private, i.e consumes
++ * userspace_addr vs. guest_memfd, based on the gfn's KVM_MEMORY_ATTRIBUTE_PRIVATE
++ * state.  At VM creation time, all memory is shared, i.e. the PRIVATE attribute
++ * is '0' for all gfns.  Userspace can control whether memory is shared/private by
++ * toggling KVM_MEMORY_ATTRIBUTE_PRIVATE via KVM_SET_MEMORY_ATTRIBUTES as needed.
++ *
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|440| <<test_mem_conversions>> pthread_create(&threads[i], NULL, __test_mem_conversions, vcpus[i]);
++ */
+ static void *__test_mem_conversions(void *__vcpu)
+ {
+ 	struct kvm_vcpu *vcpu = __vcpu;
+@@ -348,8 +454,14 @@ static void *__test_mem_conversions(void *__vcpu)
+ 
+ 			for (i = 0; i < size; i += vm->page_size) {
+ 				size_t nr_bytes = min_t(size_t, vm->page_size, size - i);
++				/*
++				 * 这个hva永远都是shared
++				 */
+ 				uint8_t *hva = addr_gpa2hva(vm, gpa + i);
+ 
++				/*
++				 * 只在此处调用memcmp_h()
++				 */
+ 				/* In all cases, the host should observe the shared data. */
+ 				memcmp_h(hva, gpa + i, uc.args[3], nr_bytes);
+ 
+@@ -395,6 +507,16 @@ static void test_mem_conversions(enum vm_mem_backing_src_type src_type, uint32_t
+ 
+ 	vm_enable_cap(vm, KVM_CAP_EXIT_HYPERCALL, (1 << KVM_HC_MAP_GPA_RANGE));
+ 
++	/*
++	 * called by:
++	 *   - tools/testing/selftests/kvm/guest_memfd_test.c|189| <<main>> fd = vm_create_guest_memfd(vm, total_size, 0);
++	 *   - tools/testing/selftests/kvm/lib/kvm_util.c|1081| <<vm_mem_add>> guest_memfd = vm_create_guest_memfd(vm, mem_size, guest_memfd_flags);
++	 *   - tools/testing/selftests/kvm/set_memory_region_test.c|370| <<test_invalid_memory_region_flags>> int guest_memfd = vm_create_guest_memfd(vm, MEM_REGION_SIZE, 0);
++	 *   - tools/testing/selftests/kvm/set_memory_region_test.c|475| <<test_add_private_memory_region>> memfd = vm_create_guest_memfd(vm2, MEM_REGION_SIZE, 0);
++	 *   - tools/testing/selftests/kvm/set_memory_region_test.c|483| <<test_add_private_memory_region>> memfd = vm_create_guest_memfd(vm, MEM_REGION_SIZE, 0);
++	 *   - tools/testing/selftests/kvm/set_memory_region_test.c|504| <<test_add_overlapping_private_memory_regions>> memfd = vm_create_guest_memfd(vm, MEM_REGION_SIZE * 4, 0);
++	 *   - tools/testing/selftests/kvm/x86_64/private_mem_conversions_test.c|422| <<test_mem_conversions>> memfd = vm_create_guest_memfd(vm, memfd_size, 0);
++	 */
+ 	memfd = vm_create_guest_memfd(vm, memfd_size, 0);
+ 
+ 	for (i = 0; i < nr_memslots; i++)
+diff --git a/tools/testing/selftests/kvm/x86_64/private_mem_kvm_exits_test.c b/tools/testing/selftests/kvm/x86_64/private_mem_kvm_exits_test.c
+index 13e72fcec8dd..4e69e5041db4 100644
+--- a/tools/testing/selftests/kvm/x86_64/private_mem_kvm_exits_test.c
++++ b/tools/testing/selftests/kvm/x86_64/private_mem_kvm_exits_test.c
+@@ -27,6 +27,12 @@ static uint64_t guest_repeatedly_read(void)
+ 	return value;
+ }
+ 
++/*
++ * 在以下使用run_vcpu_get_exit_reason():
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_kvm_exits_test.c|69| <<test_private_access_memslot_deleted>> pthread_create(&vm_thread, NULL,
++ *                                                                             (void *(*)(void *))run_vcpu_get_exit_reason, (void *)vcpu);
++ *   - tools/testing/selftests/kvm/x86_64/private_mem_kvm_exits_test.c|104| <<test_private_access_memslot_not_private>> exit_reason = run_vcpu_get_exit_reason(vcpu);
++ */
+ static uint32_t run_vcpu_get_exit_reason(struct kvm_vcpu *vcpu)
+ {
+ 	int r;
+@@ -34,6 +40,14 @@ static uint32_t run_vcpu_get_exit_reason(struct kvm_vcpu *vcpu)
+ 	r = _vcpu_run(vcpu);
+ 	if (r) {
+ 		TEST_ASSERT(errno == EFAULT, KVM_IOCTL_ERROR(KVM_RUN, r));
++		/*
++		 * 在以下使用KVM_EXIT_MEMORY_FAULT:
++		 *   - include/uapi/linux/kvm.h|180| <<global>> #define KVM_EXIT_MEMORY_FAULT 39
++		 *   - tools/include/uapi/linux/kvm.h|212| <<global>> #define KVM_EXIT_MEMORY_FAULT 39
++		 *   - tools/testing/selftests/kvm/x86_64/private_mem_kvm_exits_test.c|37| <<run_vcpu_get_exit_reason>> TEST_ASSERT_EQ(vcpu->run->exit_reason, KVM_EXIT_MEMORY_FAULT);
++		 *   - tools/testing/selftests/kvm/x86_64/private_mem_kvm_exits_test.c|77| <<test_private_access_memslot_deleted>> TEST_ASSERT_EQ(exit_reason, KVM_EXIT_MEMORY_FAULT);
++		 *   - tools/testing/selftests/kvm/x86_64/private_mem_kvm_exits_test.c|106| <<test_private_access_memslot_not_private>> TEST_ASSERT_EQ(exit_reason, KVM_EXIT_MEMORY_FAULT);
++		 */
+ 		TEST_ASSERT_EQ(vcpu->run->exit_reason, KVM_EXIT_MEMORY_FAULT);
+ 	}
+ 	return vcpu->run->exit_reason;
+@@ -74,6 +88,14 @@ static void test_private_access_memslot_deleted(void)
+ 	pthread_join(vm_thread, &thread_return);
+ 	exit_reason = (uint32_t)(uint64_t)thread_return;
+ 
++	/*
++	 * 在以下使用KVM_EXIT_MEMORY_FAULT:
++	 *   - include/uapi/linux/kvm.h|180| <<global>> #define KVM_EXIT_MEMORY_FAULT 39
++	 *   - tools/include/uapi/linux/kvm.h|212| <<global>> #define KVM_EXIT_MEMORY_FAULT 39
++	 *   - tools/testing/selftests/kvm/x86_64/private_mem_kvm_exits_test.c|37| <<run_vcpu_get_exit_reason>> TEST_ASSERT_EQ(vcpu->run->exit_reason, KVM_EXIT_MEMORY_FAULT);
++	 *   - tools/testing/selftests/kvm/x86_64/private_mem_kvm_exits_test.c|77| <<test_private_access_memslot_deleted>> TEST_ASSERT_EQ(exit_reason, KVM_EXIT_MEMORY_FAULT);
++	 *   - tools/testing/selftests/kvm/x86_64/private_mem_kvm_exits_test.c|106| <<test_private_access_memslot_not_private>> TEST_ASSERT_EQ(exit_reason, KVM_EXIT_MEMORY_FAULT);
++	 */
+ 	TEST_ASSERT_EQ(exit_reason, KVM_EXIT_MEMORY_FAULT);
+ 	TEST_ASSERT_EQ(vcpu->run->memory_fault.flags, KVM_MEMORY_EXIT_FLAG_PRIVATE);
+ 	TEST_ASSERT_EQ(vcpu->run->memory_fault.gpa, EXITS_TEST_GPA);
+@@ -103,6 +125,14 @@ static void test_private_access_memslot_not_private(void)
+ 
+ 	exit_reason = run_vcpu_get_exit_reason(vcpu);
+ 
++	/*
++	 * 在以下使用KVM_EXIT_MEMORY_FAULT:
++	 *   - include/uapi/linux/kvm.h|180| <<global>> #define KVM_EXIT_MEMORY_FAULT 39
++	 *   - tools/include/uapi/linux/kvm.h|212| <<global>> #define KVM_EXIT_MEMORY_FAULT 39
++	 *   - tools/testing/selftests/kvm/x86_64/private_mem_kvm_exits_test.c|37| <<run_vcpu_get_exit_reason>> TEST_ASSERT_EQ(vcpu->run->exit_reason, KVM_EXIT_MEMORY_FAULT);
++	 *   - tools/testing/selftests/kvm/x86_64/private_mem_kvm_exits_test.c|77| <<test_private_access_memslot_deleted>> TEST_ASSERT_EQ(exit_reason, KVM_EXIT_MEMORY_FAULT);
++	 *   - tools/testing/selftests/kvm/x86_64/private_mem_kvm_exits_test.c|106| <<test_private_access_memslot_not_private>> TEST_ASSERT_EQ(exit_reason, KVM_EXIT_MEMORY_FAULT);
++	 */
+ 	TEST_ASSERT_EQ(exit_reason, KVM_EXIT_MEMORY_FAULT);
+ 	TEST_ASSERT_EQ(vcpu->run->memory_fault.flags, KVM_MEMORY_EXIT_FLAG_PRIVATE);
+ 	TEST_ASSERT_EQ(vcpu->run->memory_fault.gpa, EXITS_TEST_GPA);
+diff --git a/virt/kvm/guest_memfd.c b/virt/kvm/guest_memfd.c
+index 0f4e0cf4f158..ee981f3ed1d2 100644
+--- a/virt/kvm/guest_memfd.c
++++ b/virt/kvm/guest_memfd.c
+@@ -7,12 +7,41 @@
+ 
+ #include "kvm_mm.h"
+ 
++/*
++ * When mapping a gfn into the guest, KVM selects shared vs. private, i.e consumes
++ * userspace_addr vs. guest_memfd, based on the gfn's KVM_MEMORY_ATTRIBUTE_PRIVATE
++ * state.  At VM creation time, all memory is shared, i.e. the PRIVATE attribute
++ * is '0' for all gfns.  Userspace can control whether memory is shared/private by
++ * toggling KVM_MEMORY_ATTRIBUTE_PRIVATE via KVM_SET_MEMORY_ATTRIBUTES as needed.
++ */
++
+ struct kvm_gmem {
+ 	struct kvm *kvm;
++	/*
++	 * 在以下使用kvm_gmem->bindings:
++	 *   - virt/kvm/guest_memfd.c|67| <<kvm_gmem_invalidate_begin>> xa_for_each_range(&gmem->bindings, index, slot, start, end - 1) {
++	 *   - virt/kvm/guest_memfd.c|99| <<kvm_gmem_invalidate_end>> if (xa_find(&gmem->bindings, &start, end - 1, XA_PRESENT)) {
++	 *   - virt/kvm/guest_memfd.c|221| <<kvm_gmem_release>> xa_for_each(&gmem->bindings, index, slot)
++	 *   - virt/kvm/guest_memfd.c|240| <<kvm_gmem_release>> xa_destroy(&gmem->bindings);
++	 *   - virt/kvm/guest_memfd.c|388| <<__kvm_gmem_create>> xa_init(&gmem->bindings);
++	 *   - virt/kvm/guest_memfd.c|464| <<kvm_gmem_bind>> if (!xa_empty(&gmem->bindings) &&
++	 *   - virt/kvm/guest_memfd.c|465| <<kvm_gmem_bind>> xa_find(&gmem->bindings, &start, end - 1, XA_PRESENT)) {
++	 *   - virt/kvm/guest_memfd.c|488| <<kvm_gmem_bind>> xa_store_range(&gmem->bindings, start, end - 1, slot, GFP_KERNEL);
++	 *   - virt/kvm/guest_memfd.c|520| <<kvm_gmem_unbind>> xa_store_range(&gmem->bindings, start, end - 1, NULL, GFP_KERNEL);
++	 *   - virt/kvm/guest_memfd.c|561| <<kvm_gmem_get_pfn>> if (WARN_ON_ONCE(xa_load(&gmem->bindings, index) != slot)) {
++	 */
+ 	struct xarray bindings;
+ 	struct list_head entry;
+ };
+ 
++/*
++ * called by:
++ *   - virt/kvm/guest_memfd.c|148| <<kvm_gmem_allocate>> folio = kvm_gmem_get_folio(inode, index);
++ *   - virt/kvm/guest_memfd.c|506| <<kvm_gmem_get_pfn>> folio = kvm_gmem_get_folio(file_inode(file), index);
++ *
++ * 不支持hugepage!
++ * 核心思想是用filemap_grab_folio()获取folio (对应index)
++ */
+ static struct folio *kvm_gmem_get_folio(struct inode *inode, pgoff_t index)
+ {
+ 	struct folio *folio;
+@@ -31,6 +60,14 @@ static struct folio *kvm_gmem_get_folio(struct inode *inode, pgoff_t index)
+ 	 * TODO: Skip clearing pages when trusted firmware will do it when
+ 	 * assigning memory to the guest.
+ 	 */
++	/*
++	 * 注释:
++	 * The uptodate flag is set on a folio when every byte in the folio is
++	 * at least as new as the corresponding bytes on storage.  Anonymous
++	 * and CoW folios are always uptodate.  If the folio is not uptodate,
++	 * some of the bytes in it may be; see the is_partially_uptodate()
++	 * address_space operation.
++	 */
+ 	if (!folio_test_uptodate(folio)) {
+ 		unsigned long nr_pages = folio_nr_pages(folio);
+ 		unsigned long i;
+@@ -48,6 +85,12 @@ static struct folio *kvm_gmem_get_folio(struct inode *inode, pgoff_t index)
+ 	return folio;
+ }
+ 
++/*
++ * called by:
++ *   - virt/kvm/guest_memfd.c|133| <<kvm_gmem_punch_hole>> kvm_gmem_invalidate_begin(gmem, start, end);
++ *   - virt/kvm/guest_memfd.c|248| <<kvm_gmem_release>> kvm_gmem_invalidate_begin(gmem, 0, -1ul);
++ *   - virt/kvm/guest_memfd.c|307| <<kvm_gmem_error_folio>> kvm_gmem_invalidate_begin(gmem, start, end);
++ */
+ static void kvm_gmem_invalidate_begin(struct kvm_gmem *gmem, pgoff_t start,
+ 				      pgoff_t end)
+ {
+@@ -56,6 +99,19 @@ static void kvm_gmem_invalidate_begin(struct kvm_gmem *gmem, pgoff_t start,
+ 	struct kvm *kvm = gmem->kvm;
+ 	unsigned long index;
+ 
++	/*
++	 * 在以下使用kvm_gmem->bindings:
++	 *   - virt/kvm/guest_memfd.c|67| <<kvm_gmem_invalidate_begin>> xa_for_each_range(&gmem->bindings, index, slot, start, end - 1) {
++	 *   - virt/kvm/guest_memfd.c|99| <<kvm_gmem_invalidate_end>> if (xa_find(&gmem->bindings, &start, end - 1, XA_PRESENT)) {
++	 *   - virt/kvm/guest_memfd.c|221| <<kvm_gmem_release>> xa_for_each(&gmem->bindings, index, slot)
++	 *   - virt/kvm/guest_memfd.c|240| <<kvm_gmem_release>> xa_destroy(&gmem->bindings);
++	 *   - virt/kvm/guest_memfd.c|388| <<__kvm_gmem_create>> xa_init(&gmem->bindings);
++	 *   - virt/kvm/guest_memfd.c|464| <<kvm_gmem_bind>> if (!xa_empty(&gmem->bindings) &&
++	 *   - virt/kvm/guest_memfd.c|465| <<kvm_gmem_bind>> xa_find(&gmem->bindings, &start, end - 1, XA_PRESENT)) {
++	 *   - virt/kvm/guest_memfd.c|488| <<kvm_gmem_bind>> xa_store_range(&gmem->bindings, start, end - 1, slot, GFP_KERNEL);
++	 *   - virt/kvm/guest_memfd.c|520| <<kvm_gmem_unbind>> xa_store_range(&gmem->bindings, start, end - 1, NULL, GFP_KERNEL);
++	 *   - virt/kvm/guest_memfd.c|561| <<kvm_gmem_get_pfn>> if (WARN_ON_ONCE(xa_load(&gmem->bindings, index) != slot)) {
++	 */
+ 	xa_for_each_range(&gmem->bindings, index, slot, start, end - 1) {
+ 		pgoff_t pgoff = slot->gmem.pgoff;
+ 
+@@ -83,11 +139,30 @@ static void kvm_gmem_invalidate_begin(struct kvm_gmem *gmem, pgoff_t start,
+ 		KVM_MMU_UNLOCK(kvm);
+ }
+ 
++/*
++ * called by:
++ *   - virt/kvm/guest_memfd.c|138| <<kvm_gmem_punch_hole>> kvm_gmem_invalidate_end(gmem, start, end);
++ *   - virt/kvm/guest_memfd.c|249| <<kvm_gmem_release>> kvm_gmem_invalidate_end(gmem, 0, -1ul);
++ *   - virt/kvm/guest_memfd.c|319| <<kvm_gmem_error_folio>> kvm_gmem_invalidate_end(gmem, start, end);
++ */
+ static void kvm_gmem_invalidate_end(struct kvm_gmem *gmem, pgoff_t start,
+ 				    pgoff_t end)
+ {
+ 	struct kvm *kvm = gmem->kvm;
+ 
++	/*
++	 * 在以下使用kvm_gmem->bindings:
++	 *   - virt/kvm/guest_memfd.c|67| <<kvm_gmem_invalidate_begin>> xa_for_each_range(&gmem->bindings, index, slot, start, end - 1) {
++	 *   - virt/kvm/guest_memfd.c|99| <<kvm_gmem_invalidate_end>> if (xa_find(&gmem->bindings, &start, end - 1, XA_PRESENT)) {
++	 *   - virt/kvm/guest_memfd.c|221| <<kvm_gmem_release>> xa_for_each(&gmem->bindings, index, slot)
++	 *   - virt/kvm/guest_memfd.c|240| <<kvm_gmem_release>> xa_destroy(&gmem->bindings);
++	 *   - virt/kvm/guest_memfd.c|388| <<__kvm_gmem_create>> xa_init(&gmem->bindings);
++	 *   - virt/kvm/guest_memfd.c|464| <<kvm_gmem_bind>> if (!xa_empty(&gmem->bindings) &&
++	 *   - virt/kvm/guest_memfd.c|465| <<kvm_gmem_bind>> xa_find(&gmem->bindings, &start, end - 1, XA_PRESENT)) {
++	 *   - virt/kvm/guest_memfd.c|488| <<kvm_gmem_bind>> xa_store_range(&gmem->bindings, start, end - 1, slot, GFP_KERNEL);
++	 *   - virt/kvm/guest_memfd.c|520| <<kvm_gmem_unbind>> xa_store_range(&gmem->bindings, start, end - 1, NULL, GFP_KERNEL);
++	 *   - virt/kvm/guest_memfd.c|561| <<kvm_gmem_get_pfn>> if (WARN_ON_ONCE(xa_load(&gmem->bindings, index) != slot)) {
++	 */
+ 	if (xa_find(&gmem->bindings, &start, end - 1, XA_PRESENT)) {
+ 		KVM_MMU_LOCK(kvm);
+ 		kvm_mmu_invalidate_end(kvm);
+@@ -95,8 +170,27 @@ static void kvm_gmem_invalidate_end(struct kvm_gmem *gmem, pgoff_t start,
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - virt/kvm/guest_memfd.c|211| <<kvm_gmem_fallocate>> ret = kvm_gmem_punch_hole(file_inode(file), offset, len);
++ *
++ * 处理FALLOC_FL_PUNCH_HOLE
++ */
+ static long kvm_gmem_punch_hole(struct inode *inode, loff_t offset, loff_t len)
+ {
++	/*
++	 * 有人问过为什么这个i_private_list在下面当成链表, 而不是一个element:
++	 * https://patchew.org/linux/8e57c347d6c461431e84ef4354dc076f363f3c01.1695751312.git.isaku.yamahata@intel.com/
++	 * 答案:
++	 * https://lore.kernel.org/all/ZQsAiGuw%2F38jIOV7@google.com/
++	 * The code is structured to allow for multiple gmem instances per inode.  This isn't
++	 * actually possible in the initial code base, but it's on the horizon[*].  I included
++	 * the list-based infrastructure in this initial series to ensure that guest_memfd
++	 * can actually support multiple files per inode, and to minimize the churn when the
++	 * "link" support comes along.
++
++[*] https://lore.kernel.org/all/cover.1691446946.git.ackerleytng@google.com
++	 */
+ 	struct list_head *gmem_list = &inode->i_mapping->i_private_list;
+ 	pgoff_t start = offset >> PAGE_SHIFT;
+ 	pgoff_t end = (offset + len) >> PAGE_SHIFT;
+@@ -111,6 +205,12 @@ static long kvm_gmem_punch_hole(struct inode *inode, loff_t offset, loff_t len)
+ 	list_for_each_entry(gmem, gmem_list, entry)
+ 		kvm_gmem_invalidate_begin(gmem, start, end);
+ 
++	/*
++	 * 注释:
++	 * Truncate the page cache, removing the pages that are between
++	 * specified offsets (and zeroing out partial pages
++	 * if lstart or lend + 1 is not page aligned).
++	 */
+ 	truncate_inode_pages_range(inode->i_mapping, offset, offset + len - 1);
+ 
+ 	list_for_each_entry(gmem, gmem_list, entry)
+@@ -121,6 +221,10 @@ static long kvm_gmem_punch_hole(struct inode *inode, loff_t offset, loff_t len)
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - virt/kvm/guest_memfd.c|209| <<kvm_gmem_fallocate>> ret = kvm_gmem_allocate(file_inode(file), offset, len);
++ */
+ static long kvm_gmem_allocate(struct inode *inode, loff_t offset, loff_t len)
+ {
+ 	struct address_space *mapping = inode->i_mapping;
+@@ -145,6 +249,14 @@ static long kvm_gmem_allocate(struct inode *inode, loff_t offset, loff_t len)
+ 			break;
+ 		}
+ 
++		/*
++		 * called by:
++		 *   - virt/kvm/guest_memfd.c|148| <<kvm_gmem_allocate>> folio = kvm_gmem_get_folio(inode, index);
++		 *   - virt/kvm/guest_memfd.c|506| <<kvm_gmem_get_pfn>> folio = kvm_gmem_get_folio(file_inode(file), index);
++		 *
++		 * 不支持hugepage!
++		 * 核心思想是用filemap_grab_folio()获取folio (对应index)
++		 */
+ 		folio = kvm_gmem_get_folio(inode, index);
+ 		if (!folio) {
+ 			r = -ENOMEM;
+@@ -168,6 +280,9 @@ static long kvm_gmem_allocate(struct inode *inode, loff_t offset, loff_t len)
+ 	return r;
+ }
+ 
++/*
++ * struct file_operations kvm_gmem_fops.fallocate = kvm_gmem_fallocate()
++ */
+ static long kvm_gmem_fallocate(struct file *file, int mode, loff_t offset,
+ 			       loff_t len)
+ {
+@@ -237,6 +352,11 @@ static int kvm_gmem_release(struct inode *inode, struct file *file)
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - virt/kvm/guest_memfd.c|541| <<kvm_gmem_unbind>> file = kvm_gmem_get_file(slot);
++ *   - virt/kvm/guest_memfd.c|583| <<kvm_gmem_get_pfn>> file = kvm_gmem_get_file(slot);
++ */
+ static inline struct file *kvm_gmem_get_file(struct kvm_memory_slot *slot)
+ {
+ 	/*
+@@ -248,12 +368,22 @@ static inline struct file *kvm_gmem_get_file(struct kvm_memory_slot *slot)
+ 	return get_file_active(&slot->gmem.file);
+ }
+ 
++/*
++ * 在以下使用kvm_gmem_fops:
++ *   - virt/kvm/guest_memfd.c|348| <<kvm_gmem_init>> kvm_gmem_fops.owner = module;
++ *   - virt/kvm/guest_memfd.c|452| <<__kvm_gmem_create>> file = anon_inode_create_getfile(anon_name, &kvm_gmem_fops, gmem,
++ *   - virt/kvm/guest_memfd.c|538| <<kvm_gmem_bind>> if (file->f_op != &kvm_gmem_fops)
++ */
+ static struct file_operations kvm_gmem_fops = {
+ 	.open		= generic_file_open,
+ 	.release	= kvm_gmem_release,
+ 	.fallocate	= kvm_gmem_fallocate,
+ };
+ 
++/*
++ * called by:
++ *   - virt/kvm/kvm_main.c|6572| <<kvm_init>> kvm_gmem_init(module);
++ */
+ void kvm_gmem_init(struct module *module)
+ {
+ 	kvm_gmem_fops.owner = module;
+@@ -298,6 +428,10 @@ static int kvm_gmem_error_folio(struct address_space *mapping, struct folio *fol
+ 	return MF_DELAYED;
+ }
+ 
++/*
++ * 在以下使用kvm_gmem_aops:
++ *   - virt/kvm/guest_memfd.c|466| <<__kvm_gmem_create>> inode->i_mapping->a_ops = &kvm_gmem_aops;
++ */
+ static const struct address_space_operations kvm_gmem_aops = {
+ 	.dirty_folio = noop_dirty_folio,
+ 	.migrate_folio	= kvm_gmem_migrate_folio,
+@@ -319,11 +453,22 @@ static int kvm_gmem_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ {
+ 	return -EINVAL;
+ }
++/*
++ * 在以下使用kvm_gmem_iops:
++ *   - virt/kvm/guest_memfd.c|465| <<__kvm_gmem_create>> inode->i_op = &kvm_gmem_iops;
++ */
+ static const struct inode_operations kvm_gmem_iops = {
+ 	.getattr	= kvm_gmem_getattr,
+ 	.setattr	= kvm_gmem_setattr,
+ };
+ 
++/*
++ * called by:
++ *   - virt/kvm/guest_memfd.c|394| <<kvm_gmem_create>> return __kvm_gmem_create(kvm, size, flags);
++ *
++ * 这个函数只是设置了inode->i_size
++ * 没有实际的内存分配
++ */
+ static int __kvm_gmem_create(struct kvm *kvm, loff_t size, u64 flags)
+ {
+ 	const char *anon_name = "[kvm-gmem]";
+@@ -336,12 +481,23 @@ static int __kvm_gmem_create(struct kvm *kvm, loff_t size, u64 flags)
+ 	if (fd < 0)
+ 		return fd;
+ 
++	/*
++	 * struct kvm_gmem {
++	 *     struct kvm *kvm;
++	 *     struct xarray bindings;
++	 *     struct list_head entry;
++	 * };
++	 */
+ 	gmem = kzalloc(sizeof(*gmem), GFP_KERNEL);
+ 	if (!gmem) {
+ 		err = -ENOMEM;
+ 		goto err_fd;
+ 	}
+ 
++	/*
++	 * 注释: Create a new anonymous inode and file pair.
++	 * 会设置file->private_data = priv;
++	 */
+ 	file = anon_inode_create_getfile(anon_name, &kvm_gmem_fops, gmem,
+ 					 O_RDWR, NULL);
+ 	if (IS_ERR(file)) {
+@@ -379,6 +535,16 @@ static int __kvm_gmem_create(struct kvm *kvm, loff_t size, u64 flags)
+ 	return err;
+ }
+ 
++/*
++ * struct kvm_create_guest_memfd {
++ *     __u64 size;
++ *     __u64 flags;
++ *     __u64 reserved[6];
++ * };
++ *
++ * called by:
++ *   - virt/kvm/kvm_main.c|5437| <<kvm_vm_ioctl(KVM_CREATE_GUEST_MEMFD)>> r = kvm_gmem_create(kvm, &guest_memfd);
++ */
+ int kvm_gmem_create(struct kvm *kvm, struct kvm_create_guest_memfd *args)
+ {
+ 	loff_t size = args->size;
+@@ -394,6 +560,14 @@ int kvm_gmem_create(struct kvm *kvm, struct kvm_create_guest_memfd *args)
+ 	return __kvm_gmem_create(kvm, size, flags);
+ }
+ 
++/*
++ * called by:
++ *   - virt/kvm/kvm_main.c|2126| <<__kvm_set_memory_region>> r = kvm_gmem_bind(kvm, new, mem->guest_memfd, mem->guest_memfd_offset);
++ *
++ * 参数应该是slot在memfd的offset
++ * 一个slot只对应一个memfd
++ * 一个memfd可以map许多个slot
++ */
+ int kvm_gmem_bind(struct kvm *kvm, struct kvm_memory_slot *slot,
+ 		  unsigned int fd, loff_t offset)
+ {
+@@ -428,6 +602,9 @@ int kvm_gmem_bind(struct kvm *kvm, struct kvm_memory_slot *slot,
+ 	start = offset >> PAGE_SHIFT;
+ 	end = start + slot->npages;
+ 
++	/*
++	 * 不希望find到
++	 */
+ 	if (!xa_empty(&gmem->bindings) &&
+ 	    xa_find(&gmem->bindings, &start, end - 1, XA_PRESENT)) {
+ 		filemap_invalidate_unlock(inode->i_mapping);
+@@ -439,9 +616,19 @@ int kvm_gmem_bind(struct kvm *kvm, struct kvm_memory_slot *slot,
+ 	 * be see either a NULL file or this new file, no need for them to go
+ 	 * away.
+ 	 */
++	/*
++	 * struct kvm_memory_slot *slot:
++	 *     struct {
++	 *         struct file __rcu *file;
++	 *         pgoff_t pgoff;
++	 *     } gmem;
++	 */
+ 	rcu_assign_pointer(slot->gmem.file, file);
+ 	slot->gmem.pgoff = start;
+ 
++	/*
++	 * 存的是slot
++	 */
+ 	xa_store_range(&gmem->bindings, start, end - 1, slot, GFP_KERNEL);
+ 	filemap_invalidate_unlock(inode->i_mapping);
+ 
+@@ -456,6 +643,11 @@ int kvm_gmem_bind(struct kvm *kvm, struct kvm_memory_slot *slot,
+ 	return r;
+ }
+ 
++/*
++ * called by:
++ *   - virt/kvm/kvm_main.c|1031| <<kvm_free_memslot>> kvm_gmem_unbind(slot);
++ *   - virt/kvm/kvm_main.c|2176| <<__kvm_set_memory_region>> kvm_gmem_unbind(new);
++ */
+ void kvm_gmem_unbind(struct kvm_memory_slot *slot)
+ {
+ 	unsigned long start = slot->gmem.pgoff;
+@@ -476,15 +668,32 @@ void kvm_gmem_unbind(struct kvm_memory_slot *slot)
+ 	filemap_invalidate_lock(file->f_mapping);
+ 	xa_store_range(&gmem->bindings, start, end - 1, NULL, GFP_KERNEL);
+ 	rcu_assign_pointer(slot->gmem.file, NULL);
++	/*
++	 * synchronize_rcu - wait until a grace period has elapsed.
++	 */
+ 	synchronize_rcu();
+ 	filemap_invalidate_unlock(file->f_mapping);
+ 
+ 	fput(file);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/mmu/mmu.c|4330| <<kvm_faultin_pfn_private>> r = kvm_gmem_get_pfn(vcpu->kvm, fault->slot, fault->gfn, &fault->pfn, &max_order);
++ */
+ int kvm_gmem_get_pfn(struct kvm *kvm, struct kvm_memory_slot *slot,
+ 		     gfn_t gfn, kvm_pfn_t *pfn, int *max_order)
+ {
++	/*
++	 * struct kvm_memory_slot *slot:
++	 *     struct {
++	 *         struct file __rcu *file;
++	 *         pgoff_t pgoff;
++	 *     } gmem;
++	 *
++	 * gfn - slot->base_gfn是gfn在这个slot的offset
++	 * 然后加上这个slot的gmem的base???
++	 */
+ 	pgoff_t index = gfn - slot->base_gfn + slot->gmem.pgoff;
+ 	struct kvm_gmem *gmem;
+ 	struct folio *folio;
+@@ -498,11 +707,18 @@ int kvm_gmem_get_pfn(struct kvm *kvm, struct kvm_memory_slot *slot,
+ 
+ 	gmem = file->private_data;
+ 
++	/*
++	 * 一个slot对应一个gmem,
++	 * 一个gmem可以map到好多slot
++	 */
+ 	if (WARN_ON_ONCE(xa_load(&gmem->bindings, index) != slot)) {
+ 		r = -EIO;
+ 		goto out_fput;
+ 	}
+ 
++	/*
++	 * struct folio - Represents a contiguous set of bytes.
++	 */
+ 	folio = kvm_gmem_get_folio(file_inode(file), index);
+ 	if (!folio) {
+ 		r = -ENOMEM;
+@@ -514,6 +730,9 @@ int kvm_gmem_get_pfn(struct kvm *kvm, struct kvm_memory_slot *slot,
+ 		goto out_unlock;
+ 	}
+ 
++	/*
++	 * 从folio中找出page
++	 */
+ 	page = folio_file_page(folio, index);
+ 
+ 	*pfn = page_to_pfn(page);
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 9c99c9373a3e..b00461929086 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -2019,6 +2019,19 @@ static bool kvm_check_memslot_overlap(struct kvm_memslots *slots, int id,
+  *
+  * Must be called holding kvm->slots_lock for write.
+  */
++/*
++ * struct kvm_userspace_memory_region2 {
++ *     __u32 slot;
++ *     __u32 flags;
++ *     __u64 guest_phys_addr;
++ *     __u64 memory_size;
++ *     __u64 userspace_addr;
++ *     __u64 guest_memfd_offset;
++ *     __u32 guest_memfd;
++ *     __u32 pad1;
++ *     __u64 pad2[14];
++ * };
++ */
+ int __kvm_set_memory_region(struct kvm *kvm,
+ 			    const struct kvm_userspace_memory_region2 *mem)
+ {
+@@ -2111,6 +2124,30 @@ int __kvm_set_memory_region(struct kvm *kvm,
+ 	    kvm_check_memslot_overlap(slots, id, base_gfn, base_gfn + npages))
+ 		return -EEXIST;
+ 
++	/*
++	 *  584 struct kvm_memory_slot {
++	 *  585         struct hlist_node id_node[2];
++	 *  586         struct interval_tree_node hva_node[2];
++	 *  587         struct rb_node gfn_node[2];
++	 *  588         gfn_t base_gfn;
++	 *  589         unsigned long npages; 
++	 *  590         unsigned long *dirty_bitmap;
++	 *  591         struct kvm_arch_memory_slot arch;
++	 *  592         unsigned long userspace_addr;
++	 *  593         u32 flags;      
++	 *  594         short id;
++	 *  595         u16 as_id;
++	 *  596 
++	 *  597 #ifdef CONFIG_KVM_PRIVATE_MEM
++	 *  598         struct {
++	 *  599                 struct file __rcu *file;
++	 *  600                 pgoff_t pgoff;
++	 *  601         } gmem;
++	 *  602 #endif
++	 *  603 };
++	 *
++	 * struct kvm_memory_slot *old, *new;
++	 */
+ 	/* Allocate a slot that will persist in the memslot. */
+ 	new = kzalloc(sizeof(*new), GFP_KERNEL_ACCOUNT);
+ 	if (!new)
+@@ -2480,6 +2517,28 @@ static u64 kvm_supported_mem_attributes(struct kvm *kvm)
+ 	return 0;
+ }
+ 
++/*
++ * 2555         struct kvm_mmu_notifier_range pre_set_range = {
++ * 2556                 .start = start,
++ * 2557                 .end = end,
++ * 2558                 .handler = kvm_pre_set_memory_attributes,
++ * 2559                 .on_lock = kvm_mmu_invalidate_begin,
++ * 2560                 .flush_on_ret = true,
++ * 2561                 .may_block = true,
++ * 2562         };
++ * 2563         struct kvm_mmu_notifier_range post_set_range = {
++ * 2564                 .start = start,
++ * 2565                 .end = end,
++ * 2566                 .arg.attributes = attributes,
++ * 2567                 .handler = kvm_arch_post_set_memory_attributes,
++ * 2568                 .on_lock = kvm_mmu_invalidate_end,
++ * 2569                 .may_block = true,
++ * 2570         };
++ *
++ * called by:
++ *   - virt/kvm/kvm_main.c|2588| <<kvm_vm_set_mem_attributes>> kvm_handle_gfn_range(kvm, &pre_set_range);
++ *   - virt/kvm/kvm_main.c|2596| <<kvm_vm_set_mem_attributes>> kvm_handle_gfn_range(kvm, &post_set_range);
++ */
+ static __always_inline void kvm_handle_gfn_range(struct kvm *kvm,
+ 						 struct kvm_mmu_notifier_range *range)
+ {
+@@ -2567,6 +2626,9 @@ static int kvm_vm_set_mem_attributes(struct kvm *kvm, gfn_t start, gfn_t end,
+ 	void *entry;
+ 	int r = 0;
+ 
++	/*
++	 * 好像目前只支持KVM_MEMORY_ATTRIBUTE_PRIVATE
++	 */
+ 	entry = attributes ? xa_mk_value(attributes) : NULL;
+ 
+ 	mutex_lock(&kvm->slots_lock);
+@@ -2575,6 +2637,15 @@ static int kvm_vm_set_mem_attributes(struct kvm *kvm, gfn_t start, gfn_t end,
+ 	if (kvm_range_has_memory_attributes(kvm, start, end, attributes))
+ 		goto out_unlock;
+ 
++	/*
++	 * 在以下使用kvm->mem_attr_array:
++	 *   - include/linux/kvm_host.h|2412| <<kvm_get_memory_attributes>> return xa_to_value(xa_load(&kvm->mem_attr_array, gfn));
++	 *   - virt/kvm/kvm_main.c|1215| <<kvm_create_vm>> xa_init(&kvm->mem_attr_array);
++	 *   - virt/kvm/kvm_main.c|1397| <<kvm_destroy_vm>> xa_destroy(&kvm->mem_attr_array);
++	 *   - virt/kvm/kvm_main.c|2446| <<kvm_range_has_memory_attributes>> XA_STATE(xas, &kvm->mem_attr_array, start);
++	 *   - virt/kvm/kvm_main.c|2583| <<kvm_vm_set_mem_attributes>> r = xa_reserve(&kvm->mem_attr_array, i, GFP_KERNEL_ACCOUNT);
++	 *   - virt/kvm/kvm_main.c|2591| <<kvm_vm_set_mem_attributes>> r = xa_err(xa_store(&kvm->mem_attr_array, i, entry, GFP_KERNEL_ACCOUNT));
++	 */
+ 	/*
+ 	 * Reserve memory ahead of time to avoid having to deal with failures
+ 	 * partway through setting the new attributes.
+@@ -2615,6 +2686,16 @@ static int kvm_vm_ioctl_set_mem_attributes(struct kvm *kvm,
+ 	if (!PAGE_ALIGNED(attrs->address) || !PAGE_ALIGNED(attrs->size))
+ 		return -EINVAL;
+ 
++	/*
++	 * struct kvm_memory_attributes {
++	 *     __u64 address;
++	 *     __u64 size;
++	 *     __u64 attributes;
++	 *     __u64 flags;
++	 * }
++	 *
++	 * start是gfn??
++	 */
+ 	start = attrs->address >> PAGE_SHIFT;
+ 	end = (attrs->address + attrs->size) >> PAGE_SHIFT;
+ 
+@@ -5121,6 +5202,19 @@ static long kvm_vm_ioctl(struct file *filp,
+ 	}
+ 	case KVM_SET_USER_MEMORY_REGION2:
+ 	case KVM_SET_USER_MEMORY_REGION: {
++		/*
++		 * struct kvm_userspace_memory_region2 {
++		 *     __u32 slot;
++		 *     __u32 flags;
++		 *     __u64 guest_phys_addr;
++		 *     __u64 memory_size;
++		 *     __u64 userspace_addr;
++		 *     __u64 guest_memfd_offset;
++		 *     __u32 guest_memfd;
++		 *     __u32 pad1;
++		 *     __u64 pad2[14];
++		 * };
++		 */
+ 		struct kvm_userspace_memory_region2 mem;
+ 		unsigned long size;
+ 
+@@ -5280,6 +5374,14 @@ static long kvm_vm_ioctl(struct file *filp,
+ #endif /* CONFIG_HAVE_KVM_IRQ_ROUTING */
+ #ifdef CONFIG_KVM_GENERIC_MEMORY_ATTRIBUTES
+ 	case KVM_SET_MEMORY_ATTRIBUTES: {
++		/*
++		 * struct kvm_memory_attributes {
++		 *     __u64 address;
++		 *     __u64 size;
++		 *     __u64 attributes;
++		 *     __u64 flags;
++		 * }
++		 */
+ 		struct kvm_memory_attributes attrs;
+ 
+ 		r = -EFAULT;
+@@ -5319,6 +5421,13 @@ static long kvm_vm_ioctl(struct file *filp,
+ 		break;
+ #ifdef CONFIG_KVM_PRIVATE_MEM
+ 	case KVM_CREATE_GUEST_MEMFD: {
++		/*
++		 * struct kvm_create_guest_memfd {
++		 *     __u64 size;
++		 *     __u64 flags;
++		 *     __u64 reserved[6];
++		 * };
++		 */
+ 		struct kvm_create_guest_memfd guest_memfd;
+ 
+ 		r = -EFAULT;
+-- 
+2.34.1
+

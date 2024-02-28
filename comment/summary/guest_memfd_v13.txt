@@ -1,0 +1,376 @@
+本文的针对gmem的理解是基于v13, 也就是要被merge到mainline的版本.
+
+[PATCH v13 00/35] KVM: guest_memfd() and per-page attributes
+https://lore.kernel.org/all/20231027182217.3615211-1-seanjc@google.com/
+
+---
+
+gmem的目的是用一个fd来表示内存. 这样在最后faultin内存的时候,
+就算是KVM也只能通过fd获取pfn来map到EPT上.
+
+也就是说: protect a guest system's memory from access by actors outside of the
+guest itself.
+
+The guest_memfd:  this memfd is tied to the virtual machine for which it was
+created, and it cannot be mapped into user space on the host (or into any other
+virtual machine). This memory can be mapped into the guest's "physical" address
+space, though, with a variant on the usual KVM memory-management operations.
+
+
+With this operation, the hypervisor can allocate memory resources for a guest
+without being able to access that memory itself. That protects the guest from
+having its memory contents disclosed or modified, either by accident or by
+malicious behavior on the part of a (possibly compromised) hypervisor. Unlike
+some previous attempts (including KVM protected memory), this operation does
+not take the affected memory out of the host kernel's direct memory map. Thus,
+while a guest using this memory is protected from user-space threats on the
+host, it could still be attacked by a compromised kernel. The bar to a
+successful attack has been raised significantly, but the protection is not
+total.
+
+---
+
+gmem有两个内存.
+
+1. 一种是普通的shared mem. 也就是以前使用的那种. 使用slot->userspace_addr来代表.
+不管是QEMU还是KVM都可以通过这个hva来访问这是内存.
+也不是我们希望的.
+
+2. 一中是用fd表示的private mem. 在slot里加入了心的gmem.
+
+ 584 struct kvm_memory_slot {
+ 585         struct hlist_node id_node[2];
+ 586         struct interval_tree_node hva_node[2];
+ 587         struct rb_node gfn_node[2];
+ 588         gfn_t base_gfn;
+ 589         unsigned long npages;
+ 590         unsigned long *dirty_bitmap;
+ 591         struct kvm_arch_memory_slot arch;
+ 592         unsigned long userspace_addr;
+ 593         u32 flags;
+ 594         short id;
+ 595         u16 as_id;
+ 596 
+ 597 #ifdef CONFIG_KVM_PRIVATE_MEM
+ 598         struct {
+ 599                 struct file __rcu *file; 
+ 600                 pgoff_t pgoff;
+ 601         } gmem;
+ 602 #endif
+ 603 };
+
+
+gmem和userspace_addr是并行同时存在的. 可以选择在gmem中获取page(的pfn),
+也可以选择userspace_addr的.
+
+如果选择gmem, 就会把fd的page给map到ept进行访问.
+userspace_addr的page仍然可以存在. 如果选择userspace_addr, 会把hva给map大盘ept.
+
+When mapping a gfn into the guest, KVM selects shared vs. private, i.e consumes
+userspace_addr vs. guest_memfd, based on the gfn's KVM_MEMORY_ATTRIBUTE_PRIVATE
+state.  At VM creation time, all memory is shared, i.e. the PRIVATE attribute
+is '0' for all gfns.  Userspace can control whether memory is shared/private by
+toggling KVM_MEMORY_ATTRIBUTE_PRIVATE via KVM_SET_MEMORY_ATTRIBUTES as needed.
+
+
+1. 初始化的时候创建一个KVM的虚拟机.
+
+2. 创建一个fd: KVM_CREATE_GUEST_MEMFD. 指定这个fd可以map的大小.
+
+3. 用KVM_SET_USER_MEMORY_REGION2设置memory region.
+如果flag里有KVM_MEM_GUEST_MEMFD, 也可以是一个private mem.
+
+4. 在KVM_SET_USER_MEMORY_REGION2的时候会bind这个slot到第一步的fd.
+
+5. 像是amd的sev一样, 在VM里可以用hypercall指定要保护的内存.
+hypercall在KVM里是不处理的, 会转发到用户空间去处理.
+
+下面是selftest里用户空间的例子.
+
+290 static void handle_exit_hypercall(struct kvm_vcpu *vcpu)
+291 {
+292         struct kvm_run *run = vcpu->run;
+293         uint64_t gpa = run->hypercall.args[0];
+294         uint64_t size = run->hypercall.args[1] * PAGE_SIZE;
+295         bool set_attributes = run->hypercall.args[2] & MAP_GPA_SET_ATTRIBUTES;
+296         bool map_shared = run->hypercall.args[2] & MAP_GPA_SHARED;
+297         bool do_fallocate = run->hypercall.args[2] & MAP_GPA_DO_FALLOCATE;
+298         struct kvm_vm *vm = vcpu->vm;
+299 
+300         TEST_ASSERT(run->hypercall.nr == KVM_HC_MAP_GPA_RANGE,
+301                     "Wanted MAP_GPA_RANGE (%u), got '%llu'",
+302                     KVM_HC_MAP_GPA_RANGE, run->hypercall.nr);
+303 
+304         if (do_fallocate)
+305                 vm_guest_mem_fallocate(vm, gpa, size, map_shared);
+306 
+307         if (set_attributes)
+308                 vm_set_memory_attributes(vm, gpa, size,
+309                                          map_shared ? 0 : KVM_MEMORY_ATTRIBUTE_PRIVATE);
+310         run->hypercall.ret = 0;
+311 }
+
+上面的例子通过KVM_SET_MEMORY_ATTRIBUTES来修改这段内存的属性.
+
+可以把这段内存指定为shared或者是private(gmem)的属性.
+
+在kvm中有kvm->mem_attr_array, 可以表示每一个gfn的属性.
+
+2546 /* Set @attributes for the gfn range [@start, @end). */
+2547 static int kvm_vm_set_mem_attributes(struct kvm *kvm, gfn_t start, gfn_t end,
+2548                                      unsigned long attributes)
+2549 {
+2550         struct kvm_mmu_notifier_range pre_set_range = {
+2551                 .start = start,
+2552                 .end = end,
+2553                 .handler = kvm_pre_set_memory_attributes,
+2554                 .on_lock = kvm_mmu_invalidate_begin,
+2555                 .flush_on_ret = true,
+2556                 .may_block = true,
+2557         };
+2558         struct kvm_mmu_notifier_range post_set_range = {
+2559                 .start = start,
+2560                 .end = end,
+2561                 .arg.attributes = attributes,
+2562                 .handler = kvm_arch_post_set_memory_attributes,
+2563                 .on_lock = kvm_mmu_invalidate_end,
+2564                 .may_block = true,
+2565         };
+2566         unsigned long i;
+2567         void *entry;
+2568         int r = 0;
+2569 
+2570         entry = attributes ? xa_mk_value(attributes) : NULL;
+2571 
+2572         mutex_lock(&kvm->slots_lock);
+2573 
+2574         /* Nothing to do if the entire range as the desired attributes. */
+2575         if (kvm_range_has_memory_attributes(kvm, start, end, attributes))
+2576                 goto out_unlock;
+2577 
+2578         /*
+2579          * Reserve memory ahead of time to avoid having to deal with failures
+2580          * partway through setting the new attributes.
+2581          */
+2582         for (i = start; i < end; i++) {
+2583                 r = xa_reserve(&kvm->mem_attr_array, i, GFP_KERNEL_ACCOUNT);
+2584                 if (r)
+2585                         goto out_unlock;
+2586         }
+2587 
+2588         kvm_handle_gfn_range(kvm, &pre_set_range);
+2589 
+2590         for (i = start; i < end; i++) {
+2591                 r = xa_err(xa_store(&kvm->mem_attr_array, i, entry,
+2592                                     GFP_KERNEL_ACCOUNT));
+2593                 KVM_BUG_ON(r, kvm);
+2594         }
+2595 
+2596         kvm_handle_gfn_range(kvm, &post_set_range);
+2597 
+2598 out_unlock:
+2599         mutex_unlock(&kvm->slots_lock);
+2600 
+2601         return r;
+2602 }
+
+
+6. 目前gmem只准备支持tdp_mmu. 当发生page fault的时候, 用kvm_mem_is_private()
+来获得gfn的属性.
+
+核心思想就是在kvm->mem_attr_array获取这个gfn对应的index的属性: 是shared还是private.
+
+2422 static inline bool kvm_mem_is_private(struct kvm *kvm, gfn_t gfn)
+2423 {
+2424         return IS_ENABLED(CONFIG_KVM_PRIVATE_MEM) &&
+2425                kvm_get_memory_attributes(kvm, gfn) & KVM_MEMORY_ATTRIBUTE_PRIVATE;
+2426 }
+
+
+7. 如果是shared, 还像是以前一样用GUP从userspace_addr来map: line 4385.
+
+4344 static int __kvm_faultin_pfn(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
+4345 {
+4346         struct kvm_memory_slot *slot = fault->slot;
+4347         bool async
+... ...
+4381         if (fault->is_private)
+4382                 return kvm_faultin_pfn_private(vcpu, fault);
+4383 
+4384         async = false;
+4385         fault->pfn = __gfn_to_pfn_memslot(slot, fault->gfn, false, false, &async,
+4386                                           fault->write, &fault->map_writable,
+4387                                           &fault->hva);
+
+
+8. 如果是gmem/private, 在line 4382, 用folio获取struct page和pfn. (我们只需要page/pfn,
+不需要hva).
+
+参见line 517.
+
+485 int kvm_gmem_get_pfn(struct kvm *kvm, struct kvm_memory_slot *slot,
+486                      gfn_t gfn, kvm_pfn_t *pfn, int *max_order)
+487 {
+488         pgoff_t index = gfn - slot->base_gfn + slot->gmem.pgoff;
+489         struct kvm_gmem *gmem;
+490         struct folio *folio;
+491         struct page *page;
+492         struct file *file;
+493         int r;
+494 
+495         file = kvm_gmem_get_file(slot);
+496         if (!file)
+497                 return -EFAULT;
+498 
+499         gmem = file->private_data;
+500 
+501         if (WARN_ON_ONCE(xa_load(&gmem->bindings, index) != slot)) {
+502                 r = -EIO;
+503                 goto out_fput;
+504         }
+505 
+506         folio = kvm_gmem_get_folio(file_inode(file), index);
+507         if (!folio) {
+508                 r = -ENOMEM;
+509                 goto out_fput;
+510         }
+511 
+512         if (folio_test_hwpoison(folio)) {
+513                 r = -EHWPOISON;
+514                 goto out_unlock;
+515         }
+516 
+517         page = folio_file_page(folio, index);
+518 
+519         *pfn = page_to_pfn(page);
+520         if (max_order)
+521                 *max_order = 0;
+522 
+523         r = 0;
+524 
+525 out_unlock:
+526         folio_unlock(folio);
+527 out_fput:
+528         fput(file);
+529 
+530         return r;
+531 }
+
+
+9. 根据selftest, 我们随时可以修改内存的attribute.
+可以在shared/和private之间切换.
+
+比如:
+
+1. 在一段shared内存写入0xa.
+
+2. 把这段内存换成private.
+
+3. 在private内存写入0xb.
+
+4. 此时在VM side读取这段内存就是0xb.
+
+5. 在用户空间用userspace_addr的map读还是0xa.
+
+说明shared和private是不冲突的同时存在的, 只是由VM决定来map那一组.
+
+
+文件实现了fallocate.
+
+251 static struct file_operations kvm_gmem_fops = {
+252         .open           = generic_file_open,
+253         .release        = kvm_gmem_release,
+254         .fallocate      = kvm_gmem_fallocate,
+255 };
+
+根据line 185的FALLOC_FL_PUNCH_HOLE是否设置了来决定:
+
+1. 用kvm_gmem_punch_hole()-->truncate_inode_pages_range()把page们移除.
+
+2. 用kvm_gmem_allocate()在folio中来preallocate page们.
+
+171 static long kvm_gmem_fallocate(struct file *file, int mode, loff_t offset,
+172                                loff_t len)
+173 {
+174         int ret;
+175
+176         if (!(mode & FALLOC_FL_KEEP_SIZE))
+177                 return -EOPNOTSUPP;
+178
+179         if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE))
+180                 return -EOPNOTSUPP;
+181
+182         if (!PAGE_ALIGNED(offset) || !PAGE_ALIGNED(len))
+183                 return -EINVAL;
+184
+185         if (mode & FALLOC_FL_PUNCH_HOLE)
+186                 ret = kvm_gmem_punch_hole(file_inode(file), offset, len);
+187         else
+188                 ret = kvm_gmem_allocate(file_inode(file), offset, len);
+189
+190         if (!ret)
+191                 file_modified(file);
+192         return ret;
+193 }
+
+---
+
+在阅读代码的时候, 很奇怪为什么line 100和line 111会遍历所有的i_private_list.
+
+ 98 static long kvm_gmem_punch_hole(struct inode *inode, loff_t offset, loff_t len)
+ 99 {
+100         struct list_head *gmem_list = &inode->i_mapping->i_private_list;
+101         pgoff_t start = offset >> PAGE_SHIFT;
+102         pgoff_t end = (offset + len) >> PAGE_SHIFT;
+103         struct kvm_gmem *gmem;
+104 
+105         /*
+106          * Bindings must be stable across invalidation to ensure the start+end
+107          * are balanced.
+108          */
+109         filemap_invalidate_lock(inode->i_mapping);
+110 
+111         list_for_each_entry(gmem, gmem_list, entry)
+112                 kvm_gmem_invalidate_begin(gmem, start, end);
+113 
+114         truncate_inode_pages_range(inode->i_mapping, offset, offset + len - 1);
+115 
+116         list_for_each_entry(gmem, gmem_list, entry)
+117                 kvm_gmem_invalidate_end(gmem, start, end);
+118 
+119         filemap_invalidate_unlock(inode->i_mapping);
+120 
+121         return 0;
+122 }
+
+创建的时候, 应该是一个gmem fd对应一个file/inode pair. 因为i_private_list应该只有一个元素才对.
+
+Sean在下面提到了为什么, 是future work.
+
+https://patchew.org/linux/8e57c347d6c461431e84ef4354dc076f363f3c01.1695751312.git.isaku.yamahata@intel.com/
+
+The code is structured to allow for multiple gmem instances per inode.  This isn't
+actually possible in the initial code base, but it's on the horizon[*].  I included
+the list-based infrastructure in this initial series to ensure that guest_memfd
+can actually support multiple files per inode, and to minimize the churn when the
+"link" support comes along.
+
+[*] https://lore.kernel.org/all/cover.1691446946.git.ackerleytng@google.com
+
+
+https://lore.kernel.org/all/ZQsAiGuw%2F38jIOV7@google.com/
+
+
+Intended usage of the two ioctls:
+
+1. Source VM’s fd is passed to destination VM via unix sockets
+2. Destination VM uses new ioctl KVM_LINK_GUEST_MEMFD to link source
+   VM’s fd to a new fd.
+3. Destination VM will pass new fds to KVM_SET_USER_MEMORY_REGION,
+   which will bind the new file, pointing to the same inode that the
+   source VM’s file points to, to memslots
+4. Use KVM_CAP_VM_MOVE_ENC_CONTEXT_FROM to move kvm->mem_attr_array
+   and slot->arch.lpage_info to the destination VM.
+5. Run the destination VM as per normal
+
+---
