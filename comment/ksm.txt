@@ -1,0 +1,374 @@
+ksm的代码在mm/ksm.c:
+
+ksm_scan_thread()
+-> ksm_do_scan()
+   -> cmp_and_merge_page()
+
+启动的地方:
+
+/sys/kernel/mm/ksm/run
+
+callstack example
+
+https://paste.debian.net/1303767/
+
+tdp_mmu_zap_leafs+5
+kvm_unmap_gfn_range+347
+kvm_mmu_notifier_invalidate_range_start+394
+__mmu_notifier_invalidate_range_start+156
+change_protection+3908
+change_prot_numa+105
+task_numa_work+1029
+bpf_trampoline_6442457341+117
+task_numa_work+9
+xfer_to_guest_mode_handle_work+261
+kvm_arch_vcpu_ioctl_run+1553
+kvm_vcpu_ioctl+667
+__x64_sys_ioctl+164
+do_syscall_64+96
+entry_SYSCALL_64_after_hwframe+110
+
+tdp_mmu_zap_leafs+5
+kvm_unmap_gfn_range+347
+kvm_mmu_notifier_invalidate_range_start+394
+__mmu_notifier_invalidate_range_start+156
+change_protection+3908
+change_prot_numa+105
+task_numa_work+1029
+bpf_trampoline_6442457341+117
+task_numa_work+9
+exit_to_user_mode_prepare+368
+irqentry_exit_to_user_mode+13
+irqentry_exit+71
+sysvec_apic_timer_interrupt+79
+asm_sysvec_apic_timer_interrupt+31
+
+------------------
+
+KSM_ATTR_RO(pages_scanned);
+KSM_ATTR_RO(pages_shared);
+KSM_ATTR_RO(pages_sharing);
+KSM_ATTR_RO(pages_unshared);
+KSM_ATTR_RO(pages_volatile);
+KSM_ATTR_RO(pages_skipped);
+KSM_ATTR_RO(ksm_zero_pages);
+KSM_ATTR_RO(general_profit);
+KSM_ATTR_RO(stable_node_dups);
+KSM_ATTR_RO(stable_node_chains);
+KSM_ATTR_RO(full_scans);
+
+KSM_ATTR(sleep_millisecs);    --> 扫描的时间间隔
+KSM_ATTR(pages_to_scan);      --> 一次扫描处理的页数
+KSM_ATTR(run);
+KSM_ATTR(merge_across_nodes); --> 是否允许merge不同node的页面
+KSM_ATTR(use_zero_pages);
+KSM_ATTR(max_page_sharing);   --> 最多可以merge的页面是 (似乎0是unlimited)
+KSM_ATTR(stable_node_chains_prune_millisecs);
+KSM_ATTR(smart_scan);
+
+------------------
+
+会对userspace用MADV_MERGEABLE标记的内存merge
+
+下面的例子说明有12480个page被合并成了200个共享的page
+
+$ cat /sys/kernel/mm/ksm/pages_sharing
+12480
+
+$ cat /sys/kernel/mm/ksm/pages_shared
+200
+
+============================
+
+ksm使用的例子:
+
+https://lore.kernel.org/kvm/832697b9-3652-422d-a019-8c0574a188ac@proxmox.com/
+
+From: Friedrich Weber <f.weber@proxmox.com>
+To: kvm@vger.kernel.org
+Cc: Sean Christopherson <seanjc@google.com>,
+	Paolo Bonzini <pbonzini@redhat.com>,
+	Andrew Morton <akpm@linux-foundation.org>,
+	linux-kernel@vger.kernel.org, linux-mm@kvack.org
+Subject: Temporary KVM guest hangs connected to KSM and NUMA balancer
+Date: Thu, 4 Jan 2024 14:42:01 +0100	[thread overview]
+Message-ID: <832697b9-3652-422d-a019-8c0574a188ac@proxmox.com> (raw)
+
+Hi,
+
+some of our (Proxmox VE) users have been reporting [1] that guests
+occasionally become unresponsive with high CPU usage for some time
+(varying between ~1 and more than 60 seconds). After that time, the
+guests come back and continue running fine. Windows guests seem most
+affected (not responding to pings during the hang, RDP sessions time
+out). But we also got reports about Linux guests. This issue was not
+present while we provided (host) kernel 5.15 and was first reported when
+we rolled out a kernel based on 6.2. The reports seem to concern NUMA
+hosts only. Users reported that the issue becomes easier to trigger the
+more memory is assigned to the guests. Setting mitigations=off was
+reported to alleviate (but not eliminate) the issue. The issue seems to
+disappear after disabling KSM.
+
+We can reproduce the issue with a Windows guest on a NUMA host, though
+only occasionally and not very reliably. Using a bpftrace script like
+[7] we found the hangs to correlate with long-running invocations of
+`task_numa_work` (more than 500ms), suggesting a connection to the NUMA
+balancer. Indeed, we can't reproduce the issue after disabling the NUMA
+balancer with `echo 0 > /proc/sys/kernel/numa_balancing` [2] and got a
+user confirming this fixes the issue for them [3].
+
+Since the Windows reproducer is not very stable, we tried to find a
+Linux guest reproducer and have found one (described below [0]) that
+triggers a very similar (hopefully the same) issue. The reproducer
+triggers the hangs also if the host is on current Linux 6.7-rc8
+(610a9b8f). A kernel bisect points to the following as the commit
+introducing the issue:
+
+f47e5bbb ("KVM: x86/mmu: Zap only TDP MMU leafs in zap range and
+mmu_notifier unmap")
+
+which is why I cc'ed Sean and Paolo. Because of the possible KSM
+connection I cc'ed Andrew and linux-mm.
+
+Indeed, on f47e5bbb~1 = a80ced6e ("KVM: SVM: fix panic on out-of-bounds
+guest IRQ") the reproducer does not trigger the hang, and on f47e5bbb it
+triggers the hang.
+
+Currently I don't know enough about the KVM/KSM/NUMA balancer code to
+tell how the patch may trigger these issues. Any idea who we could ask
+about this, or how we could further debug this would be greatly appreciated!
+
+Let me know if I can provide any more information.
+
+Best,
+
+Friedrich
+
+[0]
+
+Reproducer (example outputs with the host on f47e5bbb):
+
+* Host with 256GiB memory, 2 NUMA nodes (for output of `numactl -H` see [4])
+* Disable ksmtuned on the host, then manually enable and "boost" KSM:
+
+  echo 1250 > /sys/kernel/mm/ksm/pages_to_scan
+  echo 1 > /sys/kernel/mm/ksm/run
+
+* Create Linux guest (e.g. Debian 12) with 140GiB memory. There is no
+virtio-balloon-pci device, this is to prevent the host from reclaiming
+memory of the guest (this mimics the behavior of Windows guests). See
+[5] for QEMU 8.2 command line.
+* On the guest, run a program that allocates 128 GiB memory in 1 GiB
+chunks, initializes it with an arbitrary byte (ASCII 'A'), sleeps for
+60s and exits (allocate.c [6]):
+
+  ./allocate 128
+
+* Wait until KSM sharing pages are at >30GiB
+(/sys/kernel/mm/ksm/pages_sharing exceeds 7864320), that takes ~20
+minutes for us.
+* Optionally lower KSM pages_to_scan to a reasonable value to rule it
+out as a factor:
+
+  echo 100 > /sys/kernel/mm/ksm/pages_to_scan
+  echo 1 > /sys/kernel/mm/ksm/run
+
+* From a different machine, run a continuous `ping -D` against the guest
+* On the host, run bpftrace to trace `task_numa_work` invocations over
+500ms [7]
+* On the guest, run the allocation program 32 times in parallel, each
+process allocating 4x1 GiB of memory (32 * 4 = 128):
+
+  for i in $(seq 32); do ./allocate 4 & done
+
+* A few seconds later while the processes are still running, the guest
+becomes unresponsive for some time, thus the ping response times greatly
+increase. For example, here the guest does not respond at all for ~100
+seconds:
+
+[1704360680.898427] 64 bytes from 192.168.18.11: icmp_seq=47 ttl=64
+time=0.447 ms
+[1704360681.922522] 64 bytes from 192.168.18.11: icmp_seq=48 ttl=64
+time=0.515 ms
+[1704360710.369961] From 192.168.16.32 icmp_seq=73 Destination Host
+Unreachable
+[1704360713.442023] From 192.168.16.32 icmp_seq=76 Destination Host
+Unreachable
+... repeats ...
+[1704360786.081958] From 192.168.16.32 icmp_seq=147 Destination Host
+Unreachable
+[1704360789.154021] From 192.168.16.32 icmp_seq=151 Destination Host
+Unreachable
+[1704360790.194049] 64 bytes from 192.168.18.11: icmp_seq=49 ttl=64
+time=107244 ms
+[1704360790.196813] 64 bytes from 192.168.18.11: icmp_seq=50 ttl=64
+time=106227 ms
+[1704360790.196998] 64 bytes from 192.168.18.11: icmp_seq=51 ttl=64
+time=105203 ms
+[1704360790.206355] 64 bytes from 192.168.18.11: icmp_seq=52 ttl=64
+time=104188 ms
+[1704360790.206721] 64 bytes from 192.168.18.11: icmp_seq=53 ttl=64
+time=103165 ms
+[1704360790.206837] 64 bytes from 192.168.18.11: icmp_seq=54 ttl=64
+time=102141 ms
+[...]
+[1704360799.307342] 64 bytes from 192.168.18.11: icmp_seq=163 ttl=64
+time=0.335 ms
+[1704360800.322355] 64 bytes from 192.168.18.11: icmp_seq=164 ttl=64
+time=0.360 ms
+[1704360810.481320] 64 bytes from 192.168.18.11: icmp_seq=165 ttl=64
+time=9135 ms
+[1704360810.481331] 64 bytes from 192.168.18.11: icmp_seq=166 ttl=64
+time=8111 ms
+[1704360810.481334] 64 bytes from 192.168.18.11: icmp_seq=167 ttl=64
+time=7083 ms
+[1704360810.481336] 64 bytes from 192.168.18.11: icmp_seq=168 ttl=64
+time=6059 ms
+[1704360810.481339] 64 bytes from 192.168.18.11: icmp_seq=169 ttl=64
+time=5039 ms
+[1704360810.481409] 64 bytes from 192.168.18.11: icmp_seq=170 ttl=64
+time=4015 ms
+[...]
+[1704360827.906610] 64 bytes from 192.168.18.11: icmp_seq=191 ttl=64
+time=0.591 ms
+[1704360828.930570] 64 bytes from 192.168.18.11: icmp_seq=192 ttl=64
+time=0.576 ms
+
+* At the same time, bpftrace logs long-running invocations of
+`task_numa_work`, some examples:
+
+[1704360683] task_numa_work (tid=15476) took 868 ms
+[1704360683] task_numa_work (tid=15457) took 984 ms
+[1704360683] task_numa_work (tid=15480) took 1104 ms
+[...]
+[1704360751] task_numa_work (tid=15462) took 13916 ms
+[1704360753] task_numa_work (tid=15453) took 21708 ms
+[...]
+[1704360805] task_numa_work (tid=15485) took 1029 ms
+[1704360807] task_numa_work (tid=15485) took 1245 ms
+[1704360807] task_numa_work (tid=15446) took 2483 ms
+[1704360808] task_numa_work (tid=15466) took 4149 ms
+[1704360810] task_numa_work (tid=15446) took 3409 ms
+[...]
+[1704360814] task_numa_work (tid=15464) took 1733 ms
+[1704360816] task_numa_work (tid=15464) took 1844 ms
+
+* After some time (~100s in the example above) the guest comes back and
+ping response times go back to normal. The guest journal logs some soft
+lockups, e.g.:
+
+Jan 04 10:33:10 debian kernel: rcu: INFO: rcu_preempt detected stalls on
+CPUs/tasks:
+Jan 04 10:33:10 debian kernel: watchdog: BUG: soft lockup - CPU#10 stuck
+for 101s! [allocate:1169]
+Jan 04 10:33:10 debian kernel: watchdog: BUG: soft lockup - CPU#31 stuck
+for 101s! [allocate:1180]
+
+* We cannot trigger the hangs anymore after disabling the NUMA balancer
+-- ping response times stay under 1ms then.
+
+[1] https://forum.proxmox.com/threads/130727/
+[2] https://forum.proxmox.com/threads/130727/page-7#post-601617
+[3] https://forum.proxmox.com/threads/130727/page-7#post-603096
+[4]
+
+# numactl -H
+available: 2 nodes (0-1)
+node 0 cpus: 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 32 33 34 35 36 37 38
+39 40 41 42 43 44 45 46 47
+node 0 size: 128649 MB
+node 0 free: 124293 MB
+node 1 cpus: 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 48 49 50 51
+52 53 54 55 56 57 58 59 60 61 62 63
+node 1 size: 128971 MB
+node 1 free: 126587 MB
+node distances:
+node   0   1
+  0:  10  21
+  1:  21  10
+
+[5]
+
+./qemu-system-x86_64 \
+  -accel kvm \
+  -chardev
+'socket,id=qmp,path=/var/run/qemu-server/101.qmp,server=on,wait=off' \
+  -mon 'chardev=qmp,mode=control' \
+  -chardev 'socket,id=qmp-event,path=/var/run/qmeventd.sock,reconnect=5' \
+  -mon 'chardev=qmp-event,mode=control' \
+  -pidfile /var/run/qemu-server/101.pid \
+  -smp '64,sockets=1,cores=64,maxcpus=64' \
+  -nodefaults \
+  -vnc 'unix:/var/run/qemu-server/101.vnc,password=on' \
+  -cpu qemu64,enforce,+kvm_pv_eoi,+kvm_pv_unhalt \
+  -m 143360 \
+  -device 'pci-bridge,id=pci.3,chassis_nr=3,bus=pci.0,addr=0x5' \
+  -device 'VGA,id=vga,bus=pci.0,addr=0x2' \
+  -device 'virtio-scsi-pci,id=virtioscsi0,bus=pci.3,addr=0x1' \
+  -drive 'file=/dev/pve/vm-101-disk-0,if=none,id=drive-scsi0,format=raw' \
+  -device
+'scsi-hd,bus=virtioscsi0.0,channel=0,scsi-id=0,lun=0,drive=drive-scsi0,id=scsi0,bootindex=100'
+\
+  -netdev
+'type=tap,id=net0,ifname=tap101i0,script=/var/lib/qemu-server/pve-bridge,downscript=/var/lib/qemu-server/pve-bridgedown,vhost=on'
+\
+  -device
+'virtio-net-pci,mac=BC:24:11:09:20:0C,netdev=net0,bus=pci.0,addr=0x12,id=net0,rx_queue_size=1024,tx_queue_size=256,bootindex=102'
+\
+  -machine 'type=pc'
+
+[6]
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <assert.h>
+
+const size_t chunk_size = 1024 * 1024 * 1024; // 1 GiB
+
+void *alloc_chunk(char ch) {
+	size_t init_size = 65536;
+	size_t init_done = 0;
+	void *base = malloc(chunk_size);
+	assert(base);
+
+	while (init_done < chunk_size && init_done + init_size < chunk_size) {
+		memset((char *)base + init_done, ch, init_size);
+		init_done += init_size;
+	}
+
+	return base;
+}
+
+int main(int argc, char *argv[]) {
+	int num_chunks;
+
+	assert(argc == 2);
+	num_chunks = atoi(argv[1]);
+	assert(num_chunks >= 0 && num_chunks <= 1024);
+
+	char **chunks = malloc(num_chunks * sizeof(char *));
+
+	fprintf(stderr, "alloc %d chunks\n", num_chunks);
+	for (int i = 0; i < num_chunks; i++) {
+		fprintf(stderr, "alloc #%d: %c\n", i, 'A');
+		chunks[i] = alloc_chunk('A');
+	}
+	fprintf(stderr, "sleeping 1min\n");
+	sleep(60);
+	return 0;
+}
+
+[7]
+
+kfunc:task_numa_work { @start[tid] = nsecs; }
+kretfunc:task_numa_work /@start[tid]/ {
+	$diff = nsecs - @start[tid];
+	if ($diff > 500000000) { // 500ms
+		time("[%s] ");
+		printf("task_numa_work (tid=%d) took %d ms\n", tid, $diff / 1000000);
+	}
+	delete(@start[tid]);
+}
+
