@@ -1,0 +1,266 @@
+关于shadow_mmio_access_mask.
+
+EPT是0
+shadow是ACC_WRITE_MASK | ACC_USER_MASK
+
+kvm_x86_init()
+-> kvm_mmu_x86_module_init()
+   -> tdp_mmu_allowed = tdp_mmu_enabled
+   -> kvm_mmu_spte_module_init()
+      -> allow_mmio_caching = enable_mmio_caching;
+
+vmx_init() or svm_init()
+-> kvm_x86_vendor_init()
+   -> __kvm_x86_vendor_init()
+      -> kvm_mmu_vendor_module_init()
+         -> kvm_mmu_reset_all_pte_masks()
+            -> shadow_accessed_mask = PT_ACCESSED_MASK; (1 << 5)
+	    -> kvm_mmu_set_mmio_spte_mask(mask, mask, ACC_WRITE_MASK | ACC_USER_MASK); --> 根据情况, 把shadow的设置成ACC_WRITE_MASK | ACC_USER_MASK
+   -> ops->hardware_setup = hardware_setup()
+      -> kvm_mmu_set_ept_masks()
+         -> shadow_accessed_mask = has_ad_bits ? VMX_EPT_ACCESS_BIT : 0ull; (1 << 8)
+         -> kvm_mmu_set_mmio_spte_mask(VMX_EPT_MISCONFIG_WX_VALUE, VMX_EPT_RWX_MASK, 0); ---> ept的话会覆盖成0
+
+kvm_create_vm()
+-> hardware_enable_all()
+   -> on_each_cpu(hardware_enable_nolock, &failed, 1);
+      -> __hardware_enable_nolock()
+         -> kvm_arch_hardware_enable()
+            -> static_call(kvm_x86_hardware_enable)() = hardware_enable()
+
+
+是被下面的patch引入的.
+
+4af7715110a2617fc40ac2c1232f664019269f3a
+KVM: x86/mmu: Add explicit access mask for MMIO SPTEs
+
+commit的一些注释:
+When shadow paging is enabled, KVM tracks the allowed access type for
+MMIO SPTEs so that it can do a permission check on a MMIO GVA cache hit
+without having to walk the guest's page tables.  The tracking is done
+by retaining the WRITE and USER bits of the access when inserting the
+MMIO SPTE (read access is implicitly allowed), which allows the MMIO
+page fault handler to retrieve and cache the WRITE/USER bits from the
+SPTE. --> "retaining the WRITE and USER bits"是指在host的shadow table保留吗.
+
+---------------------------------
+
+先聊一下regular page fault的error code.
+
+  5 /*
+  6  * Page fault error code bits:
+  7  *
+  8  *   bit 0 ==    0: no page found       1: protection fault
+  9  *   bit 1 ==    0: read access         1: write access
+ 10  *   bit 2 ==    0: kernel-mode access  1: user-mode access
+ 11  *   bit 3 ==                           1: use of reserved bit detected
+ 12  *   bit 4 ==                           1: fault was an instruction fetch
+ 13  *   bit 5 ==                           1: protection keys block access
+ 14  *   bit 6 ==                           1: shadow stack access fault
+ 15  *   bit 15 ==                          1: SGX MMU page-fault
+ 16  */
+ 17 enum x86_pf_error_code {
+ 18         X86_PF_PROT     =               1 << 0,
+ 19         X86_PF_WRITE    =               1 << 1,
+ 20         X86_PF_USER     =               1 << 2,
+ 21         X86_PF_RSVD     =               1 << 3,
+ 22         X86_PF_INSTR    =               1 << 4,
+ 23         X86_PF_PK       =               1 << 5,
+ 24         X86_PF_SHSTK    =               1 << 6,
+ 25         X86_PF_SGX      =               1 << 15,
+ 26 };
+
+摘抄自下面.
+https://www.cnblogs.com/binlovetech/p/17918733.html
+
+- P(0) : 如果error_code第0个比特位置为0,表示该缺页异常是由于CPU访问的这个虚拟内存地址address
+背后并没有一个物理内存页与之映射而引起的,站在进程页表的角度来说,就是CPU访问的这个虚拟内存
+地址address在进程四级页表体系中对应的各级页目录项或者页表项是空的(页目录项或者页表项中
+的P位为0).
+
+如果error_code第0个比特位置为1,表示CPU访问的这个虚拟内存地址背后虽然有物理内存页与之映射,
+但是由于访问权限不够而引起的缺页异常(保护异常), 比如,进程尝试对一个只读的物理内存页
+进行写操作,那么就会引起写保护类型的缺页异常.
+
+- R/W(1) : 表示引起缺页异常的访问类型是什么? 如果error_code第1个比特位置为0,表示是由于读
+访问引起的.置为1表示是由于写访问引起的.
+
+注意: 该标志位只是为了描述是哪种访问类型造成了本次缺页异常,这个和前面提到的访问权限没有关系.
+比如,进程尝试对一个可写的虚拟内存页进行写入,访问权限没有问题,但是该虚拟内存页背后并未有物理
+内存与之关联,所以也会导致缺页异常.这种情况下, error_code的P位就会设置为0,R/W位就会设置为1.
+
+- U/S(2) : 表示缺页异常发生在用户态还是内核态,error_code第2个比特位设置为0表示CPU访问内核空间
+的地址引起的缺页异常,设置为1表示CPU访问用户空间的地址引起的缺页异常.
+
+- RSVD(3) : 这里用于检测页表项中的保留位(Reserved相关的比特位)是否设置,这些页表项中的保留位都
+是预留给内核以后的相关功能使用的,所以在缺页的时候需要检查这些保留位是否设置,从而决定近一步的扩展处理.
+设置为1表示页表项中预留的这些比特位被使用了.设置为0表示页表项中预留的这些比特位还没有被使用.
+
+- I/D(4) : 设置为1, 表示本次缺页异常是在CPU获取指令的时候引起的.
+
+- PK(5) : 设置为1，表示引起缺页异常的虚拟内存地址对应页表项中的Protection相关的比特位被设置了.
+
+---------------------------------
+
+再聊一下Intel SDM中的access rights这个小chapter. 这个chapter主要提及了下面的bit是怎样用来检测permission的.
+
+bit 1: R/W
+
+bit 2: U/S
+
+bit 63: NX
+
+还有一个bit 0: P, 不能叫做access rights/permission.
+
+
+比如在KVM (shadow page table)遍历guest的page table的时候, 会记录下三个access rights:
+- R/W
+- U/S
+- NX
+
+299 /*
+300  * Fetch a guest pte for a guest virtual address, or for an L2's GPA.
+301  */
+302 static int FNAME(walk_addr_generic)(struct guest_walker *walker,
+303                                     struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
+304                                     gpa_t addr, u64 access)
+305 {
+... ...
+427                 /* Convert to ACC_*_MASK flags for struct guest_walker.  */
+428                 walker->pt_access[walker->level - 1] = FNAME(gpte_access)(pt_access ^ walk_nx_mask);
+429         } while (!FNAME(is_last_gpte)(mmu, walker->level, pte));
+... ...
+
+173 /*
+174  * For PTTYPE_EPT, a page table can be executable but not readable
+175  * on supported processors. Therefore, set_spte does not automatically
+176  * set bit 0 if execute only is supported. Here, we repurpose ACC_USER_MASK
+177  * to signify readability since it isn't used in the EPT case
+178  */
+179 static inline unsigned FNAME(gpte_access)(u64 gpte)
+180 {
+181         unsigned access;
+182 #if PTTYPE == PTTYPE_EPT
+183         access = ((gpte & VMX_EPT_WRITABLE_MASK) ? ACC_WRITE_MASK : 0) |
+184                 ((gpte & VMX_EPT_EXECUTABLE_MASK) ? ACC_EXEC_MASK : 0) |
+185                 ((gpte & VMX_EPT_READABLE_MASK) ? ACC_USER_MASK : 0);
+186 #else
+187         BUILD_BUG_ON(ACC_EXEC_MASK != PT_PRESENT_MASK);
+188         BUILD_BUG_ON(ACC_EXEC_MASK != 1);
+189         access = gpte & (PT_WRITABLE_MASK | PT_USER_MASK | PT_PRESENT_MASK);
+190         /* Combine NX with P (which is set here) to get ACC_EXEC_MASK.  */
+191         access ^= (gpte >> PT64_NX_SHIFT);
+192 #endif
+193
+194         return access;
+195 }
+
+
+mmio有一点不一样. mmio是不需要exec的, 所以和X/NX无关.
+所以shadow_mmio_access_mask就不需要管理X/NX.
+
+---------------------------------
+
+关于shadow_mmio_access_mask.
+
+VMX    : 0                               --> 000b
+SVM    : PT_WRITABLE_MASK | PT_USER_MASK --> 110b
+Shadow : ACC_WRITE_MASK | ACC_USER_MASK  --> 110b
+
+这里只讨论一般的shadow page table. 有三处地方用到这个mask.
+
+- arch/x86/kvm/mmu/mmu.c|313| <<get_mmio_spte_access>> return spte & shadow_mmio_access_mask;
+- arch/x86/kvm/mmu/mmu.c|3340| <<kvm_handle_noslot_fault>> vcpu_cache_mmio_info(vcpu, gva, fault->gfn, access & shadow_mmio_access_mask);
+- arch/x86/kvm/mmu/spte.c|106| <<make_mmio_spte>> access &= shadow_mmio_access_mask;
+
+---------------------------------
+
+1. get_mmio_spte_access().
+
+EXIT_REASON_EXCEPTION_NMI:handle_exception_nmi()
+-> kvm_handle_page_fault()
+   -> kvm_mmu_page_fault()
+      -> handle_mmio_page_fault() --> error_code有PFERR_RSVD_MASK的时候
+         -> get_mmio_spte_access()
+         -> vcpu_cache_mmio_info(vcpu, addr, gfn, access);
+用在已经二次配置的mmio(等同与misconfig). 取出host shadow pte的ACC_WRITE_MASK|ACC_USER_MASK,
+然后用vcpu_cache_mmio_info()缓存
+
+问题: spte里面存的权限是怎么设计的?
+
+在walk_addr_generic的时候: (1) 会把每一个level的权限保存在walker->pt_access[walker->level - 1],
+(2)最后指向gpfn的那个保存在walker.pte_access. 使用的格式是被FNAME(gpte_access)改装过的那种.
+
+---------------------------------
+
+2. kvm_handle_noslot_fault().
+
+EXIT_REASON_EXCEPTION_NMI:handle_exception_nmi()
+-> kvm_handle_page_fault()
+   -> kvm_mmu_page_fault()
+      -> kvm_mmu_do_page_fault()
+         -> FNAME(page_fault)
+            -> kvm_faultin_pfn()
+               -> if (unlikely(!fault->slot)) kvm_handle_noslot_fault()
+                  -> vcpu_cache_mmio_info(vcpu, gva, fault->gfn, access & shadow_mmio_access_mask);
+shadow page table第一次page fault的时候, 准备做成mmio
+
+问题: 参数access怎么来的?
+
+在shadow page table的FNAME(page_fault)->FNAME(walk_addr_generic)的时候, 会把所有的level的entry进行and,
+转换成(ACC_EXEC_MASK | ACC_WRITE_MASK | ACC_USER_MASK)格式, 然后存入walker.pte_access.
+只针对shadow来说, walker.pte_access是这个address在guest内部页表定义的权限 (被FNAME(gpte_access)改装过).
+
+---------------------------------
+
+3. make_mmio_spte()
+
+EXIT_REASON_EXCEPTION_NMI:handle_exception_nmi()
+-> kvm_handle_page_fault()
+   -> kvm_mmu_page_fault()
+      -> kvm_mmu_do_page_fault()
+         -> FNAME(page_fault)
+            -> FNAME(fetch)
+               -> mmu_set_spte()
+                  -> mark_mmio_spte()
+                     -> make_mmio_spte()
+                        -> access &= shadow_mmio_access_mask;
+                        -> spte |= shadow_mmio_value | access; --> BIT_ULL(51) | PT_PRESENT_MASK;
+第一次fault后设置mmio的情况(以后可以走cache的fastpath)
+
+问题: 参数access怎么来的?
+
+在shadow page table的FNAME(page_fault)->FNAME(walk_addr_generic)的时候, 会把所有的level的entry进行and,
+转换成(ACC_EXEC_MASK | ACC_WRITE_MASK | ACC_USER_MASK)格式, 然后存入walker.pte_access.
+只针对shadow来说, walker.pte_access是这个address在guest内部页表定义的权限 (被FNAME(gpte_access)改装过).
+
+问题: 做mmio pte的时候为什么要用guest内部gpte的权限?用BIT_ULL(51) | PT_PRESENT_MASK不香吗?
+
+=====================
+
+针对shadow page table来说, 所以shadow_mmio_access_mask:
+
+1. 从一个pte中取出R/W和U/S权限, 在fastpath给vcpu_cache_mmio_info()缓存的时候用.
+
+2. 从FNAME(gpte_access)改装过的access中取出R/W和U/S权限, 在制作mmio pte的时候再放进去.
+
+3. 从FNAME(gpte_access)改装过的access中取出R/W和U/S权限, 在slowpath给vcpu_cache_mmio_info()缓存的时候用.
+
+=====================
+
+问题: 为什么要在vcpu_cache_mmio_info()缓存access?
+
+只在emulator_read_write_onepage()-->vcpu_mmio_gva_to_gpa()中使用vcpu->arch.mmio_access.
+
+guest在访问mmio的时候大部分时间是gva. 如果落入了cache的话, vcpu_mmio_gva_to_gpa()会:
+
+1. 先根据模拟的要求生成一个access作为需求,
+
+ 7752         u64 access = ((static_call(kvm_x86_get_cpl)(vcpu) == 3) ? PFERR_USER_MASK : 0)
+ 7753                 | (write ? PFERR_WRITE_MASK : 0);
+
+2. 判断这个access的需求是否被cache的vcpu->arch.mmio_access满足.
+
+如果不满足, 也就没有模拟或者交给QEMU的需要了.
+
+提醒一下, 对于shadow page table, vcpu->arch.mmio_access是对各级level的权限的综合(and).
