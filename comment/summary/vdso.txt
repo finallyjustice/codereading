@@ -1,0 +1,127 @@
+vsyscall和vdso
+
+vsyscall和vDSO是两种从userspace调用kernel space系统调用的方式.
+传统的系统调用会导致从user到kernel的switch, 这样有性能问题.
+vsyscall和vDSO是两种加速的方案. vsyscall更旧一些.
+
+vsyscall通过把一些系统调用的实现map到userspace.
+userspace可以直接调用这些固定的地址, 而不需要权限的转换.
+
+最早的vsyscall应该已经是被废弃了. 为了保持兼容, linux提供了emulated vsyscall.
+vsyscall是用linux的map_vsyscall()来初始化的.
+
+vDSO的方式更灵活, 相当于把系统调用的实现封装成了shared obj那样的格式.使用init_vdso()
+进程初始化.
+vDSO: a virtual dynamically linked shared object. In this way, the kernel can
+publish selected functions that can run straight in userspace. This means a
+regular program dynamically links in bits of kernel supplied code, which in
+turn means that there is no overhead to "jump into the kernel" to execute code.
+
+从procfs可以看到 [vvar], [vdso]和[vsyscall].
+
+[root@vm ~]# cat /proc/1704/maps
+... ...
+7fff109e4000-7fff109e8000 r--p 00000000 00:00 0                          [vvar]
+7fff109e8000-7fff109ea000 r-xp 00000000 00:00 0                          [vdso]
+ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0                  [vsyscall]
+
+
+从下面两个进程可以看出, vsyscall的地址是不变的, 而vDSO是变的.
+
+[root@vm ~]# cat /proc/1702/maps
+... ...
+7ffe1d3dc000-7ffe1d3e0000 r--p 00000000 00:00 0                          [vvar]
+7ffe1d3e0000-7ffe1d3e2000 r-xp 00000000 00:00 0                          [vdso]
+ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0                  [vsyscall]
+
+[root@vm ~]# cat /proc/1/maps
+... ...
+7ffd321d9000-7ffd321dd000 r--p 00000000 00:00 0                          [vvar]
+7ffd321dd000-7ffd321df000 r-xp 00000000 00:00 0                          [vdso]
+ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0                  [vsyscall]
+
+
+一个ELF的linux-vdso.so.1是没有固定的文件的.
+
+[root@vm ~]# ldd /bin/bash
+	linux-vdso.so.1 (0x00007ffeaf450000)
+	libtinfo.so.6 => /lib64/libtinfo.so.6 (0x00007f261c768000)
+	libdl.so.2 => /lib64/libdl.so.2 (0x00007f261c564000)
+	libc.so.6 => /lib64/libc.so.6 (0x00007f261c19f000)
+	/lib64/ld-linux-x86-64.so.2 (0x00007f261ccb3000)
+
+下面来自编译内核的时候的vdso文件.
+
+$ readelf -sW arch/x86/entry/vdso/vdso64.so
+
+Symbol table '.dynsym' contains 12 entries:
+   Num:    Value          Size Type    Bind   Vis      Ndx Name
+     0: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT  UND
+     1: 0000000000000980   823 FUNC    WEAK   DEFAULT   11 clock_gettime@@LINUX_2.6
+     2: 00000000000006d0   633 FUNC    GLOBAL DEFAULT   11 __vdso_gettimeofday@@LINUX_2.6
+     3: 0000000000000cc0   100 FUNC    WEAK   DEFAULT   11 clock_getres@@LINUX_2.6
+     4: 0000000000000cc0   100 FUNC    GLOBAL DEFAULT   11 __vdso_clock_getres@@LINUX_2.6
+     5: 00000000000006d0   633 FUNC    WEAK   DEFAULT   11 gettimeofday@@LINUX_2.6
+     6: 0000000000000950    45 FUNC    GLOBAL DEFAULT   11 __vdso_time@@LINUX_2.6
+     7: 0000000000000950    45 FUNC    WEAK   DEFAULT   11 time@@LINUX_2.6
+     8: 0000000000000980   823 FUNC    GLOBAL DEFAULT   11 __vdso_clock_gettime@@LINUX_2.6
+     9: 0000000000000000     0 OBJECT  GLOBAL DEFAULT  ABS LINUX_2.6
+    10: 0000000000000d30    41 FUNC    GLOBAL DEFAULT   11 __vdso_getcpu@@LINUX_2.6
+    11: 0000000000000d30    41 FUNC    WEAK   DEFAULT   11 getcpu@@LINUX_2.6
+
+
+使用下面的代码进行的测试.
+
+https://kernel.googlesource.com/pub/scm/linux/kernel/git/luto/misc-tests/+/5655bd41ffedc002af69e3a8d1b0a168c22f2549/dump-vdso.c
+
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+int main()
+{
+	FILE *maps;
+	void *vdso_begin, *vdso_end;
+	int found_vdso = 0;
+	maps = fopen("/proc/self/maps", "r");
+	char buf[1024];
+	while (fgets(buf, 1024, maps)) {
+		if (strstr(buf, "[vdso]")) {
+			found_vdso = 1;
+			break;
+		}
+	}
+	fclose(maps);
+	if (!found_vdso) {
+		fprintf(stderr, "Could not find vdso mapping\n");
+		return 1;
+	}
+	sscanf(buf, "%p-%p", &vdso_begin, &vdso_end);
+	write(1, vdso_begin, vdso_end - vdso_begin);
+	return 0;
+}
+
+[root@vm ~]# gcc dump.c -o dump
+[root@vm ~]# ./dump  > vdso.bin
+[root@vm ~]# readelf -sW vdso.bin
+
+Symbol table '.dynsym' contains 13 entries:
+   Num:    Value          Size Type    Bind   Vis      Ndx Name
+     0: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT  UND
+     1: 0000000000000c90     5 FUNC    WEAK   DEFAULT   11 clock_gettime@@LINUX_2.6
+     2: 0000000000000c50     5 FUNC    GLOBAL DEFAULT   11 __vdso_gettimeofday@@LINUX_2.6
+     3: 0000000000000ca0   132 FUNC    WEAK   DEFAULT   11 clock_getres@@LINUX_2.6
+     4: 0000000000000ca0   132 FUNC    GLOBAL DEFAULT   11 __vdso_clock_getres@@LINUX_2.6
+     5: 0000000000000c50     5 FUNC    WEAK   DEFAULT   11 gettimeofday@@LINUX_2.6
+     6: 0000000000000c60    46 FUNC    GLOBAL DEFAULT   11 __vdso_time@@LINUX_2.6
+     7: 0000000000000d60   157 FUNC    GLOBAL DEFAULT   11 __vdso_sgx_enter_enclave@@LINUX_2.6
+     8: 0000000000000c60    46 FUNC    WEAK   DEFAULT   11 time@@LINUX_2.6
+     9: 0000000000000c90     5 FUNC    GLOBAL DEFAULT   11 __vdso_clock_gettime@@LINUX_2.6
+    10: 0000000000000000     0 OBJECT  GLOBAL DEFAULT  ABS LINUX_2.6
+    11: 0000000000000d30    44 FUNC    GLOBAL DEFAULT   11 __vdso_getcpu@@LINUX_2.6
+    12: 0000000000000d30    44 FUNC    WEAK   DEFAULT   11 getcpu@@LINUX_2.6
+
+
+
+根据下面的链接, emulated  vsyscall最慢, vDSO最快.
+
+https://terenceli.github.io/%E6%8A%80%E6%9C%AF/2019/02/13/vsyscall-and-vdso#:~:text=The%20difference%20between%20the%20vsyscall,every%20time%20in%20every%20process.

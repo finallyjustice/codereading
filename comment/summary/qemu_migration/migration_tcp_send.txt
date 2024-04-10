@@ -1,0 +1,478 @@
+
+需要迁移的状态:
+1. cpu state
+2. ram
+3. device state
+
+状态分为两种:
+
+1. 可以iterative的. 比如ram或者vfio/iommu.
+2. 不可以iterative的. 比如设备的状态, 可以一次性发送.
+
+由一个全局的链表管理ram/vfio或者设备的状态. 类型是'SaveState'.
+
+274 static SaveState savevm_state = {
+275     .handlers = QTAILQ_HEAD_INITIALIZER(savevm_state.handlers),
+276     .handler_pri_head = { [MIG_PRI_DEFAULT ... MIG_PRI_MAX] = NULL },
+277     .global_section_id = 0,
+278 };
+
+链表SaveState->handlers上挂载着"struct SaveStateEntry".
+
+222 typedef struct SaveState {
+223     QTAILQ_HEAD(, SaveStateEntry) handlers;
+224     SaveStateEntry *handler_pri_head[MIG_PRI_MAX + 1];
+225     int global_section_id;
+226     uint32_t len;
+227     const char *name;
+228     uint32_t target_page_bits;
+229     uint32_t caps_count;
+230     MigrationCapability *capabilities;
+231     QemuUUID uuid;
+232 } SaveState;
+
+下面是"struct SaveStateEntry".
+
+ram使用SaveVMHandlers.
+device使用VMStateDescription.
+
+204 typedef struct SaveStateEntry {
+205     QTAILQ_ENTRY(SaveStateEntry) entry;
+206     char idstr[256];
+207     uint32_t instance_id;
+208     int alias_id;
+209     int version_id;
+210     /* version id read from the stream */
+211     int load_version_id;
+212     int section_id;
+213     /* section id read from the stream */
+214     int load_section_id;
+215     const SaveVMHandlers *ops;       ---> RAM类型使用
+216     const VMStateDescription *vmsd;  ---> 设备类型使用
+217     void *opaque;
+218     CompatEntry *compat;
+219     int is_ram;
+220 } SaveStateEntry;
+
+VMStateDescription被设备类型使用.
+
+184 struct VMStateDescription {
+185     const char *name;
+186     bool unmigratable;
+187     /*
+188      * This VMSD describes something that should be sent during setup phase
+189      * of migration. It plays similar role as save_setup() for explicitly
+190      * registered vmstate entries, so it can be seen as a way to describe
+191      * save_setup() in VMSD structures.
+192      *
+193      * Note that for now, a SaveStateEntry cannot have a VMSD and
+194      * operations (e.g., save_setup()) set at the same time. Consequently,
+195      * save_setup() and a VMSD with early_setup set to true are mutually
+196      * exclusive. For this reason, also early_setup VMSDs are migrated in a
+197      * QEMU_VM_SECTION_FULL section, while save_setup() data is migrated in
+198      * a QEMU_VM_SECTION_START section.
+199      */
+200     bool early_setup;
+201     int version_id;
+202     int minimum_version_id;
+203     MigrationPriority priority;
+204     int (*pre_load)(void *opaque);
+205     int (*post_load)(void *opaque, int version_id);
+206     int (*pre_save)(void *opaque);
+207     int (*post_save)(void *opaque);
+208     bool (*needed)(void *opaque);
+209     bool (*dev_unplug_pending)(void *opaque);
+210
+211     const VMStateField *fields;
+212     const VMStateDescription **subsections;
+213 };
+
+
+使用savevm_state_handler_insert()往链表上插入SaveStateEntry.
+
+savevm_state_handler_insert()被register_savevm_live()或者vmstate_register_with_alias_id()调用.
+
+下面是内存部分的初始化.
+
+ram_mig_init()
+-> register_savevm_live("ram", 0, 4, &savevm_ram_handlers, &ram_state);
+   -> savevm_state_handler_insert()
+
+4589 static SaveVMHandlers savevm_ram_handlers = {
+4590     .save_setup = ram_save_setup,
+4591     .save_live_iterate = ram_save_iterate,
+4592     .save_live_complete_postcopy = ram_save_complete,
+4593     .save_live_complete_precopy = ram_save_complete,
+4594     .has_postcopy = ram_has_postcopy,
+4595     .state_pending_exact = ram_state_pending_exact, ---> 指示还有多少必须保存的数据, 用来确定何时停CPU完成迁移?
+4596     .state_pending_estimate = ram_state_pending_estimate,
+4597     .load_state = ram_load,
+4598     .save_cleanup = ram_save_cleanup,
+4599     .load_setup = ram_load_setup,
+4600     .load_cleanup = ram_load_cleanup,
+4601     .resume_prepare = ram_resume_prepare,
+4602 };
+
+下面是设备部门的初始化 (包括virtio-net).
+
+device_set_realized()
+-> vmstate_register_with_alias_id()
+   -> savevm_state_handler_insert()	
+
+
+下面是发送端的流程.
+
+qmp_migrate()
+-> migrate_prepare()
+-> socket_start_outgoing_migration()
+   -> qio_channel_socket_connect_async(socket_outgoing_migration)
+      -> socket_outgoing_migration()
+         -> migration_channel_connect()
+            -> multifd_save_setup()
+               -> multifd_new_send_channel_create() --> N次
+                  -> socket_send_channel_create(multifd_new_send_channel_async)
+                     -> multifd_new_send_channel_async()
+                        -> multifd_channel_connect() --> 创建multifd_send_thread()
+            -> qemu_thread_create(migration_thread)
+
+
+
+migration_thread()
+-> qemu_savevm_state_header() --> 发送头部header, 比如QEMU_VM_FILE_MAGIC和QEMU_VM_FILE_VERSION
+-> qemu_savevm_state_setup()
+   -> se->ops->save_setup = ram_save_setup() --> 第一阶段
+      -> ram_init_all()
+         -> ram_init_bitmaps()
+            -> ram_list_init_bitmaps()
+               -> 遍历&ram_list.blocks: RAMBLOCK_FOREACH_NOT_IGNORED(block)
+                  -> block->bmap = bitmap_new(pages);
+                  -> bitmap_set(block->bmap, 0, pages); --> 第一阶段, 把所有block的bitmap都设置成全是1, 所以page都是dirty!
+                  -> block->clear_bmap_shift = shift;
+                  -> block->clear_bmap = bitmap_new(clear_bmap_size(pages, shift));
+            -> memory_global_dirty_log_start()
+               -> memory_region_transaction_commit()
+                  -> kvm_log_start()
+                     -> kvm_section_update_flags()
+                        -> kvm_slot_update_flags() --> 设置KVM_MEM_LOG_DIRTY_PAGES
+         -> migration_bitmap_sync_precopy()
+            -> migration_bitmap_sync() --> 脏页同步
+               -> memory_global_dirty_log_sync()
+                  -> memory_region_sync_dirty_bitmap()
+                     -> kvm_log_sync()
+                        -> kvm_physical_sync_dirty_bitmap()
+                           -> kvm_slot_get_dirty_log()
+-> while: migration_iteration_run()  --> 第二阶段
+   -> qemu_savevm_state_pending_exact()
+      -> ram_state_pending_exact()
+         -> migration_bitmap_sync_precopy()
+            -> migration_bitmap_sync() --> 脏页同步
+               -> memory_global_dirty_log_sync()
+                  -> memory_region_sync_dirty_bitmap()
+                     -> kvm_log_sync()
+                        -> kvm_physical_sync_dirty_bitmap()
+                           -> kvm_slot_get_dirty_log()
+   -> migration_completion() --> 如果完成 --> 第三阶段(ram+dev)
+      -> migration_completion_precopy()
+         -> qemu_savevm_state_complete_precopy()
+            -> qemu_savevm_state_complete_precopy_iterable() --> 剩余可以一次性迁移的最后一部分数据
+               -> se->ops->save_live_complete_precopy = ram_save_complete()
+                  -> ram_find_and_save_block()
+	             -> ram_save_host_page()
+                        -> migration_ops->ram_save_target_page = ram_save_target_page_legacy()
+                           -> 如果multifd: ram_save_multifd_page()
+                              -> multifd_queue_page()
+                                 -> multifd_send_pages()
+                                    -> p->pages = pages;
+			            -> qemu_sem_post(&p->sem); --> 唤醒multifd_send_thread()
+                           -> 如果不multifd: ram_save_page()
+                              -> save_normal_page()
+                                 -> qemu_put_buffer()
+                  -> multifd_send_sync_main()
+            -> qemu_savevm_state_complete_precopy_non_iterable() --> 迁移设备(non-iterable)
+               -> 针对每一个&savevm_state.handlers调用vmstate_save()
+                  -> vmstate_save()
+                     -> vmstate_save_state_with_err()
+                        -> vmstate_save_state_v()
+                           -> virtio_device_put()
+                              -> virtio_save()
+   -> qemu_savevm_state_iterate() --> 第二阶段真正迭代的地方
+      -> save_section_header(f, se, QEMU_VM_SECTION_PART); --> 设置数据段头标标识
+      -> se->ops->save_live_iterate = ram_save_iterate()
+         -> ram_find_and_save_block()
+            -> ram_save_host_page()
+               -> migration_ops->ram_save_target_page = ram_save_target_page_legacy()
+                  -> 如果multifd: ram_save_multifd_page()
+                     -> multifd_queue_page()
+                        -> multifd_send_pages()
+                           -> p->pages = pages;
+			   -> qemu_sem_post(&p->sem); --> 唤醒multifd_send_thread()
+		  -> 如果不multifd: ram_save_page()
+                     -> save_normal_page()
+                        -> qemu_put_buffer()
+         -> multifd_send_sync_main()
+      -> save_section_footer(f, se);
+
+-------------------------
+
+关于dirty memory/bit,
+
+一些函数比如kvm_slot_sync_dirty_pages()-->cpu_physical_memory_set_dirty_lebitmap()负责从KVMSlot->dirty_bmap转移到ram_list->dirty_memory[]->blocks[].
+
+cpu_physical_memory_sync_dirty_bitmap()负责从ram_list->dirty_memory[]->blocks[]转移到RAMBlock->bmap.
+
+migration这一层从RAMBlock->bmap来查找脏页.
+
+
+typedef struct KVMSlot
+{
+    hwaddr start_addr;
+    ram_addr_t memory_size;
+    void *ram;
+    int slot;
+    int flags;
+    int old_flags;
+    /* Dirty bitmap cache for the slot */
+    unsigned long *dirty_bmap;         ---------> 脏页 level 1
+    unsigned long dirty_bmap_size;
+    /* Cache of the address space ID */
+    int as_id;
+    /* Cache of the offset in ram address space */
+    ram_addr_t ram_start_offset;
+} KVMSlot;
+
+typedef struct KVMMemoryListener {
+    MemoryListener listener;
+    KVMSlot *slots;
+    unsigned int nr_used_slots;
+    int as_id;
+    QSIMPLEQ_HEAD(, KVMMemoryUpdate) transaction_add;
+    QSIMPLEQ_HEAD(, KVMMemoryUpdate) transaction_del;
+} KVMMemoryListener;
+
+struct KVMState
+{
+    AccelState parent_obj;
+
+    int nr_slots;
+    ... ...
+    KVMMemoryListener memory_listener;
+    ... ...
+}
+
+
+typedef struct {
+    struct rcu_head rcu;
+    unsigned long *blocks[];
+} DirtyMemoryBlocks;
+
+typedef struct RAMList {
+    QemuMutex mutex;
+    RAMBlock *mru_block;
+    /* RCU-enabled, writes protected by the ramlist lock. */
+    QLIST_HEAD(, RAMBlock) blocks;
+    DirtyMemoryBlocks *dirty_memory[DIRTY_MEMORY_NUM]; -------> 脏页 level 2
+    uint32_t version;
+    QLIST_HEAD(, RAMBlockNotifier) ramblock_notifiers;
+} RAMList;
+
+
+struct RAMBlock {
+    struct rcu_head rcu;
+    struct MemoryRegion *mr;
+    uint8_t *host;
+    uint8_t *colo_cache; /* For colo, VM's ram cache */
+    ram_addr_t offset;
+    ram_addr_t used_length;
+    ram_addr_t max_length;
+    void (*resized)(const char*, uint64_t length, void *host);
+    uint32_t flags;
+    /* Protected by iothread lock.  */
+    char idstr[256];
+    /* RCU-enabled, writes protected by the ramlist lock */
+    QLIST_ENTRY(RAMBlock) next;
+    QLIST_HEAD(, RAMBlockNotifier) ramblock_notifiers;
+    int fd;
+    uint64_t fd_offset;
+    size_t page_size;
+    /* dirty bitmap used during migration */
+    unsigned long *bmap; ---------------------> 脏页 level 3
+    /* bitmap of already received pages in postcopy */
+    unsigned long *receivedmap;
+
+    /*
+     * bitmap to track already cleared dirty bitmap.  When the bit is
+     * set, it means the corresponding memory chunk needs a log-clear.
+     * Set this up to non-NULL to enable the capability to postpone
+     * and split clearing of dirty bitmap on the remote node (e.g.,
+     * KVM).  The bitmap will be set only when doing global sync.
+     *
+     * It is only used during src side of ram migration, and it is
+     * protected by the global ram_state.bitmap_mutex.
+     *
+     * NOTE: this bitmap is different comparing to the other bitmaps
+     * in that one bit can represent multiple guest pages (which is
+     * decided by the `clear_bmap_shift' variable below).  On
+     * destination side, this should always be NULL, and the variable
+     * `clear_bmap_shift' is meaningless.
+     */
+    unsigned long *clear_bmap;
+    uint8_t clear_bmap_shift;
+
+    /*
+     * RAM block length that corresponds to the used_length on the migration
+     * source (after RAM block sizes were synchronized). Especially, after
+     * starting to run the guest, used_length and postcopy_length can differ.
+     * Used to register/unregister uffd handlers and as the size of the received
+     * bitmap. Receiving any page beyond this length will bail out, as it
+     * could not have been valid on the source.
+     */
+    ram_addr_t postcopy_length;
+};
+
+
+所有发送的数据流需要一个格式来定义.
+
+#define QEMU_VM_FILE_MAGIC           0x5145564d
+#define QEMU_VM_FILE_VERSION_COMPAT  0x00000002
+#define QEMU_VM_FILE_VERSION         0x00000003
+
+#define QEMU_VM_EOF                  0x00
+#define QEMU_VM_SECTION_START        0x01
+#define QEMU_VM_SECTION_PART         0x02
+#define QEMU_VM_SECTION_END          0x03
+#define QEMU_VM_SECTION_FULL         0x04
+#define QEMU_VM_SUBSECTION           0x05
+#define QEMU_VM_VMDESCRIPTION        0x06
+#define QEMU_VM_CONFIGURATION        0x07
+#define QEMU_VM_COMMAND              0x08
+#define QEMU_VM_SECTION_FOOTER       0x7e
+
+-------------------------
+
+下面是一些比较重要的callback.
+
+
+这是激活跟踪dirty bitmap的时候.
+
+(gdb) bt
+#0  kvm_mem_flags (mr=0x5555572bb1a0) at ../accel/kvm/kvm-all.c:469
+#1  0x0000555555dc270f in kvm_slot_update_flags (kml=0x555557242d10, mem=0x5555572646c0, mr=0x5555572bb1a0) at ../accel/kvm/kvm-all.c:485
+#2  0x0000555555dc282b in kvm_section_update_flags (kml=0x555557242d10, section=0x7ffdcb8b75f0) at ../accel/kvm/kvm-all.c:518
+#3  0x0000555555dc28cc in kvm_log_start (listener=0x555557242d10, section=0x7ffdcb8b75f0, old=0, new=4) at ../accel/kvm/kvm-all.c:539
+#4  0x0000555555d66ba7 in address_space_update_topology_pass (as=0x555556f49b40 <address_space_memory>, old_view=0x7ffde8144c90, new_view=0x7ffdb80418f0, adding=true) at ../system/memory.c:987
+#5  0x0000555555d6700d in address_space_set_flatview (as=0x555556f49b40 <address_space_memory>) at ../system/memory.c:1080
+#6  0x0000555555d671b5 in memory_region_transaction_commit () at ../system/memory.c:1132
+#7  0x0000555555d6be07 in memory_global_dirty_log_start (flags=1) at ../system/memory.c:2926
+#8  0x0000555555d81a9a in ram_init_bitmaps (rs=0x7ffdb8001320) at ../migration/ram.c:2810
+#9  0x0000555555d81b4a in ram_init_all (rsp=0x555556f49e60 <ram_state>) at ../migration/ram.c:2834
+#10 0x0000555555d81e76 in ram_save_setup (f=0x555557236b40, opaque=0x555556f49e60 <ram_state>) at ../migration/ram.c:2947
+#11 0x0000555555ba0bb0 in qemu_savevm_state_setup (f=0x555557236b40) at ../migration/savevm.c:1345
+#12 0x0000555555b8b130 in migration_thread (opaque=0x5555572488a0) at ../migration/migration.c:3340
+#13 0x0000555555fd1784 in qemu_thread_start (args=0x555557243410) at ../util/qemu-thread-posix.c:541
+#14 0x00007ffff5395ea5 in start_thread () at /lib64/libpthread.so.0
+#15 0x00007ffff50be9fd in clone () at /lib64/libc.so.6
+
+
+这是setup的时候的从KVM得到dirty map.
+
+(gdb) bt
+#0  kvm_slot_get_dirty_log (s=0x555557242c60, slot=0x555557264750) at ../accel/kvm/kvm-all.c:613
+#1  0x0000555555dc30a8 in kvm_physical_sync_dirty_bitmap (kml=0x555557242d10, section=0x7ffdcdbe8630) at ../accel/kvm/kvm-all.c:857
+#2  0x0000555555dc4aaf in kvm_log_sync (listener=0x555557242d10, section=0x7ffdcdbe8630) at ../accel/kvm/kvm-all.c:1592
+#3  0x0000555555d69e1c in memory_region_sync_dirty_bitmap (mr=0x0, last_stage=false) at ../system/memory.c:2279
+#4  0x0000555555d6bcc4 in memory_global_dirty_log_sync (last_stage=false) at ../system/memory.c:2885
+#5  0x0000555555d7e763 in migration_bitmap_sync (rs=0x7ffdc0001410, last_stage=false) at ../migration/ram.c:1046
+#6  0x0000555555d7e995 in migration_bitmap_sync_precopy (rs=0x7ffdc0001410, last_stage=false) at ../migration/ram.c:1094
+#7  0x0000555555d81aab in ram_init_bitmaps (rs=0x7ffdc0001410) at ../migration/ram.c:2811
+#8  0x0000555555d81b4a in ram_init_all (rsp=0x555556f49e60 <ram_state>) at ../migration/ram.c:2834
+#9  0x0000555555d81e76 in ram_save_setup (f=0x555557236b40, opaque=0x555556f49e60 <ram_state>) at ../migration/ram.c:2947
+#10 0x0000555555ba0bb0 in qemu_savevm_state_setup (f=0x555557236b40) at ../migration/savevm.c:1345
+#11 0x0000555555b8b130 in migration_thread (opaque=0x5555572488a0) at ../migration/migration.c:3340
+#12 0x0000555555fd1784 in qemu_thread_start (args=0x555557a4d6b0) at ../util/qemu-thread-posix.c:541
+#13 0x00007ffff5395ea5 in start_thread () at /lib64/libpthread.so.0
+#14 0x00007ffff50be9fd in clone () at /lib64/libc.so.6
+
+
+这是iteration时候的从KVM得到dirty map.
+(gdb) bt
+#0  kvm_slot_get_dirty_log (s=0x555557242c60, slot=0x5555572646c0) at ../accel/kvm/kvm-all.c:613
+#1  0x0000555555dc30a8 in kvm_physical_sync_dirty_bitmap (kml=0x555557242d10, section=0x7fffeebee640) at ../accel/kvm/kvm-all.c:857
+#2  0x0000555555dc4aaf in kvm_log_sync (listener=0x555557242d10, section=0x7fffeebee640) at ../accel/kvm/kvm-all.c:1592
+#3  0x0000555555d69e1c in memory_region_sync_dirty_bitmap (mr=0x0, last_stage=false) at ../system/memory.c:2279
+#4  0x0000555555d6bcc4 in memory_global_dirty_log_sync (last_stage=false) at ../system/memory.c:2885
+#5  0x0000555555d7e763 in migration_bitmap_sync (rs=0x7ffdc4001410, last_stage=false) at ../migration/ram.c:1046
+#6  0x0000555555d7e995 in migration_bitmap_sync_precopy (rs=0x7ffdc4001410, last_stage=false) at ../migration/ram.c:1094
+#7  0x0000555555d827c3 in ram_state_pending_exact (opaque=0x555556f49e60 <ram_state>, must_precopy=0x7fffeebee7f8, can_postcopy=0x7fffeebee800) at ../migration/ram.c:3226
+#8  0x0000555555ba1817 in qemu_savevm_state_pending_exact (must_precopy=0x7fffeebee7f8, can_postcopy=0x7fffeebee800) at ../migration/savevm.c:1680
+#9  0x0000555555b8aac0 in migration_iteration_run (s=0x5555572488a0) at ../migration/migration.c:3094
+#10 0x0000555555b8b19a in migration_thread (opaque=0x5555572488a0) at ../migration/migration.c:3352
+#11 0x0000555555fd1784 in qemu_thread_start (args=0x555557243440) at ../util/qemu-thread-posix.c:541
+#12 0x00007ffff5395ea5 in start_thread () at /lib64/libpthread.so.0
+#13 0x00007ffff50be9fd in clone () at /lib64/libc.so.6
+
+
+迭代发送dirty page的时候.
+
+(gdb) bt
+#0  ram_save_iterate (f=0x555557236b40, opaque=0x555556f49e60 <ram_state>) at ../migration/ram.c:3011
+#1  0x0000555555ba0e9f in qemu_savevm_state_iterate (f=0x555557236b40, postcopy=false) at ../migration/savevm.c:1424
+#2  0x0000555555b8abbb in migration_iteration_run (s=0x5555572488a0) at ../migration/migration.c:3116
+#3  0x0000555555b8b19a in migration_thread (opaque=0x5555572488a0) at ../migration/migration.c:3352
+#4  0x0000555555fd1784 in qemu_thread_start (args=0x555557a4d6b0) at ../util/qemu-thread-posix.c:541
+#5  0x00007ffff5395ea5 in start_thread () at /lib64/libpthread.so.0
+#6  0x00007ffff50be9fd in clone () at /lib64/libc.so.6
+
+
+完成并且最后一次迭代的时候.
+
+(gdb) bt
+#0  ram_save_complete (f=0x555557236b40, opaque=0x555556f49e60 <ram_state>) at ../migration/ram.c:3140
+#1  0x0000555555ba124a in qemu_savevm_state_complete_precopy_iterable (f=0x555557236b40, in_postcopy=false) at ../migration/savevm.c:1517
+#2  0x0000555555ba161b in qemu_savevm_state_complete_precopy (f=0x555557236b40, iterable_only=false, inactivate_disks=true) at ../migration/savevm.c:1618
+#3  0x0000555555b89e0a in migration_completion_precopy (s=0x5555572488a0, current_active_state=0x7ffdc9baf7c0) at ../migration/migration.c:2641
+#4  0x0000555555b89f9f in migration_completion (s=0x5555572488a0) at ../migration/migration.c:2704
+#5  0x0000555555b8ab1c in migration_iteration_run (s=0x5555572488a0) at ../migration/migration.c:3101
+#6  0x0000555555b8b19a in migration_thread (opaque=0x5555572488a0) at ../migration/migration.c:3352
+#7  0x0000555555fd1784 in qemu_thread_start (args=0x555557a4d6b0) at ../util/qemu-thread-posix.c:541
+#8  0x00007ffff5395ea5 in start_thread () at /lib64/libpthread.so.0
+#9  0x00007ffff50be9fd in clone () at /lib64/libc.so.6
+
+
+发送设备信息的时候.
+
+(gdb) bt
+#0  virtio_save (vdev=0x555557fd7ef0, f=0x555557236b40) at ../hw/virtio/virtio.c:2791
+#1  0x0000555555d3853b in virtio_device_put (f=0x555557236b40, opaque=0x555557fd7ef0, size=0, field=0x555556e6ad20 <__compound_literal.7>, vmdesc=0x7ffdc8000cc0) at ../hw/virtio/virtio.c:2854
+#2  0x00005555560616c6 in vmstate_save_state_v (f=0x555557236b40, vmsd=0x555556dd1a20 <vmstate_virtio_net>, opaque=0x555557fd7ef0, vmdesc=0x7ffdc8000cc0, version_id=11, errp=0x7fffeebee6a8)
+    at ../migration/vmstate.c:408
+#3  0x0000555556061356 in vmstate_save_state_with_err (f=0x555557236b40, vmsd=0x555556dd1a20 <vmstate_virtio_net>, opaque=0x555557fd7ef0, vmdesc_id=0x7ffdc8000cc0, errp=0x7fffeebee6a8)
+    at ../migration/vmstate.c:347
+#4  0x0000555555ba0060 in vmstate_save (f=0x555557236b40, se=0x5555580feb30, vmdesc=0x7ffdc8000cc0) at ../migration/savevm.c:1037
+#5  0x0000555555ba13a6 in qemu_savevm_state_complete_precopy_non_iterable (f=0x555557236b40, in_postcopy=false, inactivate_disks=true) at ../migration/savevm.c:1553
+#6  0x0000555555ba1645 in qemu_savevm_state_complete_precopy (f=0x555557236b40, iterable_only=false, inactivate_disks=true) at ../migration/savevm.c:1628
+#7  0x0000555555b89e0a in migration_completion_precopy (s=0x5555572488a0, current_active_state=0x7fffeebee7c0) at ../migration/migration.c:2641
+#8  0x0000555555b89f9f in migration_completion (s=0x5555572488a0) at ../migration/migration.c:2704
+#9  0x0000555555b8ab1c in migration_iteration_run (s=0x5555572488a0) at ../migration/migration.c:3101
+#10 0x0000555555b8b19a in migration_thread (opaque=0x5555572488a0) at ../migration/migration.c:3352
+#11 0x0000555555fd1784 in qemu_thread_start (args=0x555557234bc0) at ../util/qemu-thread-posix.c:541
+#12 0x00007ffff5395ea5 in start_thread () at /lib64/libpthread.so.0
+#13 0x00007ffff50be9fd in clone () at /lib64/libc.so.6
+
+-------------------------
+
+调试的手段:
+
+Features/Migration/Troubleshooting
+https://wiki.qemu.org/Features/Migration/Troubleshooting
+
+最好的是:
+
+(qemu) migrate "exec:cat > /dev/null"
+
+(qemu) migrate "exec:cat > /home/zhang/stream.bin"
+可以使用./scripts/analyze-migration.py脚本进行分析.
+
+
+压力测试:
+
+vm# ./stress --cpu 2 --io 4 --vm 2 --vm-bytes $(awk '/MemAvailable/{printf "%d\n", $2 * 0.5;}' < /proc/meminfo)k
