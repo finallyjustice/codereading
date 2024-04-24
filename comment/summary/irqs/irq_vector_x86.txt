@@ -1,0 +1,299 @@
+
+一共有下面的结构:
+- struct irq_chip
+- struct irq_domain
+- struct apic_chip_data
+- struct irq_cfg
+- struct irq_data
+- struct irq_desc
+
+
+Managed和核心定义是affinity是kernel auto managed的
+参看IRQD_AFFINITY_MANAGED的定义
+
+
+Normal Interrupt和Managed Interrupt的不同.
+
+Normal Interrupt
+1. At setup time: affinity可以是NULL, 也可以是所有online CPUs的subset.
+2. 用户空间可以修改affinity.
+3. When migration: IRQ可以被绑定到任何online CPUs, 或者甚至reset.
+
+Managed Interrupt
+1. At setup time: affinity不可以是NULL, affinity可以是possible CPUs.
+2. affinity不可修改
+3. When migration: IRQ只能在已经设置过的affinity内部移动, 可以shutdown/restart, 不能reset.
+
+
+Kernel Interrupt: A Major Overhaul APIC Initialization & Vector Allocation
+https://events19.linuxfoundation.org/wp-content/uploads/2017/11/A-Major-Overhaul-of-the-APIC-Initialization-and-Vector-Allocation-in-Linux-Kernel-OSS-Dou-Liyang.pdf
+
+---------------------------------------
+
+用virtio-net当例子, 一开始, 所有的virtio-net的queue的dest都是0-3,
+一直到virtio_net初始化set affinity: init_vqs()-->virtnet_set_affinity().
+
+[0] irq_matrix_alloc
+[0] assign_vector_locked
+[0] assign_irq_vector_any_locked
+[0] x86_vector_activate
+[0] __irq_domain_activate_irq
+[0] __irq_domain_activate_irq
+[0] irq_domain_activate_irq
+[0] __setup_irq
+[0] request_threaded_irq
+[0] vp_find_vqs_msix
+[0] vp_find_vqs
+[0] vp_modern_find_vqs
+[0] init_vqs
+[0] virtnet_probe
+[0] virtio_dev_probe
+[0] really_probe
+[0] __driver_probe_device
+[0] driver_probe_device
+[0] __driver_attach
+[0] bus_for_each_dev
+[0] bus_add_driver
+[0] driver_register
+[0] virtio_net_driver_init
+[0] do_one_initcall
+[0] kernel_init_freeable
+[0] kernel_init
+[0] ret_from_fork
+[0] ret_from_fork_asm
+
+
+当使用procfs重新配置affinity的时候: echo 1 > /proc/irq/31/smp_affinity_list 
+
+[0] irq_matrix_alloc
+[0] assign_vector_locked
+[0] apic_set_affinity
+[0] msi_set_affinity
+[0] irq_do_set_affinity
+[0] irq_move_masked_irq
+[0] __irq_move_irq
+[0] apic_ack_edge
+[0] handle_edge_irq
+[0] __common_interrupt
+[0] common_interrupt
+
+在下面释放旧的vector.
+
+[0] irq_matrix_free
+[0] free_moved_vector
+[0] __vector_cleanup
+[0] vector_cleanup_callback
+[0] call_timer_fn
+[0] __run_timers
+[0] run_timer_softirq
+[0] __do_softirq
+[0] __irq_exit_rcu
+[0] sysvec_apic_timer_interrupt
+
+
+-------------------------------
+
+下面是重新启动的例子.
+
+一开始有4个CPU, 4个virtio-net的queue_pair (和一个config).
+
+# cat /proc/interrupts
+           CPU0       CPU1       CPU3
+  0:         49          0          0   IO-APIC   2-edge      timer
+  1:          0          0          0   IO-APIC   1-edge      i8042
+  4:        674          0          0   IO-APIC   4-edge      ttyS0
+  8:          0          0          0   IO-APIC   8-edge      rtc0
+  9:          0          0          0   IO-APIC   9-fasteoi   acpi
+ 10:          0       1473          0   IO-APIC  10-fasteoi   enp0s3
+ 12:          0        125          0   IO-APIC  12-edge      i8042
+ 14:       2563          0          0   IO-APIC  14-edge      ata_piix
+ 15:          0          0        770   IO-APIC  15-edge      ata_piix
+ 24:          0          0          0  PCI-MSIX-0000:00:04.0   0-edge      virtio0-config
+ 25:       1501          1          0  PCI-MSIX-0000:00:04.0   1-edge      virtio0-input.0
+ 26:       1116          0          0  PCI-MSIX-0000:00:04.0   2-edge      virtio0-output.0
+ 27:          0       2004          1  PCI-MSIX-0000:00:04.0   3-edge      virtio0-input.1
+ 28:          1       2211          0  PCI-MSIX-0000:00:04.0   4-edge      virtio0-output.1
+ 29:          0          2        633  PCI-MSIX-0000:00:04.0   5-edge      virtio0-input.2
+ 30:          0          0        594  PCI-MSIX-0000:00:04.0   6-edge      virtio0-output.2
+ 31:          5          0        186  PCI-MSIX-0000:00:04.0   7-edge      virtio0-input.3
+ 32:         52          0        190  PCI-MSIX-0000:00:04.0   8-edge      virtio0-output.3
+
+0->0, 1->1, 2->2, 3->3, config->0-3(effective是0)
+
+
+如果offline CPU=2的话, irq=1和irq=14不讨论.
+
+[   65.428065] bug: assign_vector_locked() irqd=1, dest=0-1,3
+[   65.428702] bug: irq_matrix_alloc()
+[   65.429213] bug: apic_update_vector() irqd=1, newcpu=2
+[   65.429831] bug: irq_matrix_free()
+
+[   65.430316] bug: assign_vector_locked() irqd=14, dest=0-1,3
+[   65.430952] bug: irq_matrix_alloc()
+[   65.431427] bug: apic_update_vector() irqd=14, newcpu=2
+[   65.432020] bug: irq_matrix_free()
+
+因为是唯一的affinity, irq=29被转移到online mask (实际是CPU=1)
+
+[   65.432540] bug: assign_vector_locked() irqd=29, dest=0-1,3
+[   65.433163] bug: irq_matrix_alloc()
+
+然后irq=29在原来的cpu=2上释放.
+
+[   65.433653] bug: apic_update_vector() irqd=29, newcpu=2
+[   65.434238] bug: irq_matrix_free()
+
+因为是唯一的affinity, irq=30被转移到online mask (不知道实际)
+
+[   65.434788] bug: assign_vector_locked() irqd=30, dest=0-1,3
+[   65.435438] bug: irq_matrix_alloc()
+
+然后irq=30在原来的cpu=2上释放.
+
+[   65.435927] bug: apic_update_vector() irqd=30, newcpu=2
+[   65.436536] bug: irq_matrix_free()
+
+CPU=2被offline了.
+
+[   65.438176] smpboot: CPU 2 is now offline
+
+不知道为什么, irq=29又被迁移了一次, 到cpu=3
+
+[   65.440743] bug: assign_vector_locked() irqd=29, dest=3
+[   65.441679] bug: irq_matrix_alloc()
+
+irq=29在CPU=1上释放.
+
+[   66.134561] bug: free_moved_vector() irq=29, cpu=1
+[   66.135251] bug: irq_matrix_free()
+
+irq=32和irq=31也受到了影响.
+
+[   67.120187] bug: assign_vector_locked() irqd=32, dest=0
+[   67.121107] bug: irq_matrix_alloc()
+[   69.164565] bug: free_moved_vector() irq=32, cpu=3
+[   69.165263] bug: irq_matrix_free()
+[  134.432820] bug: assign_vector_locked() irqd=31, dest=0
+[  134.433637] bug: irq_matrix_alloc()
+[  137.683562] bug: free_moved_vector() irq=31, cpu=3
+[  137.684340] bug: irq_matrix_free()
+
+--------------------------------------
+
+下面是带有callstack的版本.
+
+
+如果offline CPU=2的话, irq=1和irq=14不讨论.
+
+[   65.428065] bug: assign_vector_locked() irqd=1, dest=0-1,3
+[   65.428702] bug: irq_matrix_alloc()
+[   65.429213] bug: apic_update_vector() irqd=1, newcpu=2
+[   65.429831] bug: irq_matrix_free()
+
+[   65.430316] bug: assign_vector_locked() irqd=14, dest=0-1,3
+[   65.430952] bug: irq_matrix_alloc()
+[   65.431427] bug: apic_update_vector() irqd=14, newcpu=2
+[   65.432020] bug: irq_matrix_free()
+
+[0] irq_matrix_alloc
+[0] assign_vector_locked
+[0] apic_set_affinity
+[0] msi_set_affinity
+[0] irq_do_set_affinity
+[0] irq_migrate_all_off_this_cpu
+[0] fixup_irqs
+[0] native_cpu_disable
+[0] take_cpu_down
+[0] multi_cpu_stop
+[0] cpu_stopper_thread
+[0] smpboot_thread_fn
+[0] kthread
+[0] ret_from_fork
+[0] ret_from_fork_asm
+
+[0] irq_matrix_free
+[0] apic_update_vector
+[0] assign_vector_locked
+[0] apic_set_affinity
+[0] msi_set_affinity
+[0] irq_do_set_affinity
+[0] irq_migrate_all_off_this_cpu
+[0] fixup_irqs
+[0] native_cpu_disable
+[0] take_cpu_down
+[0] multi_cpu_stop
+[0] cpu_stopper_thread
+[0] smpboot_thread_fn
+[0] kthread
+[0] ret_from_fork
+[0] ret_from_fork_asm
+
+
+因为是唯一的affinity, irq=29被转移到online mask (实际是CPU=1)
+
+[   65.432540] bug: assign_vector_locked() irqd=29, dest=0-1,3
+[   65.433163] bug: irq_matrix_alloc()
+
+[0] irq_matrix_alloc
+[0] assign_vector_locked
+[0] apic_set_affinity
+[0] msi_set_affinity
+[0] irq_do_set_affinity
+[0] irq_move_masked_irq
+[0] __irq_move_irq
+[0] apic_ack_edge
+[0] handle_edge_irq
+[0] __common_interrupt
+[0] common_interrupt
+
+[0] irq_matrix_free
+[0]  free_moved_vector
+[0] __vector_cleanup
+[0] vector_cleanup_callback
+[0] call_timer_fn
+[0] __run_timers
+[0] run_timer_softirq
+[0] __do_softirq
+[0] __irq_exit_rcu
+[0] sysvec_apic_timer_interrupt
+
+
+然后irq=29在原来的cpu=2上释放.
+
+[   65.433653] bug: apic_update_vector() irqd=29, newcpu=2
+[   65.434238] bug: irq_matrix_free()
+
+因为是唯一的affinity, irq=30被转移到online mask (不知道实际)
+
+[   65.434788] bug: assign_vector_locked() irqd=30, dest=0-1,3
+[   65.435438] bug: irq_matrix_alloc()
+
+然后irq=30在原来的cpu=2上释放.
+
+[   65.435927] bug: apic_update_vector() irqd=30, newcpu=2
+[   65.436536] bug: irq_matrix_free()
+
+CPU=2被offline了.
+
+[   65.438176] smpboot: CPU 2 is now offline
+
+不知道为什么, irq=29又被迁移了一次, 到cpu=3
+
+[   65.440743] bug: assign_vector_locked() irqd=29, dest=3
+[   65.441679] bug: irq_matrix_alloc()
+
+irq=29在CPU=1上释放.
+
+[   66.134561] bug: free_moved_vector() irq=29, cpu=1
+[   66.135251] bug: irq_matrix_free()
+
+irq=32和irq=31也受到了影响.
+
+[   67.120187] bug: assign_vector_locked() irqd=32, dest=0
+[   67.121107] bug: irq_matrix_alloc()
+[   69.164565] bug: free_moved_vector() irq=32, cpu=3
+[   69.165263] bug: irq_matrix_free()
+[  134.432820] bug: assign_vector_locked() irqd=31, dest=0
+[  134.433637] bug: irq_matrix_alloc()
+[  137.683562] bug: free_moved_vector() irq=31, cpu=3
+[  137.684340] bug: irq_matrix_free()

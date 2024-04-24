@@ -1,0 +1,152 @@
+整个测试分为特别多的小测试, 几乎每一个小测试都要创建一个VM.
+
+目前测试只针对Intel.
+
+--------------------------
+
+下面是一些基础知识: 关于arch events.
+
+# UnHalted Core Cycles
+
+This event counts core clock cycles when the clock signal on a specific core is
+running (not halted). The counter does not advance in the following conditions:
+
+- An ACPI C-state other than C0 for normal operation.
+- HLT.
+- STPCLK# pin asserted.
+- Being throttled by TM1.
+- During the frequency switching phase of a performance state transition (see
+Chapter 15, "Power and Thermal Management").
+
+The performance counter for this event counts across performance state
+transitions using different core clock frequencies.
+
+# Instruction Retired
+
+This event counts the number of instructions at retirement. For instructions
+that consist of multiple micro-ops, this event counts the retirement of the
+last micro-op of the instruction. An instruction with a REP prefix counts as
+one instruction (not per iteration). Faults before the retirement of the last
+micro-op of a multi-ops instruction are not counted.
+
+This event does not increment under VM-exit conditions. Counters continue
+counting during hardware interrupts, traps, and inside interrupt handlers.
+
+# UnHalted Reference Cycles
+
+This event counts reference clock cycles at a fixed frequency while the clock
+signal on the core is running. The event counts at a fixed frequency,
+irrespective of core frequency changes due to performance state transitions.
+Processors may implement this behavior differently.  Current implementations
+use the core crystal clock, TSC or the bus clock. Because the rate may differ
+between implementations, software should calibrate it to a time source with
+known frequency.
+
+# LLC Reference
+
+This event counts requests originating from the core that reference a cache
+line in the last level on-die cache.  The event count includes speculation and
+cache line fills due to the first-level cache hardware prefetcher, but may
+exclude cache line fills due to other hardware-prefetchers.
+
+Because cache hierarchy, cache sizes and other implementation-specific
+characteristics; value comparison to estimate performance differences is not
+recommended.
+
+# LLC Misses
+
+This event counts each cache miss condition for references to the last level
+on-die cache. The event count may include speculation and cache line fills due
+to the first-level cache hardware prefetcher, but may exclude cache line fills
+due to other hardware-prefetchers.
+
+Because cache hierarchy, cache sizes and other implementation-specific
+characteristics; value comparison to estimate performance differences is not
+recommended.
+
+# Branch Instruction Retired
+
+This event counts branch instructions at retirement. It counts the retirement
+of the last micro-op of a branch instruction.
+
+# Branch Misses Retired
+
+This event counts mispredicted branch instructions at retirement. It counts the
+retirement of the last micro-op of a branch instruction in the architectural
+path of execution and experienced misprediction in the branch prediction
+hardware.
+
+Branch prediction hardware is implementation-specific across
+microarchitectures; value comparison to estimate performance differences is not
+recommended.
+
+# Topdown Slots
+
+This event counts the total number of available slots for an unhalted logical
+processor.  The event increments by machine-width of the narrowest pipeline as
+employed by the Top-down Microarchi- tecture Analysis method. The count is
+distributed among unhalted logical processors (hyper-threads) who share the
+same physical core, in processors that support Intel Hyper-Threading
+Technology.
+
+Software can use this event as the denominator for the top-level metrics of the
+Top-down Microarchitecture Analysis method.
+
+
+关于cpuid -l 0xa的结果.
+
+0xa的eax
+Bits 07-00: Version ID of architectural performance monitoring.
+Bits 15-08: Number of general-purpose performance monitoring counter per logical processor.
+Bits 23-16: Bit width of general-purpose, performance monitoring counter.
+Bits 31-24: Length of EBX bit vector to enumerate architectural performance monitoring events.
+            Architectural event x is supported if EBX[x]=0 && EAX[31:24]>x.
+
+0xa的ebx
+Bit 00: Core cycle event not available if 1 or if EAX[31:24]<1.
+Bit 01: Instruction retired event not available if 1 or if EAX[31:24]<2.
+Bit 02: Reference cycles event not available if 1 or if EAX[31:24]<3.
+Bit 03: Last-level cache reference event not available if 1 or if EAX[31:24]<4.
+Bit 04: Last-level cache misses event not available if 1 or if EAX[31:24]<5.
+Bit 05: Branch instruction retired event not available if 1 or if EAX[31:24]<6.
+Bit 06: Branch mispredict retired event not available if 1 or if EAX[31:24]<7.
+Bit 07: Top-down slots event not available if 1 or if EAX[31:24]<8.
+Bits 31-08: Reserved = 0.
+
+------------------------------
+
+核心函数是test_intel_counters(). 用下面的循环, 对不同的PMU version都进行了测试.
+perf_caps目前就两个: 是否支持PMU_CAP_FW_WRITES, 也就是用的legacy寄存器的值还是新的.
+
+1074          */
+1075         for (v = 0; v <= max_pmu_version; v++) {
+1076                 for (i = 0; i < ARRAY_SIZE(perf_caps); i++) {
+... ...
+甚至还用到了更多的循环, 测试某些arch even支持/不支持是什么样子.
+                         for (j = 0; j <= nr_arch_events + 1; j++) {
+
+
+---> 对arch event测试的基本思想(不管支持不支持):
+
+根据参数提供的PMU虚拟化的配置创建VM (支持的event数目)
+然后在VM上测试: 对每一个arch event测试 (没有host的assert!!!):
+
+guest_test_arch_event(idx)只测试idx指定的事件
+管函数中的intel_event_to_feature[]数组定义了很多要测试的事件
+
+在gp counter的每一个counter和fixed(如果支持)测试参数idx指定的event (下面的要跑好多次):
+1. 先把counter清空0
+2. GUEST_MEASURE_EVENT(): 激活PMC, 运行一些代码(主要是loop 10次, 还有flush/move), disable PMC
+3. guest_assert_event_count(): 读取pmc的值, 确定和预期的counter是否相等
+
+
+
+---> 对gp counter测试的基本思想: 主要测试能不能都写, 是否有期望的值(应该不测试增长), 是否有期望的exception(UD)
+
+测试MSR_CORE_PERF_GLOBAL_CTRL
+通过对GP的PMCs进行读写测试: for (i = 0; i < nr_possible_counters; i++)
+判断是否成功
+判断期望的fail是否完成
+
+
+---> 对fixed的测试差不多, 除了测试能不能读写, 还增加了判断counter是否增长(不是0): GUEST_ASSERT_NE(val, 0);

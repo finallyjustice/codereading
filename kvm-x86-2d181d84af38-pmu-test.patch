@@ -1,0 +1,1176 @@
+From f9c774c615fba75f3bc66dc9bd0b4c10a690433b Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Mon, 22 Apr 2024 11:19:21 -0700
+Subject: [PATCH 1/1] kvm-x86: 2d181d84af38-pmu-test
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ arch/x86/include/asm/kvm_host.h               |  21 +
+ arch/x86/kvm/vmx/capabilities.h               |  10 +
+ arch/x86/kvm/vmx/vmx.c                        |  38 ++
+ arch/x86/kvm/x86.h                            |  12 +
+ .../selftests/kvm/include/ucall_common.h      |   5 +
+ .../selftests/kvm/include/x86_64/processor.h  |   8 +
+ .../selftests/kvm/x86_64/pmu_counters_test.c  | 639 ++++++++++++++++++
+ 7 files changed, 733 insertions(+)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 73740d698ebe..397083197e2a 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -776,6 +776,27 @@ struct kvm_vcpu_arch {
+ 	u64 ia32_xss;
+ 	u64 microcode_version;
+ 	u64 arch_capabilities;
++	/*
++	 * 在以下设置kvm_caps->supported_perf_cap:
++	 *   - arch/x86/kvm/svm/svm.c|5094| <<svm_set_cpu_caps>> kvm_caps.supported_perf_cap = 0;
++	 *   - arch/x86/kvm/vmx/vmx.c|7941| <<vmx_set_cpu_caps>> kvm_caps.supported_perf_cap = vmx_get_perf_capabilities();
++	 * 在以下使用kvm_caps->supported_perf_cap:
++	 *   - arch/x86/kvm/vmx/vmx.c|2146| <<vmx_get_supported_debugctl>> if ((kvm_caps.supported_perf_cap & PMU_CAP_LBR_FMT) &&
++	 *   - arch/x86/kvm/vmx/vmx.c|2426| <<vmx_set_msr(MSR_IA32_PERF_CAPABILITIES)>> (kvm_caps.supported_perf_cap & PMU_CAP_LBR_FMT))
++	 *   - arch/x86/kvm/vmx/vmx.c|2433| <<vmx_set_msr(MSR_IA32_PERF_CAPABILITIES)>> (kvm_caps.supported_perf_cap & PERF_CAP_PEBS_MASK))
++	 *   - arch/x86/kvm/x86.c|1691| <<kvm_get_msr_feature(MSR_IA32_PERF_CAPABILITIES)>> msr->data = kvm_caps.supported_perf_cap;
++	 *   - arch/x86/kvm/x86.c|3816| <<kvm_set_msr_common(MSR_IA32_PERF_CAPABILITIES)>> if (data & ~kvm_caps.supported_perf_cap)
++	 *   - arch/x86/kvm/x86.c|12144| <<kvm_arch_vcpu_create>> vcpu->arch.perf_capabilities = kvm_caps.supported_perf_cap;
++	 *
++	 *
++	 * 在以下设置kvm_vcpu_arch->perf_capabilities:
++	 *   - arch/x86/kvm/x86.c|3827| <<kvm_set_msr_common(MSR_IA32_PERF_CAPABILITIES)>> vcpu->arch.perf_capabilities = data;
++	 *   - arch/x86/kvm/x86.c|12144| <<kvm_arch_vcpu_create>> vcpu->arch.perf_capabilities = kvm_caps.supported_perf_cap;
++	 * 在以下使用kvm_vcpu_arch->perf_capabilities:
++	 *   - arch/x86/kvm/vmx/pmu_intel.c|116| <<vcpu_get_perf_capabilities>> return vcpu->arch.perf_capabilities;
++	 *   - arch/x86/kvm/x86.c|3824| <<kvm_set_msr_common(MSR_IA32_PERF_CAPABILITIES)>> if (vcpu->arch.perf_capabilities == data)
++	 *   - arch/x86/kvm/x86.c|4285| <<kvm_get_msr_common(MSR_IA32_PERF_CAPABILITIES)>> msr_info->data = vcpu->arch.perf_capabilities;
++	 */
+ 	u64 perf_capabilities;
+ 
+ 	/*
+diff --git a/arch/x86/kvm/vmx/capabilities.h b/arch/x86/kvm/vmx/capabilities.h
+index 41a4533f9989..fced98f6aca5 100644
+--- a/arch/x86/kvm/vmx/capabilities.h
++++ b/arch/x86/kvm/vmx/capabilities.h
+@@ -21,6 +21,16 @@ extern int __read_mostly pt_mode;
+ #define PT_MODE_SYSTEM		0
+ #define PT_MODE_HOST_GUEST	1
+ 
++/*
++ * 在以下使用PMU_CAP_FW_WRITES:
++ *   - arch/x86/kvm/vmx/capabilities.h|24| <<global>> #define PMU_CAP_FW_WRITES (1ULL << 13)
++ *   - tools/testing/selftests/kvm/include/x86_64/pmu.h|53| <<global>> #define PMU_CAP_FW_WRITES BIT_ULL(13)
++ *   - arch/x86/kvm/vmx/pmu_intel.c|121| <<fw_writes_is_enabled>> return (vcpu_get_perf_capabilities(vcpu) & PMU_CAP_FW_WRITES) != 0;
++ *   - arch/x86/kvm/vmx/vmx.c|7867| <<vmx_get_perf_capabilities>> u64 perf_cap = PMU_CAP_FW_WRITES;
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|443| <<guest_test_arch_event>> rdmsr(MSR_IA32_PERF_CAPABILITIES) & PMU_CAP_FW_WRITES)
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|821| <<guest_test_gp_counters>> rdmsr(MSR_IA32_PERF_CAPABILITIES) & PMU_CAP_FW_WRITES)
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|980| <<test_intel_counters>> PMU_CAP_FW_WRITES,
++ */
+ #define PMU_CAP_FW_WRITES	(1ULL << 13)
+ #define PMU_CAP_LBR_FMT		0x3f
+ 
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index d18dcb1e11a6..3c33df53e145 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -7862,8 +7862,40 @@ static void vmx_vcpu_after_set_cpuid(struct kvm_vcpu *vcpu)
+ 	vmx_update_exception_bitmap(vcpu);
+ }
+ 
++/*
++ * 在以下设置kvm_caps->supported_perf_cap:
++ *   - arch/x86/kvm/svm/svm.c|5094| <<svm_set_cpu_caps>> kvm_caps.supported_perf_cap = 0;
++ *   - arch/x86/kvm/vmx/vmx.c|7941| <<vmx_set_cpu_caps>> kvm_caps.supported_perf_cap = vmx_get_perf_capabilities();
++ * 在以下使用kvm_caps->supported_perf_cap:
++ *   - arch/x86/kvm/vmx/vmx.c|2146| <<vmx_get_supported_debugctl>> if ((kvm_caps.supported_perf_cap & PMU_CAP_LBR_FMT) &&
++ *   - arch/x86/kvm/vmx/vmx.c|2426| <<vmx_set_msr(MSR_IA32_PERF_CAPABILITIES)>> (kvm_caps.supported_perf_cap & PMU_CAP_LBR_FMT))
++ *   - arch/x86/kvm/vmx/vmx.c|2433| <<vmx_set_msr(MSR_IA32_PERF_CAPABILITIES)>> (kvm_caps.supported_perf_cap & PERF_CAP_PEBS_MASK))
++ *   - arch/x86/kvm/x86.c|1691| <<kvm_get_msr_feature(MSR_IA32_PERF_CAPABILITIES)>> msr->data = kvm_caps.supported_perf_cap;
++ *   - arch/x86/kvm/x86.c|3816| <<kvm_set_msr_common(MSR_IA32_PERF_CAPABILITIES)>> if (data & ~kvm_caps.supported_perf_cap)
++ *   - arch/x86/kvm/x86.c|12144| <<kvm_arch_vcpu_create>> vcpu->arch.perf_capabilities = kvm_caps.supported_perf_cap;
++ *
++ *
++ * 在以下设置kvm_vcpu_arch->perf_capabilities:
++ *   - arch/x86/kvm/x86.c|3827| <<kvm_set_msr_common(MSR_IA32_PERF_CAPABILITIES)>> vcpu->arch.perf_capabilities = data;
++ *   - arch/x86/kvm/x86.c|12144| <<kvm_arch_vcpu_create>> vcpu->arch.perf_capabilities = kvm_caps.supported_perf_cap;
++ * 在以下使用kvm_vcpu_arch->perf_capabilities:
++ *   - arch/x86/kvm/vmx/pmu_intel.c|116| <<vcpu_get_perf_capabilities>> return vcpu->arch.perf_capabilities;
++ *   - arch/x86/kvm/x86.c|3824| <<kvm_set_msr_common(MSR_IA32_PERF_CAPABILITIES)>> if (vcpu->arch.perf_capabilities == data)
++ *   - arch/x86/kvm/x86.c|4285| <<kvm_get_msr_common(MSR_IA32_PERF_CAPABILITIES)>> msr_info->data = vcpu->arch.perf_capabilities;
++ *
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|7941| <<vmx_set_cpu_caps>> kvm_caps.supported_perf_cap = vmx_get_perf_capabilities();
++ *
++ * 1. 首先给perf_cap设置PMU_CAP_FW_WRITES
++ * 2. 如果支持X86_FEATURE_PDCM, 通过MSR_IA32_PERF_CAPABILITIES获取host_perf_cap
++ * 3. 根据情况添加PMU_CAP_LBR_FMT
++ * 4. 根据情况添加PERF_CAP_PEBS_MASK
++ */
+ static __init u64 vmx_get_perf_capabilities(void)
+ {
++	/*
++	 * 1 << 13
++	 */
+ 	u64 perf_cap = PMU_CAP_FW_WRITES;
+ 	u64 host_perf_cap = 0;
+ 
+@@ -7873,6 +7905,9 @@ static __init u64 vmx_get_perf_capabilities(void)
+ 	if (boot_cpu_has(X86_FEATURE_PDCM))
+ 		rdmsrl(MSR_IA32_PERF_CAPABILITIES, host_perf_cap);
+ 
++	/*
++	 * PMU_CAP_LBR_FMT是0x3f, 根据情况添加
++	 */
+ 	if (!cpu_feature_enabled(X86_FEATURE_ARCH_LBR)) {
+ 		x86_perf_get_lbr(&vmx_lbr_caps);
+ 
+@@ -7887,6 +7922,9 @@ static __init u64 vmx_get_perf_capabilities(void)
+ 			perf_cap |= host_perf_cap & PMU_CAP_LBR_FMT;
+ 	}
+ 
++	/*
++	 * 根据情况添加PERF_CAP_PEBS_MASK
++	 */
+ 	if (vmx_pebs_supported()) {
+ 		perf_cap |= host_perf_cap & PERF_CAP_PEBS_MASK;
+ 
+diff --git a/arch/x86/kvm/x86.h b/arch/x86/kvm/x86.h
+index a8b71803777b..e42b7509ae2b 100644
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@ -28,6 +28,18 @@ struct kvm_caps {
+ 	u64 supported_mce_cap;
+ 	u64 supported_xcr0;
+ 	u64 supported_xss;
++	/*
++	 * 在以下设置kvm_caps->supported_perf_cap:
++	 *   - arch/x86/kvm/svm/svm.c|5094| <<svm_set_cpu_caps>> kvm_caps.supported_perf_cap = 0;
++	 *   - arch/x86/kvm/vmx/vmx.c|7941| <<vmx_set_cpu_caps>> kvm_caps.supported_perf_cap = vmx_get_perf_capabilities();
++	 * 在以下使用kvm_caps->supported_perf_cap:
++	 *   - arch/x86/kvm/vmx/vmx.c|2146| <<vmx_get_supported_debugctl>> if ((kvm_caps.supported_perf_cap & PMU_CAP_LBR_FMT) &&
++	 *   - arch/x86/kvm/vmx/vmx.c|2426| <<vmx_set_msr(MSR_IA32_PERF_CAPABILITIES)>> (kvm_caps.supported_perf_cap & PMU_CAP_LBR_FMT))
++	 *   - arch/x86/kvm/vmx/vmx.c|2433| <<vmx_set_msr(MSR_IA32_PERF_CAPABILITIES)>> (kvm_caps.supported_perf_cap & PERF_CAP_PEBS_MASK))
++	 *   - arch/x86/kvm/x86.c|1691| <<kvm_get_msr_feature(MSR_IA32_PERF_CAPABILITIES)>> msr->data = kvm_caps.supported_perf_cap;
++	 *   - arch/x86/kvm/x86.c|3816| <<kvm_set_msr_common(MSR_IA32_PERF_CAPABILITIES)>> if (data & ~kvm_caps.supported_perf_cap)
++	 *   - arch/x86/kvm/x86.c|12144| <<kvm_arch_vcpu_create>> vcpu->arch.perf_capabilities = kvm_caps.supported_perf_cap;
++	 */
+ 	u64 supported_perf_cap;
+ };
+ 
+diff --git a/tools/testing/selftests/kvm/include/ucall_common.h b/tools/testing/selftests/kvm/include/ucall_common.h
+index d9d6581b8d4f..7e974c1baa6c 100644
+--- a/tools/testing/selftests/kvm/include/ucall_common.h
++++ b/tools/testing/selftests/kvm/include/ucall_common.h
+@@ -64,6 +64,11 @@ int ucall_nr_pages_required(uint64_t page_size);
+ #define GUEST_SYNC6(arg0, arg1, arg2, arg3, arg4, arg5) \
+ 				ucall(UCALL_SYNC, 6, arg0, arg1, arg2, arg3, arg4, arg5)
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/guest_print_test.c|74| <<TYPE>> GUEST_PRINTF(PRINTF_FMT_##ext, vals.a, vals.b); \
++ *   - tools/testing/selftests/kvm/guest_print_test.c|149| <<guest_code_limits>> GUEST_PRINTF("%s", test_str);
++ */
+ #define GUEST_PRINTF(_fmt, _args...) ucall_fmt(UCALL_PRINTF, _fmt, ##_args)
+ #define GUEST_DONE()		ucall(UCALL_DONE, 0)
+ 
+diff --git a/tools/testing/selftests/kvm/include/x86_64/processor.h b/tools/testing/selftests/kvm/include/x86_64/processor.h
+index 81ce37ec407d..75aa4a5c07de 100644
+--- a/tools/testing/selftests/kvm/include/x86_64/processor.h
++++ b/tools/testing/selftests/kvm/include/x86_64/processor.h
+@@ -723,6 +723,14 @@ static __always_inline bool this_cpu_has_p(struct kvm_x86_cpu_property property)
+ 	return max_leaf >= property.function;
+ }
+ 
++/*
++ * struct kvm_x86_cpu_feature {
++ *    u32     function;
++ *    u16     index;
++ *    u8      reg;
++ *    u8      bit;
++ * };
++ */
+ static inline bool this_pmu_has(struct kvm_x86_pmu_feature feature)
+ {
+ 	uint32_t nr_bits;
+diff --git a/tools/testing/selftests/kvm/x86_64/pmu_counters_test.c b/tools/testing/selftests/kvm/x86_64/pmu_counters_test.c
+index 26c85815f7e9..3e8f4f05a80c 100644
+--- a/tools/testing/selftests/kvm/x86_64/pmu_counters_test.c
++++ b/tools/testing/selftests/kvm/x86_64/pmu_counters_test.c
+@@ -9,6 +9,14 @@
+ #include "pmu.h"
+ #include "processor.h"
+ 
++/*
++ * 在以下使用NUM_BRANCHES:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|20| <<NUM_INSNS_RETIRED>> #define NUM_INSNS_RETIRED (NUM_BRANCHES + NUM_EXTRA_INSNS)
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|126| <<guest_assert_event_count>> GUEST_ASSERT_EQ(count, NUM_BRANCHES);
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|146| <<guest_assert_event_count>> __asm__ __volatile__("loop ." : "+c"((int ){NUM_BRANCHES}));
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|173| <<GUEST_MEASURE_EVENT>> "1: mov $" __stringify(NUM_BRANCHES) ", %%ecx\n\t" \
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|543| <<guest_test_fixed_counters>> __asm__ __volatile__("loop ." : "+c"((int ){NUM_BRANCHES}));
++ */
+ /* Number of LOOP instructions for the guest measurement payload. */
+ #define NUM_BRANCHES		10
+ /*
+@@ -16,13 +24,47 @@
+  * instructions that are needed to set up the loop and then disabled the
+  * counter.  1 CLFLUSH/CLFLUSHOPT/NOP, 1 MFENCE, 2 MOV, 2 XOR, 1 WRMSR.
+  */
++/*
++ * 在以下使用NUM_EXTRA_INSNS:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|20| <<NUM_INSNS_RETIRED>> #define NUM_INSNS_RETIRED (NUM_BRANCHES + NUM_EXTRA_INSNS)
++ */
+ #define NUM_EXTRA_INSNS		7
++/*
++ * 在以下使用NUM_INSNS_RETIRED:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|123| <<guest_assert_event_count>> GUEST_ASSERT_EQ(count, NUM_INSNS_RETIRED);
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|139| <<guest_assert_event_count>> GUEST_ASSERT(count >= NUM_INSNS_RETIRED);
++ */
+ #define NUM_INSNS_RETIRED	(NUM_BRANCHES + NUM_EXTRA_INSNS)
+ 
++/*
++ * 在以下使用kvm_pmu_version:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|43| <<pmu_vm_create_with_one_vcpu>> sync_global_to_guest(vm, kvm_pmu_version);
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|95| <<guest_get_pmu_version>> return min_t(uint8_t, kvm_pmu_version, this_cpu_property(X86_PROPERTY_PMU_VERSION));
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|664| <<main>> kvm_pmu_version = kvm_cpu_property(X86_PROPERTY_PMU_VERSION);
++ */
+ static uint8_t kvm_pmu_version;
++/*
++ * 在以下使用kvm_has_perf_caps:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|50| <<pmu_vm_create_with_one_vcpu>> if (kvm_has_perf_caps)
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|611| <<test_intel_counters>> if (!kvm_has_perf_caps && perf_caps[i])
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|665| <<main>> kvm_has_perf_caps = kvm_cpu_has(X86_FEATURE_PDCM);
++ */
+ static bool kvm_has_perf_caps;
++/*
++ * 在以下使用is_forced_emulation_enabled:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|44| <<pmu_vm_create_with_one_vcpu>> sync_global_to_guest(vm, is_forced_emulation_enabled);
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|204| <<__guest_test_arch_event>> if (is_forced_emulation_enabled)
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|375| <<guest_test_rdpmc>> if (!is_forced_emulation_enabled)
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|666| <<main>> is_forced_emulation_enabled = kvm_is_forced_emulation_enabled();
++ */
+ static bool is_forced_emulation_enabled;
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|299| <<test_arch_events>> vm = pmu_vm_create_with_one_vcpu(&vcpu, guest_test_arch_events, pmu_version, perf_capabilities);
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|459| <<test_gp_counters>> vm = pmu_vm_create_with_one_vcpu(&vcpu, guest_test_gp_counters, pmu_version, perf_capabilities);
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|526| <<test_fixed_counters>> vm = pmu_vm_create_with_one_vcpu(&vcpu, guest_test_fixed_counters, pmu_version, perf_capabilities);
++ */
+ static struct kvm_vm *pmu_vm_create_with_one_vcpu(struct kvm_vcpu **vcpu,
+ 						  void *guest_code,
+ 						  uint8_t pmu_version,
+@@ -48,8 +90,24 @@ static struct kvm_vm *pmu_vm_create_with_one_vcpu(struct kvm_vcpu **vcpu,
+ 	return vm;
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|307| <<test_arch_events>> run_vcpu(vcpu);
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|465| <<test_gp_counters>> run_vcpu(vcpu);
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|534| <<test_fixed_counters>> run_vcpu(vcpu);
++ */
+ static void run_vcpu(struct kvm_vcpu *vcpu)
+ {
++	/*
++	 * struct ucall {
++	 *     uint64_t cmd;
++	 *     uint64_t args[UCALL_MAX_ARGS];
++	 *     char buffer[UCALL_BUFFER_LEN];
++	 *
++	 *     // Host virtual address of this struct.
++	 *     struct ucall *hva;
++	 * };
++	 */
+ 	struct ucall uc;
+ 
+ 	do {
+@@ -71,6 +129,14 @@ static void run_vcpu(struct kvm_vcpu *vcpu)
+ 	} while (uc.cmd != UCALL_DONE);
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|244| <<guest_test_arch_event>> uint32_t pmu_version = guest_get_pmu_version();
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|387| <<guest_rd_wr_counters>> const bool pmu_has_fast_mode = !guest_get_pmu_version();
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|452| <<guest_test_gp_counters>> uint8_t pmu_version = guest_get_pmu_version();
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|510| <<guest_test_fixed_counters>> if (guest_get_pmu_version() >= 2)
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|517| <<guest_test_fixed_counters>> if (guest_get_pmu_version() >= 5)
++ */
+ static uint8_t guest_get_pmu_version(void)
+ {
+ 	/*
+@@ -80,6 +146,9 @@ static uint8_t guest_get_pmu_version(void)
+ 	 * supported by KVM to verify KVM doesn't freak out and do something
+ 	 * bizarre with an architecturally valid, but unsupported, version.
+ 	 */
++	/*
++	 * 在guest调用cpuid
++	 */
+ 	return min_t(uint8_t, kvm_pmu_version, this_cpu_property(X86_PROPERTY_PMU_VERSION));
+ }
+ 
+@@ -92,13 +161,46 @@ static uint8_t guest_get_pmu_version(void)
+  * Sanity check that in all cases, the event doesn't count when it's disabled,
+  * and that KVM correctly emulates the write of an arbitrary value.
+  */
++/*
++ * struct kvm_x86_cpu_feature {
++ *     u32     function;
++ *     u16     index;
++ *     u8      reg;
++ *     u8      bit;
++ * };
++ *
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|179| <<GUEST_TEST_EVENT>> guest_assert_event_count(_idx, _event, _pmc, _pmc_msr); \
++ *
++ * 读取pmc的值, 确定和预期的counter是否相等
++ */
+ static void guest_assert_event_count(uint8_t idx,
+ 				     struct kvm_x86_pmu_feature event,
+ 				     uint32_t pmc, uint32_t pmc_msr)
+ {
+ 	uint64_t count;
+ 
++	/*
++	 * 注释
++	 * Reads the contents of the performance monitoring counter (PMC)
++	 * specified in ECX register into registers EDX:EAX.
++	 */
+ 	count = _rdpmc(pmc);
++	/*
++	 * enum intel_pmu_architectural_events {
++	 *     INTEL_ARCH_CPU_CYCLES_INDEX,
++	 *     INTEL_ARCH_INSTRUCTIONS_RETIRED_INDEX,
++	 *     INTEL_ARCH_REFERENCE_CYCLES_INDEX,
++	 *     INTEL_ARCH_LLC_REFERENCES_INDEX,
++	 *     INTEL_ARCH_LLC_MISSES_INDEX,
++	 *     INTEL_ARCH_BRANCHES_RETIRED_INDEX,
++	 *     INTEL_ARCH_BRANCHES_MISPREDICTED_INDEX,
++	 *     INTEL_ARCH_TOPDOWN_SLOTS_INDEX,
++	 *     NR_INTEL_ARCH_EVENTS,
++	 * };
++	 *
++	 * 这个event被支持吗??
++	 */
+ 	if (!this_pmu_has(event))
+ 		goto sanity_checks;
+ 
+@@ -111,6 +213,10 @@ static void guest_assert_event_count(uint8_t idx,
+ 		break;
+ 	case INTEL_ARCH_LLC_REFERENCES_INDEX:
+ 	case INTEL_ARCH_LLC_MISSES_INDEX:
++		/*
++		 * 不支持直接跳过
++		 * 支持至少不能是0
++		 */
+ 		if (!this_cpu_has(X86_FEATURE_CLFLUSHOPT) &&
+ 		    !this_cpu_has(X86_FEATURE_CLFLUSH))
+ 			break;
+@@ -127,6 +233,12 @@ static void guest_assert_event_count(uint8_t idx,
+ 	}
+ 
+ sanity_checks:
++	/*
++	 * sanity_checks感觉就是测试PMC的counter不会增长
++	 * 因为此时已经disable了吧
++	 *
++	 * NUM_BRANCHES是10
++	 */
+ 	__asm__ __volatile__("loop ." : "+c"((int){NUM_BRANCHES}));
+ 	GUEST_ASSERT_EQ(_rdpmc(pmc), count);
+ 
+@@ -149,6 +261,29 @@ static void guest_assert_event_count(uint8_t idx,
+  * branches retired events in conjunction with hardware also counting said
+  * events.
+  */
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|189| <<GUEST_TEST_EVENT>> GUEST_MEASURE_EVENT(_ctrl_msr, _value, "clflushopt 1f", FEP); \
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|191| <<GUEST_TEST_EVENT>> GUEST_MEASURE_EVENT(_ctrl_msr, _value, "clflush 1f", FEP); \
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|193| <<GUEST_TEST_EVENT>> GUEST_MEASURE_EVENT(_ctrl_msr, _value, "nop", FEP); \
++ *
++ * mfence的注释:
++ * Performs a serializing operation on all load-from-memory and store-to-memory
++ * instructions that were issued prior the MFENCE instruction. This serializing
++ * operation guarantees that every load and store instruction that precedes the
++ * MFENCE instruction in program order becomes globally visible before any load
++ * or store instruction that follows the MFENCE instruction.1 The MFENCE
++ * instruction is ordered with respect to all load and store instructions,
++ * other MFENCE instructions, any LFENCE and SFENCE instructions, and any
++ * serializing instructions (such as the CPUID instruction). MFENCE does not
++ * serialize the instruction stream.
++ *
++ * 1. 激活PMC
++ * 2. 运行一些代码: loop .十次
++ * 3. disable PMC
++ *
++ * wrmsr: Write the value in EDX:EAX to MSR specified by ECX.
++ */
+ #define GUEST_MEASURE_EVENT(_msr, _value, clflush, FEP)				\
+ do {										\
+ 	__asm__ __volatile__("wrmsr\n\t"					\
+@@ -165,6 +300,40 @@ do {										\
+ 	);									\
+ } while (0)
+ 
++/*
++ * 0xa的eax
++ * Bits 07-00: Version ID of architectural performance monitoring.
++ * Bits 15-08: Number of general-purpose performance monitoring counter per logical processor.
++ * Bits 23-16: Bit width of general-purpose, performance monitoring counter.
++ * Bits 31-24: Length of EBX bit vector to enumerate architectural performance monitoring events.
++ *             Architectural event x is supported if EBX[x]=0 && EAX[31:24]>x.
++ *
++ * 0xa的ebx
++ * Bit 00: Core cycle event not available if 1 or if EAX[31:24]<1.
++ * Bit 01: Instruction retired event not available if 1 or if EAX[31:24]<2.
++ * Bit 02: Reference cycles event not available if 1 or if EAX[31:24]<3.
++ * Bit 03: Last-level cache reference event not available if 1 or if EAX[31:24]<4.
++ * Bit 04: Last-level cache misses event not available if 1 or if EAX[31:24]<5.
++ * Bit 05: Branch instruction retired event not available if 1 or if EAX[31:24]<6.
++ * Bit 06: Branch mispredict retired event not available if 1 or if EAX[31:24]<7.
++ * Bit 07: Top-down slots event not available if 1 or if EAX[31:24]<8.
++ * Bits 31-08: Reserved = 0.
++ *
++ * struct kvm_x86_cpu_feature {
++ *     u32     function;
++ *     u16     index;
++ *     u8      reg;
++ *     u8      bit;
++ * };
++ *
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|202| <<__guest_test_arch_event>> GUEST_TEST_EVENT(idx, event, pmc, pmc_msr, ctrl_msr, ctrl_msr_value, "");
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|205| <<__guest_test_arch_event>> GUEST_TEST_EVENT(idx, event, pmc, pmc_msr, ctrl_msr, ctrl_msr_value, KVM_FEP);
++ *
++ * 1. 先把counter清空0
++ * 2. GUEST_MEASURE_EVENT(): 激活PMC, 运行一些代码, disable PMC
++ * 3. guest_assert_event_count(): 读取pmc的值, 确定和预期的counter是否相等
++ */
+ #define GUEST_TEST_EVENT(_idx, _event, _pmc, _pmc_msr, _ctrl_msr, _value, FEP)	\
+ do {										\
+ 	wrmsr(pmc_msr, 0);							\
+@@ -179,16 +348,45 @@ do {										\
+ 	guest_assert_event_count(_idx, _event, _pmc, _pmc_msr);			\
+ } while (0)
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|274| <<guest_test_arch_event>> __guest_test_arch_event(idx, gp_event, i, base_pmc_msr + i, MSR_P6_EVNTSEL0 + i, eventsel);
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|289| <<guest_test_arch_event>> __guest_test_arch_event(idx, fixed_event, i | INTEL_RDPMC_FIXED, MSR_CORE_PERF_FIXED_CTR0 + i,
++ *                                                                                                         MSR_CORE_PERF_GLOBAL_CTRL, FIXED_PMC_GLOBAL_CTRL_ENABLE(i));
++ *
++ * struct kvm_x86_cpu_feature {
++ *     u32     function;
++ *     u16     index;
++ *     u8      reg;
++ *     u8      bit;
++ * };
++ *
++ * 1. 先把counter清空0
++ * 2. GUEST_MEASURE_EVENT(): 激活PMC, 运行一些代码, disable PMC
++ * 3. guest_assert_event_count(): 读取pmc的值, 确定和预期的counter是否相等
++ */
+ static void __guest_test_arch_event(uint8_t idx, struct kvm_x86_pmu_feature event,
+ 				    uint32_t pmc, uint32_t pmc_msr,
+ 				    uint32_t ctrl_msr, uint64_t ctrl_msr_value)
+ {
++	/*
++	 * 1. 先把counter清空0
++	 * 2. GUEST_MEASURE_EVENT(): 激活PMC, 运行一些代码, disable PMC
++	 * 3. guest_assert_event_count(): 读取pmc的值, 确定和预期的counter是否相等
++	 */
+ 	GUEST_TEST_EVENT(idx, event, pmc, pmc_msr, ctrl_msr, ctrl_msr_value, "");
+ 
+ 	if (is_forced_emulation_enabled)
+ 		GUEST_TEST_EVENT(idx, event, pmc, pmc_msr, ctrl_msr, ctrl_msr_value, KVM_FEP);
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|236| <<guest_test_arch_event>> [INTEL_ARCH_LLC_REFERENCES_INDEX] = { X86_PMU_FEATURE_LLC_REFERENCES, X86_PMU_FEATURE_NULL },
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|237| <<guest_test_arch_event>> [INTEL_ARCH_LLC_MISSES_INDEX] = { X86_PMU_FEATURE_LLC_MISSES, X86_PMU_FEATURE_NULL },
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|238| <<guest_test_arch_event>> [INTEL_ARCH_BRANCHES_RETIRED_INDEX] = { X86_PMU_FEATURE_BRANCH_INSNS_RETIRED, X86_PMU_FEATURE_NULL },
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|239| <<guest_test_arch_event>> [INTEL_ARCH_BRANCHES_MISPREDICTED_INDEX] = { X86_PMU_FEATURE_BRANCHES_MISPREDICTED, X86_PMU_FEATURE_NULL },
++ */
+ #define X86_PMU_FEATURE_NULL						\
+ ({									\
+ 	struct kvm_x86_pmu_feature feature = {};			\
+@@ -196,13 +394,58 @@ static void __guest_test_arch_event(uint8_t idx, struct kvm_x86_pmu_feature even
+ 	feature;							\
+ })
+ 
++/*
++ * struct kvm_x86_cpu_feature {
++ *     u32     function;
++ *     u16     index;
++ *     u8      reg;
++ *     u8      bit;
++ * };
++ *
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|282| <<guest_test_arch_event>> if (pmu_is_null_feature(fixed_event) || !this_pmu_has(fixed_event))
++ */
+ static bool pmu_is_null_feature(struct kvm_x86_pmu_feature event)
+ {
+ 	return !(*(u64 *)&event);
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|300| <<guest_test_arch_events>> guest_test_arch_event(i);
++ *
++ * guest_test_arch_event(idx)只测试idx指定的事件
++ * 尽管函数中的intel_event_to_feature[]数组定义了很多要测试的事件
++ *
++ * 在gp counter的每一个counter和fixed(如果支持)测试参数idx指定的event (下面的要跑好多次):
++ * 1. 先把counter清空0
++ * 2. GUEST_MEASURE_EVENT(): 激活PMC, 运行一些代码, disable PMC
++ * 3. guest_assert_event_count(): 读取pmc的值, 确定和预期的counter是否相等
++ */
+ static void guest_test_arch_event(uint8_t idx)
+ {
++	/*
++	 * #define X86_PMU_FEATURE_CPU_CYCLES                      KVM_X86_PMU_FEATURE(EBX, 0)
++	 * #define X86_PMU_FEATURE_INSNS_RETIRED                   KVM_X86_PMU_FEATURE(EBX, 1)
++	 * #define X86_PMU_FEATURE_REFERENCE_CYCLES                KVM_X86_PMU_FEATURE(EBX, 2)
++	 * #define X86_PMU_FEATURE_LLC_REFERENCES                  KVM_X86_PMU_FEATURE(EBX, 3)
++	 * #define X86_PMU_FEATURE_LLC_MISSES                      KVM_X86_PMU_FEATURE(EBX, 4)
++	 * #define X86_PMU_FEATURE_BRANCH_INSNS_RETIRED            KVM_X86_PMU_FEATURE(EBX, 5)
++	 * #define X86_PMU_FEATURE_BRANCHES_MISPREDICTED           KVM_X86_PMU_FEATURE(EBX, 6)
++	 * #define X86_PMU_FEATURE_TOPDOWN_SLOTS                   KVM_X86_PMU_FEATURE(EBX, 7)
++	 *
++	 * #define X86_PMU_FEATURE_INSNS_RETIRED_FIXED             KVM_X86_PMU_FEATURE(ECX, 0)
++	 * #define X86_PMU_FEATURE_CPU_CYCLES_FIXED                KVM_X86_PMU_FEATURE(ECX, 1)
++	 * #define X86_PMU_FEATURE_REFERENCE_TSC_CYCLES_FIXED      KVM_X86_PMU_FEATURE(ECX, 2)
++	 * #define X86_PMU_FEATURE_TOPDOWN_SLOTS_FIXED             KVM_X86_PMU_FEATURE(ECX, 3)
++	 *
++	 * struct kvm_x86_cpu_feature {
++	 *     u32     function;
++	 *     u16     index;
++	 *     u8      reg;
++	 *     u8      bit;
++	 * };
++	 */
+ 	const struct {
+ 		struct kvm_x86_pmu_feature gp_event;
+ 		struct kvm_x86_pmu_feature fixed_event;
+@@ -241,11 +484,27 @@ static void guest_test_arch_event(uint8_t idx)
+ 	else
+ 		base_pmc_msr = MSR_IA32_PERFCTR0;
+ 
++	/*
++	 * struct kvm_x86_pmu_feature gp_event;
++	 *
++	 * struct kvm_x86_cpu_feature {
++	 *     u32     function;
++	 *     u16     index;
++	 *     u8      reg;
++	 *     u8      bit;
++	 * };
++	 */
+ 	gp_event = intel_event_to_feature[idx].gp_event;
+ 	GUEST_ASSERT_EQ(idx, gp_event.f.bit);
+ 
+ 	GUEST_ASSERT(nr_gp_counters);
+ 
++	/*
++	 * guest_test_arch_event(idx)只测试idx指定的事件
++	 * 尽管函数中的intel_event_to_feature[]数组定义了很多要测试的事件
++	 *
++	 * 下面的循环会在每个gp counter上测试idx指定的事件
++	 */
+ 	for (i = 0; i < nr_gp_counters; i++) {
+ 		uint64_t eventsel = ARCH_PERFMON_EVENTSEL_OS |
+ 				    ARCH_PERFMON_EVENTSEL_ENABLE |
+@@ -255,6 +514,11 @@ static void guest_test_arch_event(uint8_t idx)
+ 		if (guest_has_perf_global_ctrl)
+ 			wrmsr(MSR_CORE_PERF_GLOBAL_CTRL, BIT_ULL(i));
+ 
++		/*
++		 * 1. 先把counter清空0
++		 * 2. GUEST_MEASURE_EVENT(): 激活PMC, 运行一些代码, disable PMC
++		 * 3. guest_assert_event_count(): 读取pmc的值, 确定和预期的counter是否相等
++		 */
+ 		__guest_test_arch_event(idx, gp_event, i, base_pmc_msr + i,
+ 					MSR_P6_EVNTSEL0 + i, eventsel);
+ 	}
+@@ -263,6 +527,9 @@ static void guest_test_arch_event(uint8_t idx)
+ 		return;
+ 
+ 	fixed_event = intel_event_to_feature[idx].fixed_event;
++	/*
++	 * 这个event是否支持fixed??
++	 */
+ 	if (pmu_is_null_feature(fixed_event) || !this_pmu_has(fixed_event))
+ 		return;
+ 
+@@ -270,22 +537,90 @@ static void guest_test_arch_event(uint8_t idx)
+ 
+ 	wrmsr(MSR_CORE_PERF_FIXED_CTR_CTRL, FIXED_PMC_CTRL(i, FIXED_PMC_KERNEL));
+ 
++	/*
++	 * guest_test_arch_event(idx)只测试idx指定的事件
++	 * 尽管函数中的intel_event_to_feature[]数组定义了很多要测试的事件
++	 *
++	 * 下面会在每个fixed上测试idx指定的事件
++	 */
++	/*
++	 * 1. 先把counter清空0
++	 * 2. GUEST_MEASURE_EVENT(): 激活PMC, 运行一些代码, disable PMC
++	 * 3. guest_assert_event_count(): 读取pmc的值, 确定和预期的counter是否相等
++	 */
+ 	__guest_test_arch_event(idx, fixed_event, i | INTEL_RDPMC_FIXED,
+ 				MSR_CORE_PERF_FIXED_CTR0 + i,
+ 				MSR_CORE_PERF_GLOBAL_CTRL,
+ 				FIXED_PMC_GLOBAL_CTRL_ENABLE(i));
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|332| <<test_arch_events>> vm = pmu_vm_create_with_one_vcpu(&vcpu, guest_test_arch_events, pmu_version, perf_capabilities);
++ *
++ * 对每一个arch event测试:
++ *
++ * guest_test_arch_event(idx)只测试idx指定的事件
++ * 尽管函数中的intel_event_to_feature[]数组定义了很多要测试的事件
++ *
++ * 在gp counter的每一个counter和fixed(如果支持)测试参数idx指定的event (下面的要跑好多次):
++ * 1. 先把counter清空0
++ * 2. GUEST_MEASURE_EVENT(): 激活PMC, 运行一些代码, disable PMC
++ * 3. guest_assert_event_count(): 读取pmc的值, 确定和预期的counter是否相等
++ */
+ static void guest_test_arch_events(void)
+ {
+ 	uint8_t i;
+ 
++	/*
++	 * guest_test_arch_event(idx)只测试idx指定的事件
++	 * 尽管函数中的intel_event_to_feature[]数组定义了很多要测试的事件
++	 *
++	 * 在gp counter的每一个counter和fixed(如果支持)测试参数idx指定的event (下面的要跑好多次):
++	 * 1. 先把counter清空0
++	 * 2. GUEST_MEASURE_EVENT(): 激活PMC, 运行一些代码, disable PMC
++	 * 3. guest_assert_event_count(): 读取pmc的值, 确定和预期的counter是否相等
++	 */
+ 	for (i = 0; i < NR_INTEL_ARCH_EVENTS; i++)
+ 		guest_test_arch_event(i);
+ 
+ 	GUEST_DONE();
+ }
+ 
++/*
++ *    Architecture Performance Monitoring Features (0xa):
++ *       version ID                               = 0x3 (3)
++ *       number of counters per logical processor = 0x4 (4)
++ *       bit width of counter                     = 0x30 (48)
++ *       length of EBX bit vector                 = 0x7 (7)
++ *       core cycle event                         = available
++ *       instruction retired event                = available
++ *       reference cycles event                   = available
++ *       last-level cache ref event               = available
++ *       last-level cache miss event              = available
++ *       branch inst retired event                = available
++ *       branch mispred retired event             = available
++ *       top-down slots event                     = not available
++ *       fixed counter  0 supported               = false
++ *       fixed counter  1 supported               = false
++ *
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|624| <<test_intel_counters>> test_arch_events(v, perf_caps[i], nr_arch_events, k);
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|634| <<test_intel_counters>> test_arch_events(v, perf_caps[i], j, 0);
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|635| <<test_intel_counters>> test_arch_events(v, perf_caps[i], j, 0xff);
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|638| <<test_intel_counters>> test_arch_events(v, perf_caps[i], j, BIT(k));
++ *
++ * 根据参数提供的PMU虚拟化的配置创建VM (支持的event数目)
++ * 然后在VM上测试: 对每一个arch event测试 (没有host的assert!!!):
++ *
++ * guest_test_arch_event(idx)只测试idx指定的事件
++ * 尽管函数中的intel_event_to_feature[]数组定义了很多要测试的事件
++ *
++ * 在gp counter的每一个counter和fixed(如果支持)测试参数idx指定的event (下面的要跑好多次):
++ * 1. 先把counter清空0
++ * 2. GUEST_MEASURE_EVENT(): 激活PMC, 运行一些代码, disable PMC
++ * 3. guest_assert_event_count(): 读取pmc的值, 确定和预期的counter是否相等
++ */
+ static void test_arch_events(uint8_t pmu_version, uint64_t perf_capabilities,
+ 			     uint8_t length, uint8_t unavailable_mask)
+ {
+@@ -296,9 +631,39 @@ static void test_arch_events(uint8_t pmu_version, uint64_t perf_capabilities,
+ 	if (!pmu_version)
+ 		return;
+ 
++	/*
++	 * 对每一个arch event测试 (没有host的assert!!!):
++	 *
++	 * guest_test_arch_event(idx)只测试idx指定的事件
++	 * 尽管函数中的intel_event_to_feature[]数组定义了很多要测试的事件
++	 *
++	 * 在gp counter的每一个counter和fixed(如果支持)测试参数idx指定的event (下面的要跑好多次):
++	 * 1. 先把counter清空0
++	 * 2. GUEST_MEASURE_EVENT(): 激活PMC, 运行一些代码, disable PMC
++	 * 3. guest_assert_event_count(): 读取pmc的值, 确定和预期的counter是否相等
++	 */
+ 	vm = pmu_vm_create_with_one_vcpu(&vcpu, guest_test_arch_events,
+ 					 pmu_version, perf_capabilities);
+ 
++	/*
++	 * 0xa的eax
++	 * Bits 07-00: Version ID of architectural performance monitoring.
++	 * Bits 15-08: Number of general-purpose performance monitoring counter per logical processor.
++	 * Bits 23-16: Bit width of general-purpose, performance monitoring counter.
++	 * Bits 31-24: Length of EBX bit vector to enumerate architectural performance monitoring events.
++	 *             Architectural event x is supported if EBX[x]=0 && EAX[31:24]>x.
++	 *
++	 * 0xa的ebx
++	 * Bit 00: Core cycle event not available if 1 or if EAX[31:24]<1.
++	 * Bit 01: Instruction retired event not available if 1 or if EAX[31:24]<2.
++	 * Bit 02: Reference cycles event not available if 1 or if EAX[31:24]<3.
++	 * Bit 03: Last-level cache reference event not available if 1 or if EAX[31:24]<4.
++	 * Bit 04: Last-level cache misses event not available if 1 or if EAX[31:24]<5.
++	 * Bit 05: Branch instruction retired event not available if 1 or if EAX[31:24]<6.
++	 * Bit 06: Branch mispredict retired event not available if 1 or if EAX[31:24]<7.
++	 * Bit 07: Top-down slots event not available if 1 or if EAX[31:24]<8.
++	 * Bits 31-08: Reserved = 0.
++	 */
+ 	vcpu_set_cpuid_property(vcpu, X86_PROPERTY_PMU_EBX_BIT_VECTOR_LENGTH,
+ 				length);
+ 	vcpu_set_cpuid_property(vcpu, X86_PROPERTY_PMU_EVENTS_MASK,
+@@ -315,19 +680,54 @@ static void test_arch_events(uint8_t pmu_version, uint64_t perf_capabilities,
+  * guarantee that currently undefined MSR indices won't be used for something
+  * other than PMCs in the future.
+  */
++/*
++ * 在以下使用MAX_NR_GP_COUNTERS:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|754| <<guest_test_gp_counters>> guest_rd_wr_counters(base_msr, MAX_NR_GP_COUNTERS, nr_gp_counters, 0);
++ */
+ #define MAX_NR_GP_COUNTERS	8
++/*
++ * 在以下使用MAX_NR_FIXED_COUNTERS:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|792| <<guest_test_fixed_counters>> guest_rd_wr_counters(MSR_CORE_PERF_FIXED_CTR0, MAX_NR_FIXED_COUNTERS, nr_fixed_counters, supported_bitmask);
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|795| <<guest_test_fixed_counters>> for (i = 0; i < MAX_NR_FIXED_COUNTERS; i++) {
++ */
+ #define MAX_NR_FIXED_COUNTERS	3
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|643| <<guest_test_rdpmc>> GUEST_ASSERT_PMC_MSR_ACCESS(RDPMC, rdpmc_idx, !expect_success, vector);
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|651| <<guest_test_rdpmc>> GUEST_ASSERT_PMC_MSR_ACCESS(RDPMC, rdpmc_idx, !expect_success, vector);
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|689| <<guest_rd_wr_counters>> GUEST_ASSERT_PMC_MSR_ACCESS(WRMSR, msr, expect_gp, vector);
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|692| <<guest_rd_wr_counters>> GUEST_ASSERT_PMC_MSR_ACCESS(RDMSR, msr, expect_gp, vector);
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|718| <<guest_rd_wr_counters>> GUEST_ASSERT_PMC_MSR_ACCESS(WRMSR, msr, expect_gp, vector);
++ *
++ * 如果expect_gp, 判断vector是否是GP_VECTOR,
++ * 否则, 判断vector是否为0
++ */
+ #define GUEST_ASSERT_PMC_MSR_ACCESS(insn, msr, expect_gp, vector)		\
+ __GUEST_ASSERT(expect_gp ? vector == GP_VECTOR : !vector,			\
+ 	       "Expected %s on " #insn "(0x%x), got vector %u",			\
+ 	       expect_gp ? "#GP" : "no fault", msr, vector)			\
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|645| <<guest_test_rdpmc>> GUEST_ASSERT_PMC_VALUE(RDPMC, rdpmc_idx, val, expected_val);
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|653| <<guest_test_rdpmc>> GUEST_ASSERT_PMC_VALUE(RDPMC, rdpmc_idx, val, expected_val);
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|696| <<guest_rd_wr_counters>> GUEST_ASSERT_PMC_VALUE(RDMSR, msr, val, expected_val);
++ *
++ * 判断val是不是期望的值
++ */
+ #define GUEST_ASSERT_PMC_VALUE(insn, msr, val, expected)			\
+ 	__GUEST_ASSERT(val == expected_val,					\
+ 		       "Expected " #insn "(0x%x) to yield 0x%lx, got 0x%lx",	\
+ 		       msr, expected_val, val);
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|706| <<guest_rd_wr_counters>> guest_test_rdpmc(rdpmc_idx, expect_success, expected_val);
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|715| <<guest_rd_wr_counters>> guest_test_rdpmc(rdpmc_idx, false, -1ull);
++ *
++ * 读取rdpmc_idx对应的PMC的值, 判断是否成功
++ */
+ static void guest_test_rdpmc(uint32_t rdpmc_idx, bool expect_success,
+ 			     uint64_t expected_val)
+ {
+@@ -335,6 +735,11 @@ static void guest_test_rdpmc(uint32_t rdpmc_idx, bool expect_success,
+ 	uint64_t val;
+ 
+ 	vector = rdpmc_safe(rdpmc_idx, &val);
++	/*
++	 * 如果expect_gp, 判断vector是否是GP_VECTOR,
++	 * 否则, 判断vector是否为0
++	 *
++	 */
+ 	GUEST_ASSERT_PMC_MSR_ACCESS(RDPMC, rdpmc_idx, !expect_success, vector);
+ 	if (expect_success)
+ 		GUEST_ASSERT_PMC_VALUE(RDPMC, rdpmc_idx, val, expected_val);
+@@ -348,6 +753,15 @@ static void guest_test_rdpmc(uint32_t rdpmc_idx, bool expect_success,
+ 		GUEST_ASSERT_PMC_VALUE(RDPMC, rdpmc_idx, val, expected_val);
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|754| <<guest_test_gp_counters>> guest_rd_wr_counters(base_msr, MAX_NR_GP_COUNTERS, nr_gp_counters, 0);
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|792| <<guest_test_fixed_counters>> guest_rd_wr_counters(MSR_CORE_PERF_FIXED_CTR0, MAX_NR_FIXED_COUNTERS, nr_fixed_counters, supported_bitmask);
++ *
++ * 通过对PMCs进行读写测试: for (i = 0; i < nr_possible_counters; i++)
++ * 判断是否成功
++ * 判断期望的fail是否完成
++ */
+ static void guest_rd_wr_counters(uint32_t base_msr, uint8_t nr_possible_counters,
+ 				 uint8_t nr_counters, uint32_t or_mask)
+ {
+@@ -380,12 +794,26 @@ static void guest_rd_wr_counters(uint32_t base_msr, uint8_t nr_possible_counters
+ 		uint8_t vector;
+ 		uint64_t val;
+ 
++		/*
++		 * 写入测试的值0xffff, 因为safe不会触发问题
++		 */
+ 		vector = wrmsr_safe(msr, test_val);
++		/*
++		 * 如果expect_gp, 判断vector是否是GP_VECTOR,
++		 * 否则, 判断vector是否为0
++		 */
+ 		GUEST_ASSERT_PMC_MSR_ACCESS(WRMSR, msr, expect_gp, vector);
+ 
+ 		vector = rdmsr_safe(msr, &val);
++		/*
++		 * 如果expect_gp, 判断vector是否是GP_VECTOR,
++		 * 否则, 判断vector是否为0
++		 */
+ 		GUEST_ASSERT_PMC_MSR_ACCESS(RDMSR, msr, expect_gp, vector);
+ 
++		/*
++		 * 判断val是不是期望的值
++		 */
+ 		/* On #GP, the result of RDMSR is undefined. */
+ 		if (!expect_gp)
+ 			GUEST_ASSERT_PMC_VALUE(RDMSR, msr, val, expected_val);
+@@ -398,6 +826,9 @@ static void guest_rd_wr_counters(uint32_t base_msr, uint8_t nr_possible_counters
+ 		if (base_msr == MSR_CORE_PERF_FIXED_CTR0)
+ 			rdpmc_idx |= INTEL_RDPMC_FIXED;
+ 
++		/*
++		 * 读取rdpmc_idx对应的PMC的值, 判断是否成功
++		 */
+ 		guest_test_rdpmc(rdpmc_idx, expect_success, expected_val);
+ 
+ 		/*
+@@ -407,6 +838,9 @@ static void guest_rd_wr_counters(uint32_t base_msr, uint8_t nr_possible_counters
+ 		 */
+ 		GUEST_ASSERT(!expect_success || !pmu_has_fast_mode);
+ 		rdpmc_idx |= INTEL_RDPMC_FAST;
++		/*
++		 * 读取rdpmc_idx对应的PMC的值, 判断是否成功
++		 */
+ 		guest_test_rdpmc(rdpmc_idx, false, -1ull);
+ 
+ 		vector = wrmsr_safe(msr, 0);
+@@ -414,6 +848,15 @@ static void guest_rd_wr_counters(uint32_t base_msr, uint8_t nr_possible_counters
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|764| <<test_gp_counters>> vm = pmu_vm_create_with_one_vcpu(&vcpu, guest_test_gp_counters, pmu_version, perf_capabilities);
++ *
++ * 测试MSR_CORE_PERF_GLOBAL_CTRL
++ * 通过对GP的PMCs进行读写测试: for (i = 0; i < nr_possible_counters; i++)
++ * 判断是否成功
++ * 判断期望的fail是否完成
++ */
+ static void guest_test_gp_counters(void)
+ {
+ 	uint8_t pmu_version = guest_get_pmu_version();
+@@ -446,10 +889,25 @@ static void guest_test_gp_counters(void)
+ 	else
+ 		base_msr = MSR_IA32_PERFCTR0;
+ 
++	/*
++	 * 通过对PMCs进行读写测试: for (i = 0; i < nr_possible_counters; i++)
++	 * 判断是否成功
++	 * 判断期望的fail是否完成
++	 */
+ 	guest_rd_wr_counters(base_msr, MAX_NR_GP_COUNTERS, nr_gp_counters, 0);
+ 	GUEST_DONE();
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|973| <<test_intel_counters>> test_gp_counters(v, perf_caps[i], j);
++ *
++ * 创建一个VM (perf的cap/version根据参数, gp counter的数目也根据参数)
++ * 测试MSR_CORE_PERF_GLOBAL_CTRL
++ * 通过对GP的PMCs进行读写测试: for (i = 0; i < nr_possible_counters; i++)
++ * 判断是否成功
++ * 判断期望的fail是否完成
++ */
+ static void test_gp_counters(uint8_t pmu_version, uint64_t perf_capabilities,
+ 			     uint8_t nr_gp_counters)
+ {
+@@ -467,6 +925,10 @@ static void test_gp_counters(uint8_t pmu_version, uint64_t perf_capabilities,
+ 	kvm_vm_free(vm);
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|831| <<test_fixed_counters>> vm = pmu_vm_create_with_one_vcpu(&vcpu, guest_test_fixed_counters, pmu_version, perf_capabilities);
++ */
+ static void guest_test_fixed_counters(void)
+ {
+ 	uint64_t supported_bitmask = 0;
+@@ -484,6 +946,11 @@ static void guest_test_fixed_counters(void)
+ 	if (guest_get_pmu_version() >= 5)
+ 		supported_bitmask = this_cpu_property(X86_PROPERTY_PMU_FIXED_COUNTERS_BITMASK);
+ 
++	/*
++	 * 通过对PMCs进行读写测试: for (i = 0; i < nr_possible_counters; i++)
++	 * 判断是否成功
++	 * 判断期望的fail是否完成
++	 */
+ 	guest_rd_wr_counters(MSR_CORE_PERF_FIXED_CTR0, MAX_NR_FIXED_COUNTERS,
+ 			     nr_fixed_counters, supported_bitmask);
+ 
+@@ -516,6 +983,10 @@ static void guest_test_fixed_counters(void)
+ 	GUEST_DONE();
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/x86_64/pmu_counters_test.c|922| <<test_intel_counters>> test_fixed_counters(v, perf_caps[i], j, k);
++ */
+ static void test_fixed_counters(uint8_t pmu_version, uint64_t perf_capabilities,
+ 				uint8_t nr_fixed_counters,
+ 				uint32_t supported_bitmask)
+@@ -536,6 +1007,23 @@ static void test_fixed_counters(uint8_t pmu_version, uint64_t perf_capabilities,
+ 	kvm_vm_free(vm);
+ }
+ 
++/*
++ *    Architecture Performance Monitoring Features (0xa):
++ *       version ID                               = 0x3 (3)
++ *       number of counters per logical processor = 0x4 (4)
++ *       bit width of counter                     = 0x30 (48)
++ *       length of EBX bit vector                 = 0x7 (7)
++ *       core cycle event                         = available
++ *       instruction retired event                = available
++ *       reference cycles event                   = available
++ *       last-level cache ref event               = available
++ *       last-level cache miss event              = available
++ *       branch inst retired event                = available
++ *       branch mispred retired event             = available
++ *       top-down slots event                     = not available
++ *       fixed counter  0 supported               = false
++ *       fixed counter  1 supported               = false
++ */
+ static void test_intel_counters(void)
+ {
+ 	uint8_t nr_arch_events = kvm_cpu_property(X86_PROPERTY_PMU_EBX_BIT_VECTOR_LENGTH);
+@@ -546,6 +1034,13 @@ static void test_intel_counters(void)
+ 	uint8_t v, j;
+ 	uint32_t k;
+ 
++	/*
++	 * IA32_PMCx MSRs 从 0x0c1开始
++	 * IA32_PERFEVTSELx MSRs 从0x186开始
++	 *
++	 * 当IA_PERF_CAPABILITIES.FW_WRITE[bit 13] == 1的时候:
++	 * IA32_PMCx从0x4c1开始
++	 */
+ 	const uint64_t perf_caps[] = {
+ 		0,
+ 		PMU_CAP_FW_WRITES,
+@@ -573,13 +1068,33 @@ static void test_intel_counters(void)
+ 	 */
+ 	nr_arch_events = max_t(typeof(nr_arch_events), nr_arch_events, NR_INTEL_ARCH_EVENTS);
+ 
++	/*
++	 * 每个version测试一遍, 最多5
++	 * 0, 1, 2, 3, 4, 5
++	 */
+ 	for (v = 0; v <= max_pmu_version; v++) {
+ 		for (i = 0; i < ARRAY_SIZE(perf_caps); i++) {
++			/*
++			 * 跳过: 如果不支持cap, 并且cap不是0
++			 */
+ 			if (!kvm_has_perf_caps && perf_caps[i])
+ 				continue;
+ 
+ 			pr_info("Testing arch events, PMU version %u, perf_caps = %lx\n",
+ 				v, perf_caps[i]);
++			/*
++			 * ### 关于 test_arch_events() ###
++			 * 根据参数提供的PMU虚拟化的配置创建VM (支持的event数目)
++			 * 然后在VM上测试: 对每一个arch event测试 (没有host的assert!!!):
++			 *
++			 * guest_test_arch_event(idx)只测试idx指定的事件
++			 * 尽管函数中的intel_event_to_feature[]数组定义了很多要测试的事件
++			 *
++			 * 在gp counter的每一个counter和fixed(如果支持)测试参数idx指定的event (下面的要跑好多次):
++			 * 1. 先把counter清空0
++			 * 2. GUEST_MEASURE_EVENT(): 激活PMC, 运行一些代码, disable PMC
++			 * 3. guest_assert_event_count(): 读取pmc的值, 确定和预期的counter是否相等
++			 */
+ 			/*
+ 			 * To keep the total runtime reasonable, test every
+ 			 * possible non-zero, non-reserved bitmap combination
+@@ -587,6 +1102,25 @@ static void test_intel_counters(void)
+ 			 * vector length.
+ 			 */
+ 			if (v == pmu_version) {
++				/*
++				 * 0xa的eax
++				 * Bits 07-00: Version ID of architectural performance monitoring.
++				 * Bits 15-08: Number of general-purpose performance monitoring counter per logical processor.
++				 * Bits 23-16: Bit width of general-purpose, performance monitoring counter.
++				 * Bits 31-24: Length of EBX bit vector to enumerate architectural performance monitoring events.
++				 *             Architectural event x is supported if EBX[x]=0 && EAX[31:24]>x.
++				 *
++				 * 0xa的ebx
++				 * Bit 00: Core cycle event not available if 1 or if EAX[31:24]<1.
++				 * Bit 01: Instruction retired event not available if 1 or if EAX[31:24]<2.
++				 * Bit 02: Reference cycles event not available if 1 or if EAX[31:24]<3.
++				 * Bit 03: Last-level cache reference event not available if 1 or if EAX[31:24]<4.
++				 * Bit 04: Last-level cache misses event not available if 1 or if EAX[31:24]<5.
++				 * Bit 05: Branch instruction retired event not available if 1 or if EAX[31:24]<6.
++				 * Bit 06: Branch mispredict retired event not available if 1 or if EAX[31:24]<7.
++				 * Bit 07: Top-down slots event not available if 1 or if EAX[31:24]<8.
++				 * Bits 31-08: Reserved = 0.
++				 */
+ 				for (k = 1; k < (BIT(nr_arch_events) - 1); k++)
+ 					test_arch_events(v, perf_caps[i], nr_arch_events, k);
+ 			}
+@@ -607,6 +1141,13 @@ static void test_intel_counters(void)
+ 
+ 			pr_info("Testing GP counters, PMU version %u, perf_caps = %lx\n",
+ 				v, perf_caps[i]);
++			/*
++			 * 创建一个VM (perf的cap/version根据参数, gp counter的数目也根据参数)
++			 * 测试MSR_CORE_PERF_GLOBAL_CTRL
++			 * 通过对GP的PMCs进行读写测试: for (i = 0; i < nr_possible_counters; i++)
++			 * 判断是否成功
++			 * 判断期望的fail是否完成
++			 */
+ 			for (j = 0; j <= nr_gp_counters; j++)
+ 				test_gp_counters(v, perf_caps[i], j);
+ 
+@@ -620,8 +1161,41 @@ static void test_intel_counters(void)
+ 	}
+ }
+ 
++/*
++ * 在以下设置kvm_caps->supported_perf_cap:
++ *   - arch/x86/kvm/svm/svm.c|5094| <<svm_set_cpu_caps>> kvm_caps.supported_perf_cap = 0;
++ *   - arch/x86/kvm/vmx/vmx.c|7941| <<vmx_set_cpu_caps>> kvm_caps.supported_perf_cap = vmx_get_perf_capabilities();
++ * 在以下使用kvm_caps->supported_perf_cap:
++ *   - arch/x86/kvm/vmx/vmx.c|2146| <<vmx_get_supported_debugctl>> if ((kvm_caps.supported_perf_cap & PMU_CAP_LBR_FMT) &&
++ *   - arch/x86/kvm/vmx/vmx.c|2426| <<vmx_set_msr(MSR_IA32_PERF_CAPABILITIES)>> (kvm_caps.supported_perf_cap & PMU_CAP_LBR_FMT))
++ *   - arch/x86/kvm/vmx/vmx.c|2433| <<vmx_set_msr(MSR_IA32_PERF_CAPABILITIES)>> (kvm_caps.supported_perf_cap & PERF_CAP_PEBS_MASK))
++ *   - arch/x86/kvm/x86.c|1691| <<kvm_get_msr_feature(MSR_IA32_PERF_CAPABILITIES)>> msr->data = kvm_caps.supported_perf_cap;
++ *   - arch/x86/kvm/x86.c|3816| <<kvm_set_msr_common(MSR_IA32_PERF_CAPABILITIES)>> if (data & ~kvm_caps.supported_perf_cap)
++ *   - arch/x86/kvm/x86.c|12144| <<kvm_arch_vcpu_create>> vcpu->arch.perf_capabilities = kvm_caps.supported_perf_cap;
++ *
++ *
++ * 在以下设置kvm_vcpu_arch->perf_capabilities:
++ *   - arch/x86/kvm/x86.c|3827| <<kvm_set_msr_common(MSR_IA32_PERF_CAPABILITIES)>> vcpu->arch.perf_capabilities = data;
++ *   - arch/x86/kvm/x86.c|12144| <<kvm_arch_vcpu_create>> vcpu->arch.perf_capabilities = kvm_caps.supported_perf_cap;
++ * 在以下使用kvm_vcpu_arch->perf_capabilities:
++ *   - arch/x86/kvm/vmx/pmu_intel.c|116| <<vcpu_get_perf_capabilities>> return vcpu->arch.perf_capabilities;
++ *   - arch/x86/kvm/x86.c|3824| <<kvm_set_msr_common(MSR_IA32_PERF_CAPABILITIES)>> if (vcpu->arch.perf_capabilities == data)
++ *   - arch/x86/kvm/x86.c|4285| <<kvm_get_msr_common(MSR_IA32_PERF_CAPABILITIES)>> msr_info->data = vcpu->arch.perf_capabilities;
++ *
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|7941| <<vmx_set_cpu_caps>> kvm_caps.supported_perf_cap = vmx_get_perf_capabilities();
++ *
++ * vmx_get_perf_capabilities():
++ * 1. 首先给perf_cap设置PMU_CAP_FW_WRITES
++ * 2. 如果支持X86_FEATURE_PDCM, 通过MSR_IA32_PERF_CAPABILITIES获取host_perf_cap
++ * 3. 根据情况添加PMU_CAP_LBR_FMT
++ * 4. 根据情况添加PERF_CAP_PEBS_MASK
++ */
+ int main(int argc, char *argv[])
+ {
++	/*
++	 * 检查kvm的module参数enable_pmu
++	 */
+ 	TEST_REQUIRE(kvm_is_pmu_enabled());
+ 
+ 	TEST_REQUIRE(host_cpu_is_intel);
+@@ -629,6 +1203,10 @@ int main(int argc, char *argv[])
+ 	TEST_REQUIRE(kvm_cpu_property(X86_PROPERTY_PMU_VERSION) > 0);
+ 
+ 	kvm_pmu_version = kvm_cpu_property(X86_PROPERTY_PMU_VERSION);
++	/*
++	 * Perfmon and Debug Capability: A value of 1 indicates the processor supports the performance
++	 * and debug feature indication MSR IA32_PERF_CAPABILITIES.
++	 */
+ 	kvm_has_perf_caps = kvm_cpu_has(X86_FEATURE_PDCM);
+ 	is_forced_emulation_enabled = kvm_is_forced_emulation_enabled();
+ 
+@@ -636,3 +1214,64 @@ int main(int argc, char *argv[])
+ 
+ 	return 0;
+ }
++
++/*
++ * 关于force emulation
++ *
++ * commit 6c86eedc206dd1f9d37a2796faa8e6f2278215d2
++ * Author: Wanpeng Li <wanpengli@tencent.com>
++ * Date:   Tue Apr 3 16:28:49 2018 -0700
++ *
++ * KVM: X86: Add Force Emulation Prefix for "emulate the next instruction"
++ *
++ * There is no easy way to force KVM to run an instruction through the emulator
++ * (by design as that will expose the x86 emulator as a significant attack-surface).
++ * However, we do wish to expose the x86 emulator in case we are testing it
++ * (e.g. via kvm-unit-tests). Therefore, this patch adds a "force emulation prefix"
++ * that is designed to raise #UD which KVM will trap and it's #UD exit-handler will
++ * match "force emulation prefix" to run instruction after prefix by the x86 emulator.
++ * To not expose the x86 emulator by default, we add a module parameter that should
++ * be off by default.
++ *
++ * A simple testcase here:
++ *
++ * #include <stdio.h>
++ * #include <string.h>
++ *
++ * #define HYPERVISOR_INFO 0x40000000
++ *
++ * #define CPUID(idx, eax, ebx, ecx, edx) \
++ *     asm volatile (\
++ *     "ud2a; .ascii \"kvm\"; cpuid" \
++ *     :"=b" (*ebx), "=a" (*eax), "=c" (*ecx), "=d" (*edx) \
++ *     :"0"(idx) );
++ *
++ * void main()
++ * {
++ *     unsigned int eax, ebx, ecx, edx;
++ *     char string[13];
++ *
++ *     CPUID(HYPERVISOR_INFO, &eax, &ebx, &ecx, &edx);
++ *     *(unsigned int *)(string + 0) = ebx;
++ *     *(unsigned int *)(string + 4) = ecx;
++ *     *(unsigned int *)(string + 8) = edx;
++ *
++ *     string[12] = 0;
++ *     if (strncmp(string, "KVMKVMKVM\0\0\0", 12) == 0)
++ *         printf("kvm guest\n");
++ *     else
++ *         printf("bare hardware\n");
++ * }
++ *
++ * Suggested-by: Andrew Cooper <andrew.cooper3@citrix.com>
++ * Reviewed-by: Radim Krčmář <rkrcmar@redhat.com>
++ * Reviewed-by: Liran Alon <liran.alon@oracle.com>
++ * Cc: Paolo Bonzini <pbonzini@redhat.com>
++ * Cc: Radim Krčmář <rkrcmar@redhat.com>
++ * Cc: Andrew Cooper <andrew.cooper3@citrix.com>
++ * Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
++ * Cc: Liran Alon <liran.alon@oracle.com>
++ * Signed-off-by: Wanpeng Li <wanpengli@tencent.com>
++ * [Correctly handle usermode exits. - Paolo]
++ * Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
++ */
+-- 
+2.34.1
+
