@@ -1,0 +1,2437 @@
+From a04a3b3e53b3cf414ae5c8519396c089ae0c82cc Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Sun, 26 May 2024 11:48:21 -0700
+Subject: [PATCH 1/1] linux-v6.9
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ arch/arm64/include/asm/esr.h                  |  10 +
+ arch/arm64/include/asm/kvm_emulate.h          |   9 +
+ arch/arm64/include/asm/kvm_pgtable.h          |  73 ++
+ arch/arm64/include/asm/pgtable-hwdef.h        |   7 +
+ arch/arm64/kvm/handle_exit.c                  |  16 +
+ arch/arm64/kvm/hyp/nvhe/mem_protect.c         |   3 +
+ arch/arm64/kvm/hyp/nvhe/mm.c                  |   3 +
+ arch/arm64/kvm/hyp/nvhe/setup.c               |   6 +
+ arch/arm64/kvm/hyp/pgtable.c                  | 626 ++++++++++++++++++
+ arch/arm64/kvm/mmio.c                         |   4 +
+ arch/arm64/kvm/mmu.c                          | 125 ++++
+ arch/x86/kernel/apic/vector.c                 |   4 +
+ tools/include/uapi/linux/kvm.h                |  13 +
+ .../selftests/kvm/aarch64/page_fault_test.c   | 420 ++++++++++++
+ tools/testing/selftests/kvm/lib/elf.c         |   6 +
+ tools/testing/selftests/kvm/lib/guest_modes.c |  11 +
+ tools/testing/selftests/kvm/lib/kvm_util.c    |  36 +
+ .../testing/selftests/kvm/lib/ucall_common.c  |   6 +
+ 18 files changed, 1378 insertions(+)
+
+diff --git a/arch/arm64/include/asm/esr.h b/arch/arm64/include/asm/esr.h
+index 81606bf7d..44cb87875 100644
+--- a/arch/arm64/include/asm/esr.h
++++ b/arch/arm64/include/asm/esr.h
+@@ -386,6 +386,16 @@ static inline bool esr_is_data_abort(unsigned long esr)
+ 	return ec == ESR_ELx_EC_DABT_LOW || ec == ESR_ELx_EC_DABT_CUR;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/include/asm/kvm_emulate.h|413| <<kvm_vcpu_trap_is_translation_fault>> return esr_fsc_is_translation_fault(kvm_vcpu_get_esr(vcpu));
++ *   - arch/arm64/kvm/mmu.c|1698| <<kvm_handle_guest_abort>> if (esr_fsc_is_translation_fault(esr)) {
++ *   - arch/arm64/kvm/mmu.c|1733| <<kvm_handle_guest_abort>> if (!esr_fsc_is_translation_fault(esr) &&
++ *   - arch/arm64/mm/fault.c|267| <<is_el1_permission_fault>> return esr_fsc_is_translation_fault(esr) &&
++ *   - arch/arm64/mm/fault.c|280| <<is_spurious_el1_translation_fault>> if (!is_el1_data_abort(esr) || !esr_fsc_is_translation_fault(esr))
++ *   - arch/arm64/mm/fault.c|301| <<is_spurious_el1_translation_fault>> return !esr_fsc_is_translation_fault(dfsc);
++ *   - arch/arm64/mm/fault.c|400| <<__do_kernel_fault>> if (esr_fsc_is_translation_fault(esr) &&
++ */
+ static inline bool esr_fsc_is_translation_fault(unsigned long esr)
+ {
+ 	/* Translation fault, level -1 */
+diff --git a/arch/arm64/include/asm/kvm_emulate.h b/arch/arm64/include/asm/kvm_emulate.h
+index 975af30af..020548e76 100644
+--- a/arch/arm64/include/asm/kvm_emulate.h
++++ b/arch/arm64/include/asm/kvm_emulate.h
+@@ -296,6 +296,15 @@ static inline bool vcpu_mode_priv(const struct kvm_vcpu *vcpu)
+ 
+ static __always_inline u64 kvm_vcpu_get_esr(const struct kvm_vcpu *vcpu)
+ {
++	/*
++	 * struct kvm_vcpu *vcpu:
++	 * -> struct kvm_vcpu_arch arch;
++	 *    -> struct kvm_vcpu_fault_info fault;
++	 *       -> u64 esr_el2;            // Hyp Syndrom Register
++	 *       -> u64 far_el2;            // Hyp Fault Address Register
++	 *       -> u64 hpfar_el2;          // Hyp IPA Fault Address Register
++	 *       -> u64 disr_el1;           // Deferred [SError] Status Register
++	 */
+ 	return vcpu->arch.fault.esr_el2;
+ }
+ 
+diff --git a/arch/arm64/include/asm/kvm_pgtable.h b/arch/arm64/include/asm/kvm_pgtable.h
+index 19278dfe7..39d18b9b2 100644
+--- a/arch/arm64/include/asm/kvm_pgtable.h
++++ b/arch/arm64/include/asm/kvm_pgtable.h
+@@ -104,12 +104,72 @@ static inline kvm_pfn_t kvm_pte_to_pfn(kvm_pte_t pte)
+ 	return __phys_to_pfn(kvm_pte_to_phys(pte));
+ }
+ 
++/*
++ * 假设PAGE_SHIFT=12
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(-1) = ((12 - 3) * (4 - (-1)) + 3) = 48
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(0)  = ((12 - 3) * (4 - (0)) + 3)  = 39
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(1)  = ((12 - 3) * (4 - (1)) + 3)  = 30
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(2)  = ((12 - 3) * (4 - (2)) + 3)  = 21
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(3)  = ((12 - 3) * (4 - (3)) + 3)  = 12
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(4)  = ((12 - 3) * (4 - (4)) + 3)  = 3
++ *
++ * 下面的是Size mapped by an entry at level n ( 0 <= n <= 3)
++ * level 3的一个entry map的大小是 1 << 12 = 4K, 一个page table就是2M
++ * level 2的一个entry map的大小是 1 << 21 = 2M, 一个page table就是1G
++ * level 1的一个entry map的大小是 1 << 30 = 1G, 一个page table就是512G
++ * level 0的一个entry map的大小是 1 << 39 = 512G, 一个page table就是512G x 512
++ *
++ * level 2的一个entry map的大小是 1 << 21 = 2M
++ * // PMD_SHIFT determines the size a level 2 page table entry can map.
++ * #define PMD_SHIFT               ARM64_HW_PGTABLE_LEVEL_SHIFT(2)
++ *
++ * level 1的一个entry map的大小是 1 << 30 = 1G
++ * // PUD_SHIFT determines the size a level 1 page table entry can map.
++ * #define PUD_SHIFT               ARM64_HW_PGTABLE_LEVEL_SHIFT(1)
++ *
++ * 一个例子是CONFIG_PGTABLE_LEVELS=4.
++ * 4 - 4 = 0
++ * level 0的一个entry map的大小是 1 << 39 = 512G
++ * // PGDIR_SHIFT determines the size a top-level page table entry can map
++ * // (depending on the configuration, this level can be 0, 1 or 2).
++ * #define PGDIR_SHIFT             ARM64_HW_PGTABLE_LEVEL_SHIFT(4 - CONFIG_PGTABLE_LEVELS)
++ *
++ * level 3的一个entry叫PTE
++ * level 2的一个entry叫PMD
++ * level 1的一个entry叫PUD
++ * level 0的一个entry叫P4D
++ *
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(-1) = ((12 - 3) * (4 - (-1)) + 3) = 48
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(0)  = ((12 - 3) * (4 - (0)) + 3)  = 39
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(1)  = ((12 - 3) * (4 - (1)) + 3)  = 30
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(2)  = ((12 - 3) * (4 - (2)) + 3)  = 21
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(3)  = ((12 - 3) * (4 - (3)) + 3)  = 12
++ */
+ static inline u64 kvm_granule_shift(s8 level)
+ {
++	/*
++	 * ARM64_HW_PGTABLE_LEVEL_SHIFT(-1) = ((12 - 3) * (4 - (-1)) + 3) = 48
++	 * ARM64_HW_PGTABLE_LEVEL_SHIFT(0)  = ((12 - 3) * (4 - (0)) + 3)  = 39
++	 * ARM64_HW_PGTABLE_LEVEL_SHIFT(1)  = ((12 - 3) * (4 - (1)) + 3)  = 30
++	 * ARM64_HW_PGTABLE_LEVEL_SHIFT(2)  = ((12 - 3) * (4 - (2)) + 3)  = 21
++	 * ARM64_HW_PGTABLE_LEVEL_SHIFT(3)  = ((12 - 3) * (4 - (3)) + 3)  = 12
++	 *
++	 * Size mapped by an entry at level n ( 0 <= n <= 3)
++	 * level 3的一个entry map的大小是 1 << 12 = 4K, 一个page table就是2M
++	 * level 2的一个entry map的大小是 1 << 21 = 2M, 一个page table就是1G
++	 * level 1的一个entry map的大小是 1 << 30 = 1G, 一个page table就是512G
++	 * level 0的一个entry map的大小是 1 << 39 = 512G, 一个page table就是512G x 512
++	 */
+ 	/* Assumes KVM_PGTABLE_LAST_LEVEL is 3 */
+ 	return ARM64_HW_PGTABLE_LEVEL_SHIFT(level);
+ }
+ 
++/*
++ * level 3的一个entry map的大小是 1 << 12 = 4K, 一个page table就是2M
++ * level 2的一个entry map的大小是 1 << 21 = 2M, 一个page table就是1G
++ * level 1的一个entry map的大小是 1 << 30 = 1G, 一个page table就是512G
++ * level 0的一个entry map的大小是 1 << 39 = 512G, 一个page table就是512G x 512
++ */
+ static inline u64 kvm_granule_size(s8 level)
+ {
+ 	return BIT(kvm_granule_shift(level));
+@@ -177,6 +237,15 @@ struct kvm_pgtable_mm_ops {
+ 	void*		(*phys_to_virt)(phys_addr_t phys);
+ 	phys_addr_t	(*virt_to_phys)(void *addr);
+ 	void		(*dcache_clean_inval_poc)(void *addr, size_t size);
++	/*
++	 * 在以下使用kvm_pgtable_mm_ops->icache_inval_pou():
++	 *   - arch/arm64/kvm/mmu.c|855| <<global>> .icache_inval_pou = invalidate_icache_guest_page,
++	 *   - arch/arm64/kvm/hyp/nvhe/mem_protect.c|254| <<kvm_guest_prepare_stage2>> .icache_inval_pou = invalidate_icache_guest_page,
++	 *   - arch/arm64/kvm/hyp/pgtable.c|991| <<stage2_map_walker_try_leaf>> if (!kvm_pgtable_walk_skip_cmo(ctx) && mm_ops->icache_inval_pou &&
++	 *   - arch/arm64/kvm/hyp/pgtable.c|993| <<stage2_map_walker_try_leaf>> mm_ops->icache_inval_pou(kvm_pte_follow(new, mm_ops), granule);
++	 *   - arch/arm64/kvm/hyp/pgtable.c|1227| <<stage2_attr_walker>> if (mm_ops->icache_inval_pou &&
++	 *   - arch/arm64/kvm/hyp/pgtable.c|1229| <<stage2_attr_walker>> mm_ops->icache_inval_pou(kvm_pte_follow(pte, mm_ops),
++	 */
+ 	void		(*icache_inval_pou)(void *addr, size_t size);
+ };
+ 
+@@ -308,6 +377,10 @@ static inline kvm_pte_t *kvm_dereference_pteref(struct kvm_pgtable_walker *walke
+ 	return pteref;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|361| <<kvm_pgtable_walk>> r = kvm_pgtable_walk_begin(walker);
++ */
+ static inline int kvm_pgtable_walk_begin(struct kvm_pgtable_walker *walker)
+ {
+ 	/*
+diff --git a/arch/arm64/include/asm/pgtable-hwdef.h b/arch/arm64/include/asm/pgtable-hwdef.h
+index ef207a0d4..d1faaa624 100644
+--- a/arch/arm64/include/asm/pgtable-hwdef.h
++++ b/arch/arm64/include/asm/pgtable-hwdef.h
+@@ -38,6 +38,13 @@
+  * Rearranging it a bit we get :
+  *   (4 - n) * (PAGE_SHIFT - 3) + 3
+  */
++/*
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(-1) = ((12 - 3) * (4 - (-1)) + 3) = 48
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(0)  = ((12 - 3) * (4 - (0)) + 3)  = 39
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(1)  = ((12 - 3) * (4 - (1)) + 3)  = 30
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(2)  = ((12 - 3) * (4 - (2)) + 3)  = 21
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(3)  = ((12 - 3) * (4 - (3)) + 3)  = 12
++ */
+ #define ARM64_HW_PGTABLE_LEVEL_SHIFT(n)	((PAGE_SHIFT - 3) * (4 - (n)) + 3)
+ 
+ #define PTRS_PER_PTE		(1 << (PAGE_SHIFT - 3))
+diff --git a/arch/arm64/kvm/handle_exit.c b/arch/arm64/kvm/handle_exit.c
+index 617ae6dea..c96881acc 100644
+--- a/arch/arm64/kvm/handle_exit.c
++++ b/arch/arm64/kvm/handle_exit.c
+@@ -252,6 +252,10 @@ static int handle_svc(struct kvm_vcpu *vcpu)
+ 	return 1;
+ }
+ 
++/*
++ * 在以下使用arm_exit_handlers[]:
++ *   - arch/arm64/kvm/handle_exit.c|288| <<kvm_get_exit_handler>> return arm_exit_handlers[esr_ec];
++ */
+ static exit_handle_fn arm_exit_handlers[] = {
+ 	[0 ... ESR_ELx_EC_MAX]	= kvm_handle_unknown_ec,
+ 	[ESR_ELx_EC_WFx]	= kvm_handle_wfx,
+@@ -280,6 +284,10 @@ static exit_handle_fn arm_exit_handlers[] = {
+ 	[ESR_ELx_EC_PAC]	= kvm_handle_ptrauth,
+ };
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/handle_exit.c|311| <<handle_trap_exceptions>> exit_handler = kvm_get_exit_handler(vcpu);
++ */
+ static exit_handle_fn kvm_get_exit_handler(struct kvm_vcpu *vcpu)
+ {
+ 	u64 esr = kvm_vcpu_get_esr(vcpu);
+@@ -294,6 +302,10 @@ static exit_handle_fn kvm_get_exit_handler(struct kvm_vcpu *vcpu)
+  * KVM_EXIT_DEBUG, otherwise userspace needs to complete its
+  * emulation first.
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/handle_exit.c|342| <<handle_exit>> return handle_trap_exceptions(vcpu);
++ */
+ static int handle_trap_exceptions(struct kvm_vcpu *vcpu)
+ {
+ 	int handled;
+@@ -319,6 +331,10 @@ static int handle_trap_exceptions(struct kvm_vcpu *vcpu)
+  * Return > 0 to return to guest, < 0 on error, 0 (and set exit_reason) on
+  * proper exit to userspace.
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/arm.c|1146| <<kvm_arch_vcpu_ioctl_run>> ret = handle_exit(vcpu, ret);
++ */
+ int handle_exit(struct kvm_vcpu *vcpu, int exception_index)
+ {
+ 	struct kvm_run *run = vcpu->run;
+diff --git a/arch/arm64/kvm/hyp/nvhe/mem_protect.c b/arch/arm64/kvm/hyp/nvhe/mem_protect.c
+index 861c76021..2a3ed96f4 100644
+--- a/arch/arm64/kvm/hyp/nvhe/mem_protect.c
++++ b/arch/arm64/kvm/hyp/nvhe/mem_protect.c
+@@ -586,6 +586,9 @@ static int __check_page_state_visitor(const struct kvm_pgtable_visit_ctx *ctx,
+ 	return d->get_page_state(ctx->old, ctx->addr) == d->desired ? 0 : -EPERM;
+ }
+ 
++/*
++ * kvm_pgtable_walk()的使用者
++ */
+ static int check_page_state_range(struct kvm_pgtable *pgt, u64 addr, u64 size,
+ 				  struct check_walk_data *data)
+ {
+diff --git a/arch/arm64/kvm/hyp/nvhe/mm.c b/arch/arm64/kvm/hyp/nvhe/mm.c
+index 8850b591d..5aea1178b 100644
+--- a/arch/arm64/kvm/hyp/nvhe/mm.c
++++ b/arch/arm64/kvm/hyp/nvhe/mm.c
+@@ -291,6 +291,9 @@ static int __create_fixmap_slot_cb(const struct kvm_pgtable_visit_ctx *ctx,
+ 	return 0;
+ }
+ 
++/*
++ * kvm_pgtable_walk()的使用者
++ */
+ static int create_fixmap_slot(u64 addr, u64 cpu)
+ {
+ 	struct kvm_pgtable_walker walker = {
+diff --git a/arch/arm64/kvm/hyp/nvhe/setup.c b/arch/arm64/kvm/hyp/nvhe/setup.c
+index bc58d1b51..bd4713dbc 100644
+--- a/arch/arm64/kvm/hyp/nvhe/setup.c
++++ b/arch/arm64/kvm/hyp/nvhe/setup.c
+@@ -223,6 +223,9 @@ static int fix_hyp_pgtable_refcnt_walker(const struct kvm_pgtable_visit_ctx *ctx
+ 	return 0;
+ }
+ 
++/*
++ * kvm_pgtable_walk()的使用者
++ */
+ static int fix_host_ownership(void)
+ {
+ 	struct kvm_pgtable_walker walker = {
+@@ -243,6 +246,9 @@ static int fix_host_ownership(void)
+ 	return 0;
+ }
+ 
++/*
++ * kvm_pgtable_walk()的使用者
++ */
+ static int fix_hyp_pgtable_refcnt(void)
+ {
+ 	struct kvm_pgtable_walker walker = {
+diff --git a/arch/arm64/kvm/hyp/pgtable.c b/arch/arm64/kvm/hyp/pgtable.c
+index 5a59ef88b..cc044e56c 100644
+--- a/arch/arm64/kvm/hyp/pgtable.c
++++ b/arch/arm64/kvm/hyp/pgtable.c
+@@ -11,6 +11,41 @@
+ #include <asm/kvm_pgtable.h>
+ #include <asm/stage2_pgtable.h>
+ 
++/*
++ * 假设PAGE_SHIFT=12
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(-1) = ((12 - 3) * (4 - (-1)) + 3) = 48
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(0)  = ((12 - 3) * (4 - (0)) + 3)  = 39
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(1)  = ((12 - 3) * (4 - (1)) + 3)  = 30
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(2)  = ((12 - 3) * (4 - (2)) + 3)  = 21
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(3)  = ((12 - 3) * (4 - (3)) + 3)  = 12
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(4)  = ((12 - 3) * (4 - (4)) + 3)  = 3
++ *
++ * 下面的是Size mapped by an entry at level n ( 0 <= n <= 3)
++ * level 3的一个entry map的大小是 1 << 12 = 4K, 一个page table就是2M
++ * level 2的一个entry map的大小是 1 << 21 = 2M, 一个page table就是1G
++ * level 1的一个entry map的大小是 1 << 30 = 1G, 一个page table就是512G
++ * level 0的一个entry map的大小是 1 << 39 = 512G, 一个page table就是512G x 512
++ *
++ * level 2的一个entry map的大小是 1 << 21 = 2M
++ * // PMD_SHIFT determines the size a level 2 page table entry can map.
++ * #define PMD_SHIFT               ARM64_HW_PGTABLE_LEVEL_SHIFT(2)
++ *
++ * level 1的一个entry map的大小是 1 << 30 = 1G
++ * // PUD_SHIFT determines the size a level 1 page table entry can map.
++ * #define PUD_SHIFT               ARM64_HW_PGTABLE_LEVEL_SHIFT(1)
++ *
++ * 一个例子是CONFIG_PGTABLE_LEVELS=4.
++ * 4 - 4 = 0
++ * level 0的一个entry map的大小是 1 << 39 = 512G
++ * // PGDIR_SHIFT determines the size a top-level page table entry can map
++ * // (depending on the configuration, this level can be 0, 1 or 2).
++ * #define PGDIR_SHIFT             ARM64_HW_PGTABLE_LEVEL_SHIFT(4 - CONFIG_PGTABLE_LEVELS)
++ *
++ * level 3的一个entry叫PTE
++ * level 2的一个entry叫PMD
++ * level 1的一个entry叫PUD
++ * level 0的一个entry叫P4D
++ */
+ 
+ #define KVM_PTE_TYPE			BIT(1)
+ #define KVM_PTE_TYPE_BLOCK		0
+@@ -85,8 +120,17 @@ static bool kvm_phys_is_valid(u64 phys)
+ 	return phys < BIT(shift);
+ }
+ 
++/*
++ * block似乎就是多个page, 也就是huge page!
++ */
+ static bool kvm_block_mapping_supported(const struct kvm_pgtable_visit_ctx *ctx, u64 phys)
+ {
++	/*
++	 * level 3的一个entry map的大小是 1 << 12 = 4K, 一个page table就是2M
++	 * level 2的一个entry map的大小是 1 << 21 = 2M, 一个page table就是1G
++	 * level 1的一个entry map的大小是 1 << 30 = 1G, 一个page table就是512G
++	 * level 0的一个entry map的大小是 1 << 39 = 512G, 一个page table就是512G x 512
++	 */
+ 	u64 granule = kvm_granule_size(ctx->level);
+ 
+ 	if (!kvm_level_supports_block_mapping(ctx->level))
+@@ -101,6 +145,46 @@ static bool kvm_block_mapping_supported(const struct kvm_pgtable_visit_ctx *ctx,
+ 	return IS_ALIGNED(ctx->addr, granule);
+ }
+ 
++/*
++ * 假设PAGE_SHIFT=12
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(-1) = ((12 - 3) * (4 - (-1)) + 3) = 48
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(0)  = ((12 - 3) * (4 - (0)) + 3)  = 39
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(1)  = ((12 - 3) * (4 - (1)) + 3)  = 30
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(2)  = ((12 - 3) * (4 - (2)) + 3)  = 21
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(3)  = ((12 - 3) * (4 - (3)) + 3)  = 12
++ * ARM64_HW_PGTABLE_LEVEL_SHIFT(4)  = ((12 - 3) * (4 - (4)) + 3)  = 3
++ *
++ * 下面的是Size mapped by an entry at level n ( 0 <= n <= 3)
++ * level 3的一个entry map的大小是 1 << 12 = 4K, 一个page table就是2M
++ * level 2的一个entry map的大小是 1 << 21 = 2M, 一个page table就是1G
++ * level 1的一个entry map的大小是 1 << 30 = 1G, 一个page table就是512G
++ * level 0的一个entry map的大小是 1 << 39 = 512G, 一个page table就是512G x 512
++ *
++ * level 2的一个entry map的大小是 1 << 21 = 2M
++ * // PMD_SHIFT determines the size a level 2 page table entry can map.
++ * #define PMD_SHIFT               ARM64_HW_PGTABLE_LEVEL_SHIFT(2)
++ *
++ * level 1的一个entry map的大小是 1 << 30 = 1G
++ * // PUD_SHIFT determines the size a level 1 page table entry can map.
++ * #define PUD_SHIFT               ARM64_HW_PGTABLE_LEVEL_SHIFT(1)
++ *
++ * 一个例子是CONFIG_PGTABLE_LEVELS=4.
++ * 4 - 4 = 0
++ * level 0的一个entry map的大小是 1 << 39 = 512G
++ * // PGDIR_SHIFT determines the size a top-level page table entry can map
++ * // (depending on the configuration, this level can be 0, 1 or 2).
++ * #define PGDIR_SHIFT             ARM64_HW_PGTABLE_LEVEL_SHIFT(4 - CONFIG_PGTABLE_LEVELS)
++ *
++ * level 3的一个entry叫PTE
++ * level 2的一个entry叫PMD
++ * level 1的一个entry叫PUD
++ * level 0的一个entry叫P4D
++ */
++
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|435| <<__kvm_pgtable_walk>> for (idx = kvm_pgtable_idx(data, level); idx < PTRS_PER_PTE; ++idx) {
++ */
+ static u32 kvm_pgtable_idx(struct kvm_pgtable_walk_data *data, s8 level)
+ {
+ 	u64 shift = kvm_granule_shift(level);
+@@ -109,16 +193,59 @@ static u32 kvm_pgtable_idx(struct kvm_pgtable_walk_data *data, s8 level)
+ 	return (data->addr >> shift) & mask;
+ }
+ 
++/*
++ * level 3的一个entry叫PTE
++ * level 2的一个entry叫PMD
++ * level 1的一个entry叫PUD
++ * level 0的一个entry叫P4D
++ *
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|127| <<kvm_pgd_pages>> return kvm_pgd_page_idx(&pgt, -1ULL) + 1;
++ *   - arch/arm64/kvm/hyp/pgtable.c|320| <<_kvm_pgtable_walk>> for (idx = kvm_pgd_page_idx(pgt, data->addr); data->addr < data->end; ++idx) {
++ *
++ * 根据pgt->start_level, 计算addr的index
++ * 应该算是pgd的index吧(最高的???)
++ */
+ static u32 kvm_pgd_page_idx(struct kvm_pgtable *pgt, u64 addr)
+ {
++	/*
++	 * ARM64_HW_PGTABLE_LEVEL_SHIFT(-1) = ((12 - 3) * (4 - (-1)) + 3) = 48
++	 * ARM64_HW_PGTABLE_LEVEL_SHIFT(0)  = ((12 - 3) * (4 - (0)) + 3)  = 39
++	 * ARM64_HW_PGTABLE_LEVEL_SHIFT(1)  = ((12 - 3) * (4 - (1)) + 3)  = 30
++	 * ARM64_HW_PGTABLE_LEVEL_SHIFT(2)  = ((12 - 3) * (4 - (2)) + 3)  = 21
++	 * ARM64_HW_PGTABLE_LEVEL_SHIFT(3)  = ((12 - 3) * (4 - (3)) + 3)  = 12
++	 */
+ 	u64 shift = kvm_granule_shift(pgt->start_level - 1); /* May underflow */
+ 	u64 mask = BIT(pgt->ia_bits) - 1;
+ 
+ 	return (addr & mask) >> shift;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|1856| <<__kvm_pgtable_stage2_init>> pgd_sz = kvm_pgd_pages(ia_bits, start_level) * PAGE_SIZE;
++ *   - arch/arm64/kvm/hyp/pgtable.c|1879| <<kvm_pgtable_stage2_pgd_size>> return kvm_pgd_pages(ia_bits, start_level) * PAGE_SIZE;
++ *   - arch/arm64/kvm/hyp/pgtable.c|1908| <<kvm_pgtable_stage2_destroy>> pgd_sz = kvm_pgd_pages(pgt->ia_bits, pgt->start_level) * PAGE_SIZE;
++ *
++ * 假设ia_bits = 40和start_level = 1
++ * ipa物理地址最大是(1<<40)-1=0xffffffffff (10个ff)
++ * 从level 1开始的话, 两个page就能代表所有的ipa地址
++ * 也就是说, 从eptp开始的指针(类似cr3), 两个page就能表示所有的ipa range
++ */
+ static u32 kvm_pgd_pages(u32 ia_bits, s8 start_level)
+ {
++	/*
++	 * 比如:
++	 * crash> struct kvm_pgtable ffff3fffe4412800
++	 * struct kvm_pgtable {
++	 *   ia_bits = 40,
++	 *   start_level = 1,
++	 *   pgd = 0xffff3fff920cc000,
++	 *   mm_ops = 0xffffbb087c3a3768 <kvm_s2_mm_ops>,
++	 *   mmu = 0xffff800080e1d9c8,
++	 *   flags = 0,
++	 *   force_pte_cb = 0x0
++	 */
+ 	struct kvm_pgtable pgt = {
+ 		.ia_bits	= ia_bits,
+ 		.start_level	= start_level,
+@@ -138,6 +265,20 @@ static bool kvm_pte_table(kvm_pte_t pte, s8 level)
+ 	return FIELD_GET(KVM_PTE_TYPE, pte) == KVM_PTE_TYPE_TABLE;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|378| <<__kvm_pgtable_visit>> childp = (kvm_pteref_t)kvm_pte_follow(ctx.old, mm_ops);
++ *   - arch/arm64/kvm/hyp/pgtable.c|702| <<hyp_unmap_walker>> childp = kvm_pte_follow(ctx->old, mm_ops);
++ *   - arch/arm64/kvm/hyp/pgtable.c|780| <<hyp_free_walker>> mm_ops->put_page(kvm_pte_follow(ctx->old, mm_ops));
++ *   - arch/arm64/kvm/hyp/pgtable.c|1182| <<stage2_map_walker_try_leaf>> mm_ops->dcache_clean_inval_poc(kvm_pte_follow(new, mm_ops), granule);
++ *   - arch/arm64/kvm/hyp/pgtable.c|1187| <<stage2_map_walker_try_leaf>> mm_ops->icache_inval_pou(kvm_pte_follow(new, mm_ops), granule);
++ *   - arch/arm64/kvm/hyp/pgtable.c|1198| <<stage2_map_walk_table_pre>> kvm_pte_t *childp = kvm_pte_follow(ctx->old, mm_ops);
++ *   - arch/arm64/kvm/hyp/pgtable.c|1364| <<stage2_unmap_walker>> childp = kvm_pte_follow(ctx->old, mm_ops);
++ *   - arch/arm64/kvm/hyp/pgtable.c|1380| <<stage2_unmap_walker>> mm_ops->dcache_clean_inval_poc(kvm_pte_follow(ctx->old, mm_ops), kvm_granule_size(ctx->level));
++ *   - arch/arm64/kvm/hyp/pgtable.c|1450| <<stage2_attr_walker>> mm_ops->icache_inval_pou(kvm_pte_follow(pte, mm_ops), kvm_granule_size(ctx->level));
++ *   - arch/arm64/kvm/hyp/pgtable.c|1690| <<stage2_flush_walker>> mm_ops->dcache_clean_inval_poc(kvm_pte_follow(ctx->old, mm_ops), kvm_granule_size(ctx->level));
++ *   - arch/arm64/kvm/hyp/pgtable.c|1936| <<stage2_free_walker>> mm_ops->put_page(kvm_pte_follow(ctx->old, mm_ops))
++ */
+ static kvm_pte_t *kvm_pte_follow(kvm_pte_t pte, struct kvm_pgtable_mm_ops *mm_ops)
+ {
+ 	return mm_ops->phys_to_virt(kvm_pte_to_phys(pte));
+@@ -157,6 +298,11 @@ static kvm_pte_t kvm_init_table_pte(kvm_pte_t *childp, struct kvm_pgtable_mm_ops
+ 	return pte;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|757| <<hyp_map_walker_try_leaf>> new = kvm_init_valid_leaf_pte(phys, data->attr, ctx->level);
++ *   - arch/arm64/kvm/hyp/pgtable.c|1357| <<stage2_map_walker_try_leaf>> new = kvm_init_valid_leaf_pte(phys, data->attr, ctx->level);
++ */
+ static kvm_pte_t kvm_init_valid_leaf_pte(u64 pa, kvm_pte_t attr, s8 level)
+ {
+ 	kvm_pte_t pte = kvm_phys_to_pte(pa);
+@@ -175,6 +321,12 @@ static kvm_pte_t kvm_init_invalid_leaf_owner(u8 owner_id)
+ 	return FIELD_PREP(KVM_INVALID_PTE_OWNER_MASK, owner_id);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|375| <<__kvm_pgtable_visit>> ret = kvm_pgtable_visitor_cb(data, &ctx, KVM_PGTABLE_WALK_TABLE_PRE);
++ *   - arch/arm64/kvm/hyp/pgtable.c|380| <<__kvm_pgtable_visit>> ret = kvm_pgtable_visitor_cb(data, &ctx, KVM_PGTABLE_WALK_LEAF);
++ *   - arch/arm64/kvm/hyp/pgtable.c|409| <<__kvm_pgtable_visit>> ret = kvm_pgtable_visitor_cb(data, &ctx, KVM_PGTABLE_WALK_TABLE_POST);
++ */
+ static int kvm_pgtable_visitor_cb(struct kvm_pgtable_walk_data *data,
+ 				  const struct kvm_pgtable_visit_ctx *ctx,
+ 				  enum kvm_pgtable_walk_flags visit)
+@@ -186,6 +338,12 @@ static int kvm_pgtable_visitor_cb(struct kvm_pgtable_walk_data *data,
+ 	return walker->cb(ctx, visit);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|394| <<__kvm_pgtable_visit>> if (!kvm_pgtable_walk_continue(data->walker, ret))
++ *   - arch/arm64/kvm/hyp/pgtable.c|405| <<__kvm_pgtable_visit>> if (!kvm_pgtable_walk_continue(data->walker, ret))
++ *   - arch/arm64/kvm/hyp/pgtable.c|412| <<__kvm_pgtable_visit>> if (kvm_pgtable_walk_continue(data->walker, ret))
++ */
+ static bool kvm_pgtable_walk_continue(const struct kvm_pgtable_walker *walker,
+ 				      int r)
+ {
+@@ -199,6 +357,11 @@ static bool kvm_pgtable_walk_continue(const struct kvm_pgtable_walker *walker,
+ 	 * (e.g. write protecting a range of memory) and chug along with the
+ 	 * page table walk.
+ 	 */
++	/*
++	 * 注释:
++	 * @KVM_PGTABLE_WALK_HANDLE_FAULT:      Indicates the page-table walk was
++	 *                                      invoked from a fault handler.
++	 */
+ 	if (r == -EAGAIN)
+ 		return !(walker->flags & KVM_PGTABLE_WALK_HANDLE_FAULT);
+ 
+@@ -208,6 +371,12 @@ static bool kvm_pgtable_walk_continue(const struct kvm_pgtable_walker *walker,
+ static int __kvm_pgtable_walk(struct kvm_pgtable_walk_data *data,
+ 			      struct kvm_pgtable_mm_ops *mm_ops, kvm_pteref_t pgtable, s8 level);
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|300| <<__kvm_pgtable_walk>> ret = __kvm_pgtable_visit(data, mm_ops, pteref, level);
++ *
++ * __kvm_pgtable_walk()的使用者
++ */
+ static inline int __kvm_pgtable_visit(struct kvm_pgtable_walk_data *data,
+ 				      struct kvm_pgtable_mm_ops *mm_ops,
+ 				      kvm_pteref_t pteref, s8 level)
+@@ -228,9 +397,18 @@ static inline int __kvm_pgtable_visit(struct kvm_pgtable_walk_data *data,
+ 	int ret = 0;
+ 	bool reload = false;
+ 	kvm_pteref_t childp;
++	/*
++	 * 是table还是huge page??
++	 */
+ 	bool table = kvm_pte_table(ctx.old, level);
+ 
+ 	if (table && (ctx.flags & KVM_PGTABLE_WALK_TABLE_PRE)) {
++		/*
++		 * called by:
++		 *   - arch/arm64/kvm/hyp/pgtable.c|375| <<__kvm_pgtable_visit>> ret = kvm_pgtable_visitor_cb(data, &ctx, KVM_PGTABLE_WALK_TABLE_PRE);
++		 *   - arch/arm64/kvm/hyp/pgtable.c|380| <<__kvm_pgtable_visit>> ret = kvm_pgtable_visitor_cb(data, &ctx, KVM_PGTABLE_WALK_LEAF);
++		 *   - arch/arm64/kvm/hyp/pgtable.c|409| <<__kvm_pgtable_visit>> ret = kvm_pgtable_visitor_cb(data, &ctx, KVM_PGTABLE_WALK_TABLE_POST);
++		 */
+ 		ret = kvm_pgtable_visitor_cb(data, &ctx, KVM_PGTABLE_WALK_TABLE_PRE);
+ 		reload = true;
+ 	}
+@@ -260,10 +438,23 @@ static inline int __kvm_pgtable_visit(struct kvm_pgtable_walk_data *data,
+ 	}
+ 
+ 	childp = (kvm_pteref_t)kvm_pte_follow(ctx.old, mm_ops);
++	/*
++	 * called by:
++	 *   - arch/arm64/kvm/hyp/pgtable.c|263| <<__kvm_pgtable_visit>> ret = __kvm_pgtable_walk(data, mm_ops, childp, level + 1);
++	 *   - arch/arm64/kvm/hyp/pgtable.c|316| <<_kvm_pgtable_walk>> ret = __kvm_pgtable_walk(data, pgt->mm_ops, pteref, pgt->start_level);
++	 *   - arch/arm64/kvm/hyp/pgtable.c|1449| <<kvm_pgtable_stage2_create_unlinked>> ret = __kvm_pgtable_walk(&data, mm_ops, (kvm_pteref_t)pgtable,
++	 *   - arch/arm64/kvm/hyp/pgtable.c|1649| <<kvm_pgtable_stage2_free_unlinked>> WARN_ON(__kvm_pgtable_walk(&data, mm_ops, ptep, level + 1));
++	 */
+ 	ret = __kvm_pgtable_walk(data, mm_ops, childp, level + 1);
+ 	if (!kvm_pgtable_walk_continue(data->walker, ret))
+ 		goto out;
+ 
++	/*
++	 * called by:
++	 *   - arch/arm64/kvm/hyp/pgtable.c|375| <<__kvm_pgtable_visit>> ret = kvm_pgtable_visitor_cb(data, &ctx, KVM_PGTABLE_WALK_TABLE_PRE);
++	 *   - arch/arm64/kvm/hyp/pgtable.c|380| <<__kvm_pgtable_visit>> ret = kvm_pgtable_visitor_cb(data, &ctx, KVM_PGTABLE_WALK_LEAF);
++	 *   - arch/arm64/kvm/hyp/pgtable.c|409| <<__kvm_pgtable_visit>> ret = kvm_pgtable_visitor_cb(data, &ctx, KVM_PGTABLE_WALK_TABLE_POST);
++	 */
+ 	if (ctx.flags & KVM_PGTABLE_WALK_TABLE_POST)
+ 		ret = kvm_pgtable_visitor_cb(data, &ctx, KVM_PGTABLE_WALK_TABLE_POST);
+ 
+@@ -274,6 +465,13 @@ static inline int __kvm_pgtable_visit(struct kvm_pgtable_walk_data *data,
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|263| <<__kvm_pgtable_visit>> ret = __kvm_pgtable_walk(data, mm_ops, childp, level + 1);
++ *   - arch/arm64/kvm/hyp/pgtable.c|316| <<_kvm_pgtable_walk>> ret = __kvm_pgtable_walk(data, pgt->mm_ops, pteref, pgt->start_level);
++ *   - arch/arm64/kvm/hyp/pgtable.c|1449| <<kvm_pgtable_stage2_create_unlinked>> ret = __kvm_pgtable_walk(&data, mm_ops, (kvm_pteref_t)pgtable,
++ *   - arch/arm64/kvm/hyp/pgtable.c|1649| <<kvm_pgtable_stage2_free_unlinked>> WARN_ON(__kvm_pgtable_walk(&data, mm_ops, ptep, level + 1));
++ */
+ static int __kvm_pgtable_walk(struct kvm_pgtable_walk_data *data,
+ 			      struct kvm_pgtable_mm_ops *mm_ops, kvm_pteref_t pgtable, s8 level)
+ {
+@@ -284,12 +482,29 @@ static int __kvm_pgtable_walk(struct kvm_pgtable_walk_data *data,
+ 			 level > KVM_PGTABLE_LAST_LEVEL))
+ 		return -EINVAL;
+ 
++	/*
++	 * 下面的是Size mapped by an entry at level n ( 0 <= n <= 3)
++	 * level 3的一个entry map的大小是 1 << 12 = 4K, 一个page table就是2M
++	 * level 2的一个entry map的大小是 1 << 21 = 2M, 一个page table就是1G
++	 * level 1的一个entry map的大小是 1 << 30 = 1G, 一个page table就是512G
++	 * level 0的一个entry map的大小是 1 << 39 = 512G, 一个page table就是512G x 512
++	 *
++	 * level 3的一个entry叫PTE
++	 * level 2的一个entry叫PMD
++	 * level 1的一个entry叫PUD
++	 * level 0的一个entry叫P4D
++	 *
++	 * 只在此处调用kvm_pgtable_idx()
++	 */
+ 	for (idx = kvm_pgtable_idx(data, level); idx < PTRS_PER_PTE; ++idx) {
+ 		kvm_pteref_t pteref = &pgtable[idx];
+ 
+ 		if (data->addr >= data->end)
+ 			break;
+ 
++		/*
++		 * 只在此处调用
++		 */
+ 		ret = __kvm_pgtable_visit(data, mm_ops, pteref, level);
+ 		if (ret)
+ 			break;
+@@ -298,6 +513,22 @@ static int __kvm_pgtable_walk(struct kvm_pgtable_walk_data *data,
+ 	return ret;
+ }
+ 
++/*
++ * struct kvm_pgtable_walker walker = {
++ *     .cb             = stage2_attr_walker,
++ *     .arg            = &data,
++ *     .flags          = flags | KVM_PGTABLE_WALK_LEAF,
++ * };
++ *
++ * struct kvm_pgtable_walk_data walk_data:
++ * -> struct kvm_pgtable_walker *walker;
++ *    -> void * const arg; --> 好多例子, 比如stage2_attr_data
++ *
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|365| <<kvm_pgtable_walk>> r = _kvm_pgtable_walk(pgt, &walk_data);
++ *
++ * __kvm_pgtable_walk()的使用者
++ */
+ static int _kvm_pgtable_walk(struct kvm_pgtable *pgt, struct kvm_pgtable_walk_data *data)
+ {
+ 	u32 idx;
+@@ -310,9 +541,33 @@ static int _kvm_pgtable_walk(struct kvm_pgtable *pgt, struct kvm_pgtable_walk_da
+ 	if (!pgt->pgd)
+ 		return -EINVAL;
+ 
++	/*
++	 * level 3的一个entry叫PTE
++	 * level 2的一个entry叫PMD
++	 * level 1的一个entry叫PUD
++	 * level 0的一个entry叫P4D
++	 *
++	 * called by:
++	 *   - arch/arm64/kvm/hyp/pgtable.c|127| <<kvm_pgd_pages>> return kvm_pgd_page_idx(&pgt, -1ULL) + 1;
++	 *   - arch/arm64/kvm/hyp/pgtable.c|320| <<_kvm_pgtable_walk>> for (idx = kvm_pgd_page_idx(pgt, data->addr); data->addr < data->end; ++idx) {
++	 *
++	 * 根据pgt->start_level, 计算addr的index
++	 * 应该算是pgd的index吧(最高的???)
++	 */
+ 	for (idx = kvm_pgd_page_idx(pgt, data->addr); data->addr < data->end; ++idx) {
++		/*
++		 * struct kvm_pgtable *pgd:
++		 * -> kvm_pteref_t pgd;
++		 */
+ 		kvm_pteref_t pteref = &pgt->pgd[idx * PTRS_PER_PTE];
+ 
++		/*
++		 * called by:
++		 *   - arch/arm64/kvm/hyp/pgtable.c|263| <<__kvm_pgtable_visit>> ret = __kvm_pgtable_walk(data, mm_ops, childp, level + 1);
++		 *   - arch/arm64/kvm/hyp/pgtable.c|316| <<_kvm_pgtable_walk>> ret = __kvm_pgtable_walk(data, pgt->mm_ops, pteref, pgt->start_level);
++		 *   - arch/arm64/kvm/hyp/pgtable.c|1449| <<kvm_pgtable_stage2_create_unlinked>> ret = __kvm_pgtable_walk(&data, mm_ops, (kvm_pteref_t)pgtable,
++		 *   - arch/arm64/kvm/hyp/pgtable.c|1649| <<kvm_pgtable_stage2_free_unlinked>> WARN_ON(__kvm_pgtable_walk(&data, mm_ops, ptep, level + 1));
++		 */
+ 		ret = __kvm_pgtable_walk(data, pgt->mm_ops, pteref, pgt->start_level);
+ 		if (ret)
+ 			break;
+@@ -321,9 +576,39 @@ static int _kvm_pgtable_walk(struct kvm_pgtable *pgt, struct kvm_pgtable_walk_da
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/nvhe/mem_protect.c|598| <<check_page_state_range>> return kvm_pgtable_walk(pgt, addr, size, &walker);
++ *   - arch/arm64/kvm/hyp/nvhe/mm.c|302| <<create_fixmap_slot>> return kvm_pgtable_walk(&pkvm_pgtable, addr, PAGE_SIZE, &walker);
++ *   - arch/arm64/kvm/hyp/nvhe/setup.c|238| <<fix_host_ownership>> ret = kvm_pgtable_walk(&pkvm_pgtable, start, reg->size, &walker);
++ *   - arch/arm64/kvm/hyp/nvhe/setup.c|254| <<fix_hyp_pgtable_refcnt>> return kvm_pgtable_walk(&pkvm_pgtable, 0, BIT(pkvm_pgtable.ia_bits),
++ *   - arch/arm64/kvm/hyp/pgtable.c|372| <<kvm_pgtable_get_leaf>> ret = kvm_pgtable_walk(pgt, ALIGN_DOWN(addr, PAGE_SIZE),
++ *   - arch/arm64/kvm/hyp/pgtable.c|506| <<kvm_pgtable_hyp_map>> ret = kvm_pgtable_walk(pgt, addr, size, &walker);
++ *   - arch/arm64/kvm/hyp/pgtable.c|564| <<kvm_pgtable_hyp_unmap>> kvm_pgtable_walk(pgt, addr, size, &walker);
++ *   - arch/arm64/kvm/hyp/pgtable.c|614| <<kvm_pgtable_hyp_destroy>> WARN_ON(kvm_pgtable_walk(pgt, 0, BIT(pgt->ia_bits), &walker));
++ *   - arch/arm64/kvm/hyp/pgtable.c|1105| <<kvm_pgtable_stage2_map>> ret = kvm_pgtable_walk(pgt, addr, size, &walker);
++ *   - arch/arm64/kvm/hyp/pgtable.c|1131| <<kvm_pgtable_stage2_set_owner>> ret = kvm_pgtable_walk(pgt, addr, size, &walker);
++ *   - arch/arm64/kvm/hyp/pgtable.c|1187| <<kvm_pgtable_stage2_unmap>> ret = kvm_pgtable_walk(pgt, addr, size, &walker);
++ *   - arch/arm64/kvm/hyp/pgtable.c|1266| <<stage2_update_leaf_attrs>> ret = kvm_pgtable_walk(pgt, addr, size, &walker);
++ *   - arch/arm64/kvm/hyp/pgtable.c|1346| <<kvm_pgtable_stage2_test_clear_young>> WARN_ON(kvm_pgtable_walk(pgt, addr, size, &walker));
++ *   - arch/arm64/kvm/hyp/pgtable.c|1403| <<kvm_pgtable_stage2_flush>> return kvm_pgtable_walk(pgt, addr, size, &walker);
++ *   - arch/arm64/kvm/hyp/pgtable.c|1558| <<kvm_pgtable_stage2_split>> return kvm_pgtable_walk(pgt, addr, size, &walker);
++ *   - arch/arm64/kvm/hyp/pgtable.c|1623| <<kvm_pgtable_stage2_destroy>> WARN_ON(kvm_pgtable_walk(pgt, 0, BIT(pgt->ia_bits), &walker));
++ */
+ int kvm_pgtable_walk(struct kvm_pgtable *pgt, u64 addr, u64 size,
+ 		     struct kvm_pgtable_walker *walker)
+ {
++	/*
++	 * struct kvm_pgtable_walker walker = {
++	 *     .cb             = stage2_attr_walker,
++	 *     .arg            = &data,
++	 *     .flags          = flags | KVM_PGTABLE_WALK_LEAF,
++	 * };
++	 *
++	 * struct kvm_pgtable_walk_data walk_data:
++	 * -> struct kvm_pgtable_walker *walker;
++	 *    -> void * const arg; --> 好多例子, 比如stage2_attr_data
++	 */
+ 	struct kvm_pgtable_walk_data walk_data = {
+ 		.start	= ALIGN_DOWN(addr, PAGE_SIZE),
+ 		.addr	= ALIGN_DOWN(addr, PAGE_SIZE),
+@@ -347,6 +632,10 @@ struct leaf_walk_data {
+ 	s8		level;
+ };
+ 
++/*
++ * 在以下使用leaf_walker():
++ *   - arch/arm64/kvm/hyp/pgtable.c|649| <<kvm_pgtable_get_leaf>> .cb = leaf_walker,
++ */
+ static int leaf_walker(const struct kvm_pgtable_visit_ctx *ctx,
+ 		       enum kvm_pgtable_walk_flags visit)
+ {
+@@ -358,6 +647,13 @@ static int leaf_walker(const struct kvm_pgtable_visit_ctx *ctx,
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/nvhe/mem_protect.c|450| <<host_stage2_adjust_range>> ret = kvm_pgtable_get_leaf(&host_mmu.pgt, addr, &pte, &level);
++ *   - arch/arm64/kvm/mmu.c|845| <<get_user_mapping_size>> ret = kvm_pgtable_get_leaf(&pgt, addr, &pte, &level);
++ *
++ * kvm_pgtable_walk()的使用者
++ */
+ int kvm_pgtable_get_leaf(struct kvm_pgtable *pgt, u64 addr,
+ 			 kvm_pte_t *ptep, s8 *level)
+ {
+@@ -386,6 +682,10 @@ struct hyp_map_data {
+ 	kvm_pte_t			attr;
+ };
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|788| <<kvm_pgtable_hyp_map>> ret = hyp_set_prot_attr(prot, &map_data.attr);
++ */
+ static int hyp_set_prot_attr(enum kvm_pgtable_prot prot, kvm_pte_t *ptep)
+ {
+ 	bool device = prot & KVM_PGTABLE_PROT_DEVICE;
+@@ -421,6 +721,11 @@ static int hyp_set_prot_attr(enum kvm_pgtable_prot prot, kvm_pte_t *ptep)
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/nvhe/mem_protect.c|720| <<hyp_get_page_state>> return pkvm_getstate(kvm_pgtable_hyp_pte_prot(pte));
++ *   - arch/arm64/kvm/hyp/nvhe/setup.c|195| <<fix_host_ownership_walker>> state = pkvm_getstate(kvm_pgtable_hyp_pte_prot(ctx->old));
++ */
+ enum kvm_pgtable_prot kvm_pgtable_hyp_pte_prot(kvm_pte_t pte)
+ {
+ 	enum kvm_pgtable_prot prot = pte & KVM_PTE_LEAF_ATTR_HI_SW;
+@@ -441,6 +746,10 @@ enum kvm_pgtable_prot kvm_pgtable_hyp_pte_prot(kvm_pte_t pte)
+ 	return prot;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|755| <<hyp_map_walker>> if (hyp_map_walker_try_leaf(ctx, data))
++ */
+ static bool hyp_map_walker_try_leaf(const struct kvm_pgtable_visit_ctx *ctx,
+ 				    struct hyp_map_data *data)
+ {
+@@ -462,6 +771,10 @@ static bool hyp_map_walker_try_leaf(const struct kvm_pgtable_visit_ctx *ctx,
+ 	return true;
+ }
+ 
++/*
++ * 在以下使用hyp_map_walker():
++ *   - arch/arm64/kvm/hyp/pgtable.c|796| <<kvm_pgtable_hyp_map>> .cb = hyp_map_walker,
++ */
+ static int hyp_map_walker(const struct kvm_pgtable_visit_ctx *ctx,
+ 			  enum kvm_pgtable_walk_flags visit)
+ {
+@@ -486,6 +799,9 @@ static int hyp_map_walker(const struct kvm_pgtable_visit_ctx *ctx,
+ 	return 0;
+ }
+ 
++/*
++ * kvm_pgtable_walk()的使用者
++ */
+ int kvm_pgtable_hyp_map(struct kvm_pgtable *pgt, u64 addr, u64 size, u64 phys,
+ 			enum kvm_pgtable_prot prot)
+ {
+@@ -509,6 +825,10 @@ int kvm_pgtable_hyp_map(struct kvm_pgtable *pgt, u64 addr, u64 size, u64 phys,
+ 	return ret;
+ }
+ 
++/*
++ * 在以下使用hyp_unmap_walker():
++ *   - arch/arm64/kvm/hyp/pgtable.c|858| <<kvm_pgtable_hyp_unmap>> .cb = hyp_unmap_walker,
++ */
+ static int hyp_unmap_walker(const struct kvm_pgtable_visit_ctx *ctx,
+ 			    enum kvm_pgtable_walk_flags visit)
+ {
+@@ -549,6 +869,9 @@ static int hyp_unmap_walker(const struct kvm_pgtable_visit_ctx *ctx,
+ 	return 0;
+ }
+ 
++/*
++ * kvm_pgtable_walk()的使用者
++ */
+ u64 kvm_pgtable_hyp_unmap(struct kvm_pgtable *pgt, u64 addr, u64 size)
+ {
+ 	u64 unmapped = 0;
+@@ -565,6 +888,11 @@ u64 kvm_pgtable_hyp_unmap(struct kvm_pgtable *pgt, u64 addr, u64 size)
+ 	return unmapped;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/nvhe/setup.c|81| <<recreate_hyp_mappings>> ret = kvm_pgtable_hyp_init(&pkvm_pgtable, hyp_va_bits, &hyp_early_alloc_mm_ops);
++ *   - arch/arm64/kvm/mmu.c|2050| <<kvm_mmu_init>> err = kvm_pgtable_hyp_init(hyp_pgtable, *hyp_va_bits, &kvm_hyp_mm_ops);
++ */
+ int kvm_pgtable_hyp_init(struct kvm_pgtable *pgt, u32 va_bits,
+ 			 struct kvm_pgtable_mm_ops *mm_ops)
+ {
+@@ -588,6 +916,10 @@ int kvm_pgtable_hyp_init(struct kvm_pgtable *pgt, u32 va_bits,
+ 	return 0;
+ }
+ 
++/*
++ * 在以下使用hyp_free_walker():
++ *   - arch/arm64/kvm/hyp/pgtable.c|915| <<kvm_pgtable_hyp_destroy>> .cb = hyp_free_walker,
++ */
+ static int hyp_free_walker(const struct kvm_pgtable_visit_ctx *ctx,
+ 			   enum kvm_pgtable_walk_flags visit)
+ {
+@@ -604,6 +936,9 @@ static int hyp_free_walker(const struct kvm_pgtable_visit_ctx *ctx,
+ 	return 0;
+ }
+ 
++/*
++ * kvm_pgtable_walk()的使用者
++ */
+ void kvm_pgtable_hyp_destroy(struct kvm_pgtable *pgt)
+ {
+ 	struct kvm_pgtable_walker walker = {
+@@ -631,6 +966,11 @@ struct stage2_map_data {
+ 	bool				force_pte;
+ };
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/nvhe/mem_protect.c|132| <<prepare_host_vtcr>> host_mmu.arch.mmu.vtcr = kvm_get_vtcr(id_aa64mmfr0_el1_sys_val, id_aa64mmfr1_el1_sys_val, phys_shift);
++ *   - arch/arm64/kvm/mmu.c|925| <<kvm_init_stage2_mmu>> mmu->vtcr = kvm_get_vtcr(mmfr0, mmfr1, phys_shift);
++ */
+ u64 kvm_get_vtcr(u64 mmfr0, u64 mmfr1, u32 phys_shift)
+ {
+ 	u64 vtcr = VTCR_EL2_FLAGS;
+@@ -684,6 +1024,13 @@ u64 kvm_get_vtcr(u64 mmfr0, u64 mmfr1, u32 phys_shift)
+ 	return vtcr;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|1045| <<KVM_S2_MEMATTR>> #define KVM_S2_MEMATTR(pgt, attr) PAGE_S2_MEMATTR(attr, stage2_has_fwb(pgt))
++ *   - arch/arm64/kvm/hyp/pgtable.c|1232| <<stage2_unmap_defer_tlb_flush>> return system_supports_tlb_range() && stage2_has_fwb(pgt);
++ *   - arch/arm64/kvm/hyp/pgtable.c|1576| <<stage2_unmap_walker>> need_flush = !stage2_has_fwb(pgt);
++ *   - arch/arm64/kvm/hyp/pgtable.c|1933| <<kvm_pgtable_stage2_flush>> if (stage2_has_fwb(pgt))
++ */
+ static bool stage2_has_fwb(struct kvm_pgtable *pgt)
+ {
+ 	if (!cpus_have_final_cap(ARM64_HAS_STAGE2_FWB))
+@@ -692,6 +1039,12 @@ static bool stage2_has_fwb(struct kvm_pgtable *pgt)
+ 	return !(pgt->flags & KVM_PGTABLE_S2_NOFWB);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|1186| <<stage2_try_break_pte>> kvm_tlb_flush_vmid_range(mmu, addr, size);
++ *   - arch/arm64/kvm/hyp/pgtable.c|1611| <<kvm_pgtable_stage2_unmap>> kvm_tlb_flush_vmid_range(pgt->mmu, addr, size);
++ *   - arch/arm64/kvm/mmu.c|178| <<kvm_arch_flush_remote_tlbs_range>> kvm_tlb_flush_vmid_range(&kvm->arch.mmu, gfn << PAGE_SHIFT, nr_pages << PAGE_SHIFT);
++ */
+ void kvm_tlb_flush_vmid_range(struct kvm_s2_mmu *mmu,
+ 				phys_addr_t addr, size_t size)
+ {
+@@ -714,6 +1067,11 @@ void kvm_tlb_flush_vmid_range(struct kvm_s2_mmu *mmu,
+ 
+ #define KVM_S2_MEMATTR(pgt, attr) PAGE_S2_MEMATTR(attr, stage2_has_fwb(pgt))
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|1512| <<kvm_pgtable_stage2_map>> ret = stage2_set_prot_attr(pgt, prot, &map_data.attr);
++ *   - arch/arm64/kvm/hyp/pgtable.c|1977| <<kvm_pgtable_stage2_create_unlinked>> ret = stage2_set_prot_attr(pgt, prot, &map_data.attr);
++ */
+ static int stage2_set_prot_attr(struct kvm_pgtable *pgt, enum kvm_pgtable_prot prot,
+ 				kvm_pte_t *ptep)
+ {
+@@ -797,6 +1155,12 @@ static bool stage2_pte_is_locked(kvm_pte_t pte)
+ 	return !kvm_pte_valid(pte) && (pte & KVM_INVALID_PTE_LOCKED);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|1168| <<stage2_try_break_pte>> if (!stage2_try_set_pte(ctx, KVM_INVALID_PTE_LOCKED))
++ *   - arch/arm64/kvm/hyp/pgtable.c|1646| <<stage2_attr_walker>> if (!stage2_try_set_pte(ctx, pte))
++ *   - arch/arm64/kvm/hyp/pgtable.c|1788| <<stage2_age_walker>> if (data->mkold && !stage2_try_set_pte(ctx, new))
++ */
+ static bool stage2_try_set_pte(const struct kvm_pgtable_visit_ctx *ctx, kvm_pte_t new)
+ {
+ 	if (!kvm_pgtable_walk_shared(ctx)) {
+@@ -860,6 +1224,12 @@ static bool stage2_try_break_pte(const struct kvm_pgtable_visit_ctx *ctx,
+ 	return true;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|1366| <<stage2_map_walker_try_leaf>> stage2_make_pte(ctx, new);
++ *   - arch/arm64/kvm/hyp/pgtable.c|1429| <<stage2_map_walk_leaf>> stage2_make_pte(ctx, new);
++ *   - arch/arm64/kvm/hyp/pgtable.c|2071| <<stage2_split_walker>> stage2_make_pte(ctx, new);
++ */
+ static void stage2_make_pte(const struct kvm_pgtable_visit_ctx *ctx, kvm_pte_t new)
+ {
+ 	struct kvm_pgtable_mm_ops *mm_ops = ctx->mm_ops;
+@@ -872,6 +1242,11 @@ static void stage2_make_pte(const struct kvm_pgtable_visit_ctx *ctx, kvm_pte_t n
+ 	smp_store_release(ctx->ptep, new);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|1239| <<stage2_unmap_put_pte>> } else if (!stage2_unmap_defer_tlb_flush(pgt)) {
++ *   - arch/arm64/kvm/hyp/pgtable.c|1592| <<kvm_pgtable_stage2_unmap>> if (stage2_unmap_defer_tlb_flush(pgt))
++ */
+ static bool stage2_unmap_defer_tlb_flush(struct kvm_pgtable *pgt)
+ {
+ 	/*
+@@ -885,6 +1260,10 @@ static bool stage2_unmap_defer_tlb_flush(struct kvm_pgtable *pgt)
+ 	return system_supports_tlb_range() && stage2_has_fwb(pgt);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|1509| <<stage2_unmap_walker>> stage2_unmap_put_pte(ctx, mmu, mm_ops);
++ */
+ static void stage2_unmap_put_pte(const struct kvm_pgtable_visit_ctx *ctx,
+ 				struct kvm_s2_mmu *mmu,
+ 				struct kvm_pgtable_mm_ops *mm_ops)
+@@ -911,17 +1290,33 @@ static void stage2_unmap_put_pte(const struct kvm_pgtable_visit_ctx *ctx,
+ 	mm_ops->put_page(ctx->ptep);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|1308| <<stage2_map_walker_try_leaf>> stage2_pte_cacheable(pgt, new))
++ *   - arch/arm64/kvm/hyp/pgtable.c|1500| <<stage2_unmap_walker>> } else if (stage2_pte_cacheable(pgt, ctx->old)) {
++ *   - arch/arm64/kvm/hyp/pgtable.c|1838| <<stage2_flush_walker>> if (!kvm_pte_valid(ctx->old) || !stage2_pte_cacheable(pgt, ctx->old))
++ */
+ static bool stage2_pte_cacheable(struct kvm_pgtable *pgt, kvm_pte_t pte)
+ {
+ 	u64 memattr = pte & KVM_PTE_LEAF_ATTR_LO_S2_MEMATTR;
+ 	return memattr == KVM_S2_MEMATTR(pgt, NORMAL);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|1313| <<stage2_map_walker_try_leaf>> stage2_pte_executable(new))
++ *   - arch/arm64/kvm/hyp/pgtable.c|1584| <<stage2_attr_walker>> stage2_pte_executable(pte) && !stage2_pte_executable(ctx->old))
++ */
+ static bool stage2_pte_executable(kvm_pte_t pte)
+ {
+ 	return !(pte & KVM_PTE_LEAF_ATTR_HI_S2_XN);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|1253| <<stage2_leaf_mapping_allowed>> u64 phys = stage2_map_walker_phys_addr(ctx, data);
++ *   - arch/arm64/kvm/hyp/pgtable.c|1281| <<stage2_map_walker_try_leaf>> u64 phys = stage2_map_walker_phys_addr(ctx, data);
++ */
+ static u64 stage2_map_walker_phys_addr(const struct kvm_pgtable_visit_ctx *ctx,
+ 				       const struct stage2_map_data *data)
+ {
+@@ -942,6 +1337,11 @@ static u64 stage2_map_walker_phys_addr(const struct kvm_pgtable_visit_ctx *ctx,
+ 	return phys + (ctx->addr - ctx->start);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|1286| <<stage2_map_walker_try_leaf>> if (!stage2_leaf_mapping_allowed(ctx, data))
++ *   - arch/arm64/kvm/hyp/pgtable.c|1328| <<stage2_map_walk_table_pre>> if (!stage2_leaf_mapping_allowed(ctx, data))
++ */
+ static bool stage2_leaf_mapping_allowed(const struct kvm_pgtable_visit_ctx *ctx,
+ 					struct stage2_map_data *data)
+ {
+@@ -953,6 +1353,22 @@ static bool stage2_leaf_mapping_allowed(const struct kvm_pgtable_visit_ctx *ctx,
+ 	return kvm_block_mapping_supported(ctx, phys);
+ }
+ 
++/*
++ * |              __kvm_pgtable_walk() {
++ * |                stage2_map_walker() { 
++ * |                  stage2_map_walk_leaf() {
++ * |                    stage2_map_walker_try_leaf() {
++ * |                      stage2_has_fwb();
++ * |                      kvm_host_va();
++ * |                      clean_dcache_guest_page();
++ * |                      kvm_host_va();
++ * |                      invalidate_icache_guest_page() {
++ * |                        do_interrupt_handler() {
++ *
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|1010| <<stage2_map_walk_table_pre>> ret = stage2_map_walker_try_leaf(ctx, data);
++ *   - arch/arm64/kvm/hyp/pgtable.c|1025| <<stage2_map_walk_leaf>> ret = stage2_map_walker_try_leaf(ctx, data);
++ */
+ static int stage2_map_walker_try_leaf(const struct kvm_pgtable_visit_ctx *ctx,
+ 				      struct stage2_map_data *data)
+ {
+@@ -997,6 +1413,10 @@ static int stage2_map_walker_try_leaf(const struct kvm_pgtable_visit_ctx *ctx,
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|1402| <<stage2_map_walker>> return stage2_map_walk_table_pre(ctx, data);
++ */
+ static int stage2_map_walk_table_pre(const struct kvm_pgtable_visit_ctx *ctx,
+ 				     struct stage2_map_data *data)
+ {
+@@ -1015,6 +1435,10 @@ static int stage2_map_walk_table_pre(const struct kvm_pgtable_visit_ctx *ctx,
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|1073| <<stage2_map_walker>> return stage2_map_walk_leaf(ctx, data);
++ */
+ static int stage2_map_walk_leaf(const struct kvm_pgtable_visit_ctx *ctx,
+ 				struct stage2_map_data *data)
+ {
+@@ -1061,6 +1485,12 @@ static int stage2_map_walk_leaf(const struct kvm_pgtable_visit_ctx *ctx,
+  * Otherwise, the LEAF callback performs the mapping at the existing leaves
+  * instead.
+  */
++/*
++ * 在以下使用stage2_map_walker():
++ *   - arch/arm64/kvm/hyp/pgtable.c|1091| <<kvm_pgtable_stage2_map>> .cb = stage2_map_walker,
++ *   - arch/arm64/kvm/hyp/pgtable.c|1122| <<kvm_pgtable_stage2_set_owner>> .cb = stage2_map_walker,
++ *   - arch/arm64/kvm/hyp/pgtable.c|1418| <<kvm_pgtable_stage2_create_unlinked>> .cb = stage2_map_walker,
++ */
+ static int stage2_map_walker(const struct kvm_pgtable_visit_ctx *ctx,
+ 			     enum kvm_pgtable_walk_flags visit)
+ {
+@@ -1076,6 +1506,15 @@ static int stage2_map_walker(const struct kvm_pgtable_visit_ctx *ctx,
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/nvhe/mem_protect.c|413| <<__host_stage2_idmap>> return kvm_pgtable_stage2_map(&host_mmu.pgt, start, end - start, start, prot, &host_s2_pool, 0);
++ *   - arch/arm64/kvm/mmu.c|1111| <<kvm_phys_addr_ioremap>> ret = kvm_pgtable_stage2_map(pgt, addr, PAGE_SIZE, pa, prot, &cache, 0);
++ *   - arch/arm64/kvm/mmu.c|1603| <<user_mem_abort>> ret = kvm_pgtable_stage2_map(pgt, fault_ipa, vma_pagesize, __pfn_to_phys(pfn), prot, memcache, KVM_PGTABLE_WALK_HANDLE_FAULT | KVM_PGTABLE_WALK_SHARED);
++ *   - arch/arm64/kvm/mmu.c|1871| <<kvm_set_spte_gfn>> kvm_pgtable_stage2_map(kvm->arch.mmu.pgt, range->start << PAGE_SHIFT, PAGE_SIZE, __pfn_to_phys(pfn), KVM_PGTABLE_PROT_R, NULL, 0);
++ *
++ * kvm_pgtable_walk()的使用者
++ */
+ int kvm_pgtable_stage2_map(struct kvm_pgtable *pgt, u64 addr, u64 size,
+ 			   u64 phys, enum kvm_pgtable_prot prot,
+ 			   void *mc, enum kvm_pgtable_walk_flags flags)
+@@ -1107,6 +1546,9 @@ int kvm_pgtable_stage2_map(struct kvm_pgtable *pgt, u64 addr, u64 size,
+ 	return ret;
+ }
+ 
++/*
++ * kvm_pgtable_walk()的使用者
++ */
+ int kvm_pgtable_stage2_set_owner(struct kvm_pgtable *pgt, u64 addr, u64 size,
+ 				 void *mc, u8 owner_id)
+ {
+@@ -1132,6 +1574,10 @@ int kvm_pgtable_stage2_set_owner(struct kvm_pgtable *pgt, u64 addr, u64 size,
+ 	return ret;
+ }
+ 
++/*
++ * 在以下使用stage2_unmap_walker():
++ *   - arch/arm64/kvm/hyp/pgtable.c|1528| <<kvm_pgtable_stage2_unmap>> .cb = stage2_unmap_walker,
++ */
+ static int stage2_unmap_walker(const struct kvm_pgtable_visit_ctx *ctx,
+ 			       enum kvm_pgtable_walk_flags visit)
+ {
+@@ -1175,6 +1621,9 @@ static int stage2_unmap_walker(const struct kvm_pgtable_visit_ctx *ctx,
+ 	return 0;
+ }
+ 
++/*
++ * kvm_pgtable_walk()的使用者
++ */
+ int kvm_pgtable_stage2_unmap(struct kvm_pgtable *pgt, u64 addr, u64 size)
+ {
+ 	int ret;
+@@ -1199,6 +1648,16 @@ struct stage2_attr_data {
+ 	s8				level;
+ };
+ 
++/*
++ * 在以下使用stage2_attr_walker():
++ *   - arch/arm64/kvm/hyp/pgtable.c|1251| <<stage2_update_leaf_attrs>> .cb = stage2_attr_walker,
++ *
++ * 1254         struct kvm_pgtable_walker walker = {
++ * 1255                 .cb             = stage2_attr_walker,
++ * 1256                 .arg            = &data,
++ * 1257                 .flags          = flags | KVM_PGTABLE_WALK_LEAF,
++ * 1258         };
++ */
+ static int stage2_attr_walker(const struct kvm_pgtable_visit_ctx *ctx,
+ 			      enum kvm_pgtable_walk_flags visit)
+ {
+@@ -1236,6 +1695,33 @@ static int stage2_attr_walker(const struct kvm_pgtable_visit_ctx *ctx,
+ 	return 0;
+ }
+ 
++/*
++ * flags的例子. 
++ * enum kvm_pgtable_walk_flags - Flags to control a depth-first page-table walk.
++ * @KVM_PGTABLE_WALK_LEAF:              Visit leaf entries, including invalid
++ *                                      entries.
++ * @KVM_PGTABLE_WALK_TABLE_PRE:         Visit table entries before their
++ *                                      children.
++ * @KVM_PGTABLE_WALK_TABLE_POST:        Visit table entries after their
++ *                                      children.
++ * @KVM_PGTABLE_WALK_SHARED:            Indicates the page-tables may be shared
++ *                                      with other software walkers.
++ * @KVM_PGTABLE_WALK_HANDLE_FAULT:      Indicates the page-table walk was
++ *                                      invoked from a fault handler.
++ * @KVM_PGTABLE_WALK_SKIP_BBM_TLBI:     Visit and update table entries
++ *                                      without Break-before-make's
++ *                                      TLB invalidation.
++ * @KVM_PGTABLE_WALK_SKIP_CMO:          Visit and update table entries
++ *                                      without Cache maintenance
++ *                                      operations required.
++ *
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|1321| <<kvm_pgtable_stage2_wrprotect>> return stage2_update_leaf_attrs(pgt, addr, size, 0, KVM_PTE_LEAF_ATTR_LO_S2_S2AP_W, NULL, NULL, 0);
++ *   - arch/arm64/kvm/hyp/pgtable.c|1331| <<kvm_pgtable_stage2_mkyoung>> ret = stage2_update_leaf_attrs(pgt, addr, 1, KVM_PTE_LEAF_ATTR_LO_S2_AF, 0, &pte, NULL, KVM_PGTABLE_WALK_HANDLE_FAULT | KVM_PGTABLE_WALK_SHARED);
++ *   - arch/arm64/kvm/hyp/pgtable.c|1410| <<kvm_pgtable_stage2_relax_perms>> ret = stage2_update_leaf_attrs(pgt, addr, 1, set, clr, NULL, &level, KVM_PGTABLE_WALK_HANDLE_FAULT | KVM_PGTABLE_WALK_SHARED);
++ *
++ * kvm_pgtable_walk()的使用者
++ */
+ static int stage2_update_leaf_attrs(struct kvm_pgtable *pgt, u64 addr,
+ 				    u64 size, kvm_pte_t attr_set,
+ 				    kvm_pte_t attr_clr, kvm_pte_t *orig_pte,
+@@ -1243,6 +1729,14 @@ static int stage2_update_leaf_attrs(struct kvm_pgtable *pgt, u64 addr,
+ {
+ 	int ret;
+ 	kvm_pte_t attr_mask = KVM_PTE_LEAF_ATTR_LO | KVM_PTE_LEAF_ATTR_HI;
++	/*
++	 * struct stage2_attr_data {
++	 *     kvm_pte_t attr_set;
++	 *     kvm_pte_t attr_clr;
++	 *     kvm_pte_t pte;
++	 *     s8 level;
++	 * };
++	 */
+ 	struct stage2_attr_data data = {
+ 		.attr_set	= attr_set & attr_mask,
+ 		.attr_clr	= attr_clr & attr_mask,
+@@ -1253,6 +1747,25 @@ static int stage2_update_leaf_attrs(struct kvm_pgtable *pgt, u64 addr,
+ 		.flags		= flags | KVM_PGTABLE_WALK_LEAF,
+ 	};
+ 
++	/*
++	 * called by:
++	 *   - arch/arm64/kvm/hyp/nvhe/mem_protect.c|598| <<check_page_state_range>> return kvm_pgtable_walk(pgt, addr, size, &walker);
++	 *   - arch/arm64/kvm/hyp/nvhe/mm.c|302| <<create_fixmap_slot>> return kvm_pgtable_walk(&pkvm_pgtable, addr, PAGE_SIZE, &walker);
++	 *   - arch/arm64/kvm/hyp/nvhe/setup.c|238| <<fix_host_ownership>> ret = kvm_pgtable_walk(&pkvm_pgtable, start, reg->size, &walker);
++	 *   - arch/arm64/kvm/hyp/nvhe/setup.c|254| <<fix_hyp_pgtable_refcnt>> return kvm_pgtable_walk(&pkvm_pgtable, 0, BIT(pkvm_pgtable.ia_bits),
++	 *   - arch/arm64/kvm/hyp/pgtable.c|372| <<kvm_pgtable_get_leaf>> ret = kvm_pgtable_walk(pgt, ALIGN_DOWN(addr, PAGE_SIZE),
++	 *   - arch/arm64/kvm/hyp/pgtable.c|506| <<kvm_pgtable_hyp_map>> ret = kvm_pgtable_walk(pgt, addr, size, &walker);
++	 *   - arch/arm64/kvm/hyp/pgtable.c|564| <<kvm_pgtable_hyp_unmap>> kvm_pgtable_walk(pgt, addr, size, &walker);
++	 *   - arch/arm64/kvm/hyp/pgtable.c|614| <<kvm_pgtable_hyp_destroy>> WARN_ON(kvm_pgtable_walk(pgt, 0, BIT(pgt->ia_bits), &walker));
++	 *   - arch/arm64/kvm/hyp/pgtable.c|1105| <<kvm_pgtable_stage2_map>> ret = kvm_pgtable_walk(pgt, addr, size, &walker);
++	 *   - arch/arm64/kvm/hyp/pgtable.c|1131| <<kvm_pgtable_stage2_set_owner>> ret = kvm_pgtable_walk(pgt, addr, size, &walker);
++	 *   - arch/arm64/kvm/hyp/pgtable.c|1187| <<kvm_pgtable_stage2_unmap>> ret = kvm_pgtable_walk(pgt, addr, size, &walker);
++	 *   - arch/arm64/kvm/hyp/pgtable.c|1266| <<stage2_update_leaf_attrs>> ret = kvm_pgtable_walk(pgt, addr, size, &walker);
++	 *   - arch/arm64/kvm/hyp/pgtable.c|1346| <<kvm_pgtable_stage2_test_clear_young>> WARN_ON(kvm_pgtable_walk(pgt, addr, size, &walker));
++	 *   - arch/arm64/kvm/hyp/pgtable.c|1403| <<kvm_pgtable_stage2_flush>> return kvm_pgtable_walk(pgt, addr, size, &walker);
++	 *   - arch/arm64/kvm/hyp/pgtable.c|1558| <<kvm_pgtable_stage2_split>> return kvm_pgtable_walk(pgt, addr, size, &walker);
++	 *   - arch/arm64/kvm/hyp/pgtable.c|1623| <<kvm_pgtable_stage2_destroy>> WARN_ON(kvm_pgtable_walk(pgt, 0, BIT(pgt->ia_bits), &walker));
++	 */
+ 	ret = kvm_pgtable_walk(pgt, addr, size, &walker);
+ 	if (ret)
+ 		return ret;
+@@ -1272,6 +1785,10 @@ int kvm_pgtable_stage2_wrprotect(struct kvm_pgtable *pgt, u64 addr, u64 size)
+ 					NULL, NULL, 0);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/mmu.c|1683| <<handle_access_fault>> pte = kvm_pgtable_stage2_mkyoung(mmu->pgt, fault_ipa);
++ */
+ kvm_pte_t kvm_pgtable_stage2_mkyoung(struct kvm_pgtable *pgt, u64 addr)
+ {
+ 	kvm_pte_t pte = 0;
+@@ -1292,6 +1809,10 @@ struct stage2_age_data {
+ 	bool	young;
+ };
+ 
++/*
++ * 在以下使用stage2_age_walker():
++ *   - arch/arm64/kvm/hyp/pgtable.c|1727| <<kvm_pgtable_stage2_test_clear_young>> .cb = stage2_age_walker,
++ */
+ static int stage2_age_walker(const struct kvm_pgtable_visit_ctx *ctx,
+ 			     enum kvm_pgtable_walk_flags visit)
+ {
+@@ -1321,6 +1842,9 @@ static int stage2_age_walker(const struct kvm_pgtable_visit_ctx *ctx,
+ 	return 0;
+ }
+ 
++/*
++ * kvm_pgtable_walk()的使用者
++ */
+ bool kvm_pgtable_stage2_test_clear_young(struct kvm_pgtable *pgt, u64 addr,
+ 					 u64 size, bool mkold)
+ {
+@@ -1337,6 +1861,40 @@ bool kvm_pgtable_stage2_test_clear_young(struct kvm_pgtable *pgt, u64 addr,
+ 	return data.young;
+ }
+ 
++/*
++ * |        kvm_pgtable_stage2_relax_perms() {
++ * |          do_interrupt_handler() {
++ * |
++ * |            gic_handle_irq() {
++ * |              irq_enter() {
++ * |                irq_enter_rcu();
++ * |              }
++ * |              ipi_handler() {
++ * |                do_handle_IPI() {
++ * |                  arch_send_call_function_single_ipi() {
++ * |                    smp_cross_call() {
++ * |                      cpu_logical_map();
++ * |                      cpu_logical_map();
++ * |                    }
++ * |                  }
++ * |                }
++ * |              }
++ * |              irq_exit();
++ * |            }
++ * |
++ * |          }
++ * |          kvm_pgtable_walk() {
++ * |            __kvm_pgtable_walk() {
++ * |              kvm_host_va();
++ * |              __kvm_pgtable_walk() {
++ * |                stage2_attr_walker() {
++ * |                  kvm_host_va();
++ * |                  invalidate_icache_guest_page() {
++ * |                    do_interrupt_handler() {
++ *
++ * called by:
++ *   - arch/arm64/kvm/mmu.c|1601| <<user_mem_abort>> ret = kvm_pgtable_stage2_relax_perms(pgt, fault_ipa, prot);
++ */
+ int kvm_pgtable_stage2_relax_perms(struct kvm_pgtable *pgt, u64 addr,
+ 				   enum kvm_pgtable_prot prot)
+ {
+@@ -1356,6 +1914,12 @@ int kvm_pgtable_stage2_relax_perms(struct kvm_pgtable *pgt, u64 addr,
+ 	if (prot & KVM_PGTABLE_PROT_X)
+ 		clr |= KVM_PTE_LEAF_ATTR_HI_S2_XN;
+ 
++	/*
++	 * called by:
++	 *   - arch/arm64/kvm/hyp/pgtable.c|1321| <<kvm_pgtable_stage2_wrprotect>> return stage2_update_leaf_attrs(pgt, addr, size, 0, KVM_PTE_LEAF_ATTR_LO_S2_S2AP_W, NULL, NULL, 0);
++	 *   - arch/arm64/kvm/hyp/pgtable.c|1331| <<kvm_pgtable_stage2_mkyoung>> ret = stage2_update_leaf_attrs(pgt, addr, 1, KVM_PTE_LEAF_ATTR_LO_S2_AF, 0, &pte, NULL, KVM_PGTABLE_WALK_HANDLE_FAULT | KVM_PGTABLE_WALK_SHARED);
++	 *   - arch/arm64/kvm/hyp/pgtable.c|1410| <<kvm_pgtable_stage2_relax_perms>> ret = stage2_update_leaf_attrs(pgt, addr, 1, set, clr, NULL, &level, KVM_PGTABLE_WALK_HANDLE_FAULT | KVM_PGTABLE_WALK_SHARED);
++	 */
+ 	ret = stage2_update_leaf_attrs(pgt, addr, 1, set, clr, NULL, &level,
+ 				       KVM_PGTABLE_WALK_HANDLE_FAULT |
+ 				       KVM_PGTABLE_WALK_SHARED);
+@@ -1364,6 +1928,10 @@ int kvm_pgtable_stage2_relax_perms(struct kvm_pgtable *pgt, u64 addr,
+ 	return ret;
+ }
+ 
++/*
++ * 在以下使用stage2_flush_walker():
++ *   - arch/arm64/kvm/hyp/pgtable.c|1824| <<kvm_pgtable_stage2_flush>> .cb = stage2_flush_walker,
++ */
+ static int stage2_flush_walker(const struct kvm_pgtable_visit_ctx *ctx,
+ 			       enum kvm_pgtable_walk_flags visit)
+ {
+@@ -1379,6 +1947,9 @@ static int stage2_flush_walker(const struct kvm_pgtable_visit_ctx *ctx,
+ 	return 0;
+ }
+ 
++/*
++ * kvm_pgtable_walk()的使用者
++ */
+ int kvm_pgtable_stage2_flush(struct kvm_pgtable *pgt, u64 addr, u64 size)
+ {
+ 	struct kvm_pgtable_walker walker = {
+@@ -1393,6 +1964,9 @@ int kvm_pgtable_stage2_flush(struct kvm_pgtable *pgt, u64 addr, u64 size)
+ 	return kvm_pgtable_walk(pgt, addr, size, &walker);
+ }
+ 
++/*
++ * __kvm_pgtable_walk()的使用者
++ */
+ kvm_pte_t *kvm_pgtable_stage2_create_unlinked(struct kvm_pgtable *pgt,
+ 					      u64 phys, s8 level,
+ 					      enum kvm_pgtable_prot prot,
+@@ -1451,6 +2025,10 @@ kvm_pte_t *kvm_pgtable_stage2_create_unlinked(struct kvm_pgtable *pgt,
+  * fully populated tree up to the PTE entries. Note that @level is
+  * interpreted as in "level @level entry".
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|1930| <<stage2_split_walker>> nr_pages = stage2_block_get_nr_page_tables(level);
++ */
+ static int stage2_block_get_nr_page_tables(s8 level)
+ {
+ 	switch (level) {
+@@ -1467,6 +2045,10 @@ static int stage2_block_get_nr_page_tables(s8 level)
+ 	};
+ }
+ 
++/*
++ * 在以下使用stage2_split_walker():
++ *   - arch/arm64/kvm/hyp/pgtable.c|1985| <<kvm_pgtable_stage2_split>> .cb = stage2_split_walker,
++ */
+ static int stage2_split_walker(const struct kvm_pgtable_visit_ctx *ctx,
+ 			       enum kvm_pgtable_walk_flags visit)
+ {
+@@ -1536,6 +2118,9 @@ static int stage2_split_walker(const struct kvm_pgtable_visit_ctx *ctx,
+ 	return 0;
+ }
+ 
++/*
++ * kvm_pgtable_walk()的使用者
++ */
+ int kvm_pgtable_stage2_split(struct kvm_pgtable *pgt, u64 addr, u64 size,
+ 			     struct kvm_mmu_memory_cache *mc)
+ {
+@@ -1548,6 +2133,24 @@ int kvm_pgtable_stage2_split(struct kvm_pgtable *pgt, u64 addr, u64 size,
+ 	return kvm_pgtable_walk(pgt, addr, size, &walker);
+ }
+ 
++/*
++ * crash> struct kvm_pgtable ffff3fffe4412800
++ * struct kvm_pgtable {
++ *   ia_bits = 40,
++ *   start_level = 1,
++ *   pgd = 0xffff3fff920cc000,
++ *   mm_ops = 0xffffbb087c3a3768 <kvm_s2_mm_ops>,
++ *   mmu = 0xffff800080e1d9c8,
++ *   flags = 0,
++ *   force_pte_cb = 0x0
++ * }
++ */
++/*
++ * called by:
++ *   - arch/arm64/include/asm/kvm_pgtable.h|561| <<kvm_pgtable_stage2_init>> __kvm_pgtable_stage2_init(pgt, mmu, mm_ops, 0, NULL)
++ *   - arch/arm64/kvm/hyp/nvhe/mem_protect.c|151| <<kvm_host_prepare_stage2>> ret = __kvm_pgtable_stage2_init(&host_mmu.pgt, mmu, &host_mmu.mm_ops, KVM_HOST_S2_FLAGS, host_stage2_force_pte_cb);
++ *   - arch/arm64/kvm/hyp/nvhe/mem_protect.c|258| <<kvm_guest_prepare_stage2>> ret = __kvm_pgtable_stage2_init(mmu->pgt, mmu, &vm->mm_ops, 0, guest_stage2_force_pte_cb);
++ */
+ int __kvm_pgtable_stage2_init(struct kvm_pgtable *pgt, struct kvm_s2_mmu *mmu,
+ 			      struct kvm_pgtable_mm_ops *mm_ops,
+ 			      enum kvm_pgtable_stage2_flags flags,
+@@ -1559,6 +2162,12 @@ int __kvm_pgtable_stage2_init(struct kvm_pgtable *pgt, struct kvm_s2_mmu *mmu,
+ 	u32 sl0 = FIELD_GET(VTCR_EL2_SL0_MASK, vtcr);
+ 	s8 start_level = VTCR_EL2_TGRAN_SL0_BASE - sl0;
+ 
++	/*
++	 * 假设ia_bits = 40和start_level = 1
++	 * ipa物理地址最大是(1<<40)-1=0xffffffffff (10个ff)
++	 * 从level 1开始的话, 两个page就能代表所有的ipa地址
++	 * 也就是说, 从eptp开始的指针(类似cr3), 两个page就能表示所有的ipa range
++	 */
+ 	pgd_sz = kvm_pgd_pages(ia_bits, start_level) * PAGE_SIZE;
+ 	pgt->pgd = (kvm_pteref_t)mm_ops->zalloc_pages_exact(pgd_sz);
+ 	if (!pgt->pgd)
+@@ -1576,6 +2185,12 @@ int __kvm_pgtable_stage2_init(struct kvm_pgtable *pgt, struct kvm_s2_mmu *mmu,
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/nvhe/mem_protect.c|238| <<kvm_guest_prepare_stage2>> nr_pages = kvm_pgtable_stage2_pgd_size(mmu->vtcr) >> PAGE_SHIFT;
++ *   - arch/arm64/kvm/hyp/nvhe/pkvm.c|490| <<__pkvm_init_vm>> pgd_size = kvm_pgtable_stage2_pgd_size(host_mmu.arch.mmu.vtcr);
++ *   - arch/arm64/kvm/pkvm.c|137| <<__pkvm_create_hyp_vm>> pgd_sz = kvm_pgtable_stage2_pgd_size(host_kvm->arch.mmu.vtcr);
++ */
+ size_t kvm_pgtable_stage2_pgd_size(u64 vtcr)
+ {
+ 	u32 ia_bits = VTCR_EL2_IPA(vtcr);
+@@ -1585,6 +2200,11 @@ size_t kvm_pgtable_stage2_pgd_size(u64 vtcr)
+ 	return kvm_pgd_pages(ia_bits, start_level) * PAGE_SIZE;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/hyp/pgtable.c|2077| <<kvm_pgtable_stage2_destroy>> .cb = stage2_free_walker,
++ *   - arch/arm64/kvm/hyp/pgtable.c|2092| <<kvm_pgtable_stage2_free_unlinked>> .cb = stage2_free_walker,
++ */
+ static int stage2_free_walker(const struct kvm_pgtable_visit_ctx *ctx,
+ 			      enum kvm_pgtable_walk_flags visit)
+ {
+@@ -1601,6 +2221,9 @@ static int stage2_free_walker(const struct kvm_pgtable_visit_ctx *ctx,
+ 	return 0;
+ }
+ 
++/*
++ * kvm_pgtable_walk()的使用者
++ */
+ void kvm_pgtable_stage2_destroy(struct kvm_pgtable *pgt)
+ {
+ 	size_t pgd_sz;
+@@ -1616,6 +2239,9 @@ void kvm_pgtable_stage2_destroy(struct kvm_pgtable *pgt)
+ 	pgt->pgd = NULL;
+ }
+ 
++/*
++ * __kvm_pgtable_walk()的使用者
++ */
+ void kvm_pgtable_stage2_free_unlinked(struct kvm_pgtable_mm_ops *mm_ops, void *pgtable, s8 level)
+ {
+ 	kvm_pteref_t ptep = (kvm_pteref_t)pgtable;
+diff --git a/arch/arm64/kvm/mmio.c b/arch/arm64/kvm/mmio.c
+index 200c8019a..afacf3cfe 100644
+--- a/arch/arm64/kvm/mmio.c
++++ b/arch/arm64/kvm/mmio.c
+@@ -120,6 +120,10 @@ int kvm_handle_mmio_return(struct kvm_vcpu *vcpu)
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/mmu.c|1790| <<kvm_handle_guest_abort>> ret = io_mem_abort(vcpu, fault_ipa);
++ */
+ int io_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa)
+ {
+ 	struct kvm_run *run = vcpu->run;
+diff --git a/arch/arm64/kvm/mmu.c b/arch/arm64/kvm/mmu.c
+index dc04bc767..d29365fae 100644
+--- a/arch/arm64/kvm/mmu.c
++++ b/arch/arm64/kvm/mmu.c
+@@ -275,6 +275,29 @@ static void clean_dcache_guest_page(void *va, size_t size)
+ 	__clean_dcache_guest_page(va, size);
+ }
+ 
++/*
++ * 在以下使用kvm_pgtable_mm_ops->icache_inval_pou():
++ *   - arch/arm64/kvm/mmu.c|855| <<global>> .icache_inval_pou = invalidate_icache_guest_page,
++ *   - arch/arm64/kvm/hyp/nvhe/mem_protect.c|254| <<kvm_guest_prepare_stage2>> .icache_inval_pou = invalidate_icache_guest_page,
++ *   - arch/arm64/kvm/hyp/pgtable.c|991| <<stage2_map_walker_try_leaf>> if (!kvm_pgtable_walk_skip_cmo(ctx) && mm_ops->icache_inval_pou &&
++ *   - arch/arm64/kvm/hyp/pgtable.c|993| <<stage2_map_walker_try_leaf>> mm_ops->icache_inval_pou(kvm_pte_follow(new, mm_ops), granule);
++ *   - arch/arm64/kvm/hyp/pgtable.c|1227| <<stage2_attr_walker>> if (mm_ops->icache_inval_pou &&
++ *   - arch/arm64/kvm/hyp/pgtable.c|1229| <<stage2_attr_walker>> mm_ops->icache_inval_pou(kvm_pte_follow(pte, mm_ops),
++ *
++ * 844 static struct kvm_pgtable_mm_ops kvm_s2_mm_ops = {
++ * 845         .zalloc_page            = stage2_memcache_zalloc_page,
++ * 846         .zalloc_pages_exact     = kvm_s2_zalloc_pages_exact,
++ * 847         .free_pages_exact       = kvm_s2_free_pages_exact,
++ * 848         .free_unlinked_table    = stage2_free_unlinked_table,
++ * 849         .get_page               = kvm_host_get_page,
++ * 850         .put_page               = kvm_s2_put_page,
++ * 851         .page_count             = kvm_host_page_count,
++ * 852         .phys_to_virt           = kvm_host_va,
++ * 853         .virt_to_phys           = kvm_host_pa,
++ * 854         .dcache_clean_inval_poc = clean_dcache_guest_page,
++ * 855         .icache_inval_pou       = invalidate_icache_guest_page,
++ * 856 };
++ */
+ static void invalidate_icache_guest_page(void *va, size_t size)
+ {
+ 	__invalidate_icache_guest_page(va, size);
+@@ -841,6 +864,11 @@ static int get_user_mapping_size(struct kvm *kvm, u64 addr)
+ 	return BIT(ARM64_HW_PGTABLE_LEVEL_SHIFT(level));
+ }
+ 
++/*
++ * 在以下使用kvm_s2_mm_ops:
++ *   - arch/arm64/kvm/mmu.c|228| <<stage2_free_unlinked_table_rcu_cb>> kvm_pgtable_stage2_free_unlinked(&kvm_s2_mm_ops, pgtable, level);
++ *   - arch/arm64/kvm/mmu.c|909| <<kvm_init_stage2_mmu>> err = kvm_pgtable_stage2_init(pgt, mmu, &kvm_s2_mm_ops);
++ */
+ static struct kvm_pgtable_mm_ops kvm_s2_mm_ops = {
+ 	.zalloc_page		= stage2_memcache_zalloc_page,
+ 	.zalloc_pages_exact	= kvm_s2_zalloc_pages_exact,
+@@ -1374,6 +1402,45 @@ static bool kvm_vma_mte_allowed(struct vm_area_struct *vma)
+ 	return vma->vm_flags & VM_MTE_ALLOWED;
+ }
+ 
++/*
++ * |        kvm_pgtable_stage2_relax_perms() {
++ * |          do_interrupt_handler() {
++ * |
++ * |            gic_handle_irq() {
++ * |              irq_enter() {
++ * |                irq_enter_rcu();
++ * |              }
++ * |              ipi_handler() {
++ * |                do_handle_IPI() {
++ * |                  arch_send_call_function_single_ipi() {
++ * |                    smp_cross_call() {
++ * |                      cpu_logical_map();
++ * |                      cpu_logical_map();
++ * |                    }
++ * |                  }
++ * |                }
++ * |              }
++ * |              irq_exit();
++ * |            }
++ * |
++ * |          }
++ * |          kvm_pgtable_walk() {
++ * |            __kvm_pgtable_walk() {
++ * |              kvm_host_va();
++ * |              __kvm_pgtable_walk() {
++ * |                stage2_attr_walker() {
++ * |                  kvm_host_va();
++ * |                  invalidate_icache_guest_page() {
++ * |                    do_interrupt_handler() {
++ */
++/*
++ * 在以下使用kvm_handle_guest_abort():
++ *   - arch/arm64/kvm/handle_exit.c|272| <<global>> [ESR_ELx_EC_IABT_LOW] = kvm_handle_guest_abort,
++ *   - arch/arm64/kvm/handle_exit.c|273| <<global>> [ESR_ELx_EC_DABT_LOW] = kvm_handle_guest_abort,
++ *
++ * called by:
++ *   - arch/arm64/kvm/mmu.c|1765| <<kvm_handle_guest_abort>> ret = user_mem_abort(vcpu, fault_ipa, memslot, hva, esr_fsc_is_permission_fault(esr));
++ */
+ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
+ 			  struct kvm_memory_slot *memslot, unsigned long hva,
+ 			  bool fault_is_perm)
+@@ -1470,6 +1537,9 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
+ 		fault_ipa &= ~(vma_pagesize - 1);
+ 
+ 	gfn = fault_ipa >> PAGE_SHIFT;
++	/*
++	 * 似乎tagged memory?
++	 */
+ 	mte_allowed = kvm_vma_mte_allowed(vma);
+ 
+ 	vfio_allow_any_uc = vma->vm_flags & VM_ALLOW_ANY_UNCACHED;
+@@ -1521,6 +1591,12 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
+ 		return -ENOEXEC;
+ 
+ 	read_lock(&kvm->mmu_lock);
++	/*
++	 * struct kvm_vcpu *vcpu:
++	 * -> struct kvm_vcpu_arch arch;
++	 *    -> struct kvm_s2_mmu *hw_mmu;
++	 *       -> struct kvm_pgtable *pgt;
++	 */
+ 	pgt = vcpu->arch.hw_mmu->pgt;
+ 	if (mmu_invalidate_retry(kvm, mmu_seq))
+ 		goto out_unlock;
+@@ -1611,6 +1687,35 @@ static void handle_access_fault(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa)
+ 		kvm_set_pfn_accessed(kvm_pte_to_pfn(pte));
+ }
+ 
++/*
++ * 255 static exit_handle_fn arm_exit_handlers[] = {
++ * 256         [0 ... ESR_ELx_EC_MAX]  = kvm_handle_unknown_ec,
++ * 257         [ESR_ELx_EC_WFx]        = kvm_handle_wfx,
++ * 258         [ESR_ELx_EC_CP15_32]    = kvm_handle_cp15_32,
++ * 259         [ESR_ELx_EC_CP15_64]    = kvm_handle_cp15_64,
++ * 260         [ESR_ELx_EC_CP14_MR]    = kvm_handle_cp14_32,
++ * 261         [ESR_ELx_EC_CP14_LS]    = kvm_handle_cp14_load_store,
++ * 262         [ESR_ELx_EC_CP10_ID]    = kvm_handle_cp10_id,
++ * 263         [ESR_ELx_EC_CP14_64]    = kvm_handle_cp14_64,
++ * 264         [ESR_ELx_EC_HVC32]      = handle_hvc,
++ * 265         [ESR_ELx_EC_SMC32]      = handle_smc,
++ * 266         [ESR_ELx_EC_HVC64]      = handle_hvc,
++ * 267         [ESR_ELx_EC_SMC64]      = handle_smc,
++ * 268         [ESR_ELx_EC_SVC64]      = handle_svc,
++ * 269         [ESR_ELx_EC_SYS64]      = kvm_handle_sys_reg,
++ * 270         [ESR_ELx_EC_SVE]        = handle_sve,
++ * 271         [ESR_ELx_EC_ERET]       = kvm_handle_eret,
++ * 272         [ESR_ELx_EC_IABT_LOW]   = kvm_handle_guest_abort,
++ * 273         [ESR_ELx_EC_DABT_LOW]   = kvm_handle_guest_abort,
++ * 274         [ESR_ELx_EC_SOFTSTP_LOW]= kvm_handle_guest_debug,
++ * 275         [ESR_ELx_EC_WATCHPT_LOW]= kvm_handle_guest_debug,
++ * 276         [ESR_ELx_EC_BREAKPT_LOW]= kvm_handle_guest_debug,
++ * 277         [ESR_ELx_EC_BKPT32]     = kvm_handle_guest_debug,
++ * 278         [ESR_ELx_EC_BRK64]      = kvm_handle_guest_debug,
++ * 279         [ESR_ELx_EC_FP_ASIMD]   = handle_no_fpsimd,
++ * 280         [ESR_ELx_EC_PAC]        = kvm_handle_ptrauth,
++ * 281 };
++ */
+ /**
+  * kvm_handle_guest_abort - handles all 2nd stage aborts
+  * @vcpu:	the VCPU pointer
+@@ -1622,6 +1727,11 @@ static void handle_access_fault(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa)
+  * space. The distinction is based on the IPA causing the fault and whether this
+  * memory region has been registered as standard RAM by user space.
+  */
++/*
++ * 在以下使用kvm_handle_guest_abort():
++ *   - arch/arm64/kvm/handle_exit.c|272| <<global>> [ESR_ELx_EC_IABT_LOW] = kvm_handle_guest_abort,
++ *   - arch/arm64/kvm/handle_exit.c|273| <<global>> [ESR_ELx_EC_DABT_LOW] = kvm_handle_guest_abort,
++ */
+ int kvm_handle_guest_abort(struct kvm_vcpu *vcpu)
+ {
+ 	unsigned long esr;
+@@ -1632,9 +1742,24 @@ int kvm_handle_guest_abort(struct kvm_vcpu *vcpu)
+ 	gfn_t gfn;
+ 	int ret, idx;
+ 
++	/*
++	 * struct kvm_vcpu *vcpu:
++	 * -> struct kvm_vcpu_arch arch;
++	 *    -> struct kvm_vcpu_fault_info fault;
++	 *       -> u64 esr_el2;            // Hyp Syndrom Register
++	 *       -> u64 far_el2;            // Hyp Fault Address Register
++	 *       -> u64 hpfar_el2;          // Hyp IPA Fault Address Register
++	 *       -> u64 disr_el1;           // Deferred [SError] Status Register
++	 */
+ 	esr = kvm_vcpu_get_esr(vcpu);
+ 
+ 	fault_ipa = kvm_vcpu_get_fault_ipa(vcpu);
++	/*
++	 * #define ESR_ELx_EC_IABT_LOW     (0x20)
++	 * #define ESR_ELx_EC_IABT_CUR     (0x21)
++	 * #define ESR_ELx_EC_DABT_LOW     (0x24)
++	 * #define ESR_ELx_EC_DABT_CUR     (0x25)
++	 */
+ 	is_iabt = kvm_vcpu_trap_is_iabt(vcpu);
+ 
+ 	if (esr_fsc_is_translation_fault(esr)) {
+diff --git a/arch/x86/kernel/apic/vector.c b/arch/x86/kernel/apic/vector.c
+index 185738c72..c01278dd4 100644
+--- a/arch/x86/kernel/apic/vector.c
++++ b/arch/x86/kernel/apic/vector.c
+@@ -1071,6 +1071,10 @@ void irq_complete_move(struct irq_cfg *cfg)
+ /*
+  * Called from fixup_irqs() with @desc->lock held and interrupts disabled.
+  */
++/*
++ * called by:
++ *   - kernel/irq/cpuhotplug.c|96| <<migrate_one_irq>> irq_force_complete_move(desc);
++ */
+ void irq_force_complete_move(struct irq_desc *desc)
+ {
+ 	struct apic_chip_data *apicd;
+diff --git a/tools/include/uapi/linux/kvm.h b/tools/include/uapi/linux/kvm.h
+index 2190adbe3..4626d3637 100644
+--- a/tools/include/uapi/linux/kvm.h
++++ b/tools/include/uapi/linux/kvm.h
+@@ -1158,10 +1158,23 @@ struct kvm_vfio_spapr_tce {
+ #define KVM_GET_DIRTY_LOG         _IOW(KVMIO,  0x42, struct kvm_dirty_log)
+ #define KVM_SET_NR_MMU_PAGES      _IO(KVMIO,   0x44)
+ #define KVM_GET_NR_MMU_PAGES      _IO(KVMIO,   0x45)  /* deprecated */
++/*
++ * 在以下使用KVM_SET_USER_MEMORY_REGION:
++ *   - tools/testing/selftests/kvm/lib/kvm_util.c|921| <<__vm_set_user_memory_region>> return ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &region);
++ */
+ #define KVM_SET_USER_MEMORY_REGION _IOW(KVMIO, 0x46, \
+ 					struct kvm_userspace_memory_region)
+ #define KVM_SET_TSS_ADDR          _IO(KVMIO,   0x47)
+ #define KVM_SET_IDENTITY_MAP_ADDR _IOW(KVMIO,  0x48, __u64)
++/*
++ * tools在以下使用KVM_SET_USER_MEMORY_REGION2:
++ *   - tools/testing/selftests/kvm/lib/kvm_util.c|513| <<kvm_vm_restart>> int ret = ioctl(vmp->fd, KVM_SET_USER_MEMORY_REGION2, &region->region);
++ *   - tools/testing/selftests/kvm/lib/kvm_util.c|718| <<__vm_mem_region_delete>> vm_ioctl(vm, KVM_SET_USER_MEMORY_REGION2, &region->region);
++ *   - tools/testing/selftests/kvm/lib/kvm_util.c|947| <<__vm_set_user_memory_region2>> return ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION2, &region);
++ *   - tools/testing/selftests/kvm/lib/kvm_util.c|1112| <<vm_mem_add>> ret = __vm_ioctl(vm, KVM_SET_USER_MEMORY_REGION2, &region->region);
++ *   - tools/testing/selftests/kvm/lib/kvm_util.c|1204| <<vm_mem_region_set_flags>> ret = __vm_ioctl(vm, KVM_SET_USER_MEMORY_REGION2, &region->region);
++ *   - tools/testing/selftests/kvm/lib/kvm_util.c|1234| <<vm_mem_region_move>> ret = __vm_ioctl(vm, KVM_SET_USER_MEMORY_REGION2, &region->region);
++ */
+ #define KVM_SET_USER_MEMORY_REGION2 _IOW(KVMIO, 0x49, \
+ 					 struct kvm_userspace_memory_region2)
+ 
+diff --git a/tools/testing/selftests/kvm/aarch64/page_fault_test.c b/tools/testing/selftests/kvm/aarch64/page_fault_test.c
+index 597290527..830728a6e 100644
+--- a/tools/testing/selftests/kvm/aarch64/page_fault_test.c
++++ b/tools/testing/selftests/kvm/aarch64/page_fault_test.c
+@@ -18,14 +18,66 @@
+ #include "guest_modes.h"
+ #include "userfaultfd_util.h"
+ 
++/*
++ * 在以下使用TEST_GVA:
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|27| <<global>> static uint64_t *guest_test_memory = (uint64_t *)TEST_GVA;
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|23| <<TEST_EXEC_GVA>> #define TEST_EXEC_GVA (TEST_GVA + 0x8)
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|231| <<guest_ld_preidx>> uint64_t addr = TEST_GVA - 8;
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|240| <<guest_ld_preidx>> GUEST_ASSERT_EQ(addr, TEST_GVA);
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|246| <<guest_st_preidx>> uint64_t addr = TEST_GVA - 8;
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|251| <<guest_st_preidx>> GUEST_ASSERT_EQ(addr, TEST_GVA);
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|275| <<guest_clear_pte_af>> flush_tlb_page(TEST_GVA);
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|625| <<handle_cmd>> pte_gpa = addr_hva2gpa(vm, virt_get_pte_hva(vm, TEST_GVA));
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|685| <<load_exec_code_for_test>> assert(TEST_EXEC_GVA > TEST_GVA);
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|686| <<load_exec_code_for_test>> code = hva + TEST_EXEC_GVA - TEST_GVA;
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|713| <<setup_gva_maps>> virt_pg_map(vm, TEST_GVA, region->region.guest_phys_addr);
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|715| <<setup_gva_maps>> pte_gpa = addr_hva2gpa(vm, virt_get_pte_hva(vm, TEST_GVA));
++ *
++ * 在以下使用TEST_DATA:
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|150| <<guest_write64>> WRITE_ONCE(*guest_test_memory, TEST_DATA);
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|152| <<guest_write64>> GUEST_ASSERT_EQ(val, TEST_DATA);
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|181| <<guest_cas>> :: "r" (0ul), "r" (TEST_DATA), "r" (guest_test_memory));
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|183| <<guest_cas>> GUEST_ASSERT_EQ(val, TEST_DATA);
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|245| <<guest_st_preidx>> uint64_t val = TEST_DATA;
++ */
++
+ /* Guest virtual addresses that point to the test page and its PTE. */
+ #define TEST_GVA				0xc0000000
+ #define TEST_EXEC_GVA				(TEST_GVA + 0x8)
+ #define TEST_PTE_GVA				0xb0000000
+ #define TEST_DATA				0x0123456789ABCDEF
+ 
++/*
++ * 在以下使用guest_test_memory:
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|150| <<guest_write64>> WRITE_ONCE(*guest_test_memory, TEST_DATA);
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|151| <<guest_write64>> val = READ_ONCE(*guest_test_memory);
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|181| <<guest_cas>> :: "r" (0ul), "r" (TEST_DATA), "r" (guest_test_memory));
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|182| <<guest_cas>> val = READ_ONCE(*guest_test_memory);
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|190| <<guest_read64>> val = READ_ONCE(*guest_test_memory);
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|199| <<guest_at>> asm volatile("at s1e1r, %0" :: "r" (guest_test_memory));
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|216| <<guest_dc_zva>> asm volatile("dc zva, %0" :: "r" (guest_test_memory));
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|218| <<guest_dc_zva>> val = READ_ONCE(*guest_test_memory);
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|252| <<guest_st_preidx>> val = READ_ONCE(*guest_test_memory);
++ */
+ static uint64_t *guest_test_memory = (uint64_t *)TEST_GVA;
+ 
++/*
++ * 在以下使用CMD_HOLE_DATA:
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|942| <<global>> TEST_UFFD(guest_read64, with_af, CMD_HOLE_DATA | CMD_HOLE_PT,
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|944| <<global>> TEST_UFFD(guest_read64, no_af, CMD_HOLE_DATA | CMD_HOLE_PT,
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|946| <<global>> TEST_UFFD(guest_cas, with_af, CMD_HOLE_DATA | CMD_HOLE_PT,
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|952| <<global>> TEST_UFFD(guest_at, no_af, CMD_HOLE_DATA | CMD_HOLE_PT,
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|954| <<global>> TEST_UFFD(guest_ld_preidx, with_af, CMD_HOLE_DATA | CMD_HOLE_PT,
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|956| <<global>> TEST_UFFD(guest_write64, with_af, CMD_HOLE_DATA | CMD_HOLE_PT,
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|958| <<global>> TEST_UFFD(guest_dc_zva, with_af, CMD_HOLE_DATA | CMD_HOLE_PT,
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|960| <<global>> TEST_UFFD(guest_st_preidx, with_af, CMD_HOLE_DATA | CMD_HOLE_PT,
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|962| <<global>> TEST_UFFD(guest_exec, with_af, CMD_HOLE_DATA | CMD_HOLE_PT,
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|482| <<handle_cmd>> if (cmd & CMD_HOLE_PT)
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|822| <<TEST_UFFD_AND_DIRTY_LOG>> .mem_mark_cmd = CMD_HOLE_DATA | CMD_HOLE_PT, \
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|882| <<TEST_RO_MEMSLOT_AND_UFFD>> .mem_mark_cmd = CMD_HOLE_DATA | CMD_HOLE_PT, \
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|898| <<TEST_RO_MEMSLOT_NO_SYNDROME_AND_UFFD>> .mem_mark_cmd = CMD_HOLE_DATA | CMD_HOLE_PT, \
++ */
++
+ #define CMD_NONE				(0)
+ #define CMD_SKIP_TEST				(1ULL << 1)
+ #define CMD_HOLE_PT				(1ULL << 2)
+@@ -40,6 +92,14 @@ static uint64_t *guest_test_memory = (uint64_t *)TEST_GVA;
+ #define CHECK_FN_NR				10
+ 
+ static struct event_cnt {
++	/*
++	 * 在以下使用event_cnt->mmio_exits:
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|621| <<mmio_on_test_gpa_handler>> events.mmio_exits += 1;
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|921| <<check_event_counts>> TEST_ASSERT_EQ(test->expected_events.mmio_exits, events.mmio_exits);
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1180| <<TEST_RO_MEMSLOT>> .expected_events = { .mmio_exits = _mmio_exits }, \
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1204| <<TEST_RO_MEMSLOT_AND_DIRTY_LOG>> .expected_events = { .mmio_exits = _mmio_exits}, \
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1231| <<TEST_RO_MEMSLOT_AND_UFFD>> .expected_events = { .mmio_exits = _mmio_exits, \
++	 */
+ 	int mmio_exits;
+ 	int fail_vcpu_runs;
+ 	int uffd_faults;
+@@ -47,8 +107,26 @@ static struct event_cnt {
+ 	pthread_mutex_t uffd_faults_mutex;
+ } events;
+ 
++/*
++ * 关于UFFD.
++ *
++ * Userspace creates a new userfaultfd, initializes it, and registers one or
++ * more regions of virtual memory with it. Then, any page faults which occur
++ * within the region(s) result in a message being delivered to the userfaultfd,
++ * notifying userspace of the fault.
++ */
++
+ struct test_desc {
+ 	const char *name;
++	/*
++	 * 在以下使用test_desc->mem_mark_cmd:
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|344| <<guest_code>> GUEST_SYNC(test->mem_mark_cmd);
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|902| <<TEST_ACCESS>> .mem_mark_cmd = _mark_cmd, \
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|915| <<TEST_UFFD>> .mem_mark_cmd = _mark_cmd, \
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|943| <<TEST_UFFD_AND_DIRTY_LOG>> .mem_mark_cmd = CMD_HOLE_DATA | CMD_HOLE_PT, \
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1003| <<TEST_RO_MEMSLOT_AND_UFFD>> .mem_mark_cmd = CMD_HOLE_DATA | CMD_HOLE_PT, \
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1019| <<TEST_RO_MEMSLOT_NO_SYNDROME_AND_UFFD>> .mem_mark_cmd = CMD_HOLE_DATA | CMD_HOLE_PT, \
++	 */
+ 	uint64_t mem_mark_cmd;
+ 	/* Skip the test if any prepare function returns false */
+ 	bool (*guest_prepare[PREPARE_FN_NR])(void);
+@@ -61,6 +139,18 @@ struct test_desc {
+ 	void (*mmio_handler)(struct kvm_vm *vm, struct kvm_run *run);
+ 	void (*fail_vcpu_run_handler)(int ret);
+ 	uint32_t pt_memslot_flags;
++	/*
++	 * 在以下使用test_desc->data_memslot_flags:
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|663| <<setup_memslots>> vm_userspace_mem_region_add(vm, p->src_type, data_gpa, TEST_DATA_MEMSLOT, data_size / guest_page_size, p->test_desc->data_memslot_flags);
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|885| <<TEST_DIRTY_LOG>> .data_memslot_flags = KVM_MEM_LOG_DIRTY_PAGES, \
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|898| <<TEST_UFFD_AND_DIRTY_LOG>> .data_memslot_flags = KVM_MEM_LOG_DIRTY_PAGES, \
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|913| <<TEST_RO_MEMSLOT>> .data_memslot_flags = KVM_MEM_READONLY, \
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|924| <<TEST_RO_MEMSLOT_NO_SYNDROME>> .data_memslot_flags = KVM_MEM_READONLY, \
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|936| <<TEST_RO_MEMSLOT_AND_DIRTY_LOG>> .data_memslot_flags = KVM_MEM_READONLY | KVM_MEM_LOG_DIRTY_PAGES, \
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|948| <<TEST_RO_MEMSLOT_NO_SYNDROME_AND_DIRTY_LOG>> .data_memslot_flags = KVM_MEM_READONLY | KVM_MEM_LOG_DIRTY_PAGES, \
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|961| <<TEST_RO_MEMSLOT_AND_UFFD>> .data_memslot_flags = KVM_MEM_READONLY, \
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|977| <<TEST_RO_MEMSLOT_NO_SYNDROME_AND_UFFD>> .data_memslot_flags = KVM_MEM_READONLY, \
++	 */
+ 	uint32_t data_memslot_flags;
+ 	bool skip;
+ 	struct event_cnt expected_events;
+@@ -71,6 +161,10 @@ struct test_params {
+ 	struct test_desc *test_desc;
+ };
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|213| <<guest_clear_pte_af>> flush_tlb_page(TEST_GVA);
++ */
+ static inline void flush_tlb_page(uint64_t vaddr)
+ {
+ 	uint64_t page = vaddr >> 12;
+@@ -81,6 +175,17 @@ static inline void flush_tlb_page(uint64_t vaddr)
+ 	isb();
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|914| <<global>> TEST_ACCESS(guest_write64, with_af, CMD_NONE),
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|931| <<global>> TEST_ACCESS(guest_write64, no_af, CMD_HOLE_DATA),
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|956| <<global>> TEST_UFFD(guest_write64, with_af, CMD_HOLE_DATA | CMD_HOLE_PT,
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|980| <<global>> TEST_DIRTY_LOG(guest_write64, with_af, guest_check_write_in_dirty_log,
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1016| <<global>> TEST_UFFD_AND_DIRTY_LOG(guest_write64, with_af,
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1043| <<global>> TEST_RO_MEMSLOT(guest_write64, mmio_on_test_gpa_handler, 1),
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1064| <<global>> TEST_RO_MEMSLOT_AND_DIRTY_LOG(guest_write64, mmio_on_test_gpa_handler,
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1086| <<global>> TEST_RO_MEMSLOT_AND_UFFD(guest_write64, mmio_on_test_gpa_handler, 1,
++ */
+ static void guest_write64(void)
+ {
+ 	uint64_t val;
+@@ -236,11 +341,27 @@ static void guest_check_s1ptw_wr_in_dirty_log(void)
+ 	GUEST_SYNC(CMD_CHECK_S1PTW_WR_IN_DIRTY_LOG);
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1004| <<global>> TEST_DIRTY_LOG(guest_read64, no_af, guest_check_no_write_in_dirty_log, guest_check_no_s1ptw_wr_in_dirty_log),
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1009| <<global>> TEST_DIRTY_LOG(guest_at, no_af, guest_check_no_write_in_dirty_log, guest_check_no_s1ptw_wr_in_dirty_log),
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1036| <<global>> TEST_UFFD_AND_DIRTY_LOG(guest_read64, no_af, uffd_data_handler, 2, guest_check_no_write_in_dirty_log, guest_check_no_s1ptw_wr_in_dirty_log),
++ */
+ static void guest_check_no_s1ptw_wr_in_dirty_log(void)
+ {
+ 	GUEST_SYNC(CMD_CHECK_NO_S1PTW_WR_IN_DIRTY_LOG);
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|949| <<global>> TEST_ACCESS(guest_exec, with_af, CMD_NONE),
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|994| <<global>> TEST_UFFD(guest_exec, with_af, CMD_HOLE_DATA | CMD_HOLE_PT, uffd_data_handler, uffd_pt_handler, 2),
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1010| <<global>> TEST_DIRTY_LOG(guest_exec, with_af, guest_check_no_write_in_dirty_log, guest_check_s1ptw_wr_in_dirty_log),
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1044| <<global>> TEST_UFFD_AND_DIRTY_LOG(guest_exec, with_af, uffd_data_handler, 2, guest_check_no_write_in_dirty_log, guest_check_s1ptw_wr_in_dirty_log),
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1074| <<global>> TEST_RO_MEMSLOT(guest_exec, 0, 0),
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1094| <<global>> TEST_RO_MEMSLOT_AND_DIRTY_LOG(guest_exec, 0, 0, guest_check_no_write_in_dirty_log),
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1117| <<global>> TEST_RO_MEMSLOT_AND_UFFD(guest_exec, 0, 0, uffd_data_handler, 2),
++ */
+ static void guest_exec(void)
+ {
+ 	int (*code)(void) = (int (*)(void))TEST_EXEC_GVA;
+@@ -250,12 +371,31 @@ static void guest_exec(void)
+ 	GUEST_ASSERT_EQ(ret, 0x77);
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|341| <<guest_code>> if (!guest_prepare(test))
++ */
+ static bool guest_prepare(struct test_desc *test)
+ {
+ 	bool (*prepare_fn)(void);
+ 	int i;
+ 
+ 	for (i = 0; i < PREPARE_FN_NR; i++) {
++		/*
++		 * 在以下使用test_desc->guest_prepare:
++		 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|319| <<guest_prepare>> prepare_fn = test->guest_prepare[i];
++		 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|341| <<guest_code>> if (!guest_prepare(test))
++		 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|900| <<TEST_ACCESS>> .guest_prepare = { _PREPARE(_with_af), \
++		 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|912| <<TEST_UFFD>> .guest_prepare = { _PREPARE(_with_af), \
++		 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|927| <<TEST_DIRTY_LOG>> .guest_prepare = { _PREPARE(_with_af), \
++		 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|940| <<TEST_UFFD_AND_DIRTY_LOG>> .guest_prepare = { _PREPARE(_with_af), \
++		 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|955| <<TEST_RO_MEMSLOT>> .guest_prepare = { _PREPARE(_access) }, \
++		 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|966| <<TEST_RO_MEMSLOT_NO_SYNDROME>> .guest_prepare = { _PREPARE(_access) }, \
++		 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|978| <<TEST_RO_MEMSLOT_AND_DIRTY_LOG>> .guest_prepare = { _PREPARE(_access) }, \
++		 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|990| <<TEST_RO_MEMSLOT_NO_SYNDROME_AND_DIRTY_LOG>> .guest_prepare = { _PREPARE(_access) }, \
++		 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1004| <<TEST_RO_MEMSLOT_AND_UFFD>> .guest_prepare = { _PREPARE(_access) }, \
++		 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1020| <<TEST_RO_MEMSLOT_NO_SYNDROME_AND_UFFD>> .guest_prepare = { _PREPARE(_access) }, \
++		 */
+ 		prepare_fn = test->guest_prepare[i];
+ 		if (prepare_fn && !prepare_fn())
+ 			return false;
+@@ -264,25 +404,77 @@ static bool guest_prepare(struct test_desc *test)
+ 	return true;
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|409| <<guest_code>> guest_test_check(test);
++ */
+ static void guest_test_check(struct test_desc *test)
+ {
+ 	void (*check_fn)(void);
+ 	int i;
+ 
+ 	for (i = 0; i < CHECK_FN_NR; i++) {
++		/*
++		 * 在以下使用test_desc->guest_test_check:
++		 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|370| <<guest_test_check>> check_fn = test->guest_test_check[i];
++		 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|990| <<TEST_ACCESS>> .guest_test_check = { _CHECK(_with_af) }, \
++		 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1002| <<TEST_UFFD>> .guest_test_check = { _CHECK(_with_af) }, \
++		 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1016| <<TEST_DIRTY_LOG>> .guest_test_check = { _CHECK(_with_af), _test_check, _pt_check }, \
++		 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1030| <<TEST_UFFD_AND_DIRTY_LOG>> .guest_test_check = { _CHECK(_with_af), _test_check, _pt_check }, \
++		 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1066| <<TEST_RO_MEMSLOT_AND_DIRTY_LOG>> .guest_test_check = { _test_check }, \
++		 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1078| <<TEST_RO_MEMSLOT_NO_SYNDROME_AND_DIRTY_LOG>> .guest_test_check = { _test_check }, \
++		 */
+ 		check_fn = test->guest_test_check[i];
+ 		if (check_fn)
+ 			check_fn();
+ 	}
+ }
+ 
++/*
++ * 在以下使用guest_code():
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|812| <<run_test>> vcpu = vm_vcpu_add(vm, 0, guest_code);
++ */
+ static void guest_code(struct test_desc *test)
+ {
+ 	if (!guest_prepare(test))
+ 		GUEST_SYNC(CMD_SKIP_TEST);
+ 
++	/*
++	 * #define CMD_NONE                                (0)
++	 * #define CMD_SKIP_TEST                           (1ULL << 1)
++	 * #define CMD_HOLE_PT                             (1ULL << 2)
++	 * #define CMD_HOLE_DATA                           (1ULL << 3)
++	 * #define CMD_CHECK_WRITE_IN_DIRTY_LOG            (1ULL << 4)
++	 * #define CMD_CHECK_S1PTW_WR_IN_DIRTY_LOG         (1ULL << 5)
++	 * #define CMD_CHECK_NO_WRITE_IN_DIRTY_LOG         (1ULL << 6)
++	 * #define CMD_CHECK_NO_S1PTW_WR_IN_DIRTY_LOG      (1ULL << 7)
++	 * #define CMD_SET_PTE_AF                          (1ULL << 8)
++	 *
++	 * 在以下使用test_desc->mem_mark_cmd:
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|344| <<guest_code>> GUEST_SYNC(test->mem_mark_cmd);
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|902| <<TEST_ACCESS>> .mem_mark_cmd = _mark_cmd, \
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|915| <<TEST_UFFD>> .mem_mark_cmd = _mark_cmd, \
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|943| <<TEST_UFFD_AND_DIRTY_LOG>> .mem_mark_cmd = CMD_HOLE_DATA | CMD_HOLE_PT, \
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1003| <<TEST_RO_MEMSLOT_AND_UFFD>> .mem_mark_cmd = CMD_HOLE_DATA | CMD_HOLE_PT, \
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1019| <<TEST_RO_MEMSLOT_NO_SYNDROME_AND_UFFD>> .mem_mark_cmd = CMD_HOLE_DATA | CMD_HOLE_PT, \
++	 */
+ 	GUEST_SYNC(test->mem_mark_cmd);
+ 
++	/*
++	 * 在以下使用test_desc->guest_test:
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|420| <<guest_code>> if (test->guest_test)
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|421| <<guest_code>> test->guest_test();
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1003| <<TEST_ACCESS>> .guest_test = _access, \
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1014| <<TEST_UFFD>> .guest_test = _access, \
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1029| <<TEST_DIRTY_LOG>> .guest_test = _access, \
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1042| <<TEST_UFFD_AND_DIRTY_LOG>> .guest_test = _access, \
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1056| <<TEST_RO_MEMSLOT>> .guest_test = _access, \
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1067| <<TEST_RO_MEMSLOT_NO_SYNDROME>> .guest_test = _access, \
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1079| <<TEST_RO_MEMSLOT_AND_DIRTY_LOG>> .guest_test = _access, \
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1091| <<TEST_RO_MEMSLOT_NO_SYNDROME_AND_DIRTY_LOG>> .guest_test = _access, \
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1105| <<TEST_RO_MEMSLOT_AND_UFFD>> .guest_test = _access, \
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1121| <<TEST_RO_MEMSLOT_NO_SYNDROME_AND_UFFD>> .guest_test = _access, \
++	 */
+ 	if (test->guest_test)
+ 		test->guest_test();
+ 
+@@ -550,6 +742,10 @@ static void setup_abort_handlers(struct kvm_vm *vm, struct kvm_vcpu *vcpu,
+ 				ESR_EC_IABT, no_iabt_handler);
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|770| <<run_test>> setup_gva_maps(vm);
++ */
+ static void setup_gva_maps(struct kvm_vm *vm)
+ {
+ 	struct userspace_mem_region *region;
+@@ -569,6 +765,61 @@ enum pf_test_memslots {
+ 	TEST_DATA_MEMSLOT,
+ };
+ 
++/*
++ * $ sudo ./page_fault_test -s anonymous_hugetlb
++ * setup_memslots() name=guest_read64_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=4096, max_gfn=68719476735, data_gpa=0x0000ffffffc00000
++ * setup_memslots() name=guest_read64_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=17179869183, data_gpa=0x0000ffffffc00000
++ * setup_memslots() name=guest_read64_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=65536, max_gfn=4294967295, data_gpa=0x0000ffffffc00000
++ * setup_memslots() name=guest_read64_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=4096, max_gfn=268435455, data_gpa=0x000000ffffc00000
++ * setup_memslots() name=guest_read64_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=67108863, data_gpa=0x000000ffffc00000
++ * setup_memslots() name=guest_read64_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=65536, max_gfn=16777215, data_gpa=0x000000ffffc00000
++ * setup_memslots() name=guest_read64_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=4096, max_gfn=16777215, data_gpa=0x0000000fffc00000
++ * setup_memslots() name=guest_read64_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=4194303, data_gpa=0x0000000fffc00000
++ * setup_memslots() name=guest_read64_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=65536, max_gfn=1048575, data_gpa=0x0000000fffc00000
++ * setup_memslots() name=guest_read64_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=4194303, data_gpa=0x0000000fffc00000
++ * setup_memslots() name=guest_ld_preidx_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=4096, max_gfn=68719476735, data_gpa=0x0000ffffffc00000
++ * setup_memslots() name=guest_ld_preidx_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=17179869183, data_gpa=0x0000ffffffc00000
++ * setup_memslots() name=guest_ld_preidx_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=65536, max_gfn=4294967295, data_gpa=0x0000ffffffc00000
++ * setup_memslots() name=guest_ld_preidx_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=4096, max_gfn=268435455, data_gpa=0x000000ffffc00000
++ * setup_memslots() name=guest_ld_preidx_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=67108863, data_gpa=0x000000ffffc00000
++ * setup_memslots() name=guest_ld_preidx_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=65536, max_gfn=16777215, data_gpa=0x000000ffffc00000
++ * setup_memslots() name=guest_ld_preidx_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=4096, max_gfn=16777215, data_gpa=0x0000000fffc00000
++ * setup_memslots() name=guest_ld_preidx_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=4194303, data_gpa=0x0000000fffc00000
++ * setup_memslots() name=guest_ld_preidx_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=65536, max_gfn=1048575, data_gpa=0x0000000fffc00000
++ * setup_memslots() name=guest_ld_preidx_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=4194303, data_gpa=0x0000000fffc00000
++ * ... ...
++ * setup_memslots() name=ro_memslot_guest_at, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=4096, max_gfn=68719476735, data_gpa=0x0000ffffffc00000
++ * setup_memslots() name=ro_memslot_guest_at, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=17179869183, data_gpa=0x0000ffffffc00000
++ * setup_memslots() name=ro_memslot_guest_at, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=65536, max_gfn=4294967295, data_gpa=0x0000ffffffc00000
++ * setup_memslots() name=ro_memslot_guest_at, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=4096, max_gfn=268435455, data_gpa=0x000000ffffc00000
++ * setup_memslots() name=ro_memslot_guest_at, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=67108863, data_gpa=0x000000ffffc00000
++ * setup_memslots() name=ro_memslot_guest_at, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=65536, max_gfn=16777215, data_gpa=0x000000ffffc00000
++ * setup_memslots() name=ro_memslot_guest_at, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=4096, max_gfn=16777215, data_gpa=0x0000000fffc00000
++ * setup_memslots() name=ro_memslot_guest_at, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=4194303, data_gpa=0x0000000fffc00000
++ * setup_memslots() name=ro_memslot_guest_at, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=65536, max_gfn=1048575, data_gpa=0x0000000fffc00000
++ * setup_memslots() name=ro_memslot_guest_at, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=4194303, data_gpa=0x0000000fffc00000
++ * setup_memslots() name=ro_memslot_guest_exec, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=4096, max_gfn=68719476735, data_gpa=0x0000ffffffc00000
++ * setup_memslots() name=ro_memslot_guest_exec, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=17179869183, data_gpa=0x0000ffffffc00000
++ * setup_memslots() name=ro_memslot_guest_exec, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=65536, max_gfn=4294967295, data_gpa=0x0000ffffffc00000
++ * setup_memslots() name=ro_memslot_guest_exec, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=4096, max_gfn=268435455, data_gpa=0x000000ffffc00000
++ * setup_memslots() name=ro_memslot_guest_exec, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=67108863, data_gpa=0x000000ffffc00000
++ * setup_memslots() name=ro_memslot_guest_exec, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=65536, max_gfn=16777215, data_gpa=0x000000ffffc00000
++ * setup_memslots() name=ro_memslot_guest_exec, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=4096, max_gfn=16777215, data_gpa=0x0000000fffc00000
++ * setup_memslots() name=ro_memslot_guest_exec, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=4194303, data_gpa=0x0000000fffc00000
++ * setup_memslots() name=ro_memslot_guest_exec, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=65536, max_gfn=1048575, data_gpa=0x0000000fffc00000
++ * setup_memslots() name=ro_memslot_guest_exec, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=4194303, data_gpa=0x0000000fffc00000
++ * setup_memslots() name=ro_memslot_guest_write64, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=4096, max_gfn=68719476735, data_gpa=0x0000ffffffc00000
++ * setup_memslots() name=ro_memslot_guest_write64, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=17179869183, data_gpa=0x0000ffffffc00000
++ * setup_memslots() name=ro_memslot_guest_write64, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=65536, max_gfn=4294967295, data_gpa=0x0000ffffffc00000
++ * setup_memslots() name=ro_memslot_guest_write64, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=4096, max_gfn=268435455, data_gpa=0x000000ffffc00000
++ * setup_memslots() name=ro_memslot_guest_write64, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=67108863, data_gpa=0x000000ffffc00000
++ * setup_memslots() name=ro_memslot_guest_write64, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=65536, max_gfn=16777215, data_gpa=0x000000ffffc00000
++ * setup_memslots() name=ro_memslot_guest_write64, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=4096, max_gfn=16777215, data_gpa=0x0000000fffc00000
++ * setup_memslots() name=ro_memslot_guest_write64, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=4194303, data_gpa=0x0000000fffc00000
++ * setup_memslots() name=ro_memslot_guest_write64, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=65536, max_gfn=1048575, data_gpa=0x0000000fffc00000
++ * setup_memslots() name=ro_memslot_guest_write64, src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=4194303, data_gpa=0x0000000fffc00000
++ * ... ...
++ */
+ /*
+  * Create a memslot for code and data at pfn=0, and test-data and PT ones
+  * at max_gfn.
+@@ -596,8 +847,36 @@ static void setup_memslots(struct kvm_vm *vm, struct test_params *p)
+ 	data_gpa = (max_gfn * guest_page_size) - data_size;
+ 	data_gpa = align_down(data_gpa, backing_src_pagesz);
+ 
++	/*
++	 * 1171 void vm_userspace_mem_region_add(struct kvm_vm *vm,
++	 * 1172                                  enum vm_mem_backing_src_type src_type,
++	 * 1173                                  uint64_t guest_paddr, uint32_t slot,
++	 * 1174                                  uint64_t npages, uint32_t flags)
++	 */
++
++	/*
++	 * 一般的代码和数据的size是code_npages
++	 */
+ 	vm_userspace_mem_region_add(vm, VM_MEM_SRC_ANONYMOUS, 0,
+ 				    CODE_AND_DATA_MEMSLOT, code_npages, 0);
++	/*
++	 * 85 enum kvm_mem_region_type {
++	 * 86         MEM_REGION_CODE,
++	 * 87         MEM_REGION_DATA,
++	 * 88         MEM_REGION_PT,
++	 * 89         MEM_REGION_TEST_DATA,       
++	 * 90         NR_MEM_REGIONS,
++	 * 91 };
++	 *
++	 * 618 enum pf_test_memslots {
++	 * 619         CODE_AND_DATA_MEMSLOT,
++	 * 620         PAGE_TABLE_MEMSLOT,
++	 * 621         TEST_DATA_MEMSLOT,
++	 * 622 };
++	 *
++	 * struct kvm_vm *vm:
++	 * -> uint32_t memslots[NR_MEM_REGIONS];
++	 */
+ 	vm->memslots[MEM_REGION_CODE] = CODE_AND_DATA_MEMSLOT;
+ 	vm->memslots[MEM_REGION_DATA] = CODE_AND_DATA_MEMSLOT;
+ 
+@@ -606,16 +885,32 @@ static void setup_memslots(struct kvm_vm *vm, struct test_params *p)
+ 				    p->test_desc->pt_memslot_flags);
+ 	vm->memslots[MEM_REGION_PT] = PAGE_TABLE_MEMSLOT;
+ 
++	/*
++	 * flags的例子:
++	 * #define KVM_MEM_LOG_DIRTY_PAGES (1UL << 0)
++	 * #define KVM_MEM_READONLY        (1UL << 1)
++	 * #define KVM_MEM_GUEST_MEMFD     (1UL << 2)
++	 */
+ 	vm_userspace_mem_region_add(vm, p->src_type, data_gpa, TEST_DATA_MEMSLOT,
+ 				    data_size / guest_page_size,
+ 				    p->test_desc->data_memslot_flags);
+ 	vm->memslots[MEM_REGION_TEST_DATA] = TEST_DATA_MEMSLOT;
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|811| <<run_test>> setup_ucall(vm);
++ */
+ static void setup_ucall(struct kvm_vm *vm)
+ {
+ 	struct userspace_mem_region *region = vm_get_mem_region(vm, MEM_REGION_TEST_DATA);
+ 
++	/*
++	 * called by:
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|711| <<setup_ucall>> ucall_init(vm, region->region.guest_phys_addr + region->region.memory_size);
++	 *   - tools/testing/selftests/kvm/lib/kvm_util.c|434| <<__vm_create>> ucall_init(vm, slot0->region.guest_phys_addr + slot0->region.memory_size);
++	 *   - tools/testing/selftests/kvm/s390x/cmma_test.c|146| <<finish_vm_setup>> ucall_init(vm, slot0->region.guest_phys_addr + slot0->region.memory_size);
++	 */
+ 	ucall_init(vm, region->region.guest_phys_addr + region->region.memory_size);
+ }
+ 
+@@ -654,6 +949,10 @@ static void reset_event_counts(void)
+  * This function either succeeds, skips the test (after setting test->skip), or
+  * fails with a TEST_FAIL that aborts all tests.
+  */
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|778| <<run_test>> vcpu_run_loop(vm, vcpu, test);
++ */
+ static void vcpu_run_loop(struct kvm_vm *vm, struct kvm_vcpu *vcpu,
+ 			  struct test_desc *test)
+ {
+@@ -695,6 +994,10 @@ static void vcpu_run_loop(struct kvm_vm *vm, struct kvm_vcpu *vcpu,
+ 	pr_debug(test->skip ? "Skipped.\n" : "Done.\n");
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1156| <<for_each_test_and_guest_mode>> for_each_guest_mode(run_test, &p);
++ */
+ static void run_test(enum vm_guest_mode mode, void *arg)
+ {
+ 	struct test_params *p = (struct test_params *)arg;
+@@ -703,11 +1006,33 @@ static void run_test(enum vm_guest_mode mode, void *arg)
+ 	struct kvm_vcpu *vcpu;
+ 	struct uffd_desc *pt_uffd, *data_uffd;
+ 
++	/*
++	 * 例子:
++	 * Testing guest mode: PA-bits:48,  VA-bits:48,  4K pages
++	 * Testing memory backing src type: anonymous_hugetlb
++	 * Testing guest mode: PA-bits:48,  VA-bits:48, 16K pages
++	 * Testing memory backing src type: anonymous_hugetlb
++	 * Testing guest mode: PA-bits:48,  VA-bits:48, 64K pages
++	 * Testing memory backing src type: anonymous_hugetlb
++	 * Testing guest mode: PA-bits:40,  VA-bits:48,  4K pages
++	 * Testing memory backing src type: anonymous_hugetlb
++	 * Testing guest mode: PA-bits:40,  VA-bits:48, 16K pages
++	 */
+ 	print_test_banner(mode, p);
+ 
+ 	vm = ____vm_create(VM_SHAPE(mode));
+ 	setup_memslots(vm, p);
++	/*
++	 * called by:
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|810| <<run_test>> kvm_vm_elf_load(vm, program_invocation_name);
++	 *   - tools/testing/selftests/kvm/lib/kvm_util.c|425| <<__vm_create>> kvm_vm_elf_load(vm, program_invocation_name);
++	 *   - tools/testing/selftests/kvm/s390x/cmma_test.c|143| <<finish_vm_setup>> kvm_vm_elf_load(vm, program_invocation_name);
++	 */
+ 	kvm_vm_elf_load(vm, program_invocation_name);
++	/*
++	 * called by:
++	 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|811| <<run_test>> setup_ucall(vm);
++	 */
+ 	setup_ucall(vm);
+ 	vcpu = vm_vcpu_add(vm, 0, guest_code);
+ 
+@@ -772,6 +1097,44 @@ static void help(char *name)
+ #define _CHECK_with_af			guest_check_pte_af
+ #define _CHECK_no_af			NULL
+ 
++/*
++ * 67 struct test_desc {
++ * 68         const char *name;
++ * 69         uint64_t mem_mark_cmd;
++ * 70         // Skip the test if any prepare function returns false
++ * 71         bool (*guest_prepare[PREPARE_FN_NR])(void);
++ * 72         void (*guest_test)(void);
++ * 73         void (*guest_test_check[CHECK_FN_NR])(void);
++ * 74         uffd_handler_t uffd_pt_handler;
++ * 75         uffd_handler_t uffd_data_handler;
++ * 76         void (*dabt_handler)(struct ex_regs *regs);
++ * 77         void (*iabt_handler)(struct ex_regs *regs);
++ * 78         void (*mmio_handler)(struct kvm_vm *vm, struct kvm_run *run);
++ * 79         void (*fail_vcpu_run_handler)(int ret);
++ * 80         uint32_t pt_memslot_flags;
++ * 81         uint32_t data_memslot_flags;
++ * 82         bool skip;
++ * 83         struct event_cnt expected_events;
++ * 84 };
++ */
++
++/*
++ * 在以下使用TEST_ACCESS():
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1152| <<global>> TEST_ACCESS(guest_read64, with_af, CMD_NONE),
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1153| <<global>> TEST_ACCESS(guest_ld_preidx, with_af, CMD_NONE),
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1154| <<global>> TEST_ACCESS(guest_cas, with_af, CMD_NONE),
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1155| <<global>> TEST_ACCESS(guest_write64, with_af, CMD_NONE),
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1156| <<global>> TEST_ACCESS(guest_st_preidx, with_af, CMD_NONE),
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1157| <<global>> TEST_ACCESS(guest_dc_zva, with_af, CMD_NONE),
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1158| <<global>> TEST_ACCESS(guest_exec, with_af, CMD_NONE),
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1169| <<global>> TEST_ACCESS(guest_read64, no_af, CMD_HOLE_DATA),
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1170| <<global>> TEST_ACCESS(guest_cas, no_af, CMD_HOLE_DATA),
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1171| <<global>> TEST_ACCESS(guest_ld_preidx, no_af, CMD_HOLE_DATA),
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1172| <<global>> TEST_ACCESS(guest_write64, no_af, CMD_HOLE_DATA),
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1173| <<global>> TEST_ACCESS(guest_st_preidx, no_af, CMD_HOLE_DATA),
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1174| <<global>> TEST_ACCESS(guest_at, no_af, CMD_HOLE_DATA),
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1175| <<global>> TEST_ACCESS(guest_dc_zva, no_af, CMD_HOLE_DATA),
++ */
+ /* Performs an access and checks that no faults were triggered. */
+ #define TEST_ACCESS(_access, _with_af, _mark_cmd)				\
+ {										\
+@@ -905,6 +1268,26 @@ static void help(char *name)
+ 				    .uffd_faults = _uffd_faults },		\
+ }
+ 
++/*
++ * 67 struct test_desc {
++ * 68         const char *name;
++ * 69         uint64_t mem_mark_cmd;
++ * 70         // Skip the test if any prepare function returns false
++ * 71         bool (*guest_prepare[PREPARE_FN_NR])(void);
++ * 72         void (*guest_test)(void);
++ * 73         void (*guest_test_check[CHECK_FN_NR])(void);
++ * 74         uffd_handler_t uffd_pt_handler;
++ * 75         uffd_handler_t uffd_data_handler;
++ * 76         void (*dabt_handler)(struct ex_regs *regs);
++ * 77         void (*iabt_handler)(struct ex_regs *regs);
++ * 78         void (*mmio_handler)(struct kvm_vm *vm, struct kvm_run *run);
++ * 79         void (*fail_vcpu_run_handler)(int ret);
++ * 80         uint32_t pt_memslot_flags;
++ * 81         uint32_t data_memslot_flags;
++ * 82         bool skip;
++ * 83         struct event_cnt expected_events;
++ * 84 };
++ */
+ static struct test_desc tests[] = {
+ 
+ 	/* Check that HW is setting the Access Flag (AF) (sanity checks). */
+@@ -1092,6 +1475,32 @@ static struct test_desc tests[] = {
+ 	{ 0 }
+ };
+ 
++/*
++ * 一些例子:
++ * for_each_test_and_guest_mode() name=guest_read64_SCAT2(with_af, "CMD_NONE")
++ * setup_memslots() name=guest_read64_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=4096, max_gfn=68719476735, data_gpa=0x0000ffffffc00000
++ * setup_memslots() name=guest_read64_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=17179869183, data_gpa=0x0000ffffffc00000
++ * setup_memslots() name=guest_read64_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=65536, max_gfn=4294967295, data_gpa=0x0000ffffffc00000
++ * setup_memslots() name=guest_read64_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=4096, max_gfn=268435455, data_gpa=0x000000ffffc00000
++ * setup_memslots() name=guest_read64_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=67108863, data_gpa=0x000000ffffc00000
++ * setup_memslots() name=guest_read64_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=65536, max_gfn=16777215, data_gpa=0x000000ffffc00000
++ * setup_memslots() name=guest_read64_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=4096, max_gfn=16777215, data_gpa=0x0000000fffc00000
++ * setup_memslots() name=guest_read64_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=4194303, data_gpa=0x0000000fffc00000
++ * setup_memslots() name=guest_read64_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=65536, max_gfn=1048575, data_gpa=0x0000000fffc00000
++ * setup_memslots() name=guest_read64_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=4194303, data_gpa=0x0000000fffc00000
++ * for_each_test_and_guest_mode() name=guest_ld_preidx_SCAT2(with_af, "CMD_NONE")
++ * setup_memslots() name=guest_ld_preidx_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=4096, max_gfn=68719476735, data_gpa=0x0000ffffffc00000
++ * setup_memslots() name=guest_ld_preidx_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=17179869183, data_gpa=0x0000ffffffc00000
++ * setup_memslots() name=guest_ld_preidx_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=65536, max_gfn=4294967295, data_gpa=0x0000ffffffc00000
++ * setup_memslots() name=guest_ld_preidx_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=4096, max_gfn=268435455, data_gpa=0x000000ffffc00000
++ * setup_memslots() name=guest_ld_preidx_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=67108863, data_gpa=0x000000ffffc00000
++ * setup_memslots() name=guest_ld_preidx_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=65536, max_gfn=16777215, data_gpa=0x000000ffffc00000
++ * setup_memslots() name=guest_ld_preidx_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=4096, max_gfn=16777215, data_gpa=0x0000000fffc00000
++ * setup_memslots() name=guest_ld_preidx_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=4194303, data_gpa=0x0000000fffc00000
++ * setup_memslots() name=guest_ld_preidx_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=65536, max_gfn=1048575, data_gpa=0x0000000fffc00000
++ * setup_memslots() name=guest_ld_preidx_SCAT2(with_af, "CMD_NONE"), src_type=2 code_npages=512, pt_size=2097152, data_size=2097152, backing_src_pagesz=2097152, guest_page_size=16384, max_gfn=4194303, data_gpa=0x0000000fffc00000
++ * ... ...
++ */
+ static void for_each_test_and_guest_mode(enum vm_mem_backing_src_type src_type)
+ {
+ 	struct test_desc *t;
+@@ -1119,6 +1528,17 @@ int main(int argc, char *argv[])
+ 	while ((opt = getopt(argc, argv, "hm:s:")) != -1) {
+ 		switch (opt) {
+ 		case 'm':
++			/*
++			 * called by:
++			 *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1485| <<main>> guest_modes_cmdline(optarg);
++			 *   - tools/testing/selftests/kvm/access_tracking_perf_test.c|365| <<main>> guest_modes_cmdline(optarg);
++			 *   - tools/testing/selftests/kvm/demand_paging_test.c|245| <<main>> guest_modes_cmdline(optarg);
++			 *   - tools/testing/selftests/kvm/dirty_log_perf_test.c|386| <<main>> guest_modes_cmdline(optarg);
++			 *   - tools/testing/selftests/kvm/dirty_log_test.c|898| <<main>> guest_modes_cmdline(optarg);
++			 *   - tools/testing/selftests/kvm/include/guest_modes.h|21| <<main>> void guest_modes_cmdline(const char *arg);
++			 *   - tools/testing/selftests/kvm/kvm_page_table_test.c|456| <<main>> guest_modes_cmdline(optarg);
++			 *   - tools/testing/selftests/kvm/memslot_modification_stress_test.c|152| <<main>> guest_modes_cmdline(optarg);
++			 */
+ 			guest_modes_cmdline(optarg);
+ 			break;
+ 		case 's':
+diff --git a/tools/testing/selftests/kvm/lib/elf.c b/tools/testing/selftests/kvm/lib/elf.c
+index f34d926d9..d96b8eba3 100644
+--- a/tools/testing/selftests/kvm/lib/elf.c
++++ b/tools/testing/selftests/kvm/lib/elf.c
+@@ -111,6 +111,12 @@ static void elfhdr_get(const char *filename, Elf64_Ehdr *hdrp)
+  * by the image and it needs to have sufficient available physical pages, to
+  * back the virtual pages used to load the image.
+  */
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|810| <<run_test>> kvm_vm_elf_load(vm, program_invocation_name);
++ *   - tools/testing/selftests/kvm/lib/kvm_util.c|425| <<__vm_create>> kvm_vm_elf_load(vm, program_invocation_name);
++ *   - tools/testing/selftests/kvm/s390x/cmma_test.c|143| <<finish_vm_setup>> kvm_vm_elf_load(vm, program_invocation_name);
++ */
+ void kvm_vm_elf_load(struct kvm_vm *vm, const char *filename)
+ {
+ 	off_t offset, offset_rv;
+diff --git a/tools/testing/selftests/kvm/lib/guest_modes.c b/tools/testing/selftests/kvm/lib/guest_modes.c
+index b04901e55..84c4bda35 100644
+--- a/tools/testing/selftests/kvm/lib/guest_modes.c
++++ b/tools/testing/selftests/kvm/lib/guest_modes.c
+@@ -111,6 +111,17 @@ void guest_modes_help(void)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|1485| <<main>> guest_modes_cmdline(optarg);
++ *   - tools/testing/selftests/kvm/access_tracking_perf_test.c|365| <<main>> guest_modes_cmdline(optarg);
++ *   - tools/testing/selftests/kvm/demand_paging_test.c|245| <<main>> guest_modes_cmdline(optarg);
++ *   - tools/testing/selftests/kvm/dirty_log_perf_test.c|386| <<main>> guest_modes_cmdline(optarg);
++ *   - tools/testing/selftests/kvm/dirty_log_test.c|898| <<main>> guest_modes_cmdline(optarg);
++ *   - tools/testing/selftests/kvm/include/guest_modes.h|21| <<main>> void guest_modes_cmdline(const char *arg);
++ *   - tools/testing/selftests/kvm/kvm_page_table_test.c|456| <<main>> guest_modes_cmdline(optarg);
++ *   - tools/testing/selftests/kvm/memslot_modification_stress_test.c|152| <<main>> guest_modes_cmdline(optarg);
++ */
+ void guest_modes_cmdline(const char *arg)
+ {
+ 	static bool mode_selected;
+diff --git a/tools/testing/selftests/kvm/lib/kvm_util.c b/tools/testing/selftests/kvm/lib/kvm_util.c
+index b2262b5fa..c2f60ad6a 100644
+--- a/tools/testing/selftests/kvm/lib/kvm_util.c
++++ b/tools/testing/selftests/kvm/lib/kvm_util.c
+@@ -907,6 +907,12 @@ static void vm_userspace_mem_region_hva_insert(struct rb_root *hva_tree,
+ }
+ 
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/lib/kvm_util.c|927| <<vm_set_user_memory_region>> int ret = __vm_set_user_memory_region(vm, slot, flags, gpa, size, hva);
++ *   - tools/testing/selftests/kvm/set_memory_region_test.c|354| <<test_invalid_memory_region_flags>> r = __vm_set_user_memory_region(vm, 0, BIT(i), 0, MEM_REGION_SIZE, NULL);
++ *   - tools/testing/selftests/kvm/set_memory_region_test.c|436| <<test_add_max_memory_regions>> ret = __vm_set_user_memory_region(vm, max_mem_slots, 0, (uint64_t)max_mem_slots * MEM_REGION_SIZE, MEM_REGION_SIZE, mem_extra);
++ */
+ int __vm_set_user_memory_region(struct kvm_vm *vm, uint32_t slot, uint32_t flags,
+ 				uint64_t gpa, uint64_t size, void *hva)
+ {
+@@ -921,6 +927,12 @@ int __vm_set_user_memory_region(struct kvm_vm *vm, uint32_t slot, uint32_t flags
+ 	return ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &region);
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/max_guest_memory_test.c|238| <<main>> vm_set_user_memory_region(vm, slot, 0, gpa, slot_size, mem);
++ *   - tools/testing/selftests/kvm/max_guest_memory_test.c|279| <<main>> vm_set_user_memory_region(vm, slot, 0, 0, 0, NULL);
++ *   - tools/testing/selftests/kvm/set_memory_region_test.c|426| <<test_add_max_memory_regions>> vm_set_user_memory_region(vm, slot, 0, ((uint64_t)slot * MEM_REGION_SIZE), MEM_REGION_SIZE, mem_aligned + (uint64_t)slot * MEM_REGION_SIZE);
++ */
+ void vm_set_user_memory_region(struct kvm_vm *vm, uint32_t slot, uint32_t flags,
+ 			       uint64_t gpa, uint64_t size, void *hva)
+ {
+@@ -930,6 +942,18 @@ void vm_set_user_memory_region(struct kvm_vm *vm, uint32_t slot, uint32_t flags,
+ 		    errno, strerror(errno));
+ }
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/lib/kvm_util.c|966| <<vm_set_user_memory_region2>> int ret = __vm_set_user_memory_region2(vm, slot, flags, gpa, size, hva, guest_memfd, guest_memfd_offset);
++ *   - tools/testing/selftests/kvm/set_memory_region_test.c|363| <<test_invalid_memory_region_flags>> r = __vm_set_user_memory_region2(vm, 0, BIT(i), 0, MEM_REGION_SIZE, NULL, 0, 0);
++ *   - tools/testing/selftests/kvm/set_memory_region_test.c|372| <<test_invalid_memory_region_flags>> r = __vm_set_user_memory_region2(vm, 0, KVM_MEM_LOG_DIRTY_PAGES | KVM_MEM_GUEST_MEMFD, 0, MEM_REGION_SIZE, NULL, guest_memfd, 0);
++ *   - tools/testing/selftests/kvm/set_memory_region_test.c|378| <<test_invalid_memory_region_flags>> r = __vm_set_user_memory_region2(vm, 0, KVM_MEM_READONLY | KVM_MEM_GUEST_MEMFD, 0, MEM_REGION_SIZE, NULL, guest_memfd, 0);
++ *   - tools/testing/selftests/kvm/set_memory_region_test.c|452| <<test_invalid_guest_memfd>> int r = __vm_set_user_memory_region2(vm, MEM_REGION_SLOT, KVM_MEM_GUEST_MEMFD, MEM_REGION_GPA, MEM_REGION_SIZE, 0, memfd, offset);
++ *   - tools/testing/selftests/kvm/set_memory_region_test.c|521| <<test_add_overlapping_private_memory_regions>> r = __vm_set_user_memory_region2(vm, MEM_REGION_SLOT, KVM_MEM_GUEST_MEMFD, MEM_REGION_GPA * 2 - MEM_REGION_SIZE,
++ *                                MEM_REGION_SIZE * 2, 0, memfd, 0);
++ *   - tools/testing/selftests/kvm/set_memory_region_test.c|529| <<test_add_overlapping_private_memory_regions>> r = __vm_set_user_memory_region2(vm, MEM_REGION_SLOT, KVM_MEM_GUEST_MEMFD, MEM_REGION_GPA * 2 + MEM_REGION_SIZE,
++ *                                MEM_REGION_SIZE * 2, 0, memfd, 0);
++ */
+ int __vm_set_user_memory_region2(struct kvm_vm *vm, uint32_t slot, uint32_t flags,
+ 				 uint64_t gpa, uint64_t size, void *hva,
+ 				 uint32_t guest_memfd, uint64_t guest_memfd_offset)
+@@ -1137,11 +1161,23 @@ void vm_mem_add(struct kvm_vm *vm, enum vm_mem_backing_src_type src_type,
+ 	}
+ }
+ 
++/*
++ * 比较vm_set_user_memory_region()
++ *
++ * 936 void vm_set_user_memory_region(struct kvm_vm *vm, uint32_t slot, uint32_t flags,
++ * 937                                uint64_t gpa, uint64_t size, void *hva)
++ */
++
+ void vm_userspace_mem_region_add(struct kvm_vm *vm,
+ 				 enum vm_mem_backing_src_type src_type,
+ 				 uint64_t guest_paddr, uint32_t slot,
+ 				 uint64_t npages, uint32_t flags)
+ {
++	/*
++	 * 987 void vm_mem_add(struct kvm_vm *vm, enum vm_mem_backing_src_type src_type,
++	 * 988                 uint64_t guest_paddr, uint32_t slot, uint64_t npages,
++	 * 989                 uint32_t flags, int guest_memfd, uint64_t guest_memfd_offset)
++	 */
+ 	vm_mem_add(vm, src_type, guest_paddr, slot, npages, flags, -1, 0);
+ }
+ 
+diff --git a/tools/testing/selftests/kvm/lib/ucall_common.c b/tools/testing/selftests/kvm/lib/ucall_common.c
+index f5af65a41..a8e26bffe 100644
+--- a/tools/testing/selftests/kvm/lib/ucall_common.c
++++ b/tools/testing/selftests/kvm/lib/ucall_common.c
+@@ -22,6 +22,12 @@ int ucall_nr_pages_required(uint64_t page_size)
+  */
+ static struct ucall_header *ucall_pool;
+ 
++/*
++ * called by:
++ *   - tools/testing/selftests/kvm/aarch64/page_fault_test.c|711| <<setup_ucall>> ucall_init(vm, region->region.guest_phys_addr + region->region.memory_size);
++ *   - tools/testing/selftests/kvm/lib/kvm_util.c|434| <<__vm_create>> ucall_init(vm, slot0->region.guest_phys_addr + slot0->region.memory_size);
++ *   - tools/testing/selftests/kvm/s390x/cmma_test.c|146| <<finish_vm_setup>> ucall_init(vm, slot0->region.guest_phys_addr + slot0->region.memory_size);
++ */
+ void ucall_init(struct kvm_vm *vm, vm_paddr_t mmio_gpa)
+ {
+ 	struct ucall_header *hdr;
+-- 
+2.34.1
+
