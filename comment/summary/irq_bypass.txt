@@ -1,0 +1,303 @@
+
+struct kvm {
+    struct {
+        spinlock_t        lock;
+	struct list_head  items;
+	struct list_head  resampler_list;
+	struct mutex      resampler_lock;
+    } irqfds;
+
+    struct list_head ioeventfds;
+
+    struct kvm_irq_routing_table __rcu *irq_routing;
+}
+
+每个gsi都在map[]数组中有一个hlist_head, 上面链接着kvm_kernel_irq_routing_entry.
+使用KVM_SET_GSI_ROUTING从QEMU到KVM配置.
+
+但是只看到ioapic, vfio和virtio使用, 没见到nvme的模拟使用.
+nvme模拟使用KVM_SIGNAL_MSI, 现场创建一个临时的kvm_kernel_irq_routing_entry.
+
+676 #ifdef CONFIG_HAVE_KVM_IRQ_ROUTING
+677 struct kvm_irq_routing_table {
+678         int chip[KVM_NR_IRQCHIPS][KVM_IRQCHIP_NUM_PINS];
+679         u32 nr_rt_entries;
+680         /*
+681          * Array indexed by gsi. Each entry contains list of irq chips
+682          * the gsi is connected to.
+683          */
+684         struct hlist_head map[] __counted_by(nr_rt_entries);
+685 };
+686 #endif
+
+651 struct kvm_kernel_irq_routing_entry {
+652         u32 gsi;
+653         u32 type;
+654         int (*set)(struct kvm_kernel_irq_routing_entry *e,
+655                    struct kvm *kvm, int irq_source_id, int level,
+656                    bool line_status);
+657         union {
+658                 struct {
+659                         unsigned irqchip;
+660                         unsigned pin;
+661                 } irqchip;
+662                 struct {
+663                         u32 address_lo;
+664                         u32 address_hi;
+665                         u32 data;
+666                         u32 flags;
+667                         u32 devid;
+668                 } msi;
+669                 struct kvm_s390_adapter_int adapter;
+670                 struct kvm_hv_sint hv_sint;
+671                 struct kvm_xen_evtchn xen_evtchn;
+672         };
+673         struct hlist_node link;
+674 };
+
+
+问题是, QEMU是如何使用KVM_SET_GSI_ROUTING的呢?
+KVM_SET_GSI_ROUTING的参数是KVMState->irq_routes.
+
+struct KVMState:
+-> struct kvm_irq_routing *irq_routes;
+-> int nr_allocated_irq_routes;
+-> unsigned long *used_gsi_bitmap;
+-> unsigned int gsi_count;
+
+---------------
+
+guest->host使用ioeventfd, 通过KVM_IOEVENTFD创建删除.
+这样guest的io/mmio陷出到KVM的时候就可以通过match具体的addr找到eventfd.
+VFIO应该是用不到ioeventfd的.
+通过QEMU的virtio_bus_set_host_notifier()-->k->ioeventfd_assign=virtio_pci_ioeventfd_assign()设置.
+应该是处理来自guest的VIRTIO_PCI_COMMON_STATUS/VIRTIO_CONFIG_S_DRIVER_OK触发的.
+
+host->guest使用irqfd, 通过KVM_IRQFD创建删除.
+这样host通知guest的irq可以通过某个eventfd.
+
+不管是创建还是删除,KVM_IRQFD的参数是kvm_irqfd结构.
+
+struct kvm_irqfd {
+    __u32 fd;
+    __u32 gsi;
+    __u32 flags;
+    __u32 resamplefd;
+    __u8  pad[16];
+};
+
+添加irqfd的函数是kvm_irqchip_add_irqfd_notifier_gsi()-->kvm_irqchip_assign_irqfd():
+- accel/kvm/kvm-all.c|2220| <<kvm_irqchip_add_irqfd_notifier>> return kvm_irqchip_add_irqfd_notifier_gsi(s, n, rn, GPOINTER_TO_INT(gsi));
+- hw/hyperv/hyperv.c|438| <<hyperv_sint_route_new>> r = kvm_irqchip_add_irqfd_notifier_gsi(kvm_state, &sint_route->sint_set_notifier, ack_notifier, gsi);
+- hw/misc/ivshmem.c|296| <<ivshmem_vector_unmask>> ret = kvm_irqchip_add_irqfd_notifier_gsi(kvm_state, n, NULL, v->virq);
+- hw/misc/ivshmem.c|467| <<setup_interrupt>> kvm_irqchip_add_irqfd_notifier_gsi(kvm_state, n, NULL, s->msi_vectors[vector].virq);
+- hw/remote/proxy.c|45| <<proxy_intx_update>> kvm_irqchip_add_irqfd_notifier_gsi(kvm_state, &dev->intr, &dev->resample, dev->virq);
+- hw/s390x/virtio-ccw.c|1003| <<virtio_ccw_add_irqfd>> return kvm_irqchip_add_irqfd_notifier_gsi(kvm_state, notifier, NULL, dev->routes.gsi[n]);
+- hw/vfio/pci.c|142| <<vfio_intx_enable_kvm>> if (kvm_irqchip_add_irqfd_notifier_gsi(kvm_state, &vdev->intx.interrupt, &vdev->intx.unmask, vdev->intx.route.irq)) {
+- hw/vfio/pci.c|483| <<vfio_connect_kvm_msi_virq>> if (kvm_irqchip_add_irqfd_notifier_gsi(kvm_state, &vector->kvm_interrupt, NULL, vector->virq) < 0) {
+- hw/virtio/virtio-pci.c|844| <<kvm_virtio_pci_irqfd_use>> return kvm_irqchip_add_irqfd_notifier_gsi(kvm_state, n, NULL, irqfd->virq);
+
+gsi/virq是QEMU和KVM一起在全局定义的唯一个guest某个irq的标识符, 可以使用kvm_irqchip_add_msi_route()获得.
+- hw/misc/ivshmem.c|434| <<ivshmem_add_kvm_msi_virq>> ret = kvm_irqchip_add_msi_route(&c, vector, pdev);
+- hw/vfio/pci.c|469| <<vfio_add_kvm_msi_virq>> vector->virq = kvm_irqchip_add_msi_route(&vfio_route_change, vector_n, &vdev->pdev);
+- hw/virtio/virtio-pci.c|819| <<kvm_virtio_pci_vq_vector_use>> ret = kvm_irqchip_add_msi_route(&c, vector, &proxy->pci_dev);
+- target/i386/kvm/kvm.c|5400| <<kvm_arch_init_irq_routing>> if (kvm_irqchip_add_msi_route(&c, 0, NULL) < 0) {
+
+这个patch可以帮助打印host_irq(vfio设备本身的irq)和gsi/virq的关系.
+
+[PATCH v2] KVM: X86: Introduce vfio_intr_stat per-vm debugfs file
+https://lore.kernel.org/all/1644324020-17639-1-git-send-email-yuanzhaoxiong@baidu.com/
+
+---------------
+
+新的问题来了 ... gsi/virq怎么样和host_irq绑定的? 使用的irqbypass!!
+
+把producer和consumer绑定在一起.
+
+319 static int
+320 kvm_irqfd_assign(struct kvm *kvm, struct kvm_irqfd *args)
+321 {
+... ...
+444 #ifdef CONFIG_HAVE_KVM_IRQ_BYPASS
+445         if (kvm_arch_has_irq_bypass()) {
+446                 /*
+447                  * struct kvm_kernel_irqfd *irqfd:
+448                  * -> struct irq_bypass_consumer consumer;
+449                  * -> struct irq_bypass_producer *producer;
+450                  */
+451                 irqfd->consumer.token = (void *)irqfd->eventfd;
+452                 irqfd->consumer.add_producer = kvm_arch_irq_bypass_add_producer;
+453                 irqfd->consumer.del_producer = kvm_arch_irq_bypass_del_producer;
+454                 irqfd->consumer.stop = kvm_arch_irq_bypass_stop;
+455                 irqfd->consumer.start = kvm_arch_irq_bypass_start;
+456                 ret = irq_bypass_register_consumer(&irqfd->consumer);
+457                 if (ret)
+458                         pr_info("irq bypass consumer (token %p) registration fails: %d\n",
+459                                 irqfd->consumer.token, ret);
+460         }
+461 #endif
+
+当我们绑定的时候, 就可以用下面的函数告诉KVM/kernel,
+请把host_irq每次post到某个vCPU, vector是xxx.
+
+struct kvm_x86_ops vmx_x86_ops.pi_update_irte = vmx_pi_update_irte
+struct kvm_x86_ops svm_x86_ops.pi_update_irte = avic_pi_update_irte
+
+---------------
+
+如果mask了一个MSI-X会怎么样? (以前没有mask)
+
+msix_table_mmio_write()
+-> msix_handle_mask_update()
+   -> msix_fire_vector_notifier()
+      -> dev->msix_vector_release_notifier = vfio_msix_vector_release()
+
+第一步, 使用vector->interrupt: int32_t fd = event_notifier_get_fd(&vector->interrupt);
+第二步, vfio_set_irq_signaling(&vdev->vbasedev, VFIO_PCI_MSIX_IRQ_INDEX, nr, VFIO_IRQ_SET_ACTION_TRIGGER, fd, &err)
+
+
+vfio有两个notifier:
+- VFIOMSIVector->kvm_interrupt: fastpath, 用来和irqbypass绑定.
+  向IRQFD注册过.
+- VFIOMSIVector->interrupt: 有QEMU userspace的fd handler, 可以接收VFIO的通知.
+  可以用于mask中断的时候.
+  从来没有向IRQFD注册过.
+
+所以vfio_msix_vector_release()用的是vector->interrupt.
+
+VFIO kernel端会触发vfio_pci_set_msi_trigger()-->vfio_msi_set_vector_signal().
+
+1. 用irq_bypass_unregister_producer(&ctx->producer)等取消已经有的绑定.
+2. 重新分配host_irq: ret = request_irq(irq, vfio_msihandler, 0, ctx->name, trigger)
+3. 添加到irqbypass: irq_bypass_register_producer(&ctx->producer).
+因为vector->interrupt没用IRQFD注册过, 所以不会match到任何consumer.
+因此, 不会触发kvm_arch_irq_bypass_add_producer()->vmx_pi_update_irte().
+
+如果此时硬件有了中断,会触发vfio_msihandler().
+
+378 static irqreturn_t vfio_msihandler(int irq, void *arg)
+379 {
+380         struct eventfd_ctx *trigger = arg;
+381
+382         eventfd_signal(trigger);
+383         return IRQ_HANDLED;
+384 }
+
+通知QEMU的vector->interrupt的fd handler,也就是QEMU的vfio_msi_interrupt().
+根据是否mask了来决定是否时候PBA.
+
+352     if (vdev->interrupt == VFIO_INT_MSIX) {
+353         get_msg = msix_get_message; 
+354         notify = msix_notify;
+355        
+356         /* A masked vector firing needs to use the PBA, enable it */
+357         if (msix_is_masked(&vdev->pdev, nr)) {
+358             set_bit(nr, vdev->msix->pending);
+359             memory_region_set_enabled(&vdev->pdev.msix_pba_mmio, true);
+360             trace_vfio_msix_pba_enable(vdev->vbasedev.name);
+361         }
+
+---------------
+
+如果重新unmask了一个MSI-X会怎么样?
+
+已经unmask的话, line 175直接返回. 
+
+164 static void msix_handle_mask_update(PCIDevice *dev, int vector, bool was_masked)
+165 {
+166     bool is_masked = msix_is_masked(dev, vector);
+167 
+168     if (xen_mode == XEN_EMULATE) {
+169         MSIMessage msg = msix_prepare_message(dev, vector);
+170 
+171         xen_evtchn_snoop_msi(dev, true, vector, msg.address, msg.data,
+172                              is_masked);
+173     }
+174 
+175     if (is_masked == was_masked) {
+176         return;
+177     }
+178 
+179     msix_fire_vector_notifier(dev, vector, is_masked);
+180 
+181     if (!is_masked && msix_is_pending(dev, vector)) {
+182         msix_clr_pending(dev, vector);
+183         msix_notify(dev, vector);
+184     }
+185 }
+
+如果之前中断是mask的,
+
+msix_fire_vector_notifier()
+-> dev->msix_vector_use_notifier = vfio_msix_vector_use()
+   -> vfio_msix_vector_do_use(pdev, nr, &msg, vfio_msi_interrupt);
+      -> vfio_update_kvm_msi_virq(vector, *msg, pdev)
+         -> kvm_irqchip_update_msi_route(kvm_state, vector->virq, msg, pdev);
+            -> 只是更新某一个entry!
+         -> kvm_irqchip_commit_routes(kvm_state);
+            -> KVM_SET_GSI_ROUTING
+      -> fd = event_notifier_get_fd(&vector->kvm_interrupt);
+      -> vfio_set_irq_signaling(&vdev->vbasedev, VFIO_PCI_MSIX_IRQ_INDEX, nr, VFIO_IRQ_SET_ACTION_TRIGGER, fd, &err)
+
+好奇怪, 这里要麻烦到KVM_SET_GSI_ROUTING.
+
+
+# cat set_ftrace_filter
+irq_bypass_register_consumer [irqbypass]
+irq_bypass_unregister_producer [irqbypass]
+irq_bypass_unregister_consumer [irqbypass]
+irq_bypass_register_producer [irqbypass]
+kvm_set_memory_region [kvm]
+irqfd_update [kvm]
+kvm_irqfd_assign [kvm]
+kvm_irqfd [kvm]
+kvm_irqfd_release [kvm]
+kvm_irq_routing_update [kvm]
+kvm_set_irq_routing [kvm]
+kvm_arch_irq_bypass_add_producer [kvm]
+kvm_arch_irq_bypass_del_producer [kvm]
+kvm_arch_update_irqfd_routing [kvm]
+vmx_pi_update_irte [kvm_intel]
+vfio_msihandler [vfio_pci_core]
+vfio_msi_set_vector_signal [vfio_pci_core]
+vfio_pci_set_msi_trigger [vfio_pci_core]
+
+把irq从CPU=5换到CPU=6上.
+
+       CPU 5/KVM-51857   [011] ..... 435912.873065: vfio_pci_set_msi_trigger <-vfio_pci_core_ioctl
+       CPU 5/KVM-51857   [011] ..... 435912.873068: vfio_msi_set_vector_signal <-vfio_msi_set_block
+       CPU 5/KVM-51857   [011] ..... 435912.873069: irq_bypass_unregister_producer <-vfio_msi_set_vector_signal
+       CPU 5/KVM-51857   [011] ..... 435912.873070: kvm_arch_irq_bypass_del_producer <-__disconnect
+       CPU 5/KVM-51857   [011] ..... 435912.873070: vmx_pi_update_irte <-kvm_arch_irq_bypass_del_producer
+       CPU 5/KVM-51857   [011] ..... 435912.873102: irq_bypass_register_producer <-vfio_msi_set_vector_signal
+
+       CPU 5/KVM-51857   [011] ..... 435912.873255: kvm_set_irq_routing <-kvm_vm_ioctl
+       CPU 5/KVM-51857   [011] ..... 435912.873263: kvm_irq_routing_update <-kvm_set_irq_routing
+       CPU 5/KVM-51857   [011] d.... 435912.873263: irqfd_update <-kvm_irq_routing_update
+       CPU 5/KVM-51857   [011] d.... 435912.873264: kvm_arch_update_irqfd_routing <-kvm_irq_routing_update
+       CPU 5/KVM-51857   [011] d.... 435912.873264: vmx_pi_update_irte <-kvm_irq_routing_update
+       CPU 5/KVM-51857   [011] d.... 435912.873266: irqfd_update <-kvm_irq_routing_update
+       CPU 5/KVM-51857   [011] d.... 435912.873266: irqfd_update <-kvm_irq_routing_update
+       CPU 5/KVM-51857   [011] d.... 435912.873266: kvm_arch_update_irqfd_routing <-kvm_irq_routing_update
+       CPU 5/KVM-51857   [011] d.... 435912.873266: vmx_pi_update_irte <-kvm_irq_routing_update
+
+       CPU 5/KVM-51857   [011] ..... 435912.873290: vfio_pci_set_msi_trigger <-vfio_pci_core_ioctl
+       CPU 5/KVM-51857   [011] ..... 435912.873291: vfio_msi_set_vector_signal <-vfio_msi_set_block
+       CPU 5/KVM-51857   [011] ..... 435912.873291: irq_bypass_unregister_producer <-vfio_msi_set_vector_signal
+       CPU 5/KVM-51857   [011] ..... 435912.873311: irq_bypass_register_producer <-vfio_msi_set_vector_signal
+       CPU 5/KVM-51857   [011] ..... 435912.873312: kvm_arch_irq_bypass_add_producer <-__connect
+       CPU 5/KVM-51857   [011] ..... 435912.873312: vmx_pi_update_irte <-kvm_arch_irq_bypass_add_producer
+
+---------------
+
+如果在mask的时候重写了MSI-X table会怎么样?
+
+---------------
+
+如果在unmask的时候重写了MSI-X table会怎么样?
+
+---------------
+
+struct VirtQueue
+-> EventNotifier guest_notifier;
+-> EventNotifier host_notifier;
