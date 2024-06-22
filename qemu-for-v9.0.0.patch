@@ -1,34 +1,50 @@
-From 6ce21b523bd517fa20deeac2a48a5592dcbff6a7 Mon Sep 17 00:00:00 2001
+From d22c985d0bc56c98feedc3b1c43aed01771ea585 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Sun, 9 Jun 2024 10:18:54 -0700
+Date: Sat, 22 Jun 2024 09:56:25 -0700
 Subject: [PATCH 1/1] qemu for v9.0.0
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
- accel/kvm/kvm-all.c             | 128 +++++++++++++++++++++++++++++++
- hw/i386/kvm/apic.c              |  14 ++++
- hw/pci/msi.c                    |  10 +++
- hw/pci/msix.c                   |  60 +++++++++++++++
- hw/pci/pcie.c                   |   4 +
- hw/pci/pcie_port.c              |  14 ++++
- hw/vfio/helpers.c               |  17 ++++
- hw/vfio/pci.c                   | 132 ++++++++++++++++++++++++++++++++
- hw/vfio/pci.h                   |   9 +++
- hw/virtio/virtio-bus.c          |  22 ++++++
- hw/virtio/virtio-pci.c          |  34 ++++++++
- hw/virtio/virtio.c              |  58 ++++++++++++++
- include/hw/hotplug.h            |  23 ++++++
- include/hw/i386/apic_internal.h |  10 +++
- include/hw/pci/pci_device.h     |  51 ++++++++++++
- include/hw/virtio/virtio.h      |   7 ++
- include/sysemu/kvm_int.h        |  39 ++++++++++
- system/cpus.c                   |   4 +
- system/memory.c                 |  29 +++++++
- target/arm/kvm.c                |   5 ++
- target/i386/kvm/kvm.c           |   9 +++
- util/event_notifier-posix.c     |  55 +++++++++++++
- util/main-loop.c                |  33 ++++++++
- 23 files changed, 767 insertions(+)
+ accel/kvm/kvm-all.c               | 128 ++++++++++++++
+ block/aio_task.c                  |   6 +
+ block/block-backend.c             |  43 +++++
+ block/file-posix.c                |  46 +++++
+ block/io.c                        |  86 +++++++++
+ block/qcow2-threads.c             |   5 +
+ block/qcow2.c                     |   6 +
+ hw/block/virtio-blk.c             | 285 ++++++++++++++++++++++++++++++
+ hw/core/vm-change-state-handler.c |  87 +++++++++
+ hw/i386/kvm/apic.c                |  14 ++
+ hw/pci/msi.c                      |  10 ++
+ hw/pci/msix.c                     |  60 +++++++
+ hw/pci/pci.c                      |  85 +++++++++
+ hw/pci/pcie.c                     |   4 +
+ hw/pci/pcie_port.c                |  14 ++
+ hw/scsi/scsi-disk.c               |  11 ++
+ hw/vfio/helpers.c                 |  17 ++
+ hw/vfio/pci.c                     | 132 ++++++++++++++
+ hw/vfio/pci.h                     |   9 +
+ hw/virtio/virtio-bus.c            |  22 +++
+ hw/virtio/virtio-pci.c            |  34 ++++
+ hw/virtio/virtio.c                |  65 +++++++
+ include/block/block_int-common.h  |  27 +++
+ include/hw/hotplug.h              |  23 +++
+ include/hw/i386/apic_internal.h   |  10 ++
+ include/hw/pci/pci_bus.h          |   8 +
+ include/hw/pci/pci_device.h       |  51 ++++++
+ include/hw/scsi/scsi.h            |  10 ++
+ include/hw/virtio/virtio-blk.h    |  39 ++++
+ include/hw/virtio/virtio.h        |   7 +
+ include/sysemu/kvm_int.h          |  39 ++++
+ iothread.c                        |   8 +
+ system/cpus.c                     |   4 +
+ system/memory.c                   |  29 +++
+ target/arm/kvm.c                  |   5 +
+ target/i386/kvm/kvm.c             |   9 +
+ util/aio-posix.c                  |  23 +++
+ util/event_notifier-posix.c       |  55 ++++++
+ util/main-loop.c                  |  33 ++++
+ 39 files changed, 1549 insertions(+)
 
 diff --git a/accel/kvm/kvm-all.c b/accel/kvm/kvm-all.c
 index 931f74256..79e9fbf32 100644
@@ -269,6 +285,885 @@ index 931f74256..79e9fbf32 100644
  /* Called synchronously (via signalfd) in main thread.  */
  int kvm_on_sigbus(int code, void *addr)
  {
+diff --git a/block/aio_task.c b/block/aio_task.c
+index 9bd17ea2c..8abec7c1b 100644
+--- a/block/aio_task.c
++++ b/block/aio_task.c
+@@ -27,6 +27,12 @@
+ #include "block/aio_task.h"
+ 
+ struct AioTaskPool {
++    /*
++     * 在以下使用AioTaskPool->main_co:
++     *   - block/aio_task.c|57| <<aio_task_co>> aio_co_wake(pool->main_co);
++     *   - block/aio_task.c|64| <<aio_task_pool_wait_one>> assert(qemu_coroutine_self() == pool->main_co);
++     *   - block/aio_task.c|103| <<aio_task_pool_new>> pool->main_co = qemu_coroutine_self();
++     */
+     Coroutine *main_co;
+     int status;
+     int max_busy_tasks;
+diff --git a/block/block-backend.c b/block/block-backend.c
+index db6f9b92a..1c4c99562 100644
+--- a/block/block-backend.c
++++ b/block/block-backend.c
+@@ -1565,6 +1565,10 @@ static void blk_aio_complete_bh(void *opaque)
+     blk_aio_complete(acb);
+ }
+ 
++/*
++ * 比如cb是virtio_blk_rw_complete()
++ *     co_entry是blk_aio_write_entry()
++ */
+ static BlockAIOCB *blk_aio_prwv(BlockBackend *blk, int64_t offset,
+                                 int64_t bytes,
+                                 void *iobuf, CoroutineEntry co_entry,
+@@ -1610,6 +1614,11 @@ static void coroutine_fn blk_aio_read_entry(void *opaque)
+     blk_aio_complete(acb);
+ }
+ 
++/*
++ * 在以下使用blk_aio_write_entry():
++ *   - block/block-backend.c|1630| <<blk_aio_pwrite_zeroes>> return blk_aio_prwv(blk, offset, bytes, NULL, blk_aio_write_entry, flags | BDRV_REQ_ZERO_WRITE, cb, opaque);
++ *   - block/block-backend.c|1712| <<blk_aio_pwritev>> return blk_aio_prwv(blk, offset, qiov->size, qiov, blk_aio_write_entry, flags, cb, opaque);
++ */
+ static void coroutine_fn blk_aio_write_entry(void *opaque)
+ {
+     BlkAioEmAIOCB *acb = opaque;
+@@ -1622,6 +1631,19 @@ static void coroutine_fn blk_aio_write_entry(void *opaque)
+     blk_aio_complete(acb);
+ }
+ 
++/*
++ * 在以下使用blk_aio_pwrite_zeroes():
++ *   - hw/block/virtio-blk.c|568| <<virtio_blk_handle_discard_write_zeroes>> blk_aio_pwrite_zeroes(s->blk, sector << BDRV_SECTOR_BITS, bytes, blk_aio_flags, virtio_blk_discard_write_zeroes_complete, req);
++ *   - hw/nvme/ctrl.c|2192| <<nvme_rw_cb>> req->aiocb = blk_aio_pwrite_zeroes(blk, offset, mlen, BDRV_REQ_MAY_UNMAP, nvme_rw_complete_cb, req);
++ *   - hw/nvme/ctrl.c|2539| <<nvme_dsm_md_cb>> iocb->aiocb = blk_aio_pwrite_zeroes(ns->blkconf.blk, nvme_moff(ns, slba), nvme_m2b(ns, nlb), BDRV_REQ_MAY_UNMAP, nvme_dsm_cb, iocb);
++ *   - hw/nvme/ctrl.c|3637| <<nvme_do_write>> req->aiocb = blk_aio_pwrite_zeroes(blk, data_offset, data_size, BDRV_REQ_MAY_UNMAP, nvme_rw_cb, req);
++ *   - hw/nvme/ctrl.c|3911| <<nvme_zone_reset_epilogue_cb>> iocb->aiocb = blk_aio_pwrite_zeroes(ns->blkconf.blk, moff, count, BDRV_REQ_MAY_UNMAP, nvme_zone_reset_cb, iocb);
++ *   - hw/nvme/ctrl.c|3965| <<nvme_zone_reset_cb>> iocb->aiocb = blk_aio_pwrite_zeroes(ns->blkconf.blk, nvme_l2b(ns, zone->d.zslba), nvme_l2b(ns, ns->zone_size), BDRV_REQ_MAY_UNMAP, nvme_zone_reset_epilogue_cb, iocb);
++ *   - hw/nvme/ctrl.c|6523| <<nvme_format_ns_cb>> iocb->aiocb = blk_aio_pwrite_zeroes(ns->blkconf.blk, iocb->offset, bytes, BDRV_REQ_MAY_UNMAP, nvme_format_ns_cb, iocb);
++ *   - hw/nvme/dif.c|632| <<nvme_dif_rw>> req->aiocb = blk_aio_pwrite_zeroes(blk, offset, len, flags, nvme_dif_rw_mdata_out_cb, ctx);
++ *   - hw/scsi/scsi-disk.c|1889| <<scsi_disk_emulate_write_same>> r->req.aiocb = blk_aio_pwrite_zeroes(s->qdev.conf.blk, r->req.cmd.lba * s->qdev.blocksize, nb_sectors * s->qdev.blocksize, flags, scsi_aio_complete, r);
++ *   - qemu-io-cmds.c|1683| <<aio_write_f>> blk_aio_pwrite_zeroes(blk, ctx->offset, count, ctx->flags, aio_write_done, ctx);
++ */
+ BlockAIOCB *blk_aio_pwrite_zeroes(BlockBackend *blk, int64_t offset,
+                                   int64_t bytes, BdrvRequestFlags flags,
+                                   BlockCompletionFunc *cb, void *opaque)
+@@ -1702,6 +1724,27 @@ BlockAIOCB *blk_aio_preadv(BlockBackend *blk, int64_t offset,
+                         blk_aio_read_entry, flags, cb, opaque);
+ }
+ 
++/*
++ * called by:
++ *   - hw/block/dataplane/xen-block.c|393| <<xen_block_do_aio>> blk_aio_pwritev(dataplane->blk, request->start, &request->v, 0, xen_block_complete_aio, request);
++ *   - hw/block/m25p80.c|564| <<flash_sync_page>> blk_aio_pwritev(s->blk, page * s->pi->page_size, iov, 0, blk_sync_complete, iov);
++ *   - hw/block/m25p80.c|580| <<flash_sync_area>> blk_aio_pwritev(s->blk, off, iov, 0, blk_sync_complete, iov);
++ *   - hw/block/virtio-blk.c|399| <<submit_requests>> blk_aio_pwritev(blk, sector_num << BDRV_SECTOR_BITS, qiov, flags, virtio_blk_rw_complete, mrb->reqs[start]);
++ *   - hw/ide/core.c|1101| <<ide_sector_write>> s->pio_aiocb = blk_aio_pwritev(s->blk, sector_num << BDRV_SECTOR_BITS, &s->qiov, 0, ide_sector_write_cb, s);
++ *   - hw/nvme/ctrl.c|1465| <<nvme_blk_write>> req->aiocb = blk_aio_pwritev(blk, offset, &req->sg.iov, 0, cb, req);
++ *   - hw/nvme/ctrl.c|2917| <<nvme_copy_out_cb>> iocb->aiocb = blk_aio_pwritev(ns->blkconf.blk, nvme_moff(ns, iocb->slba), &iocb->iov, 0, nvme_copy_out_completed_cb, iocb);
++ *   - hw/nvme/ctrl.c|3011| <<nvme_copy_in_completed_cb>> iocb->aiocb = blk_aio_pwritev(ns->blkconf.blk, nvme_l2b(ns, iocb->slba), &iocb->iov, 0, nvme_copy_out_cb, iocb);
++ *   - hw/nvme/dif.c|530| <<nvme_dif_rw_mdata_out_cb>> req->aiocb = blk_aio_pwritev(blk, offset, &ctx->mdata.iov, 0, nvme_dif_rw_cb, ctx);
++ *   - hw/nvme/dif.c|701| <<nvme_dif_rw>> req->aiocb = blk_aio_pwritev(ns->blkconf.blk, offset, &ctx->data.iov, 0, nvme_dif_rw_mdata_out_cb, ctx);
++ *   - hw/scsi/scsi-disk.c|1842| <<scsi_write_same_complete>> r->req.aiocb = blk_aio_pwritev(s->qdev.conf.blk, data->sector << BDRV_SECTOR_BITS, &data->qiov, 0, scsi_write_same_complete, data);
++ *   - hw/scsi/scsi-disk.c|1914| <<scsi_disk_emulate_write_same>> r->req.aiocb = blk_aio_pwritev(s->qdev.conf.blk, data->sector << BDRV_SECTOR_BITS, &data->qiov, 0, scsi_write_same_complete, data);
++ *   - hw/scsi/scsi-disk.c|3089| <<scsi_dma_writev>> return blk_aio_pwritev(s->qdev.conf.blk, offset, iov, 0, cb, cb_opaque);
++ *   - qemu-img.c|4493| <<bench_cb>> acb = blk_aio_pwritev(b->blk, offset, b->qiov, 0, bench_cb, b);
++ *   - qemu-io-cmds.c|663| <<do_aio_writev>> blk_aio_pwritev(blk, offset, qiov, flags, aio_rw_done, &async_ret);
++ *   - qemu-io-cmds.c|1699| <<aio_write_f>> blk_aio_pwritev(blk, ctx->offset, &ctx->qiov, ctx->flags, aio_write_done, ctx);
++ *   - system/dma-helpers.c|265| <<dma_blk_write_io_func>> return blk_aio_pwritev(blk, offset, iov, 0, cb, cb_opaque);
++ *   - tests/unit/test-replication.c|113| <<test_blk_write>> blk_aio_pwritev(blk, offset, &qiov, 0, blk_rw_done, &async_ret);
++ */
+ BlockAIOCB *blk_aio_pwritev(BlockBackend *blk, int64_t offset,
+                             QEMUIOVector *qiov, BdrvRequestFlags flags,
+                             BlockCompletionFunc *cb, void *opaque)
+diff --git a/block/file-posix.c b/block/file-posix.c
+index 35684f7e2..b332f64ad 100644
+--- a/block/file-posix.c
++++ b/block/file-posix.c
+@@ -2404,6 +2404,18 @@ out:
+     return result;
+ }
+ 
++/*
++ * called by:
++ *   - block/file-posix.c|2533| <<raw_co_prw>> ret = raw_thread_pool_submit(handle_aiocb_rw, &acb);
++ *   - block/file-posix.c|2603| <<raw_co_flush_to_disk>> return raw_thread_pool_submit(handle_aiocb_flush, &acb);
++ *   - block/file-posix.c|2642| <<raw_regular_truncate>> return raw_thread_pool_submit(handle_aiocb_truncate, &acb);
++ *   - block/file-posix.c|3400| <<raw_co_zone_report>> return raw_thread_pool_submit(handle_aiocb_zone_report, &acb);
++ *   - block/file-posix.c|3477| <<raw_co_zone_mgmt>> ret = raw_thread_pool_submit(handle_aiocb_zone_mgmt, &acb);
++ *   - block/file-posix.c|3559| <<raw_do_pdiscard>> ret = raw_thread_pool_submit(handle_aiocb_discard, &acb);
++ *   - block/file-posix.c|3665| <<raw_do_pwrite_zeroes>> return raw_thread_pool_submit(handler, &acb);
++ *   - block/file-posix.c|3906| <<raw_co_copy_range_to>> return raw_thread_pool_submit(handle_aiocb_copy_range, &acb);
++ *   - block/file-posix.c|4249| <<hdev_co_ioctl>> return raw_thread_pool_submit(handle_aiocb_ioctl, &acb);
++ */
+ static int coroutine_fn raw_thread_pool_submit(ThreadPoolFunc func, void *arg)
+ {
+     return thread_pool_submit_co(func, arg);
+@@ -3567,6 +3579,37 @@ raw_co_pdiscard(BlockDriverState *bs, int64_t offset, int64_t bytes)
+     return raw_do_pdiscard(bs, offset, bytes, false);
+ }
+ 
++/*
++ * (gdb) bt
++ * #0  bdrv_co_get_self_request (bs=0x629000005200) at ../block/io.c:720
++ * #1  0x00005555570f6929 in raw_do_pwrite_zeroes (bs=0x629000005200, offset=458752, bytes=65536, flags=BDRV_REQ_NO_FALLBACK, blkdev=false) at ../block/file-posix.c:3598
++ * #2  0x00005555570f6f1d in raw_co_pwrite_zeroes (bs=0x629000005200, offset=458752, bytes=65536, flags=BDRV_REQ_NO_FALLBACK) at ../block/file-posix.c:3641
++ * #3  0x0000555556fb193d in bdrv_co_do_pwrite_zeroes (bs=0x629000005200, offset=458752, bytes=65536, flags=258) at ../block/io.c:1901
++ * #4  0x0000555556fb2b50 in bdrv_aligned_pwritev (child=0x608000002920, req=0x7ffd14df80d0, offset=458752, bytes=65536, align=512, qiov=0x0, qiov_offset=0, flags=258) at ../block/io.c:2100
++ * #5  0x0000555556fb33a7 in bdrv_co_do_zero_pwritev (child=0x608000002920, offset=458752, bytes=65536, flags=258, req=0x7ffd14df80d0) at ../block/io.c:2183
++ * #6  0x0000555556fb3c43 in bdrv_co_pwritev_part (child=0x608000002920, offset=458752, bytes=65536, qiov=0x0, qiov_offset=0, flags=258) at ../block/io.c:2283
++ * #7  0x0000555556fb362c in bdrv_co_pwritev (child=0x608000002920, offset=458752, bytes=65536, qiov=0x0, flags=258) at ../block/io.c:2216
++ * #8  0x0000555556fb3f19 in bdrv_co_pwrite_zeroes (child=0x608000002920, offset=458752, bytes=65536, flags=BDRV_REQ_NO_FALLBACK) at ../block/io.c:2322
++ * #9  0x0000555556ffae77 in handle_alloc_space (bs=0x62900000a200, l2meta=0x60b0011bb730) at ../block/qcow2.c:2557
++ * #10 0x0000555556ffb3de in qcow2_co_pwritev_task (bs=0x62900000a200, host_offset=458752, offset=131072, bytes=8192, qiov=0x61200532c758, qiov_offset=0, l2meta=0x60b0011bb730) at ../block/qcow2.c:2609
++ * #11 0x0000555556ffb828 in qcow2_co_pwritev_task_entry (task=0x7ffd14c07320) at ../block/qcow2.c:2657
++ * #12 0x0000555556ff97cd in qcow2_add_task
++ *     (bs=0x62900000a200, pool=0x0, func=0x555556ffb653 <qcow2_co_pwritev_task_entry>, subcluster_type=QCOW2_SUBCLUSTER_UNALLOCATED_PLAIN, host_offset=458752, offset=131072, bytes=8192, qiov=0x61200532c758, qiov_offset=0, l2meta=0x60b0011bb730) at ../block/qcow2.c:2307
++ * #13 0x0000555556ffbd90 in qcow2_co_pwritev_part (bs=0x62900000a200, offset=131072, bytes=8192, qiov=0x61200532c758, qiov_offset=0, flags=BDRV_REQ_REGISTERED_BUF) at ../block/qcow2.c:2709
++ * #14 0x0000555556face86 in bdrv_driver_pwritev (bs=0x62900000a200, offset=131072, bytes=8192, qiov=0x61200532c758, qiov_offset=0, flags=BDRV_REQ_REGISTERED_BUF) at ../block/io.c:1070
++ * #15 0x0000555556fb2bcb in bdrv_aligned_pwritev (child=0x608000002e20, req=0x7ffd14df7cd0, offset=131072, bytes=8192, align=1, qiov=0x61200532c758, qiov_offset=0, flags=BDRV_REQ_REGISTERED_BUF) at ../block/io.c:2106
++ * #16 0x0000555556fb3d48 in bdrv_co_pwritev_part (child=0x608000002e20, offset=131072, bytes=8192, qiov=0x61200532c758, qiov_offset=0, flags=BDRV_REQ_REGISTERED_BUF) at ../block/io.c:2299
++ * #17 0x0000555556f7f9bd in blk_co_do_pwritev_part (blk=0x6190000d8e80, offset=131072, bytes=8192, qiov=0x61200532c758, qiov_offset=0, flags=BDRV_REQ_REGISTERED_BUF) at ../block/block-backend.c:1425
++ * #18 0x0000555556f80d1d in blk_aio_write_entry (opaque=0x6080016c0920) at ../block/block-backend.c:1620
++ * #19 0x000055555734236e in coroutine_trampoline (i0=87277888, i1=24864) at ../util/coroutine-ucontext.c:175
++ * #20 0x00007ffff70b4830 in __start_context () at /lib64/libc.so.6
++ * #21 0x00007fffef7e01c0 in  ()
++ * #22 0x0000000000000000 in  ()
++ *
++ * called by:
++ *   - block/file-posix.c|3641| <<raw_co_pwrite_zeroes>> return raw_do_pwrite_zeroes(bs, offset, bytes, flags, false);
++ *   - block/file-posix.c|4243| <<hdev_co_pwrite_zeroes>> return raw_do_pwrite_zeroes(bs, offset, bytes, flags, true);
++ */
+ static int coroutine_fn
+ raw_do_pwrite_zeroes(BlockDriverState *bs, int64_t offset, int64_t bytes,
+                      BdrvRequestFlags flags, bool blkdev)
+@@ -3634,6 +3677,9 @@ raw_do_pwrite_zeroes(BlockDriverState *bs, int64_t offset, int64_t bytes,
+     return raw_thread_pool_submit(handler, &acb);
+ }
+ 
++/*
++ * BlockDriver bdrv_file.block/file-posix.c|3923| <<global>> .bdrv_co_pwrite_zeroes = raw_co_pwrite_zeroes,
++ */
+ static int coroutine_fn raw_co_pwrite_zeroes(
+     BlockDriverState *bs, int64_t offset,
+     int64_t bytes, BdrvRequestFlags flags)
+diff --git a/block/io.c b/block/io.c
+index 7217cf811..86aa006d6 100644
+--- a/block/io.c
++++ b/block/io.c
+@@ -582,6 +582,15 @@ void bdrv_drain_all(void)
+  *
+  * This function should be called when a tracked request is completing.
+  */
++/*
++ * called by:
++ *   - block/io.c|1822| <<bdrv_co_preadv_part>> tracked_request_end(&req);
++ *   - block/io.c|2305| <<bdrv_co_pwritev_part>> tracked_request_end(&req);
++ *   - block/io.c|3187| <<bdrv_co_pdiscard>> tracked_request_end(&req);
++ *   - block/io.c|3445| <<bdrv_co_copy_range_internal>> tracked_request_end(&req);
++ *   - block/io.c|3461| <<bdrv_co_copy_range_internal>> tracked_request_end(&req);
++ *   - block/io.c|3661| <<bdrv_co_truncate>> tracked_request_end(&req);
++ */
+ static void coroutine_fn tracked_request_end(BdrvTrackedRequest *req)
+ {
+     if (req->serialising) {
+@@ -603,6 +612,15 @@ static void coroutine_fn tracked_request_end(BdrvTrackedRequest *req)
+ /**
+  * Add an active request to the tracked requests list
+  */
++/*
++ * called by:
++ *   - block/io.c|1818| <<bdrv_co_preadv_part>> tracked_request_begin(&req, bs, offset, bytes, BDRV_TRACKED_READ);
++ *   - block/io.c|2279| <<bdrv_co_pwritev_part>> tracked_request_begin(&req, bs, offset, bytes, BDRV_TRACKED_WRITE);
++ *   - block/io.c|3118| <<bdrv_co_pdiscard>> tracked_request_begin(&req, bs, offset, bytes, BDRV_TRACKED_DISCARD);
++ *   - block/io.c|3432| <<bdrv_co_copy_range_internal>> tracked_request_begin(&req, src->bs, src_offset, bytes, BDRV_TRACKED_READ);
++ *   - block/io.c|3449| <<bdrv_co_copy_range_internal>> tracked_request_begin(&req, dst->bs, dst_offset, bytes, BDRV_TRACKED_WRITE);
++ *   - block/io.c|3584| <<bdrv_co_truncate>> tracked_request_begin(&req, bs, offset - new_bytes, new_bytes, BDRV_TRACKED_TRUNCATE);
++ */
+ static void coroutine_fn tracked_request_begin(BdrvTrackedRequest *req,
+                                                BlockDriverState *bs,
+                                                int64_t offset,
+@@ -625,6 +643,13 @@ static void coroutine_fn tracked_request_begin(BdrvTrackedRequest *req,
+     qemu_co_queue_init(&req->wait_queue);
+ 
+     qemu_mutex_lock(&bs->reqs_lock);
++    /*
++     * 在以下使用BlockDriverState->tracked_requests:
++     *   - block/io.c|628| <<tracked_request_begin>> QLIST_INSERT_HEAD(&bs->tracked_requests, req, list);
++     *   - block/io.c|654| <<bdrv_find_conflicting_request>> QLIST_FOREACH(req, &self->bs->tracked_requests, list) {
++     *   - block/io.c|724| <<bdrv_co_get_self_request>> QLIST_FOREACH(req, &bs->tracked_requests, list) {
++     *   - block/mirror.c|1130| <<mirror_run>> assert(QLIST_EMPTY(&bs->tracked_requests));
++     */
+     QLIST_INSERT_HEAD(&bs->tracked_requests, req, list);
+     qemu_mutex_unlock(&bs->reqs_lock);
+ }
+@@ -715,6 +740,10 @@ static void tracked_request_set_serialising(BdrvTrackedRequest *req,
+  * Return the tracked request on @bs for the current coroutine, or
+  * NULL if there is none.
+  */
++/*
++ * called by:
++ *   - block/file-posix.c|3598| <<raw_do_pwrite_zeroes>> req = bdrv_co_get_self_request(bs);
++ */
+ BdrvTrackedRequest *coroutine_fn bdrv_co_get_self_request(BlockDriverState *bs)
+ {
+     BdrvTrackedRequest *req;
+@@ -722,6 +751,13 @@ BdrvTrackedRequest *coroutine_fn bdrv_co_get_self_request(BlockDriverState *bs)
+     IO_CODE();
+ 
+     QLIST_FOREACH(req, &bs->tracked_requests, list) {
++        /*
++	 * 在以下使用BlockDriverState->tracked_requests:
++	 *   - block/io.c|628| <<tracked_request_begin>> QLIST_INSERT_HEAD(&bs->tracked_requests, req, list);
++	 *   - block/io.c|654| <<bdrv_find_conflicting_request>> QLIST_FOREACH(req, &self->bs->tracked_requests, list) {
++	 *   - block/io.c|724| <<bdrv_co_get_self_request>> QLIST_FOREACH(req, &bs->tracked_requests, list) {
++	 *   - block/mirror.c|1130| <<mirror_run>> assert(QLIST_EMPTY(&bs->tracked_requests));
++	 */
+         if (req->co == self) {
+             return req;
+         }
+@@ -1828,6 +1864,11 @@ fail:
+     return ret;
+ }
+ 
++/*
++ * called by:
++ *   - block/io.c|1301| <<bdrv_co_do_copy_on_readv>> ret = bdrv_co_do_pwrite_zeroes(bs, align_offset, pnum, BDRV_REQ_WRITE_UNCHANGED);
++ *   - block/io.c|2129| <<bdrv_aligned_pwritev>> ret = bdrv_co_do_pwrite_zeroes(bs, offset, bytes, flags);
++ */
+ static int coroutine_fn GRAPH_RDLOCK
+ bdrv_co_do_pwrite_zeroes(BlockDriverState *bs, int64_t offset, int64_t bytes,
+                          BdrvRequestFlags flags)
+@@ -2276,6 +2317,15 @@ int coroutine_fn bdrv_co_pwritev_part(BdrvChild *child,
+     }
+ 
+     bdrv_inc_in_flight(bs);
++    /*
++     * called by:
++     *   - block/io.c|1818| <<bdrv_co_preadv_part>> tracked_request_begin(&req, bs, offset, bytes, BDRV_TRACKED_READ);
++     *   - block/io.c|2279| <<bdrv_co_pwritev_part>> tracked_request_begin(&req, bs, offset, bytes, BDRV_TRACKED_WRITE);
++     *   - block/io.c|3118| <<bdrv_co_pdiscard>> tracked_request_begin(&req, bs, offset, bytes, BDRV_TRACKED_DISCARD);
++     *   - block/io.c|3432| <<bdrv_co_copy_range_internal>> tracked_request_begin(&req, src->bs, src_offset, bytes, BDRV_TRACKED_READ);
++     *   - block/io.c|3449| <<bdrv_co_copy_range_internal>> tracked_request_begin(&req, dst->bs, dst_offset, bytes, BDRV_TRACKED_WRITE);
++     *   - block/io.c|3584| <<bdrv_co_truncate>> tracked_request_begin(&req, bs, offset - new_bytes, new_bytes, BDRV_TRACKED_TRUNCATE);
++     */
+     tracked_request_begin(&req, bs, offset, bytes, BDRV_TRACKED_WRITE);
+ 
+     if (flags & BDRV_REQ_ZERO_WRITE) {
+@@ -3442,6 +3492,15 @@ static int coroutine_fn GRAPH_RDLOCK bdrv_co_copy_range_internal(
+                                                     bytes,
+                                                     read_flags, write_flags);
+ 
++        /*
++	 * called by:
++	 *   - block/io.c|1822| <<bdrv_co_preadv_part>> tracked_request_end(&req);
++	 *   - block/io.c|2305| <<bdrv_co_pwritev_part>> tracked_request_end(&req);
++	 *   - block/io.c|3187| <<bdrv_co_pdiscard>> tracked_request_end(&req);
++	 *   - block/io.c|3445| <<bdrv_co_copy_range_internal>> tracked_request_end(&req);
++	 *   - block/io.c|3461| <<bdrv_co_copy_range_internal>> tracked_request_end(&req);
++	 *   - block/io.c|3661| <<bdrv_co_truncate>> tracked_request_end(&req);
++	 */
+         tracked_request_end(&req);
+         bdrv_dec_in_flight(src->bs);
+     } else {
+@@ -3458,6 +3517,15 @@ static int coroutine_fn GRAPH_RDLOCK bdrv_co_copy_range_internal(
+                                                       read_flags, write_flags);
+         }
+         bdrv_co_write_req_finish(dst, dst_offset, bytes, &req, ret);
++        /*
++	 * called by:
++	 *   - block/io.c|1822| <<bdrv_co_preadv_part>> tracked_request_end(&req);
++	 *   - block/io.c|2305| <<bdrv_co_pwritev_part>> tracked_request_end(&req);
++	 *   - block/io.c|3187| <<bdrv_co_pdiscard>> tracked_request_end(&req);
++	 *   - block/io.c|3445| <<bdrv_co_copy_range_internal>> tracked_request_end(&req);
++	 *   - block/io.c|3461| <<bdrv_co_copy_range_internal>> tracked_request_end(&req);
++	 *   - block/io.c|3661| <<bdrv_co_truncate>> tracked_request_end(&req);
++	 */
+         tracked_request_end(&req);
+         bdrv_dec_in_flight(dst->bs);
+     }
+@@ -3581,6 +3649,15 @@ int coroutine_fn bdrv_co_truncate(BdrvChild *child, int64_t offset, bool exact,
+     }
+ 
+     bdrv_inc_in_flight(bs);
++    /*
++     * called by:
++     *   - block/io.c|1818| <<bdrv_co_preadv_part>> tracked_request_begin(&req, bs, offset, bytes, BDRV_TRACKED_READ);
++     *   - block/io.c|2279| <<bdrv_co_pwritev_part>> tracked_request_begin(&req, bs, offset, bytes, BDRV_TRACKED_WRITE);
++     *   - block/io.c|3118| <<bdrv_co_pdiscard>> tracked_request_begin(&req, bs, offset, bytes, BDRV_TRACKED_DISCARD);
++     *   - block/io.c|3432| <<bdrv_co_copy_range_internal>> tracked_request_begin(&req, src->bs, src_offset, bytes, BDRV_TRACKED_READ);
++     *   - block/io.c|3449| <<bdrv_co_copy_range_internal>> tracked_request_begin(&req, dst->bs, dst_offset, bytes, BDRV_TRACKED_WRITE);
++     *   - block/io.c|3584| <<bdrv_co_truncate>> tracked_request_begin(&req, bs, offset - new_bytes, new_bytes, BDRV_TRACKED_TRUNCATE);
++     */
+     tracked_request_begin(&req, bs, offset - new_bytes, new_bytes,
+                           BDRV_TRACKED_TRUNCATE);
+ 
+@@ -3658,6 +3735,15 @@ int coroutine_fn bdrv_co_truncate(BdrvChild *child, int64_t offset, bool exact,
+     bdrv_co_write_req_finish(child, offset - new_bytes, new_bytes, &req, 0);
+ 
+ out:
++    /*
++     * called by:
++     *   - block/io.c|1822| <<bdrv_co_preadv_part>> tracked_request_end(&req);
++     *   - block/io.c|2305| <<bdrv_co_pwritev_part>> tracked_request_end(&req);
++     *   - block/io.c|3187| <<bdrv_co_pdiscard>> tracked_request_end(&req);
++     *   - block/io.c|3445| <<bdrv_co_copy_range_internal>> tracked_request_end(&req);
++     *   - block/io.c|3461| <<bdrv_co_copy_range_internal>> tracked_request_end(&req);
++     *   - block/io.c|3661| <<bdrv_co_truncate>> tracked_request_end(&req);
++     */
+     tracked_request_end(&req);
+     bdrv_dec_in_flight(bs);
+ 
+diff --git a/block/qcow2-threads.c b/block/qcow2-threads.c
+index d6071a1ea..03c3e07a5 100644
+--- a/block/qcow2-threads.c
++++ b/block/qcow2-threads.c
+@@ -38,6 +38,11 @@
+ #include "block/thread-pool.h"
+ #include "crypto.h"
+ 
++/*
++ * called by:
++ *   - block/qcow2-threads.c|350| <<qcow2_co_do_compress>> qcow2_co_process(bs, qcow2_compress_pool_func, &arg);
++ *   - block/qcow2-threads.c|478| <<qcow2_co_encdec>> return len == 0 ? 0 : qcow2_co_process(bs, qcow2_encdec_pool_func, &arg);
++ */
+ static int coroutine_fn
+ qcow2_co_process(BlockDriverState *bs, ThreadPoolFunc *func, void *arg)
+ {
+diff --git a/block/qcow2.c b/block/qcow2.c
+index 956128b40..73b00efb4 100644
+--- a/block/qcow2.c
++++ b/block/qcow2.c
+@@ -2272,6 +2272,12 @@ typedef struct Qcow2AioTask {
+ } Qcow2AioTask;
+ 
+ static coroutine_fn int qcow2_co_preadv_task_entry(AioTask *task);
++/*
++ * called by:
++ *   - block/qcow2.c|2410| <<qcow2_co_preadv_part>> ret = qcow2_add_task(bs, aio, qcow2_co_preadv_task_entry, type, host_offset, offset, cur_bytes, qiov, qiov_offset, NULL);
++ *   - block/qcow2.c|2709| <<qcow2_co_pwritev_part>> ret = qcow2_add_task(bs, aio, qcow2_co_pwritev_task_entry, 0, host_offset, offset, cur_bytes, qiov, qiov_offset, l2meta);
++ *   - block/qcow2.c|4786| <<qcow2_co_pwritev_compressed_part>> ret = qcow2_add_task(bs, aio, qcow2_co_pwritev_compressed_task_entry, 0, 0, offset, chunk_size, qiov, qiov_offset, NULL);
++ */
+ static coroutine_fn int qcow2_add_task(BlockDriverState *bs,
+                                        AioTaskPool *pool,
+                                        AioTaskFunc func,
+diff --git a/hw/block/virtio-blk.c b/hw/block/virtio-blk.c
+index bb86e65f6..ac5396ac6 100644
+--- a/hw/block/virtio-blk.c
++++ b/hw/block/virtio-blk.c
+@@ -100,6 +100,20 @@ static int virtio_blk_handle_rw_error(VirtIOBlockReq *req, int error,
+     return action != BLOCK_ERROR_ACTION_IGNORE;
+ }
+ 
++/*
++ * (gdb) bt
++ * #0  virtio_blk_rw_complete (opaque=0x6120019435c0, ret=0) at ../hw/block/virtio-blk.c:105
++ * #1  0x0000555556f805a4 in blk_aio_complete (acb=0x608000f026a0) at ../block/block-backend.c:1555
++ * #2  0x0000555556f80d66 in blk_aio_write_entry (opaque=0x608000f026a0) at ../block/block-backend.c:1622
++ * #3  0x000055555734236e in coroutine_trampoline (i0=106945984, i1=24864) at ../util/coroutine-ucontext.c:175
++ * #4  0x00007ffff70b4830 in __start_context () at /lib64/libc.so.6
++ * #5  0x00007ffde38341c0 in  ()
++ * #6  0x0000000000000000 in  ()
++ *
++ * 在以下使用virtio_blk_rw_complete():
++ *   - hw/block/virtio-blk.c|434| <<submit_requests>> blk_aio_pwritev(blk, sector_num << BDRV_SECTOR_BITS, qiov, flags, virtio_blk_rw_complete, mrb->reqs[start]);
++ *   - hw/block/virtio-blk.c|438| <<submit_requests>> blk_aio_preadv(blk, sector_num << BDRV_SECTOR_BITS, qiov, flags, virtio_blk_rw_complete, mrb->reqs[start]);
++ */
+ static void virtio_blk_rw_complete(void *opaque, int ret)
+ {
+     VirtIOBlockReq *next = opaque;
+@@ -353,6 +367,52 @@ static void virtio_blk_handle_scsi(VirtIOBlockReq *req)
+     }
+ }
+ 
++/*
++ * (qemu) qemu-system-x86_64: ../block/file-posix.c:3599: raw_do_pwrite_zeroes: Assertion `req' failed.
++ * run.sh: line 11: 74885 Aborted                 (core dumped) /home/opc/qemu/build/qemu-system-x86_64 -hda ol89.qcow2 -m 8G -smp 4 -vnc :4 -enable-kvm -cpu host -net nic -net user,hostfwd=tcp::5028-:22 -monitor stdio -name debug-threads=on -object iothread,id=t0 -object iothread,id=t1 -object iothread,id=t2 -object iothread,id=t3 -blockdev node-name=file01,driver=file,filename=test.qcow2,cache.direct=on,cache.no-flush=off -blockdev node-name=drive01,driver=qcow2,cache.direct=on,cache.no-flush=off,file=file01 -device '{"driver": "virtio-blk-pci", "drive": "drive01", "iothread-vq-mapping": [{"iothread": "t0", "vqs": [0]}, {"iothread": "t1", "vqs": [1]}, {"iothread": "t2", "vqs": [2]}, {"iothread": "t3", "vqs": [3]}]}'
++ *
++ * 在以下调用tracked_request_end():
++ *   - block/io.c|1822| <<bdrv_co_preadv_part>> tracked_request_end(&req);
++ *   - block/io.c|2305| <<bdrv_co_pwritev_part>> tracked_request_end(&req);
++ *   - block/io.c|3187| <<bdrv_co_pdiscard>> tracked_request_end(&req);
++ *   - block/io.c|3445| <<bdrv_co_copy_range_internal>> tracked_request_end(&req);
++ *   - block/io.c|3461| <<bdrv_co_copy_range_internal>> tracked_request_end(&req);
++ *   - block/io.c|3661| <<bdrv_co_truncate>> tracked_request_end(&req);
++ *
++ * (gdb) bt
++ * #0  bdrv_co_get_self_request (bs=0x629000005200) at ../block/io.c:720
++ * #1  0x00005555570f6929 in raw_do_pwrite_zeroes (bs=0x629000005200, offset=458752, bytes=65536, flags=BDRV_REQ_NO_FALLBACK, blkdev=false) at ../block/file-posix.c:3598
++ * #2  0x00005555570f6f1d in raw_co_pwrite_zeroes (bs=0x629000005200, offset=458752, bytes=65536, flags=BDRV_REQ_NO_FALLBACK) at ../block/file-posix.c:3641
++ * #3  0x0000555556fb193d in bdrv_co_do_pwrite_zeroes (bs=0x629000005200, offset=458752, bytes=65536, flags=258) at ../block/io.c:1901
++ * #4  0x0000555556fb2b50 in bdrv_aligned_pwritev (child=0x608000002920, req=0x7ffd14df80d0, offset=458752, bytes=65536, align=512, qiov=0x0, qiov_offset=0, flags=258) at ../block/io.c:2100
++ * #5  0x0000555556fb33a7 in bdrv_co_do_zero_pwritev (child=0x608000002920, offset=458752, bytes=65536, flags=258, req=0x7ffd14df80d0) at ../block/io.c:2183
++ * #6  0x0000555556fb3c43 in bdrv_co_pwritev_part (child=0x608000002920, offset=458752, bytes=65536, qiov=0x0, qiov_offset=0, flags=258) at ../block/io.c:2283
++ * #7  0x0000555556fb362c in bdrv_co_pwritev (child=0x608000002920, offset=458752, bytes=65536, qiov=0x0, flags=258) at ../block/io.c:2216
++ * #8  0x0000555556fb3f19 in bdrv_co_pwrite_zeroes (child=0x608000002920, offset=458752, bytes=65536, flags=BDRV_REQ_NO_FALLBACK) at ../block/io.c:2322
++ * #9  0x0000555556ffae77 in handle_alloc_space (bs=0x62900000a200, l2meta=0x60b0011bb730) at ../block/qcow2.c:2557
++ * #10 0x0000555556ffb3de in qcow2_co_pwritev_task (bs=0x62900000a200, host_offset=458752, offset=131072, bytes=8192, qiov=0x61200532c758, qiov_offset=0, l2meta=0x60b0011bb730) at ../block/qcow2.c:2609
++ * #11 0x0000555556ffb828 in qcow2_co_pwritev_task_entry (task=0x7ffd14c07320) at ../block/qcow2.c:2657
++ * #12 0x0000555556ff97cd in qcow2_add_task (bs=0x62900000a200, pool=0x0, func=0x555556ffb653 <qcow2_co_pwritev_task_entry>, subcluster_type=QCOW2_SUBCLUSTER_UNALLOCATED_PLAIN,
++ *                           host_offset=458752, offset=131072, bytes=8192, qiov=0x61200532c758, qiov_offset=0, l2meta=0x60b0011bb730) at ../block/qcow2.c:2307
++ * #13 0x0000555556ffbd90 in qcow2_co_pwritev_part (bs=0x62900000a200, offset=131072, bytes=8192, qiov=0x61200532c758, qiov_offset=0, flags=BDRV_REQ_REGISTERED_BUF) at ../block/qcow2.c:2709
++ * #14 0x0000555556face86 in bdrv_driver_pwritev (bs=0x62900000a200, offset=131072, bytes=8192, qiov=0x61200532c758, qiov_offset=0, flags=BDRV_REQ_REGISTERED_BUF) at ../block/io.c:1070
++ * #15 0x0000555556fb2bcb in bdrv_aligned_pwritev (child=0x608000002e20, req=0x7ffd14df7cd0, offset=131072, bytes=8192, align=1, qiov=0x61200532c758, qiov_offset=0, flags=BDRV_REQ_REGISTERED_BUF)
++ *                           at ../block/io.c:2106
++ * #16 0x0000555556fb3d48 in bdrv_co_pwritev_part (child=0x608000002e20, offset=131072, bytes=8192, qiov=0x61200532c758, qiov_offset=0, flags=BDRV_REQ_REGISTERED_BUF) at ../block/io.c:2299
++ * #17 0x0000555556f7f9bd in blk_co_do_pwritev_part (blk=0x6190000d8e80, offset=131072, bytes=8192, qiov=0x61200532c758, qiov_offset=0, flags=BDRV_REQ_REGISTERED_BUF) at ../block/block-backend.c:1425
++ * #18 0x0000555556f80d1d in blk_aio_write_entry (opaque=0x6080016c0920) at ../block/block-backend.c:1620
++ * #19 0x000055555734236e in coroutine_trampoline (i0=87277888, i1=24864) at ../util/coroutine-ucontext.c:175
++ * #20 0x00007ffff70b4830 in __start_context () at /lib64/libc.so.6
++ * #21 0x00007fffef7e01c0 in  ()
++ * #22 0x0000000000000000 in  ()
++ */
++
++/*
++ * called by:
++ *   - hw/block/virtio-blk.c|462| <<virtio_blk_submit_multireq>> submit_requests(s, mrb, 0, 1, -1);
++ *   - hw/block/virtio-blk.c|486| <<virtio_blk_submit_multireq>> submit_requests(s, mrb, start, num_reqs, niov);
++ *   - hw/block/virtio-blk.c|502| <<virtio_blk_submit_multireq>> submit_requests(s, mrb, start, num_reqs, niov);
++ */
+ static inline void submit_requests(VirtIOBlock *s, MultiReqBuffer *mrb,
+                                    int start, int num_reqs, int niov)
+ {
+@@ -424,6 +484,19 @@ static int multireq_compare(const void *a, const void *b)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - hw/block/virtio-blk.c|517| <<virtio_blk_handle_flush>> virtio_blk_submit_multireq(s, mrb);
++ *   - hw/block/virtio-blk.c|1034| <<virtio_blk_handle_request>> virtio_blk_submit_multireq(s, mrb);
++ *   - hw/block/virtio-blk.c|1166| <<virtio_blk_handle_vq>> virtio_blk_submit_multireq(s, &mrb);
++ *   - hw/block/virtio-blk.c|1214| <<virtio_blk_dma_restart_bh>> virtio_blk_submit_multireq(s, &mrb);
++ *
++ * typedef struct MultiReqBuffer {
++ *     VirtIOBlockReq *reqs[VIRTIO_BLK_MAX_MERGE_REQS];
++ *     unsigned int num_reqs;
++ *     bool is_write;
++ * } MultiReqBuffer;
++ */
+ static void virtio_blk_submit_multireq(VirtIOBlock *s, MultiReqBuffer *mrb)
+ {
+     int i = 0, start = 0, num_reqs = 0, niov = 0, nb_sectors = 0;
+@@ -928,6 +1001,11 @@ out:
+     return err_status;
+ }
+ 
++/*
++ * called by:
++ *   - hw/block/virtio-blk.c|1153| <<virtio_blk_handle_vq>> if (virtio_blk_handle_request(req, &mrb)) {
++ *   - hw/block/virtio-blk.c|1198| <<virtio_blk_dma_restart_bh>> if (virtio_blk_handle_request(req, &mrb)) {
++ */
+ static int virtio_blk_handle_request(VirtIOBlockReq *req, MultiReqBuffer *mrb)
+ {
+     uint32_t type;
+@@ -1108,6 +1186,10 @@ static int virtio_blk_handle_request(VirtIOBlockReq *req, MultiReqBuffer *mrb)
+     return 0;
+ }
+ 
++/*
++ * 在以下使用virtio_blk_handle_vq():
++ *   - hw/block/virtio-blk.c|1186| <<virtio_blk_handle_output>> virtio_blk_handle_vq(s, vq);
++ */
+ void virtio_blk_handle_vq(VirtIOBlock *s, VirtQueue *vq)
+ {
+     VirtIOBlockReq *req;
+@@ -1134,17 +1216,56 @@ void virtio_blk_handle_vq(VirtIOBlock *s, VirtQueue *vq)
+         }
+     } while (!virtio_queue_empty(vq));
+ 
++    /*
++     * typedef struct MultiReqBuffer {
++     *     VirtIOBlockReq *reqs[VIRTIO_BLK_MAX_MERGE_REQS];
++     *     unsigned int num_reqs;
++     *     bool is_write;
++     * } MultiReqBuffer;
++     */
+     if (mrb.num_reqs) {
++        /*
++	 * called by:
++	 *   - hw/block/virtio-blk.c|517| <<virtio_blk_handle_flush>> virtio_blk_submit_multireq(s, mrb);
++	 *   - hw/block/virtio-blk.c|1034| <<virtio_blk_handle_request>> virtio_blk_submit_multireq(s, mrb);
++	 *   - hw/block/virtio-blk.c|1166| <<virtio_blk_handle_vq>> virtio_blk_submit_multireq(s, &mrb);
++	 *   - hw/block/virtio-blk.c|1214| <<virtio_blk_dma_restart_bh>> virtio_blk_submit_multireq(s, &mrb);
++	 */
+         virtio_blk_submit_multireq(s, &mrb);
+     }
+ 
+     defer_call_end();
+ }
+ 
++/*
++ * (gdb) bt
++ * #0  virtio_blk_handle_output (vdev=0x62d00001c830, vq=0x7ffddbda4800) at ../hw/block/virtio-blk.c:1010
++ * #1  0x0000555556ca8da7 in virtio_queue_notify_vq (vq=0x7ffddbda4800) at ../hw/virtio/virtio.c:2277
++ * #2  0x0000555556cb03f4 in virtio_queue_host_notifier_read (n=0x7ffddbda4874) at ../hw/virtio/virtio.c:3641
++ * #3  0x00005555572f3b2f in aio_dispatch_handler (ctx=0x613000121880, node=0x60d000036c20) at ../util/aio-posix.c:372
++ * #4  0x00005555572f3d80 in aio_dispatch_ready_handlers (ctx=0x613000121880, ready_list=0x7ffff1947aa0) at ../util/aio-posix.c:401
++ * #5  0x00005555572f5845 in aio_poll (ctx=0x613000121880, blocking=true) at ../util/aio-posix.c:723
++ * #6  0x0000555556ef1830 in iothread_run (opaque=0x611000024440) at ../iothread.c:63
++ * #7  0x00005555573005c6 in qemu_thread_start (args=0x603000090d30) at ../util/qemu-thread-posix.c:541
++ * #8  0x00007ffff70eac12 in start_thread () at /lib64/libc.so.6
++ * #9  0x00007ffff716fcc0 in clone3 () at /lib64/libc.so.6
++ *
++ * 在以下使用virtio_blk_handle_output():
++ *   - hw/block/virtio-blk.c|2079| <<virtio_blk_device_realize>> virtio_add_queue(vdev, conf->queue_size, virtio_blk_handle_output);
++ */
+ static void virtio_blk_handle_output(VirtIODevice *vdev, VirtQueue *vq)
+ {
+     VirtIOBlock *s = (VirtIOBlock *)vdev;
+ 
++    /*
++     * 在以下使用VirtIOBlock->ioeventfd_disabled:
++     *   - hw/block/virtio-blk.c|1202| <<virtio_blk_handle_output>> if (!s->ioeventfd_disabled && !s->ioeventfd_started) {
++     *   - hw/block/virtio-blk.c|1207| <<virtio_blk_handle_output>> if (!s->ioeventfd_disabled) {
++     *   - hw/block/virtio-blk.c|2057| <<virtio_blk_start_ioeventfd>> s->ioeventfd_disabled = true;
++     *   - hw/block/virtio-blk.c|2094| <<virtio_blk_stop_ioeventfd>> if (s->ioeventfd_disabled) {
++     *   - hw/block/virtio-blk.c|2095| <<virtio_blk_stop_ioeventfd>> s->ioeventfd_disabled = false;
++     *   - hw/block/virtio-blk.c|2246| <<virtio_blk_device_realize>> s->ioeventfd_disabled = true;
++     */
+     if (!s->ioeventfd_disabled && !s->ioeventfd_started) {
+         /* Some guests kick before setting VIRTIO_CONFIG_S_DRIVER_OK so start
+          * ioeventfd here instead of waiting for .set_status().
+@@ -1155,6 +1276,9 @@ static void virtio_blk_handle_output(VirtIODevice *vdev, VirtQueue *vq)
+         }
+     }
+ 
++    /*
++     * 只在此处调用
++     */
+     virtio_blk_handle_vq(s, vq);
+ }
+ 
+@@ -1190,6 +1314,31 @@ static void virtio_blk_dma_restart_bh(void *opaque)
+     blk_dec_in_flight(s->conf.conf.blk);
+ }
+ 
++/*
++ * (gdb) bt
++ * #0  virtio_blk_dma_restart_cb (opaque=0x62d00001c830, running=false, state=RUN_STATE_PAUSED) at ../hw/block/virtio-blk.c:1059
++ * #1  0x000055555677f0e8 in vm_state_notify (running=false, state=RUN_STATE_PAUSED) at ../system/runstate.c:380
++ * #2  0x000055555675eefe in do_vm_stop (state=RUN_STATE_PAUSED, send_stop=true) at ../system/cpus.c:290
++ * #3  0x00005555567612ab in vm_stop (state=RUN_STATE_PAUSED) at ../system/cpus.c:697
++ * #4  0x0000555556856668 in qmp_stop (errp=0x0) at ../monitor/qmp-cmds.c:61
++ * #5  0x00005555568490c0 in hmp_stop (mon=0x610000003540, qdict=0x621000231500) at ../monitor/hmp-cmds.c:119
++ * #6  0x0000555556852256 in handle_hmp_command_exec (mon=0x610000003540, cmd=0x555558959120 <hmp_cmds+7680>, qdict=0x621000231500) at ../monitor/hmp.c:1106
++ * #7  0x00005555568526f2 in handle_hmp_command (mon=0x610000003540, cmdline=0x0) at ../monitor/hmp.c:1158
++ * #8  0x000055555684b248 in monitor_command_cb (opaque=0x610000003540, cmdline=0x626000000100 "stop", readline_opaque=0x0) at ../monitor/hmp.c:47
++ * #9  0x0000555557369303 in readline_handle_byte (rs=0x626000000100, ch=13) at ../util/readline.c:419
++ * #10 0x00005555568542ab in monitor_read (opaque=0x610000003540, buf=0x7ffff537e020 "\r", size=1) at ../monitor/hmp.c:1390
++ * #11 0x00005555571298fd in qemu_chr_be_write_impl (s=0x610000003440, buf=0x7ffff537e020 "\r", len=1) at ../chardev/char.c:214
++ * #12 0x00005555571299a8 in qemu_chr_be_write (s=0x610000003440, buf=0x7ffff537e020 "\r", len=1) at ../chardev/char.c:226
++ * #13 0x000055555712e942 in fd_chr_read (chan=0x60b000068160, cond=G_IO_IN, opaque=0x610000003440) at ../chardev/char-fd.c:72
++ * #14 0x0000555556e85ff5 in qio_channel_fd_source_dispatch (source=0x60c000054dc0, callback=0x55555712e6b1 <fd_chr_read>, user_data=0x610000003440) at ../io/channel-watch.c:84
++ * #15 0x00007ffff7533f4f in g_main_context_dispatch () at /lib64/libglib-2.0.so.0
++ * #16 0x000055555733abaa in glib_pollfds_poll () at ../util/main-loop.c:287
++ * #17 0x000055555733ad23 in os_host_main_loop_wait (timeout=499000000) at ../util/main-loop.c:310
++ * #18 0x000055555733b03c in main_loop_wait (nonblocking=0) at ../util/main-loop.c:589
++ * #19 0x0000555556780465 in qemu_main_loop () at ../system/runstate.c:795
++ * #20 0x0000555556e39fe2 in qemu_default_main () at ../system/main.c:37
++ * #21 0x0000555556e3a01f in main (argc=42, argv=0x7fffffffda58) at ../system/main.c:48
++ */
+ static void virtio_blk_dma_restart_cb(void *opaque, bool running,
+                                       RunState state)
+ {
+@@ -1512,6 +1661,10 @@ static void virtio_blk_resize(void *opaque)
+     aio_bh_schedule_oneshot(qemu_get_aio_context(), virtio_resize_cb, vdev);
+ }
+ 
++/*
++ * called by:
++ *   - hw/block/virtio-blk.c|1707| <<virtio_blk_drained_begin>> virtio_blk_ioeventfd_detach(s);
++ */
+ static void virtio_blk_ioeventfd_detach(VirtIOBlock *s)
+ {
+     VirtIODevice *vdev = VIRTIO_DEVICE(s);
+@@ -1522,12 +1675,115 @@ static void virtio_blk_ioeventfd_detach(VirtIOBlock *s)
+     }
+ }
+ 
++/*
++ * (gdb) bt
++ * #0  virtio_blk_dma_restart_cb (opaque=0x62d00001c830, running=false, state=RUN_STATE_PAUSED) at ../hw/block/virtio-blk.c:1059
++ * #1  0x000055555677f0e8 in vm_state_notify (running=false, state=RUN_STATE_PAUSED) at ../system/runstate.c:380
++ * #2  0x000055555675eefe in do_vm_stop (state=RUN_STATE_PAUSED, send_stop=true) at ../system/cpus.c:290
++ * #3  0x00005555567612ab in vm_stop (state=RUN_STATE_PAUSED) at ../system/cpus.c:697
++ * #4  0x0000555556856668 in qmp_stop (errp=0x0) at ../monitor/qmp-cmds.c:61
++ * #5  0x00005555568490c0 in hmp_stop (mon=0x610000003540, qdict=0x621000231500) at ../monitor/hmp-cmds.c:119
++ * #6  0x0000555556852256 in handle_hmp_command_exec (mon=0x610000003540, cmd=0x555558959120 <hmp_cmds+7680>, qdict=0x621000231500) at ../monitor/hmp.c:1106
++ * #7  0x00005555568526f2 in handle_hmp_command (mon=0x610000003540, cmdline=0x0) at ../monitor/hmp.c:1158
++ * #8  0x000055555684b248 in monitor_command_cb (opaque=0x610000003540, cmdline=0x626000000100 "stop", readline_opaque=0x0) at ../monitor/hmp.c:47
++ * #9  0x0000555557369303 in readline_handle_byte (rs=0x626000000100, ch=13) at ../util/readline.c:419
++ * #10 0x00005555568542ab in monitor_read (opaque=0x610000003540, buf=0x7ffff537e020 "\r", size=1) at ../monitor/hmp.c:1390
++ * #11 0x00005555571298fd in qemu_chr_be_write_impl (s=0x610000003440, buf=0x7ffff537e020 "\r", len=1) at ../chardev/char.c:214
++ * #12 0x00005555571299a8 in qemu_chr_be_write (s=0x610000003440, buf=0x7ffff537e020 "\r", len=1) at ../chardev/char.c:226
++ * #13 0x000055555712e942 in fd_chr_read (chan=0x60b000068160, cond=G_IO_IN, opaque=0x610000003440) at ../chardev/char-fd.c:72
++ * #14 0x0000555556e85ff5 in qio_channel_fd_source_dispatch (source=0x60c000054dc0, callback=0x55555712e6b1 <fd_chr_read>, user_data=0x610000003440) at ../io/channel-watch.c:84
++ * #15 0x00007ffff7533f4f in g_main_context_dispatch () at /lib64/libglib-2.0.so.0
++ * #16 0x000055555733abaa in glib_pollfds_poll () at ../util/main-loop.c:287
++ * #17 0x000055555733ad23 in os_host_main_loop_wait (timeout=499000000) at ../util/main-loop.c:310
++ * #18 0x000055555733b03c in main_loop_wait (nonblocking=0) at ../util/main-loop.c:589
++ * #19 0x0000555556780465 in qemu_main_loop () at ../system/runstate.c:795
++ * #20 0x0000555556e39fe2 in qemu_default_main () at ../system/main.c:37
++ * #21 0x0000555556e3a01f in main (argc=42, argv=0x7fffffffda58) at ../system/main.c:48
++ *
++ *
++ * 初始化(BIOS/Kernel)会调用
++ * system_powerdown会调用
++ *
++ * (gdb) bt
++ * #0  virtio_queue_aio_attach_host_notifier (vq=0x7ffddbda4800, ctx=0x613000121880) at ../hw/virtio/virtio.c:3575
++ * #1  0x0000555556ba8095 in virtio_blk_ioeventfd_attach (s=0x62d00001c830) at ../hw/block/virtio-blk.c:1391
++ * #2  0x0000555556ba9e98 in virtio_blk_start_ioeventfd (vdev=0x62d00001c830) at ../hw/block/virtio-blk.c:1721
++ * #3  0x00005555566934ae in virtio_bus_start_ioeventfd (bus=0x62d00001c7b0) at ../hw/virtio/virtio-bus.c:236
++ * #4  0x000055555669686b in virtio_pci_start_ioeventfd (proxy=0x62d000014400) at ../hw/virtio/virtio-pci.c:375
++ * #5  0x000055555669cafe in virtio_pci_common_write (opaque=0x62d000014400, addr=20, val=15, size=1) at ../hw/virtio/virtio-pci.c:1616
++ * #6  0x0000555556d1538b in memory_region_write_accessor (mr=0x62d000014fa0, addr=20, value=0x7ffde5865020, size=1, shift=0, mask=255, attrs=...) at ../system/memory.c:497
++ * #7  0x0000555556d159cf in access_with_adjusted_size (addr=20, value=0x7ffde5865020, size=1, access_size_min=1, access_size_max=4, access_fn=0x555556d15177 <memory_region_write_accessor>, mr=0x62d000014fa0, attrs=...)
++ *     at ../system/memory.c:573
++ * #8  0x0000555556d1dcf0 in memory_region_dispatch_write (mr=0x62d000014fa0, addr=20, data=15, op=MO_8, attrs=...) at ../system/memory.c:1521
++ * #9  0x0000555556d41d5c in flatview_write_continue_step (attrs=..., buf=0x7ffff6205028 "\017", len=1, mr_addr=20, l=0x7ffde5960540, mr=0x62d000014fa0) at ../system/physmem.c:2756
++ * #10 0x0000555556d41f50 in flatview_write_continue (fv=0x606000085e20, addr=4261412884, attrs=..., ptr=0x7ffff6205028, len=1, mr_addr=20, l=1, mr=0x62d000014fa0) at ../system/physmem.c:2786
++ * #11 0x0000555556d42254 in flatview_write (fv=0x606000085e20, addr=4261412884, attrs=..., buf=0x7ffff6205028, len=1) at ../system/physmem.c:2817
++ * #12 0x0000555556d42e3d in address_space_write (as=0x555558d5fda0 <address_space_memory>, addr=4261412884, attrs=..., buf=0x7ffff6205028, len=1) at ../system/physmem.c:2937
++ * #13 0x0000555556d42f00 in address_space_rw (as=0x555558d5fda0 <address_space_memory>, addr=4261412884, attrs=..., buf=0x7ffff6205028, len=1, is_write=true) at ../system/physmem.c:2947
++ * #14 0x0000555556e104c0 in kvm_cpu_exec (cpu=0x62b000000200) at ../accel/kvm/kvm-all.c:3031
++ * #15 0x0000555556e1981b in kvm_vcpu_thread_fn (arg=0x62b000000200) at ../accel/kvm/kvm-accel-ops.c:50
++ * #16 0x00005555573005c6 in qemu_thread_start (args=0x6030000a4b60) at ../util/qemu-thread-posix.c:541
++ * #17 0x00007ffff70eac12 in start_thread () at /lib64/libc.so.6
++ * #18 0x00007ffff716fcc0 in clone3 () at /lib64/libc.so.6
++ *
++ * stop/cont会调用
++ *
++ * (gdb) bt
++ * #0  virtio_queue_aio_attach_host_notifier (vq=0x7ffddbda4c28, ctx=0x613000123100) at ../hw/virtio/virtio.c:3575
++ * #1  0x0000555556ba8095 in virtio_blk_ioeventfd_attach (s=0x62d00001c830) at ../hw/block/virtio-blk.c:1391
++ * #2  0x0000555556ba9e98 in virtio_blk_start_ioeventfd (vdev=0x62d00001c830) at ../hw/block/virtio-blk.c:1721
++ * #3  0x00005555566934ae in virtio_bus_start_ioeventfd (bus=0x62d00001c7b0) at ../hw/virtio/virtio-bus.c:236
++ * #4  0x000055555669686b in virtio_pci_start_ioeventfd (proxy=0x62d000014400) at ../hw/virtio/virtio-pci.c:375
++ * #5  0x000055555669b223 in virtio_pci_vmstate_change (d=0x62d000014400, running=true) at ../hw/virtio/virtio-pci.c:1361
++ * #6  0x0000555556cae295 in virtio_vmstate_change (opaque=0x62d00001c830, running=true, state=RUN_STATE_RUNNING) at ../hw/virtio/virtio.c:3207
++ * #7  0x000055555677ee82 in vm_state_notify (running=true, state=RUN_STATE_RUNNING) at ../system/runstate.c:370
++ * #8  0x00005555567614b9 in vm_prepare_start (step_pending=false) at ../system/cpus.c:740
++ * #9  0x0000555556761535 in vm_start () at ../system/cpus.c:747
++ * #10 0x0000555556856af7 in qmp_cont (errp=0x7ffff4c74e60) at ../monitor/qmp-cmds.c:114
++ * #11 0x00005555568495d0 in hmp_cont (mon=0x610000003540, qdict=0x621000138900) at ../monitor/hmp-cmds.c:171
++ * #12 0x0000555556852256 in handle_hmp_command_exec (mon=0x610000003540, cmd=0x5555589579b0 <hmp_cmds+1680>, qdict=0x621000138900) at ../monitor/hmp.c:1106
++ * #13 0x00005555568526f2 in handle_hmp_command (mon=0x610000003540, cmdline=0x0) at ../monitor/hmp.c:1158
++ * #14 0x000055555684b248 in monitor_command_cb (opaque=0x610000003540, cmdline=0x626000000100 "cont", readline_opaque=0x0) at ../monitor/hmp.c:47
++ * #15 0x0000555557369303 in readline_handle_byte (rs=0x626000000100, ch=13) at ../util/readline.c:419
++ * #16 0x00005555568542ab in monitor_read (opaque=0x610000003540, buf=0x7ffff535a020 "\r", size=1) at ../monitor/hmp.c:1390
++ * #17 0x00005555571298fd in qemu_chr_be_write_impl (s=0x610000003440, buf=0x7ffff535a020 "\r", len=1) at ../chardev/char.c:214
++ * #18 0x00005555571299a8 in qemu_chr_be_write (s=0x610000003440, buf=0x7ffff535a020 "\r", len=1) at ../chardev/char.c:226
++ * #19 0x000055555712e942 in fd_chr_read (chan=0x60b000068160, cond=G_IO_IN, opaque=0x610000003440) at ../chardev/char-fd.c:72
++ * #20 0x0000555556e85ff5 in qio_channel_fd_source_dispatch (source=0x60c000054dc0, callback=0x55555712e6b1 <fd_chr_read>, user_data=0x610000003440) at ../io/channel-watch.c:84
++ * #21 0x00007ffff7533f4f in g_main_context_dispatch () at /lib64/libglib-2.0.so.0
++ * #22 0x000055555733abaa in glib_pollfds_poll () at ../util/main-loop.c:287
++ * #23 0x000055555733ad23 in os_host_main_loop_wait (timeout=499000000) at ../util/main-loop.c:310
++ * #24 0x000055555733b03c in main_loop_wait (nonblocking=0) at ../util/main-loop.c:589
++ * #25 0x0000555556780465 in qemu_main_loop () at ../system/runstate.c:795
++ * #26 0x0000555556e39fe2 in qemu_default_main () at ../system/main.c:37
++ * #27 0x0000555556e3a01f in main (argc=42, argv=0x7fffffffda58) at ../system/main.c:48
++ *
++ * called by:
++ *   - hw/block/virtio-blk.c|1605| <<virtio_blk_drained_end>> virtio_blk_ioeventfd_attach(s);
++ *   - hw/block/virtio-blk.c|1934| <<virtio_blk_start_ioeventfd>> virtio_blk_ioeventfd_attach(s);
++ */
+ static void virtio_blk_ioeventfd_attach(VirtIOBlock *s)
+ {
+     VirtIODevice *vdev = VIRTIO_DEVICE(s);
+ 
+     for (uint16_t i = 0; i < s->conf.num_queues; i++) {
+         VirtQueue *vq = virtio_get_queue(vdev, i);
++        /*
++	 * 在以下使用vq_aio_context[][]:
++	 *   - hw/block/virtio-blk.c|1261| <<virtio_blk_dma_restart_cb>> aio_bh_schedule_oneshot(s->vq_aio_context[i], virtio_blk_dma_restart_bh, vq_rq[i]);
++	 *   - hw/block/virtio-blk.c|1549| <<virtio_blk_ioeventfd_detach>> virtio_queue_aio_detach_host_notifier(vq, s->vq_aio_context[i]);
++	 *   - hw/block/virtio-blk.c|1559| <<virtio_blk_ioeventfd_attach>> virtio_queue_aio_attach_host_notifier(vq, s->vq_aio_context[i]);
++	 *   - hw/block/virtio-blk.c|1749| <<virtio_blk_vq_aio_context_init>> s->vq_aio_context = g_new(AioContext *, conf->num_queues);
++	 *   - hw/block/virtio-blk.c|1753| <<virtio_blk_vq_aio_context_init>> if (!apply_iothread_vq_mapping(conf->iothread_vq_mapping_list, s->vq_aio_context, conf->num_queues, errp)) {
++	 *   - hw/block/virtio-blk.c|1756| <<virtio_blk_vq_aio_context_init>> g_free(s->vq_aio_context);
++	 *   - hw/block/virtio-blk.c|1757| <<virtio_blk_vq_aio_context_init>> s->vq_aio_context = NULL;
++	 *   - hw/block/virtio-blk.c|1763| <<virtio_blk_vq_aio_context_init>> s->vq_aio_context[i] = ctx;
++	 *   - hw/block/virtio-blk.c|1771| <<virtio_blk_vq_aio_context_init>> s->vq_aio_context[i] = ctx;
++	 *   - hw/block/virtio-blk.c|1798| <<virtio_blk_vq_aio_context_cleanup>> g_free(s->vq_aio_context);
++	 *   - hw/block/virtio-blk.c|1799| <<virtio_blk_vq_aio_context_cleanup>> s->vq_aio_context = NULL;
++	 *   - hw/block/virtio-blk.c|1864| <<virtio_blk_start_ioeventfd>> r = blk_set_aio_context(s->conf.conf.blk, s->vq_aio_context[0], &local_err);
++	 *   - hw/block/virtio-blk.c|1943| <<virtio_blk_stop_ioeventfd>> AioContext *ctx = s->vq_aio_context[i];
++	 */
+         virtio_queue_aio_attach_host_notifier(vq, s->vq_aio_context[i]);
+     }
+ }
+@@ -1632,6 +1888,10 @@ validate_iothread_vq_mapping_list(IOThreadVirtQueueMappingList *list,
+  *
+  * Returns: %true on success, %false on failure.
+  **/
++/*
++ * called by:
++ *   - hw/block/virtio-blk.c|1752| <<virtio_blk_vq_aio_context_init>> if (!apply_iothread_vq_mapping(conf->iothread_vq_mapping_list, s->vq_aio_context, conf->num_queues, errp)) {
++ */
+ static bool apply_iothread_vq_mapping(
+         IOThreadVirtQueueMappingList *iothread_vq_mapping_list,
+         AioContext **vq_aio_context,
+@@ -1652,6 +1912,14 @@ static bool apply_iothread_vq_mapping(
+     }
+ 
+     for (node = iothread_vq_mapping_list; node; node = node->next) {
++        /*
++	 * called by:
++	 *   - block/export/export.c|123| <<blk_exp_add>> iothread = iothread_by_id(export->iothread);
++	 *   - blockdev.c|3560| <<qmp_x_blockdev_set_iothread>> IOThread *obj = iothread_by_id(iothread->u.s);
++	 *   - hw/block/virtio-blk.c|1601| <<validate_iothread_vq_mapping_list>> if (!iothread_by_id(name)) {
++	 *   - hw/block/virtio-blk.c|1683| <<apply_iothread_vq_mapping>> IOThread *iothread = iothread_by_id(node->value->iothread);
++	 *   - hw/block/virtio-blk.c|1789| <<virtio_blk_vq_aio_context_cleanup>> IOThread *iothread = iothread_by_id(node->value->iothread);
++	 */
+         IOThread *iothread = iothread_by_id(node->value->iothread);
+         AioContext *ctx = iothread_get_aio_context(iothread);
+ 
+@@ -1680,6 +1948,13 @@ static bool apply_iothread_vq_mapping(
+     return true;
+ }
+ 
++/*
++ * called by:
++ *   - hw/block/virtio-blk.c|2088| <<virtio_blk_device_realize>> virtio_blk_vq_aio_context_init(s, &err);
++ *
++ * VirtIOBlock *s:
++ * -> AioContext **vq_aio_context;
++ */
+ /* Context: BQL held */
+ static bool virtio_blk_vq_aio_context_init(VirtIOBlock *s, Error **errp)
+ {
+@@ -1771,6 +2046,10 @@ static void virtio_blk_vq_aio_context_cleanup(VirtIOBlock *s)
+     s->vq_aio_context = NULL;
+ }
+ 
++/*
++ * 在以下使用virtio_blk_start_ioeventfd():
++ *   - hw/block/virtio-blk.c|2254| <<virtio_blk_class_init>> vdc->start_ioeventfd = virtio_blk_start_ioeventfd;
++ */
+ /* Context: BQL held */
+ static int virtio_blk_start_ioeventfd(VirtIODevice *vdev)
+ {
+@@ -2071,6 +2350,12 @@ static void virtio_blk_device_realize(DeviceState *dev, Error **errp)
+      * This must be after virtio_init() so virtio_blk_dma_restart_cb() gets
+      * called after ->start_ioeventfd() has already set blk's AioContext.
+      */
++    /*
++     * called by:
++     *   - hw/block/virtio-blk.c|2157| <<virtio_blk_device_realize>> qdev_add_vm_change_state_handler(dev, virtio_blk_dma_restart_cb, s);
++     *   - hw/scsi/scsi-bus.c|358| <<scsi_qdev_realize>> dev->vmsentry = qdev_add_vm_change_state_handler(DEVICE(dev), scsi_dma_restart_cb, dev);
++     *   - hw/virtio/virtio.c|3285| <<virtio_init>> vdev->vmstate = qdev_add_vm_change_state_handler(DEVICE(vdev), virtio_vmstate_change, vdev);
++     */
+     s->change =
+         qdev_add_vm_change_state_handler(dev, virtio_blk_dma_restart_cb, s);
+ 
+diff --git a/hw/core/vm-change-state-handler.c b/hw/core/vm-change-state-handler.c
+index 8e2639224..5f1c759b4 100644
+--- a/hw/core/vm-change-state-handler.c
++++ b/hw/core/vm-change-state-handler.c
+@@ -52,6 +52,88 @@ static int qdev_get_dev_tree_depth(DeviceState *dev)
+  *
+  * Returns: an entry to be freed with qemu_del_vm_change_state_handler()
+  */
++/*
++ * 先
++ * (gdb) bt
++ * #0  qdev_add_vm_change_state_handler (dev=0x62d00001c830, cb=0x555556cae0c9 <virtio_vmstate_change>, opaque=0x62d00001c830) at ../hw/core/vm-change-state-handler.c:59
++ * #1  0x0000555556caea60 in virtio_init (vdev=0x62d00001c830, device_id=2, config_size=57) at ../hw/virtio/virtio.c:3263
++ * #2  0x0000555556baaf85 in virtio_blk_device_realize (dev=0x62d00001c830, errp=0x7ffff4cdeda0) at ../hw/block/virtio-blk.c:1902
++ * #3  0x0000555556cb0bab in virtio_device_realize (dev=0x62d00001c830, errp=0x7ffff4cdec20) at ../hw/virtio/virtio.c:3718
++ * #4  0x0000555556e45110 in device_set_realized (obj=0x62d00001c830, value=true, errp=0x7ffff4cde0a0) at ../hw/core/qdev.c:510
++ * #5  0x0000555556e5c5b5 in property_set_bool (obj=0x62d00001c830, v=0x61100009bcc0, name=0x555557875960 "realized", opaque=0x60200000c5f0, errp=0x7ffff4cde0a0) at ../qom/object.c:2354
++ * #6  0x0000555556e57a50 in object_property_set (obj=0x62d00001c830, name=0x555557875960 "realized", v=0x61100009bcc0, errp=0x7ffff4cde0a0) at ../qom/object.c:1463
++ * #7  0x0000555556e6148d in object_property_set_qobject (obj=0x62d00001c830, name=0x555557875960 "realized", value=0x6030000d1560, errp=0x7ffff4cde0a0) at ../qom/qom-qobject.c:28
++ * #8  0x0000555556e57fca in object_property_set_bool (obj=0x62d00001c830, name=0x555557875960 "realized", value=true, errp=0x7ffff4cde0a0) at ../qom/object.c:1533
++ * #9  0x0000555556e43fba in qdev_realize (dev=0x62d00001c830, bus=0x62d00001c7b0, errp=0x7ffff4cde0a0) at ../hw/core/qdev.c:291
++ * #10 0x0000555556cfb5c4 in virtio_blk_pci_realize (vpci_dev=0x62d000014400, errp=0x7ffff4cde0a0) at ../hw/virtio/virtio-blk-pci.c:64
++ * #11 0x00005555566a0878 in virtio_pci_realize (pci_dev=0x62d000014400, errp=0x7ffff4cde0a0) at ../hw/virtio/virtio-pci.c:2259
++ * #12 0x0000555556475b08 in pci_qdev_realize (qdev=0x62d000014400, errp=0x7ffff4cddde0) at ../hw/pci/pci.c:2093
++ * #13 0x00005555566a10f7 in virtio_pci_dc_realize (qdev=0x62d000014400, errp=0x7ffff4cddde0) at ../hw/virtio/virtio-pci.c:2351
++ * #14 0x0000555556e45110 in device_set_realized (obj=0x62d000014400, value=true, errp=0x7ffff4de17c0) at ../hw/core/qdev.c:510
++ * #15 0x0000555556e5c5b5 in property_set_bool (obj=0x62d000014400, v=0x61100009bb80, name=0x555557875960 "realized", opaque=0x60200000c5f0, errp=0x7ffff4de17c0) at ../qom/object.c:2354
++ * #16 0x0000555556e57a50 in object_property_set (obj=0x62d000014400, name=0x555557875960 "realized", v=0x61100009bb80, errp=0x7ffff4de17c0) at ../qom/object.c:1463
++ * #17 0x0000555556e6148d in object_property_set_qobject (obj=0x62d000014400, name=0x555557875960 "realized", value=0x6030000d0fc0, errp=0x7ffff4de17c0) at ../qom/qom-qobject.c:28
++ * #18 0x0000555556e57fca in object_property_set_bool (obj=0x62d000014400, name=0x555557875960 "realized", value=true, errp=0x7ffff4de17c0) at ../qom/object.c:1533
++ * #19 0x0000555556e43fba in qdev_realize (dev=0x62d000014400, bus=0x61d000102c80, errp=0x7ffff4de17c0) at ../hw/core/qdev.c:291
++ * #20 0x0000555556771f7e in qdev_device_add_from_qdict (opts=0x62100000dd00, from_json=true, errp=0x7ffff4de17c0) at ../system/qdev-monitor.c:719
++ * #21 0x000055555678ec8b in qemu_create_cli_devices () at ../system/vl.c:2656
++ * #22 0x000055555678f001 in qmp_x_exit_preconfig (errp=0x555558dc1a00 <error_fatal>) at ../system/vl.c:2713
++ * #23 0x0000555556793f88 in qemu_init (argc=34, argv=0x7fffffffdb78) at ../system/vl.c:3758
++ * #24 0x0000555556e3a016 in main (argc=34, argv=0x7fffffffdb78) at ../system/main.c:47
++ *
++ * 再
++ * (gdb) bt
++ * #0  qdev_add_vm_change_state_handler (dev=0x62d00001c830, cb=0x555556ba5184 <virtio_blk_dma_restart_cb>, opaque=0x62d00001c830) at ../hw/core/vm-change-state-handler.c:59
++ * #1  0x0000555556bab377 in virtio_blk_device_realize (dev=0x62d00001c830, errp=0x7ffff4cdeda0) at ../hw/block/virtio-blk.c:1935
++ * #2  0x0000555556cb0bab in virtio_device_realize (dev=0x62d00001c830, errp=0x7ffff4cdec20) at ../hw/virtio/virtio.c:3718
++ * #3  0x0000555556e45110 in device_set_realized (obj=0x62d00001c830, value=true, errp=0x7ffff4cde0a0) at ../hw/core/qdev.c:510
++ * #4  0x0000555556e5c5b5 in property_set_bool (obj=0x62d00001c830, v=0x61100009bcc0, name=0x555557875960 "realized", opaque=0x60200000c5f0, errp=0x7ffff4cde0a0) at ../qom/object.c:2354
++ * #5  0x0000555556e57a50 in object_property_set (obj=0x62d00001c830, name=0x555557875960 "realized", v=0x61100009bcc0, errp=0x7ffff4cde0a0) at ../qom/object.c:1463
++ * #6  0x0000555556e6148d in object_property_set_qobject (obj=0x62d00001c830, name=0x555557875960 "realized", value=0x6030000d1560, errp=0x7ffff4cde0a0) at ../qom/qom-qobject.c:28
++ * #7  0x0000555556e57fca in object_property_set_bool (obj=0x62d00001c830, name=0x555557875960 "realized", value=true, errp=0x7ffff4cde0a0) at ../qom/object.c:1533
++ * #8  0x0000555556e43fba in qdev_realize (dev=0x62d00001c830, bus=0x62d00001c7b0, errp=0x7ffff4cde0a0) at ../hw/core/qdev.c:291
++ * #9  0x0000555556cfb5c4 in virtio_blk_pci_realize (vpci_dev=0x62d000014400, errp=0x7ffff4cde0a0) at ../hw/virtio/virtio-blk-pci.c:64
++ * #10 0x00005555566a0878 in virtio_pci_realize (pci_dev=0x62d000014400, errp=0x7ffff4cde0a0) at ../hw/virtio/virtio-pci.c:2259
++ * #11 0x0000555556475b08 in pci_qdev_realize (qdev=0x62d000014400, errp=0x7ffff4cddde0) at ../hw/pci/pci.c:2093
++ * #12 0x00005555566a10f7 in virtio_pci_dc_realize (qdev=0x62d000014400, errp=0x7ffff4cddde0) at ../hw/virtio/virtio-pci.c:2351
++ * #13 0x0000555556e45110 in device_set_realized (obj=0x62d000014400, value=true, errp=0x7ffff4de17c0) at ../hw/core/qdev.c:510
++ * #14 0x0000555556e5c5b5 in property_set_bool (obj=0x62d000014400, v=0x61100009bb80, name=0x555557875960 "realized", opaque=0x60200000c5f0, errp=0x7ffff4de17c0) at ../qom/object.c:2354
++ * #15 0x0000555556e57a50 in object_property_set (obj=0x62d000014400, name=0x555557875960 "realized", v=0x61100009bb80, errp=0x7ffff4de17c0) at ../qom/object.c:1463
++ * #16 0x0000555556e6148d in object_property_set_qobject (obj=0x62d000014400, name=0x555557875960 "realized", value=0x6030000d0fc0, errp=0x7ffff4de17c0) at ../qom/qom-qobject.c:28
++ * #17 0x0000555556e57fca in object_property_set_bool (obj=0x62d000014400, name=0x555557875960 "realized", value=true, errp=0x7ffff4de17c0) at ../qom/object.c:1533
++ * #18 0x0000555556e43fba in qdev_realize (dev=0x62d000014400, bus=0x61d000102c80, errp=0x7ffff4de17c0) at ../hw/core/qdev.c:291
++ * #19 0x0000555556771f7e in qdev_device_add_from_qdict (opts=0x62100000dd00, from_json=true, errp=0x7ffff4de17c0) at ../system/qdev-monitor.c:719
++ * #20 0x000055555678ec8b in qemu_create_cli_devices () at ../system/vl.c:2656
++ * #21 0x000055555678f001 in qmp_x_exit_preconfig (errp=0x555558dc1a00 <error_fatal>) at ../system/vl.c:2713
++ * #22 0x0000555556793f88 in qemu_init (argc=34, argv=0x7fffffffdb78) at ../system/vl.c:3758
++ * #23 0x0000555556e3a016 in main (argc=34, argv=0x7fffffffdb78) at ../system/main.c:47
++ *
++ * 先
++ * (gdb) bt
++ * #0  virtio_vmstate_change (opaque=0x62d00001c830, running=true, state=RUN_STATE_RUNNING) at ../hw/virtio/virtio.c:3196
++ * #1  0x000055555677ee82 in vm_state_notify (running=true, state=RUN_STATE_RUNNING) at ../system/runstate.c:370
++ * #2  0x00005555567614b9 in vm_prepare_start (step_pending=false) at ../system/cpus.c:740
++ * #3  0x0000555556761535 in vm_start () at ../system/cpus.c:747
++ * #4  0x0000555556856af7 in qmp_cont (errp=0x0) at ../monitor/qmp-cmds.c:114
++ * #5  0x000055555678f234 in qmp_x_exit_preconfig (errp=0x555558dc1a00 <error_fatal>) at ../system/vl.c:2738
++ * #6  0x0000555556793f88 in qemu_init (argc=34, argv=0x7fffffffdb78) at ../system/vl.c:3758
++ * #7  0x0000555556e3a016 in main (argc=34, argv=0x7fffffffdb78) at ../system/main.c:47
++ *
++ * 再
++ * #0  virtio_blk_dma_restart_cb (opaque=0x62d00001c830, running=true, state=RUN_STATE_RUNNING) at ../hw/block/virtio-blk.c:1059
++ * #1  0x000055555677ee82 in vm_state_notify (running=true, state=RUN_STATE_RUNNING) at ../system/runstate.c:370
++ * #2  0x00005555567614b9 in vm_prepare_start (step_pending=false) at ../system/cpus.c:740
++ * #3  0x0000555556761535 in vm_start () at ../system/cpus.c:747
++ * #4  0x0000555556856af7 in qmp_cont (errp=0x0) at ../monitor/qmp-cmds.c:114
++ * #5  0x000055555678f234 in qmp_x_exit_preconfig (errp=0x555558dc1a00 <error_fatal>) at ../system/vl.c:2738
++ * #6  0x0000555556793f88 in qemu_init (argc=34, argv=0x7fffffffdb78) at ../system/vl.c:3758
++ * #7  0x0000555556e3a016 in main (argc=34, argv=0x7fffffffdb78) at ../system/main.c:47
++ *
++ * called by:
++ *   - hw/block/virtio-blk.c|2157| <<virtio_blk_device_realize>> qdev_add_vm_change_state_handler(dev, virtio_blk_dma_restart_cb, s);
++ *   - hw/scsi/scsi-bus.c|358| <<scsi_qdev_realize>> dev->vmsentry = qdev_add_vm_change_state_handler(DEVICE(dev), scsi_dma_restart_cb, dev);
++ *   - hw/virtio/virtio.c|3285| <<virtio_init>> vdev->vmstate = qdev_add_vm_change_state_handler(DEVICE(vdev), virtio_vmstate_change, vdev);
++ */
+ VMChangeStateEntry *qdev_add_vm_change_state_handler(DeviceState *dev,
+                                                      VMChangeStateHandler *cb,
+                                                      void *opaque)
+@@ -63,6 +145,11 @@ VMChangeStateEntry *qdev_add_vm_change_state_handler(DeviceState *dev,
+  * Exactly like qdev_add_vm_change_state_handler() but passes a prepare_cb
+  * argument too.
+  */
++/*
++ * 在以下使用qdev_add_vm_change_state_handler_full():
++ *   - hw/core/vm-change-state-handler.c|59| <<qdev_add_vm_change_state_handler>> return qdev_add_vm_change_state_handler_full(dev, cb, NULL, opaque);
++ *   - hw/vfio/migration.c|859| <<vfio_migration_init>> migration->vm_state = qdev_add_vm_change_state_handler_full(vbasedev->dev, vfio_vmstate_change, prepare_cb, vbasedev);
++ */
+ VMChangeStateEntry *qdev_add_vm_change_state_handler_full(
+     DeviceState *dev, VMChangeStateHandler *cb,
+     VMChangeStateHandler *prepare_cb, void *opaque)
 diff --git a/hw/i386/kvm/apic.c b/hw/i386/kvm/apic.c
 index a72c28e8a..69ffa20bd 100644
 --- a/hw/i386/kvm/apic.c
@@ -430,6 +1325,148 @@ index 487e49834..a4b563fda 100644
  int msix_set_vector_notifiers(PCIDevice *dev,
                                MSIVectorUseNotifier use_notifier,
                                MSIVectorReleaseNotifier release_notifier,
+diff --git a/hw/pci/pci.c b/hw/pci/pci.c
+index e7a39cb20..36b203b8b 100644
+--- a/hw/pci/pci.c
++++ b/hw/pci/pci.c
+@@ -1110,31 +1110,92 @@ uint16_t pci_requester_id(PCIDevice *dev)
+     return pci_req_id_cache_extract(&dev->requester_id_cache);
+ }
+ 
++/*
++ * called by:
++ *   - hw/pci/pci.c|1166| <<do_pci_register_device>> if (pci_bus_devfn_available(bus, devfn) && !pci_bus_devfn_reserved(bus, devfn)) {
++ *   - hw/pci/pci.c|1180| <<do_pci_register_device>> } else if (!pci_bus_devfn_available(bus, devfn)) {
++ */
+ static bool pci_bus_devfn_available(PCIBus *bus, int devfn)
+ {
+     return !(bus->devices[devfn]);
+ }
+ 
++/*
++ * called by:
++ *   - hw/pci/pci.c|1167| <<do_pci_register_device>> if (pci_bus_devfn_available(bus, devfn) && !pci_bus_devfn_reserved(bus, devfn)) {
++ *   - hw/pci/pci.c|1175| <<do_pci_register_device>> } else if (pci_bus_devfn_reserved(bus, devfn)) {
++ */
+ static bool pci_bus_devfn_reserved(PCIBus *bus, int devfn)
+ {
++    /*
++     * 在以下使用PCIBus->slot_reserved_mask:
++     *   - hw/pci/pci.c|511| <<pci_root_bus_internal_init>> bus->slot_reserved_mask = 0x0;
++     *   - hw/pci/pci.c|1130| <<pci_bus_devfn_reserved>> return bus->slot_reserved_mask & (1UL << PCI_SLOT(devfn));
++     *   - hw/pci/pci.c|1135| <<pci_bus_get_slot_reserved_mask>> return bus->slot_reserved_mask;
++     *   - hw/pci/pci.c|1140| <<pci_bus_set_slot_reserved_mask>> bus->slot_reserved_mask |= mask;
++     *   - hw/pci/pci.c|1149| <<pci_bus_clear_slot_reserved_mask>> bus->slot_reserved_mask &= ~mask;
++     */
+     return bus->slot_reserved_mask & (1UL << PCI_SLOT(devfn));
+ }
+ 
++/*
++ * called by:
++ *   - hw/xen/xen_pt.c|974| <<xen_igd_clear_slot>> if (!(pci_bus_get_slot_reserved_mask(pci_bus) & XEN_PCI_IGD_SLOT_MASK)) {
++ */
+ uint32_t pci_bus_get_slot_reserved_mask(PCIBus *bus)
+ {
++    /*
++     * 在以下使用PCIBus->slot_reserved_mask:
++     *   - hw/pci/pci.c|511| <<pci_root_bus_internal_init>> bus->slot_reserved_mask = 0x0;
++     *   - hw/pci/pci.c|1130| <<pci_bus_devfn_reserved>> return bus->slot_reserved_mask & (1UL << PCI_SLOT(devfn));
++     *   - hw/pci/pci.c|1135| <<pci_bus_get_slot_reserved_mask>> return bus->slot_reserved_mask;
++     *   - hw/pci/pci.c|1140| <<pci_bus_set_slot_reserved_mask>> bus->slot_reserved_mask |= mask;
++     *   - hw/pci/pci.c|1149| <<pci_bus_clear_slot_reserved_mask>> bus->slot_reserved_mask &= ~mask;
++     */
+     return bus->slot_reserved_mask;
+ }
+ 
++/*
++ * called by:
++ *   - hw/sparc64/sun4u.c|613| <<sun4uv_init>> pci_bus_set_slot_reserved_mask(pci_bus, 0xfffffffc);
++ *   - hw/sparc64/sun4u.c|614| <<sun4uv_init>> pci_bus_set_slot_reserved_mask(pci_busA, 0xfffffff1);
++ *   - hw/sparc64/sun4u.c|615| <<sun4uv_init>> pci_bus_set_slot_reserved_mask(pci_busB, 0xfffffff0);
++ *   - hw/xen/xen_pt.c|954| <<xen_igd_reserve_slot>> pci_bus_set_slot_reserved_mask(pci_bus, XEN_PCI_IGD_SLOT_MASK);
++ */
+ void pci_bus_set_slot_reserved_mask(PCIBus *bus, uint32_t mask)
+ {
++    /*
++     * 在以下使用PCIBus->slot_reserved_mask:
++     *   - hw/pci/pci.c|511| <<pci_root_bus_internal_init>> bus->slot_reserved_mask = 0x0;
++     *   - hw/pci/pci.c|1130| <<pci_bus_devfn_reserved>> return bus->slot_reserved_mask & (1UL << PCI_SLOT(devfn));
++     *   - hw/pci/pci.c|1135| <<pci_bus_get_slot_reserved_mask>> return bus->slot_reserved_mask;
++     *   - hw/pci/pci.c|1140| <<pci_bus_set_slot_reserved_mask>> bus->slot_reserved_mask |= mask;
++     *   - hw/pci/pci.c|1149| <<pci_bus_clear_slot_reserved_mask>> bus->slot_reserved_mask &= ~mask;
++     */
+     bus->slot_reserved_mask |= mask;
+ }
+ 
++/*
++ * called by:
++ *   - hw/xen/xen_pt.c|985| <<xen_igd_clear_slot>> pci_bus_clear_slot_reserved_mask(pci_bus, XEN_PCI_IGD_SLOT_MASK);
++ */
+ void pci_bus_clear_slot_reserved_mask(PCIBus *bus, uint32_t mask)
+ {
++    /*
++     * 在以下使用PCIBus->slot_reserved_mask:
++     *   - hw/pci/pci.c|511| <<pci_root_bus_internal_init>> bus->slot_reserved_mask = 0x0;
++     *   - hw/pci/pci.c|1130| <<pci_bus_devfn_reserved>> return bus->slot_reserved_mask & (1UL << PCI_SLOT(devfn));
++     *   - hw/pci/pci.c|1135| <<pci_bus_get_slot_reserved_mask>> return bus->slot_reserved_mask;
++     *   - hw/pci/pci.c|1140| <<pci_bus_set_slot_reserved_mask>> bus->slot_reserved_mask |= mask;
++     *   - hw/pci/pci.c|1149| <<pci_bus_clear_slot_reserved_mask>> bus->slot_reserved_mask &= ~mask;
++     */
+     bus->slot_reserved_mask &= ~mask;
+ }
+ 
++/*
++ * called by:
++ *   - hw/pci/pci.c|2086| <<pci_qdev_realize>> pci_dev = do_pci_register_device(pci_dev, object_get_typename(OBJECT(qdev)), pci_dev->devfn, errp);
++ */
+ /* -1 for devfn means auto assign */
+ static PCIDevice *do_pci_register_device(PCIDevice *pci_dev,
+                                          const char *name, int devfn,
+@@ -2028,6 +2089,10 @@ PCIDevice *pci_find_device(PCIBus *bus, int bus_num, uint8_t devfn)
+ 
+ #define ONBOARD_INDEX_MAX (16 * 1024 - 1)
+ 
++/*
++ * 在以下使用pci_qdev_realize():
++ *   - hw/pci/pci.c|2632| <<pci_device_class_init>> k->realize = pci_qdev_realize;
++ */
+ static void pci_qdev_realize(DeviceState *qdev, Error **errp)
+ {
+     PCIDevice *pci_dev = (PCIDevice *)qdev;
+@@ -2767,6 +2832,12 @@ void pci_bus_get_w64_range(PCIBus *bus, Range *range)
+     pci_for_each_device_under_bus(bus, pci_dev_get_w64, range);
+ }
+ 
++/*
++ * called by:
++ *   - hw/pci/pci.c|2178| <<pci_qdev_realize>> if (pci_is_express(pci_dev) &&
++ *                     !pcie_find_capability(pci_dev, PCI_EXT_CAP_ID_ARI) && pcie_has_upstream_port(pci_dev) && PCI_SLOT(pci_dev->devfn)) {
++ *   - hw/pci/pci.c|2867| <<pci_get_function_0>> if(pcie_has_upstream_port(pci_dev)) {
++ */
+ static bool pcie_has_upstream_port(PCIDevice *dev)
+ {
+     PCIDevice *parent_dev = pci_bridge_get_device(pci_get_bus(dev));
+@@ -2783,6 +2854,20 @@ static bool pcie_has_upstream_port(PCIDevice *dev)
+          pcie_cap_get_type(parent_dev) == PCI_EXP_TYPE_DOWNSTREAM);
+ }
+ 
++/*
++ * called by:
++ *   - hw/isa/vt82c686.c|658| <<via_isa_set_irq>> ViaISAState *s = VIA_ISA(pci_get_function_0(d));
++ *   - hw/pci/pci.c|1207| <<do_pci_register_device>> else if (dev->hotplugged && !pci_is_vf(pci_dev) && pci_get_function_0(pci_dev)) {
++ *   - hw/pci/pci.c|1210| <<do_pci_register_device>> error_setg(errp, "PCI: slot %d function 0 already occupied by %s,"
++ *                              " new func %s cannot be exposed to guest.", PCI_SLOT(pci_get_function_0(pci_dev)->devfn), pci_get_function_0(pci_dev)->name, name);
++ *   - hw/pci/pci.c|1211| <<do_pci_register_device>> error_setg(errp, "PCI: slot %d function 0 already occupied by %s,"
++ *                              " new func %s cannot be exposed to guest.", PCI_SLOT(pci_get_function_0(pci_dev)->devfn), pci_get_function_0(pci_dev)->name, name);
++ *   - hw/pci/pci_host.c|88| <<pci_host_config_write_common>> if ((pci_dev->qdev.hotplugged && !pci_get_function_0(pci_dev)) || !pci_dev->has_power || is_pci_dev_ejected(pci_dev)) {
++ *   - hw/pci/pci_host.c|113| <<pci_host_config_read_common>> if ((pci_dev->qdev.hotplugged && !pci_get_function_0(pci_dev)) || !pci_dev->has_power || is_pci_dev_ejected(pci_dev)) {
++ *   - hw/pci/pcie.c|524| <<pcie_cap_slot_plug_cb>> if (pci_get_function_0(pci_dev)) {
++ *   - hw/ppc/spapr_pci.c|1582| <<spapr_pci_pre_plug>> pci_get_function_0(PCI_DEVICE(drc->dev))->name);
++ *   - hw/rdma/vmw/pvrdma_main.c|628| <<pvrdma_realize>> func0 = pci_get_function_0(pdev);
++ */
+ PCIDevice *pci_get_function_0(PCIDevice *pci_dev)
+ {
+     PCIBus *bus = pci_get_bus(pci_dev);
 diff --git a/hw/pci/pcie.c b/hw/pci/pcie.c
 index 4b2f0805c..cfdf84d70 100644
 --- a/hw/pci/pcie.c
@@ -472,6 +1509,28 @@ index 20ff2b39e..a6f17ae07 100644
      struct PCIEChassis *c;
      c = pcie_chassis_find(slot->chassis);
      if (!c) {
+diff --git a/hw/scsi/scsi-disk.c b/hw/scsi/scsi-disk.c
+index 4bd7af9d0..1f02721ca 100644
+--- a/hw/scsi/scsi-disk.c
++++ b/hw/scsi/scsi-disk.c
+@@ -2887,6 +2887,17 @@ static BlockAIOCB *scsi_block_do_sgio(SCSIBlockReq *req,
+     /* The rest is as in scsi-generic.c.  */
+     io_header->mx_sb_len = sizeof(r->req.sense);
+     io_header->sbp = r->req.sense;
++    /*
++     * sg_io_hd_t *io_header:
++     * -> unsigned int timeout;
++     *
++     * SCSIDiskState *s:
++     * -> SCSIDevice qdev;
++     *    -> QTAILQ_HEAD(, SCSIRequest) requests;
++     *    -> uint32_t channel;
++     *    -> uint32_t lun;
++     *    -> uint32_t io_timeout;
++     */
+     io_header->timeout = s->qdev.io_timeout * 1000;
+     io_header->usr_ptr = r;
+     io_header->flags |= SG_FLAG_DIRECT_IO;
 diff --git a/hw/vfio/helpers.c b/hw/vfio/helpers.c
 index 47b4096c0..f3b43ed52 100644
 --- a/hw/vfio/helpers.c
@@ -891,7 +1950,7 @@ index cb159fd07..c660e8b68 100644
                                           bool with_irqfd)
  {
 diff --git a/hw/virtio/virtio.c b/hw/virtio/virtio.c
-index 871674f9b..1bb6b5145 100644
+index 871674f9b..7509ff226 100644
 --- a/hw/virtio/virtio.c
 +++ b/hw/virtio/virtio.c
 @@ -148,7 +148,30 @@ struct VirtQueue
@@ -945,7 +2004,21 @@ index 871674f9b..1bb6b5145 100644
  EventNotifier *virtio_queue_get_guest_notifier(VirtQueue *vq)
  {
      return &vq->guest_notifier;
-@@ -3641,6 +3677,18 @@ void virtio_queue_host_notifier_read(EventNotifier *n)
+@@ -3562,6 +3598,13 @@ static void virtio_queue_host_notifier_aio_poll_end(EventNotifier *n)
+     virtio_queue_set_notification(vq, 1);
+ }
+ 
++/*
++ * called by:
++ *   - hw/block/virtio-blk.c|1590| <<virtio_blk_ioeventfd_attach>> virtio_queue_aio_attach_host_notifier(vq, s->vq_aio_context[i]);
++ *   - hw/scsi/virtio-scsi-dataplane.c|157| <<virtio_scsi_dataplane_start>> virtio_queue_aio_attach_host_notifier(vs->ctrl_vq, s->ctx);
++ *   - hw/scsi/virtio-scsi-dataplane.c|161| <<virtio_scsi_dataplane_start>> virtio_queue_aio_attach_host_notifier(vs->cmd_vqs[i], s->ctx);
++ *   - hw/scsi/virtio-scsi.c|1173| <<virtio_scsi_drained_end>> virtio_queue_aio_attach_host_notifier(vq, s->ctx);
++ */
+ void virtio_queue_aio_attach_host_notifier(VirtQueue *vq, AioContext *ctx)
+ {
+     /*
+@@ -3641,6 +3684,18 @@ void virtio_queue_host_notifier_read(EventNotifier *n)
      }
  }
  
@@ -964,7 +2037,7 @@ index 871674f9b..1bb6b5145 100644
  EventNotifier *virtio_queue_get_host_notifier(VirtQueue *vq)
  {
      return &vq->host_notifier;
-@@ -3784,6 +3832,16 @@ static Property virtio_properties[] = {
+@@ -3784,6 +3839,16 @@ static Property virtio_properties[] = {
      DEFINE_PROP_END_OF_LIST(),
  };
  
@@ -981,6 +2054,46 @@ index 871674f9b..1bb6b5145 100644
  static int virtio_device_start_ioeventfd_impl(VirtIODevice *vdev)
  {
      VirtioBusState *qbus = VIRTIO_BUS(qdev_get_parent_bus(DEVICE(vdev)));
+diff --git a/include/block/block_int-common.h b/include/block/block_int-common.h
+index 761276127..3a48f9eef 100644
+--- a/include/block/block_int-common.h
++++ b/include/block/block_int-common.h
+@@ -1238,8 +1238,35 @@ struct BlockDriverState {
+ 
+     unsigned int write_gen;               /* Current data generation */
+ 
++    /*
++     * 在以下使用BlockDriverState->reqs_lock:
++     *   - block.c|422| <<bdrv_new>> qemu_mutex_init(&bs->reqs_lock);
++     *   - block.c|5528| <<bdrv_delete>> qemu_mutex_destroy(&bs->reqs_lock);
++     *   - block/io.c|591| <<tracked_request_end>> qemu_mutex_lock(&req->bs->reqs_lock);
++     *   - block/io.c|593| <<tracked_request_end>> qemu_mutex_unlock(&req->bs->reqs_lock);
++     *   - block/io.c|627| <<tracked_request_begin>> qemu_mutex_lock(&bs->reqs_lock);
++     *   - block/io.c|629| <<tracked_request_begin>> qemu_mutex_unlock(&bs->reqs_lock);
++     *   - block/io.c|690| <<bdrv_wait_serialising_requests_locked>> qemu_co_queue_wait(&req->wait_queue, &self->bs->reqs_lock);
++     *   - block/io.c|793| <<bdrv_wait_serialising_requests>> qemu_mutex_lock(&bs->reqs_lock);
++     *   - block/io.c|795| <<bdrv_wait_serialising_requests>> qemu_mutex_unlock(&bs->reqs_lock);
++     *   - block/io.c|803| <<bdrv_make_request_serialising>> qemu_mutex_lock(&req->bs->reqs_lock);
++     *   - block/io.c|808| <<bdrv_make_request_serialising>> qemu_mutex_unlock(&req->bs->reqs_lock);
++     *   - block/io.c|1973| <<bdrv_co_write_req_prepare>> QEMU_LOCK_GUARD(&bs->reqs_lock);
++     *   - block/io.c|2962| <<bdrv_co_flush>> qemu_mutex_lock(&bs->reqs_lock);
++     *   - block/io.c|2967| <<bdrv_co_flush>> qemu_co_queue_wait(&bs->flush_queue, &bs->reqs_lock);
++     *   - block/io.c|2972| <<bdrv_co_flush>> qemu_mutex_unlock(&bs->reqs_lock);
++     *   - block/io.c|3060| <<bdrv_co_flush>> qemu_mutex_lock(&bs->reqs_lock);
++     *   - block/io.c|3064| <<bdrv_co_flush>> qemu_mutex_unlock(&bs->reqs_lock);
++     */
+     /* Protected by reqs_lock.  */
+     QemuMutex reqs_lock;
++    /*
++     * 在以下使用BlockDriverState->tracked_requests:
++     *   - block/io.c|628| <<tracked_request_begin>> QLIST_INSERT_HEAD(&bs->tracked_requests, req, list);
++     *   - block/io.c|654| <<bdrv_find_conflicting_request>> QLIST_FOREACH(req, &self->bs->tracked_requests, list) {
++     *   - block/io.c|724| <<bdrv_co_get_self_request>> QLIST_FOREACH(req, &bs->tracked_requests, list) {
++     *   - block/mirror.c|1130| <<mirror_run>> assert(QLIST_EMPTY(&bs->tracked_requests));
++     */
+     QLIST_HEAD(, BdrvTrackedRequest) tracked_requests;
+     CoQueue flush_queue;                  /* Serializing flush queue */
+     bool active_flush_req;                /* Flush request in flight? */
 diff --git a/include/hw/hotplug.h b/include/hw/hotplug.h
 index a9840ed48..5bf50cd32 100644
 --- a/include/hw/hotplug.h
@@ -1036,6 +2149,25 @@ index d6e85833d..b762e01bf 100644
      void (*send_msi)(MSIMessage *msi);
  };
  
+diff --git a/include/hw/pci/pci_bus.h b/include/hw/pci/pci_bus.h
+index 226131254..dd6817a18 100644
+--- a/include/hw/pci/pci_bus.h
++++ b/include/hw/pci/pci_bus.h
+@@ -36,6 +36,14 @@ struct PCIBus {
+     const PCIIOMMUOps *iommu_ops;
+     void *iommu_opaque;
+     uint8_t devfn_min;
++    /*
++     * 在以下使用PCIBus->slot_reserved_mask:
++     *   - hw/pci/pci.c|511| <<pci_root_bus_internal_init>> bus->slot_reserved_mask = 0x0;
++     *   - hw/pci/pci.c|1130| <<pci_bus_devfn_reserved>> return bus->slot_reserved_mask & (1UL << PCI_SLOT(devfn));
++     *   - hw/pci/pci.c|1135| <<pci_bus_get_slot_reserved_mask>> return bus->slot_reserved_mask;
++     *   - hw/pci/pci.c|1140| <<pci_bus_set_slot_reserved_mask>> bus->slot_reserved_mask |= mask;
++     *   - hw/pci/pci.c|1149| <<pci_bus_clear_slot_reserved_mask>> bus->slot_reserved_mask &= ~mask;
++     */
+     uint32_t slot_reserved_mask;
+     pci_set_irq_fn set_irq;
+     pci_map_irq_fn map_irq;
 diff --git a/include/hw/pci/pci_device.h b/include/hw/pci/pci_device.h
 index d3dd0f64b..bb61a3f96 100644
 --- a/include/hw/pci/pci_device.h
@@ -1114,6 +2246,91 @@ index d3dd0f64b..bb61a3f96 100644
      MSIVectorPollNotifier msix_vector_poll_notifier;
  
      /* ID of standby device in net_failover pair */
+diff --git a/include/hw/scsi/scsi.h b/include/hw/scsi/scsi.h
+index c3d5e17e3..20e18bfd4 100644
+--- a/include/hw/scsi/scsi.h
++++ b/include/hw/scsi/scsi.h
+@@ -91,6 +91,16 @@ struct SCSIDevice
+     uint64_t port_wwn;
+     int scsi_version;
+     int default_scsi_version;
++    /*
++     * 在以下使用SCSIDevice->io_timeout:
++     *   - hw/scsi/scsi-disk.c|3234| <<global>> DEFINE_PROP_UINT32("io_timeout", SCSIDiskState, qdev.io_timeout, DEFAULT_IO_TIMEOUT),
++     *   - hw/scsi/scsi-generic.c|778| <<global>> DEFINE_PROP_UINT32("io_timeout", SCSIDevice, io_timeout, DEFAULT_IO_TIMEOUT),
++     *   - hw/scsi/scsi-disk.c|2701| <<get_device_type>> ret = scsi_SG_IO_FROM_DEV(s->qdev.conf.blk, cmd, sizeof(cmd), buf, sizeof(buf), s->qdev.io_timeout);
++     *   - hw/scsi/scsi-disk.c|2901| <<scsi_block_do_sgio>> io_header->timeout = s->qdev.io_timeout * 1000;
++     *   - hw/scsi/scsi-generic.c|133| <<execute_command>> r->io_header.timeout = s->io_timeout * 1000;
++     *   - hw/scsi/scsi-generic.c|577| <<scsi_generic_set_vpd_bl_emulation>> ret = scsi_SG_IO_FROM_DEV(s->conf.blk, cmd, sizeof(cmd), buf, sizeof(buf), s->io_timeout);
++     *   - hw/scsi/scsi-generic.c|613| <<scsi_generic_read_device_identification>> ret = scsi_SG_IO_FROM_DEV(s->conf.blk, cmd, sizeof(cmd), buf, sizeof(buf), s->io_timeout);
++     */
+     uint32_t io_timeout;
+     bool needs_vpd_bl_emulation;
+     bool hba_supports_iothread;
+diff --git a/include/hw/virtio/virtio-blk.h b/include/hw/virtio/virtio-blk.h
+index 5c14110c4..edb18bd62 100644
+--- a/include/hw/virtio/virtio-blk.h
++++ b/include/hw/virtio/virtio-blk.h
+@@ -38,6 +38,16 @@ struct VirtIOBlkConf
+ {
+     BlockConf conf;
+     IOThread *iothread;
++    /*
++     * 在以下使用apply_iothread_vq_mapping->iothread_vq_mapping_list:
++     *   - hw/block/virtio-blk.c|2176| <<global>> DEFINE_PROP_IOTHREAD_VQ_MAPPING_LIST("iothread-vq-mapping", VirtIOBlock, conf.iothread_vq_mapping_list),
++     *   - hw/block/virtio-blk.c|1720| <<virtio_blk_vq_aio_context_init>> if (conf->iothread && conf->iothread_vq_mapping_list) {
++     *   - hw/block/virtio-blk.c|1727| <<virtio_blk_vq_aio_context_init>> if (conf->iothread || conf->iothread_vq_mapping_list) {
++     *   - hw/block/virtio-blk.c|1751| <<virtio_blk_vq_aio_context_init>> if (conf->iothread_vq_mapping_list) {
++     *   - hw/block/virtio-blk.c|1752| <<virtio_blk_vq_aio_context_init>> if (!apply_iothread_vq_mapping(conf->iothread_vq_mapping_list,
++     *   - hw/block/virtio-blk.c|1785| <<virtio_blk_vq_aio_context_cleanup>> if (conf->iothread_vq_mapping_list) {
++     *   - hw/block/virtio-blk.c|1788| <<virtio_blk_vq_aio_context_cleanup>> for (node = conf->iothread_vq_mapping_list; node; node = node->next) {
++     */
+     IOThreadVirtQueueMappingList *iothread_vq_mapping_list;
+     char *serial;
+     uint32_t request_merging;
+@@ -60,6 +70,15 @@ struct VirtIOBlock {
+     unsigned short sector_mask;
+     bool original_wce;
+     VMChangeStateEntry *change;
++    /*
++     * 在以下使用VirtIOBlock->ioeventfd_disabled:
++     *   - hw/block/virtio-blk.c|1202| <<virtio_blk_handle_output>> if (!s->ioeventfd_disabled && !s->ioeventfd_started) {
++     *   - hw/block/virtio-blk.c|1207| <<virtio_blk_handle_output>> if (!s->ioeventfd_disabled) {
++     *   - hw/block/virtio-blk.c|2057| <<virtio_blk_start_ioeventfd>> s->ioeventfd_disabled = true;
++     *   - hw/block/virtio-blk.c|2094| <<virtio_blk_stop_ioeventfd>> if (s->ioeventfd_disabled) {
++     *   - hw/block/virtio-blk.c|2095| <<virtio_blk_stop_ioeventfd>> s->ioeventfd_disabled = false;
++     *   - hw/block/virtio-blk.c|2246| <<virtio_blk_device_realize>> s->ioeventfd_disabled = true;
++     */
+     bool ioeventfd_disabled;
+     bool ioeventfd_started;
+     bool ioeventfd_starting;
+@@ -69,6 +88,26 @@ struct VirtIOBlock {
+      * The AioContext for each virtqueue. The BlockDriverState will use the
+      * first element as its AioContext.
+      */
++    /*
++     * 在以下使用VirtIOBlock->vq_aio_context[][]:
++     *   - hw/block/virtio-blk.c|1261| <<virtio_blk_dma_restart_cb>> aio_bh_schedule_oneshot(s->vq_aio_context[i], virtio_blk_dma_restart_bh, vq_rq[i]);
++     *   - hw/block/virtio-blk.c|1549| <<virtio_blk_ioeventfd_detach>> virtio_queue_aio_detach_host_notifier(vq, s->vq_aio_context[i]);
++     *   - hw/block/virtio-blk.c|1559| <<virtio_blk_ioeventfd_attach>> virtio_queue_aio_attach_host_notifier(vq, s->vq_aio_context[i]);
++     *   - hw/block/virtio-blk.c|1749| <<virtio_blk_vq_aio_context_init>> s->vq_aio_context = g_new(AioContext *, conf->num_queues);
++     *   - hw/block/virtio-blk.c|1753| <<virtio_blk_vq_aio_context_init>> if (!apply_iothread_vq_mapping(conf->iothread_vq_mapping_list, s->vq_aio_context, conf->num_queues, errp)) {
++     *   - hw/block/virtio-blk.c|1756| <<virtio_blk_vq_aio_context_init>> g_free(s->vq_aio_context);
++     *   - hw/block/virtio-blk.c|1757| <<virtio_blk_vq_aio_context_init>> s->vq_aio_context = NULL;
++     *   - hw/block/virtio-blk.c|1763| <<virtio_blk_vq_aio_context_init>> s->vq_aio_context[i] = ctx;
++     *   - hw/block/virtio-blk.c|1771| <<virtio_blk_vq_aio_context_init>> s->vq_aio_context[i] = ctx;
++     *   - hw/block/virtio-blk.c|1798| <<virtio_blk_vq_aio_context_cleanup>> g_free(s->vq_aio_context);
++     *   - hw/block/virtio-blk.c|1799| <<virtio_blk_vq_aio_context_cleanup>> s->vq_aio_context = NULL;
++     *   - hw/block/virtio-blk.c|1864| <<virtio_blk_start_ioeventfd>> r = blk_set_aio_context(s->conf.conf.blk, s->vq_aio_context[0], &local_err);
++     *   - hw/block/virtio-blk.c|1943| <<virtio_blk_stop_ioeventfd>> AioContext *ctx = s->vq_aio_context[i];
++     *
++     * 注释:
++     * The AioContext for each virtqueue. The BlockDriverState will use the
++     * first element as its AioContext.
++     */
+     AioContext **vq_aio_context;
+ 
+     uint64_t host_features;
 diff --git a/include/hw/virtio/virtio.h b/include/hw/virtio/virtio.h
 index 7d5ffdc14..38d0aa447 100644
 --- a/include/hw/virtio/virtio.h
@@ -1185,6 +2402,25 @@ index 882e37e12..495f09599 100644
      unsigned int gsi_count;
  #endif
      KVMMemoryListener memory_listener;
+diff --git a/iothread.c b/iothread.c
+index e1e9e0473..1313d4d44 100644
+--- a/iothread.c
++++ b/iothread.c
+@@ -395,6 +395,14 @@ void iothread_destroy(IOThread *iothread)
+     object_unparent(OBJECT(iothread));
+ }
+ 
++/*
++ * called by:
++ *   - block/export/export.c|123| <<blk_exp_add>> iothread = iothread_by_id(export->iothread);
++ *   - blockdev.c|3560| <<qmp_x_blockdev_set_iothread>> IOThread *obj = iothread_by_id(iothread->u.s);
++ *   - hw/block/virtio-blk.c|1601| <<validate_iothread_vq_mapping_list>> if (!iothread_by_id(name)) {
++ *   - hw/block/virtio-blk.c|1683| <<apply_iothread_vq_mapping>> IOThread *iothread = iothread_by_id(node->value->iothread);
++ *   - hw/block/virtio-blk.c|1789| <<virtio_blk_vq_aio_context_cleanup>> IOThread *iothread = iothread_by_id(node->value->iothread);
++ */
+ /* Lookup IOThread by its id.  Only finds user-created objects, not internal
+  * iothread_create() objects. */
+ IOThread *iothread_by_id(const char *id)
 diff --git a/system/cpus.c b/system/cpus.c
 index 68d161d96..c3ed8ede1 100644
 --- a/system/cpus.c
@@ -1304,6 +2540,40 @@ index e68cbe929..4f30321d7 100644
  int kvm_arch_fixup_msi_route(struct kvm_irq_routing_entry *route,
                               uint64_t address, uint32_t data, PCIDevice *dev)
  {
+diff --git a/util/aio-posix.c b/util/aio-posix.c
+index 266c9dd35..4ec189cd3 100644
+--- a/util/aio-posix.c
++++ b/util/aio-posix.c
+@@ -192,6 +192,29 @@ static void aio_set_fd_poll(AioContext *ctx, int fd,
+     node->io_poll_end = io_poll_end;
+ }
+ 
++/*
++ * called by:
++ *   - block/linux-aio.c|435| <<laio_detach_aio_context>> aio_set_event_notifier(old_context, &s->e, NULL, NULL, NULL);
++  2 block/linux-aio.c|444| <<laio_attach_aio_context>> aio_set_event_notifier(new_context, &s->e,
++  3 block/nvme.c|873| <<nvme_init>> aio_set_event_notifier(bdrv_get_aio_context(bs),
++  4 block/nvme.c|959| <<nvme_close>> aio_set_event_notifier(bdrv_get_aio_context(bs),
++  5 block/nvme.c|1557| <<nvme_detach_aio_context>> aio_set_event_notifier(bdrv_get_aio_context(bs),
++  6 block/nvme.c|1568| <<nvme_attach_aio_context>> aio_set_event_notifier(new_context, &s->irq_notifier[MSIX_SHARED_IRQ_IDX],
++  7 block/win32-aio.c|177| <<win32_aio_detach_aio_context>> aio_set_event_notifier(old_context, &aio->e, NULL, NULL, NULL);
++  8 block/win32-aio.c|185| <<win32_aio_attach_aio_context>> aio_set_event_notifier(new_context, &aio->e, win32_aio_completion_cb,
++  9 hw/virtio/virtio.c|3614| <<virtio_queue_aio_attach_host_notifier>> aio_set_event_notifier(ctx, &vq->host_notifier,
++ 10 hw/virtio/virtio.c|3643| <<virtio_queue_aio_attach_host_notifier_no_poll>> aio_set_event_notifier(ctx, &vq->host_notifier,
++ *   - hw/virtio/virtio.c|3658| <<virtio_queue_aio_detach_host_notifier>> aio_set_event_notifier(ctx, &vq->host_notifier, NULL, NULL, NULL);
++ 12 include/block/aio.h|477| <<QSLIST_HEAD>> void aio_set_event_notifier(AioContext *ctx,
++ 13 tests/unit/test-aio.c|106| <<set_event_notifier>> aio_set_event_notifier(nctx, notifier, handler, NULL, NULL);
++ 14 tests/unit/test-nested-aio-poll.c|94| <<test>> aio_set_event_notifier(td.ctx, &td.poll_notifier,
++ 15 tests/unit/test-nested-aio-poll.c|99| <<test>> aio_set_event_notifier(td.ctx, &td.dummy_notifier,
++ 16 tests/unit/test-nested-aio-poll.c|117| <<test>> aio_set_event_notifier(td.ctx, &td.dummy_notifier, NULL, NULL, NULL);
++ 17 tests/unit/test-nested-aio-poll.c|118| <<test>> aio_set_event_notifier(td.ctx, &td.poll_notifier, NULL, NULL, NULL);
++ *   - util/async.c|414| <<aio_ctx_finalize>> aio_set_event_notifier(ctx, &ctx->notifier, NULL, NULL, NULL);
++ 21 util/async.c|595| <<aio_context_new>> aio_set_event_notifier(ctx, &ctx->notifier,
++ 22 util/main-loop.c|685| <<event_notifier_set_handler>> aio_set_event_notifier(iohandler_ctx, e, handler, NULL, NULL);
++ */
+ void aio_set_event_notifier(AioContext *ctx,
+                             EventNotifier *notifier,
+                             EventNotifierHandler *io_read,
 diff --git a/util/event_notifier-posix.c b/util/event_notifier-posix.c
 index 76420c5b5..1dfe9252a 100644
 --- a/util/event_notifier-posix.c
