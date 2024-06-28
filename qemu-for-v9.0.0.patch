@@ -1,6 +1,6 @@
-From d22c985d0bc56c98feedc3b1c43aed01771ea585 Mon Sep 17 00:00:00 2001
+From b1fc7cb2be271624aeb7993bad03e1cf52ee2913 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Sat, 22 Jun 2024 09:56:25 -0700
+Date: Fri, 28 Jun 2024 08:42:00 -0700
 Subject: [PATCH 1/1] qemu for v9.0.0
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
@@ -37,6 +37,8 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  include/hw/virtio/virtio.h        |   7 +
  include/sysemu/kvm_int.h          |  39 ++++
  iothread.c                        |   8 +
+ net/tap-linux.c                   |   8 +
+ net/tap.c                         |  31 ++++
  system/cpus.c                     |   4 +
  system/memory.c                   |  29 +++
  target/arm/kvm.c                  |   5 +
@@ -44,7 +46,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  util/aio-posix.c                  |  23 +++
  util/event_notifier-posix.c       |  55 ++++++
  util/main-loop.c                  |  33 ++++
- 39 files changed, 1549 insertions(+)
+ 41 files changed, 1588 insertions(+)
 
 diff --git a/accel/kvm/kvm-all.c b/accel/kvm/kvm-all.c
 index 931f74256..79e9fbf32 100644
@@ -2421,6 +2423,81 @@ index e1e9e0473..1313d4d44 100644
  /* Lookup IOThread by its id.  Only finds user-created objects, not internal
   * iothread_create() objects. */
  IOThread *iothread_by_id(const char *id)
+diff --git a/net/tap-linux.c b/net/tap-linux.c
+index c7e514ecb..87d345033 100644
+--- a/net/tap-linux.c
++++ b/net/tap-linux.c
+@@ -146,6 +146,14 @@ void tap_set_sndbuf(int fd, const NetdevTapOptions *tap, Error **errp)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - net/tap.c|675| <<net_init_bridge>> vnet_hdr = tap_probe_vnet_hdr(fd, errp);
++ *   - net/tap.c|892| <<net_init_tap>> vnet_hdr = tap_probe_vnet_hdr(fd, errp);
++ *   - net/tap.c|949| <<net_init_tap>> vnet_hdr = tap_probe_vnet_hdr(fd, errp);
++ *   - net/tap.c|954| <<net_init_tap>> } else if (vnet_hdr != tap_probe_vnet_hdr(fd, NULL)) {
++ *   - net/tap.c|1001| <<net_init_tap>> vnet_hdr = tap_probe_vnet_hdr(fd, errp);
++ */
+ int tap_probe_vnet_hdr(int fd, Error **errp)
+ {
+     struct ifreq ifr;
+diff --git a/net/tap.c b/net/tap.c
+index baaa2f7a9..399fe8f92 100644
+--- a/net/tap.c
++++ b/net/tap.c
+@@ -60,6 +60,25 @@ typedef struct TAPState {
+     bool has_uso;
+     bool enabled;
+     VHostNetState *vhost_net;
++    /*
++     * 在以下设置TAPState->host_vnet_hdr_len:
++     *   - net/tap.c|286| <<tap_set_vnet_hdr_len>> s->host_vnet_hdr_len = len;
++     *   - net/tap.c|425| <<net_tap_fd_init>> s->host_vnet_hdr_len = vnet_hdr ? sizeof(struct virtio_net_hdr) : 0;
++     * 在以下使用TAPState->host_vnet_hdr_len:
++     *   - net/tap.c|124| <<tap_receive_iov>> if (s->host_vnet_hdr_len && !s->using_vnet_hdr) {
++     *   - net/tap.c|127| <<tap_receive_iov>> iov_copy[0].iov_len = s->host_vnet_hdr_len;
++     *   - net/tap.c|143| <<tap_receive_raw>> if (s->host_vnet_hdr_len) {
++     *   - net/tap.c|145| <<tap_receive_raw>> iov[iovcnt].iov_len = s->host_vnet_hdr_len;
++     *   - net/tap.c|161| <<tap_receive>> if (s->host_vnet_hdr_len && !s->using_vnet_hdr) {
++     *   - net/tap.c|200| <<tap_send>> if (s->host_vnet_hdr_len && !s->using_vnet_hdr) {
++     *   - net/tap.c|201| <<tap_send>> buf += s->host_vnet_hdr_len;
++     *   - net/tap.c|202| <<tap_send>> size -= s->host_vnet_hdr_len;
++     *   - net/tap.c|257| <<tap_has_vnet_hdr>> return !!s->host_vnet_hdr_len;
++     *   - net/tap.c|273| <<tap_get_vnet_hdr_len>> return s->host_vnet_hdr_len;
++     *   - net/tap.c|301| <<tap_using_vnet_hdr>> assert(!!s->host_vnet_hdr_len == using_vnet_hdr);
++     *   - net/tap.c|435| <<net_tap_fd_init>> if (tap_probe_vnet_hdr_len(s->fd, s->host_vnet_hdr_len)) {
++     *   - net/tap.c|436| <<net_tap_fd_init>> tap_fd_set_vnet_hdr_len(s->fd, s->host_vnet_hdr_len);
++     */
+     unsigned host_vnet_hdr_len;
+     Notifier exit;
+ } TAPState;
+@@ -408,6 +427,11 @@ static NetClientInfo net_tap_info = {
+     .set_steering_ebpf = tap_set_steering_ebpf,
+ };
+ 
++/*
++ * called by;
++ *   - net/tap.c|675| <<net_init_bridge>> s = net_tap_fd_init(peer, "bridge", name, fd, vnet_hdr);
++ *   - net/tap.c|726| <<net_init_tap_one>> TAPState *s = net_tap_fd_init(peer, model, name, fd, vnet_hdr);
++ */
+ static TAPState *net_tap_fd_init(NetClientState *peer,
+                                  const char *model,
+                                  const char *name,
+@@ -697,6 +721,13 @@ static int net_tap_init(const NetdevTapOptions *tap, int *vnet_hdr,
+ 
+ #define MAX_TAP_QUEUES 1024
+ 
++/*
++ * called by:
++ *   - net/tap.c|886| <<net_init_tap>> net_init_tap_one(tap, peer, "tap", name, NULL, script, downscript, vhostfdname, vnet_hdr, fd, &err);
++ *   - net/tap.c|949| <<net_init_tap>> net_init_tap_one(tap, peer, "tap", name, ifname, script, downscript, tap->vhostfds ? vhost_fds[i] : NULL, vnet_hdr, fd, &err);
++ *   - net/tap.c|995| <<net_init_tap>> net_init_tap_one(tap, peer, "bridge", name, ifname, script, downscript, vhostfdname, vnet_hdr, fd, &err);
++ *   - net/tap.c|1040| <<net_init_tap>> net_init_tap_one(tap, peer, "tap", name, ifname, i >= 1 ? "no" : script, i >= 1 ? "no" : downscript, vhostfdname, vnet_hdr, fd, &err);
++ */
+ static void net_init_tap_one(const NetdevTapOptions *tap, NetClientState *peer,
+                              const char *model, const char *name,
+                              const char *ifname, const char *script,
 diff --git a/system/cpus.c b/system/cpus.c
 index 68d161d96..c3ed8ede1 100644
 --- a/system/cpus.c
