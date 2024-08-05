@@ -1,0 +1,2158 @@
+From 8144acf7424c98029a07dfc25d36cef6552a1565 Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Mon, 5 Aug 2024 11:24:26 -0700
+Subject: [PATCH 1/1] linux-v6.10
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ arch/x86/include/asm/kvm_host.h | 140 +++++++
+ arch/x86/include/uapi/asm/kvm.h |   6 +
+ arch/x86/kvm/irq.c              |  11 +
+ arch/x86/kvm/irq_comm.c         |  18 +
+ arch/x86/kvm/lapic.c            | 672 ++++++++++++++++++++++++++++++++
+ arch/x86/kvm/lapic.h            | 124 ++++++
+ arch/x86/kvm/vmx/posted_intr.c  | 140 +++++++
+ arch/x86/kvm/vmx/vmx.c          |  22 ++
+ arch/x86/kvm/vmx/vmx.h          |  23 ++
+ arch/x86/kvm/x86.c              | 141 +++++++
+ virt/kvm/irqchip.c              |   3 +
+ 11 files changed, 1300 insertions(+)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index f8ca74e76..0c66f00f2 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -108,6 +108,18 @@
+ #define KVM_REQ_HV_STIMER		KVM_ARCH_REQ(22)
+ #define KVM_REQ_LOAD_EOI_EXITMAP	KVM_ARCH_REQ(23)
+ #define KVM_REQ_GET_NESTED_STATE_PAGES	KVM_ARCH_REQ(24)
++/*
++ * 在以下使用KVM_REQ_APICV_UPDATE:
++ *   - arch/x86/kvm/lapic.c|3138| <<kvm_lapic_set_base>> kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
++ *   - arch/x86/kvm/lapic.c|3452| <<kvm_create_lapic>> kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
++ *   - arch/x86/kvm/svm/nested.c|830| <<enter_svm_guest_mode>> kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
++ *   - arch/x86/kvm/svm/nested.c|1245| <<svm_leave_nested>> kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
++ *   - arch/x86/kvm/vmx/nested.c|4924| <<nested_vmx_vmexit>> kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
++ *   - arch/x86/kvm/x86.c|10778| <<__kvm_set_or_clear_apicv_inhibit>> kvm_make_all_cpus_request(kvm, KVM_REQ_APICV_UPDATE);
++ *   - arch/x86/kvm/x86.c|11018| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_APICV_UPDATE, vcpu)) kvm_vcpu_update_apicv(vcpu);
++ *
++ * 处理的函数是kvm_vcpu_update_apicv(vcpu);
++ */
+ #define KVM_REQ_APICV_UPDATE \
+ 	KVM_ARCH_REQ_FLAGS(25, KVM_REQUEST_WAIT | KVM_REQUEST_NO_WAKEUP)
+ #define KVM_REQ_TLB_FLUSH_CURRENT	KVM_ARCH_REQ(26)
+@@ -763,6 +775,22 @@ struct kvm_vcpu_arch {
+ 	u32 pkru;
+ 	u32 hflags;
+ 	u64 efer;
++	/*
++	 * 在以下修改kvm_vcpu_arch->apic_base:
++	 *   - arch/x86/kvm/lapic.c|2974| <<kvm_lapic_set_base>> vcpu->arch.apic_base = value;
++	 *   - arch/x86/kvm/lapic.c|3289| <<kvm_create_lapic>> vcpu->arch.apic_base = MSR_IA32_APICBASE_ENABLE;
++	 * 在以下使用kvm_vcpu_arch->apic_base:
++	 *   - arch/x86/kvm/cpuid.c|286| <<__kvm_update_cpuid_runtime>> vcpu->arch.apic_base & MSR_IA32_APICBASE_ENABLE);
++	 *   - arch/x86/kvm/lapic.c|2916| <<kvm_free_lapic>> if (!(vcpu->arch.apic_base & MSR_IA32_APICBASE_ENABLE))
++	 *   - arch/x86/kvm/lapic.c|2971| <<kvm_lapic_set_base>> u64 old_value = vcpu->arch.apic_base;
++	 *   - arch/x86/kvm/lapic.c|3007| <<kvm_lapic_set_base>> apic->base_address = apic->vcpu->arch.apic_base &
++	 *   - arch/x86/kvm/lapic.c|3448| <<kvm_apic_set_state>> kvm_lapic_set_base(vcpu, vcpu->arch.apic_base);
++	 *   - arch/x86/kvm/lapic.h|225| <<kvm_apic_hw_enabled>> return apic->vcpu->arch.apic_base & MSR_IA32_APICBASE_ENABLE;
++	 *   - arch/x86/kvm/lapic.h|276| <<apic_x2apic_mode>> return apic->vcpu->arch.apic_base & X2APIC_ENABLE;
++	 *   - arch/x86/kvm/vmx/nested.c|912| <<nested_vmx_msr_check_common>> if (CC(vcpu->arch.apic_base & X2APIC_ENABLE && e->index >> 8 == 0x8))
++	 *   - arch/x86/kvm/x86.c|470| <<kvm_get_apic_base>> return vcpu->arch.apic_base;
++	 *   - arch/x86/kvm/x86.c|12644| <<kvm_vcpu_is_bsp>> return (vcpu->arch.apic_base & MSR_IA32_APICBASE_BSP) != 0;
++	 */
+ 	u64 apic_base;
+ 	struct kvm_lapic *apic;    /* kernel irqchip context */
+ 	bool load_eoi_exitmap_pending;
+@@ -1080,12 +1108,56 @@ enum kvm_apic_logical_mode {
+ 
+ struct kvm_apic_map {
+ 	struct rcu_head rcu;
++	/*
++	 * 在以下设置kvm_apic_map->logical_mode:
++	 *   - arch/x86/kvm/lapic.c|393| <<kvm_recalculate_logical_map>> new->logical_mode = logical_mode;
++	 *   - arch/x86/kvm/lapic.c|395| <<kvm_recalculate_logical_map>> new->logical_mode = KVM_APIC_MODE_MAP_DISABLED;
++	 *   - arch/x86/kvm/lapic.c|413| <<kvm_recalculate_logical_map>> new->logical_mode = KVM_APIC_MODE_MAP_DISABLED;
++	 *   - arch/x86/kvm/lapic.c|422| <<kvm_recalculate_logical_map>> new->logical_mode = KVM_APIC_MODE_MAP_DISABLED;
++	 *   - arch/x86/kvm/lapic.c|520| <<kvm_recalculate_apic_map>> new->logical_mode = KVM_APIC_MODE_SW_DISABLED;
++
++	 * 在以下使用kvm_apic_map->logical_mode:
++	 *   - arch/x86/kvm/lapic.c|230| <<kvm_apic_map_get_logical_dest>> switch (map->logical_mode) {
++	 *   - arch/x86/kvm/lapic.c|368| <<kvm_recalculate_logical_map>> if (new->logical_mode == KVM_APIC_MODE_MAP_DISABLED)
++	 *   - arch/x86/kvm/lapic.c|392| <<kvm_recalculate_logical_map>> if (new->logical_mode == KVM_APIC_MODE_SW_DISABLED) {
++	 *   - arch/x86/kvm/lapic.c|394| <<kvm_recalculate_logical_map>> } else if (new->logical_mode != logical_mode) {
++	 *   - arch/x86/kvm/lapic.c|570| <<kvm_recalculate_apic_map>> if (!new || new->logical_mode == KVM_APIC_MODE_MAP_DISABLED)
++	 *   - arch/x86/kvm/lapic.c|1252| <<kvm_apic_is_broadcast_dest>> if ((irq->dest_id == APIC_BROADCAST && map->logical_mode != KVM_APIC_MODE_X2APIC))
++	 */
+ 	enum kvm_apic_logical_mode logical_mode;
++	/*
++	 * 在以下设置kvm_apic_map->max_apic_id:
++	 *   - arch/x86/kvm/lapic.c|619| <<kvm_recalculate_apic_map>> new->max_apic_id = max_id;
++	 * 在以下使用kvm_apic_map->max_apic_id:
++	 *   - arch/x86/kvm/lapic.c|333| <<kvm_apic_map_get_logical_dest>> u32 max_apic_id = map->max_apic_id;
++	 *   - arch/x86/kvm/lapic.c|338| <<kvm_apic_map_get_logical_dest>> offset = array_index_nospec(offset, map->max_apic_id + 1);
++	 *   - arch/x86/kvm/lapic.c|390| <<kvm_recalculate_phys_map>> if (WARN_ON_ONCE(xapic_id > new->max_apic_id))
++	 *   - arch/x86/kvm/lapic.c|399| <<kvm_recalculate_phys_map>> if (x2apic_id > new->max_apic_id)
++	 *   - arch/x86/kvm/lapic.c|1090| <<__pv_send_ipi>> if (min > map->max_apic_id)
++	 *   - arch/x86/kvm/lapic.c|1094| <<__pv_send_ipi>> min((u32)BITS_PER_LONG, (map->max_apic_id - min + 1))) {
++	 *   - arch/x86/kvm/lapic.c|1478| <<kvm_apic_map_get_dest_lapic>> if (irq->dest_id > map->max_apic_id) {
++	 *   - arch/x86/kvm/lapic.c|1481| <<kvm_apic_map_get_dest_lapic>> u32 dest_id = array_index_nospec(irq->dest_id, map->max_apic_id + 1);
++	 *   - arch/x86/kvm/x86.c|10082| <<kvm_sched_yield>> if (likely(map) && dest_id <= map->max_apic_id && map->phys_map[dest_id])
++	 */
+ 	u32 max_apic_id;
+ 	union {
+ 		struct kvm_lapic *xapic_flat_map[8];
+ 		struct kvm_lapic *xapic_cluster_map[16][4];
+ 	};
++	/*
++	 * 在以下使用kvm_apic_map->(*phys_map[]):
++	 *   - arch/x86/kvm/lapic.c|200| <<kvm_apic_map_get_logical_dest>> *cluster = &map->phys_map[offset];
++	 *   - arch/x86/kvm/lapic.c|283| <<kvm_recalculate_phys_map>> new->phys_map[x2apic_id] = apic;
++	 *   - arch/x86/kvm/lapic.c|285| <<kvm_recalculate_phys_map>> if (!apic_x2apic_mode(apic) && !new->phys_map[xapic_id])
++	 *   - arch/x86/kvm/lapic.c|286| <<kvm_recalculate_phys_map>> new->phys_map[xapic_id] = apic;
++	 *   - arch/x86/kvm/lapic.c|298| <<kvm_recalculate_phys_map>> if (new->phys_map[physical_id])
++	 *   - arch/x86/kvm/lapic.c|301| <<kvm_recalculate_phys_map>> new->phys_map[physical_id] = apic;
++	 *   - arch/x86/kvm/lapic.c|856| <<__pv_send_ipi>> if (map->phys_map[min + i]) {
++	 *   - arch/x86/kvm/lapic.c|857| <<__pv_send_ipi>> vcpu = map->phys_map[min + i]->vcpu;
++	 *   - arch/x86/kvm/lapic.c|1177| <<kvm_apic_map_get_dest_lapic>> *dst = &map->phys_map[dest_id];
++	 *   - arch/x86/kvm/x86.c|10043| <<kvm_sched_yield>> if (likely(map) && dest_id <= map->max_apic_id && map->phys_map[dest_id])
++	 *   - arch/x86/kvm/x86.c|10044| <<kvm_sched_yield>> target = map->phys_map[dest_id]->vcpu;
++	 */
+ 	struct kvm_lapic *phys_map[];
+ };
+ 
+@@ -1327,7 +1399,31 @@ struct kvm_arch {
+ 	struct kvm_pit *vpit;
+ 	atomic_t vapics_in_nmi_mode;
+ 	struct mutex apic_map_lock;
++	/*
++	 * 在以下使用kvm_arch->apic_map(x86):
++	 *   - arch/x86/kvm/lapic.c|490| <<kvm_recalculate_apic_map>> old = rcu_dereference_protected(kvm->arch.apic_map, lockdep_is_held(&kvm->arch.apic_map_lock));
++	 *   - arch/x86/kvm/lapic.c|492| <<kvm_recalculate_apic_map>> rcu_assign_pointer(kvm->arch.apic_map, new);
++	 *   - arch/x86/kvm/lapic.c|891| <<kvm_pv_send_ipi>> map = rcu_dereference(kvm->arch.apic_map);
++	 *   - arch/x86/kvm/lapic.c|1256| <<kvm_irq_delivery_to_apic_fast>> map = rcu_dereference(kvm->arch.apic_map);
++	 *   - arch/x86/kvm/lapic.c|1298| <<kvm_intr_is_single_vcpu_fast>> map = rcu_dereference(kvm->arch.apic_map);
++	 *   - arch/x86/kvm/lapic.c|1433| <<kvm_bitmap_or_dest_vcpus>> map = rcu_dereference(kvm->arch.apic_map);
++	 *   - arch/x86/kvm/x86.c|10041| <<kvm_sched_yield>> map = rcu_dereference(vcpu->kvm->arch.apic_map);
++	 *   - arch/x86/kvm/x86.c|12779| <<kvm_arch_destroy_vm>> kvfree(rcu_dereference_check(kvm->arch.apic_map, 1));
++	 */
+ 	struct kvm_apic_map __rcu *apic_map;
++	/*
++	 * 在以下使用kvm_arch->apic_map_dirty(x86):
++	 *   - arch/x86/kvm/lapic.c|397| <<kvm_recalculate_apic_map>> if (atomic_read_acquire(&kvm->arch.apic_map_dirty) == CLEAN)
++	 *   - arch/x86/kvm/lapic.c|413| <<kvm_recalculate_apic_map>> if (atomic_cmpxchg_acquire(&kvm->arch.apic_map_dirty, DIRTY, UPDATE_IN_PROGRESS) == CLEAN) {
++	 *   - arch/x86/kvm/lapic.c|489| <<kvm_recalculate_apic_map>> atomic_cmpxchg_release(&kvm->arch.apic_map_dirty, UPDATE_IN_PROGRESS, CLEAN);
++	 *   - arch/x86/kvm/lapic.c|512| <<apic_set_spiv>> atomic_set_release(&apic->vcpu->kvm->arch.apic_map_dirty, DIRTY);
++	 *   - arch/x86/kvm/lapic.c|525| <<kvm_apic_set_xapic_id>> atomic_set_release(&apic->vcpu->kvm->arch.apic_map_dirty, DIRTY);
++	 *   - arch/x86/kvm/lapic.c|531| <<kvm_apic_set_ldr>> atomic_set_release(&apic->vcpu->kvm->arch.apic_map_dirty, DIRTY);
++	 *   - arch/x86/kvm/lapic.c|537| <<kvm_apic_set_dfr>> atomic_set_release(&apic->vcpu->kvm->arch.apic_map_dirty, DIRTY);
++	 *   - arch/x86/kvm/lapic.c|548| <<kvm_apic_set_x2apic_id>> atomic_set_release(&apic->vcpu->kvm->arch.apic_map_dirty, DIRTY);
++	 *   - arch/x86/kvm/lapic.c|2565| <<kvm_lapic_set_base>> atomic_set_release(&apic->vcpu->kvm->arch.apic_map_dirty, DIRTY);
++	 *   - arch/x86/kvm/lapic.c|3033| <<kvm_apic_set_state>> atomic_set_release(&apic->vcpu->kvm->arch.apic_map_dirty, DIRTY);
++	 */
+ 	atomic_t apic_map_dirty;
+ 
+ 	bool apic_access_memslot_enabled;
+@@ -1335,6 +1431,15 @@ struct kvm_arch {
+ 
+ 	/* Protects apicv_inhibit_reasons */
+ 	struct rw_semaphore apicv_update_lock;
++	/*
++	 * 在以下使用kvm_arch->apicv_inhibit_reasons(x86):
++	 *   - arch/x86/kvm/x86.c|9996| <<kvm_apicv_activated>> return (READ_ONCE(kvm->arch.apicv_inhibit_reasons) == 0);
++	 *   - arch/x86/kvm/x86.c|10002| <<kvm_vcpu_apicv_activated>> ulong vm_reasons = READ_ONCE(vcpu->kvm->arch.apicv_inhibit_reasons);
++	 *   - arch/x86/kvm/x86.c|10025| <<kvm_apicv_init>> set_or_clear_apicv_inhibit(&kvm->arch.apicv_inhibit_reasons, reason, true);
++	 *   - arch/x86/kvm/x86.c|10679| <<__kvm_set_or_clear_apicv_inhibit>> old = new = kvm->arch.apicv_inhibit_reasons;
++	 *   - arch/x86/kvm/x86.c|10697| <<__kvm_set_or_clear_apicv_inhibit>> kvm->arch.apicv_inhibit_reasons = new;
++	 *   - arch/x86/kvm/x86.c|10706| <<__kvm_set_or_clear_apicv_inhibit>> kvm->arch.apicv_inhibit_reasons = new;
++	 */
+ 	unsigned long apicv_inhibit_reasons;
+ 
+ 	gpa_t wall_clock;
+@@ -1396,7 +1501,22 @@ struct kvm_arch {
+ 
+ 	bool disabled_lapic_found;
+ 
++	/*
++	 * 在以下使用kvm_arch->x2apic_format:
++	 *   - arch/x86/kvm/irq_comm.c|111| <<kvm_set_msi_irq>> trace_kvm_msi_set_irq(msg.address_lo | (kvm->arch.x2apic_format ?
++	 *   - arch/x86/kvm/irq_comm.c|114| <<kvm_set_msi_irq>> irq->dest_id = x86_msi_msg_get_destid(&msg, kvm->arch.x2apic_format);
++	 *   - arch/x86/kvm/irq_comm.c|128| <<kvm_msi_route_invalid>> return kvm->arch.x2apic_format && (e->msi.address_hi & 0xff);
++	 *   - arch/x86/kvm/lapic.c|328| <<kvm_recalculate_phys_map>> if (vcpu->kvm->arch.x2apic_format) {
++	 *   - arch/x86/kvm/lapic.c|3095| <<kvm_apic_state_fixup>> if (vcpu->kvm->arch.x2apic_format) {
++	 *   - arch/x86/kvm/x86.c|6565| <<kvm_vm_ioctl_enable_cap>> if (cap->args[0] & KVM_X2APIC_API_USE_32BIT_IDS) kvm->arch.x2apic_format = true;
++	 */
+ 	bool x2apic_format;
++	/*
++	 * 在以下使用kvm_arch->x2apic_broadcast_quirk_disabled:
++	 *   - arch/x86/kvm/lapic.c|1341| <<kvm_apic_mda>> if (!vcpu->kvm->arch.x2apic_broadcast_quirk_disabled &&
++	 *   - arch/x86/kvm/lapic.c|1421| <<kvm_apic_is_broadcast_dest>> if (kvm->arch.x2apic_broadcast_quirk_disabled) {
++	 *   - arch/x86/kvm/x86.c|6567| <<kvm_vm_ioctl_enable_cap(KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK)>> kvm->arch.x2apic_broadcast_quirk_disabled = true;
++	 */
+ 	bool x2apic_broadcast_quirk_disabled;
+ 
+ 	bool guest_can_read_msr_platform_info;
+@@ -2134,12 +2254,32 @@ void __kvm_set_or_clear_apicv_inhibit(struct kvm *kvm,
+ void kvm_set_or_clear_apicv_inhibit(struct kvm *kvm,
+ 				    enum kvm_apicv_inhibit reason, bool set);
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/i8254.c|308| <<kvm_pit_set_reinject>> kvm_set_apicv_inhibit(kvm, APICV_INHIBIT_REASON_PIT_REINJ);
++ *   - arch/x86/kvm/lapic.c|476| <<kvm_recalculate_apic_map>> kvm_set_apicv_inhibit(kvm, APICV_INHIBIT_REASON_PHYSICAL_ID_ALIASED);
++ *   - arch/x86/kvm/lapic.c|481| <<kvm_recalculate_apic_map>> kvm_set_apicv_inhibit(kvm, APICV_INHIBIT_REASON_LOGICAL_ID_ALIASED);
++ *   - arch/x86/kvm/lapic.c|486| <<kvm_recalculate_apic_map>> kvm_set_apicv_inhibit(kvm, APICV_INHIBIT_REASON_APIC_ID_MODIFIED);
++ *   - arch/x86/kvm/lapic.c|2600| <<kvm_lapic_set_base>> kvm_set_apicv_inhibit(apic->vcpu->kvm, APICV_INHIBIT_REASON_APIC_BASE_MODIFIED);
++ *   - arch/x86/kvm/svm/sev.c|304| <<__sev_guest_init>> kvm_set_apicv_inhibit(kvm, APICV_INHIBIT_REASON_SEV);
++ *   - arch/x86/kvm/svm/svm.c|3862| <<svm_enable_irq_window>> kvm_set_apicv_inhibit(vcpu->kvm, APICV_INHIBIT_REASON_IRQWIN);
++ */
+ static inline void kvm_set_apicv_inhibit(struct kvm *kvm,
+ 					 enum kvm_apicv_inhibit reason)
+ {
+ 	kvm_set_or_clear_apicv_inhibit(kvm, reason, true);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/i8254.c|314| <<kvm_pit_set_reinject>> kvm_clear_apicv_inhibit(kvm, APICV_INHIBIT_REASON_PIT_REINJ);
++ *   - arch/x86/kvm/lapic.c|478| <<kvm_recalculate_apic_map>> kvm_clear_apicv_inhibit(kvm, APICV_INHIBIT_REASON_PHYSICAL_ID_ALIASED);
++ *   - arch/x86/kvm/lapic.c|483| <<kvm_recalculate_apic_map>> kvm_clear_apicv_inhibit(kvm, APICV_INHIBIT_REASON_LOGICAL_ID_ALIASED);
++ *   - arch/x86/kvm/lapic.c|488| <<kvm_recalculate_apic_map>> kvm_clear_apicv_inhibit(kvm, APICV_INHIBIT_REASON_APIC_ID_MODIFIED);
++ *   - arch/x86/kvm/svm/svm.c|3217| <<interrupt_window_interception>> kvm_clear_apicv_inhibit(vcpu->kvm, APICV_INHIBIT_REASON_IRQWIN);
++ *   - arch/x86/kvm/x86.c|6553| <<kvm_vm_ioctl_enable_cap>> kvm_clear_apicv_inhibit(kvm, APICV_INHIBIT_REASON_ABSENT);
++ *   - arch/x86/kvm/x86.c|7075| <<kvm_arch_vm_ioctl>> kvm_clear_apicv_inhibit(kvm, APICV_INHIBIT_REASON_ABSENT);
++ */
+ static inline void kvm_clear_apicv_inhibit(struct kvm *kvm,
+ 					   enum kvm_apicv_inhibit reason)
+ {
+diff --git a/arch/x86/include/uapi/asm/kvm.h b/arch/x86/include/uapi/asm/kvm.h
+index 9fae1b73b..d8acaa7c3 100644
+--- a/arch/x86/include/uapi/asm/kvm.h
++++ b/arch/x86/include/uapi/asm/kvm.h
+@@ -824,6 +824,12 @@ struct kvm_sev_receive_update_data {
+ 	__u32 pad2;
+ };
+ 
++/*
++ * 在以下使用KVM_X2APIC_API_USE_32BIT_IDS:
++ *   - arch/x86/kvm/x86.c|125| <<KVM_X2APIC_API_VALID_FLAGS>> #define KVM_X2APIC_API_VALID_FLAGS (KVM_X2APIC_API_USE_32BIT_IDS | \
++ *   - arch/x86/kvm/x86.c|6564| <<kvm_vm_ioctl_enable_cap>> if (cap->args[0] & KVM_X2APIC_API_USE_32BIT_IDS)
++ *   - tools/testing/selftests/kvm/x86_64/xapic_state_test.c|169| <<test_apic_id>> vm_enable_cap(vm, KVM_CAP_X2APIC_API, KVM_X2APIC_API_USE_32BIT_IDS)
++ */
+ #define KVM_X2APIC_API_USE_32BIT_IDS            (1ULL << 0)
+ #define KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK  (1ULL << 1)
+ 
+diff --git a/arch/x86/kvm/irq.c b/arch/x86/kvm/irq.c
+index ad9ca8a60..2870f1964 100644
+--- a/arch/x86/kvm/irq.c
++++ b/arch/x86/kvm/irq.c
+@@ -79,6 +79,12 @@ int kvm_cpu_has_extint(struct kvm_vcpu *v)
+  * interrupt from apic will handled by hardware,
+  * we don't need to check it here.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/svm/svm.c|2431| <<svm_set_gif>> if (svm->vcpu.arch.smi_pending || svm->vcpu.arch.nmi_pending || kvm_cpu_has_injectable_intr(&svm->vcpu) || kvm_apic_has_pending_init_or_sipi(&svm->vcpu))
++ *   - arch/x86/kvm/x86.c|10543| <<kvm_check_and_inject_events>> if (kvm_cpu_has_injectable_intr(vcpu)) {
++ *   - arch/x86/kvm/x86.c|10561| <<kvm_check_and_inject_events>> if (kvm_cpu_has_injectable_intr(vcpu))
++ */
+ int kvm_cpu_has_injectable_intr(struct kvm_vcpu *v)
+ {
+ 	if (kvm_cpu_has_extint(v))
+@@ -135,6 +141,11 @@ static int kvm_cpu_get_extint(struct kvm_vcpu *v)
+ /*
+  * Read pending interrupt vector and intack.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/vmx/nested.c|4937| <<nested_vmx_vmexit>> int irq = kvm_cpu_get_interrupt(vcpu);
++ *   - arch/x86/kvm/x86.c|10544| <<kvm_check_and_inject_events>> int irq = kvm_cpu_get_interrupt(vcpu);
++ */
+ int kvm_cpu_get_interrupt(struct kvm_vcpu *v)
+ {
+ 	int vector = kvm_cpu_get_extint(v);
+diff --git a/arch/x86/kvm/irq_comm.c b/arch/x86/kvm/irq_comm.c
+index 68f3f6c26..a67cf688f 100644
+--- a/arch/x86/kvm/irq_comm.c
++++ b/arch/x86/kvm/irq_comm.c
+@@ -108,6 +108,15 @@ void kvm_set_msi_irq(struct kvm *kvm, struct kvm_kernel_irq_routing_entry *e,
+ 			       .address_hi = e->msi.address_hi,
+ 			       .data = e->msi.data };
+ 
++	/*
++	 * 在以下使用kvm_arch->x2apic_format:
++	 *   - arch/x86/kvm/irq_comm.c|111| <<kvm_set_msi_irq>> trace_kvm_msi_set_irq(msg.address_lo | (kvm->arch.x2apic_format ?
++	 *   - arch/x86/kvm/irq_comm.c|114| <<kvm_set_msi_irq>> irq->dest_id = x86_msi_msg_get_destid(&msg, kvm->arch.x2apic_format);
++	 *   - arch/x86/kvm/irq_comm.c|128| <<kvm_msi_route_invalid>> return kvm->arch.x2apic_format && (e->msi.address_hi & 0xff);
++	 *   - arch/x86/kvm/lapic.c|328| <<kvm_recalculate_phys_map>> if (vcpu->kvm->arch.x2apic_format) {
++	 *   - arch/x86/kvm/lapic.c|3095| <<kvm_apic_state_fixup>> if (vcpu->kvm->arch.x2apic_format) {
++	 *   - arch/x86/kvm/x86.c|6565| <<kvm_vm_ioctl_enable_cap>> if (cap->args[0] & KVM_X2APIC_API_USE_32BIT_IDS) kvm->arch.x2apic_format = true;
++	 */
+ 	trace_kvm_msi_set_irq(msg.address_lo | (kvm->arch.x2apic_format ?
+ 			      (u64)msg.address_hi << 32 : 0), msg.data);
+ 
+@@ -125,6 +134,15 @@ EXPORT_SYMBOL_GPL(kvm_set_msi_irq);
+ static inline bool kvm_msi_route_invalid(struct kvm *kvm,
+ 		struct kvm_kernel_irq_routing_entry *e)
+ {
++	/*
++	 * 在以下使用kvm_arch->x2apic_format:
++	 *   - arch/x86/kvm/irq_comm.c|111| <<kvm_set_msi_irq>> trace_kvm_msi_set_irq(msg.address_lo | (kvm->arch.x2apic_format ?
++	 *   - arch/x86/kvm/irq_comm.c|114| <<kvm_set_msi_irq>> irq->dest_id = x86_msi_msg_get_destid(&msg, kvm->arch.x2apic_format);
++	 *   - arch/x86/kvm/irq_comm.c|128| <<kvm_msi_route_invalid>> return kvm->arch.x2apic_format && (e->msi.address_hi & 0xff);
++	 *   - arch/x86/kvm/lapic.c|328| <<kvm_recalculate_phys_map>> if (vcpu->kvm->arch.x2apic_format) {
++	 *   - arch/x86/kvm/lapic.c|3095| <<kvm_apic_state_fixup>> if (vcpu->kvm->arch.x2apic_format) {
++	 *   - arch/x86/kvm/x86.c|6565| <<kvm_vm_ioctl_enable_cap>> if (cap->args[0] & KVM_X2APIC_API_USE_32BIT_IDS) kvm->arch.x2apic_format = true;
++	 */
+ 	return kvm->arch.x2apic_format && (e->msi.address_hi & 0xff);
+ }
+ 
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index acd7d4810..fe3e59e6e 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -46,17 +46,95 @@
+ #include "hyperv.h"
+ #include "smm.h"
+ 
++/*
++ * enable_apicv=N, vfio通过vfio_msihandler()唤醒irqfd_wakeup()插入中断.
++ */
++
++/*
++ * The x2APIC architecture extends the xAPIC architecture in a backward
++ * compatible manner and provides forward extendability for future Intel
++ * platform innovations. Specifically, the x2APIC architecture does the
++ * following:
++ *
++ * - Retains all key elements of compatibility to the xAPIC architecture:
++ *   1. delivery modes,
++ *   2. interrupt and processor priorities,
++ *   3. interrupt sources,
++ *   4. interrupt destination types;
++ * - Provides extensions to scal processor addressability for both the logical
++ *   and physical destination modes;
++ * - Adds new features to enhance performance of interrupt delivery;
++ * - Reduces complexity of logical destination mode interrupt delivery on link
++ *   based platform architectures/
++ * - Use MSR programming interface to access APIC registers when operating in
++ *   XAPIC mode.
++ *
++ * TPR (Task Priority Register)
++ * 任务优先级寄存器,确定当前CPU能够处理什么优先级别的中断,CPU只处理比TPR中级别更高的中断.
++ * 比它低的中断暂时屏蔽掉,也就是在IRR中继续等到.
++ *
++ * 另外 优先级别=vector/16, vector为每个中断对应的中断向量号.
++ *
++ * PPR (Processor Priority Register)
++ * 处理器优先级寄存器，表示当前正处理的中断的优先级,以此来决定处于IRR中的中断是否发送给CPU.
++ * 处于IRR中的中断只有优先级高于处理器优先级才会被发送给处理器. PPR的值为ISR中正服务的最高
++ * 优先级中断和TPR两者之间选取优先级较大的,所以TPR就是靠间接控制PPR来实现暂时屏蔽比TPR优先
++ * 级小的中断的.
++ */
++/*
++ * pv-eoi (减少vmexit的数量)
++ *
++ * x86 PC体系架构中的中断控制器,早先是8259A,现在更普遍使用的是APIC,他们处理中断的流程遵循如下流程:
++ *
++ * 1. 外部设备产生一个中断,如果该中断没有被屏蔽掉,中断控制器将IRR寄存器中相应的位置1,表示收到中断,但是还未提交给CPU处理.
++ * 2. 中断控制器将该中断提交给CPU,CPU收到中断请求后,会应答中断控制器.
++ * 3. 中断控制器收到CPU的中断应答后,将IRR寄存器中相应的位清0,并将ISR寄存器相应的位置1,表示CPU正在处理该中断.
++ * 4. 当该中断的处理程序结束以前,需要将中断控制器的EOI寄存器对应的位置1,表示CPU完成了对该中断的处理.
++ * 5. 中断控制器收到EOI后,ISR寄存器中相应的位清0，允许下次中断.
++ * 6. 在虚拟化场景中,该流程至少会导致两次VM Exit: 第一次是VMM截获到设备中断的时候,通知客户机退出,将这个中断注入到客户机中;
++ *    另外一次是当客户机操作系统处理完该中断后,写中断控制器的EOI寄存器,这是个MMIO操作,也会导致客户机退出.
++ *    在一个外部IO比较频繁的场景中,外部中断会导致大量的VM Exit,影响客户机的整体性能.
++ *
++ * PV-EOI其实就是通过半虚拟化的办法来优化上述的VM Exit影响,virtio也是使用这个思想来优化网络和磁盘;就EOI的优化来说,其思想本质上很简单:
++ *
++ * 1. 客户机和VMM协商,首先确定双方是否都能支持PV-EOI特性,如果成功,则进一步协商一块2 bytes的内存区间作为双方处理EOI的共享缓存;
++ * 2. 在VMM向客户机注入中断之前,会把缓存的最低位置1,表示客户机不需要通过写EOI寄存器;
++ * 3. 客户机在写EOI之前,如果发现该位被设置,则将该位清0;VMM轮询这个标志位,当检查到清0后,会更新模拟中断控制器中的EOI寄存器;
++ *    如果客户机发现该位未被设置,则继续使用MMIO或者MSR写EOI寄存器;
++ *
++ * 需要注意的是,为了保证客户机和VMM同时处理共享内存的性能和可靠性,目前KVM的PV-EOF方案采用了如下的优化措施:
++ *
++ * 1. VMM保障仅会在客户机VCPU的上下文中更改共享内存中的最低位,从而避免了客户机采用任何锁机制来与VMM进行同步;
++ * 2. 客户机必须使用原子的test_and_clear操作来更改共享内存中的最低位,这是因为VMM在任何时候都有可能设置或者清除该位;
++ */
++
++/*
++ * 在以下使用mod_64():
++ *   - arch/x86/kvm/lapic.c|1600| <<apic_get_tmcct>> ns = mod_64(ktime_to_ns(remaining), apic->lapic_timer.period);
++ */
+ #ifndef CONFIG_X86_64
+ #define mod_64(x, y) ((x) - (y) * div64_u64(x, y))
+ #else
+ #define mod_64(x, y) ((x) % (y))
+ #endif
+ 
++/*
++ * 在以下使用APIC_VERSION:
++ *   - arch/x86/kvm/lapic.c|629| <<kvm_apic_set_version>> v = APIC_VERSION | ((apic->nr_lvt_entries - 1) << 16);
++ */
+ /* 14 is the version for Xeon and Pentium 8.4.8*/
+ #define APIC_VERSION			0x14UL
++/*
++ * 在以下使用LAPIC_MMIO_LENGTH:
++ *   - arch/x86/kvm/lapic.c|1624| <<__apic_read>> if (offset >= LAPIC_MMIO_LENGTH) return 0;
++ *   - arch/x86/kvm/lapic.c|1739| <<apic_mmio_in_range>> return addr >= apic->base_address && addr < apic->base_address + LAPIC_MMIO_LENGTH;
++ */
+ #define LAPIC_MMIO_LENGTH		(1 << 12)
+ /* followed define is not in apicdef.h */
+ #define MAX_APIC_VECTOR			256
++/*
++ * 256 / 32 = 8
++ */
+ #define APIC_VECTORS_PER_REG		32
+ 
+ /*
+@@ -67,6 +145,10 @@
+  * the guest, i.e. so that the interrupt arrives in the guest with minimal
+  * latency relative to the deadline programmed by the guest.
+  */
++/*
++ * 在以下使用lapic_timer_advance:
++ *   - arch/x86/kvm/lapic.c|2897| <<kvm_create_lapic>> if (lapic_timer_advance)
++ */
+ static bool lapic_timer_advance __read_mostly = true;
+ module_param(lapic_timer_advance, bool, 0444);
+ 
+@@ -79,6 +161,12 @@ module_param(lapic_timer_advance, bool, 0444);
+ static int kvm_lapic_msr_read(struct kvm_lapic *apic, u32 reg, u64 *data);
+ static int kvm_lapic_msr_write(struct kvm_lapic *apic, u32 reg, u64 data);
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|89| <<kvm_lapic_set_reg>> __kvm_lapic_set_reg(apic->regs, reg_off, val);
++  3 arch/x86/kvm/lapic.c|3035| <<kvm_apic_state_fixup>> __kvm_lapic_set_reg(s->regs, APIC_ICR2, icr >> 32);
++  4 arch/x86/kvm/lapic.c|3050| <<kvm_apic_get_state>> __kvm_lapic_set_reg(s->regs, APIC_TMCCT,
++ */
+ static inline void __kvm_lapic_set_reg(char *regs, int reg_off, u32 val)
+ {
+ 	*((u32 *) (regs + reg_off)) = val;
+@@ -117,6 +205,13 @@ static inline int apic_test_vector(int vec, void *bitmap)
+ 	return test_bit(VEC_POS(vec), (bitmap) + REG_POS(vec));
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/ioapic.c|122| <<__rtc_irq_eoi_tracking_restore_one>> new_val = kvm_apic_pending_eoi(vcpu, e->fields.vector);
++ *   - arch/x86/kvm/ioapic.c|194| <<ioapic_lazy_update_eoi>> kvm_apic_pending_eoi(vcpu, entry->fields.vector))
++ *   - arch/x86/kvm/ioapic.c|301| <<kvm_ioapic_scan_entry>> kvm_apic_pending_eoi(vcpu, e->fields.vector))
++ *   - arch/x86/kvm/irq_comm.c|437| <<kvm_scan_ioapic_routes>> kvm_apic_pending_eoi(vcpu, irq.vector)))
++ */
+ bool kvm_apic_pending_eoi(struct kvm_vcpu *vcpu, int vector)
+ {
+ 	struct kvm_lapic *apic = vcpu->arch.apic;
+@@ -138,7 +233,48 @@ static inline int __apic_test_and_clear_vector(int vec, void *bitmap)
+ __read_mostly DEFINE_STATIC_KEY_FALSE(kvm_has_noapic_vcpu);
+ EXPORT_SYMBOL_GPL(kvm_has_noapic_vcpu);
+ 
++/*
++ * apic_hw_disabled代表HW enabled APIC in APIC_BASE MSR
++ * 比如过去是return (apic)->vcpu->arch.apic_base & MSR_IA32_APICBASE_ENABLE;
++ *
++ * commit c5cc421ba3219b90f11d151bc55f1608c12830fa
++ * Author: Gleb Natapov <gleb@redhat.com>
++ * Date:   Sun Aug 5 15:58:30 2012 +0300
++ *
++ * KVM: use jump label to optimize checking for HW enabled APIC in APIC_BASE MSR
++ *
++ * Usually all APICs are HW enabled so the check can be optimized out.
++ *
++ * Signed-off-by: Gleb Natapov <gleb@redhat.com>
++ * Signed-off-by: Avi Kivity <avi@redhat.com>
++ */
+ __read_mostly DEFINE_STATIC_KEY_DEFERRED_FALSE(apic_hw_disabled, HZ);
++/*
++ * apic_sw_disabled代表SW enabled apic in spurious interrupt register,
++ * 比如过去是return apic_get_reg(apic, APIC_SPIV) & APIC_SPIV_APIC_ENABLED;
++ *
++ * commit f8c1ea103947038b7197bdd4c8451886a58af0c0
++ * Author: Gleb Natapov <gleb@redhat.com>
++ * Date:   Sun Aug 5 15:58:31 2012 +0300
++ *
++ * KVM: use jump label to optimize checking for SW enabled apic in spurious interrupt register
++ *
++ * Usually all APICs are SW enabled so the check can be optimized out.
++ *
++ * Signed-off-by: Gleb Natapov <gleb@redhat.com>
++ * Signed-off-by: Avi Kivity <avi@redhat.com>
++ *
++ * 在以下使用apic_sw_disabled:
++ *   - arch/x86/kvm/lapic.c|263| <<global>> __read_mostly DEFINE_STATIC_KEY_DEFERRED_FALSE(apic_sw_disabled, HZ);
++ *   - arch/x86/kvm/lapic.h|229| <<global>> extern struct static_key_false_deferred apic_sw_disabled;
++ *   - arch/x86/kvm/lapic.c|837| <<apic_set_spiv>> static_branch_slow_dec_deferred(&apic_sw_disabled);
++ *   - arch/x86/kvm/lapic.c|839| <<apic_set_spiv>> static_branch_inc(&apic_sw_disabled.key);
++ *   - arch/x86/kvm/lapic.c|2920| <<kvm_free_lapic>> static_branch_slow_dec_deferred(&apic_sw_disabled);
++ *   - arch/x86/kvm/lapic.c|3290| <<kvm_create_lapic>> static_branch_inc(&apic_sw_disabled.key);
++ *   - arch/x86/kvm/lapic.c|3779| <<kvm_lapic_exit>> static_key_deferred_flush(&apic_sw_disabled);
++ *   - arch/x86/kvm/lapic.c|3780| <<kvm_lapic_exit>> WARN_ON(static_branch_unlikely(&apic_sw_disabled.key));
++ *   - arch/x86/kvm/lapic.h|255| <<kvm_apic_sw_enabled>> if (static_branch_unlikely(&apic_sw_disabled.key))
++ */
+ __read_mostly DEFINE_STATIC_KEY_DEFERRED_FALSE(apic_sw_disabled, HZ);
+ 
+ static inline int apic_enabled(struct kvm_lapic *apic)
+@@ -176,13 +312,39 @@ static bool kvm_use_posted_timer_interrupt(struct kvm_vcpu *vcpu)
+ 	return kvm_can_post_timer_interrupt(vcpu) && vcpu->mode == IN_GUEST_MODE;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|389| <<kvm_recalculate_logical_map>> WARN_ON_ONCE(ldr != kvm_apic_calc_x2apic_ldr(kvm_x2apic_id(apic)));
++ *   - arch/x86/kvm/lapic.c|642| <<kvm_apic_set_x2apic_id>> u32 ldr = kvm_apic_calc_x2apic_ldr(id);
++ *   - arch/x86/kvm/lapic.c|3093| <<kvm_apic_state_fixup>> *ldr = kvm_apic_calc_x2apic_ldr(*id);
++ */
+ static inline u32 kvm_apic_calc_x2apic_ldr(u32 id)
+ {
+ 	return ((id >> 4) << 16) | (1 << (id & 0xf));
+ }
+ 
++/*
++ * 为了加速对于目标VCPU的查找,在kvm.arch.apic_map中保存了kvm_apic_map结构体.
++ * phys_map成员和logical_map成员记录了RTE的destination filed同VLAPIC结构体的
++ * 对应的关系,分别对应physical mode和logic mode.在发送中断的时候,如果有该map表,
++ * 且中断不是lowest priority和广播,则通过RTE的destination filed就可以直接找到
++ * 目标VCPU，进行快速的分发.否则需要遍历所有的VCPU,逐一的和RTE的destination
++ * field进行匹配.
++ *
++ * called by:
++ *   - arch/x86/kvm/lapic.c|393| <<kvm_recalculate_logical_map>> if (WARN_ON_ONCE(!kvm_apic_map_get_logical_dest(new, ldr, &cluster, &mask))) {
++ *   - arch/x86/kvm/lapic.c|1290| <<kvm_apic_map_get_dest_lapic>> if (!kvm_apic_map_get_logical_dest(map, irq->dest_id, dst, (u16 *)bitmap))
++ */
+ static inline bool kvm_apic_map_get_logical_dest(struct kvm_apic_map *map,
+ 		u32 dest_id, struct kvm_lapic ***cluster, u16 *mask) {
++	/*
++	 * 在以下设置kvm_apic_map->logical_mode:
++	 *   - arch/x86/kvm/lapic.c|393| <<kvm_recalculate_logical_map>> new->logical_mode = logical_mode;
++	 *   - arch/x86/kvm/lapic.c|395| <<kvm_recalculate_logical_map>> new->logical_mode = KVM_APIC_MODE_MAP_DISABLED;
++	 *   - arch/x86/kvm/lapic.c|413| <<kvm_recalculate_logical_map>> new->logical_mode = KVM_APIC_MODE_MAP_DISABLED;
++	 *   - arch/x86/kvm/lapic.c|422| <<kvm_recalculate_logical_map>> new->logical_mode = KVM_APIC_MODE_MAP_DISABLED;
++	 *   - arch/x86/kvm/lapic.c|520| <<kvm_recalculate_apic_map>> new->logical_mode = KVM_APIC_MODE_SW_DISABLED;
++	 */
+ 	switch (map->logical_mode) {
+ 	case KVM_APIC_MODE_SW_DISABLED:
+ 		/* Arbitrarily use the flat map so that @cluster isn't NULL. */
+@@ -228,15 +390,41 @@ static void kvm_apic_map_free(struct rcu_head *rcu)
+ 	kvfree(map);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|474| <<kvm_recalculate_apic_map>> r = kvm_recalculate_phys_map(new, vcpu, &xapic_id_mismatch);
++ *
++ * 初始化kvm_apic_map->phys_map[]
++ */
+ static int kvm_recalculate_phys_map(struct kvm_apic_map *new,
+ 				    struct kvm_vcpu *vcpu,
+ 				    bool *xapic_id_mismatch)
+ {
+ 	struct kvm_lapic *apic = vcpu->arch.apic;
++	/*
++	 * 代码: return apic->vcpu->vcpu_id;
++	 */
+ 	u32 x2apic_id = kvm_x2apic_id(apic);
++	/*
++	 * 代码: return kvm_lapic_get_reg(apic, APIC_ID) >> 24;
++	 */
+ 	u32 xapic_id = kvm_xapic_id(apic);
+ 	u32 physical_id;
+ 
++	/*
++	 * 在以下设置kvm_apic_map->max_apic_id:
++	 *   - arch/x86/kvm/lapic.c|619| <<kvm_recalculate_apic_map>> new->max_apic_id = max_id;
++	 * 在以下使用kvm_apic_map->max_apic_id:
++	 *   - arch/x86/kvm/lapic.c|333| <<kvm_apic_map_get_logical_dest>> u32 max_apic_id = map->max_apic_id;
++	 *   - arch/x86/kvm/lapic.c|338| <<kvm_apic_map_get_logical_dest>> offset = array_index_nospec(offset, map->max_apic_id + 1);
++	 *   - arch/x86/kvm/lapic.c|390| <<kvm_recalculate_phys_map>> if (WARN_ON_ONCE(xapic_id > new->max_apic_id))
++	 *   - arch/x86/kvm/lapic.c|399| <<kvm_recalculate_phys_map>> if (x2apic_id > new->max_apic_id)
++	 *   - arch/x86/kvm/lapic.c|1090| <<__pv_send_ipi>> if (min > map->max_apic_id)
++	 *   - arch/x86/kvm/lapic.c|1094| <<__pv_send_ipi>> min((u32)BITS_PER_LONG, (map->max_apic_id - min + 1))) {
++	 *   - arch/x86/kvm/lapic.c|1478| <<kvm_apic_map_get_dest_lapic>> if (irq->dest_id > map->max_apic_id) {
++	 *   - arch/x86/kvm/lapic.c|1481| <<kvm_apic_map_get_dest_lapic>> u32 dest_id = array_index_nospec(irq->dest_id, map->max_apic_id + 1);
++	 *   - arch/x86/kvm/x86.c|10082| <<kvm_sched_yield>> if (likely(map) && dest_id <= map->max_apic_id && map->phys_map[dest_id])
++	 */
+ 	/*
+ 	 * For simplicity, KVM always allocates enough space for all possible
+ 	 * xAPIC IDs.  Yell, but don't kill the VM, as KVM can continue on
+@@ -277,6 +465,15 @@ static int kvm_recalculate_phys_map(struct kvm_apic_map *new,
+ 	 * manually modified its xAPIC IDs, events targeting that ID are
+ 	 * supposed to be recognized by all vCPUs with said ID.
+ 	 */
++	/*
++	 * 在以下使用kvm_arch->x2apic_format:
++	 *   - arch/x86/kvm/irq_comm.c|111| <<kvm_set_msi_irq>> trace_kvm_msi_set_irq(msg.address_lo | (kvm->arch.x2apic_format ?
++	 *   - arch/x86/kvm/irq_comm.c|114| <<kvm_set_msi_irq>> irq->dest_id = x86_msi_msg_get_destid(&msg, kvm->arch.x2apic_format);
++	 *   - arch/x86/kvm/irq_comm.c|128| <<kvm_msi_route_invalid>> return kvm->arch.x2apic_format && (e->msi.address_hi & 0xff);
++	 *   - arch/x86/kvm/lapic.c|328| <<kvm_recalculate_phys_map>> if (vcpu->kvm->arch.x2apic_format) {
++	 *   - arch/x86/kvm/lapic.c|3095| <<kvm_apic_state_fixup>> if (vcpu->kvm->arch.x2apic_format) {
++	 *   - arch/x86/kvm/x86.c|6565| <<kvm_vm_ioctl_enable_cap>> if (cap->args[0] & KVM_X2APIC_API_USE_32BIT_IDS) kvm->arch.x2apic_format = true;
++	 */
+ 	if (vcpu->kvm->arch.x2apic_format) {
+ 		/* See also kvm_apic_match_physical_addr(). */
+ 		if (apic_x2apic_mode(apic) || x2apic_id > 0xff)
+@@ -285,6 +482,12 @@ static int kvm_recalculate_phys_map(struct kvm_apic_map *new,
+ 		if (!apic_x2apic_mode(apic) && !new->phys_map[xapic_id])
+ 			new->phys_map[xapic_id] = apic;
+ 	} else {
++		/*
++		 * 代码: return apic->vcpu->vcpu_id;
++		 * u32 x2apic_id = kvm_x2apic_id(apic);
++		 * 代码: return kvm_lapic_get_reg(apic, APIC_ID) >> 24;
++		 * u32 xapic_id = kvm_xapic_id(apic);
++		 */
+ 		/*
+ 		 * Disable the optimized map if the physical APIC ID is already
+ 		 * mapped, i.e. is aliased to multiple vCPUs.  The optimized
+@@ -304,28 +507,78 @@ static int kvm_recalculate_phys_map(struct kvm_apic_map *new,
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|486| <<kvm_recalculate_apic_map>> kvm_recalculate_logical_map(new, vcpu);
++ */
+ static void kvm_recalculate_logical_map(struct kvm_apic_map *new,
+ 					struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_lapic *apic = vcpu->arch.apic;
++	/*
++	 * enum kvm_apic_logical_mode {
++	 *     // All local APICs are software disabled.
++	 *     KVM_APIC_MODE_SW_DISABLED,
++	 *     // All software enabled local APICs in xAPIC cluster addressing mode.
++	 *     KVM_APIC_MODE_XAPIC_CLUSTER,
++	 *     // All software enabled local APICs in xAPIC flat addressing mode.
++	 *     KVM_APIC_MODE_XAPIC_FLAT,
++	 *     // All software enabled local APICs in x2APIC mode.
++	 *     KVM_APIC_MODE_X2APIC,
++	 *     //
++	 *     // Optimized map disabled, e.g. not all local APICs in the same logical
++	 *     // mode, same logical ID assigned to multiple APICs, etc.
++	 *     //
++	 *     KVM_APIC_MODE_MAP_DISABLED,
++	 * };
++	 */
+ 	enum kvm_apic_logical_mode logical_mode;
+ 	struct kvm_lapic **cluster;
+ 	u16 mask;
+ 	u32 ldr;
+ 
++	/*
++	 * 在以下设置kvm_apic_map->logical_mode:
++	 *   - arch/x86/kvm/lapic.c|393| <<kvm_recalculate_logical_map>> new->logical_mode = logical_mode;
++	 *   - arch/x86/kvm/lapic.c|395| <<kvm_recalculate_logical_map>> new->logical_mode = KVM_APIC_MODE_MAP_DISABLED;
++	 *   - arch/x86/kvm/lapic.c|413| <<kvm_recalculate_logical_map>> new->logical_mode = KVM_APIC_MODE_MAP_DISABLED;
++	 *   - arch/x86/kvm/lapic.c|422| <<kvm_recalculate_logical_map>> new->logical_mode = KVM_APIC_MODE_MAP_DISABLED;
++	 *   - arch/x86/kvm/lapic.c|520| <<kvm_recalculate_apic_map>> new->logical_mode = KVM_APIC_MODE_SW_DISABLED;
++	 */
+ 	if (new->logical_mode == KVM_APIC_MODE_MAP_DISABLED)
+ 		return;
+ 
++	/*
++	 * apic_sw_disabled代表SW enabled apic in spurious interrupt register,
++	 * 比如过去是return apic_get_reg(apic, APIC_SPIV) & APIC_SPIV_APIC_ENABLED;
++	 */
+ 	if (!kvm_apic_sw_enabled(apic))
+ 		return;
+ 
++	/*
++	 * 取出LDR:
++	 *
++	 * Bits 0-23     Reserved.
++	 * Bits 24-31
++	 *     Flat model     Bitmap of target processors (each bit identifies single processor; supports a maximum of 8 local APIC units)
++	 *     Cluster model
++	 *         Bits 24-27     Local APIC address (identifies the specific processor in a group)
++	 *         Bits 28-31     Cluster address (identifies a group of processors)
++	 */
+ 	ldr = kvm_lapic_get_reg(apic, APIC_LDR);
+ 	if (!ldr)
+ 		return;
+ 
+ 	if (apic_x2apic_mode(apic)) {
++		/*
++		 * 注释: All software enabled local APICs in x2APIC mode.
++		 */
+ 		logical_mode = KVM_APIC_MODE_X2APIC;
+ 	} else {
++		/*
++		 * #define         GET_APIC_LOGICAL_ID(x)  (((x) >> 24) & 0xFFu)
++		 * 实际是高8位, 24-31
++		 */
+ 		ldr = GET_APIC_LOGICAL_ID(ldr);
+ 		if (kvm_lapic_get_reg(apic, APIC_DFR) == APIC_DFR_FLAT)
+ 			logical_mode = KVM_APIC_MODE_XAPIC_FLAT;
+@@ -340,6 +593,11 @@ static void kvm_recalculate_logical_map(struct kvm_apic_map *new,
+ 	if (new->logical_mode == KVM_APIC_MODE_SW_DISABLED) {
+ 		new->logical_mode = logical_mode;
+ 	} else if (new->logical_mode != logical_mode) {
++		/*
++		 * 注释:
++		 * Optimized map disabled, e.g. not all local APICs in the same logical
++		 * mode, same logical ID assigned to multiple APICs, etc.
++		 */
+ 		new->logical_mode = KVM_APIC_MODE_MAP_DISABLED;
+ 		return;
+ 	}
+@@ -351,11 +609,34 @@ static void kvm_recalculate_logical_map(struct kvm_apic_map *new,
+ 	 * reversing the LDR calculation to get cluster of APICs, i.e. no
+ 	 * additional work is required.
+ 	 */
++	/*
++	 * 看到一句"The Destination Format Register (DFR) is not supported in x2APIC mode"
++	 */
+ 	if (apic_x2apic_mode(apic)) {
++		/*
++		 * 在以下使用kvm_apic_calc_x2apic_ldr():
++		 *   - arch/x86/kvm/lapic.c|389| <<kvm_recalculate_logical_map>> WARN_ON_ONCE(ldr != kvm_apic_calc_x2apic_ldr(kvm_x2apic_id(apic)));
++		 *   - arch/x86/kvm/lapic.c|642| <<kvm_apic_set_x2apic_id>> u32 ldr = kvm_apic_calc_x2apic_ldr(id);
++		 *   - arch/x86/kvm/lapic.c|3093| <<kvm_apic_state_fixup>> *ldr = kvm_apic_calc_x2apic_ldr(*id);
++		 */
+ 		WARN_ON_ONCE(ldr != kvm_apic_calc_x2apic_ldr(kvm_x2apic_id(apic)));
+ 		return;
+ 	}
+ 
++	/*
++	 * 为了加速对于目标VCPU的查找,在kvm.arch.apic_map中保存了kvm_apic_map结构体.
++	 * phys_map成员和logical_map成员记录了RTE的destination filed同VLAPIC结构体的
++	 * 对应的关系,分别对应physical mode和logic mode.在发送中断的时候,如果有该map表,
++	 * 且中断不是lowest priority和广播,则通过RTE的destination filed就可以直接找到
++	 * 目标VCPU，进行快速的分发.否则需要遍历所有的VCPU,逐一的和RTE的destination
++	 * field进行匹配.
++	 *
++	 * called by:
++	 *   - arch/x86/kvm/lapic.c|393| <<kvm_recalculate_logical_map>> if (WARN_ON_ONCE(!kvm_apic_map_get_logical_dest(new, ldr, &cluster, &mask))) {
++	 *   - arch/x86/kvm/lapic.c|1290| <<kvm_apic_map_get_dest_lapic>> if (!kvm_apic_map_get_logical_dest(map, irq->dest_id, dst, (u16 *)bitmap))
++	 *
++	 * 核心部分
++	 */
+ 	if (WARN_ON_ONCE(!kvm_apic_map_get_logical_dest(new, ldr,
+ 							&cluster, &mask))) {
+ 		new->logical_mode = KVM_APIC_MODE_MAP_DISABLED;
+@@ -384,6 +665,62 @@ enum {
+ 	DIRTY
+ };
+ 
++/*
++ * 5.15的例子.
++ *
++ * [0] kvm_recalculate_apic_map
++ * [0] kvm_vcpu_reset
++ * [0] kvm_arch_vcpu_create
++ * [0] kvm_vm_ioctl_create_vcpu
++ * [0] kvm_vm_ioctl
++ * [0] __x64_sys_ioctl
++ * [0] do_syscall_64
++ * [0] entry_SYSCALL_64_after_hwframe
++ *
++ * [0] kvm_recalculate_apic_map
++ * [0] kvm_apic_set_state
++ * [0] kvm_arch_vcpu_ioctl
++ * [0] kvm_vcpu_ioctl
++ * [0] __x64_sys_ioctl
++ * [0] do_syscall_64
++ * [0] entry_SYSCALL_64_after_hwframe
++ *
++ * [0] kvm_recalculate_apic_map
++ * [0] kvm_lapic_reg_write
++ * [0] handle_apic_write
++ * [0] vmx_handle_exit
++ * [0] vcpu_enter_guest
++ * [0] vcpu_run
++ * [0] kvm_arch_vcpu_ioctl_run
++ * [0] kvm_vcpu_ioctl
++ * [0] __x64_sys_ioctl
++ * [0] do_syscall_64
++ * [0] entry_SYSCALL_64_after_hwframe
++ *
++ * [0] kvm_recalculate_apic_map
++ * [0] kvm_lapic_reg_write
++ * [0] apic_mmio_write
++ * [0] write_mmio
++ * [0] emulator_read_write_onepage
++ * [0] emulator_read_write
++ * [0] x86_emulate_insn
++ * [0] x86_emulate_instruction
++ * [0] vmx_handle_exit
++ * [0] vcpu_enter_guest
++ * [0] vcpu_run
++ * [0] kvm_arch_vcpu_ioctl_run
++ * [0] kvm_vcpu_ioctl
++ * [0] __x64_sys_ioctl
++ * [0] do_syscall_64
++ * [0] entry_SYSCALL_64_after_hwframe
++ *
++ * called by:
++ *   - arch/x86/kvm/lapic.c|2412| <<kvm_lapic_reg_write>> kvm_recalculate_apic_map(apic->vcpu->kvm);
++ *   - arch/x86/kvm/lapic.c|2751| <<kvm_lapic_reset>> kvm_recalculate_apic_map(vcpu->kvm);
++ *   - arch/x86/kvm/lapic.c|3028| <<kvm_apic_set_state>> kvm_recalculate_apic_map(vcpu->kvm);
++ *   - arch/x86/kvm/lapic.c|3034| <<kvm_apic_set_state>> kvm_recalculate_apic_map(vcpu->kvm);
++ *   - arch/x86/kvm/x86.c|496| <<kvm_set_apic_base>> kvm_recalculate_apic_map(vcpu->kvm);
++ */
+ void kvm_recalculate_apic_map(struct kvm *kvm)
+ {
+ 	struct kvm_apic_map *new, *old = NULL;
+@@ -393,6 +730,25 @@ void kvm_recalculate_apic_map(struct kvm *kvm)
+ 	bool xapic_id_mismatch;
+ 	int r;
+ 
++	/*
++	 * 在以下使用kvm_arch->apic_map_dirty(x86):
++	 *   - arch/x86/kvm/lapic.c|397| <<kvm_recalculate_apic_map>> if (atomic_read_acquire(&kvm->arch.apic_map_dirty) == CLEAN)
++	 *   - arch/x86/kvm/lapic.c|413| <<kvm_recalculate_apic_map>> if (atomic_cmpxchg_acquire(&kvm->arch.apic_map_dirty, DIRTY, UPDATE_IN_PROGRESS) == CLEAN) {
++	 *   - arch/x86/kvm/lapic.c|489| <<kvm_recalculate_apic_map>> atomic_cmpxchg_release(&kvm->arch.apic_map_dirty, UPDATE_IN_PROGRESS, CLEAN);
++	 *   - arch/x86/kvm/lapic.c|512| <<apic_set_spiv>> atomic_set_release(&apic->vcpu->kvm->arch.apic_map_dirty, DIRTY);
++	 *   - arch/x86/kvm/lapic.c|525| <<kvm_apic_set_xapic_id>> atomic_set_release(&apic->vcpu->kvm->arch.apic_map_dirty, DIRTY);
++	 *   - arch/x86/kvm/lapic.c|531| <<kvm_apic_set_ldr>> atomic_set_release(&apic->vcpu->kvm->arch.apic_map_dirty, DIRTY);
++	 *   - arch/x86/kvm/lapic.c|537| <<kvm_apic_set_dfr>> atomic_set_release(&apic->vcpu->kvm->arch.apic_map_dirty, DIRTY);
++	 *   - arch/x86/kvm/lapic.c|548| <<kvm_apic_set_x2apic_id>> atomic_set_release(&apic->vcpu->kvm->arch.apic_map_dirty, DIRTY);
++	 *   - arch/x86/kvm/lapic.c|2565| <<kvm_lapic_set_base>> atomic_set_release(&apic->vcpu->kvm->arch.apic_map_dirty, DIRTY);
++	 *   - arch/x86/kvm/lapic.c|3033| <<kvm_apic_set_state>> atomic_set_release(&apic->vcpu->kvm->arch.apic_map_dirty, DIRTY);
++	 *
++	 * enum {
++	 *     CLEAN,
++	 *     UPDATE_IN_PROGRESS,
++	 *     DIRTY
++	 * };
++	 */
+ 	/* Read kvm->arch.apic_map_dirty before kvm->arch.apic_map.  */
+ 	if (atomic_read_acquire(&kvm->arch.apic_map_dirty) == CLEAN)
+ 		return;
+@@ -437,6 +793,22 @@ void kvm_recalculate_apic_map(struct kvm *kvm)
+ 	if (!new)
+ 		goto out;
+ 
++	/*
++	 * 在以下设置kvm_apic_map->max_apic_id:
++	 *   - arch/x86/kvm/lapic.c|619| <<kvm_recalculate_apic_map>> new->max_apic_id = max_id;
++	 * 在以下使用kvm_apic_map->max_apic_id:
++	 *   - arch/x86/kvm/lapic.c|333| <<kvm_apic_map_get_logical_dest>> u32 max_apic_id = map->max_apic_id;
++	 *   - arch/x86/kvm/lapic.c|338| <<kvm_apic_map_get_logical_dest>> offset = array_index_nospec(offset, map->max_apic_id + 1);
++	 *   - arch/x86/kvm/lapic.c|390| <<kvm_recalculate_phys_map>> if (WARN_ON_ONCE(xapic_id > new->max_apic_id))
++	 *   - arch/x86/kvm/lapic.c|399| <<kvm_recalculate_phys_map>> if (x2apic_id > new->max_apic_id)
++	 *   - arch/x86/kvm/lapic.c|1090| <<__pv_send_ipi>> if (min > map->max_apic_id)
++	 *   - arch/x86/kvm/lapic.c|1094| <<__pv_send_ipi>> min((u32)BITS_PER_LONG, (map->max_apic_id - min + 1))) {
++	 *   - arch/x86/kvm/lapic.c|1478| <<kvm_apic_map_get_dest_lapic>> if (irq->dest_id > map->max_apic_id) {
++	 *   - arch/x86/kvm/lapic.c|1481| <<kvm_apic_map_get_dest_lapic>> u32 dest_id = array_index_nospec(irq->dest_id, map->max_apic_id + 1);
++	 *   - arch/x86/kvm/x86.c|10082| <<kvm_sched_yield>> if (likely(map) && dest_id <= map->max_apic_id && map->phys_map[dest_id])
++	 *
++	 * 只在此处设置kvm_apic_map->max_apic_id:
++	 */
+ 	new->max_apic_id = max_id;
+ 	new->logical_mode = KVM_APIC_MODE_SW_DISABLED;
+ 
+@@ -444,6 +816,12 @@ void kvm_recalculate_apic_map(struct kvm *kvm)
+ 		if (!kvm_apic_present(vcpu))
+ 			continue;
+ 
++		/*
++		 * called by:
++		 *   - arch/x86/kvm/lapic.c|474| <<kvm_recalculate_apic_map>> r = kvm_recalculate_phys_map(new, vcpu, &xapic_id_mismatch);
++		 *
++		 * 初始化kvm_apic_map->phys_map[]
++		 */
+ 		r = kvm_recalculate_phys_map(new, vcpu, &xapic_id_mismatch);
+ 		if (r) {
+ 			kvfree(new);
+@@ -456,24 +834,53 @@ void kvm_recalculate_apic_map(struct kvm *kvm)
+ 			goto out;
+ 		}
+ 
++		/*
++		 * called by:
++		 *   - arch/x86/kvm/lapic.c|486| <<kvm_recalculate_apic_map>> kvm_recalculate_logical_map(new, vcpu);
++		 */
+ 		kvm_recalculate_logical_map(new, vcpu);
+ 	}
+ out:
++	/*
++	 * 在以下使用kvm_arch->apicv_inhibit_reasons(x86):
++	 *   - arch/x86/kvm/x86.c|9996| <<kvm_apicv_activated>> return (READ_ONCE(kvm->arch.apicv_inhibit_reasons) == 0);
++	 *   - arch/x86/kvm/x86.c|10002| <<kvm_vcpu_apicv_activated>> ulong vm_reasons = READ_ONCE(vcpu->kvm->arch.apicv_inhibit_reasons);
++	 *   - arch/x86/kvm/x86.c|10025| <<kvm_apicv_init>> set_or_clear_apicv_inhibit(&kvm->arch.apicv_inhibit_reasons, reason, true);
++	 *   - arch/x86/kvm/x86.c|10679| <<__kvm_set_or_clear_apicv_inhibit>> old = new = kvm->arch.apicv_inhibit_reasons;
++	 *   - arch/x86/kvm/x86.c|10697| <<__kvm_set_or_clear_apicv_inhibit>> kvm->arch.apicv_inhibit_reasons = new;
++	 *   - arch/x86/kvm/x86.c|10706| <<__kvm_set_or_clear_apicv_inhibit>> kvm->arch.apicv_inhibit_reasons = new;
++	 */
+ 	/*
+ 	 * The optimized map is effectively KVM's internal version of APICv,
+ 	 * and all unwanted aliasing that results in disabling the optimized
+ 	 * map also applies to APICv.
+ 	 */
++	/*
++	 * 注释:
++	 * APICv is disabled because not all vCPUs have a 1:1 mapping between
++	 * APIC ID and vCPU, _and_ KVM is not applying its x2APIC hotplug hack.
++	 */
+ 	if (!new)
+ 		kvm_set_apicv_inhibit(kvm, APICV_INHIBIT_REASON_PHYSICAL_ID_ALIASED);
+ 	else
+ 		kvm_clear_apicv_inhibit(kvm, APICV_INHIBIT_REASON_PHYSICAL_ID_ALIASED);
+ 
++	/*
++	 * 注释:
++	 * AVIC is disabled because not all vCPUs with a valid LDR have a 1:1
++	 * mapping between logical ID and vCPU.
++	 */
+ 	if (!new || new->logical_mode == KVM_APIC_MODE_MAP_DISABLED)
+ 		kvm_set_apicv_inhibit(kvm, APICV_INHIBIT_REASON_LOGICAL_ID_ALIASED);
+ 	else
+ 		kvm_clear_apicv_inhibit(kvm, APICV_INHIBIT_REASON_LOGICAL_ID_ALIASED);
+ 
++	/*
++	 * 注释:
++	 * For simplicity, the APIC acceleration is inhibited
++	 * first time either APIC ID or APIC base are changed by the guest
++	 * from their reset values.
++	 */
+ 	if (xapic_id_mismatch)
+ 		kvm_set_apicv_inhibit(kvm, APICV_INHIBIT_REASON_APIC_ID_MODIFIED);
+ 	else
+@@ -493,9 +900,23 @@ void kvm_recalculate_apic_map(struct kvm *kvm)
+ 	if (old)
+ 		call_rcu(&old->rcu, kvm_apic_map_free);
+ 
++	/*
++	 * called by:
++	 *   - arch/x86/kvm/ioapic.c|313| <<kvm_arch_post_irq_ack_notifier_list_update>> kvm_make_scan_ioapic_request(kvm);
++	 *   - arch/x86/kvm/ioapic.c|436| <<ioapic_write_indirect>> kvm_make_scan_ioapic_request(ioapic->kvm);
++	 *   - arch/x86/kvm/ioapic.c|773| <<kvm_set_ioapic>> kvm_make_scan_ioapic_request(kvm);
++	 *   - arch/x86/kvm/irq_comm.c|409| <<kvm_arch_post_irq_routing_update>> kvm_make_scan_ioapic_request(kvm);
++	 *   - arch/x86/kvm/lapic.c|504| <<kvm_recalculate_apic_map>> kvm_make_scan_ioapic_request(kvm);
++	 */
+ 	kvm_make_scan_ioapic_request(kvm);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|2349| <<kvm_lapic_reg_write(APIC_SPIV)>> apic_set_spiv(apic, val & mask);
++ *   - arch/x86/kvm/lapic.c|2759| <<kvm_lapic_reset>> apic_set_spiv(apic, 0xff);
++ *   - arch/x86/kvm/lapic.c|3065| <<kvm_apic_set_state>> apic_set_spiv(apic, *((u32 *)(s->regs + APIC_SPIV)));
++ */
+ static inline void apic_set_spiv(struct kvm_lapic *apic, u32 val)
+ {
+ 	bool enabled = val & APIC_SPIV_APIC_ENABLED;
+@@ -625,6 +1046,27 @@ void kvm_apic_after_set_mcg_cap(struct kvm_vcpu *vcpu)
+ 	kvm_apic_set_version(vcpu);
+ }
+ 
++/*
++ * 320h        LVT Timer Register      Read/Write
++ * 330h        LVT Thermal Sensor Register     Read/Write
++ * 340h        LVT Performance Monitoring Counters Register    Read/Write
++ * 350h        LVT LINT0 Register      Read/Write
++ * 360h        LVT LINT1 Register      Read/Write
++ * 370h        LVT Error Register      Read/Write
++ *
++ *
++ * 32 enum lapic_lvt_entry {
++ * 33         LVT_TIMER,
++ * 34         LVT_THERMAL_MONITOR,
++ * 35         LVT_PERFORMANCE_COUNTER,
++ * 36         LVT_LINT0,
++ * 37         LVT_LINT1,
++ * 38         LVT_ERROR,
++ * 39         LVT_CMCI,
++ * 40
++ * 41         KVM_APIC_MAX_NR_LVT_ENTRIES,
++ * 42 };
++ */
+ static const unsigned int apic_lvt_mask[KVM_APIC_MAX_NR_LVT_ENTRIES] = {
+ 	[LVT_TIMER] = LVT_MASK,      /* timer mode mask added at runtime */
+ 	[LVT_THERMAL_MONITOR] = LVT_MASK | APIC_MODE_MASK,
+@@ -664,6 +1106,11 @@ static u8 count_vectors(void *bitmap)
+ 	return count;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|1071| <<kvm_apic_update_irr>> bool irr_updated = __kvm_apic_update_irr(pir, apic->regs, max_irr);
++ *   - arch/x86/kvm/vmx/nested.c|3908| <<vmx_complete_nested_posted_interrupt>> __kvm_apic_update_irr(vmx->nested.pi_desc->pir, vapic_page, &max_irr);
++ */
+ bool __kvm_apic_update_irr(u32 *pir, void *regs, int *max_irr)
+ {
+ 	u32 i, vec;
+@@ -700,11 +1147,31 @@ bool __kvm_apic_update_irr(u32 *pir, void *regs, int *max_irr)
+ }
+ EXPORT_SYMBOL_GPL(__kvm_apic_update_irr);
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|6937| <<vmx_sync_pir_to_irr>> kvm_apic_update_irr(vcpu, vmx->pi_desc.pir, &max_irr);
++ */
+ bool kvm_apic_update_irr(struct kvm_vcpu *vcpu, u32 *pir, int *max_irr)
+ {
+ 	struct kvm_lapic *apic = vcpu->arch.apic;
+ 	bool irr_updated = __kvm_apic_update_irr(pir, apic->regs, max_irr);
+ 
++	/*
++	 * 在以下设置kvm_lapic->irr_pending:
++	 *   - arch/x86/kvm/lapic.c|1079| <<kvm_apic_update_irr>> apic->irr_pending = true;
++	 *   - arch/x86/kvm/lapic.c|1119| <<apic_clear_irr>> apic->irr_pending = false;
++	 *   - arch/x86/kvm/lapic.c|1122| <<apic_clear_irr>> apic->irr_pending = true;
++	 *   - arch/x86/kvm/lapic.c|3038| <<kvm_apic_update_apicv>> apic->irr_pending = true;
++	 *   - arch/x86/kvm/lapic.h|183| <<kvm_lapic_set_irr>> apic->irr_pending = true;
++	 *   - arch/x86/kvm/svm/avic.c|342| <<avic_kick_vcpu>> vcpu->arch.apic->irr_pending = true;
++	 * 在以下使用kvm_lapic->irr_pending:
++	 *   - arch/x86/kvm/lapic.c|1097| <<int apic_find_highest_irr>> if (!apic->irr_pending) return -1;
++	 *   - arch/x86/kvm/lapic.c|3577| <<apic_sync_pv_eoi_to_guest>> apic->irr_pending ||
++	 *
++	 * 在以下设置kvm_lapic->apicv_active:
++	 *   - arch/x86/kvm/lapic.c|2919| <<kvm_create_lapic>> apic->apicv_active = true;
++	 *   - arch/x86/kvm/x86.c|10671| <<__kvm_vcpu_update_apicv>> apic->apicv_active = activate;
++	 */
+ 	if (unlikely(!apic->apicv_active && irr_updated))
+ 		apic->irr_pending = true;
+ 	return irr_updated;
+@@ -716,6 +1183,14 @@ static inline int apic_search_irr(struct kvm_lapic *apic)
+ 	return find_highest_vector(apic->regs + APIC_IRR);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|1117| <<apic_clear_irr>> apic_find_highest_irr(apic));
++ *   - arch/x86/kvm/lapic.c|1203| <<kvm_lapic_find_highest_irr>> return apic_find_highest_irr(vcpu->arch.apic);
++ *   - arch/x86/kvm/lapic.c|1326| <<apic_has_interrupt_for_ppr>> highest_irr = apic_find_highest_irr(apic);
++ *   - arch/x86/kvm/lapic.c|3494| <<kvm_apic_set_state>> static_call_cond(kvm_x86_hwapic_irr_update)(vcpu, apic_find_highest_irr(apic));
++ *   - arch/x86/kvm/lapic.c|3604| <<kvm_lapic_sync_to_vapic>> max_irr = apic_find_highest_irr(apic);
++ */
+ static inline int apic_find_highest_irr(struct kvm_lapic *apic)
+ {
+ 	int result;
+@@ -724,6 +1199,18 @@ static inline int apic_find_highest_irr(struct kvm_lapic *apic)
+ 	 * Note that irr_pending is just a hint. It will be always
+ 	 * true with virtual interrupt delivery enabled.
+ 	 */
++	/*
++	 * 在以下设置kvm_lapic->irr_pending:
++	 *   - arch/x86/kvm/lapic.c|1079| <<kvm_apic_update_irr>> apic->irr_pending = true;
++	 *   - arch/x86/kvm/lapic.c|1119| <<apic_clear_irr>> apic->irr_pending = false;
++	 *   - arch/x86/kvm/lapic.c|1122| <<apic_clear_irr>> apic->irr_pending = true;
++	 *   - arch/x86/kvm/lapic.c|3038| <<kvm_apic_update_apicv>> apic->irr_pending = true;
++	 *   - arch/x86/kvm/lapic.h|183| <<kvm_lapic_set_irr>> apic->irr_pending = true;
++	 *   - arch/x86/kvm/svm/avic.c|342| <<avic_kick_vcpu>> vcpu->arch.apic->irr_pending = true;
++	 * 在以下使用kvm_lapic->irr_pending:
++	 *   - arch/x86/kvm/lapic.c|1097| <<int apic_find_highest_irr>> if (!apic->irr_pending) return -1;
++	 *   - arch/x86/kvm/lapic.c|3577| <<apic_sync_pv_eoi_to_guest>> apic->irr_pending ||
++	 */
+ 	if (!apic->irr_pending)
+ 		return -1;
+ 
+@@ -735,12 +1222,29 @@ static inline int apic_find_highest_irr(struct kvm_lapic *apic)
+ 
+ static inline void apic_clear_irr(int vec, struct kvm_lapic *apic)
+ {
++	/*
++	 * 在以下设置kvm_lapic->apicv_active:
++	 *   - arch/x86/kvm/lapic.c|2919| <<kvm_create_lapic>> apic->apicv_active = true;
++	 *   - arch/x86/kvm/x86.c|10671| <<__kvm_vcpu_update_apicv>> apic->apicv_active = activate;
++	 */
+ 	if (unlikely(apic->apicv_active)) {
+ 		/* need to update RVI */
+ 		kvm_lapic_clear_vector(vec, apic->regs + APIC_IRR);
+ 		static_call_cond(kvm_x86_hwapic_irr_update)(apic->vcpu,
+ 							    apic_find_highest_irr(apic));
+ 	} else {
++		/*
++		 * 在以下设置kvm_lapic->irr_pending:
++		 *   - arch/x86/kvm/lapic.c|1079| <<kvm_apic_update_irr>> apic->irr_pending = true;
++		 *   - arch/x86/kvm/lapic.c|1119| <<apic_clear_irr>> apic->irr_pending = false;
++		 *   - arch/x86/kvm/lapic.c|1122| <<apic_clear_irr>> apic->irr_pending = true;
++		 *   - arch/x86/kvm/lapic.c|3038| <<kvm_apic_update_apicv>> apic->irr_pending = true;
++		 *   - arch/x86/kvm/lapic.h|183| <<kvm_lapic_set_irr>> apic->irr_pending = true;
++		 *   - arch/x86/kvm/svm/avic.c|342| <<avic_kick_vcpu>> vcpu->arch.apic->irr_pending = true;
++		 * 在以下使用kvm_lapic->irr_pending:
++		 *   - arch/x86/kvm/lapic.c|1097| <<int apic_find_highest_irr>> if (!apic->irr_pending) return -1;
++		 *   - arch/x86/kvm/lapic.c|3577| <<apic_sync_pv_eoi_to_guest>> apic->irr_pending ||
++		 */
+ 		apic->irr_pending = false;
+ 		kvm_lapic_clear_vector(vec, apic->regs + APIC_IRR);
+ 		if (apic_search_irr(apic) != -1)
+@@ -818,6 +1322,11 @@ static inline void apic_clear_isr(int vec, struct kvm_lapic *apic)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|6939| <<vmx_sync_pir_to_irr>> max_irr = kvm_lapic_find_highest_irr(vcpu);
++ *   - arch/x86/kvm/x86.c|10299| <<update_cr8_intercept>> max_irr = kvm_lapic_find_highest_irr(vcpu);
++ */
+ int kvm_lapic_find_highest_irr(struct kvm_vcpu *vcpu)
+ {
+ 	/* This may race with setting of irr in __apic_accept_irq() and
+@@ -942,9 +1451,17 @@ static bool pv_eoi_test_and_clr_pending(struct kvm_vcpu *vcpu)
+ 	return val;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|1359| <<apic_update_ppr>> apic_has_interrupt_for_ppr(apic, ppr) != -1)
++ *   - arch/x86/kvm/lapic.c|3340| <<kvm_apic_has_interrupt>> return apic_has_interrupt_for_ppr(apic, ppr);
++ */
+ static int apic_has_interrupt_for_ppr(struct kvm_lapic *apic, u32 ppr)
+ {
+ 	int highest_irr;
++	/*
++	 * vmx_sync_pir_to_irr()
++	 */
+ 	if (kvm_x86_ops.sync_pir_to_irr)
+ 		highest_irr = static_call(kvm_x86_sync_pir_to_irr)(apic->vcpu);
+ 	else
+@@ -976,6 +1493,16 @@ static bool __apic_update_ppr(struct kvm_lapic *apic, u32 *new_ppr)
+ 	return ppr < old_ppr;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|1475| <<kvm_apic_update_ppr>> apic_update_ppr(vcpu->arch.apic);
++ *   - arch/x86/kvm/lapic.c|1482| <<apic_set_tpr>> apic_update_ppr(apic);
++ *   - arch/x86/kvm/lapic.c|2043| <<apic_set_eoi>> apic_update_ppr(apic);
++ *   - arch/x86/kvm/lapic.c|2148| <<__apic_read>> apic_update_ppr(apic);
++ *   - arch/x86/kvm/lapic.c|3304| <<kvm_lapic_reset>> apic_update_ppr(apic);
++ *   - arch/x86/kvm/lapic.c|3515| <<kvm_get_apic_interrupt>> apic_update_ppr(apic);
++ *   - arch/x86/kvm/lapic.c|3604| <<kvm_apic_set_state>> apic_update_ppr(apic);
++ */
+ static void apic_update_ppr(struct kvm_lapic *apic)
+ {
+ 	u32 ppr;
+@@ -1023,6 +1550,10 @@ static bool kvm_apic_match_physical_addr(struct kvm_lapic *apic, u32 mda)
+ 	return mda == kvm_xapic_id(apic);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|1331| <<kvm_apic_match_dest>> return kvm_apic_match_logical_addr(target, mda);
++ */
+ static bool kvm_apic_match_logical_addr(struct kvm_lapic *apic, u32 mda)
+ {
+ 	u32 logical_id;
+@@ -1030,14 +1561,39 @@ static bool kvm_apic_match_logical_addr(struct kvm_lapic *apic, u32 mda)
+ 	if (kvm_apic_broadcast(apic, mda))
+ 		return true;
+ 
++	/*
++	 * 取出LDR:
++	 *
++	 * Bits 0-23     Reserved.
++	 * Bits 24-31
++	 *     Flat model     Bitmap of target processors (each bit identifies single processor; supports a maximum of 8 local APIC units)
++	 *     Cluster model
++	 *         Bits 24-27     Local APIC address (identifies the specific processor in a group)
++	 *         Bits 28-31     Cluster address (identifies a group of processors)
++	 */
+ 	logical_id = kvm_lapic_get_reg(apic, APIC_LDR);
+ 
++	/*
++	 * 对于x2apic, 这里的logical_id是LDR
++	 *
++	 * 根据x2apic的manual, 似乎高16-bit是cluster, 低16-bit是id
++	 */
+ 	if (apic_x2apic_mode(apic))
+ 		return ((logical_id >> 16) == (mda >> 16))
+ 		       && (logical_id & mda & 0xffff) != 0;
+ 
+ 	logical_id = GET_APIC_LOGICAL_ID(logical_id);
+ 
++	/*
++	 * 注释:
++	 * The DFR (destination format register) specifies Flat or Cluster
++	 * model and is structured as follows
++	 * Bits 0-27	Reserved.
++	 * Bits 28-31	Model (1111b = Flat model, 0000b = Cluster model)
++	 *
++	 * #define         APIC_DFR_CLUSTER                0x0FFFFFFFul
++	 * #define         APIC_DFR_FLAT                   0xFFFFFFFFul
++	 */
+ 	switch (kvm_lapic_get_reg(apic, APIC_DFR)) {
+ 	case APIC_DFR_FLAT:
+ 		return (logical_id & mda) != 0;
+@@ -1065,11 +1621,21 @@ static bool kvm_apic_match_logical_addr(struct kvm_lapic *apic, u32 mda)
+  * important when userspace wants to use x2APIC-format MSIs, because
+  * APIC_BROADCAST (0xff) is a legal route for "cluster 0, CPUs 0-7".
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|1373| <<kvm_apic_match_dest>> u32 mda = kvm_apic_mda(vcpu, dest, source, target);
++ */
+ static u32 kvm_apic_mda(struct kvm_vcpu *vcpu, unsigned int dest_id,
+ 		struct kvm_lapic *source, struct kvm_lapic *target)
+ {
+ 	bool ipi = source != NULL;
+ 
++	/*
++	 * 在以下使用kvm_arch->x2apic_broadcast_quirk_disabled:
++	 *   - arch/x86/kvm/lapic.c|1341| <<kvm_apic_mda>> if (!vcpu->kvm->arch.x2apic_broadcast_quirk_disabled &&
++	 *   - arch/x86/kvm/lapic.c|1421| <<kvm_apic_is_broadcast_dest>> if (kvm->arch.x2apic_broadcast_quirk_disabled) {
++	 *   - arch/x86/kvm/x86.c|6567| <<kvm_vm_ioctl_enable_cap(KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK)>> kvm->arch.x2apic_broadcast_quirk_disabled = true;
++	 */
+ 	if (!vcpu->kvm->arch.x2apic_broadcast_quirk_disabled &&
+ 	    !ipi && dest_id == APIC_BROADCAST && apic_x2apic_mode(target))
+ 		return X2APIC_BROADCAST;
+@@ -1077,6 +1643,27 @@ static u32 kvm_apic_mda(struct kvm_vcpu *vcpu, unsigned int dest_id,
+ 	return dest_id;
+ }
+ 
++/*
++ * shorthand可以是:
++ * - APIC_DEST_NOSHORT
++ * - APIC_DEST_SELF
++ * - APIC_DEST_ALLINC
++ * - APIC_DEST_ALLBUT
++ *
++ * dest_mode可以是:
++ * - APIC_DEST_PHYSICAL
++ * - APIC_DEST_LOGICAL
++ *
++ * called by:
++ *   - arch/x86/kvm/ioapic.c|117| <<__rtc_irq_eoi_tracking_restore_one>> if (!kvm_apic_match_dest(vcpu, NULL, APIC_DEST_NOSHORT, e->fields.dest_id, kvm_lapic_irq_dest_mode(!!e->fields.dest_mode)))
++ *   - arch/x86/kvm/ioapic.c|191| <<ioapic_lazy_update_eoi>> if (!kvm_apic_match_dest(vcpu, NULL, APIC_DEST_NOSHORT, entry->fields.dest_id, entry->fields.dest_mode) ||
++ *   - arch/x86/kvm/ioapic.c|299| <<kvm_ioapic_scan_entry>> if (kvm_apic_match_dest(vcpu, NULL, APIC_DEST_NOSHORT, e->fields.dest_id, dm)
++ *   - arch/x86/kvm/irq_comm.c|70| <<kvm_irq_delivery_to_apic>> if (!kvm_apic_match_dest(vcpu, src, irq->shorthand, irq->dest_id, irq->dest_mode))
++ *   - arch/x86/kvm/irq_comm.c|352| <<kvm_intr_is_single_vcpu>> if (!kvm_apic_match_dest(vcpu, NULL, irq->shorthand, irq->dest_id, irq->dest_mode))
++ *   - arch/x86/kvm/irq_comm.c|435| <<kvm_scan_ioapic_routes>> (kvm_apic_match_dest(vcpu, NULL, APIC_DEST_NOSHORT, irq.dest_id, irq.dest_mode) ||
++ *   - arch/x86/kvm/lapic.c|1679| <<kvm_bitmap_or_dest_vcpus>> if (!kvm_apic_match_dest(vcpu, NULL, irq->shorthand, irq->dest_id, irq->dest_mode))
++ *   - arch/x86/kvm/svm/avic.c|484| <<avic_kick_target_vcpus>> if (kvm_apic_match_dest(vcpu, source, icrl & APIC_SHORT_MASK, dest, icrl & APIC_DEST_MASK))
++ */
+ bool kvm_apic_match_dest(struct kvm_vcpu *vcpu, struct kvm_lapic *source,
+ 			   int shorthand, unsigned int dest, int dest_mode)
+ {
+@@ -1152,6 +1739,12 @@ static bool kvm_apic_is_broadcast_dest(struct kvm *kvm, struct kvm_lapic **src,
+  * means that the interrupt should be dropped.  In this case, *bitmap would be
+  * zero and *dst undefined.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|1244| <<kvm_irq_delivery_to_apic_fast>> ret = kvm_apic_map_get_dest_lapic(kvm, &src, irq, map, &dst, &bitmap);
++ *   - arch/x86/kvm/lapic.c|1286| <<kvm_intr_is_single_vcpu_fast>> if (kvm_apic_map_get_dest_lapic(kvm, NULL, irq, map, &dst, &bitmap) &&
++ *   - arch/x86/kvm/lapic.c|1421| <<kvm_bitmap_or_dest_vcpus>> ret = kvm_apic_map_get_dest_lapic(kvm, &src, irq, map, &dest_vcpu,
++ */
+ static inline bool kvm_apic_map_get_dest_lapic(struct kvm *kvm,
+ 		struct kvm_lapic **src, struct kvm_lapic_irq *irq,
+ 		struct kvm_apic_map *map, struct kvm_lapic ***dst,
+@@ -2540,6 +3133,12 @@ u64 kvm_lapic_get_cr8(struct kvm_vcpu *vcpu)
+ 	return (tpr & 0xf0) >> 4;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|3267| <<kvm_lapic_reset>> kvm_lapic_set_base(vcpu, msr_val);
++ *   - arch/x86/kvm/lapic.c|3599| <<kvm_apic_set_state>> kvm_lapic_set_base(vcpu, vcpu->arch.apic_base);
++ *   - arch/x86/kvm/x86.c|495| <<kvm_set_apic_base>> kvm_lapic_set_base(vcpu, msr_info->data);
++ */
+ void kvm_lapic_set_base(struct kvm_vcpu *vcpu, u64 value)
+ {
+ 	u64 old_value = vcpu->arch.apic_base;
+@@ -2574,6 +3173,18 @@ void kvm_lapic_set_base(struct kvm_vcpu *vcpu, u64 value)
+ 	}
+ 
+ 	if ((old_value ^ value) & (MSR_IA32_APICBASE_ENABLE | X2APIC_ENABLE)) {
++		/*
++		 * 在以下使用KVM_REQ_APICV_UPDATE:
++		 *   - arch/x86/kvm/lapic.c|3138| <<kvm_lapic_set_base>> kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
++		 *   - arch/x86/kvm/lapic.c|3452| <<kvm_create_lapic>> kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
++		 *   - arch/x86/kvm/svm/nested.c|830| <<enter_svm_guest_mode>> kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
++		 *   - arch/x86/kvm/svm/nested.c|1245| <<svm_leave_nested>> kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
++		 *   - arch/x86/kvm/vmx/nested.c|4924| <<nested_vmx_vmexit>> kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
++		 *   - arch/x86/kvm/x86.c|10778| <<__kvm_set_or_clear_apicv_inhibit>> kvm_make_all_cpus_request(kvm, KVM_REQ_APICV_UPDATE);
++		 *   - arch/x86/kvm/x86.c|11018| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_APICV_UPDATE, vcpu)) kvm_vcpu_update_apicv(vcpu);
++		 *
++		 * 处理的函数是kvm_vcpu_update_apicv(vcpu);
++		 */
+ 		kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
+ 		static_call_cond(kvm_x86_set_virtual_apic_mode)(vcpu);
+ 	}
+@@ -2593,6 +3204,18 @@ void kvm_apic_update_apicv(struct kvm_vcpu *vcpu)
+ 	struct kvm_lapic *apic = vcpu->arch.apic;
+ 
+ 	if (apic->apicv_active) {
++		/*
++		 * 在以下设置kvm_lapic->irr_pending:
++		 *   - arch/x86/kvm/lapic.c|1079| <<kvm_apic_update_irr>> apic->irr_pending = true;
++		 *   - arch/x86/kvm/lapic.c|1119| <<apic_clear_irr>> apic->irr_pending = false;
++		 *   - arch/x86/kvm/lapic.c|1122| <<apic_clear_irr>> apic->irr_pending = true;
++		 *   - arch/x86/kvm/lapic.c|3038| <<kvm_apic_update_apicv>> apic->irr_pending = true;
++		 *   - arch/x86/kvm/lapic.h|183| <<kvm_lapic_set_irr>> apic->irr_pending = true;
++		 *   - arch/x86/kvm/svm/avic.c|342| <<avic_kick_vcpu>> vcpu->arch.apic->irr_pending = true;
++		 * 在以下使用kvm_lapic->irr_pending:
++		 *   - arch/x86/kvm/lapic.c|1097| <<int apic_find_highest_irr>> if (!apic->irr_pending) return -1;
++		 *   - arch/x86/kvm/lapic.c|3577| <<apic_sync_pv_eoi_to_guest>> apic->irr_pending ||
++		 */
+ 		/* irr_pending is always true when apicv is activated. */
+ 		apic->irr_pending = true;
+ 		apic->isr_count = 1;
+@@ -2876,6 +3499,18 @@ int kvm_create_lapic(struct kvm_vcpu *vcpu)
+ 	 */
+ 	if (enable_apicv) {
+ 		apic->apicv_active = true;
++		/*
++		 * 在以下使用KVM_REQ_APICV_UPDATE:
++		 *   - arch/x86/kvm/lapic.c|3138| <<kvm_lapic_set_base>> kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
++		 *   - arch/x86/kvm/lapic.c|3452| <<kvm_create_lapic>> kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
++		 *   - arch/x86/kvm/svm/nested.c|830| <<enter_svm_guest_mode>> kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
++		 *   - arch/x86/kvm/svm/nested.c|1245| <<svm_leave_nested>> kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
++		 *   - arch/x86/kvm/vmx/nested.c|4924| <<nested_vmx_vmexit>> kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
++		 *   - arch/x86/kvm/x86.c|10778| <<__kvm_set_or_clear_apicv_inhibit>> kvm_make_all_cpus_request(kvm, KVM_REQ_APICV_UPDATE);
++		 *   - arch/x86/kvm/x86.c|11018| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_APICV_UPDATE, vcpu)) kvm_vcpu_update_apicv(vcpu);
++		 *
++		 * 处理的函数是kvm_vcpu_update_apicv(vcpu);
++		 */
+ 		kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
+ 	}
+ 
+@@ -2887,6 +3522,13 @@ int kvm_create_lapic(struct kvm_vcpu *vcpu)
+ 	return -ENOMEM;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/irq.c|96| <<kvm_cpu_has_injectable_intr>> return kvm_apic_has_interrupt(v) != -1;
++ *   - arch/x86/kvm/irq.c|109| <<kvm_cpu_has_interrupt>> return kvm_apic_has_interrupt(v) != -1;
++ *   - arch/x86/kvm/lapic.c|3534| <<kvm_get_apic_interrupt>> int vector = kvm_apic_has_interrupt(vcpu);
++ *   - arch/x86/kvm/vmx/nested.c|3703| <<nested_vmx_run>> kvm_apic_has_interrupt(vcpu) == vmx->nested.posted_intr_nv) {
++ */
+ int kvm_apic_has_interrupt(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_lapic *apic = vcpu->arch.apic;
+@@ -2922,6 +3564,10 @@ void kvm_inject_apic_timer_irqs(struct kvm_vcpu *vcpu)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/irq.c|149| <<kvm_cpu_get_interrupt>> return kvm_get_apic_interrupt(v);
++ */
+ int kvm_get_apic_interrupt(struct kvm_vcpu *vcpu)
+ {
+ 	int vector = kvm_apic_has_interrupt(vcpu);
+@@ -2968,6 +3614,15 @@ static int kvm_apic_state_fixup(struct kvm_vcpu *vcpu,
+ 		u32 *ldr = (u32 *)(s->regs + APIC_LDR);
+ 		u64 icr;
+ 
++		/*
++		 * 在以下使用kvm_arch->x2apic_format:
++		 *   - arch/x86/kvm/irq_comm.c|111| <<kvm_set_msi_irq>> trace_kvm_msi_set_irq(msg.address_lo | (kvm->arch.x2apic_format ?
++		 *   - arch/x86/kvm/irq_comm.c|114| <<kvm_set_msi_irq>> irq->dest_id = x86_msi_msg_get_destid(&msg, kvm->arch.x2apic_format);
++		 *   - arch/x86/kvm/irq_comm.c|128| <<kvm_msi_route_invalid>> return kvm->arch.x2apic_format && (e->msi.address_hi & 0xff);
++		 *   - arch/x86/kvm/lapic.c|328| <<kvm_recalculate_phys_map>> if (vcpu->kvm->arch.x2apic_format) {
++		 *   - arch/x86/kvm/lapic.c|3095| <<kvm_apic_state_fixup>> if (vcpu->kvm->arch.x2apic_format) {
++		 *   - arch/x86/kvm/x86.c|6565| <<kvm_vm_ioctl_enable_cap>> if (cap->args[0] & KVM_X2APIC_API_USE_32BIT_IDS) kvm->arch.x2apic_format = true;
++		 */
+ 		if (vcpu->kvm->arch.x2apic_format) {
+ 			if (*id != vcpu->vcpu_id)
+ 				return -EINVAL;
+@@ -3043,6 +3698,11 @@ int kvm_apic_set_state(struct kvm_vcpu *vcpu, struct kvm_lapic_state *s)
+ 	__start_apic_timer(apic, APIC_TMCCT);
+ 	kvm_lapic_set_reg(apic, APIC_TMCCT, 0);
+ 	kvm_apic_update_apicv(vcpu);
++	/*
++	 * 在以下设置kvm_lapic->apicv_active:
++	 *   - arch/x86/kvm/lapic.c|2919| <<kvm_create_lapic>> apic->apicv_active = true;
++	 *   - arch/x86/kvm/x86.c|10671| <<__kvm_vcpu_update_apicv>> apic->apicv_active = activate;
++	 */
+ 	if (apic->apicv_active) {
+ 		static_call_cond(kvm_x86_apicv_post_state_restore)(vcpu);
+ 		static_call_cond(kvm_x86_hwapic_irr_update)(vcpu, apic_find_highest_irr(apic));
+@@ -3126,6 +3786,18 @@ void kvm_lapic_sync_from_vapic(struct kvm_vcpu *vcpu)
+ static void apic_sync_pv_eoi_to_guest(struct kvm_vcpu *vcpu,
+ 					struct kvm_lapic *apic)
+ {
++	/*
++	 * 在以下设置kvm_lapic->irr_pending:
++	 *   - arch/x86/kvm/lapic.c|1079| <<kvm_apic_update_irr>> apic->irr_pending = true;
++	 *   - arch/x86/kvm/lapic.c|1119| <<apic_clear_irr>> apic->irr_pending = false;
++	 *   - arch/x86/kvm/lapic.c|1122| <<apic_clear_irr>> apic->irr_pending = true;
++	 *   - arch/x86/kvm/lapic.c|3038| <<kvm_apic_update_apicv>> apic->irr_pending = true;
++	 *   - arch/x86/kvm/lapic.h|183| <<kvm_lapic_set_irr>> apic->irr_pending = true;
++	 *   - arch/x86/kvm/svm/avic.c|342| <<avic_kick_vcpu>> vcpu->arch.apic->irr_pending = true;
++	 * 在以下使用kvm_lapic->irr_pending:
++	 *   - arch/x86/kvm/lapic.c|1097| <<int apic_find_highest_irr>> if (!apic->irr_pending) return -1;
++	 *   - arch/x86/kvm/lapic.c|3577| <<apic_sync_pv_eoi_to_guest>> apic->irr_pending ||
++	 */
+ 	if (!pv_eoi_enabled(vcpu) ||
+ 	    /* IRR set or many bits in ISR: could be nested. */
+ 	    apic->irr_pending ||
+diff --git a/arch/x86/kvm/lapic.h b/arch/x86/kvm/lapic.h
+index a69e706b9..95c702583 100644
+--- a/arch/x86/kvm/lapic.h
++++ b/arch/x86/kvm/lapic.h
+@@ -62,8 +62,32 @@ struct kvm_lapic {
+ 	struct kvm_timer lapic_timer;
+ 	u32 divide_count;
+ 	struct kvm_vcpu *vcpu;
++	/*
++	 * 在以下设置kvm_lapic->apicv_active:
++	 *   - arch/x86/kvm/lapic.c|2919| <<kvm_create_lapic>> apic->apicv_active = true;
++	 *   - arch/x86/kvm/x86.c|10671| <<__kvm_vcpu_update_apicv>> apic->apicv_active = activate;
++	 */
+ 	bool apicv_active;
++	/*
++	 * 在以下使用kvm_lapic->sw_enabled:
++	 *   - arch/x86/kvm/lapic.c|540| <<apic_set_spiv>> if (enabled != apic->sw_enabled) {
++	 *   - arch/x86/kvm/lapic.c|541| <<apic_set_spiv>> apic->sw_enabled = enabled;
++	 *   - arch/x86/kvm/lapic.c|2534| <<kvm_free_lapic>> if (!apic->sw_enabled)
++	 *   - arch/x86/kvm/lapic.h|207| <<kvm_apic_sw_enabled>> return apic->sw_enabled;
++	 */
+ 	bool sw_enabled;
++	/*
++	 * 在以下设置kvm_lapic->irr_pending:
++	 *   - arch/x86/kvm/lapic.c|1079| <<kvm_apic_update_irr>> apic->irr_pending = true;
++	 *   - arch/x86/kvm/lapic.c|1119| <<apic_clear_irr>> apic->irr_pending = false;
++	 *   - arch/x86/kvm/lapic.c|1122| <<apic_clear_irr>> apic->irr_pending = true;
++	 *   - arch/x86/kvm/lapic.c|3038| <<kvm_apic_update_apicv>> apic->irr_pending = true;
++	 *   - arch/x86/kvm/lapic.h|183| <<kvm_lapic_set_irr>> apic->irr_pending = true;
++	 *   - arch/x86/kvm/svm/avic.c|342| <<avic_kick_vcpu>> vcpu->arch.apic->irr_pending = true;
++	 * 在以下使用kvm_lapic->irr_pending:
++	 *   - arch/x86/kvm/lapic.c|1097| <<int apic_find_highest_irr>> if (!apic->irr_pending) return -1;
++	 *   - arch/x86/kvm/lapic.c|3577| <<apic_sync_pv_eoi_to_guest>> apic->irr_pending ||
++	 */
+ 	bool irr_pending;
+ 	bool lvt0_in_nmi_mode;
+ 	/* Number of bits set in ISR. */
+@@ -161,9 +185,26 @@ static inline void kvm_lapic_set_vector(int vec, void *bitmap)
+ 	set_bit(VEC_POS(vec), (bitmap) + REG_POS(vec));
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/svm/svm.c|3695| <<svm_deliver_interrupt>> kvm_lapic_set_irr(vector, apic);
++ *   - arch/x86/kvm/vmx/vmx.c|4286| <<vmx_deliver_interrupt>> kvm_lapic_set_irr(vector, apic);
++ */
+ static inline void kvm_lapic_set_irr(int vec, struct kvm_lapic *apic)
+ {
+ 	kvm_lapic_set_vector(vec, apic->regs + APIC_IRR);
++	/*
++	 * 在以下设置kvm_lapic->irr_pending:
++	 *   - arch/x86/kvm/lapic.c|1079| <<kvm_apic_update_irr>> apic->irr_pending = true;
++	 *   - arch/x86/kvm/lapic.c|1119| <<apic_clear_irr>> apic->irr_pending = false;
++	 *   - arch/x86/kvm/lapic.c|1122| <<apic_clear_irr>> apic->irr_pending = true;
++	 *   - arch/x86/kvm/lapic.c|3038| <<kvm_apic_update_apicv>> apic->irr_pending = true;
++	 *   - arch/x86/kvm/lapic.h|183| <<kvm_lapic_set_irr>> apic->irr_pending = true;
++	 *   - arch/x86/kvm/svm/avic.c|342| <<avic_kick_vcpu>> vcpu->arch.apic->irr_pending = true;
++	 * 在以下使用kvm_lapic->irr_pending:
++	 *   - arch/x86/kvm/lapic.c|1097| <<int apic_find_highest_irr>> if (!apic->irr_pending) return -1;
++	 *   - arch/x86/kvm/lapic.c|3577| <<apic_sync_pv_eoi_to_guest>> apic->irr_pending ||
++	 */
+ 	/*
+ 	 * irr_pending must be true if any interrupt is pending; set it after
+ 	 * APIC_IRR to avoid race with apic_clear_irr
+@@ -192,8 +233,39 @@ static inline bool lapic_in_kernel(struct kvm_vcpu *vcpu)
+ 
+ extern struct static_key_false_deferred apic_hw_disabled;
+ 
++/*
++ * apic_hw_disabled代表HW enabled APIC in APIC_BASE MSR
++ * 比如过去是return (apic)->vcpu->arch.apic_base & MSR_IA32_APICBASE_ENABLE;
++ *
++ * commit c5cc421ba3219b90f11d151bc55f1608c12830fa
++ * Author: Gleb Natapov <gleb@redhat.com>
++ * Date:   Sun Aug 5 15:58:30 2012 +0300
++ *
++ * KVM: use jump label to optimize checking for HW enabled APIC in APIC_BASE MSR
++ *
++ * Usually all APICs are HW enabled so the check can be optimized out.
++ *
++ * Signed-off-by: Gleb Natapov <gleb@redhat.com>
++ * Signed-off-by: Avi Kivity <avi@redhat.com>
++ */
+ static inline bool kvm_apic_hw_enabled(struct kvm_lapic *apic)
+ {
++	/*
++	 * 在以下修改kvm_vcpu_arch->apic_base:
++	 *   - arch/x86/kvm/lapic.c|2974| <<kvm_lapic_set_base>> vcpu->arch.apic_base = value;
++	 *   - arch/x86/kvm/lapic.c|3289| <<kvm_create_lapic>> vcpu->arch.apic_base = MSR_IA32_APICBASE_ENABLE;
++	 * 在以下使用kvm_vcpu_arch->apic_base:
++	 *   - arch/x86/kvm/cpuid.c|286| <<__kvm_update_cpuid_runtime>> vcpu->arch.apic_base & MSR_IA32_APICBASE_ENABLE);
++	 *   - arch/x86/kvm/lapic.c|2916| <<kvm_free_lapic>> if (!(vcpu->arch.apic_base & MSR_IA32_APICBASE_ENABLE))
++	 *   - arch/x86/kvm/lapic.c|2971| <<kvm_lapic_set_base>> u64 old_value = vcpu->arch.apic_base;
++	 *   - arch/x86/kvm/lapic.c|3007| <<kvm_lapic_set_base>> apic->base_address = apic->vcpu->arch.apic_base &
++	 *   - arch/x86/kvm/lapic.c|3448| <<kvm_apic_set_state>> kvm_lapic_set_base(vcpu, vcpu->arch.apic_base);
++	 *   - arch/x86/kvm/lapic.h|225| <<kvm_apic_hw_enabled>> return apic->vcpu->arch.apic_base & MSR_IA32_APICBASE_ENABLE;
++	 *   - arch/x86/kvm/lapic.h|276| <<apic_x2apic_mode>> return apic->vcpu->arch.apic_base & X2APIC_ENABLE;
++	 *   - arch/x86/kvm/vmx/nested.c|912| <<nested_vmx_msr_check_common>> if (CC(vcpu->arch.apic_base & X2APIC_ENABLE && e->index >> 8 == 0x8))
++	 *   - arch/x86/kvm/x86.c|470| <<kvm_get_apic_base>> return vcpu->arch.apic_base;
++	 *   - arch/x86/kvm/x86.c|12644| <<kvm_vcpu_is_bsp>> return (vcpu->arch.apic_base & MSR_IA32_APICBASE_BSP) != 0;
++	 */
+ 	if (static_branch_unlikely(&apic_hw_disabled.key))
+ 		return apic->vcpu->arch.apic_base & MSR_IA32_APICBASE_ENABLE;
+ 	return true;
+@@ -201,8 +273,30 @@ static inline bool kvm_apic_hw_enabled(struct kvm_lapic *apic)
+ 
+ extern struct static_key_false_deferred apic_sw_disabled;
+ 
++/*
++ * apic_sw_disabled代表SW enabled apic in spurious interrupt register,
++ * 比如过去是return apic_get_reg(apic, APIC_SPIV) & APIC_SPIV_APIC_ENABLED;
++ *
++ * commit f8c1ea103947038b7197bdd4c8451886a58af0c0
++ * Author: Gleb Natapov <gleb@redhat.com>
++ * Date:   Sun Aug 5 15:58:31 2012 +0300
++ *
++ * KVM: use jump label to optimize checking for SW enabled apic in spurious interrupt register
++ *
++ * Usually all APICs are SW enabled so the check can be optimized out.
++ *
++ * Signed-off-by: Gleb Natapov <gleb@redhat.com>
++ * Signed-off-by: Avi Kivity <avi@redhat.com>
++ */
+ static inline bool kvm_apic_sw_enabled(struct kvm_lapic *apic)
+ {
++	/*
++	 * 在以下使用kvm_lapic->sw_enabled:
++	 *   - arch/x86/kvm/lapic.c|540| <<apic_set_spiv>> if (enabled != apic->sw_enabled) {
++	 *   - arch/x86/kvm/lapic.c|541| <<apic_set_spiv>> apic->sw_enabled = enabled;
++	 *   - arch/x86/kvm/lapic.c|2534| <<kvm_free_lapic>> if (!apic->sw_enabled)
++	 *   - arch/x86/kvm/lapic.h|207| <<kvm_apic_sw_enabled>> return apic->sw_enabled;
++	 */
+ 	if (static_branch_unlikely(&apic_sw_disabled.key))
+ 		return apic->sw_enabled;
+ 	return true;
+@@ -210,6 +304,10 @@ static inline bool kvm_apic_sw_enabled(struct kvm_lapic *apic)
+ 
+ static inline bool kvm_apic_present(struct kvm_vcpu *vcpu)
+ {
++	/*
++	 * apic_hw_disabled代表HW enabled APIC in APIC_BASE MSR
++	 * 比如过去是return (apic)->vcpu->arch.apic_base & MSR_IA32_APICBASE_ENABLE;
++	 */
+ 	return lapic_in_kernel(vcpu) && kvm_apic_hw_enabled(vcpu->arch.apic);
+ }
+ 
+@@ -223,6 +321,32 @@ static inline int apic_x2apic_mode(struct kvm_lapic *apic)
+ 	return apic->vcpu->arch.apic_base & X2APIC_ENABLE;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/irq.c|87| <<kvm_cpu_has_injectable_intr>> if (!is_guest_mode(v) && kvm_vcpu_apicv_active(v))
++ *   - arch/x86/kvm/lapic.c|299| <<kvm_can_post_timer_interrupt>> return pi_inject_timer && kvm_vcpu_apicv_active(vcpu) &&
++ *   - arch/x86/kvm/svm/avic.c|933| <<avic_pi_update_irte>> kvm_vcpu_apicv_active(&svm->vcpu)) {
++ *   - arch/x86/kvm/svm/avic.c|1120| <<avic_refresh_virtual_apic_mode>> if (kvm_vcpu_apicv_active(vcpu)) {
++ *   - arch/x86/kvm/svm/avic.c|1138| <<avic_refresh_apicv_exec_ctrl>> bool activated = kvm_vcpu_apicv_active(vcpu);
++ *   - arch/x86/kvm/svm/avic.c|1155| <<avic_vcpu_blocking>> if (!kvm_vcpu_apicv_active(vcpu))
++ *   - arch/x86/kvm/svm/avic.c|1176| <<avic_vcpu_unblocking>> if (!kvm_vcpu_apicv_active(vcpu))
++ *   - arch/x86/kvm/svm/nested.c|829| <<enter_svm_guest_mode>> if (kvm_vcpu_apicv_active(vcpu))
++ *   - arch/x86/kvm/svm/svm.c|1246| <<init_vmcb>> if (!kvm_vcpu_apicv_active(vcpu))
++ *   - arch/x86/kvm/svm/svm.c|1360| <<init_vmcb>> if (kvm_vcpu_apicv_active(vcpu))
++ *   - arch/x86/kvm/svm/svm.c|1560| <<svm_vcpu_load>> if (kvm_vcpu_apicv_active(vcpu))
++ *   - arch/x86/kvm/svm/svm.c|1566| <<svm_vcpu_put>> if (kvm_vcpu_apicv_active(vcpu))
++ *   - arch/x86/kvm/svm/svm.c|4004| <<sync_lapic_to_cr8>> kvm_vcpu_apicv_active(vcpu))
++ *   - arch/x86/kvm/vmx/nested.c|3479| <<nested_vmx_enter_non_root_mode>> if (likely(!evaluate_pending_interrupts) && kvm_vcpu_apicv_active(vcpu))
++ *   - arch/x86/kvm/vmx/vmx.c|4055| <<vmx_update_msr_bitmap_x2apic>> if (enable_apicv && kvm_vcpu_apicv_active(vcpu))
++ *   - arch/x86/kvm/vmx/vmx.c|4388| <<vmx_pin_based_exec_ctrl>> if (!kvm_vcpu_apicv_active(&vmx->vcpu))
++ *   - arch/x86/kvm/vmx/vmx.c|4454| <<vmx_refresh_apicv_exec_ctrl>> if (kvm_vcpu_apicv_active(vcpu)) {
++ *   - arch/x86/kvm/vmx/vmx.c|4523| <<vmx_tertiary_exec_control>> if (!enable_ipiv || !kvm_vcpu_apicv_active(&vmx->vcpu))
++ *   - arch/x86/kvm/vmx/vmx.c|4616| <<vmx_secondary_exec_control>> if (!kvm_vcpu_apicv_active(vcpu))
++ *   - arch/x86/kvm/vmx/vmx.c|6972| <<vmx_sync_pir_to_irr>> if (!is_guest_mode(vcpu) && kvm_vcpu_apicv_active(vcpu))
++ *   - arch/x86/kvm/vmx/vmx.c|6982| <<vmx_load_eoi_exitmap>> if (!kvm_vcpu_apicv_active(vcpu))
++ *   - arch/x86/kvm/x86.c|11164| <<vcpu_enter_guest>> WARN_ON_ONCE((kvm_vcpu_apicv_activated(vcpu) != kvm_vcpu_apicv_active(vcpu)) &&
++ *   - arch/x86/kvm/x86.c|13284| <<kvm_arch_dy_has_pending_interrupt>> return kvm_vcpu_apicv_active(vcpu) &&
++ */
+ static inline bool kvm_vcpu_apicv_active(struct kvm_vcpu *vcpu)
+ {
+ 	return lapic_in_kernel(vcpu) && vcpu->arch.apic->apicv_active;
+diff --git a/arch/x86/kvm/vmx/posted_intr.c b/arch/x86/kvm/vmx/posted_intr.c
+index ec08fa3ca..fab14817a 100644
+--- a/arch/x86/kvm/vmx/posted_intr.c
++++ b/arch/x86/kvm/vmx/posted_intr.c
+@@ -12,6 +12,56 @@
+ #include "trace.h"
+ #include "vmx.h"
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|8314| <<vmx_hardware_unsetup>> kvm_set_posted_intr_wakeup_handler(NULL);
++ *   - arch/x86/kvm/vmx/vmx.c|8624| <<vmx_hardware_setup>> kvm_set_posted_intr_wakeup_handler(pi_wakeup_handler);
++ *
++ * 311 #if IS_ENABLED(CONFIG_KVM)
++ * 312 static void dummy_handler(void) {}
++ * 313 static void (*kvm_posted_intr_wakeup_handler)(void) = dummy_handler;
++ * 314
++ * 315 void kvm_set_posted_intr_wakeup_handler(void (*handler)(void))
++ * 316 {
++ * 317         if (handler)
++ * 318                 kvm_posted_intr_wakeup_handler = handler;
++ * 319         else {
++ * 320                 kvm_posted_intr_wakeup_handler = dummy_handler;
++ * 321                 synchronize_rcu();
++ * 322         }
++ * 323 }
++ * 324 EXPORT_SYMBOL_GPL(kvm_set_posted_intr_wakeup_handler);
++ * 325
++ * 326 //
++ * 327 // Handler for POSTED_INTERRUPT_VECTOR.
++ * 328 //
++ * 329 DEFINE_IDTENTRY_SYSVEC_SIMPLE(sysvec_kvm_posted_intr_ipi)
++ * 330 {
++ * 331         apic_eoi();
++ * 332         inc_irq_stat(kvm_posted_intr_ipis);
++ * 333 }
++ * 334
++ * 335 //
++ * 336 // Handler for POSTED_INTERRUPT_WAKEUP_VECTOR.
++ * 337 //
++ * 338 DEFINE_IDTENTRY_SYSVEC(sysvec_kvm_posted_intr_wakeup_ipi)
++ * 339 {
++ * 340         apic_eoi();
++ * 341         inc_irq_stat(kvm_posted_intr_wakeup_ipis);
++ * 342         kvm_posted_intr_wakeup_handler();
++ * 343 }
++ * 344
++ * 345 //
++ * 346 // Handler for POSTED_INTERRUPT_NESTED_VECTOR.
++ * 347 //
++ * 348 DEFINE_IDTENTRY_SYSVEC_SIMPLE(sysvec_kvm_posted_intr_nested_ipi)
++ * 349 {
++ * 350         apic_eoi();
++ * 351         inc_irq_stat(kvm_posted_intr_nested_ipis);
++ * 352 }
++ * 353 #endif
++ */
++
+ /*
+  * Maintain a per-CPU list of vCPUs that need to be awakened by wakeup_handler()
+  * when a WAKEUP_VECTOR interrupted is posted.  vCPUs are added to the list when
+@@ -21,6 +71,13 @@
+  * wake the target vCPUs.  vCPUs are removed from the list and the notification
+  * vector is reset when the vCPU is scheduled in.
+  */
++/*
++ * 在以下使用wakeup_vcpus_on_cpu:
++ *   - arch/x86/kvm/vmx/posted_intr.c|24| <<global>> static DEFINE_PER_CPU(struct list_head, wakeup_vcpus_on_cpu);
++ *   - arch/x86/kvm/vmx/posted_intr.c|157| <<pi_enable_wakeup_handler>> list_add_tail(&vmx->pi_wakeup_list, &per_cpu(wakeup_vcpus_on_cpu, vcpu->cpu));
++ *   - arch/x86/kvm/vmx/posted_intr.c|221| <<pi_wakeup_handler>> struct list_head *wakeup_list = &per_cpu(wakeup_vcpus_on_cpu, cpu);
++ *   - arch/x86/kvm/vmx/posted_intr.c|236| <<pi_init_cpu>> INIT_LIST_HEAD(&per_cpu(wakeup_vcpus_on_cpu, cpu));
++ */
+ static DEFINE_PER_CPU(struct list_head, wakeup_vcpus_on_cpu);
+ /*
+  * Protect the per-CPU list with a per-CPU spinlock to handle task migration.
+@@ -29,8 +86,26 @@ static DEFINE_PER_CPU(struct list_head, wakeup_vcpus_on_cpu);
+  * CPU.  IRQs must be disabled when taking this lock, otherwise deadlock will
+  * occur if a wakeup IRQ arrives and attempts to acquire the lock.
+  */
++/*
++ * 在以下使用wakeup_vcpus_on_cpu_lock:
++ *   - arch/x86/kvm/vmx/posted_intr.c|32| <<global>> static DEFINE_PER_CPU(raw_spinlock_t, wakeup_vcpus_on_cpu_lock);
++ *   - arch/x86/kvm/vmx/posted_intr.c|92| <<vmx_vcpu_pi_load>> raw_spin_lock(&per_cpu(wakeup_vcpus_on_cpu_lock, vcpu->cpu));
++ *   - arch/x86/kvm/vmx/posted_intr.c|94| <<vmx_vcpu_pi_load>> raw_spin_unlock(&per_cpu(wakeup_vcpus_on_cpu_lock, vcpu->cpu));
++ *   - arch/x86/kvm/vmx/posted_intr.c|155| <<pi_enable_wakeup_handler>> raw_spin_lock(&per_cpu(wakeup_vcpus_on_cpu_lock, vcpu->cpu));
++ *   - arch/x86/kvm/vmx/posted_intr.c|158| <<pi_enable_wakeup_handler>> raw_spin_unlock(&per_cpu(wakeup_vcpus_on_cpu_lock, vcpu->cpu));
++ *   - arch/x86/kvm/vmx/posted_intr.c|222| <<pi_wakeup_handler>> raw_spinlock_t *spinlock = &per_cpu(wakeup_vcpus_on_cpu_lock, cpu);
++ *   - arch/x86/kvm/vmx/posted_intr.c|237| <<pi_init_cpu>> raw_spin_lock_init(&per_cpu(wakeup_vcpus_on_cpu_lock, cpu));
++ */
+ static DEFINE_PER_CPU(raw_spinlock_t, wakeup_vcpus_on_cpu_lock);
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/vmx/posted_intr.c|55| <<vmx_vcpu_pi_load>> struct pi_desc *pi_desc = vcpu_to_pi_desc(vcpu);
++ *   - arch/x86/kvm/vmx/posted_intr.c|148| <<pi_enable_wakeup_handler>> struct pi_desc *pi_desc = vcpu_to_pi_desc(vcpu);
++ *   - arch/x86/kvm/vmx/posted_intr.c|198| <<vmx_vcpu_pi_put>> struct pi_desc *pi_desc = vcpu_to_pi_desc(vcpu);
++ *   - arch/x86/kvm/vmx/posted_intr.c|242| <<pi_has_pending_interrupt>> struct pi_desc *pi_desc = vcpu_to_pi_desc(vcpu);
++ *   - arch/x86/kvm/vmx/posted_intr.c|337| <<vmx_pi_update_irte>> vcpu_info.pi_desc_addr = __pa(vcpu_to_pi_desc(vcpu));
++ */
+ static inline struct pi_desc *vcpu_to_pi_desc(struct kvm_vcpu *vcpu)
+ {
+ 	return &(to_vmx(vcpu)->pi_desc);
+@@ -50,6 +125,10 @@ static int pi_try_set_control(struct pi_desc *pi_desc, u64 *pold, u64 new)
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/vmx/vmx.c|1491| <<vmx_vcpu_load>> vmx_vcpu_pi_load(vcpu, cpu);
++ */
+ void vmx_vcpu_pi_load(struct kvm_vcpu *vcpu, int cpu)
+ {
+ 	struct pi_desc *pi_desc = vcpu_to_pi_desc(vcpu);
+@@ -100,6 +179,26 @@ void vmx_vcpu_pi_load(struct kvm_vcpu *vcpu, int cpu)
+ 
+ 	old.control = READ_ONCE(pi_desc->control);
+ 	do {
++		/*
++		 * 12 struct pi_desc {
++		 * 13         union {
++		 * 14                 u32 pir[8];     // Posted interrupt requested
++		 * 15                 u64 pir64[4];
++		 * 16         };      
++		 * 17         union {
++		 * 18                 struct {
++		 * 19                         u16     notifications; // Suppress and outstanding bits
++		 * 20                         u8      nv;
++		 * 21                         u8      rsvd_2;
++		 * 22                         u32     ndst;
++		 * 23                 };
++		 * 24                 u64 control;
++		 * 25         };      
++		 * 26         u32 rsvd[6];
++		 * 27 } __aligned(64);
++		 *
++		 * struct pi_desc old, new;
++		 */
+ 		new.control = old.control;
+ 
+ 		/*
+@@ -143,6 +242,10 @@ static bool vmx_can_use_vtd_pi(struct kvm *kvm)
+  * Put the vCPU on this pCPU's list of vCPUs that needs to be awakened and set
+  * WAKEUP as the notification vector in the PI descriptor.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/vmx/posted_intr.c|204| <<vmx_vcpu_pi_put>> pi_enable_wakeup_handler(vcpu);
++ */
+ static void pi_enable_wakeup_handler(struct kvm_vcpu *vcpu)
+ {
+ 	struct pi_desc *pi_desc = vcpu_to_pi_desc(vcpu);
+@@ -153,6 +256,13 @@ static void pi_enable_wakeup_handler(struct kvm_vcpu *vcpu)
+ 	local_irq_save(flags);
+ 
+ 	raw_spin_lock(&per_cpu(wakeup_vcpus_on_cpu_lock, vcpu->cpu));
++	/*
++	 * 在以下使用wakeup_vcpus_on_cpu:
++	 *   - arch/x86/kvm/vmx/posted_intr.c|24| <<global>> static DEFINE_PER_CPU(struct list_head, wakeup_vcpus_on_cpu);
++	 *   - arch/x86/kvm/vmx/posted_intr.c|157| <<pi_enable_wakeup_handler>> list_add_tail(&vmx->pi_wakeup_list, &per_cpu(wakeup_vcpus_on_cpu, vcpu->cpu));
++	 *   - arch/x86/kvm/vmx/posted_intr.c|221| <<pi_wakeup_handler>> struct list_head *wakeup_list = &per_cpu(wakeup_vcpus_on_cpu, cpu);
++	 *   - arch/x86/kvm/vmx/posted_intr.c|236| <<pi_init_cpu>> INIT_LIST_HEAD(&per_cpu(wakeup_vcpus_on_cpu, cpu));
++	 */
+ 	list_add_tail(&vmx->pi_wakeup_list,
+ 		      &per_cpu(wakeup_vcpus_on_cpu, vcpu->cpu));
+ 	raw_spin_unlock(&per_cpu(wakeup_vcpus_on_cpu_lock, vcpu->cpu));
+@@ -218,10 +328,27 @@ void vmx_vcpu_pi_put(struct kvm_vcpu *vcpu)
+ void pi_wakeup_handler(void)
+ {
+ 	int cpu = smp_processor_id();
++	/*
++	 * 在以下使用wakeup_vcpus_on_cpu:
++	 *   - arch/x86/kvm/vmx/posted_intr.c|24| <<global>> static DEFINE_PER_CPU(struct list_head, wakeup_vcpus_on_cpu);
++	 *   - arch/x86/kvm/vmx/posted_intr.c|157| <<pi_enable_wakeup_handler>> list_add_tail(&vmx->pi_wakeup_list, &per_cpu(wakeup_vcpus_on_cpu, vcpu->cpu));
++	 *   - arch/x86/kvm/vmx/posted_intr.c|221| <<pi_wakeup_handler>> struct list_head *wakeup_list = &per_cpu(wakeup_vcpus_on_cpu, cpu);
++	 *   - arch/x86/kvm/vmx/posted_intr.c|236| <<pi_init_cpu>> INIT_LIST_HEAD(&per_cpu(wakeup_vcpus_on_cpu, cpu));
++	 */
+ 	struct list_head *wakeup_list = &per_cpu(wakeup_vcpus_on_cpu, cpu);
+ 	raw_spinlock_t *spinlock = &per_cpu(wakeup_vcpus_on_cpu_lock, cpu);
+ 	struct vcpu_vmx *vmx;
+ 
++	/*
++	 * 注释
++	 * Maintain a per-CPU list of vCPUs that need to be awakened by wakeup_handler()
++	 * when a WAKEUP_VECTOR interrupted is posted.  vCPUs are added to the list when
++	 * the vCPU is scheduled out and is blocking (e.g. in HLT) with IRQs enabled.
++	 * The vCPUs posted interrupt descriptor is updated at the same time to set its
++	 * notification vector to WAKEUP_VECTOR, so that posted interrupt from devices
++	 * wake the target vCPUs.  vCPUs are removed from the list and the notification
++	 * vector is reset when the vCPU is scheduled in.
++	 */
+ 	raw_spin_lock(spinlock);
+ 	list_for_each_entry(vmx, wakeup_list, pi_wakeup_list) {
+ 
+@@ -233,6 +360,13 @@ void pi_wakeup_handler(void)
+ 
+ void __init pi_init_cpu(int cpu)
+ {
++	/*
++	 * 在以下使用wakeup_vcpus_on_cpu:
++	 *   - arch/x86/kvm/vmx/posted_intr.c|24| <<global>> static DEFINE_PER_CPU(struct list_head, wakeup_vcpus_on_cpu);
++	 *   - arch/x86/kvm/vmx/posted_intr.c|157| <<pi_enable_wakeup_handler>> list_add_tail(&vmx->pi_wakeup_list, &per_cpu(wakeup_vcpus_on_cpu, vcpu->cpu));
++	 *   - arch/x86/kvm/vmx/posted_intr.c|221| <<pi_wakeup_handler>> struct list_head *wakeup_list = &per_cpu(wakeup_vcpus_on_cpu, cpu);
++	 *   - arch/x86/kvm/vmx/posted_intr.c|236| <<pi_init_cpu>> INIT_LIST_HEAD(&per_cpu(wakeup_vcpus_on_cpu, cpu));
++	 */
+ 	INIT_LIST_HEAD(&per_cpu(wakeup_vcpus_on_cpu, cpu));
+ 	raw_spin_lock_init(&per_cpu(wakeup_vcpus_on_cpu_lock, cpu));
+ }
+@@ -269,6 +403,12 @@ void vmx_pi_start_assignment(struct kvm *kvm)
+  * @set: set or unset PI
+  * returns 0 on success, < 0 on failure
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|13619| <<kvm_arch_irq_bypass_add_producer>> ret = static_call(kvm_x86_pi_update_irte)(irqfd->kvm,
++ *   - arch/x86/kvm/x86.c|13644| <<kvm_arch_irq_bypass_del_producer>> ret = static_call(kvm_x86_pi_update_irte)(irqfd->kvm, prod->irq, irqfd->gsi, 0);
++ *   - arch/x86/kvm/x86.c|13655| <<kvm_arch_update_irqfd_routing>> return static_call(kvm_x86_pi_update_irte)(kvm, host_irq, guest_irq, set);
++ */
+ int vmx_pi_update_irte(struct kvm *kvm, unsigned int host_irq,
+ 		       uint32_t guest_irq, bool set)
+ {
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index b3c83c06f..800e3281b 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -4251,6 +4251,11 @@ static int vmx_deliver_posted_interrupt(struct kvm_vcpu *vcpu, int vector)
+ 	if (!r)
+ 		return 0;
+ 
++	/*
++	 * 在以下设置kvm_lapic->apicv_active:
++	 *   - arch/x86/kvm/lapic.c|2919| <<kvm_create_lapic>> apic->apicv_active = true;
++	 *   - arch/x86/kvm/x86.c|10671| <<__kvm_vcpu_update_apicv>> apic->apicv_active = activate;
++	 */
+ 	/* Note, this is called iff the local APIC is in-kernel. */
+ 	if (!vcpu->arch.apic->apicv_active)
+ 		return -1;
+@@ -4272,6 +4277,9 @@ static int vmx_deliver_posted_interrupt(struct kvm_vcpu *vcpu, int vector)
+ 	return 0;
+ }
+ 
++/*
++ * arch/x86/kvm/lapic.c|1934| <<__apic_accept_irq>> static_call(kvm_x86_deliver_interrupt)(apic, delivery_mode, trig_mode, vector);
++ */
+ void vmx_deliver_interrupt(struct kvm_lapic *apic, int delivery_mode,
+ 			   int trig_mode, int vector)
+ {
+@@ -6912,6 +6920,14 @@ void vmx_hwapic_irr_update(struct kvm_vcpu *vcpu, int max_irr)
+ 		vmx_set_rvi(max_irr);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/lapic.c|1324| <<apic_has_interrupt_for_ppr>> highest_irr = static_call(kvm_x86_sync_pir_to_irr)(apic->vcpu);
++ *   - arch/x86/kvm/x86.c|5122| <<kvm_vcpu_ioctl_get_lapic>> static_call_cond(kvm_x86_sync_pir_to_irr)(vcpu);
++ *   - arch/x86/kvm/x86.c|10807| <<vcpu_scan_ioapic>> static_call_cond(kvm_x86_sync_pir_to_irr)(vcpu);
++ *   - arch/x86/kvm/x86.c|11090| <<vcpu_enter_guest>> if (kvm_lapic_enabled(vcpu)) static_call_cond(kvm_x86_sync_pir_to_irr)(vcpu);
++ *   - arch/x86/kvm/x86.c|11139| <<vcpu_enter_guest>> if (kvm_lapic_enabled(vcpu)) static_call_cond(kvm_x86_sync_pir_to_irr)(vcpu);
++ */
+ int vmx_sync_pir_to_irr(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+@@ -6928,6 +6944,12 @@ int vmx_sync_pir_to_irr(struct kvm_vcpu *vcpu)
+ 		 * But on x86 this is just a compiler barrier anyway.
+ 		 */
+ 		smp_mb__after_atomic();
++		/*
++		 * struct vcpu_vmx *vmx:
++		 * -> struct pi_desc pi_desc;
++		 *    -> u32 pir[8];     // Posted interrupt requested
++		 *    -> u64 pir64[4];
++		 */
+ 		got_posted_interrupt =
+ 			kvm_apic_update_irr(vcpu, vmx->pi_desc.pir, &max_irr);
+ 	} else {
+diff --git a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
+index 7b64e271a..432cf17ad 100644
+--- a/arch/x86/kvm/vmx/vmx.h
++++ b/arch/x86/kvm/vmx/vmx.h
+@@ -322,9 +322,32 @@ struct vcpu_vmx {
+ 
+ 	union vmx_exit_reason exit_reason;
+ 
++	/*
++	 * 在以下使用vcpu_vmx->pi_desc:
++	 *   - arch/x86/kvm/vmx/posted_intr.c|111| <<vcpu_to_pi_desc>> return &(to_vmx(vcpu)->pi_desc);
++	 *   - arch/x86/kvm/vmx/posted_intr.c|340| <<pi_wakeup_handler>> if (pi_test_on(&vmx->pi_desc))
++	 *   - arch/x86/kvm/vmx/vmx.c|4263| <<vmx_deliver_posted_interrupt>> if (pi_test_and_set_pir(vector, &vmx->pi_desc))
++	 *   - arch/x86/kvm/vmx/vmx.c|4267| <<vmx_deliver_posted_interrupt>> if (pi_test_and_set_on(&vmx->pi_desc))
++	 *   - arch/x86/kvm/vmx/vmx.c|4752| <<init_vmcs>> vmcs_write64(POSTED_INTR_DESC_ADDR, __pa((&vmx->pi_desc)));
++	 *   - arch/x86/kvm/vmx/vmx.c|4863| <<__vmx_vcpu_reset>> vmx->pi_desc.nv = POSTED_INTR_VECTOR;
++	 *   - arch/x86/kvm/vmx/vmx.c|4864| <<__vmx_vcpu_reset>> __pi_set_sn(&vmx->pi_desc);
++	 *   - arch/x86/kvm/vmx/vmx.c|6937| <<vmx_sync_pir_to_irr>> if (pi_test_on(&vmx->pi_desc)) {
++	 *   - arch/x86/kvm/vmx/vmx.c|6938| <<vmx_sync_pir_to_irr>> pi_clear_on(&vmx->pi_desc);
++	 *   - arch/x86/kvm/vmx/vmx.c|6951| <<vmx_sync_pir_to_irr>> kvm_apic_update_irr(vcpu, vmx->pi_desc.pir, &max_irr);
++	 *   - arch/x86/kvm/vmx/vmx.c|6995| <<vmx_apicv_pre_state_restore>> pi_clear_on(&vmx->pi_desc);
++	 *   - arch/x86/kvm/vmx/vmx.c|6996| <<vmx_apicv_pre_state_restore>> memset(vmx->pi_desc.pir, 0, sizeof(vmx->pi_desc.pir));
++	 *   - arch/x86/kvm/vmx/vmx.c|7638| <<vmx_vcpu_create>>WRITE_ONCE(to_kvm_vmx(vcpu->kvm)->pid_table[vcpu->vcpu_id], __pa(&vmx->pi_desc) | PID_TABLE_ENTRY_VALID);
++	 */
+ 	/* Posted interrupt descriptor */
+ 	struct pi_desc pi_desc;
+ 
++	/*
++	 * 在以下使用vcpu_vmx->pi_wakeup_list:
++	 *   - arch/x86/kvm/vmx/posted_intr.c|93| <<vmx_vcpu_pi_load>> list_del(&vmx->pi_wakeup_list);
++	 *   - arch/x86/kvm/vmx/posted_intr.c|156| <<pi_enable_wakeup_handler>> list_add_tail(&vmx->pi_wakeup_list,
++	 *   - arch/x86/kvm/vmx/posted_intr.c|226| <<pi_wakeup_handler>> list_for_each_entry(vmx, wakeup_list, pi_wakeup_list) {
++	 *   - arch/x86/kvm/vmx/vmx.c|7526| <<vmx_vcpu_create>> INIT_LIST_HEAD(&vmx->pi_wakeup_list);
++	 */
+ 	/* Used if this vCPU is waiting for PI notification wakeup. */
+ 	struct list_head pi_wakeup_list;
+ 
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 0763a0f72..e74d38d1c 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -6561,6 +6561,15 @@ int kvm_vm_ioctl_enable_cap(struct kvm *kvm,
+ 		if (cap->args[0] & ~KVM_X2APIC_API_VALID_FLAGS)
+ 			break;
+ 
++		/*
++		 * 在以下使用kvm_arch->x2apic_format:
++		 *   - arch/x86/kvm/irq_comm.c|111| <<kvm_set_msi_irq>> trace_kvm_msi_set_irq(msg.address_lo | (kvm->arch.x2apic_format ?
++		 *   - arch/x86/kvm/irq_comm.c|114| <<kvm_set_msi_irq>> irq->dest_id = x86_msi_msg_get_destid(&msg, kvm->arch.x2apic_format);
++		 *   - arch/x86/kvm/irq_comm.c|128| <<kvm_msi_route_invalid>> return kvm->arch.x2apic_format && (e->msi.address_hi & 0xff);
++		 *   - arch/x86/kvm/lapic.c|328| <<kvm_recalculate_phys_map>> if (vcpu->kvm->arch.x2apic_format) {
++		 *   - arch/x86/kvm/lapic.c|3095| <<kvm_apic_state_fixup>> if (vcpu->kvm->arch.x2apic_format) {
++		 *   - arch/x86/kvm/x86.c|6565| <<kvm_vm_ioctl_enable_cap>> if (cap->args[0] & KVM_X2APIC_API_USE_32BIT_IDS) kvm->arch.x2apic_format = true;
++		 */
+ 		if (cap->args[0] & KVM_X2APIC_API_USE_32BIT_IDS)
+ 			kvm->arch.x2apic_format = true;
+ 		if (cap->args[0] & KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK)
+@@ -9991,14 +10000,48 @@ static void kvm_pv_kick_cpu_op(struct kvm *kvm, int apicid)
+ 	kvm_irq_delivery_to_apic(kvm, NULL, &lapic_irq, NULL);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|9998| <<global>> EXPORT_SYMBOL_GPL(kvm_apicv_activated);
++ *   - arch/x86/kvm/ioapic.c|229| <<ioapic_set_irq>> if (edge && kvm_apicv_activated(ioapic->kvm))
++ *   - arch/x86/kvm/mmu/mmu.c|4410| <<kvm_faultin_pfn>> if (!kvm_apicv_activated(vcpu->kvm))
++ *   - arch/x86/kvm/svm/avic.c|256| <<avic_init_vmcb>> if (kvm_apicv_activated(svm->vcpu.kvm))
++ *   - arch/x86/kvm/svm/avic.c|290| <<avic_init_backing_page>> if (kvm_apicv_activated(vcpu->kvm)) {
++ *   - arch/x86/kvm/svm/nested.c|1160| <<nested_svm_vmexit>> if (kvm_apicv_activated(vcpu->kvm))
++ *   - arch/x86/kvm/svm/nested.c|1244| <<svm_leave_nested>> if (kvm_apicv_activated(vcpu->kvm))
++ */
+ bool kvm_apicv_activated(struct kvm *kvm)
+ {
++	/*
++	 * 在以下使用kvm_arch->apicv_inhibit_reasons(x86):
++	 *   - arch/x86/kvm/x86.c|9996| <<kvm_apicv_activated>> return (READ_ONCE(kvm->arch.apicv_inhibit_reasons) == 0);
++	 *   - arch/x86/kvm/x86.c|10002| <<kvm_vcpu_apicv_activated>> ulong vm_reasons = READ_ONCE(vcpu->kvm->arch.apicv_inhibit_reasons);
++	 *   - arch/x86/kvm/x86.c|10025| <<kvm_apicv_init>> set_or_clear_apicv_inhibit(&kvm->arch.apicv_inhibit_reasons, reason, true);
++	 *   - arch/x86/kvm/x86.c|10679| <<__kvm_set_or_clear_apicv_inhibit>> old = new = kvm->arch.apicv_inhibit_reasons;
++	 *   - arch/x86/kvm/x86.c|10697| <<__kvm_set_or_clear_apicv_inhibit>> kvm->arch.apicv_inhibit_reasons = new;
++	 *   - arch/x86/kvm/x86.c|10706| <<__kvm_set_or_clear_apicv_inhibit>> kvm->arch.apicv_inhibit_reasons = new;
++	 */
+ 	return (READ_ONCE(kvm->arch.apicv_inhibit_reasons) == 0);
+ }
+ EXPORT_SYMBOL_GPL(kvm_apicv_activated);
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/svm/svm.c|1636| <<svm_set_vintr>> WARN_ON(kvm_vcpu_apicv_activated(&svm->vcpu));
++ *   - arch/x86/kvm/x86.c|10621| <<__kvm_vcpu_update_apicv>> activate = kvm_vcpu_apicv_activated(vcpu) && (kvm_get_apic_mode(vcpu) != LAPIC_MODE_DISABLED);
++ *   - arch/x86/kvm/x86.c|11053| <<vcpu_enter_guest>> WARN_ON_ONCE((kvm_vcpu_apicv_activated(vcpu) != kvm_vcpu_apicv_active(vcpu)) && (kvm_get_apic_mode(vcpu) != LAPIC_MODE_DISABLED));
++ */
+ bool kvm_vcpu_apicv_activated(struct kvm_vcpu *vcpu)
+ {
++	/*
++	 * 在以下使用kvm_arch->apicv_inhibit_reasons(x86):
++	 *   - arch/x86/kvm/x86.c|9996| <<kvm_apicv_activated>> return (READ_ONCE(kvm->arch.apicv_inhibit_reasons) == 0);
++	 *   - arch/x86/kvm/x86.c|10002| <<kvm_vcpu_apicv_activated>> ulong vm_reasons = READ_ONCE(vcpu->kvm->arch.apicv_inhibit_reasons);
++	 *   - arch/x86/kvm/x86.c|10025| <<kvm_apicv_init>> set_or_clear_apicv_inhibit(&kvm->arch.apicv_inhibit_reasons, reason, true);
++	 *   - arch/x86/kvm/x86.c|10679| <<__kvm_set_or_clear_apicv_inhibit>> old = new = kvm->arch.apicv_inhibit_reasons;
++	 *   - arch/x86/kvm/x86.c|10697| <<__kvm_set_or_clear_apicv_inhibit>> kvm->arch.apicv_inhibit_reasons = new;
++	 *   - arch/x86/kvm/x86.c|10706| <<__kvm_set_or_clear_apicv_inhibit>> kvm->arch.apicv_inhibit_reasons = new;
++	 */
+ 	ulong vm_reasons = READ_ONCE(vcpu->kvm->arch.apicv_inhibit_reasons);
+ 	ulong vcpu_reasons = static_call(kvm_x86_vcpu_get_apicv_inhibit_reasons)(vcpu);
+ 
+@@ -10006,6 +10049,11 @@ bool kvm_vcpu_apicv_activated(struct kvm_vcpu *vcpu)
+ }
+ EXPORT_SYMBOL_GPL(kvm_vcpu_apicv_activated);
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|10025| <<kvm_apicv_init>> set_or_clear_apicv_inhibit(&kvm->arch.apicv_inhibit_reasons, reason, true);
++ *   - arch/x86/kvm/x86.c|10681| <<__kvm_set_or_clear_apicv_inhibit>> set_or_clear_apicv_inhibit(&new, reason, set);
++ */
+ static void set_or_clear_apicv_inhibit(unsigned long *inhibits,
+ 				       enum kvm_apicv_inhibit reason, bool set)
+ {
+@@ -10338,6 +10386,10 @@ static void kvm_inject_exception(struct kvm_vcpu *vcpu)
+  * ordering between that side effect, the instruction completing, _and_ the
+  * delivery of the asynchronous event.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|11033| <<vcpu_enter_guest>> r = kvm_check_and_inject_events(vcpu, &req_immediate_exit);
++ */
+ static int kvm_check_and_inject_events(struct kvm_vcpu *vcpu,
+ 				       bool *req_immediate_exit)
+ {
+@@ -10502,6 +10554,11 @@ static int kvm_check_and_inject_events(struct kvm_vcpu *vcpu,
+ 		if (r < 0)
+ 			goto out;
+ 		if (r) {
++			/*
++			 * called by:
++			 *   - arch/x86/kvm/vmx/nested.c|4937| <<nested_vmx_vmexit>> int irq = kvm_cpu_get_interrupt(vcpu);
++			 *   - arch/x86/kvm/x86.c|10544| <<kvm_check_and_inject_events>> int irq = kvm_cpu_get_interrupt(vcpu);
++			 */
+ 			int irq = kvm_cpu_get_interrupt(vcpu);
+ 
+ 			if (!WARN_ON_ONCE(irq == -1)) {
+@@ -10593,11 +10650,24 @@ void kvm_make_scan_ioapic_request_mask(struct kvm *kvm,
+ 	kvm_make_vcpus_request_mask(kvm, KVM_REQ_SCAN_IOAPIC, vcpu_bitmap);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/ioapic.c|313| <<kvm_arch_post_irq_ack_notifier_list_update>> kvm_make_scan_ioapic_request(kvm);
++ *   - arch/x86/kvm/ioapic.c|436| <<ioapic_write_indirect>> kvm_make_scan_ioapic_request(ioapic->kvm);
++ *   - arch/x86/kvm/ioapic.c|773| <<kvm_set_ioapic>> kvm_make_scan_ioapic_request(kvm);
++ *   - arch/x86/kvm/irq_comm.c|409| <<kvm_arch_post_irq_routing_update>> kvm_make_scan_ioapic_request(kvm);
++ *   - arch/x86/kvm/lapic.c|504| <<kvm_recalculate_apic_map>> kvm_make_scan_ioapic_request(kvm);
++ */
+ void kvm_make_scan_ioapic_request(struct kvm *kvm)
+ {
+ 	kvm_make_all_cpus_request(kvm, KVM_REQ_SCAN_IOAPIC);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/svm/nested.c|1161| <<nested_svm_vmexit>> __kvm_vcpu_update_apicv(vcpu);
++ *   - arch/x86/kvm/x86.c|10687| <<kvm_vcpu_update_apicv>> __kvm_vcpu_update_apicv(vcpu);
++ */
+ void __kvm_vcpu_update_apicv(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_lapic *apic = vcpu->arch.apic;
+@@ -10613,6 +10683,11 @@ void __kvm_vcpu_update_apicv(struct kvm_vcpu *vcpu)
+ 	activate = kvm_vcpu_apicv_activated(vcpu) &&
+ 		   (kvm_get_apic_mode(vcpu) != LAPIC_MODE_DISABLED);
+ 
++	/*
++	 * 在以下设置kvm_lapic->apicv_active:
++	 *   - arch/x86/kvm/lapic.c|2919| <<kvm_create_lapic>> apic->apicv_active = true;
++	 *   - arch/x86/kvm/x86.c|10671| <<__kvm_vcpu_update_apicv>> apic->apicv_active = activate;
++	 */
+ 	if (apic->apicv_active == activate)
+ 		goto out;
+ 
+@@ -10635,6 +10710,10 @@ void __kvm_vcpu_update_apicv(struct kvm_vcpu *vcpu)
+ }
+ EXPORT_SYMBOL_GPL(__kvm_vcpu_update_apicv);
+ 
++/*
++ * 处理KVM_REQ_APICV_UPDATE:
++ *   - arch/x86/kvm/x86.c|10978| <<vcpu_enter_guest(KVM_REQ_APICV_UPDATE)>> kvm_vcpu_update_apicv(vcpu);
++ */
+ static void kvm_vcpu_update_apicv(struct kvm_vcpu *vcpu)
+ {
+ 	if (!lapic_in_kernel(vcpu))
+@@ -10658,6 +10737,12 @@ static void kvm_vcpu_update_apicv(struct kvm_vcpu *vcpu)
+ 	__kvm_vcpu_update_apicv(vcpu);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/hyperv.c|148| <<synic_update_vector>> __kvm_set_or_clear_apicv_inhibit(vcpu->kvm, APICV_INHIBIT_REASON_HYPERV, !!hv->synic_auto_eoi_used);
++ *   - arch/x86/kvm/x86.c|10717| <<kvm_set_or_clear_apicv_inhibit>> __kvm_set_or_clear_apicv_inhibit(kvm, reason, set);
++ *   - arch/x86/kvm/x86.c|11956| <<kvm_arch_vcpu_guestdbg_update_apicv_inhibit>> __kvm_set_or_clear_apicv_inhibit(kvm, APICV_INHIBIT_REASON_BLOCKIRQ, set);
++ */
+ void __kvm_set_or_clear_apicv_inhibit(struct kvm *kvm,
+ 				      enum kvm_apicv_inhibit reason, bool set)
+ {
+@@ -10668,8 +10753,22 @@ void __kvm_set_or_clear_apicv_inhibit(struct kvm *kvm,
+ 	if (!(kvm_x86_ops.required_apicv_inhibits & BIT(reason)))
+ 		return;
+ 
++	/*
++	 * 在以下使用kvm_arch->apicv_inhibit_reasons(x86):
++	 *   - arch/x86/kvm/x86.c|9996| <<kvm_apicv_activated>> return (READ_ONCE(kvm->arch.apicv_inhibit_reasons) == 0);
++	 *   - arch/x86/kvm/x86.c|10002| <<kvm_vcpu_apicv_activated>> ulong vm_reasons = READ_ONCE(vcpu->kvm->arch.apicv_inhibit_reasons);
++	 *   - arch/x86/kvm/x86.c|10025| <<kvm_apicv_init>> set_or_clear_apicv_inhibit(&kvm->arch.apicv_inhibit_reasons, reason, true);
++	 *   - arch/x86/kvm/x86.c|10679| <<__kvm_set_or_clear_apicv_inhibit>> old = new = kvm->arch.apicv_inhibit_reasons;
++	 *   - arch/x86/kvm/x86.c|10697| <<__kvm_set_or_clear_apicv_inhibit>> kvm->arch.apicv_inhibit_reasons = new;
++	 *   - arch/x86/kvm/x86.c|10706| <<__kvm_set_or_clear_apicv_inhibit>> kvm->arch.apicv_inhibit_reasons = new;
++	 */
+ 	old = new = kvm->arch.apicv_inhibit_reasons;
+ 
++	/*
++	 * called by:
++	 *   - arch/x86/kvm/x86.c|10025| <<kvm_apicv_init>> set_or_clear_apicv_inhibit(&kvm->arch.apicv_inhibit_reasons, reason, true);
++	 *   - arch/x86/kvm/x86.c|10681| <<__kvm_set_or_clear_apicv_inhibit>> set_or_clear_apicv_inhibit(&new, reason, set);
++	 */
+ 	set_or_clear_apicv_inhibit(&new, reason, set);
+ 
+ 	if (!!old != !!new) {
+@@ -10685,6 +10784,18 @@ void __kvm_set_or_clear_apicv_inhibit(struct kvm *kvm,
+ 		 * side (handling the request) also prevents other vCPUs from
+ 		 * servicing the request with a stale apicv_inhibit_reasons.
+ 		 */
++		/*
++		 * 在以下使用KVM_REQ_APICV_UPDATE:
++		 *   - arch/x86/kvm/lapic.c|3138| <<kvm_lapic_set_base>> kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
++		 *   - arch/x86/kvm/lapic.c|3452| <<kvm_create_lapic>> kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
++		 *   - arch/x86/kvm/svm/nested.c|830| <<enter_svm_guest_mode>> kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
++		 *   - arch/x86/kvm/svm/nested.c|1245| <<svm_leave_nested>> kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
++		 *   - arch/x86/kvm/vmx/nested.c|4924| <<nested_vmx_vmexit>> kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
++		 *   - arch/x86/kvm/x86.c|10778| <<__kvm_set_or_clear_apicv_inhibit>> kvm_make_all_cpus_request(kvm, KVM_REQ_APICV_UPDATE);
++		 *   - arch/x86/kvm/x86.c|11018| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_APICV_UPDATE, vcpu)) kvm_vcpu_update_apicv(vcpu);
++		 *
++		 * 处理的函数是kvm_vcpu_update_apicv(vcpu);
++		 */
+ 		kvm_make_all_cpus_request(kvm, KVM_REQ_APICV_UPDATE);
+ 		kvm->arch.apicv_inhibit_reasons = new;
+ 		if (new) {
+@@ -10699,6 +10810,11 @@ void __kvm_set_or_clear_apicv_inhibit(struct kvm *kvm,
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/include/asm/kvm_host.h|2188| <<kvm_set_apicv_inhibit>> kvm_set_or_clear_apicv_inhibit(kvm, reason, true);
++ *   - arch/x86/include/asm/kvm_host.h|2204| <<kvm_clear_apicv_inhibit>> kvm_set_or_clear_apicv_inhibit(kvm, reason, false);
++ */
+ void kvm_set_or_clear_apicv_inhibit(struct kvm *kvm,
+ 				    enum kvm_apicv_inhibit reason, bool set)
+ {
+@@ -10770,6 +10886,10 @@ static void kvm_vcpu_reload_apic_access_page(struct kvm_vcpu *vcpu)
+  * exiting to the userspace.  Otherwise, the value will be returned to the
+  * userspace.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|11370| <<vcpu_run>> r = vcpu_enter_guest(vcpu);
++ */
+ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ {
+ 	int r;
+@@ -10920,6 +11040,18 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 		if (kvm_check_request(KVM_REQ_HV_STIMER, vcpu))
+ 			kvm_hv_process_stimers(vcpu);
+ #endif
++		/*
++		 * 在以下使用KVM_REQ_APICV_UPDATE:
++		 *   - arch/x86/kvm/lapic.c|3138| <<kvm_lapic_set_base>> kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
++		 *   - arch/x86/kvm/lapic.c|3452| <<kvm_create_lapic>> kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
++		 *   - arch/x86/kvm/svm/nested.c|830| <<enter_svm_guest_mode>> kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
++		 *   - arch/x86/kvm/svm/nested.c|1245| <<svm_leave_nested>> kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
++		 *   - arch/x86/kvm/vmx/nested.c|4924| <<nested_vmx_vmexit>> kvm_make_request(KVM_REQ_APICV_UPDATE, vcpu);
++		 *   - arch/x86/kvm/x86.c|10778| <<__kvm_set_or_clear_apicv_inhibit>> kvm_make_all_cpus_request(kvm, KVM_REQ_APICV_UPDATE);
++		 *   - arch/x86/kvm/x86.c|11018| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_APICV_UPDATE, vcpu)) kvm_vcpu_update_apicv(vcpu);
++		 *
++		 * 处理的函数是kvm_vcpu_update_apicv(vcpu);
++		 */
+ 		if (kvm_check_request(KVM_REQ_APICV_UPDATE, vcpu))
+ 			kvm_vcpu_update_apicv(vcpu);
+ 		if (kvm_check_request(KVM_REQ_APF_READY, vcpu))
+@@ -11045,10 +11177,16 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 		WARN_ON_ONCE((kvm_vcpu_apicv_activated(vcpu) != kvm_vcpu_apicv_active(vcpu)) &&
+ 			     (kvm_get_apic_mode(vcpu) != LAPIC_MODE_DISABLED));
+ 
++		/*
++		 * vmx_vcpu_run()
++		 */
+ 		exit_fastpath = static_call(kvm_x86_vcpu_run)(vcpu, req_immediate_exit);
+ 		if (likely(exit_fastpath != EXIT_FASTPATH_REENTER_GUEST))
+ 			break;
+ 
++		/*
++		 * vmx_sync_pir_to_irr()
++		 */
+ 		if (kvm_lapic_enabled(vcpu))
+ 			static_call_cond(kvm_x86_sync_pir_to_irr)(vcpu);
+ 
+@@ -11098,6 +11236,9 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 	if (vcpu->arch.xfd_no_write_intercept)
+ 		fpu_sync_guest_vmexit_xfd_state();
+ 
++	/*
++	 * vmx_handle_exit_irqoff()
++	 */
+ 	static_call(kvm_x86_handle_exit_irqoff)(vcpu);
+ 
+ 	if (vcpu->arch.guest_fpu.xfd_err)
+diff --git a/virt/kvm/irqchip.c b/virt/kvm/irqchip.c
+index 1e567d1f6..3b24e782f 100644
+--- a/virt/kvm/irqchip.c
++++ b/virt/kvm/irqchip.c
+@@ -85,6 +85,9 @@ int kvm_set_irq(struct kvm *kvm, int irq_source_id, u32 irq, int level,
+ 
+ 	while (i--) {
+ 		int r;
++		/*
++		 * kvm_set_msi()
++		 */
+ 		r = irq_set[i].set(&irq_set[i], kvm, irq_source_id, level,
+ 				   line_status);
+ 		if (r < 0)
+-- 
+2.34.1
+
