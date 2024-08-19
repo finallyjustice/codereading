@@ -1,0 +1,329 @@
+关于BlockBackend, BlockDriverState和BdrvChild的关系
+
+--------------------
+
+## BlockBackend表示一个device的后端的集合. device可以是virtio-blk,
+可以是scsi-disk, 也可以是一个nvme-ns.
+BlockBackend这结构可以集合了多个存储/文件.
+
+如果一个device想访问后端的数据,参数是BlockBackend.
+
+virtio-blk:
+
+463 blk_aio_preadv(blk, sector_num << BDRV_SECTOR_BITS, qiov,
+464                        flags, virtio_blk_rw_complete,
+465                        mrb->reqs[start]);
+
+scsi-hd:
+
+3073 BlockAIOCB *scsi_dma_readv(int64_t offset, QEMUIOVector *iov,
+3074                            BlockCompletionFunc *cb, void *cb_opaque,
+3075                            void *opaque)
+3076 {
+3077     SCSIDiskReq *r = opaque;
+3078     SCSIDiskState *s = DO_UPCAST(SCSIDiskState, qdev, r->req.dev);
+3079     return blk_aio_preadv(s->qdev.conf.blk, offset, iov, 0, cb, cb_opaque);
+3080 }
+
+3228 static Property scsi_block_properties[] = {
+3229     DEFINE_BLOCK_ERROR_PROPERTIES(SCSIDiskState, qdev.conf),
+3230     DEFINE_PROP_DRIVE("drive", SCSIDiskState, qdev.conf.blk),
+
+struct SCSIDiskState:
+-> SCSIDevice qdev;
+   -> BlockConf conf;
+      -> BlockBackend *blk;
+
+
+一个BlockBackend可以有多个存储/文件, 比方overlay.
+每一个文件都需要一个BlockDriverState来表示.
+
+--------------------
+
+## BlockDriverState表示一个具体的存储/文件. 正如上面说的,
+一个BlockBackend可以有多个存储/文件, 比方overlay.
+每一个文件都需要一个BlockDriverState来表示.
+
+这些BlockDriverState用BdrvChild来代理.
+每个BlockDriverState都要由一个BdrvChild来表示.
+
+比如BlockBackend最root的存储/文件就是"BdrvChild *root".
+
+当前这个存储/文件的类型在"BlockDriver *drv", 比如:
+- BlockDriver bdrv_raw
+- BlockDriver bdrv_qcow2
+- BlockDriver bdrv_mirror_top
+- BlockDriver bdrv_iscsi
+
+1072 struct BlockDriverState {
+1073     /*
+1074      * Protected by big QEMU lock or read-only after opening.  No special
+1075      * locking needed during I/O...
+1076      */
+1077     int open_flags; /* flags used to open the file, re-used for re-open */
+1078     bool encrypted; /* if true, the media is encrypted */
+1079     bool sg;        /* if true, the device is a /dev/sg* */
+1080     bool probed;    /* if true, format was probed rather than specified */
+1081     bool force_share; /* if true, always allow all shared permissions */
+1082     bool implicit;  /* if true, this filter node was automatically inserted */
+1083
+1084     BlockDriver *drv; /* NULL means no media */
+1085     void *opaque;
+
+--------------------
+
+## BdrvChild是一个BlockDriverState的代表,可以看到, 第一个就是BlockDriverState.
+
+1017 struct BdrvChild {
+1018     BlockDriverState *bs;
+1019     char *name;
+1020     const BdrvChildClass *klass;
+1021     BdrvChildRole role;
+1022     void *opaque;
+
+比如BlockBackend并不直接指向BlockDriverState, 而是通过BdrvChild.
+
+struct BlockBackend
+-> BdrvChild *root;
+   -> BlockDriverState *bs;
+
+--------------------
+
+下面是一个raw来read的例子.
+
+-object iothread,id=iothread01 \
+-device virtio-blk-pci,id=vblk01,num-queues=8,drive=drive01,iothread=iothread01 \
+-blockdev node-name=file01,driver=file,aio=threads,filename=test01.raw,cache.direct=on,cache.no-flush=off \
+-blockdev node-name=drive01,driver=raw,cache.direct=on,cache.no-flush=off,file=file01 \
+
+(gdb) bt
+#0  raw_co_preadv (bs=0x555557401530, offset=0, bytes=512, qiov=0x7fffe00032b8, flags=BDRV_REQ_REGISTERED_BUF) at ../block/file-posix.c:2571
+#1  0x0000555555f35a50 in bdrv_driver_preadv (bs=0x555557401530, offset=0, bytes=512, qiov=0x7fffe00032b8, qiov_offset=0, flags=8) at ../block/io.c:1002
+#2  0x0000555555f36d3e in bdrv_aligned_preadv (child=0x55555740e110, req=0x7ffda6e6ea50, offset=0, bytes=512, align=512, qiov=0x7fffe00032b8, qiov_offset=0, flags=8) at ../block/io.c:1395
+#3  0x0000555555f37cf5 in bdrv_co_preadv_part (child=0x55555740e110, offset=0, bytes=512, qiov=0x7fffe00032b8, qiov_offset=0, flags=BDRV_REQ_REGISTERED_BUF) at ../block/io.c:1819
+#4  0x0000555555f37a85 in bdrv_co_preadv (child=0x55555740e110, offset=0, bytes=512, qiov=0x7fffe00032b8, flags=BDRV_REQ_REGISTERED_BUF) at ../block/io.c:1768
+#5  0x0000555555f7f3ac in raw_co_preadv (bs=0x555557407880, offset=0, bytes=512, qiov=0x7fffe00032b8, flags=BDRV_REQ_REGISTERED_BUF) at ../block/raw-format.c:221
+#6  0x0000555555f35a50 in bdrv_driver_preadv (bs=0x555557407880, offset=0, bytes=512, qiov=0x7fffe00032b8, qiov_offset=0, flags=8) at ../block/io.c:1002
+#7  0x0000555555f36d3e in bdrv_aligned_preadv (child=0x555558069da0, req=0x7ffda6e6eda0, offset=0, bytes=512, align=1, qiov=0x7fffe00032b8, qiov_offset=0, flags=8) at ../block/io.c:1395
+#8  0x0000555555f37cf5 in bdrv_co_preadv_part (child=0x555558069da0, offset=0, bytes=512, qiov=0x7fffe00032b8, qiov_offset=0, flags=BDRV_REQ_REGISTERED_BUF) at ../block/io.c:1819
+#9  0x0000555555f217fc in blk_co_do_preadv_part (blk=0x5555580ed980, offset=0, bytes=512, qiov=0x7fffe00032b8, qiov_offset=0, flags=BDRV_REQ_REGISTERED_BUF) at ../block/block-backend.c:1347
+#10 0x0000555555f22223 in blk_aio_read_entry (opaque=0x7fffe0003360) at ../block/block-backend.c:1608
+#11 0x00005555560d8120 in coroutine_trampoline (i0=-536857664, i1=32767) at ../util/coroutine-ucontext.c:175
+#12 0x00007ffff4ee1150 in __start_context () at /lib/../lib64/libc.so.6
+#13 0x00007fffef4539e0 in  ()
+#14 0x0000000000000000 in  ()
+
+virtio-blk的backend.
+
+(gdb) p *((BlockBackend *)0x5555580ed980)
+$13 = {name = 0x0, refcnt = 1, root = 0x555558069da0, ctx = 0x5555573fd610, legacy_dinfo = 0x0, link = {tqe_next = 0x0, tqe_circ = {tql_next = 0x0, tql_prev = 0x555557415dd8}}, 
+  monitor_link = {tqe_next = 0x0, tqe_circ = {tql_next = 0x0, tql_prev = 0x0}}, public = {throttle_group_member = {aio_context = 0x0, throttled_reqs_lock = {locked = 0, ctx = 0x0, 
+        from_push = {slh_first = 0x0}, to_pop = {slh_first = 0x0}, handoff = 0, sequence = 0, holder = 0x0}, throttled_reqs = {{entries = {sqh_first = 0x0, sqh_last = 0x0}}, {
+          entries = {sqh_first = 0x0, sqh_last = 0x0}}}, io_limits_disabled = 0, restart_pending = 0, throttle_state = 0x0, throttle_timers = {timers = {0x0, 0x0}, 
+        clock_type = QEMU_CLOCK_REALTIME, timer_cb = {0x0, 0x0}, timer_opaque = 0x0}, pending_reqs = {0, 0}, round_robin = {le_next = 0x0, le_prev = 0x0}}}, dev = 0x5555580e8e70, 
+  dev_ops = 0x555556f1ca60 <virtio_block_ops>, dev_opaque = 0x5555580e8e70, root_state = {open_flags = 0, detect_zeroes = BLOCKDEV_DETECT_ZEROES_OPTIONS_OFF}, 
+  enable_write_cache = false, stats = {lock = {lock = {__data = {__lock = 0, __count = 0, __owner = 0, __nusers = 0, __kind = 0, __spins = 0, __elision = 0, __list = {__prev = 0x0, 
+            __next = 0x0}}, __size = '\000' <repeats 39 times>, __align = 0}, file = 0x0, line = 0, initialized = true}, nr_bytes = {0, 0, 0, 0, 0, 0}, nr_ops = {0, 0, 0, 0, 0, 0}, 
+    invalid_ops = {0, 0, 0, 0, 0, 0}, failed_ops = {0, 0, 0, 0, 0, 0}, total_time_ns = {0, 0, 0, 0, 0, 0}, merged = {0, 0, 0, 0, 0, 0}, last_access_time_ns = 0, intervals = {
+      slh_first = 0x0}, account_invalid = true, account_failed = true, latency_histogram = {{nbins = 0, boundaries = 0x0, bins = 0x0}, {nbins = 0, boundaries = 0x0, bins = 0x0}, {
+        nbins = 0, boundaries = 0x0, bins = 0x0}, {nbins = 0, boundaries = 0x0, bins = 0x0}, {nbins = 0, boundaries = 0x0, bins = 0x0}, {nbins = 0, boundaries = 0x0, bins = 0x0}}}, 
+  on_read_error = BLOCKDEV_ON_ERROR_REPORT, on_write_error = BLOCKDEV_ON_ERROR_ENOSPC, iostatus_enabled = true, iostatus = BLOCK_DEVICE_IO_STATUS_OK, perm = 3, shared_perm = 13, 
+  disable_perm = false, allow_aio_context_change = false, allow_write_beyond_eof = false, remove_bs_notifiers = {notifiers = {lh_first = 0x0}}, insert_bs_notifiers = {notifiers = {
+      lh_first = 0x0}}, aio_notifiers = {lh_first = 0x0}, quiesce_counter = 0, queued_requests_lock = {lock = {__data = {__lock = 0, __count = 0, __owner = 0, __nusers = 0, 
+        __kind = 0, __spins = 0, __elision = 0, __list = {__prev = 0x0, __next = 0x0}}, __size = '\000' <repeats 39 times>, __align = 0}, file = 0x0, line = 0, initialized = true}, 
+  queued_requests = {entries = {sqh_first = 0x0, sqh_last = 0x5555580edd20}}, disable_request_queuing = false, vmsh = 0x0, force_allow_inactivate = false, in_flight = 1}
+
+virtio-blk的backend指向的设备就是virtio-blk.
+
+(gdb) p *((BlockBackend *)0x5555580ed980)->dev
+$14 = {parent_obj = {class = 0x55555734c8c0, free = 0x0, Python Exception <class 'gdb.error'> There is no member named keys.:
+properties = 0x555558045d80, ref = 2, parent = 0x5555580e0aa0}, id = 0x0,
+  canonical_path = 0x555557f33c00 "/machine/peripheral/vblk01/virtio-backend", realized = true, pending_deleted_event = false, pending_deleted_expires_ms = 0, opts = 0x0,
+  hotplugged = 0, allow_unplug_during_migration = false, parent_bus = 0x5555580e8df0, gpios = {lh_first = 0x0}, clocks = {lh_first = 0x0}, child_bus = {lh_first = 0x0},
+  num_child_bus = 0, instance_id_alias = -1, alias_required_for_version = 0, reset = {count = 0, hold_phase_pending = false, exit_phase_in_progress = false}, unplug_blockers = 0x0,
+  mem_reentrancy_guard = {engaged_in_io = false}}
+
+(gdb) p ((BlockBackend *)0x5555580ed980)->dev
+$15 = (DeviceState *) 0x5555580e8e70
+
+(gdb) p ((VirtIOBlock *)0x5555580e8e70)->blk
+$17 = (BlockBackend *) 0x5555580ed980
+
+BlockBackend的root的BlockDriverState.
+
+(gdb) p ((BlockBackend *)0x5555580ed980)->root
+$2 = (BdrvChild *) 0x555558069da0
+
+(gdb) p *((BlockBackend *)0x5555580ed980)->root
+$3 = {bs = 0x555557407880, name = 0x5555580ed960 "root", klass = 0x555556f25a60 <child_root>, role = 20, opaque = 0x5555580ed980, perm = 3, shared_perm = 13, frozen = false, quiesced_parent = false, next = {le_next = 0x0, le_prev = 0x0}, next_parent = {le_next = 0x0, le_prev = 0x55555740ba50}}
+
+可以看到, 第一层的drv是raw.
+
+(gdb) p *(BlockDriverState *)0x555557407880
+$5 = {open_flags = 8226, encrypted = false, sg = false, probed = false, force_share = false, implicit = false, drv = 0x55555705b5e0 <bdrv_raw>, opaque = 0x555557400f90,
+  aio_context = 0x5555573fd610, aio_notifiers = {lh_first = 0x0}, walking_aio_notifiers = false, filename = "test01.raw", '\000' <repeats 4085 times>,
+  backing_file = '\000' <repeats 4095 times>, auto_backing_file = '\000' <repeats 4095 times>, backing_format = '\000' <repeats 15 times>, full_open_options = 0x0,
+  exact_filename = "test01.raw", '\000' <repeats 4085 times>, bl = {request_alignment = 1, max_pdiscard = 0, pdiscard_alignment = 0, max_pwrite_zeroes = 0,
+    pwrite_zeroes_alignment = 0, opt_transfer = 0, max_transfer = 0, max_hw_transfer = 0, max_hw_iov = 0, min_mem_alignment = 512, opt_mem_alignment = 4096, max_iov = 1024,
+    has_variable_length = false, zoned = BLK_Z_NONE, zone_size = 0, nr_zones = 0, max_append_sectors = 0, max_open_zones = 0, max_active_zones = 0, write_granularity = 0},
+  supported_read_flags = BDRV_REQ_REGISTERED_BUF, supported_write_flags = 72, supported_zero_flags = 324, supported_truncate_flags = BDRV_REQ_ZERO_WRITE,
+  node_name = "drive01", '\000' <repeats 24 times>, node_list = {tqe_next = 0x5555574177b0, tqe_circ = {tql_next = 0x5555574177b0, tql_prev = 0x555557405628}}, bs_list = {
+    tqe_next = 0x5555574102c0, tqe_circ = {tql_next = 0x5555574102c0, tql_prev = 0x555557405638}}, monitor_list = {tqe_next = 0x0, tqe_circ = {tql_next = 0x0,
+      tql_prev = 0x555557405648}}, refcnt = 2, op_blockers = {{lh_first = 0x0} <repeats 16 times>}, inherits_from = 0x0, children = {lh_first = 0x55555740e110}, backing = 0x0,
+  file = 0x55555740e110, parents = {lh_first = 0x555558069da0}, options = 0x555557406860, explicit_options = 0x55555740bb90, detect_zeroes = BLOCKDEV_DETECT_ZEROES_OPTIONS_OFF,
+  backing_blocker = 0x0, total_sectors = 204800, write_threshold_offset = 0, dirty_bitmap_mutex = {lock = {__data = {__lock = 0, __count = 0, __owner = 0, __nusers = 0, __kind = 0,
+        __spins = 0, __elision = 0, __list = {__prev = 0x0, __next = 0x0}}, __size = '\000' <repeats 39 times>, __align = 0}, file = 0x0, line = 0, initialized = true},
+  dirty_bitmaps = {lh_first = 0x0}, wr_highest_offset = {value = 0}, copy_on_read = 0, in_flight = 2, serialising_in_flight = 0, enable_write_cache = 0, quiesce_counter = 0,
+  write_gen = 0, reqs_lock = {lock = {__data = {__lock = 0, __count = 0, __owner = 0, __nusers = 0, __kind = 0, __spins = 0, __elision = 0, __list = {__prev = 0x0, __next = 0x0}},
+      __size = '\000' <repeats 39 times>, __align = 0}, file = 0x0, line = 0, initialized = true}, tracked_requests = {lh_first = 0x7ffda6e6eda0}, flush_queue = {entries = {
+      sqh_first = 0x0, sqh_last = 0x55555740bb28}}, active_flush_req = false, flushed_gen = 0, never_freeze = false, bsc_modify_lock = {locked = 0, ctx = 0x0, from_push = {
+      slh_first = 0x0}, to_pop = {slh_first = 0x0}, handoff = 0, sequence = 0, holder = 0x0}, block_status_cache = 0x5555574005d0, wps = 0x0}
+
+这个raw下面还挂了一个文件.
+
+(gdb) p ((BlockDriverState *)0x555557407880)->backing
+$7 = (BdrvChild *) 0x0
+
+(gdb) p ((BlockDriverState *)0x555557407880)->file
+$8 = (BdrvChild *) 0x55555740e110
+
+(gdb) p *((BlockDriverState *)0x555557407880)->file
+$9 = {bs = 0x555557401530, name = 0x5555574011b0 "file", klass = 0x555556f24c60 <child_of_bds>, role = 20, opaque = 0x555557407880, perm = 3, shared_perm = 13, frozen = false, 
+  quiesced_parent = false, next = {le_next = 0x0, le_prev = 0x55555740ba38}, next_parent = {le_next = 0x0, le_prev = 0x555557405700}}
+
+这个文件的BlockDriverState.
+
+(gdb) p *(BlockDriverState *)0x555557401530
+$10 = {open_flags = 40994, encrypted = false, sg = false, probed = false, force_share = false, implicit = false, drv = 0x55555705f2a0 <bdrv_file>, opaque = 0x555557400a30, 
+  aio_context = 0x5555573fd610, aio_notifiers = {lh_first = 0x0}, walking_aio_notifiers = false, filename = "test01.raw", '\000' <repeats 4085 times>, 
+  backing_file = '\000' <repeats 4095 times>, auto_backing_file = '\000' <repeats 4095 times>, backing_format = '\000' <repeats 15 times>, full_open_options = 0x55555740e230, 
+  exact_filename = "test01.raw", '\000' <repeats 4085 times>, bl = {request_alignment = 512, max_pdiscard = 0, pdiscard_alignment = 0, max_pwrite_zeroes = 0, 
+    pwrite_zeroes_alignment = 0, opt_transfer = 0, max_transfer = 0, max_hw_transfer = 0, max_hw_iov = 0, min_mem_alignment = 512, opt_mem_alignment = 4096, max_iov = 1024, 
+    has_variable_length = false, zoned = BLK_Z_NONE, zone_size = 0, nr_zones = 0, max_append_sectors = 0, max_open_zones = 0, max_active_zones = 0, write_granularity = 0}, 
+  supported_read_flags = BDRV_REQ_REGISTERED_BUF, supported_write_flags = BDRV_REQ_REGISTERED_BUF, supported_zero_flags = 260, supported_truncate_flags = BDRV_REQ_ZERO_WRITE, 
+  node_name = "file01", '\000' <repeats 25 times>, node_list = {tqe_next = 0x555557407880, tqe_circ = {tql_next = 0x555557407880, tql_prev = 0x555557055bc0 <graph_bdrv_states>}}, 
+  bs_list = {tqe_next = 0x555557407880, tqe_circ = {tql_next = 0x555557407880, tql_prev = 0x555557055bd0 <all_bdrv_states>}}, monitor_list = {tqe_next = 0x555557407880, tqe_circ = {
+      tql_next = 0x555557407880, tql_prev = 0x5555570553c0 <monitor_bdrv_states>}}, refcnt = 2, op_blockers = {{lh_first = 0x0} <repeats 16 times>}, inherits_from = 0x0, children = {
+    lh_first = 0x0}, backing = 0x0, file = 0x0, parents = {lh_first = 0x55555740e110}, options = 0x5555573ff160, explicit_options = 0x555557405840, 
+  detect_zeroes = BLOCKDEV_DETECT_ZEROES_OPTIONS_OFF, backing_blocker = 0x0, total_sectors = 204800, write_threshold_offset = 0, dirty_bitmap_mutex = {lock = {__data = {__lock = 0, 
+        __count = 0, __owner = 0, __nusers = 0, __kind = 0, __spins = 0, __elision = 0, __list = {__prev = 0x0, __next = 0x0}}, __size = '\000' <repeats 39 times>, __align = 0}, 
+    file = 0x0, line = 0, initialized = true}, dirty_bitmaps = {lh_first = 0x0}, wr_highest_offset = {value = 0}, copy_on_read = 0, in_flight = 1, serialising_in_flight = 0, 
+  enable_write_cache = 0, quiesce_counter = 0, write_gen = 0, reqs_lock = {lock = {__data = {__lock = 0, __count = 0, __owner = 0, __nusers = 0, __kind = 0, __spins = 0, 
+        __elision = 0, __list = {__prev = 0x0, __next = 0x0}}, __size = '\000' <repeats 39 times>, __align = 0}, file = 0x0, line = 0, initialized = true}, tracked_requests = {
+    lh_first = 0x7ffda6e6ea50}, flush_queue = {entries = {sqh_first = 0x0, sqh_last = 0x5555574057d8}}, active_flush_req = false, flushed_gen = 0, never_freeze = false, 
+  bsc_modify_lock = {locked = 0, ctx = 0x0, from_push = {slh_first = 0x0}, to_pop = {slh_first = 0x0}, handoff = 0, sequence = 0, holder = 0x0}, block_status_cache = 0x555557400250, 
+  wps = 0x0}
+
+
+(gdb) p ((BlockDriverState *)0x555557401530)->opaque 
+$12 = (void *) 0x555557400a30
+
+(gdb) p *(BDRVRawState *)0x555557400a30
+$11 = {fd = 13, use_lock = true, type = 0, open_flags = 16386, buf_align = 512, perm = 3, shared_perm = 13, locked_perm = 3, locked_shared_perm = 2, aio_max_batch = 0,
+  perm_change_fd = 0, perm_change_flags = 0, reopen_state = 0x0, has_discard = true, has_write_zeroes = true, use_linux_aio = false, use_linux_io_uring = false,
+  page_cache_inconsistent = 0, has_fallocate = true, needs_alignment = true, force_alignment = false, drop_cache = true, check_cache_dropped = false, stats = {discard_nb_ok = 0,
+    discard_nb_failed = 0, discard_bytes_ok = 0}, pr_mgr = 0x0}
+
+
+下面是整个结构.
+
+struct BlockBackend
+-> BdrvChild *root;
+   -> BlockDriverState *bs ("test01.raw");
+      -> BlockDriver *drv = bdrv_raw;
+      -> -> void *opaque = BDRVRawState (block/raw-format.c);
+      -> BdrvChild * GRAPH_RDLOCK_PTR backing = 0x0;
+      -> BdrvChild * GRAPH_RDLOCK_PTR file;
+         -> BlockDriverState *bs ("test01.raw");
+            -> BlockDriver *drv = bdrv_file;
+            -> void *opaque = BDRVRawState (block/file-posix.c);
+               -> BdrvChild * GRAPH_RDLOCK_PTR backing = 0x0;
+	       -> BdrvChild * GRAPH_RDLOCK_PTR file = 0x0;
+
+===================
+
+以raw为例子, 当从virtio-blk read的时候.
+
+virtio-blk调用blk_aio_preadv(), 参数是BlockBackend.
+
+356 static inline void submit_requests(VirtIOBlock *s, MultiReqBuffer *mrb,
+357                                    int start, int num_reqs, int niov)
+358 {
+359     BlockBackend *blk = s->blk;
+... ...
+403         blk_aio_preadv(blk, sector_num << BDRV_SECTOR_BITS, qiov,
+404                        flags, virtio_blk_rw_complete,
+405                        mrb->reqs[start]);
+
+在generic的io中, 参数换成了BlockBackend->root(BdrvChild).
+
+1318 static int coroutine_fn
+1319 blk_co_do_preadv_part(BlockBackend *blk, int64_t offset, int64_t bytes,
+1320                       QEMUIOVector *qiov, size_t qiov_offset,
+1321                       BdrvRequestFlags flags)
+1322 {
+... ...
+1347     ret = bdrv_co_preadv_part(blk->root, offset, bytes, qiov, qiov_offset,
+1348                               flags);
+1349     bdrv_dec_in_flight(bs);
+1350     return ret;
+1351 }
+
+参数还是BdrvChild.
+
+1771 int coroutine_fn bdrv_co_preadv_part(BdrvChild *child,
+1772     int64_t offset, int64_t bytes,
+1773     QEMUIOVector *qiov, size_t qiov_offset,
+1774     BdrvRequestFlags flags)
+1775 {
+... ...
+1819     ret = bdrv_aligned_preadv(child, &req, offset, bytes,
+1820                               bs->bl.request_alignment,
+1821                               qiov, qiov_offset, flags);
+
+参数变成了BlockDriverState.
+
+1324 static int coroutine_fn GRAPH_RDLOCK
+1325 bdrv_aligned_preadv(BdrvChild *child, BdrvTrackedRequest *req,
+1326                     int64_t offset, int64_t bytes, int64_t align,
+1327                     QEMUIOVector *qiov, size_t qiov_offset, int flags)
+1328 {
+1329     BlockDriverState *bs = child->bs;
+... ...
+1406             ret = bdrv_driver_preadv(bs, offset + bytes - bytes_remaining,
+1407                                      num, qiov,
+1408                                      qiov_offset + bytes - bytes_remaining,
+1409                                      flags);
+
+参数还是BlockDriverState.
+这里取出了driver: bs->drv.
+
+ 973 static int coroutine_fn GRAPH_RDLOCK
+ 974 bdrv_driver_preadv(BlockDriverState *bs, int64_t offset, int64_t bytes,
+ 975                    QEMUIOVector *qiov, size_t qiov_offset, int flags)
+ 976 {
+ 977     BlockDriver *drv = bs->drv;
+... ...
+1001     if (drv->bdrv_co_preadv) {
+1002         ret = drv->bdrv_co_preadv(bs, offset, bytes, qiov, flags);
+1003         goto out;
+1004     }
+
+在raw (raw-format.c)中, 用到了BlockDriverState->file (BdrvChild).
+
+然后继续以新的BdrvChild为参数调用io, 去真正的访问文件.
+
+209 static int coroutine_fn GRAPH_RDLOCK
+210 raw_co_preadv(BlockDriverState *bs, int64_t offset, int64_t bytes,
+211               QEMUIOVector *qiov, BdrvRequestFlags flags)
+212 {
+213     int ret;
+214
+215     ret = raw_adjust_offset(bs, &offset, bytes, false);
+216     if (ret) {
+217         return ret;
+218     }
+219
+220     BLKDBG_CO_EVENT(bs->file, BLKDBG_READ_AIO);
+221     return bdrv_co_preadv(bs->file, offset, bytes, qiov, flags);
+222 }
