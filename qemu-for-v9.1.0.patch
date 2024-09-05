@@ -1,0 +1,2878 @@
+From 6adf41bf4b00a17723bebb012bf5eeb330050d02 Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Wed, 4 Sep 2024 17:04:13 -0700
+Subject: [PATCH 1/1] qemu for v9.1.0
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ accel/kvm/kvm-accel-ops.c     |   7 +
+ accel/kvm/kvm-all.c           |  21 +
+ block.c                       | 125 +++++
+ block/file-posix.c            |  50 ++
+ block/mirror.c                |  73 +++
+ blockdev.c                    |  55 +++
+ hw/block/virtio-blk.c         |  33 ++
+ hw/scsi/megasas.c             |   6 +
+ hw/scsi/scsi-bus.c            |   6 +
+ hw/scsi/scsi-disk.c           |  26 +
+ hw/scsi/scsi-generic.c        |   6 +
+ hw/scsi/virtio-scsi.c         |   6 +
+ hw/vfio/pci.c                 |  13 +
+ include/hw/block/block.h      |  32 ++
+ include/hw/virtio/virtio.h    |  33 ++
+ qom/object.c                  |  26 +
+ target/i386/cpu.c             | 215 ++++++++
+ target/i386/cpu.h             | 106 ++++
+ target/i386/kvm/kvm-cpu.c     |  23 +
+ target/i386/kvm/kvm.c         | 892 ++++++++++++++++++++++++++++++++++
+ target/i386/kvm/vmsr_energy.c |  51 ++
+ target/i386/machine.c         |  45 ++
+ 22 files changed, 1850 insertions(+)
+
+diff --git a/accel/kvm/kvm-accel-ops.c b/accel/kvm/kvm-accel-ops.c
+index c239dfc87a..ea6884b3e7 100644
+--- a/accel/kvm/kvm-accel-ops.c
++++ b/accel/kvm/kvm-accel-ops.c
+@@ -26,6 +26,10 @@
+ #include <linux/kvm.h>
+ #include "kvm-cpus.h"
+ 
++/*
++ * 在以下使用kvm_vcpu_thread_fn():
++ *   - accel/kvm/kvm-accel-ops.c|71| <<kvm_start_vcpu_thread>> qemu_thread_create(cpu->thread, thread_name, kvm_vcpu_thread_fn, cpu, QEMU_THREAD_JOINABLE);
++ */
+ static void *kvm_vcpu_thread_fn(void *arg)
+ {
+     CPUState *cpu = arg;
+@@ -38,6 +42,9 @@ static void *kvm_vcpu_thread_fn(void *arg)
+     cpu->thread_id = qemu_get_thread_id();
+     current_cpu = cpu;
+ 
++    /*
++     * 只在此处调用
++     */
+     r = kvm_init_vcpu(cpu, &error_fatal);
+     kvm_init_cpu_signals(cpu);
+ 
+diff --git a/accel/kvm/kvm-all.c b/accel/kvm/kvm-all.c
+index 75d11a07b2..2004c5b61f 100644
+--- a/accel/kvm/kvm-all.c
++++ b/accel/kvm/kvm-all.c
+@@ -105,6 +105,13 @@ static const KVMCapabilityInfo kvm_required_capabilites[] = {
+     KVM_CAP_LAST_INFO
+ };
+ 
++/*
++ * 在以下使用kvm_irqchip_change_notifiers:
++ *   - accel/kvm/kvm-all.c|108| <<global>> static NotifierList kvm_irqchip_change_notifiers =
++ *   - accel/kvm/kvm-all.c|109| <<global>> NOTIFIER_LIST_INITIALIZER(kvm_irqchip_change_notifiers);
++ *   - accel/kvm/kvm-all.c|2041| <<kvm_irqchip_add_change_notifier>> notifier_list_add(&kvm_irqchip_change_notifiers, n);
++ *   - accel/kvm/kvm-all.c|2051| <<kvm_irqchip_change_notify>> notifier_list_notify(&kvm_irqchip_change_notifiers, NULL);
++ */
+ static NotifierList kvm_irqchip_change_notifiers =
+     NOTIFIER_LIST_INITIALIZER(kvm_irqchip_change_notifiers);
+ 
+@@ -456,6 +463,10 @@ void kvm_destroy_vcpu(CPUState *cpu)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-accel-ops.c|45| <<kvm_vcpu_thread_fn>> r = kvm_init_vcpu(cpu, &error_fatal);
++ */
+ int kvm_init_vcpu(CPUState *cpu, Error **errp)
+ {
+     KVMState *s = kvm_state;
+@@ -507,6 +518,16 @@ int kvm_init_vcpu(CPUState *cpu, Error **errp)
+         }
+     }
+ 
++    /*
++     * 支持的架构:
++     *   - target/arm/kvm.c|1863| <<kvm_arch_init_vcpu>> int kvm_arch_init_vcpu(CPUState *cs)
++     *   - target/i386/kvm/kvm.c|2255| <<kvm_arch_init_vcpu>> int kvm_arch_init_vcpu(CPUState *cs)
++     *   - target/loongarch/kvm/kvm.c|666| <<kvm_arch_init_vcpu>> int kvm_arch_init_vcpu(CPUState *cs)
++     *   - target/mips/kvm.c|64| <<kvm_arch_init_vcpu>> int kvm_arch_init_vcpu(CPUState *cs)
++     *   - target/ppc/kvm.c|480| <<kvm_arch_init_vcpu>> int kvm_arch_init_vcpu(CPUState *cs)
++     *   - target/riscv/kvm/kvm-cpu.c|1358| <<kvm_arch_init_vcpu>> int kvm_arch_init_vcpu(CPUState *cs)
++     *   - target/s390x/kvm/kvm.c|410| <<kvm_arch_init_vcpu>> int kvm_arch_init_vcpu(CPUState *cs)
++     */
+     ret = kvm_arch_init_vcpu(cpu);
+     if (ret < 0) {
+         error_setg_errno(errp, -ret,
+diff --git a/block.c b/block.c
+index c317de9eaa..9adfc61a23 100644
+--- a/block.c
++++ b/block.c
+@@ -2378,6 +2378,31 @@ TransactionActionDrv bdrv_drv_set_perm_drv = {
+     .commit = bdrv_drv_set_perm_commit,
+ };
+ 
++/*
++ * [0] qemu_lock_fd
++ * [0] raw_handle_perm_lock
++ * [0] raw_check_perm
++ * [0] bdrv_drv_set_perm
++ * [0] bdrv_node_refresh_perm
++ * [0] bdrv_list_refresh_perms
++ * [0] bdrv_replace_node_common
++ * [0] mirror_start_job
++ * [0] commit_active_start
++ * [0] qmp_block_commit
++ * [0] qmp_marshal_block_commit
++ * [0] do_qmp_dispatch_bh
++ * [0] aio_bh_poll
++ * [0] aio_dispatch
++ * [0] aio_ctx_dispatch
++ * [0] g_main_context_dispatch
++ * [0] glib_pollfds_poll
++ * [0] os_host_main_loop_wait
++ * [0] main_loop_wait
++ * [0] qemu_main_loop
++ * [0] qemu_default_main
++ * [0] __libc_start_main
++ * [0] _start
++ */
+ /*
+  * After calling this function, the transaction @tran may only be completed
+  * while holding a reader lock for the graph.
+@@ -2488,6 +2513,31 @@ bdrv_replace_child_tran(BdrvChild *child, BlockDriverState *new_bs,
+     /* old_bs reference is transparently moved from @child to @s */
+ }
+ 
++/*
++ * [0] qemu_lock_fd
++ * [0] raw_handle_perm_lock
++ * [0] raw_check_perm
++ * [0] bdrv_drv_set_perm
++ * [0] bdrv_node_refresh_perm
++ * [0] bdrv_list_refresh_perms
++ * [0] bdrv_replace_node_common
++ * [0] mirror_start_job
++ * [0] commit_active_start
++ * [0] qmp_block_commit
++ * [0] qmp_marshal_block_commit
++ * [0] do_qmp_dispatch_bh
++ * [0] aio_bh_poll
++ * [0] aio_dispatch
++ * [0] aio_ctx_dispatch
++ * [0] g_main_context_dispatch
++ * [0] glib_pollfds_poll
++ * [0] os_host_main_loop_wait
++ * [0] main_loop_wait
++ * [0] qemu_main_loop
++ * [0] qemu_default_main
++ * [0] __libc_start_main
++ * [0] _start
++ */
+ /*
+  * Refresh permissions in @bs subtree. The function is intended to be called
+  * after some graph modification that was done without permission update.
+@@ -2567,6 +2617,31 @@ bdrv_node_refresh_perm(BlockDriverState *bs, BlockReopenQueue *q,
+     return 0;
+ }
+ 
++/*
++ * [0] qemu_lock_fd
++ * [0] raw_handle_perm_lock
++ * [0] raw_check_perm
++ * [0] bdrv_drv_set_perm
++ * [0] bdrv_node_refresh_perm
++ * [0] bdrv_list_refresh_perms
++ * [0] bdrv_replace_node_common
++ * [0] mirror_start_job
++ * [0] commit_active_start
++ * [0] qmp_block_commit
++ * [0] qmp_marshal_block_commit
++ * [0] do_qmp_dispatch_bh
++ * [0] aio_bh_poll
++ * [0] aio_dispatch
++ * [0] aio_ctx_dispatch
++ * [0] g_main_context_dispatch
++ * [0] glib_pollfds_poll
++ * [0] os_host_main_loop_wait
++ * [0] main_loop_wait
++ * [0] qemu_main_loop
++ * [0] qemu_default_main
++ * [0] __libc_start_main
++ * [0] _start
++ */
+ /*
+  * @list is a product of bdrv_topological_dfs() (may be called several times) -
+  * a topologically sorted subgraph.
+@@ -5306,6 +5381,31 @@ static void GRAPH_WRLOCK bdrv_remove_child(BdrvChild *child, Transaction *tran)
+     tran_add(tran, &bdrv_remove_child_drv, child);
+ }
+ 
++/*
++ * [0] qemu_lock_fd
++ * [0] raw_handle_perm_lock
++ * [0] raw_check_perm
++ * [0] bdrv_drv_set_perm
++ * [0] bdrv_node_refresh_perm
++ * [0] bdrv_list_refresh_perms
++ * [0] bdrv_replace_node_common
++ * [0] mirror_start_job
++ * [0] commit_active_start
++ * [0] qmp_block_commit
++ * [0] qmp_marshal_block_commit
++ * [0] do_qmp_dispatch_bh
++ * [0] aio_bh_poll
++ * [0] aio_dispatch
++ * [0] aio_ctx_dispatch
++ * [0] g_main_context_dispatch
++ * [0] glib_pollfds_poll
++ * [0] os_host_main_loop_wait
++ * [0] main_loop_wait
++ * [0] qemu_main_loop
++ * [0] qemu_default_main
++ * [0] __libc_start_main
++ * [0] _start
++ */
+ /*
+  * Both @from and @to (if non-NULL) must be drained. @to must be kept drained
+  * until the transaction is completed.
+@@ -5347,6 +5447,31 @@ bdrv_replace_node_noperm(BlockDriverState *from,
+     return 0;
+ }
+ 
++/*
++ * [0] qemu_lock_fd
++ * [0] raw_handle_perm_lock
++ * [0] raw_check_perm
++ * [0] bdrv_drv_set_perm
++ * [0] bdrv_node_refresh_perm
++ * [0] bdrv_list_refresh_perms
++ * [0] bdrv_replace_node_common
++ * [0] mirror_start_job
++ * [0] commit_active_start
++ * [0] qmp_block_commit
++ * [0] qmp_marshal_block_commit
++ * [0] do_qmp_dispatch_bh
++ * [0] aio_bh_poll
++ * [0] aio_dispatch
++ * [0] aio_ctx_dispatch
++ * [0] g_main_context_dispatch
++ * [0] glib_pollfds_poll
++ * [0] os_host_main_loop_wait
++ * [0] main_loop_wait
++ * [0] qemu_main_loop
++ * [0] qemu_default_main
++ * [0] __libc_start_main
++ * [0] _start
++ */
+ /*
+  * Switch all parents of @from to point to @to instead. @from and @to must be in
+  * the same AioContext and both must be drained.
+diff --git a/block/file-posix.c b/block/file-posix.c
+index ff928b5e85..ec168f9ab5 100644
+--- a/block/file-posix.c
++++ b/block/file-posix.c
+@@ -959,6 +959,31 @@ static int raw_check_lock_bytes(int fd, uint64_t perm, uint64_t shared_perm,
+     return 0;
+ }
+ 
++/*
++ * [0] qemu_lock_fd
++ * [0] raw_handle_perm_lock
++ * [0] raw_check_perm
++ * [0] bdrv_drv_set_perm
++ * [0] bdrv_node_refresh_perm
++ * [0] bdrv_list_refresh_perms
++ * [0] bdrv_replace_node_common
++ * [0] mirror_start_job
++ * [0] commit_active_start
++ * [0] qmp_block_commit
++ * [0] qmp_marshal_block_commit
++ * [0] do_qmp_dispatch_bh
++ * [0] aio_bh_poll
++ * [0] aio_dispatch
++ * [0] aio_ctx_dispatch
++ * [0] g_main_context_dispatch
++ * [0] glib_pollfds_poll
++ * [0] os_host_main_loop_wait
++ * [0] main_loop_wait
++ * [0] qemu_main_loop
++ * [0] qemu_default_main
++ * [0] __libc_start_main
++ * [0] _start
++ */
+ static int raw_handle_perm_lock(BlockDriverState *bs,
+                                 RawPermLockOp op,
+                                 uint64_t new_perm, uint64_t new_shared,
+@@ -3747,6 +3772,31 @@ static QemuOptsList raw_create_opts = {
+     }
+ };
+ 
++/*
++ * [0] qemu_lock_fd
++ * [0] raw_handle_perm_lock
++ * [0] raw_check_perm
++ * [0] bdrv_drv_set_perm
++ * [0] bdrv_node_refresh_perm
++ * [0] bdrv_list_refresh_perms
++ * [0] bdrv_replace_node_common
++ * [0] mirror_start_job
++ * [0] commit_active_start
++ * [0] qmp_block_commit
++ * [0] qmp_marshal_block_commit
++ * [0] do_qmp_dispatch_bh
++ * [0] aio_bh_poll
++ * [0] aio_dispatch
++ * [0] aio_ctx_dispatch
++ * [0] g_main_context_dispatch
++ * [0] glib_pollfds_poll
++ * [0] os_host_main_loop_wait
++ * [0] main_loop_wait
++ * [0] qemu_main_loop
++ * [0] qemu_default_main
++ * [0] __libc_start_main
++ * [0] _start
++ */
+ static int raw_check_perm(BlockDriverState *bs, uint64_t perm, uint64_t shared,
+                           Error **errp)
+ {
+diff --git a/block/mirror.c b/block/mirror.c
+index 61f0a717b7..175b7cfd16 100644
+--- a/block/mirror.c
++++ b/block/mirror.c
+@@ -1706,6 +1706,42 @@ static BlockDriver bdrv_mirror_top = {
+     .filtered_child_is_backing  = true,
+ };
+ 
++/*
++ * [0] qemu_lock_fd
++ * [0] raw_handle_perm_lock
++ * [0] raw_check_perm
++ * [0] bdrv_drv_set_perm
++ * [0] bdrv_node_refresh_perm
++ * [0] bdrv_list_refresh_perms
++ * [0] bdrv_replace_node_common
++ * [0] mirror_start_job
++ * [0] commit_active_start
++ * [0] qmp_block_commit
++ * [0] qmp_marshal_block_commit
++ * [0] do_qmp_dispatch_bh
++ * [0] aio_bh_poll
++ * [0] aio_dispatch
++ * [0] aio_ctx_dispatch
++ * [0] g_main_context_dispatch
++ * [0] glib_pollfds_poll
++ * [0] os_host_main_loop_wait
++ * [0] main_loop_wait
++ * [0] qemu_main_loop
++ * [0] qemu_default_main
++ * [0] __libc_start_main
++ * [0] _start
++ *
++ * bs     :
++ *   - filename = "/tmp/overlay01.qcow2"i,
++ *   - exact_filename = "/tmp/overlay01.qcow2"
++ *   - backing_file = "test01.qcow2"
++ *   - auto_backing_file = "test01.qcow2"
++ * target :
++ *   - filename = "test01.qcow2"
++ *   - exact_filename = "test01.qcow2"
++ *   - backing_file = 0
++ *   - auto_backing_file = 0
++ */
+ static BlockJob *mirror_start_job(
+                              const char *job_id, BlockDriverState *bs,
+                              int creation_flags, BlockDriverState *target,
+@@ -2039,6 +2075,43 @@ void mirror_start(const char *job_id, BlockDriverState *bs,
+                      filter_node_name, true, copy_mode, false, errp);
+ }
+ 
++/*
++ * [0] qemu_lock_fd
++ * [0] raw_handle_perm_lock
++ * [0] raw_check_perm
++ * [0] bdrv_drv_set_perm
++ * [0] bdrv_node_refresh_perm
++ * [0] bdrv_list_refresh_perms
++ * [0] bdrv_replace_node_common
++ * [0] mirror_start_job
++ * [0] commit_active_start
++ * [0] qmp_block_commit
++ * [0] qmp_marshal_block_commit
++ * [0] do_qmp_dispatch_bh
++ * [0] aio_bh_poll
++ * [0] aio_dispatch
++ * [0] aio_ctx_dispatch
++ * [0] g_main_context_dispatch
++ * [0] glib_pollfds_poll
++ * [0] os_host_main_loop_wait
++ * [0] main_loop_wait
++ * [0] qemu_main_loop
++ * [0] qemu_default_main
++ * [0] __libc_start_main
++ * [0] _start
++ *
++ * 两个重要的参数:
++ * bs   :
++ *   - filename = "/tmp/overlay01.qcow2",
++ *   - exact_filename = "/tmp/overlay01.qcow2"
++ *   - backing_file = "test01.qcow2"
++ *   - auto_backing_file = "test01.qcow2"
++ * base :
++ *   - filename = "test01.qcow2"
++ *   - exact_filename = "test01.qcow2"
++ *   - backing_file = 0
++ *   - auto_backing_file = 0
++ */
+ BlockJob *commit_active_start(const char *job_id, BlockDriverState *bs,
+                               BlockDriverState *base, int creation_flags,
+                               int64_t speed, BlockdevOnError on_error,
+diff --git a/blockdev.c b/blockdev.c
+index 835064ed03..59bbb8e56a 100644
+--- a/blockdev.c
++++ b/blockdev.c
+@@ -2423,6 +2423,35 @@ out_rdlock:
+     bdrv_graph_rdunlock_main_loop();
+ }
+ 
++/*
++ * [0] qemu_lock_fd
++ * [0] raw_handle_perm_lock
++ * [0] raw_check_perm
++ * [0] bdrv_drv_set_perm
++ * [0] bdrv_node_refresh_perm
++ * [0] bdrv_list_refresh_perms
++ * [0] bdrv_replace_node_common
++ * [0] mirror_start_job
++ * [0] commit_active_start
++ * [0] qmp_block_commit
++ * [0] qmp_marshal_block_commit
++ * [0] do_qmp_dispatch_bh
++ * [0] aio_bh_poll
++ * [0] aio_dispatch
++ * [0] aio_ctx_dispatch
++ * [0] g_main_context_dispatch
++ * [0] glib_pollfds_poll
++ * [0] os_host_main_loop_wait
++ * [0] main_loop_wait
++ * [0] qemu_main_loop
++ * [0] qemu_default_main
++ * [0] __libc_start_main
++ * [0] _start
++ *
++ * (QEMU) blockdev-snapshot-sync node-name=drive01 snapshot-file=/tmp/overlay01.qcow2 snapshot-node-name=over01
++ * (QEMU) block-commit device=over01 job-id=jobA
++ * (QEMU) block-job-complete device=jobA
++ */
+ void qmp_block_commit(const char *job_id, const char *device,
+                       const char *base_node,
+                       const char *base,
+@@ -2559,6 +2588,19 @@ void qmp_block_commit(const char *job_id, const char *device,
+         }
+     }
+ 
++    /*
++     * 这里有两个很重要的:
++     * top_bs  :
++     *   - filename = "/tmp/overlay01.qcow2"i,
++     *   - exact_filename = "/tmp/overlay01.qcow2"
++     *   - backing_file = "test01.qcow2"
++     *   - auto_backing_file = "test01.qcow2"
++     * base_bs :
++     *   - filename = "test01.qcow2"
++     *   - exact_filename = "test01.qcow2"
++     *   - backing_file = 0
++     *   - auto_backing_file = 0
++     */
+     /* Do not allow attempts to commit an image into itself */
+     if (top_bs == base_bs) {
+         error_setg(errp, "cannot commit an image into itself");
+@@ -2596,6 +2638,19 @@ void qmp_block_commit(const char *job_id, const char *device,
+              */
+             job_id = bdrv_get_device_name(bs);
+         }
++        /*
++	 * 两个重要的参数:
++	 * top_bs  :
++	 *   - filename = "/tmp/overlay01.qcow2"i,
++	 *   - exact_filename = "/tmp/overlay01.qcow2"
++	 *   - backing_file = "test01.qcow2"
++	 *   - auto_backing_file = "test01.qcow2"
++	 * base_bs :
++	 *   - filename = "test01.qcow2"
++	 *   - exact_filename = "test01.qcow2"
++	 *   - backing_file = 0
++	 *   - auto_backing_file = 0
++	 */
+         commit_active_start(job_id, top_bs, base_bs, job_flags, speed, on_error,
+                             filter_node_name, NULL, NULL, false, &local_err);
+     } else {
+diff --git a/hw/block/virtio-blk.c b/hw/block/virtio-blk.c
+index 73bdfd6122..ec67b61c5c 100644
+--- a/hw/block/virtio-blk.c
++++ b/hw/block/virtio-blk.c
+@@ -37,6 +37,39 @@
+ #include "hw/virtio/virtio-blk-common.h"
+ #include "qemu/coroutine.h"
+ 
++/*
++ * QEMU-9.0的例子.
++ *
++ * (gdb) bt
++ * #0  blk_new (ctx=0x55555716e240, perm=0, shared_perm=15) at ../block/block-backend.c:357
++ * #1  0x000055555593f279 in set_drive_helper (obj=0x5555580dc630, v=
++ *     0x5555580e0fc0, name=0x5555580de030 "drive", opaque=0x555556fbbf80 <virtio_blk_properties>, iothread=false, errp=0x7fffffffd710) at ../hw/core/qdev-properties-system.c:146
++ * #2  0x000055555593f453 in set_drive (obj=0x5555580dc630, v=0x5555580e0fc0, name=0x5555580de030 "drive", opaque=0x555556fbbf80 <virtio_blk_properties>, errp=0x7fffffffd710)
++ *     at ../hw/core/qdev-properties-system.c:190
++ * #3  0x0000555555e8b43c in field_prop_set (obj=0x5555580dc630, v=0x5555580e0fc0, name=0x5555580de030 "drive", opaque=0x555556fbbf80 <virtio_blk_properties>, errp=0x7fffffffd710)
++ *     at ../hw/core/qdev-properties.c:88
++ * #4  0x0000555555e98e36 in object_property_set (obj=0x5555580dc630, name=0x5555580de030 "drive", v=0x5555580e0fc0, errp=0x7fffffffd710) at ../qom/object.c:1472
++ * #5  0x0000555555e9c464 in property_set_alias (obj=0x5555580d4260, v=0x5555580e0e00, name=0x5555580e0d90 "drive", opaque=0x5555580de010, errp=0x7fffffffd710) at ../qom/object.c:2799
++ * #6  0x0000555555e98e36 in object_property_set (obj=0x5555580d4260, name=0x5555580e0d90 "drive", v=0x5555580e0e00, errp=0x7fffffffd710) at ../qom/object.c:1472
++ * #7  0x0000555555e9cbc1 in object_set_properties_from_qdict (obj=0x5555580d4260, qdict=0x5555580dfc70, v=0x5555580e0e00, errp=0x7fffffffd710) at ../qom/object_interfaces.c:55
++ * #8  0x0000555555e9ccbc in object_set_properties_from_keyval (obj=0x5555580d4260, qdict=0x5555580dfc70, from_json=false, errp=0x7fffffffd710) at ../qom/object_interfaces.c:73
++ * #9  0x0000555555bbc53a in qdev_device_add_from_qdict (opts=0x5555580d3220, from_json=false, errp=0x7fffffffd710) at ../system/qdev-monitor.c:712
++ * #10 0x0000555555bbc611 in qdev_device_add (opts=0x55555716d840, errp=0x5555570af7c0 <error_fatal>) at ../system/qdev-monitor.c:737
++ * #11 0x0000555555bc6d64 in device_init_func (opaque=0x0, opts=0x55555716d840, errp=0x5555570af7c0 <error_fatal>) at ../system/vl.c:1200
++ * #12 0x00005555560c439e in qemu_opts_foreach (list=0x555556f98e80 <qemu_device_opts>, func=0x555555bc6d35 <device_init_func>, opaque=0x0, errp=0x5555570af7c0 <error_fatal>)
++ *     at ../util/qemu-option.c:1135
++ * #13 0x0000555555bcac00 in qemu_create_cli_devices () at ../system/vl.c:2637
++ * #14 0x0000555555bcae46 in qmp_x_exit_preconfig (errp=0x5555570af7c0 <error_fatal>) at ../system/vl.c:2706
++ * #15 0x0000555555bcd92e in qemu_init (argc=30, argv=0x7fffffffdb18) at ../system/vl.c:3739
++ * #16 0x0000555555e8a1ef in main (argc=30, argv=0x7fffffffdb18) at ../system/main.c:47
++ *
++ * VirtIOBlock:
++ * -> BlockBackend *blk;
++ * -> VirtIOBlkConf conf;
++ *    -> BlockConf conf;
++ *       -> BlockBackend *blk;
++ */
++
+ static void virtio_blk_ioeventfd_attach(VirtIOBlock *s);
+ 
+ static void virtio_blk_init_request(VirtIOBlock *s, VirtQueue *vq,
+diff --git a/hw/scsi/megasas.c b/hw/scsi/megasas.c
+index 2d0c607177..ac28691259 100644
+--- a/hw/scsi/megasas.c
++++ b/hw/scsi/megasas.c
+@@ -37,6 +37,12 @@
+ #include "migration/vmstate.h"
+ #include "qom/object.h"
+ 
++/*
++ * 这个文档:
++ * A Practical Look at QEMU's Block Layer Primitives
++ * https://kashyapc.fedorapeople.org/virt/LinuxCon-NA-2016/A-Practical-Look-at-QEMU-Block-Layer-Primitives-LC-NA-2016.pdf
++ */
++
+ #define MEGASAS_VERSION_GEN1 "1.70"
+ #define MEGASAS_VERSION_GEN2 "1.80"
+ #define MEGASAS_MAX_FRAMES 2048         /* Firmware limit at 65535 */
+diff --git a/hw/scsi/scsi-bus.c b/hw/scsi/scsi-bus.c
+index 53eff5dd3d..74e459688c 100644
+--- a/hw/scsi/scsi-bus.c
++++ b/hw/scsi/scsi-bus.c
+@@ -17,6 +17,12 @@
+ #include "sysemu/dma.h"
+ #include "qemu/cutils.h"
+ 
++/*
++ * 这个文档:
++ * A Practical Look at QEMU's Block Layer Primitives
++ * https://kashyapc.fedorapeople.org/virt/LinuxCon-NA-2016/A-Practical-Look-at-QEMU-Block-Layer-Primitives-LC-NA-2016.pdf
++ */
++
+ static char *scsibus_get_dev_path(DeviceState *dev);
+ static char *scsibus_get_fw_dev_path(DeviceState *dev);
+ static void scsi_req_dequeue(SCSIRequest *req);
+diff --git a/hw/scsi/scsi-disk.c b/hw/scsi/scsi-disk.c
+index 4d94b2b816..4d8833768f 100644
+--- a/hw/scsi/scsi-disk.c
++++ b/hw/scsi/scsi-disk.c
+@@ -47,6 +47,12 @@
+ #include <scsi/sg.h>
+ #endif
+ 
++/*
++ * 这个文档:
++ * A Practical Look at QEMU's Block Layer Primitives
++ * https://kashyapc.fedorapeople.org/virt/LinuxCon-NA-2016/A-Practical-Look-at-QEMU-Block-Layer-Primitives-LC-NA-2016.pdf
++ */
++
+ #define SCSI_WRITE_SAME_MAX         (512 * KiB)
+ #define SCSI_DMA_BUF_SIZE           (128 * KiB)
+ #define SCSI_MAX_INQUIRY_LEN        256
+@@ -96,6 +102,16 @@ typedef struct SCSIDiskReq {
+ #define SCSI_DISK_F_NO_REMOVABLE_DEVOPS   2
+ 
+ struct SCSIDiskState {
++    /*
++     * 3228 static Property scsi_block_properties[] = {
++     * 3229     DEFINE_BLOCK_ERROR_PROPERTIES(SCSIDiskState, qdev.conf),
++     * 3230     DEFINE_PROP_DRIVE("drive", SCSIDiskState, qdev.conf.blk),
++     *
++     * struct SCSIDiskState:
++     * -> SCSIDevice qdev;
++     *    -> BlockConf conf;
++     *       -> BlockBackend *blk;
++     */
+     SCSIDevice qdev;
+     uint32_t features;
+     bool media_changed;
+@@ -3266,6 +3282,16 @@ static const TypeInfo scsi_cd_info = {
+     .class_init    = scsi_cd_class_initfn,
+ };
+ 
++/*
++ * 3228 static Property scsi_block_properties[] = {
++ * 3229     DEFINE_BLOCK_ERROR_PROPERTIES(SCSIDiskState, qdev.conf),
++ * 3230     DEFINE_PROP_DRIVE("drive", SCSIDiskState, qdev.conf.blk),
++ *
++ * struct SCSIDiskState:
++ * -> SCSIDevice qdev;
++ *    -> BlockConf conf;
++ *       -> BlockBackend *blk;
++ */
+ #ifdef __linux__
+ static Property scsi_block_properties[] = {
+     DEFINE_BLOCK_ERROR_PROPERTIES(SCSIDiskState, qdev.conf),
+diff --git a/hw/scsi/scsi-generic.c b/hw/scsi/scsi-generic.c
+index ee945f87e3..4fd08858ac 100644
+--- a/hw/scsi/scsi-generic.c
++++ b/hw/scsi/scsi-generic.c
+@@ -33,6 +33,12 @@
+ #define MAX_UINT ((unsigned int)-1)
+ #endif
+ 
++/*
++ * 这个文档:
++ * A Practical Look at QEMU's Block Layer Primitives
++ * https://kashyapc.fedorapeople.org/virt/LinuxCon-NA-2016/A-Practical-Look-at-QEMU-Block-Layer-Primitives-LC-NA-2016.pdf
++ */
++
+ typedef struct SCSIGenericReq {
+     SCSIRequest req;
+     uint8_t *buf;
+diff --git a/hw/scsi/virtio-scsi.c b/hw/scsi/virtio-scsi.c
+index 9f02ceea09..e4dbd4c728 100644
+--- a/hw/scsi/virtio-scsi.c
++++ b/hw/scsi/virtio-scsi.c
+@@ -31,6 +31,12 @@
+ #include "hw/virtio/virtio-access.h"
+ #include "trace.h"
+ 
++/*
++ * 这个文档:
++ * A Practical Look at QEMU's Block Layer Primitives
++ * https://kashyapc.fedorapeople.org/virt/LinuxCon-NA-2016/A-Practical-Look-at-QEMU-Block-Layer-Primitives-LC-NA-2016.pdf
++ */
++
+ typedef struct VirtIOSCSIReq {
+     /*
+      * Note:
+diff --git a/hw/vfio/pci.c b/hw/vfio/pci.c
+index 2407720c35..bfe3c088f0 100644
+--- a/hw/vfio/pci.c
++++ b/hw/vfio/pci.c
+@@ -585,6 +585,16 @@ static int vfio_msix_vector_do_use(PCIDevice *pdev, unsigned int nr,
+             Error *err = NULL;
+             int32_t fd;
+ 
++            /*
++	     * 注释
++	     * Two interrupt paths are configured per vector.  The first, is only used
++	     * for interrupts injected via QEMU.  This is typically the non-accel path,
++	     * but may also be used when we want QEMU to handle masking and pending
++	     * bits.  The KVM path bypasses QEMU and is therefore higher performance,
++	     * but requires masking at the device.  virq is used to track the MSI route
++	     * through KVM, thus kvm_interrupt is only available when virq is set to a
++	     * valid (>= 0) value.
++	     */
+             if (vector->virq >= 0) {
+                 fd = event_notifier_get_fd(&vector->kvm_interrupt);
+             } else {
+@@ -600,6 +610,9 @@ static int vfio_msix_vector_do_use(PCIDevice *pdev, unsigned int nr,
+         }
+     }
+ 
++    /*
++     * 这里会改变memslots!!!
++     */
+     /* Disable PBA emulation when nothing more is pending. */
+     clear_bit(nr, vdev->msix->pending);
+     if (find_first_bit(vdev->msix->pending,
+diff --git a/include/hw/block/block.h b/include/hw/block/block.h
+index de3946a5f1..2a50a8c16b 100644
+--- a/include/hw/block/block.h
++++ b/include/hw/block/block.h
+@@ -68,6 +68,38 @@ static inline unsigned int get_physical_block_exp(BlockConf *conf)
+     DEFINE_PROP_ON_OFF_AUTO("account-failed", _state,                   \
+                             _conf.account_failed, ON_OFF_AUTO_AUTO)
+ 
++/*
++ * QEMU-9.0的例子.
++ *
++ * (gdb) bt
++ * #0  blk_new (ctx=0x55555716e240, perm=0, shared_perm=15) at ../block/block-backend.c:357
++ * #1  0x000055555593f279 in set_drive_helper (obj=0x5555580dc630, v=
++ *     0x5555580e0fc0, name=0x5555580de030 "drive", opaque=0x555556fbbf80 <virtio_blk_properties>, iothread=false, errp=0x7fffffffd710) at ../hw/core/qdev-properties-system.c:146
++ * #2  0x000055555593f453 in set_drive (obj=0x5555580dc630, v=0x5555580e0fc0, name=0x5555580de030 "drive", opaque=0x555556fbbf80 <virtio_blk_properties>, errp=0x7fffffffd710)
++ *     at ../hw/core/qdev-properties-system.c:190
++ * #3  0x0000555555e8b43c in field_prop_set (obj=0x5555580dc630, v=0x5555580e0fc0, name=0x5555580de030 "drive", opaque=0x555556fbbf80 <virtio_blk_properties>, errp=0x7fffffffd710)
++ *     at ../hw/core/qdev-properties.c:88
++ * #4  0x0000555555e98e36 in object_property_set (obj=0x5555580dc630, name=0x5555580de030 "drive", v=0x5555580e0fc0, errp=0x7fffffffd710) at ../qom/object.c:1472
++ * #5  0x0000555555e9c464 in property_set_alias (obj=0x5555580d4260, v=0x5555580e0e00, name=0x5555580e0d90 "drive", opaque=0x5555580de010, errp=0x7fffffffd710) at ../qom/object.c:2799
++ * #6  0x0000555555e98e36 in object_property_set (obj=0x5555580d4260, name=0x5555580e0d90 "drive", v=0x5555580e0e00, errp=0x7fffffffd710) at ../qom/object.c:1472
++ * #7  0x0000555555e9cbc1 in object_set_properties_from_qdict (obj=0x5555580d4260, qdict=0x5555580dfc70, v=0x5555580e0e00, errp=0x7fffffffd710) at ../qom/object_interfaces.c:55
++ * #8  0x0000555555e9ccbc in object_set_properties_from_keyval (obj=0x5555580d4260, qdict=0x5555580dfc70, from_json=false, errp=0x7fffffffd710) at ../qom/object_interfaces.c:73
++ * #9  0x0000555555bbc53a in qdev_device_add_from_qdict (opts=0x5555580d3220, from_json=false, errp=0x7fffffffd710) at ../system/qdev-monitor.c:712
++ * #10 0x0000555555bbc611 in qdev_device_add (opts=0x55555716d840, errp=0x5555570af7c0 <error_fatal>) at ../system/qdev-monitor.c:737
++ * #11 0x0000555555bc6d64 in device_init_func (opaque=0x0, opts=0x55555716d840, errp=0x5555570af7c0 <error_fatal>) at ../system/vl.c:1200
++ * #12 0x00005555560c439e in qemu_opts_foreach (list=0x555556f98e80 <qemu_device_opts>, func=0x555555bc6d35 <device_init_func>, opaque=0x0, errp=0x5555570af7c0 <error_fatal>)
++ *     at ../util/qemu-option.c:1135
++ * #13 0x0000555555bcac00 in qemu_create_cli_devices () at ../system/vl.c:2637
++ * #14 0x0000555555bcae46 in qmp_x_exit_preconfig (errp=0x5555570af7c0 <error_fatal>) at ../system/vl.c:2706
++ * #15 0x0000555555bcd92e in qemu_init (argc=30, argv=0x7fffffffdb18) at ../system/vl.c:3739
++ * #16 0x0000555555e8a1ef in main (argc=30, argv=0x7fffffffdb18) at ../system/main.c:47
++ *
++ * VirtIOBlock:
++ * -> BlockBackend *blk;
++ * -> VirtIOBlkConf conf;
++ *    -> BlockConf conf;
++ *       -> BlockBackend *blk;
++ */
+ #define DEFINE_BLOCK_PROPERTIES(_state, _conf)                          \
+     DEFINE_PROP_DRIVE("drive", _state, _conf.blk),                      \
+     DEFINE_BLOCK_PROPERTIES_BASE(_state, _conf)
+diff --git a/include/hw/virtio/virtio.h b/include/hw/virtio/virtio.h
+index 0fcbc5c0c6..491cfeeb57 100644
+--- a/include/hw/virtio/virtio.h
++++ b/include/hw/virtio/virtio.h
+@@ -121,8 +121,41 @@ struct VirtIODevice
+      * backend (e.g. vhost) and could potentially be a subset of the
+      * total feature set offered by QEMU.
+      */
++    /*
++     * 注释:
++     * These fields represent a set of VirtIO features at various
++     * levels of the stack. @host_features indicates the complete
++     * feature set the VirtIO device can offer to the driver.
++     * @guest_features indicates which features the VirtIO driver has
++     * selected by writing to the feature register. Finally
++     * @backend_features represents everything supported by the
++     * backend (e.g. vhost) and could potentially be a subset of the
++     * total feature set offered by QEMU.
++     */
+     uint64_t host_features;
++    /*
++     * 注释:
++     * These fields represent a set of VirtIO features at various
++     * levels of the stack. @host_features indicates the complete
++     * feature set the VirtIO device can offer to the driver.
++     * @guest_features indicates which features the VirtIO driver has
++     * selected by writing to the feature register. Finally
++     * @backend_features represents everything supported by the
++     * backend (e.g. vhost) and could potentially be a subset of the
++     * total feature set offered by QEMU.
++     */
+     uint64_t guest_features;
++    /*
++     * 注释:
++     * These fields represent a set of VirtIO features at various
++     * levels of the stack. @host_features indicates the complete
++     * feature set the VirtIO device can offer to the driver.
++     * @guest_features indicates which features the VirtIO driver has
++     * selected by writing to the feature register. Finally
++     * @backend_features represents everything supported by the
++     * backend (e.g. vhost) and could potentially be a subset of the
++     * total feature set offered by QEMU.
++     */
+     uint64_t backend_features;
+ 
+     size_t config_len;
+diff --git a/qom/object.c b/qom/object.c
+index 157a45c5f8..41622d3d8e 100644
+--- a/qom/object.c
++++ b/qom/object.c
+@@ -1704,6 +1704,32 @@ int object_property_get_enum(Object *obj, const char *name,
+     return ret;
+ }
+ 
++/*
++ * 旧的version的实现
++ *
++ * (gdb) bt
++ * #0  object_property_parse (obj=0x555556a5f460, name=0x55555680db00 "x2apic", string=0x55555680db20 "off", errp=0x7fffffffd878) at ../qom/object.c:1646
++ * #1  0x0000555555d28d33 in object_apply_global_props (obj=0x555556a5f460, props=0x5555569b8f00, errp=0x55555679a800 <error_fatal>) at ../qom/object.c:412
++ * #2  0x0000555555d20e5c in qdev_prop_set_globals (dev=0x555556a5f460) at ../hw/core/qdev-properties.c:790
++ * #3  0x0000555555d2385d in device_post_init (obj=0x555556a5f460) at ../hw/core/qdev.c:697
++ * #4  0x0000555555d28c2d in object_post_init_with_type (obj=0x555556a5f460, ti=0x555556802d20) at ../qom/object.c:384
++ * #5  0x0000555555d28c5b in object_post_init_with_type (obj=0x555556a5f460, ti=0x5555567b2220) at ../qom/object.c:388
++ * #6  0x0000555555d28c5b in object_post_init_with_type (obj=0x555556a5f460, ti=0x5555567e1470) at ../qom/object.c:388
++ * #7  0x0000555555d28c5b in object_post_init_with_type (obj=0x555556a5f460, ti=0x5555567f4600) at ../qom/object.c:388
++ * #8  0x0000555555d28c5b in object_post_init_with_type (obj=0x555556a5f460, ti=0x5555567f4960) at ../qom/object.c:388
++ * #9  0x0000555555d29141 in object_initialize_with_type (obj=0x555556a5f460, size=51344, type=0x5555567f4960) at ../qom/object.c:520
++ * #10 0x0000555555d29838 in object_new_with_type (type=0x5555567f4960) at ../qom/object.c:734
++ * #11 0x0000555555d2988f in object_new (typename=0x5555567f4ae0 "host-x86_64-cpu") at ../qom/object.c:749
++ * #12 0x0000555555b2dfce in x86_cpu_new (x86ms=0x555556a0b990, apic_id=0, errp=0x55555679a800 <error_fatal>) at ../hw/i386/x86.c:96
++ * #13 0x0000555555b2e0e6 in x86_cpus_init (x86ms=0x555556a0b990, default_cpu_version=1) at ../hw/i386/x86.c:128
++ * #14 0x0000555555b398df in pc_init1 (machine=0x555556a0b990, host_type=0x55555606fef4 "i440FX-pcihost", pci_type=0x55555606feed "i440FX") at ../hw/i386/pc_piix.    c:157
++ * #15 0x0000555555b3a322 in pc_init_v7_0 (machine=0x555556a0b990) at ../hw/i386/pc_piix.c:427
++ * #16 0x0000555555954dff in machine_run_board_init (machine=0x555556a0b990) at ../hw/core/machine.c:1189
++ * #17 0x0000555555896b1d in qemu_init_board () at ../softmmu/vl.c:2656
++ * #18 0x0000555555896d5b in qmp_x_exit_preconfig (errp=0x55555679a800 <error_fatal>) at ../softmmu/vl.c:2746
++ * #19 0x0000555555899362 in qemu_init (argc=18, argv=0x7fffffffdf08, envp=0x7fffffffdfa0) at ../softmmu/vl.c:3776
++ * #20 0x0000555555836e7d in main (argc=18, argv=0x7fffffffdf08, envp=0x7fffffffdfa0) at ../softmmu/main.c:49
++ */
+ bool object_property_parse(Object *obj, const char *name,
+                            const char *string, Error **errp)
+ {
+diff --git a/target/i386/cpu.c b/target/i386/cpu.c
+index 85ef7452c0..e72a34783c 100644
+--- a/target/i386/cpu.c
++++ b/target/i386/cpu.c
+@@ -46,6 +46,12 @@
+ #include "disas/capstone.h"
+ #include "cpu-internal.h"
+ 
++/*
++ * 查看:
++ *
++ * https://github.com/finallyjustice/codereading/blob/master/comment/kvm/qemu_kvm_cpuid_features.txt
++ */
++
+ static void x86_cpu_realizefn(DeviceState *dev, Error **errp);
+ 
+ /* Helpers for building CPUID[2] descriptors: */
+@@ -912,6 +918,11 @@ void x86_cpu_vendor_words2str(char *dst, uint32_t vendor1,
+ #define TCG_8000_0008_EBX  (CPUID_8000_0008_EBX_XSAVEERPTR | \
+           CPUID_8000_0008_EBX_WBNOINVD | CPUID_8000_0008_EBX_KERNEL_FEATURES)
+ 
++/*
++ * 查看:
++ *
++ * https://github.com/finallyjustice/codereading/blob/master/comment/kvm/qemu_kvm_cpuid_features.txt
++ */
+ FeatureWordInfo feature_word_info[FEATURE_WORDS] = {
+     [FEAT_1_EDX] = {
+         .type = CPUID_FEATURE_WORD,
+@@ -5352,6 +5363,9 @@ static void max_x86_cpu_initfn(Object *obj)
+      * these defaults are used for TCG and all other accelerators
+      * besides KVM and HVF, which overwrite these values
+      */
++    /*
++     * TCG默认是AuthenticAMD
++     */
+     object_property_set_str(OBJECT(cpu), "vendor", CPUID_VENDOR_AMD,
+                             &error_abort);
+     object_property_set_str(OBJECT(cpu), "model-id",
+@@ -5552,6 +5566,105 @@ static char *x86_cpuid_get_vendor(Object *obj, Error **errp)
+     return value;
+ }
+ 
++/*
++ * 初始化默认是AMD
++ *
++ * (gdb) bt
++ * #0  x86_cpuid_set_vendor (obj=0x5555574631f0, value=0x55555746c020 "AuthenticAMD", errp=0x5555570af7b8 <error_abort>)
++ *            at ../target/i386/cpu.c:5190
++ * #1  0x0000555555e9b051 in property_set_str (obj=0x5555574631f0, v=0x55555746bf20, name=0x5555562f38b7 "vendor",
++ *            opaque=0x555557184d80, errp=0x5555570af7b8 <error_abort>) at ../qom/object.c:2281
++ * #2  0x0000555555e98e36 in object_property_set (obj=0x5555574631f0, name=0x5555562f38b7 "vendor", v=0x55555746bf20,
++ *            errp=0x5555570af7b8 <error_abort>) at ../qom/object.c:1472
++ * #3  0x0000555555e9dba3 in object_property_set_qobject (obj=0x5555574631f0, name=0x5555562f38b7 "vendor",
++ *            value=0x555557463080, errp=0x5555570af7b8 <error_abort>) at ../qom/qom-qobject.c:28
++ * #4  0x0000555555e98eda in object_property_set_str (obj=0x5555574631f0, name=0x5555562f38b7 "vendor", value=0x5555562f38aa "AuthenticAMD",
++ *            errp=0x5555570af7b8 <error_abort>) at ../qom/object.c:1480
++ * #5  0x0000555555ce8d85 in max_x86_cpu_initfn (obj=0x5555574631f0) at ../target/i386/cpu.c:4987
++ * #6  0x0000555555e9650e in object_init_with_type (obj=0x5555574631f0, ti=0x555557154310) at ../qom/object.c:429
++ * #7  0x0000555555e964f0 in object_init_with_type (obj=0x5555574631f0, ti=0x555557154670) at ../qom/object.c:425
++ * #8  0x0000555555e96b05 in object_initialize_with_type (obj=0x5555574631f0, size=25888, type=0x555557154670) at ../qom/object.c:571
++ * #9  0x0000555555e97385 in object_new_with_type (type=0x555557154670) at ../qom/object.c:791
++ * #10 0x0000555555e973e9 in object_new (typename=0x5555571547f0 "host-x86_64-cpu") at ../qom/object.c:806
++ * #11 0x0000555555c9413a in x86_cpu_new (x86ms=0x5555573e9000, apic_id=0, errp=0x5555570af7c0 <error_fatal>) at ../hw/i386/x86.c:100
++ * #12 0x0000555555c942f7 in x86_cpus_init (x86ms=0x5555573e9000, default_cpu_version=1) at ../hw/i386/x86.c:156
++ * #13 0x0000555555ca1242 in pc_init1 (machine=0x5555573e9000, pci_type=0x5555562e5df3 "i440FX") at ../hw/i386/pc_piix.c:185
++ * #14 0x0000555555ca20fa in pc_init_v9_0 (machine=0x5555573e9000) at ../hw/i386/pc_piix.c:523
++ * #15 0x000055555593b0b8 in machine_run_board_init (machine=0x5555573e9000, mem_path=0x0, errp=0x7fffffffd970)
++ *            at ../hw/core/machine.c:1547
++ * #16 0x0000555555bcab2e in qemu_init_board () at ../system/vl.c:2613
++ * #17 0x0000555555bcae41 in qmp_x_exit_preconfig (errp=0x5555570af7c0 <error_fatal>) at ../system/vl.c:2705
++ * #18 0x0000555555bcd92e in qemu_init (argc=24, argv=0x7fffffffdc68) at ../system/vl.c:3739
++ * #19 0x0000555555e8a1ef in main (argc=24, argv=0x7fffffffdc68) at ../system/main.c:47
++ *
++ * 有"-cpu host"
++ *
++ * (gdb) bt
++ * #0  x86_cpuid_set_vendor (obj=0x5555574631f0, value=0x55555746c020 "GenuineIntel", errp=0x5555570af7b8 <error_abort>)
++ *            at ../target/i386/cpu.c:5190
++ * #1  0x0000555555e9b051 in property_set_str (obj=0x5555574631f0, v=0x55555746bf20, name=0x5555562f5a45 "vendor",
++ *            opaque=0x555557184d80, errp=0x5555570af7b8 <error_abort>) at ../qom/object.c:2281
++ * #2  0x0000555555e98e36 in object_property_set (obj=0x5555574631f0, name=0x5555562f5a45 "vendor", v=0x55555746bf20,
++ *            errp=0x5555570af7b8 <error_abort>) at ../qom/object.c:1472
++ * #3  0x0000555555e9dba3 in object_property_set_qobject (obj=0x5555574631f0, name=0x5555562f5a45 "vendor", value=0x555557463080,
++ *            errp=0x5555570af7b8 <error_abort>) at ../qom/qom-qobject.c:28
++ * #4  0x0000555555e98eda in object_property_set_str (obj=0x5555574631f0, name=0x5555562f5a45 "vendor", value=0x7fffffffd583 "GenuineIntel",
++ *            errp=0x5555570af7b8 <error_abort>) at ../qom/object.c:1480
++ * #5  0x0000555555cf7dc0 in host_cpu_max_instance_init (cpu=0x5555574631f0) at ../target/i386/host-cpu.c:178
++ * #6  0x0000555555c81a89 in kvm_cpu_max_instance_init (cpu=0x5555574631f0) at ../target/i386/kvm/kvm-cpu.c:71
++ * #7  0x0000555555c81e1f in kvm_cpu_instance_init (cs=0x5555574631f0) at ../target/i386/kvm/kvm-cpu.c:184
++ * #8  0x0000555555e46ba0 in accel_cpu_instance_init (cpu=0x5555574631f0) at ../accel/accel-target.c:118
++ * #9  0x0000555555cf01d8 in x86_cpu_post_initfn (obj=0x5555574631f0) at ../target/i386/cpu.c:7596
++ * #10 0x0000555555e96547 in object_post_init_with_type (obj=0x5555574631f0, ti=0x555557140640) at ../qom/object.c:436
++ * #11 0x0000555555e96575 in object_post_init_with_type (obj=0x5555574631f0, ti=0x555557154310) at ../qom/object.c:440
++ * #12 0x0000555555e96575 in object_post_init_with_type (obj=0x5555574631f0, ti=0x555557154670) at ../qom/object.c:440
++ * #13 0x0000555555e96b18 in object_initialize_with_type (obj=0x5555574631f0, size=25888, type=0x555557154670) at ../qom/object.c:572
++ * #14 0x0000555555e97385 in object_new_with_type (type=0x555557154670) at ../qom/object.c:791
++ * #15 0x0000555555e973e9 in object_new (typename=0x5555571547f0 "host-x86_64-cpu") at ../qom/object.c:806
++ * #16 0x0000555555c9413a in x86_cpu_new (x86ms=0x5555573e9000, apic_id=0, errp=0x5555570af7c0 <error_fatal>) at ../hw/i386/x86.c:100
++ * #17 0x0000555555c942f7 in x86_cpus_init (x86ms=0x5555573e9000, default_cpu_version=1) at ../hw/i386/x86.c:156
++ * #18 0x0000555555ca1242 in pc_init1 (machine=0x5555573e9000, pci_type=0x5555562e5df3 "i440FX") at ../hw/i386/pc_piix.c:185
++ * #19 0x0000555555ca20fa in pc_init_v9_0 (machine=0x5555573e9000) at ../hw/i386/pc_piix.c:523
++ * #20 0x000055555593b0b8 in machine_run_board_init (machine=0x5555573e9000, mem_path=0x0, errp=0x7fffffffd970)
++ *            at ../hw/core/machine.c:1547
++ * #21 0x0000555555bcab2e in qemu_init_board () at ../system/vl.c:2613
++ * #22 0x0000555555bcae41 in qmp_x_exit_preconfig (errp=0x5555570af7c0 <error_fatal>) at ../system/vl.c:2705
++ * #23 0x0000555555bcd92e in qemu_init (argc=24, argv=0x7fffffffdc68) at ../system/vl.c:3739
++ * #24 0x0000555555e8a1ef in main (argc=24, argv=0x7fffffffdc68) at ../system/main.c:47
++ *
++ * 没有"-cpu host"
++ *
++ * (gdb) bt
++ * #0  x86_cpuid_set_vendor (obj=0x5555574631f0, value=0x55555746c020 "GenuineIntel", errp=0x5555570af7b8 <error_abort>)
++ *            at ../target/i386/cpu.c:5190
++ * #1  0x0000555555e9b051 in property_set_str (obj=0x5555574631f0, v=0x55555746bf20, name=0x5555562f5a45 "vendor",
++ *            opaque=0x555557184d80, errp=0x5555570af7b8 <error_abort>) at ../qom/object.c:2281
++ * #2  0x0000555555e98e36 in object_property_set (obj=0x5555574631f0, name=0x5555562f5a45 "vendor", v=0x55555746bf20,
++ *            errp=0x5555570af7b8 <error_abort>) at ../qom/object.c:1472
++ * #3  0x0000555555e9dba3 in object_property_set_qobject (obj=0x5555574631f0, name=0x5555562f5a45 "vendor",
++ *            value=0x555557463080, errp=0x5555570af7b8 <error_abort>) at ../qom/qom-qobject.c:28
++ * #4  0x0000555555e98eda in object_property_set_str (obj=0x5555574631f0, name=0x5555562f5a45 "vendor", value=0x7fffffffd62b "GenuineIntel",
++ *            errp=0x5555570af7b8 <error_abort>) at ../qom/object.c:1480
++ * #5  0x0000555555cf7cbb in host_cpu_instance_init (cpu=0x5555574631f0) at ../target/i386/host-cpu.c:162
++ * #6  0x0000555555c81d91 in kvm_cpu_instance_init (cs=0x5555574631f0) at ../target/i386/kvm/kvm-cpu.c:169
++ * #7  0x0000555555e46ba0 in accel_cpu_instance_init (cpu=0x5555574631f0) at ../accel/accel-target.c:118
++ * #8  0x0000555555cf01d8 in x86_cpu_post_initfn (obj=0x5555574631f0) at ../target/i386/cpu.c:7596
++ * #9  0x0000555555e96547 in object_post_init_with_type (obj=0x5555574631f0, ti=0x555557140640) at ../qom/object.c:436
++ * #10 0x0000555555e96575 in object_post_init_with_type (obj=0x5555574631f0, ti=0x5555571241b0) at ../qom/object.c:440
++ * #11 0x0000555555e96b18 in object_initialize_with_type (obj=0x5555574631f0, size=25888, type=0x5555571241b0) at ../qom/object.c:572
++ * #12 0x0000555555e97385 in object_new_with_type (type=0x5555571241b0) at ../qom/object.c:791
++ * #13 0x0000555555e973e9 in object_new (typename=0x5555562ec770 "qemu64-x86_64-cpu") at ../qom/object.c:806
++ * #14 0x0000555555c9413a in x86_cpu_new (x86ms=0x5555573e9000, apic_id=0, errp=0x5555570af7c0 <error_fatal>) at ../hw/i386/x86.c:100
++ * #15 0x0000555555c942f7 in x86_cpus_init (x86ms=0x5555573e9000, default_cpu_version=1) at ../hw/i386/x86.c:156
++ * #16 0x0000555555ca1242 in pc_init1 (machine=0x5555573e9000, pci_type=0x5555562e5df3 "i440FX") at ../hw/i386/pc_piix.c:185
++ * #17 0x0000555555ca20fa in pc_init_v9_0 (machine=0x5555573e9000) at ../hw/i386/pc_piix.c:523
++ * #18 0x000055555593b0b8 in machine_run_board_init (machine=0x5555573e9000, mem_path=0x0, errp=0x7fffffffd990)
++ *            at ../hw/core/machine.c:1547
++ * #19 0x0000555555bcab2e in qemu_init_board () at ../system/vl.c:2613
++ * #20 0x0000555555bcae41 in qmp_x_exit_preconfig (errp=0x5555570af7c0 <error_fatal>) at ../system/vl.c:2705
++ * #21 0x0000555555bcd92e in qemu_init (argc=22, argv=0x7fffffffdc88) at ../system/vl.c:3739
++ * #22 0x0000555555e8a1ef in main (argc=22, argv=0x7fffffffdc88) at ../system/main.c:47
++ */
+ static void x86_cpuid_set_vendor(Object *obj, const char *value,
+                                  Error **errp)
+ {
+@@ -5565,6 +5678,18 @@ static void x86_cpuid_set_vendor(Object *obj, const char *value,
+         return;
+     }
+ 
++    /*
++     * 在以下使用CPUArchState->cpuid_vendor1:
++     *   - target/i386/cpu.c|5550| <<x86_cpuid_get_vendor>> x86_cpu_vendor_words2str(value, env->cpuid_vendor1, env->cpuid_vendor2,
++     *   - target/i386/cpu.c|5568| <<x86_cpuid_set_vendor>> env->cpuid_vendor1 = 0;
++     *   - target/i386/cpu.c|5572| <<x86_cpuid_set_vendor>> env->cpuid_vendor1 |= ((uint8_t)value[i ]) << (8 * i);
++     *   - target/i386/cpu.c|6451| <<cpu_x86_cpuid>> *ebx = env->cpuid_vendor1;
++     *   - target/i386/cpu.c|6862| <<cpu_x86_cpuid>> *ebx = env->cpuid_vendor1;
++     *   - target/i386/cpu.c|6877| <<cpu_x86_cpuid>> if (env->cpuid_vendor1 != CPUID_VENDOR_INTEL_1 ||
++     *   - target/i386/cpu.c|6883| <<cpu_x86_cpuid>> if (tcg_enabled() && env->cpuid_vendor1 == CPUID_VENDOR_INTEL_1 &&
++     *   - target/i386/cpu.h|1051| <<IS_INTEL_CPU>> #define IS_INTEL_CPU(env) ((env)->cpuid_vendor1 == CPUID_VENDOR_INTEL_1 && \
++     *   - target/i386/cpu.h|1054| <<IS_AMD_CPU>> #define IS_AMD_CPU(env) ((env)->cpuid_vendor1 == CPUID_VENDOR_AMD_1 && \
++     */
+     env->cpuid_vendor1 = 0;
+     env->cpuid_vendor2 = 0;
+     env->cpuid_vendor3 = 0;
+@@ -6405,6 +6530,33 @@ uint32_t cpu_x86_virtual_addr_width(CPUX86State *env)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - hw/i386/fw_cfg.c|183| <<fw_cfg_build_feature_control>> cpu_x86_cpuid(env, 1, 0, &unused, &unused, &ecx, &edx);
++ *   - hw/i386/fw_cfg.c|195| <<fw_cfg_build_feature_control>> cpu_x86_cpuid(env, 0x7, 0, &unused, &ebx, &ecx, &unused);
++ *   - target/i386/hvf/hvf.c|404| <<hvf_cpu_x86_cpuid>> cpu_x86_cpuid(env, index, count, eax, ebx, ecx, edx);
++ *   - target/i386/kvm/kvm.c|2061| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, 0, 0, &limit, &unused, &unused, &unused);
++ *   - target/i386/kvm/kvm.c|2077| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, i, 0, &c->eax, &c->ebx, &c->ecx, &c->edx);
++ *   - target/i386/kvm/kvm.c|2087| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, i, 0, &c->eax, &c->ebx, &c->ecx, &c->edx);
++ *   - target/i386/kvm/kvm.c|2108| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, i, j, &c->eax, &c->ebx, &c->ecx, &c->edx);
++ *   - target/i386/kvm/kvm.c|2133| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, i, j, &c->eax, &c->ebx, &c->ecx, &c->edx);
++ *   - target/i386/kvm/kvm.c|2154| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, i, 0, &c->eax, &c->ebx, &c->ecx, &c->edx);
++ *   - target/i386/kvm/kvm.c|2165| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, i, j, &c->eax, &c->ebx, &c->ecx, &c->edx);
++ *   - target/i386/kvm/kvm.c|2172| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, i, 0, &c->eax, &c->ebx, &c->ecx, &c->edx);
++ *   - target/i386/kvm/kvm.c|2187| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, 0x0a, 0, &eax, &unused, &unused, &edx);
++ *   - target/i386/kvm/kvm.c|2211| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, 0x80000000, 0, &limit, &unused, &unused, &unused);
++ *   - target/i386/kvm/kvm.c|2227| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, i, j, &c->eax, &c->ebx, &c->ecx, &c->edx);
++ *   - target/i386/kvm/kvm.c|2241| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, i, 0, &c->eax, &c->ebx, &c->ecx, &c->edx);
++ *   - target/i386/kvm/kvm.c|2255| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, 0xC0000000, 0, &limit, &unused, &unused, &unused);
++ *   - target/i386/kvm/kvm.c|2266| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, i, 0, &c->eax, &c->ebx, &c->ecx, &c->edx);
++ *   - target/i386/tcg/fpu_helper.c|3151| <<helper_xsetbv>> cpu_x86_cpuid(env, 0x0d, 0, &ena_lo, &dummy, &dummy, &ena_hi);
++ *   - target/i386/tcg/misc_helper.c|56| <<helper_cpuid>> cpu_x86_cpuid(env, (uint32_t)env->regs[R_EAX], (uint32_t)env->regs[R_ECX],
++ *   - target/i386/whpx/whpx-all.c|1946| <<whpx_vcpu_run>> cpu_x86_cpuid(env, cpuid_fn, 0, (UINT32 *)&rax, (UINT32 *)&rbx,
++ *
++ * 查看:
++ *
++ * https://github.com/finallyjustice/codereading/blob/master/comment/kvm/qemu_kvm_cpuid_features.txt
++ */
+ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
+                    uint32_t *eax, uint32_t *ebx,
+                    uint32_t *ecx, uint32_t *edx)
+@@ -6447,6 +6599,30 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
+ 
+     switch(index) {
+     case 0:
++        /*
++	 * 查看:
++	 *
++	 * https://github.com/finallyjustice/codereading/blob/master/comment/kvm/qemu_kvm_cpuid_features.txt
++	 *
++	 * 在以下使用CPUArchState->cpuid_vendor1:
++	 *   - target/i386/cpu.c|5550| <<x86_cpuid_get_vendor>> x86_cpu_vendor_words2str(value, env->cpuid_vendor1, env->cpuid_vendor2,
++	 *   - target/i386/cpu.c|5568| <<x86_cpuid_set_vendor>> env->cpuid_vendor1 = 0;
++	 *   - target/i386/cpu.c|5572| <<x86_cpuid_set_vendor>> env->cpuid_vendor1 |= ((uint8_t)value[i ]) << (8 * i);
++	 *   - target/i386/cpu.c|6451| <<cpu_x86_cpuid>> *ebx = env->cpuid_vendor1;
++	 *   - target/i386/cpu.c|6862| <<cpu_x86_cpuid>> *ebx = env->cpuid_vendor1;
++	 *   - target/i386/cpu.c|6877| <<cpu_x86_cpuid>> if (env->cpuid_vendor1 != CPUID_VENDOR_INTEL_1 ||
++	 *   - target/i386/cpu.c|6883| <<cpu_x86_cpuid>> if (tcg_enabled() && env->cpuid_vendor1 == CPUID_VENDOR_INTEL_1 &&
++	 *   - target/i386/cpu.h|1051| <<IS_INTEL_CPU>> #define IS_INTEL_CPU(env) ((env)->cpuid_vendor1 == CPUID_VENDOR_INTEL_1 && \
++	 *   - target/i386/cpu.h|1054| <<IS_AMD_CPU>> #define IS_AMD_CPU(env) ((env)->cpuid_vendor1 == CPUID_VENDOR_AMD_1 && \
++	 *
++	 * # cpuid -1 -l 0x0
++         * CPU:
++         *    vendor_id = "GenuineIntel"
++         *
++	 * # cpuid -1 -l 0x0 -r
++         * CPU:
++         *    0x00000000 0x00: eax=0x00000014 ebx=0x756e6547 ecx=0x6c65746e edx=0x49656e69
++	 */
+         *eax = env->cpuid_level;
+         *ebx = env->cpuid_vendor1;
+         *edx = env->cpuid_vendor2;
+@@ -6460,6 +6636,11 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
+         if ((*ecx & CPUID_EXT_XSAVE) && (env->cr[4] & CR4_OSXSAVE_MASK)) {
+             *ecx |= CPUID_EXT_OSXSAVE;
+         }
++        /*
++	 * 查看:
++	 *
++	 * https://github.com/finallyjustice/codereading/blob/master/comment/kvm/qemu_kvm_cpuid_features.txt
++	 */
+         *edx = env->features[FEAT_1_EDX];
+         if (threads_per_pkg > 1) {
+             *ebx |= threads_per_pkg << 16;
+@@ -7963,6 +8144,40 @@ static void x86_cpu_register_feature_bit_props(X86CPUClass *xcc,
+                                                int bitnr)
+ {
+     FeatureWordInfo *fi = &feature_word_info[w];
++    /*
++     * 915 FeatureWordInfo feature_word_info[FEATURE_WORDS] = {
++     * 916     [FEAT_1_EDX] = {
++     * 917         .type = CPUID_FEATURE_WORD,
++     * 918         .feat_names = {
++     * 919             "fpu", "vme", "de", "pse",
++     * 920             "tsc", "msr", "pae", "mce",
++     * 921             "cx8", "apic", NULL, "sep",
++     * 922             "mtrr", "pge", "mca", "cmov",
++     * 923             "pat", "pse36", "pn", "clflush",
++     * 924             NULL, "ds", "acpi", "mmx",
++     * 925             "fxsr", "sse", "sse2", "ss",
++     * 926             "ht", "tm", "ia64", "pbe",
++     * 927         },
++     * 928         .cpuid = {.eax = 1, .reg = R_EDX, },
++     * 929         .tcg_features = TCG_FEATURES,
++     * 930         .no_autoenable_flags = CPUID_HT,
++     * 931     },
++     * 932     [FEAT_1_ECX] = {
++     * 933         .type = CPUID_FEATURE_WORD,
++     * 934         .feat_names = {
++     * 935             "pni", "pclmulqdq", "dtes64", "monitor",
++     * 936             "ds-cpl", "vmx", "smx", "est",
++     * 937             "tm2", "ssse3", "cid", NULL,
++     * 938             "fma", "cx16", "xtpr", "pdcm",
++     * 939             NULL, "pcid", "dca", "sse4.1",
++     * 940             "sse4.2", "x2apic", "movbe", "popcnt",
++     * 941             "tsc-deadline", "aes", "xsave", NULL,
++     * 942             "avx", "f16c", "rdrand", "hypervisor",
++     * 943         },
++     * 944         .cpuid = { .eax = 1, .reg = R_ECX, },
++     * 945         .tcg_features = TCG_EXT_FEATURES,
++     * 946     },
++     */
+     const char *name = fi->feat_names[bitnr];
+ 
+     if (!name) {
+diff --git a/target/i386/cpu.h b/target/i386/cpu.h
+index 14edd57a37..776bcaed02 100644
+--- a/target/i386/cpu.h
++++ b/target/i386/cpu.h
+@@ -1787,12 +1787,61 @@ typedef struct CPUArchState {
+     uint64_t msr_ia32_feature_control;
+     uint64_t msr_ia32_sgxlepubkeyhash[4];
+ 
++    /*
++     * 在以下使用CPUX86State->msr_fixed_ctr_ctrl:
++     *   - target/i386/machine.c|674| <<global>> VMSTATE_UINT64(env.msr_fixed_ctr_ctrl, X86CPU),
++     *   - target/i386/kvm/kvm.c|4430| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_CORE_PERF_FIXED_CTR_CTRL, env->msr_fixed_ctr_ctrl);
++     *   - target/i386/kvm/kvm.c|5234| <<kvm_get_msrs>> env->msr_fixed_ctr_ctrl = msrs[i].data;
++     *   - target/i386/machine.c|650| <<pmu_enable_needed>> if (env->msr_fixed_ctr_ctrl || env->msr_global_ctrl ||
++     */
+     uint64_t msr_fixed_ctr_ctrl;
++    /*
++     * 在以下使用CPUX86State->msr_global_ctrl:
++     *   - target/i386/machine.c|675| <<global>> VMSTATE_UINT64(env.msr_global_ctrl, X86CPU),
++     *   - target/i386/kvm/kvm.c|4432| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_CORE_PERF_GLOBAL_CTRL, env->msr_global_ctrl);
++     *   - target/i386/kvm/kvm.c|5237| <<kvm_get_msrs>> env->msr_global_ctrl = msrs[i].data;
++     *   - target/i386/machine.c|650| <<pmu_enable_needed>> if (env->msr_fixed_ctr_ctrl || env->msr_global_ctrl ||
++     */
+     uint64_t msr_global_ctrl;
++    /*
++     * 在以下使用CPUX86State->msr_global_status:
++     *   - target/i386/machine.c|676| <<global>> VMSTATE_UINT64(env.msr_global_status, X86CPU),
++     *   - target/i386/kvm/kvm.c|4424| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_CORE_PERF_GLOBAL_STATUS, env->msr_global_status);
++     *   - target/i386/kvm/kvm.c|5240| <<kvm_get_msrs>> env->msr_global_status = msrs[i].data;
++     *   - target/i386/machine.c|651| <<pmu_enable_needed>> env->msr_global_status || env->msr_global_ovf_ctrl) {
++     */
+     uint64_t msr_global_status;
++    /*
++     * 在以下使用CPUX86State->msr_global_ovf_ctrl:
++     *   - target/i386/machine.c|677| <<global>> VMSTATE_UINT64(env.msr_global_ovf_ctrl, X86CPU),
++     *   - target/i386/kvm/kvm.c|4426| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_CORE_PERF_GLOBAL_OVF_CTRL, env->msr_global_ovf_ctrl);
++     *   - target/i386/kvm/kvm.c|5243| <<kvm_get_msrs>> env->msr_global_ovf_ctrl = msrs[i].data;
++     *   - target/i386/machine.c|651| <<pmu_enable_needed>> env->msr_global_status || env->msr_global_ovf_ctrl) {
++     */
+     uint64_t msr_global_ovf_ctrl;
++    /*
++     * 在以下使用CPUX86State->msr_fixed_counters[MAX_FIXED_COUNTERS]:
++     *   - target/i386/machine.c|678| <<global>> VMSTATE_UINT64_ARRAY(env.msr_fixed_counters, X86CPU, MAX_FIXED_COUNTERS),
++     *   - target/i386/kvm/kvm.c|4422| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_CORE_PERF_FIXED_CTR0 + i, env->msr_fixed_counters[i]);
++     *   - target/i386/kvm/kvm.c|5270| <<kvm_get_msrs>> env->msr_fixed_counters[index - MSR_CORE_PERF_FIXED_CTR0] = msrs[i].data;
++     *   - target/i386/machine.c|655| <<pmu_enable_needed>> if (env->msr_fixed_counters[i]) {
++     */
+     uint64_t msr_fixed_counters[MAX_FIXED_COUNTERS];
++    /*
++     * 在以下使用CPUX86State->msr_gp_counters[MAX_GP_COUNTERS]:
++     *   - target/i386/machine.c|679| <<global>> VMSTATE_UINT64_ARRAY(env.msr_gp_counters, X86CPU, MAX_GP_COUNTERS),
++     *   - target/i386/kvm/kvm.c|4418| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_P6_PERFCTR0 + i, env->msr_gp_counters[i]);
++     *   - target/i386/kvm/kvm.c|5249| <<kvm_get_msrs>> env->msr_gp_counters[index - MSR_P6_PERFCTR0] = msrs[i].data;
++     *   - target/i386/machine.c|660| <<pmu_enable_needed>> if (env->msr_gp_counters[i] || env->msr_gp_evtsel[i]) {
++     */
+     uint64_t msr_gp_counters[MAX_GP_COUNTERS];
++    /*
++     * 在以下使用CPUX86State->msr_gp_evtsel[MAX_GP_COUNTERS]:
++     *   - target/i386/machine.c|680| <<global>> VMSTATE_UINT64_ARRAY(env.msr_gp_evtsel, X86CPU, MAX_GP_COUNTERS),
++     *   - target/i386/kvm/kvm.c|4420| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_P6_EVNTSEL0 + i, env->msr_gp_evtsel[i]);
++     *   - target/i386/kvm/kvm.c|5252| <<kvm_get_msrs>> env->msr_gp_evtsel[index - MSR_P6_EVNTSEL0] = msrs[i].data;
++     *   - target/i386/machine.c|660| <<pmu_enable_needed>> if (env->msr_gp_counters[i] || env->msr_gp_evtsel[i]) {
++     */
+     uint64_t msr_gp_evtsel[MAX_GP_COUNTERS];
+ 
+     uint64_t pat;
+@@ -1909,6 +1958,18 @@ typedef struct CPUArchState {
+     uint32_t cpuid_max_level, cpuid_max_xlevel, cpuid_max_xlevel2;
+     /* Actual level/xlevel/xlevel2 value: */
+     uint32_t cpuid_level, cpuid_xlevel, cpuid_xlevel2;
++    /*
++     * 在以下使用CPUX86State->cpuid_vendor1:
++     *   - target/i386/cpu.c|5550| <<x86_cpuid_get_vendor>> x86_cpu_vendor_words2str(value, env->cpuid_vendor1, env->cpuid_vendor2,
++     *   - target/i386/cpu.c|5568| <<x86_cpuid_set_vendor>> env->cpuid_vendor1 = 0;
++     *   - target/i386/cpu.c|5572| <<x86_cpuid_set_vendor>> env->cpuid_vendor1 |= ((uint8_t)value[i ]) << (8 * i);
++     *   - target/i386/cpu.c|6451| <<cpu_x86_cpuid>> *ebx = env->cpuid_vendor1;
++     *   - target/i386/cpu.c|6862| <<cpu_x86_cpuid>> *ebx = env->cpuid_vendor1;
++     *   - target/i386/cpu.c|6877| <<cpu_x86_cpuid>> if (env->cpuid_vendor1 != CPUID_VENDOR_INTEL_1 ||
++     *   - target/i386/cpu.c|6883| <<cpu_x86_cpuid>> if (tcg_enabled() && env->cpuid_vendor1 == CPUID_VENDOR_INTEL_1 &&
++     *   - target/i386/cpu.h|1051| <<IS_INTEL_CPU>> #define IS_INTEL_CPU(env) ((env)->cpuid_vendor1 == CPUID_VENDOR_INTEL_1 && \
++     *   - target/i386/cpu.h|1054| <<IS_AMD_CPU>> #define IS_AMD_CPU(env) ((env)->cpuid_vendor1 == CPUID_VENDOR_AMD_1 && \
++     */
+     uint32_t cpuid_vendor1;
+     uint32_t cpuid_vendor2;
+     uint32_t cpuid_vendor3;
+@@ -2148,6 +2209,25 @@ struct ArchCPU {
+      * paging, guest physical address space might be restricted to 48 bits
+      * even if the host cpu supports more physical address bits.
+      */
++    /*
++     * 在以下设置ArchCPU->guest_phys_bits:
++     *   - target/i386/cpu.c|8315| <<global>> DEFINE_PROP_UINT32("guest-phys-bits", X86CPU, guest_phys_bits, -1),
++     *   - target/i386/cpu.c|7708| <<x86_cpu_realizefn>> cpu->guest_phys_bits = 0;
++     *   - target/i386/kvm/kvm-cpu.c|30| <<kvm_set_guest_phys_bits>> cpu->guest_phys_bits = guest_phys_bits;
++     *   - target/i386/kvm/kvm-cpu.c|32| <<kvm_set_guest_phys_bits>> cpu->guest_phys_bits = cpu->phys_bits;
++     *   - target/i386/kvm/kvm-cpu.c|37| <<kvm_set_guest_phys_bits>> cpu->guest_phys_bits = cpu->host_phys_bits_limit;
++     * 在以下使用ArchCPU->guest_phys_bits:
++     *   - target/i386/cpu.c|6940| <<cpu_x86_cpuid>> *eax |= (cpu->guest_phys_bits << 16);
++     *   - target/i386/cpu.c|7703| <<x86_cpu_realizefn>> if (cpu->guest_phys_bits == -1) {
++     *   - target/i386/cpu.c|7761| <<x86_cpu_realizefn>> if (cpu->guest_phys_bits &&
++     *   - target/i386/cpu.c|7762| <<x86_cpu_realizefn>> (cpu->guest_phys_bits > cpu->phys_bits ||
++     *   - target/i386/cpu.c|7763| <<x86_cpu_realizefn>> cpu->guest_phys_bits < 32)) {
++     *   - target/i386/cpu.c|7766| <<x86_cpu_realizefn>> cpu->phys_bits, cpu->guest_phys_bits);
++     *   - target/i386/cpu.c|7777| <<x86_cpu_realizefn>> if (cpu->guest_phys_bits != 0) {
++     *   - target/i386/kvm/kvm-cpu.c|31| <<kvm_set_guest_phys_bits>> if (cpu->guest_phys_bits > cpu->phys_bits) {
++     *   - target/i386/kvm/kvm-cpu.c|36| <<kvm_set_guest_phys_bits>> cpu->guest_phys_bits > cpu->host_phys_bits_limit) {
++     *   - target/i386/kvm/kvm-cpu.c|89| <<kvm_cpu_realizefn>> if ((env->features[FEAT_8000_0001_EDX] & CPUID_EXT2_LM) && cpu->guest_phys_bits == -1) {
++     */
+     uint32_t guest_phys_bits;
+ 
+     /* in order to simplify APIC support, we leave this pointer to the
+@@ -2156,6 +2236,32 @@ struct ArchCPU {
+     struct MemoryRegion *cpu_as_root, *cpu_as_mem, *smram;
+     Notifier machine_done;
+ 
++    /*
++     * 在以下使用ArchCPU->kvm_msr_buf (struct kvm_msrs *):
++     *   - target/i386/kvm/kvm.c|2544| <<kvm_arch_init_vcpu>> cpu->kvm_msr_buf = g_malloc0(MSR_BUF_SIZE);
++     *   - target/i386/kvm/kvm.c|2571| <<kvm_arch_destroy_vcpu>> g_free(cpu->kvm_msr_buf);
++     *   - target/i386/kvm/kvm.c|2572| <<kvm_arch_destroy_vcpu>> cpu->kvm_msr_buf = NULL;
++     *   - target/i386/kvm/kvm.c|3757| <<kvm_msr_buf_reset>> memset(cpu->kvm_msr_buf, 0, MSR_BUF_SIZE);
++     *   - target/i386/kvm/kvm.c|3785| <<kvm_msr_entry_add>> struct kvm_msrs *msrs = cpu->kvm_msr_buf;
++     *   - target/i386/kvm/kvm.c|3808| <<kvm_put_one_msr>> return kvm_vcpu_ioctl(CPU(cpu), KVM_SET_MSRS, cpu->kvm_msr_buf);
++     *   - target/i386/kvm/kvm.c|4045| <<kvm_buf_set_msrs>> int ret = kvm_vcpu_ioctl(CPU(cpu), KVM_SET_MSRS, cpu->kvm_msr_buf);
++     *   - target/i386/kvm/kvm.c|4050| <<kvm_buf_set_msrs>> if (ret < cpu->kvm_msr_buf->nmsrs) {
++     *   - target/i386/kvm/kvm.c|4051| <<kvm_buf_set_msrs>> struct kvm_msr_entry *e = &cpu->kvm_msr_buf->entries[ret];
++     *   - target/i386/kvm/kvm.c|4056| <<kvm_buf_set_msrs>> assert(ret == cpu->kvm_msr_buf->nmsrs);
++     *   - target/i386/kvm/kvm.c|4581| <<kvm_get_msrs>> struct kvm_msr_entry *msrs = cpu->kvm_msr_buf->entries;
++     *   - target/i386/kvm/kvm.c|4819| <<kvm_get_msrs>> ret = kvm_vcpu_ioctl(CPU(cpu), KVM_GET_MSRS, cpu->kvm_msr_buf);
++     *   - target/i386/kvm/kvm.c|4824| <<kvm_get_msrs>> if (ret < cpu->kvm_msr_buf->nmsrs) {
++     *   - target/i386/kvm/kvm.c|4825| <<kvm_get_msrs>> struct kvm_msr_entry *e = &cpu->kvm_msr_buf->entries[ret];
++     *   - target/i386/kvm/kvm.c|4830| <<kvm_get_msrs>> assert(ret == cpu->kvm_msr_buf->nmsrs);
++     *
++     * // for KVM_GET_MSRS and KVM_SET_MSRS
++     * struct kvm_msrs {
++     *     __u32 nmsrs; // number of msrs in entries
++     *     __u32 pad;
++     *
++     *     struct kvm_msr_entry entries[];
++     * };
++     */
+     struct kvm_msrs *kvm_msr_buf;
+ 
+     int32_t node_id; /* NUMA node this CPU belongs to */
+diff --git a/target/i386/kvm/kvm-cpu.c b/target/i386/kvm/kvm-cpu.c
+index 6bf8dcfc60..e030e872c8 100644
+--- a/target/i386/kvm/kvm-cpu.c
++++ b/target/i386/kvm/kvm-cpu.c
+@@ -17,6 +17,10 @@
+ #include "kvm_i386.h"
+ #include "hw/core/accel-cpu.h"
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm-cpu.c|90| <<kvm_cpu_realizefn>> kvm_set_guest_phys_bits(cs);
++ */
+ static void kvm_set_guest_phys_bits(CPUState *cs)
+ {
+     X86CPU *cpu = X86_CPU(cs);
+@@ -27,6 +31,25 @@ static void kvm_set_guest_phys_bits(CPUState *cs)
+     if (!guest_phys_bits) {
+         return;
+     }
++    /*
++     * 在以下设置ArchCPU->guest_phys_bits:
++     *   - target/i386/cpu.c|8315| <<global>> DEFINE_PROP_UINT32("guest-phys-bits", X86CPU, guest_phys_bits, -1),
++     *   - target/i386/cpu.c|7708| <<x86_cpu_realizefn>> cpu->guest_phys_bits = 0;
++     *   - target/i386/kvm/kvm-cpu.c|30| <<kvm_set_guest_phys_bits>> cpu->guest_phys_bits = guest_phys_bits;
++     *   - target/i386/kvm/kvm-cpu.c|32| <<kvm_set_guest_phys_bits>> cpu->guest_phys_bits = cpu->phys_bits;
++     *   - target/i386/kvm/kvm-cpu.c|37| <<kvm_set_guest_phys_bits>> cpu->guest_phys_bits = cpu->host_phys_bits_limit;
++     * 在以下使用ArchCPU->guest_phys_bits:
++     *   - target/i386/cpu.c|6940| <<cpu_x86_cpuid>> *eax |= (cpu->guest_phys_bits << 16);
++     *   - target/i386/cpu.c|7703| <<x86_cpu_realizefn>> if (cpu->guest_phys_bits == -1) {
++     *   - target/i386/cpu.c|7761| <<x86_cpu_realizefn>> if (cpu->guest_phys_bits &&
++     *   - target/i386/cpu.c|7762| <<x86_cpu_realizefn>> (cpu->guest_phys_bits > cpu->phys_bits ||
++     *   - target/i386/cpu.c|7763| <<x86_cpu_realizefn>> cpu->guest_phys_bits < 32)) {
++     *   - target/i386/cpu.c|7766| <<x86_cpu_realizefn>> cpu->phys_bits, cpu->guest_phys_bits);
++     *   - target/i386/cpu.c|7777| <<x86_cpu_realizefn>> if (cpu->guest_phys_bits != 0) {
++     *   - target/i386/kvm/kvm-cpu.c|31| <<kvm_set_guest_phys_bits>> if (cpu->guest_phys_bits > cpu->phys_bits) {
++     *   - target/i386/kvm/kvm-cpu.c|36| <<kvm_set_guest_phys_bits>> cpu->guest_phys_bits > cpu->host_phys_bits_limit) {
++     *   - target/i386/kvm/kvm-cpu.c|89| <<kvm_cpu_realizefn>> if ((env->features[FEAT_8000_0001_EDX] & CPUID_EXT2_LM) && cpu->guest_phys_bits == -1) {
++     */
+     cpu->guest_phys_bits = guest_phys_bits;
+     if (cpu->guest_phys_bits > cpu->phys_bits) {
+         cpu->guest_phys_bits = cpu->phys_bits;
+diff --git a/target/i386/kvm/kvm.c b/target/i386/kvm/kvm.c
+index 2fa88ef1e3..8bc1516428 100644
+--- a/target/i386/kvm/kvm.c
++++ b/target/i386/kvm/kvm.c
+@@ -85,6 +85,12 @@
+ #define KVM_APIC_BUS_CYCLE_NS       1
+ #define KVM_APIC_BUS_FREQUENCY      (1000000000ULL / KVM_APIC_BUS_CYCLE_NS)
+ 
++/*
++ * 在以下使用MSR_KVM_SYSTEM_TIME:
++ *   - target/i386/kvm/kvm.c|4154| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_KVM_SYSTEM_TIME, env->system_time_msr);
++ *   - target/i386/kvm/kvm.c|4634| <<kvm_get_msrs>> kvm_msr_entry_add(cpu, MSR_KVM_SYSTEM_TIME, 0);
++ *   - target/i386/kvm/kvm.c|4896| <<kvm_get_msrs>> case MSR_KVM_SYSTEM_TIME:
++ */
+ #define MSR_KVM_WALL_CLOCK  0x11
+ #define MSR_KVM_SYSTEM_TIME 0x12
+ 
+@@ -94,6 +100,10 @@
+ 
+ static void kvm_init_msrs(X86CPU *cpu);
+ 
++/*
++ * 在以下使用kvm_arch_required_capabilities[]:
++ *   - accel/kvm/kvm-all.c|2541| <<kvm_init>> kvm_check_extension_list(s, kvm_arch_required_capabilities);
++ */
+ const KVMCapabilityInfo kvm_arch_required_capabilities[] = {
+     KVM_CAP_INFO(SET_TSS_ADDR),
+     KVM_CAP_INFO(EXT_CPUID),
+@@ -146,8 +156,64 @@ static bool has_msr_vmx_procbased_ctls2;
+ static bool has_msr_perf_capabs;
+ static bool has_msr_pkrs;
+ 
++/*
++ * 查看:
++ *
++ * https://github.com/finallyjustice/codereading/blob/master/comment/kvm/qemu_kvm_cpuid_features.txt
++ *
++ * 在以下使用has_architectural_pmu_version:
++ *   - target/i386/kvm/kvm.c|2162| <<kvm_x86_build_cpuid>> has_architectural_pmu_version = eax & 0xff;
++ *   - target/i386/kvm/kvm.c|2163| <<kvm_x86_build_cpuid>> if (has_architectural_pmu_version > 0) {
++ *   - target/i386/kvm/kvm.c|2174| <<kvm_x86_build_cpuid>> if (has_architectural_pmu_version > 1) {
++ *   - target/i386/kvm/kvm.c|4316| <<kvm_put_msrs>> if (has_architectural_pmu_version > 0) {
++ *   - target/i386/kvm/kvm.c|4317| <<kvm_put_msrs>> if (has_architectural_pmu_version > 1) {
++ *   - target/i386/kvm/kvm.c|4334| <<kvm_put_msrs>> if (has_architectural_pmu_version > 1) {
++ *   - target/i386/kvm/kvm.c|4820| <<kvm_get_msrs>> if (has_architectural_pmu_version > 0) {
++ *   - target/i386/kvm/kvm.c|4821| <<kvm_get_msrs>> if (has_architectural_pmu_version > 1) {
++ *
++ * 1. 如果guest_vendor和host_vendor不一样, 不支持PMU.
++ * has_architectural_pmu_version = 0.
++ * num_architectural_pmu_gp_counters = 0.
++ * num_architectural_pmu_fixed_counters = 0.
++ *
++ * 2. 如果guest_vendor是Intel
++ * 完全按照cpuid来算
++ *
++ * 3. 如果guest_vendor是AMD
++ * 3.1. 查看cpuid是否支持X86_FEATURE_PERFMON_V2.
++ *      如果支持, 根据0x80000022获取寄存器的数目.
++ *      此外, 3个global的也支持!
++ *      寄存器的base address和MSR_F15H_PERF_CTR5的一样(KVM svm其实限制了最多6个)
++ * 3.2. 如果不是ver=2, 如果支持X86_FEATURE_PERFCTR_CORE,
++ *      就是6个寄存器
++ * 3.3. 默认只支持4个
++ */
+ static uint32_t has_architectural_pmu_version;
++/*
++ * 查看:
++ *
++ * https://github.com/finallyjustice/codereading/blob/master/comment/kvm/qemu_kvm_cpuid_features.txt
++ *
++ * 在以下使用num_architectural_pmu_gp_counters:
++ *   - target/i386/kvm/kvm.c|2164| <<kvm_x86_build_cpuid>> num_architectural_pmu_gp_counters = (eax & 0xff00) >> 8;
++ *   - target/i386/kvm/kvm.c|2170| <<kvm_x86_build_cpuid>> if (num_architectural_pmu_gp_counters > MAX_GP_COUNTERS) {
++ *   - target/i386/kvm/kvm.c|2171| <<kvm_x86_build_cpuid>> num_architectural_pmu_gp_counters = MAX_GP_COUNTERS;
++ *   - target/i386/kvm/kvm.c|4328| <<kvm_put_msrs>> for (i = 0; i < num_architectural_pmu_gp_counters; i++) {
++ *   - target/i386/kvm/kvm.c|4830| <<kvm_get_msrs>> for (i = 0; i < num_architectural_pmu_gp_counters; i++) {
++ */
+ static uint32_t num_architectural_pmu_gp_counters;
++/*
++ * 查看:
++ *
++ * https://github.com/finallyjustice/codereading/blob/master/comment/kvm/qemu_kvm_cpuid_features.txt
++ *
++ * 在以下使用num_architectural_pmu_fixed_counters:
++ *   - target/i386/kvm/kvm.c|2175| <<kvm_x86_build_cpuid>> num_architectural_pmu_fixed_counters = edx & 0x1f;
++ *   - target/i386/kvm/kvm.c|2177| <<kvm_x86_build_cpuid>> if (num_architectural_pmu_fixed_counters > MAX_FIXED_COUNTERS) {
++ *   - target/i386/kvm/kvm.c|2178| <<kvm_x86_build_cpuid>> num_architectural_pmu_fixed_counters = MAX_FIXED_COUNTERS;
++ *   - target/i386/kvm/kvm.c|4324| <<kvm_put_msrs>> for (i = 0; i < num_architectural_pmu_fixed_counters; i++) {
++ *   - target/i386/kvm/kvm.c|4827| <<kvm_get_msrs>> for (i = 0; i < num_architectural_pmu_fixed_counters; i++) {
++ */
+ static uint32_t num_architectural_pmu_fixed_counters;
+ 
+ static int has_xsave2;
+@@ -162,6 +228,18 @@ static struct kvm_cpuid2 *cpuid_cache;
+ static struct kvm_cpuid2 *hv_cpuid_cache;
+ static struct kvm_msr_list *kvm_feature_msrs;
+ 
++/*
++ * 在以下使用msr_handlers[KVM_MSR_FILTER_MAX_RANGES]:
++ *   - target/i386/kvm/kvm.c|6026| <<kvm_install_msr_filters>> KVMMSRHandlers *handler = &msr_handlers[i];
++ *   - target/i386/kvm/kvm.c|6060| <<kvm_filter_msr>> for (i = 0; i < ARRAY_SIZE(msr_handlers); i++) {
++ *   - target/i386/kvm/kvm.c|6061| <<kvm_filter_msr>> if (!msr_handlers[i].msr) {
++ *   - target/i386/kvm/kvm.c|6062| <<kvm_filter_msr>> msr_handlers[i] = (KVMMSRHandlers) {
++ *   - target/i386/kvm/kvm.c|6069| <<kvm_filter_msr>> msr_handlers[i] = (KVMMSRHandlers) { };
++ *   - target/i386/kvm/kvm.c|6085| <<kvm_handle_rdmsr>> for (i = 0; i < ARRAY_SIZE(msr_handlers); i++) {
++ *   - target/i386/kvm/kvm.c|6086| <<kvm_handle_rdmsr>> KVMMSRHandlers *handler = &msr_handlers[i];
++ *   - target/i386/kvm/kvm.c|6105| <<kvm_handle_wrmsr>> for (i = 0; i < ARRAY_SIZE(msr_handlers); i++) {
++ *   - target/i386/kvm/kvm.c|6106| <<kvm_handle_wrmsr>> KVMMSRHandlers *handler = &msr_handlers[i];
++ */
+ static KVMMSRHandlers msr_handlers[KVM_MSR_FILTER_MAX_RANGES];
+ 
+ #define BUS_LOCK_SLICE_TIME 1000000000ULL /* ns */
+@@ -175,6 +253,17 @@ static const char *vm_type_name[] = {
+     [KVM_X86_SNP_VM] = "SEV-SNP",
+ };
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|213| <<kvm_get_vm_type>> if (!kvm_is_vm_type_supported(kvm_type)) {
++ *   - target/i386/sev.c|1408| <<sev_kvm_type>> if (!kvm_is_vm_type_supported(kvm_type)) {
++ *
++ * #define KVM_X86_DEFAULT_VM      0
++ * #define KVM_X86_SW_PROTECTED_VM 1
++ * #define KVM_X86_SEV_VM          2
++ * #define KVM_X86_SEV_ES_VM       3        
++ * #define KVM_X86_SNP_VM          4
++ */
+ bool kvm_is_vm_type_supported(int type)
+ {
+     uint32_t machine_types;
+@@ -192,6 +281,10 @@ bool kvm_is_vm_type_supported(int type)
+     return !!(machine_types & BIT(type));
+ }
+ 
++/*
++ * called by:
++ *   - hw/i386/x86.c|357| <<x86_kvm_type>> return kvm_enabled() ? kvm_get_vm_type(ms) : 0;
++ */
+ int kvm_get_vm_type(MachineState *ms)
+ {
+     int kvm_type = KVM_X86_DEFAULT_VM;
+@@ -214,6 +307,10 @@ int kvm_get_vm_type(MachineState *ms)
+     return kvm_type;
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/sev.c|772| <<sev_snp_launch_start>> if (!kvm_enable_hypercall(BIT_ULL(KVM_HC_MAP_GPA_RANGE))) {
++ */
+ bool kvm_enable_hypercall(uint64_t enable_mask)
+ {
+     KVMState *s = KVM_STATE(current_accel());
+@@ -221,11 +318,19 @@ bool kvm_enable_hypercall(uint64_t enable_mask)
+     return !kvm_vm_enable_cap(s, KVM_CAP_EXIT_HYPERCALL, 0, enable_mask);
+ }
+ 
++/*
++ * called by:
++ *   - hw/i386/x86.c|177| <<x86_machine_is_smm_enabled>> smm_available = kvm_has_smm();
++ */
+ bool kvm_has_smm(void)
+ {
+     return kvm_vm_check_extension(kvm_state, KVM_CAP_X86_SMM);
+ }
+ 
++/*
++ * called by:
++ *   - hw/i386/kvm/clock.c|152| <<kvm_update_clock>> s->clock_is_reliable = kvm_has_adjust_clock_stable();
++ */
+ bool kvm_has_adjust_clock_stable(void)
+ {
+     int ret = kvm_check_extension(kvm_state, KVM_CAP_ADJUST_CLOCK);
+@@ -233,11 +338,19 @@ bool kvm_has_adjust_clock_stable(void)
+     return (ret & KVM_CLOCK_TSC_STABLE);
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/machine.c|266| <<cpu_pre_save>> (!kvm_has_exception_payload() && (env->hflags & HF_GUEST_MASK) &&
++ */
+ bool kvm_has_exception_payload(void)
+ {
+     return has_exception_payload;
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|269| <<kvm_enable_x2apic>> kvm_x2apic_api_set_flags(KVM_X2APIC_API_USE_32BIT_IDS |
++ */
+ static bool kvm_x2apic_api_set_flags(uint64_t flags)
+ {
+     KVMState *s = KVM_STATE(current_accel());
+@@ -245,6 +358,11 @@ static bool kvm_x2apic_api_set_flags(uint64_t flags)
+     return !kvm_vm_enable_cap(s, KVM_CAP_X2APIC_API, 0, flags);
+ }
+ 
++/*
++ * 在以下使用MEMORIZE():
++ *   - target/i386/kvm/kvm.c|268| <<kvm_enable_x2apic>> return MEMORIZE(
++ *   - target/i386/kvm/kvm.c|6098| <<kvm_enable_sgx_provisioning>> return MEMORIZE(__kvm_enable_sgx_provisioning(s), has_sgx_provisioning);
++ */
+ #define MEMORIZE(fn, _result) \
+     ({ \
+         static bool _memorized; \
+@@ -258,11 +376,21 @@ static bool kvm_x2apic_api_set_flags(uint64_t flags)
+ 
+ static bool has_x2apic_api;
+ 
++/*
++ * called by:
++ *   - hw/i386/kvm/apic.c|38| <<kvm_put_apic_state>> if (kvm_has_x2apic_api() && s->apicbase & MSR_IA32_APICBASE_EXTD) {
++ *   - hw/i386/kvm/apic.c|67| <<kvm_get_apic_state>> if (kvm_has_x2apic_api() && s->apicbase & MSR_IA32_APICBASE_EXTD) {
++ */
+ bool kvm_has_x2apic_api(void)
+ {
+     return has_x2apic_api;
+ }
+ 
++/*
++ * called by:
++ *   - hw/i386/intel_iommu.c|4255| <<vtd_decide_config>> if (kvm_irqchip_is_split() && !kvm_enable_x2apic()) {
++ *   - hw/i386/x86-common.c|98| <<x86_cpus_init>> kvm_irqchip_in_kernel() && !kvm_enable_x2apic()) {
++ */
+ bool kvm_enable_x2apic(void)
+ {
+     return MEMORIZE(
+@@ -276,6 +404,10 @@ bool kvm_hv_vpindex_settable(void)
+     return hv_vpindex_settable;
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|303| <<do_kvm_synchronize_tsc>> kvm_get_tsc(cpu);
++ */
+ static int kvm_get_tsc(CPUState *cs)
+ {
+     X86CPU *cpu = X86_CPU(cs);
+@@ -298,11 +430,19 @@ static int kvm_get_tsc(CPUState *cs)
+     return 0;
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|316| <<kvm_synchronize_all_tsc>> run_on_cpu(cpu, do_kvm_synchronize_tsc, RUN_ON_CPU_NULL);
++ */
+ static inline void do_kvm_synchronize_tsc(CPUState *cpu, run_on_cpu_data arg)
+ {
+     kvm_get_tsc(cpu);
+ }
+ 
++/*
++ * called by:
++ *   - hw/i386/kvm/clock.c|210| <<kvmclock_vm_state_change>> kvm_synchronize_all_tsc();
++ */
+ void kvm_synchronize_all_tsc(void)
+ {
+     CPUState *cpu;
+@@ -314,6 +454,10 @@ void kvm_synchronize_all_tsc(void)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|353| <<get_supported_cpuid>> while ((cpuid = try_get_cpuid(s, max)) == NULL) {
++ */
+ static struct kvm_cpuid2 *try_get_cpuid(KVMState *s, int max)
+ {
+     struct kvm_cpuid2 *cpuid;
+@@ -342,6 +486,10 @@ static struct kvm_cpuid2 *try_get_cpuid(KVMState *s, int max)
+ /* Run KVM_GET_SUPPORTED_CPUID ioctl(), allocating a buffer large enough
+  * for all entries.
+  */
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|421| <<kvm_arch_get_supported_cpuid>> cpuid = get_supported_cpuid(s);
++ */
+ static struct kvm_cpuid2 *get_supported_cpuid(KVMState *s)
+ {
+     struct kvm_cpuid2 *cpuid;
+@@ -373,6 +521,11 @@ static bool host_tsx_broken(void)
+ 
+ /* Returns the value for a specific register on the cpuid entry
+  */
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|425| <<kvm_arch_get_supported_cpuid>> ret = cpuid_entry_get_reg(entry, reg);
++ *   - target/i386/kvm/kvm.c|1291| <<hv_cpuid_get_host>> return cpuid_entry_get_reg(entry, reg);
++ */
+ static uint32_t cpuid_entry_get_reg(struct kvm_cpuid_entry2 *entry, int reg)
+ {
+     uint32_t ret = 0;
+@@ -395,6 +548,14 @@ static uint32_t cpuid_entry_get_reg(struct kvm_cpuid_entry2 *entry, int reg)
+ 
+ /* Find matching entry for function/index on kvm_cpuid2 struct
+  */
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|423| <<kvm_arch_get_supported_cpuid>> struct kvm_cpuid_entry2 *entry = cpuid_find_entry(cpuid, function, index);
++ *   - target/i386/kvm/kvm.c|1286| <<hv_cpuid_get_host>> entry = cpuid_find_entry(cpuid, func, 0);
++ *   - target/i386/kvm/kvm.c|2245| <<kvm_arch_init_vcpu>> c = cpuid_find_entry(&cpuid_data.cpuid, 1, 0);
++ *   - target/i386/kvm/kvm.c|2251| <<kvm_arch_init_vcpu>> c = cpuid_find_entry(&cpuid_data.cpuid, 7, 0);
++ *   - target/i386/kvm/kvm.c|2288| <<kvm_arch_init_vcpu>> c = cpuid_find_entry(&cpuid_data.cpuid, kvm_base, 0);
++ */
+ static struct kvm_cpuid_entry2 *cpuid_find_entry(struct kvm_cpuid2 *cpuid,
+                                                  uint32_t function,
+                                                  uint32_t index)
+@@ -410,6 +571,29 @@ static struct kvm_cpuid_entry2 *cpuid_find_entry(struct kvm_cpuid2 *cpuid,
+     return NULL;
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/cpu.c|6063| <<x86_cpu_get_supported_feature_word>> r = kvm_arch_get_supported_cpuid(kvm_state, wi->cpuid.eax,
++ *   - target/i386/cpu.c|6137| <<x86_cpu_get_supported_cpuid>> *eax = kvm_arch_get_supported_cpuid(kvm_state, func, index, R_EAX);
++ *   - target/i386/cpu.c|6138| <<x86_cpu_get_supported_cpuid>> *ebx = kvm_arch_get_supported_cpuid(kvm_state, func, index, R_EBX);
++ *   - target/i386/cpu.c|6139| <<x86_cpu_get_supported_cpuid>> *ecx = kvm_arch_get_supported_cpuid(kvm_state, func, index, R_ECX);
++ *   - target/i386/cpu.c|6140| <<x86_cpu_get_supported_cpuid>> *edx = kvm_arch_get_supported_cpuid(kvm_state, func, index, R_EDX);
++ *   - target/i386/kvm/kvm-cpu.c|25| <<kvm_set_guest_phys_bits>> eax = kvm_arch_get_supported_cpuid(cs->kvm_state, 0x80000008, 0, R_EAX);
++ *   - target/i386/kvm/kvm-cpu.c|118| <<kvm_cpu_max_instance_init>> kvm_arch_get_supported_cpuid(s, 0x0, 0, R_EAX);
++ *   - target/i386/kvm/kvm-cpu.c|120| <<kvm_cpu_max_instance_init>> kvm_arch_get_supported_cpuid(s, 0x80000000, 0, R_EAX);
++ *   - target/i386/kvm/kvm-cpu.c|122| <<kvm_cpu_max_instance_init>> kvm_arch_get_supported_cpuid(s, 0xC0000000, 0, R_EAX);
++ *   - target/i386/kvm/kvm.c|537| <<kvm_arch_get_supported_cpuid>> cpuid_1_edx = kvm_arch_get_supported_cpuid(s, 1, 0, R_EDX);
++ *   - target/i386/kvm/kvm.c|601| <<kvm_arch_get_supported_msr_feature>> if (kvm_arch_get_supported_cpuid(s, 0xD, 1, R_ECX) &
++ *   - target/i386/kvm/kvm.c|605| <<kvm_arch_get_supported_msr_feature>> if (kvm_arch_get_supported_cpuid(s, 1, 0, R_ECX) &
++ *   - target/i386/kvm/kvm.c|609| <<kvm_arch_get_supported_msr_feature>> if (kvm_arch_get_supported_cpuid(s, 7, 0, R_EBX) &
++ *   - target/i386/kvm/kvm.c|613| <<kvm_arch_get_supported_msr_feature>> if (kvm_arch_get_supported_cpuid(s, 7, 0, R_EBX) &
++ *   - target/i386/kvm/kvm.c|617| <<kvm_arch_get_supported_msr_feature>> if (kvm_arch_get_supported_cpuid(s, 0x80000001, 0, R_EDX) &
++ *   - target/i386/kvm/kvm.c|1771| <<kvm_init_xsave>> assert(kvm_arch_get_supported_cpuid(kvm_state, 0xd, 0, R_ECX) <=
++ *   - target/i386/kvm/kvm.c|4014| <<kvm_put_msrs>> int addr_num = kvm_arch_get_supported_cpuid(kvm_state,
++ *   - target/i386/kvm/kvm.c|4441| <<kvm_get_msrs>> kvm_arch_get_supported_cpuid(kvm_state, 0x14, 1, R_EAX) & 0x7;
++ *   - target/i386/kvm/kvm.c|6239| <<kvm_request_xsave_components>> supported = kvm_arch_get_supported_cpuid(s, 0xd, 0, R_EAX);
++ *   - target/i386/kvm/kvm.c|6240| <<kvm_request_xsave_components>> supported |= (uint64_t)kvm_arch_get_supported_cpuid(s, 0xd, 0, R_EDX) << 32;
++ */
+ uint32_t kvm_arch_get_supported_cpuid(KVMState *s, uint32_t function,
+                                       uint32_t index, int reg)
+ {
+@@ -560,6 +744,15 @@ uint32_t kvm_arch_get_supported_cpuid(KVMState *s, uint32_t function,
+     return ret;
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/cpu.c|6068| <<x86_cpu_get_supported_feature_word>> r = kvm_arch_get_supported_msr_feature(kvm_state,
++ *   - target/i386/kvm/kvm-cpu.c|79| <<kvm_cpu_realizefn>> kvm_arch_get_supported_msr_feature(kvm_state,
++ *   - target/i386/kvm/kvm.c|3610| <<kvm_msr_entry_add_vmx>> kvm_arch_get_supported_msr_feature(kvm_state,
++ *   - target/i386/kvm/kvm.c|3621| <<kvm_msr_entry_add_vmx>> kvm_arch_get_supported_msr_feature(kvm_state,
++ *   - target/i386/kvm/kvm.c|3624| <<kvm_msr_entry_add_vmx>> kvm_arch_get_supported_msr_feature(kvm_state,
++ *   - target/i386/kvm/kvm.c|3709| <<kvm_msr_entry_add_perf>> kvm_arch_get_supported_msr_feature(kvm_state,
++ */
+ uint64_t kvm_arch_get_supported_msr_feature(KVMState *s, uint32_t index)
+ {
+     struct {
+@@ -645,6 +838,10 @@ static int kvm_get_mce_cap_supported(KVMState *s, uint64_t *mce_cap,
+     return kvm_ioctl(s, KVM_X86_GET_MCE_CAP_SUPPORTED, mce_cap);
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|736| <<kvm_arch_on_sigbus_vcpu>> kvm_mce_inject(cpu, paddr, code);
++ */
+ static void kvm_mce_inject(X86CPU *cpu, hwaddr paddr, int code)
+ {
+     CPUState *cs = CPU(cpu);
+@@ -714,6 +911,11 @@ static void hardware_memory_error(void *host_addr)
+     exit(1);
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|3032| <<kvm_cpu_exec>> kvm_arch_on_sigbus_vcpu(cpu, pending_sigbus_code,
++ *   - accel/kvm/kvm-all.c|3570| <<kvm_on_sigbus>> kvm_arch_on_sigbus_vcpu(first_cpu, code, addr);
++ */
+ void kvm_arch_on_sigbus_vcpu(CPUState *c, int code, void *addr)
+ {
+     X86CPU *cpu = X86_CPU(c);
+@@ -768,6 +970,11 @@ void kvm_arch_on_sigbus_vcpu(CPUState *c, int code, void *addr)
+     emit_hypervisor_memory_failure(MEMORY_FAILURE_ACTION_IGNORE, false);
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|5436| <<kvm_arch_process_async_events>> kvm_queue_exception(env, EXCP12_MCHK, 0, 0);
++ *   - target/i386/kvm/kvm.c|5657| <<kvm_handle_debug>> kvm_queue_exception(env, arch_info->exception,
++ */
+ static void kvm_queue_exception(CPUX86State *env,
+                                 int32_t exception_nr,
+                                 uint8_t exception_has_payload,
+@@ -809,6 +1016,29 @@ static void cpu_update_state(void *opaque, bool running, RunState state)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|347| <<kvm_park_vcpu>> trace_kvm_park_vcpu(cpu->cpu_index, kvm_arch_vcpu_id(cpu));
++ *   - accel/kvm/kvm-all.c|350| <<kvm_park_vcpu>> vcpu->vcpu_id = kvm_arch_vcpu_id(cpu);
++ *   - accel/kvm/kvm-all.c|376| <<kvm_create_vcpu>> unsigned long vcpu_id = kvm_arch_vcpu_id(cpu);
++ *   - accel/kvm/kvm-all.c|420| <<do_kvm_destroy_vcpu>> trace_kvm_destroy_vcpu(cpu->cpu_index, kvm_arch_vcpu_id(cpu));
++ *   - accel/kvm/kvm-all.c|465| <<kvm_init_vcpu>> trace_kvm_init_vcpu(cpu->cpu_index, kvm_arch_vcpu_id(cpu));
++ *   - accel/kvm/kvm-all.c|471| <<kvm_init_vcpu>> kvm_arch_vcpu_id(cpu));
++ *   - accel/kvm/kvm-all.c|489| <<kvm_init_vcpu>> kvm_arch_vcpu_id(cpu));
++ *   - accel/kvm/kvm-all.c|514| <<kvm_init_vcpu>> kvm_arch_vcpu_id(cpu));
++ *   - hw/i386/kvm/xen_evtchn.c|563| <<assign_kernel_port>> ha.u.evtchn.deliver.port.vcpu = kvm_arch_vcpu_id(cpu);
++ *   - hw/i386/kvm/xen_evtchn.c|925| <<set_port_pending>> evt.vcpu = kvm_arch_vcpu_id(cpu);
++ *   - hw/i386/kvm/xen_evtchn.c|1784| <<xen_evtchn_translate_pirq_msi>> route->u.xen_evtchn.vcpu = kvm_arch_vcpu_id(cpu);
++ *   - hw/intc/openpic_kvm.c|262| <<kvm_openpic_connect_vcpu>> kvm_arch_vcpu_id(cs));
++ *   - hw/intc/spapr_xive_kvm.c|43| <<kvm_cpu_is_enabled>> unsigned long vcpu_id = kvm_arch_vcpu_id(cs);
++ *   - hw/intc/spapr_xive_kvm.c|56| <<kvm_cpu_enable>> unsigned long vcpu_id = kvm_arch_vcpu_id(cs);
++ *   - hw/intc/spapr_xive_kvm.c|92| <<kvmppc_xive_cpu_set_state>> kvm_arch_vcpu_id(tctx->cs));
++ *   - hw/intc/spapr_xive_kvm.c|111| <<kvmppc_xive_cpu_get_state>> kvm_arch_vcpu_id(tctx->cs));
++ *   - hw/intc/spapr_xive_kvm.c|165| <<kvmppc_xive_cpu_connect>> vcpu_id = kvm_arch_vcpu_id(tctx->cs);
++ *   - hw/intc/xics_kvm.c|83| <<icp_get_kvm_state>> " for CPU %ld: %s", kvm_arch_vcpu_id(icp->cs), strerror(errno));
++ *   - hw/intc/xics_kvm.c|130| <<icp_set_kvm_state>> kvm_arch_vcpu_id(icp->cs));
++ *   - hw/intc/xics_kvm.c|151| <<icp_kvm_realize>> vcpu_id = kvm_arch_vcpu_id(cs);
++ */
+ unsigned long kvm_arch_vcpu_id(CPUState *cs)
+ {
+     X86CPU *cpu = X86_CPU(cs);
+@@ -842,6 +1072,11 @@ static inline bool freq_within_bounds(int freq, int target_freq)
+         return false;
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|2054| <<kvm_arch_init_vcpu>> r = kvm_arch_set_tsc_khz(cs);
++ *   - target/i386/kvm/kvm.c|5158| <<kvm_arch_put_registers>> kvm_arch_set_tsc_khz(cpu);
++ */
+ static int kvm_arch_set_tsc_khz(CPUState *cs)
+ {
+     X86CPU *cpu = X86_CPU(cs);
+@@ -894,6 +1129,11 @@ static int kvm_arch_set_tsc_khz(CPUState *cs)
+     return 0;
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|2135| <<kvm_arch_init_vcpu>> c->eax = ((!!tsc_is_stable_and_known(env) << 1) |
++ *   - target/i386/kvm/kvm.c|2280| <<kvm_arch_init_vcpu>> && tsc_is_stable_and_known(env)) {
++ */
+ static bool tsc_is_stable_and_known(CPUX86State *env)
+ {
+     if (!env->tsc_khz) {
+@@ -905,6 +1145,28 @@ static bool tsc_is_stable_and_known(CPUX86State *env)
+ 
+ #define DEFAULT_EVMCS_VERSION ((1 << 8) | 1)
+ 
++/*
++ * 在以下使用kvm_hyperv_properties[]:
++ *   - target/i386/kvm/kvm.c|916| <<global>> } kvm_hyperv_properties[] = {
++ *   - target/i386/kvm/kvm.c|1299| <<hyperv_feature_supported>> for (i = 0; i < ARRAY_SIZE(kvm_hyperv_properties[feature].flags); i++) {
++ *   - target/i386/kvm/kvm.c|1301| <<hyperv_feature_supported>> func = kvm_hyperv_properties[feature].flags[i].func;
++ *   - target/i386/kvm/kvm.c|1302| <<hyperv_feature_supported>> reg = kvm_hyperv_properties[feature].flags[i].reg;
++ *   - target/i386/kvm/kvm.c|1303| <<hyperv_feature_supported>> bits = kvm_hyperv_properties[feature].flags[i].bits;
++ *   - target/i386/kvm/kvm.c|1323| <<hv_feature_check_deps>> deps = kvm_hyperv_properties[feature].dependencies;
++ *   - target/i386/kvm/kvm.c|1328| <<hv_feature_check_deps>> kvm_hyperv_properties[feature].desc,
++ *   - target/i386/kvm/kvm.c|1329| <<hv_feature_check_deps>> kvm_hyperv_properties[dep_feat].desc);
++ *   - target/i386/kvm/kvm.c|1344| <<hv_build_cpuid_leaf>> for (i = 0; i < ARRAY_SIZE(kvm_hyperv_properties); i++) {
++ *   - target/i386/kvm/kvm.c|1349| <<hv_build_cpuid_leaf>> for (j = 0; j < ARRAY_SIZE(kvm_hyperv_properties[i].flags); j++) {
++ *   -  target/i386/kvm/kvm.c|1350| <<hv_build_cpuid_leaf>> if (kvm_hyperv_properties[i].flags[j].func != func) {
++ *   - target/i386/kvm/kvm.c|1353| <<hv_build_cpuid_leaf>> if (kvm_hyperv_properties[i].flags[j].reg != reg) {
++ *   - target/i386/kvm/kvm.c|1357| <<hv_build_cpuid_leaf>> r |= kvm_hyperv_properties[i].flags[j].bits;
++ *   - target/i386/kvm/kvm.c|1447| <<kvm_hyperv_expand_features>> for (feat = 0; feat < ARRAY_SIZE(kvm_hyperv_properties); feat++) {
++ *   - target/i386/kvm/kvm.c|1454| <<kvm_hyperv_expand_features>> for (feat = 0; feat < ARRAY_SIZE(kvm_hyperv_properties); feat++) {
++ *   - target/i386/kvm/kvm.c|1463| <<kvm_hyperv_expand_features>> kvm_hyperv_properties[feat].desc);
++ *   - target/i386/kvm/kvm.c|1480| <<kvm_hyperv_expand_features>> kvm_hyperv_properties[HYPERV_FEAT_SYNIC].desc,
++ *   - target/i386/kvm/kvm.c|1481| <<kvm_hyperv_expand_features>> kvm_hyperv_properties[HYPERV_FEAT_VPINDEX].desc);
++ *   - target/i386/kvm/kvm.c|1721| <<hyperv_init_vcpu>> kvm_hyperv_properties[HYPERV_FEAT_EVMCS].desc);
++ */
+ static struct {
+     const char *desc;
+     struct {
+@@ -1160,6 +1422,10 @@ static struct kvm_cpuid2 *get_supported_hv_cpuid(CPUState *cs)
+  * When KVM_GET_SUPPORTED_HV_CPUID is not supported we fill CPUID feature
+  * leaves from KVM_CAP_HYPERV* and present MSRs data.
+  */
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|1277| <<hv_cpuid_get_host>> cpuid = get_supported_hv_cpuid_legacy(cs);
++ */
+ static struct kvm_cpuid2 *get_supported_hv_cpuid_legacy(CPUState *cs)
+ {
+     X86CPU *cpu = X86_CPU(cs);
+@@ -1633,6 +1899,10 @@ static bool evmcs_version_supported(uint16_t evmcs_version,
+         (max_version <= max_supported_version);
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|2089| <<kvm_arch_init_vcpu>> r = hyperv_init_vcpu(cpu);
++ */
+ static int hyperv_init_vcpu(X86CPU *cpu)
+ {
+     CPUState *cs = CPU(cpu);
+@@ -1754,6 +2024,10 @@ static Error *invtsc_mig_blocker;
+ 
+ #define KVM_MAX_CPUID_ENTRIES  100
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|2299| <<kvm_arch_init_vcpu>> kvm_init_xsave(env);
++ */
+ static void kvm_init_xsave(CPUX86State *env)
+ {
+     if (has_xsave2) {
+@@ -1772,6 +2046,11 @@ static void kvm_init_xsave(CPUX86State *env)
+            env->xsave_buf_len);
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|2309| <<kvm_arch_init_vcpu>> kvm_init_nested_state(env);
++ *   - target/i386/kvm/kvm.c|2362| <<kvm_arch_reset_vcpu>> kvm_init_nested_state(env);
++ */
+ static void kvm_init_nested_state(CPUX86State *env)
+ {
+     struct kvm_vmx_nested_state_hdr *vmx_hdr;
+@@ -1796,6 +2075,14 @@ static void kvm_init_nested_state(CPUX86State *env)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|2203| <<kvm_arch_init_vcpu>> cpuid_i = kvm_x86_build_cpuid(env, cpuid_data.entries, cpuid_i);
++ *
++ * 查看:
++ *
++ * https://github.com/finallyjustice/codereading/blob/master/comment/kvm/qemu_kvm_cpuid_features.txt
++ */
+ static uint32_t kvm_x86_build_cpuid(CPUX86State *env,
+                                     struct kvm_cpuid_entry2 *entries,
+                                     uint32_t cpuid_i)
+@@ -1804,6 +2091,29 @@ static uint32_t kvm_x86_build_cpuid(CPUX86State *env,
+     uint32_t unused;
+     struct kvm_cpuid_entry2 *c;
+ 
++    /*
++     * called by:
++     *   - hw/i386/fw_cfg.c|183| <<fw_cfg_build_feature_control>> cpu_x86_cpuid(env, 1, 0, &unused, &unused, &ecx, &edx);
++     *   - hw/i386/fw_cfg.c|195| <<fw_cfg_build_feature_control>> cpu_x86_cpuid(env, 0x7, 0, &unused, &ebx, &ecx, &unused);
++     *   - target/i386/hvf/hvf.c|404| <<hvf_cpu_x86_cpuid>> cpu_x86_cpuid(env, index, count, eax, ebx, ecx, edx);
++     *   - target/i386/kvm/kvm.c|2061| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, 0, 0, &limit, &unused, &unused, &unused);
++     *   - target/i386/kvm/kvm.c|2077| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, i, 0, &c->eax, &c->ebx, &c->ecx, &c->edx);
++     *   - target/i386/kvm/kvm.c|2087| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, i, 0, &c->eax, &c->ebx, &c->ecx, &c->edx);
++     *   - target/i386/kvm/kvm.c|2108| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, i, j, &c->eax, &c->ebx, &c->ecx, &c->edx);
++     *   - target/i386/kvm/kvm.c|2133| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, i, j, &c->eax, &c->ebx, &c->ecx, &c->edx);
++     *   - target/i386/kvm/kvm.c|2154| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, i, 0, &c->eax, &c->ebx, &c->ecx, &c->edx);
++     *   - target/i386/kvm/kvm.c|2165| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, i, j, &c->eax, &c->ebx, &c->ecx, &c->edx);
++     *   - target/i386/kvm/kvm.c|2172| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, i, 0, &c->eax, &c->ebx, &c->ecx, &c->edx);
++     *   - target/i386/kvm/kvm.c|2187| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, 0x0a, 0, &eax, &unused, &unused, &edx);
++     *   - target/i386/kvm/kvm.c|2211| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, 0x80000000, 0, &limit, &unused, &unused, &unused);
++     *   - target/i386/kvm/kvm.c|2227| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, i, j, &c->eax, &c->ebx, &c->ecx, &c->edx);
++     *   - target/i386/kvm/kvm.c|2241| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, i, 0, &c->eax, &c->ebx, &c->ecx, &c->edx);
++     *   - target/i386/kvm/kvm.c|2255| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, 0xC0000000, 0, &limit, &unused, &unused, &unused);
++     *   - target/i386/kvm/kvm.c|2266| <<kvm_x86_build_cpuid>> cpu_x86_cpuid(env, i, 0, &c->eax, &c->ebx, &c->ecx, &c->edx);
++     *   - target/i386/tcg/fpu_helper.c|3151| <<helper_xsetbv>> cpu_x86_cpuid(env, 0x0d, 0, &ena_lo, &dummy, &dummy, &ena_hi);
++     *   - target/i386/tcg/misc_helper.c|56| <<helper_cpuid>> cpu_x86_cpuid(env, (uint32_t)env->regs[R_EAX], (uint32_t)env->regs[R_ECX],
++     *   - target/i386/whpx/whpx-all.c|1946| <<whpx_vcpu_run>> cpu_x86_cpuid(env, cpuid_fn, 0, (UINT32 *)&rax, (UINT32 *)&rbx,
++     */
+     cpu_x86_cpuid(env, 0, 0, &limit, &unused, &unused, &unused);
+ 
+     for (i = 0; i <= limit; i++) {
+@@ -1930,12 +2240,49 @@ static uint32_t kvm_x86_build_cpuid(CPUX86State *env,
+     if (limit >= 0x0a) {
+         uint32_t eax, edx;
+ 
++        /*
++         * 1. 如果guest_vendor和host_vendor不一样, 不支持PMU.
++	 * has_architectural_pmu_version = 0.
++	 * num_architectural_pmu_gp_counters = 0.
++	 * num_architectural_pmu_fixed_counters = 0.
++	 *
++	 * 2. 如果guest_vendor是Intel
++	 * 完全按照cpuid来算
++	 *
++	 * 3. 如果guest_vendor是AMD
++	 * 3.1. 查看cpuid是否支持X86_FEATURE_PERFMON_V2.
++	 *      如果支持, 根据0x80000022获取寄存器的数目.
++	 *      此外, 3个global的也支持!
++	 *      寄存器的base address和MSR_F15H_PERF_CTR5的一样(KVM svm其实限制了最多6个)
++	 * 3.2. 如果不是ver=2, 如果支持X86_FEATURE_PERFCTR_CORE,
++	 *      就是6个寄存器
++	 * 3.3. 默认只支持4个
++	 */
+         cpu_x86_cpuid(env, 0x0a, 0, &eax, &unused, &unused, &edx);
+ 
++        /*
++	 * 在以下使用has_architectural_pmu_version:
++	 *   - target/i386/kvm/kvm.c|2162| <<kvm_x86_build_cpuid>> has_architectural_pmu_version = eax & 0xff;
++	 *   - target/i386/kvm/kvm.c|2163| <<kvm_x86_build_cpuid>> if (has_architectural_pmu_version > 0) {
++	 *   - target/i386/kvm/kvm.c|2174| <<kvm_x86_build_cpuid>> if (has_architectural_pmu_version > 1) {
++	 *   - target/i386/kvm/kvm.c|4316| <<kvm_put_msrs>> if (has_architectural_pmu_version > 0) {
++	 *   - target/i386/kvm/kvm.c|4317| <<kvm_put_msrs>> if (has_architectural_pmu_version > 1) {
++	 *   - target/i386/kvm/kvm.c|4334| <<kvm_put_msrs>> if (has_architectural_pmu_version > 1) {
++	 *   - target/i386/kvm/kvm.c|4820| <<kvm_get_msrs>> if (has_architectural_pmu_version > 0) {
++	 *   - target/i386/kvm/kvm.c|4821| <<kvm_get_msrs>> if (has_architectural_pmu_version > 1) {
++	 */
+         has_architectural_pmu_version = eax & 0xff;
+         if (has_architectural_pmu_version > 0) {
+             num_architectural_pmu_gp_counters = (eax & 0xff00) >> 8;
+ 
++            /*
++	     * 在以下使用num_architectural_pmu_gp_counters:
++	     *   - target/i386/kvm/kvm.c|2164| <<kvm_x86_build_cpuid>> num_architectural_pmu_gp_counters = (eax & 0xff00) >> 8;
++	     *   - target/i386/kvm/kvm.c|2170| <<kvm_x86_build_cpuid>> if (num_architectural_pmu_gp_counters > MAX_GP_COUNTERS) {
++	     *   - target/i386/kvm/kvm.c|2171| <<kvm_x86_build_cpuid>> num_architectural_pmu_gp_counters = MAX_GP_COUNTERS;
++	     *   - target/i386/kvm/kvm.c|4328| <<kvm_put_msrs>> for (i = 0; i < num_architectural_pmu_gp_counters; i++) {
++	     *   - target/i386/kvm/kvm.c|4830| <<kvm_get_msrs>> for (i = 0; i < num_architectural_pmu_gp_counters; i++) {
++	     */
+             /* Shouldn't be more than 32, since that's the number of bits
+              * available in EBX to tell us _which_ counters are available.
+              * Play it safe.
+@@ -1945,6 +2292,14 @@ static uint32_t kvm_x86_build_cpuid(CPUX86State *env,
+             }
+ 
+             if (has_architectural_pmu_version > 1) {
++                /*
++		 * 在以下使用num_architectural_pmu_fixed_counters:
++		 *   - target/i386/kvm/kvm.c|2175| <<kvm_x86_build_cpuid>> num_architectural_pmu_fixed_counters = edx & 0x1f;
++		 *   - target/i386/kvm/kvm.c|2177| <<kvm_x86_build_cpuid>> if (num_architectural_pmu_fixed_counters > MAX_FIXED_COUNTERS) {
++		 *   - target/i386/kvm/kvm.c|2178| <<kvm_x86_build_cpuid>> num_architectural_pmu_fixed_counters = MAX_FIXED_COUNTERS;
++		 *   - target/i386/kvm/kvm.c|4324| <<kvm_put_msrs>> for (i = 0; i < num_architectural_pmu_fixed_counters; i++) {
++		 *   - target/i386/kvm/kvm.c|4827| <<kvm_get_msrs>> for (i = 0; i < num_architectural_pmu_fixed_counters; i++) {
++		 */
+                 num_architectural_pmu_fixed_counters = edx & 0x1f;
+ 
+                 if (num_architectural_pmu_fixed_counters > MAX_FIXED_COUNTERS) {
+@@ -2021,6 +2376,32 @@ full:
+     abort();
+ }
+ 
++/*
++ * 1. 如果guest_vendor和host_vendor不一样, 不支持PMU.
++ * has_architectural_pmu_version = 0.
++ * num_architectural_pmu_gp_counters = 0.
++ * num_architectural_pmu_fixed_counters = 0.
++ *
++ * 2. 如果guest_vendor是Intel
++ * 完全按照cpuid来算
++ *
++ * 3. 如果guest_vendor是AMD
++ * 3.1. 查看cpuid是否支持X86_FEATURE_PERFMON_V2.
++ *      如果支持, 根据0x80000022获取寄存器的数目.
++ *      此外, 3个global的也支持!
++ *      寄存器的base address和MSR_F15H_PERF_CTR5的一样(KVM svm其实限制了最多6个)
++ * 3.2. 如果不是ver=2, 如果支持X86_FEATURE_PERFCTR_CORE,
++ *      就是6个寄存器
++ * 3.3. 默认只支持4个
++ *
++ *
++ * called by:
++ *   - accel/kvm/kvm-all.c|510| <<kvm_init_vcpu>> ret = kvm_arch_init_vcpu(cpu);
++ *
++ * 查看:
++ *
++ * https://github.com/finallyjustice/codereading/blob/master/comment/kvm/qemu_kvm_cpuid_features.txt
++ */
+ int kvm_arch_init_vcpu(CPUState *cs)
+ {
+     struct {
+@@ -2200,6 +2581,30 @@ int kvm_arch_init_vcpu(CPUState *cs)
+         }
+     }
+ 
++    /*
++     * 1. 如果guest_vendor和host_vendor不一样, 不支持PMU.
++     * has_architectural_pmu_version = 0.
++     * num_architectural_pmu_gp_counters = 0.
++     * num_architectural_pmu_fixed_counters = 0.
++     *
++     * 2. 如果guest_vendor是Intel
++     * 完全按照cpuid来算
++     *
++     * 3. 如果guest_vendor是AMD
++     * 3.1. 查看cpuid是否支持X86_FEATURE_PERFMON_V2.
++     *      如果支持, 根据0x80000022获取寄存器的数目.
++     *      此外, 3个global的也支持!
++     *      寄存器的base address和MSR_F15H_PERF_CTR5的一样(KVM svm其实限制了最多6个)
++     * 3.2. 如果不是ver=2, 如果支持X86_FEATURE_PERFCTR_CORE,
++     *      就是6个寄存器
++     * 3.3. 默认只支持4个
++     *
++     * 查看:
++     *
++     * https://github.com/finallyjustice/codereading/blob/master/comment/kvm/qemu_kvm_cpuid_features.txt
++     *
++     * 只在此处调用
++     */
+     cpuid_i = kvm_x86_build_cpuid(env, cpuid_data.entries, cpuid_i);
+     cpuid_data.cpuid.nent = cpuid_i;
+ 
+@@ -2310,12 +2715,41 @@ int kvm_arch_init_vcpu(CPUState *cs)
+         }
+     }
+ 
++    /*
++     * 在以下使用ArchCPU->kvm_msr_buf (struct kvm_msrs *):
++     *   - target/i386/kvm/kvm.c|2544| <<kvm_arch_init_vcpu>> cpu->kvm_msr_buf = g_malloc0(MSR_BUF_SIZE);
++     *   - target/i386/kvm/kvm.c|2571| <<kvm_arch_destroy_vcpu>> g_free(cpu->kvm_msr_buf);
++     *   - target/i386/kvm/kvm.c|2572| <<kvm_arch_destroy_vcpu>> cpu->kvm_msr_buf = NULL;
++     *   - target/i386/kvm/kvm.c|3757| <<kvm_msr_buf_reset>> memset(cpu->kvm_msr_buf, 0, MSR_BUF_SIZE);
++     *   - target/i386/kvm/kvm.c|3785| <<kvm_msr_entry_add>> struct kvm_msrs *msrs = cpu->kvm_msr_buf;
++     *   - target/i386/kvm/kvm.c|3808| <<kvm_put_one_msr>> return kvm_vcpu_ioctl(CPU(cpu), KVM_SET_MSRS, cpu->kvm_msr_buf);
++     *   - target/i386/kvm/kvm.c|4045| <<kvm_buf_set_msrs>> int ret = kvm_vcpu_ioctl(CPU(cpu), KVM_SET_MSRS, cpu->kvm_msr_buf);
++     *   - target/i386/kvm/kvm.c|4050| <<kvm_buf_set_msrs>> if (ret < cpu->kvm_msr_buf->nmsrs) {
++     *   - target/i386/kvm/kvm.c|4051| <<kvm_buf_set_msrs>> struct kvm_msr_entry *e = &cpu->kvm_msr_buf->entries[ret];
++     *   - target/i386/kvm/kvm.c|4056| <<kvm_buf_set_msrs>> assert(ret == cpu->kvm_msr_buf->nmsrs);
++     *   - target/i386/kvm/kvm.c|4581| <<kvm_get_msrs>> struct kvm_msr_entry *msrs = cpu->kvm_msr_buf->entries;
++     *   - target/i386/kvm/kvm.c|4819| <<kvm_get_msrs>> ret = kvm_vcpu_ioctl(CPU(cpu), KVM_GET_MSRS, cpu->kvm_msr_buf);
++     *   - target/i386/kvm/kvm.c|4824| <<kvm_get_msrs>> if (ret < cpu->kvm_msr_buf->nmsrs) {
++     *   - target/i386/kvm/kvm.c|4825| <<kvm_get_msrs>> struct kvm_msr_entry *e = &cpu->kvm_msr_buf->entries[ret];
++     *   - target/i386/kvm/kvm.c|4830| <<kvm_get_msrs>> assert(ret == cpu->kvm_msr_buf->nmsrs);
++     *
++     * // for KVM_GET_MSRS and KVM_SET_MSRS
++     * struct kvm_msrs {
++     *     __u32 nmsrs; // number of msrs in entries
++     *     __u32 pad;
++     *
++     *     struct kvm_msr_entry entries[];
++     * };
++     */
+     cpu->kvm_msr_buf = g_malloc0(MSR_BUF_SIZE);
+ 
+     if (!(env->features[FEAT_8000_0001_EDX] & CPUID_EXT2_RDTSCP)) {
+         has_msr_tsc_aux = false;
+     }
+ 
++    /*
++     * 只在此处调用
++     */
+     kvm_init_msrs(cpu);
+ 
+     return 0;
+@@ -2326,6 +2760,10 @@ int kvm_arch_init_vcpu(CPUState *cs)
+     return r;
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|422| <<do_kvm_destroy_vcpu>> ret = kvm_arch_destroy_vcpu(cpu);
++ */
+ int kvm_arch_destroy_vcpu(CPUState *cs)
+ {
+     X86CPU *cpu = X86_CPU(cs);
+@@ -2344,6 +2782,10 @@ int kvm_arch_destroy_vcpu(CPUState *cs)
+     return 0;
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/cpu.c|7217| <<x86_cpu_reset_hold>> kvm_arch_reset_vcpu(cpu);
++ */
+ void kvm_arch_reset_vcpu(X86CPU *cpu)
+ {
+     CPUX86State *env = &cpu->env;
+@@ -2364,6 +2806,10 @@ void kvm_arch_reset_vcpu(X86CPU *cpu)
+     sev_es_set_reset_vector(CPU(cpu));
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/cpu.c|7231| <<x86_cpu_after_reset>> kvm_arch_after_reset_vcpu(cpu);
++ */
+ void kvm_arch_after_reset_vcpu(X86CPU *cpu)
+ {
+     CPUX86State *env = &cpu->env;
+@@ -2382,6 +2828,10 @@ void kvm_arch_after_reset_vcpu(X86CPU *cpu)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/helper.c|609| <<do_cpu_init>> kvm_arch_do_init_vcpu(cpu);
++ */
+ void kvm_arch_do_init_vcpu(X86CPU *cpu)
+ {
+     CPUX86State *env = &cpu->env;
+@@ -2392,6 +2842,10 @@ void kvm_arch_do_init_vcpu(X86CPU *cpu)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|3074| <<kvm_arch_init>> kvm_get_supported_feature_msrs(s);
++ */
+ static int kvm_get_supported_feature_msrs(KVMState *s)
+ {
+     int ret = 0;
+@@ -2432,6 +2886,10 @@ static int kvm_get_supported_feature_msrs(KVMState *s)
+     return 0;
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|3069| <<kvm_arch_init>> ret = kvm_get_supported_msrs(s);
++ */
+ static int kvm_get_supported_msrs(KVMState *s)
+ {
+     int ret = 0;
+@@ -2563,6 +3021,10 @@ static int kvm_get_supported_msrs(KVMState *s)
+     return ret;
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|3187| <<kvm_arch_init>> r = kvm_filter_msr(s, MSR_CORE_THREAD_COUNT, kvm_rdmsr_core_thread_count, NULL);
++ */
+ static bool kvm_rdmsr_core_thread_count(X86CPU *cpu,
+                                         uint32_t msr,
+                                         uint64_t *val)
+@@ -2656,6 +3118,11 @@ static void register_smram_listener(Notifier *n, void *unused)
+                                  &smram_address_space, 1, "kvm-smram");
+ }
+ 
++/*
++ * 在以下使用kvm_msr_energy_thread():
++ *   - target/i386/kvm/kvm.c|2987| <<kvm_msr_energy_thread_init>> qemu_thread_create(&r->msr_thr, "kvm-msr",
++ *                  kvm_msr_energy_thread, s, QEMU_THREAD_JOINABLE);
++ */
+ static void *kvm_msr_energy_thread(void *data)
+ {
+     KVMState *s = data;
+@@ -2885,6 +3352,10 @@ clean:
+     return NULL;
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|3229| <<kvm_arch_init>> r = kvm_msr_energy_thread_init(s, ms);
++ */
+ static int kvm_msr_energy_thread_init(KVMState *s, MachineState *ms)
+ {
+     MachineClass *mc = MACHINE_GET_CLASS(ms);
+@@ -2990,11 +3461,19 @@ out:
+     return ret;
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|2478| <<kvm_init>> type = kvm_arch_get_default_type(ms);
++ */
+ int kvm_arch_get_default_type(MachineState *ms)
+ {
+     return 0;
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|2635| <<kvm_init>> ret = kvm_arch_init(ms, s);
++ */
+ int kvm_arch_init(MachineState *ms, KVMState *s)
+ {
+     uint64_t identity_base = 0xfffbc000;
+@@ -3469,13 +3948,95 @@ static int kvm_put_sregs2(X86CPU *cpu)
+ }
+ 
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|3493| <<kvm_put_one_msr>> kvm_msr_buf_reset(cpu);
++ *   - target/i386/kvm/kvm.c|3739| <<kvm_init_msrs>> kvm_msr_buf_reset(cpu);
++ *   - target/i386/kvm/kvm.c|3774| <<kvm_put_msrs>> kvm_msr_buf_reset(cpu);
++ *   - target/i386/kvm/kvm.c|4248| <<kvm_get_msrs>> kvm_msr_buf_reset(cpu);
++ */
+ static void kvm_msr_buf_reset(X86CPU *cpu)
+ {
++    /*
++     * 在以下使用ArchCPU->kvm_msr_buf (struct kvm_msrs *):
++     *   - target/i386/kvm/kvm.c|2544| <<kvm_arch_init_vcpu>> cpu->kvm_msr_buf = g_malloc0(MSR_BUF_SIZE);
++     *   - target/i386/kvm/kvm.c|2571| <<kvm_arch_destroy_vcpu>> g_free(cpu->kvm_msr_buf);
++     *   - target/i386/kvm/kvm.c|2572| <<kvm_arch_destroy_vcpu>> cpu->kvm_msr_buf = NULL;
++     *   - target/i386/kvm/kvm.c|3757| <<kvm_msr_buf_reset>> memset(cpu->kvm_msr_buf, 0, MSR_BUF_SIZE);
++     *   - target/i386/kvm/kvm.c|3785| <<kvm_msr_entry_add>> struct kvm_msrs *msrs = cpu->kvm_msr_buf;
++     *   - target/i386/kvm/kvm.c|3808| <<kvm_put_one_msr>> return kvm_vcpu_ioctl(CPU(cpu), KVM_SET_MSRS, cpu->kvm_msr_buf);
++     *   - target/i386/kvm/kvm.c|4045| <<kvm_buf_set_msrs>> int ret = kvm_vcpu_ioctl(CPU(cpu), KVM_SET_MSRS, cpu->kvm_msr_buf);
++     *   - target/i386/kvm/kvm.c|4050| <<kvm_buf_set_msrs>> if (ret < cpu->kvm_msr_buf->nmsrs) {
++     *   - target/i386/kvm/kvm.c|4051| <<kvm_buf_set_msrs>> struct kvm_msr_entry *e = &cpu->kvm_msr_buf->entries[ret];
++     *   - target/i386/kvm/kvm.c|4056| <<kvm_buf_set_msrs>> assert(ret == cpu->kvm_msr_buf->nmsrs);
++     *   - target/i386/kvm/kvm.c|4581| <<kvm_get_msrs>> struct kvm_msr_entry *msrs = cpu->kvm_msr_buf->entries;
++     *   - target/i386/kvm/kvm.c|4819| <<kvm_get_msrs>> ret = kvm_vcpu_ioctl(CPU(cpu), KVM_GET_MSRS, cpu->kvm_msr_buf);
++     *   - target/i386/kvm/kvm.c|4824| <<kvm_get_msrs>> if (ret < cpu->kvm_msr_buf->nmsrs) {
++     *   - target/i386/kvm/kvm.c|4825| <<kvm_get_msrs>> struct kvm_msr_entry *e = &cpu->kvm_msr_buf->entries[ret];
++     *   - target/i386/kvm/kvm.c|4830| <<kvm_get_msrs>> assert(ret == cpu->kvm_msr_buf->nmsrs);
++     *
++     * // for KVM_GET_MSRS and KVM_SET_MSRS
++     * struct kvm_msrs {
++     *     __u32 nmsrs; // number of msrs in entries
++     *     __u32 pad;
++     *
++     *     struct kvm_msr_entry entries[];
++     * };
++     */
+     memset(cpu->kvm_msr_buf, 0, MSR_BUF_SIZE);
+ }
+ 
++/*
++ * 特别多的调用:
++ *   - target/i386/kvm/kvm.c|3494| <<kvm_put_one_msr>> kvm_msr_entry_add(cpu, index, value);
++ *   - target/i386/kvm/kvm.c|3663| <<kvm_msr_entry_add_vmx>> kvm_msr_entry_add(cpu, MSR_IA32_VMX_TRUE_PROCBASED_CTLS,
++ *   - target/i386/kvm/kvm.c|3666| <<kvm_msr_entry_add_vmx>> kvm_msr_entry_add(cpu, MSR_IA32_VMX_TRUE_PINBASED_CTLS,
++ *   - target/i386/kvm/kvm.c|3669| <<kvm_msr_entry_add_vmx>> kvm_msr_entry_add(cpu, MSR_IA32_VMX_TRUE_EXIT_CTLS,
++ *   - target/i386/kvm/kvm.c|3672| <<kvm_msr_entry_add_vmx>> kvm_msr_entry_add(cpu, MSR_IA32_VMX_TRUE_ENTRY_CTLS,
++ *   - target/i386/kvm/kvm.c|3675| <<kvm_msr_entry_add_vmx>> kvm_msr_entry_add(cpu, MSR_IA32_VMX_PROCBASED_CTLS2,
++ *   - target/i386/kvm/kvm.c|3678| <<kvm_msr_entry_add_vmx>> kvm_msr_entry_add(cpu, MSR_IA32_VMX_EPT_VPID_CAP,
++ *   - target/i386/kvm/kvm.c|3680| <<kvm_msr_entry_add_vmx>> kvm_msr_entry_add(cpu, MSR_IA32_VMX_BASIC,
++ *   - target/i386/kvm/kvm.c|3682| <<kvm_msr_entry_add_vmx>> kvm_msr_entry_add(cpu, MSR_IA32_VMX_MISC,
++ *   - target/i386/kvm/kvm.c|3685| <<kvm_msr_entry_add_vmx>> kvm_msr_entry_add(cpu, MSR_IA32_VMX_VMFUNC, f[FEAT_VMX_VMFUNC]);
++ *   - target/i386/kvm/kvm.c|3692| <<kvm_msr_entry_add_vmx>> kvm_msr_entry_add(cpu, MSR_IA32_VMX_CR0_FIXED0,
++ *   - target/i386/kvm/kvm.c|3694| <<kvm_msr_entry_add_vmx>> kvm_msr_entry_add(cpu, MSR_IA32_VMX_CR4_FIXED0,
++ *   - target/i386/kvm/kvm.c|3699| <<kvm_msr_entry_add_vmx>> kvm_msr_entry_add(cpu, MSR_IA32_VMX_VMCS_ENUM, 0x32);
++ *   - target/i386/kvm/kvm.c|3702| <<kvm_msr_entry_add_vmx>> kvm_msr_entry_add(cpu, MSR_IA32_VMX_VMCS_ENUM, 0x2E);
++ *   - target/i386/kvm/kvm.c|3713| <<kvm_msr_entry_add_perf>> kvm_msr_entry_add(cpu, MSR_IA32_PERF_CAPABILITIES,
++ *   - target/i386/kvm/kvm.c|3741| <<kvm_init_msrs>> kvm_msr_entry_add(cpu, MSR_IA32_ARCH_CAPABILITIES,
++ *   - target/i386/kvm/kvm.c|3746| <<kvm_init_msrs>> kvm_msr_entry_add(cpu, MSR_IA32_CORE_CAPABILITY,
++ *   - target/i386/kvm/kvm.c|3755| <<kvm_init_msrs>> kvm_msr_entry_add(cpu, MSR_IA32_UCODE_REV, cpu->ucode_rev);
++ *   - 特别特别多的kvm_put_msrs()
++ *   - 特别特别多的kvm_get_msrs()
++ */
+ static void kvm_msr_entry_add(X86CPU *cpu, uint32_t index, uint64_t value)
+ {
++    /*
++     * 在以下使用ArchCPU->kvm_msr_buf (struct kvm_msrs *):
++     *   - target/i386/kvm/kvm.c|2544| <<kvm_arch_init_vcpu>> cpu->kvm_msr_buf = g_malloc0(MSR_BUF_SIZE);
++     *   - target/i386/kvm/kvm.c|2571| <<kvm_arch_destroy_vcpu>> g_free(cpu->kvm_msr_buf);
++     *   - target/i386/kvm/kvm.c|2572| <<kvm_arch_destroy_vcpu>> cpu->kvm_msr_buf = NULL;
++     *   - target/i386/kvm/kvm.c|3757| <<kvm_msr_buf_reset>> memset(cpu->kvm_msr_buf, 0, MSR_BUF_SIZE);
++     *   - target/i386/kvm/kvm.c|3785| <<kvm_msr_entry_add>> struct kvm_msrs *msrs = cpu->kvm_msr_buf;
++     *   - target/i386/kvm/kvm.c|3808| <<kvm_put_one_msr>> return kvm_vcpu_ioctl(CPU(cpu), KVM_SET_MSRS, cpu->kvm_msr_buf);
++     *   - target/i386/kvm/kvm.c|4045| <<kvm_buf_set_msrs>> int ret = kvm_vcpu_ioctl(CPU(cpu), KVM_SET_MSRS, cpu->kvm_msr_buf);
++     *   - target/i386/kvm/kvm.c|4050| <<kvm_buf_set_msrs>> if (ret < cpu->kvm_msr_buf->nmsrs) {
++     *   - target/i386/kvm/kvm.c|4051| <<kvm_buf_set_msrs>> struct kvm_msr_entry *e = &cpu->kvm_msr_buf->entries[ret];
++     *   - target/i386/kvm/kvm.c|4056| <<kvm_buf_set_msrs>> assert(ret == cpu->kvm_msr_buf->nmsrs);
++     *   - target/i386/kvm/kvm.c|4581| <<kvm_get_msrs>> struct kvm_msr_entry *msrs = cpu->kvm_msr_buf->entries;
++     *   - target/i386/kvm/kvm.c|4819| <<kvm_get_msrs>> ret = kvm_vcpu_ioctl(CPU(cpu), KVM_GET_MSRS, cpu->kvm_msr_buf);
++     *   - target/i386/kvm/kvm.c|4824| <<kvm_get_msrs>> if (ret < cpu->kvm_msr_buf->nmsrs) {
++     *   - target/i386/kvm/kvm.c|4825| <<kvm_get_msrs>> struct kvm_msr_entry *e = &cpu->kvm_msr_buf->entries[ret];
++     *   - target/i386/kvm/kvm.c|4830| <<kvm_get_msrs>> assert(ret == cpu->kvm_msr_buf->nmsrs);
++     *
++     * // for KVM_GET_MSRS and KVM_SET_MSRS
++     * struct kvm_msrs {
++     *     __u32 nmsrs; // number of msrs in entries
++     *     __u32 pad;
++     *
++     *     struct kvm_msr_entry entries[];
++     * };
++     */
+     struct kvm_msrs *msrs = cpu->kvm_msr_buf;
+     void *limit = ((void *)msrs) + MSR_BUF_SIZE;
+     struct kvm_msr_entry *entry = &msrs->entries[msrs->nmsrs];
+@@ -3488,6 +4049,12 @@ static void kvm_msr_entry_add(X86CPU *cpu, uint32_t index, uint64_t value)
+     msrs->nmsrs++;
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|3522| <<kvm_put_apicbase>> ret = kvm_put_one_msr(cpu, MSR_IA32_APICBASE, value);
++ *   - target/i386/kvm/kvm.c|3535| <<kvm_put_tscdeadline_msr>> ret = kvm_put_one_msr(cpu, MSR_IA32_TSCDEADLINE, env->tsc_deadline);
++ *   - target/i386/kvm/kvm.c|3558| <<kvm_put_msr_feature_control>> ret = kvm_put_one_msr(cpu, MSR_IA32_FEATURE_CONTROL,
++ */
+ static int kvm_put_one_msr(X86CPU *cpu, int index, uint64_t value)
+ {
+     kvm_msr_buf_reset(cpu);
+@@ -3604,6 +4171,10 @@ static uint64_t make_vmx_msr_value(uint32_t index, uint32_t features)
+     return must_be_one | (((uint64_t)can_be_one) << 32);
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|3763| <<kvm_init_msrs>> kvm_msr_entry_add_vmx(cpu, env->features);
++ */
+ static void kvm_msr_entry_add_vmx(X86CPU *cpu, FeatureWordArray f)
+ {
+     uint64_t kvm_vmx_basic =
+@@ -3703,6 +4274,10 @@ static void kvm_msr_entry_add_vmx(X86CPU *cpu, FeatureWordArray f)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|3751| <<kvm_init_msrs>> kvm_msr_entry_add_perf(cpu, env->features);
++ */
+ static void kvm_msr_entry_add_perf(X86CPU *cpu, FeatureWordArray f)
+ {
+     uint64_t kvm_perf_cap =
+@@ -3715,8 +4290,39 @@ static void kvm_msr_entry_add_perf(X86CPU *cpu, FeatureWordArray f)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|3766| <<kvm_init_msrs>> assert(kvm_buf_set_msrs(cpu) == 0);
++ *   - target/i386/kvm/kvm.c|4097| <<kvm_put_msrs>> return kvm_buf_set_msrs(cpu);
++ */
+ static int kvm_buf_set_msrs(X86CPU *cpu)
+ {
++    /*
++     * 在以下使用ArchCPU->kvm_msr_buf (struct kvm_msrs *):
++     *   - target/i386/kvm/kvm.c|2544| <<kvm_arch_init_vcpu>> cpu->kvm_msr_buf = g_malloc0(MSR_BUF_SIZE);
++     *   - target/i386/kvm/kvm.c|2571| <<kvm_arch_destroy_vcpu>> g_free(cpu->kvm_msr_buf);
++     *   - target/i386/kvm/kvm.c|2572| <<kvm_arch_destroy_vcpu>> cpu->kvm_msr_buf = NULL;
++     *   - target/i386/kvm/kvm.c|3757| <<kvm_msr_buf_reset>> memset(cpu->kvm_msr_buf, 0, MSR_BUF_SIZE);
++     *   - target/i386/kvm/kvm.c|3785| <<kvm_msr_entry_add>> struct kvm_msrs *msrs = cpu->kvm_msr_buf;
++     *   - target/i386/kvm/kvm.c|3808| <<kvm_put_one_msr>> return kvm_vcpu_ioctl(CPU(cpu), KVM_SET_MSRS, cpu->kvm_msr_buf);
++     *   - target/i386/kvm/kvm.c|4045| <<kvm_buf_set_msrs>> int ret = kvm_vcpu_ioctl(CPU(cpu), KVM_SET_MSRS, cpu->kvm_msr_buf);
++     *   - target/i386/kvm/kvm.c|4050| <<kvm_buf_set_msrs>> if (ret < cpu->kvm_msr_buf->nmsrs) {
++     *   - target/i386/kvm/kvm.c|4051| <<kvm_buf_set_msrs>> struct kvm_msr_entry *e = &cpu->kvm_msr_buf->entries[ret];
++     *   - target/i386/kvm/kvm.c|4056| <<kvm_buf_set_msrs>> assert(ret == cpu->kvm_msr_buf->nmsrs);
++     *   - target/i386/kvm/kvm.c|4581| <<kvm_get_msrs>> struct kvm_msr_entry *msrs = cpu->kvm_msr_buf->entries;
++     *   - target/i386/kvm/kvm.c|4819| <<kvm_get_msrs>> ret = kvm_vcpu_ioctl(CPU(cpu), KVM_GET_MSRS, cpu->kvm_msr_buf);
++     *   - target/i386/kvm/kvm.c|4824| <<kvm_get_msrs>> if (ret < cpu->kvm_msr_buf->nmsrs) {
++     *   - target/i386/kvm/kvm.c|4825| <<kvm_get_msrs>> struct kvm_msr_entry *e = &cpu->kvm_msr_buf->entries[ret];
++     *   - target/i386/kvm/kvm.c|4830| <<kvm_get_msrs>> assert(ret == cpu->kvm_msr_buf->nmsrs);
++     *
++     * // for KVM_GET_MSRS and KVM_SET_MSRS
++     * struct kvm_msrs {
++     *     __u32 nmsrs; // number of msrs in entries
++     *     __u32 pad;
++     *
++     *     struct kvm_msr_entry entries[];
++     * };
++     */
+     int ret = kvm_vcpu_ioctl(CPU(cpu), KVM_SET_MSRS, cpu->kvm_msr_buf);
+     if (ret < 0) {
+         return ret;
+@@ -3732,6 +4338,10 @@ static int kvm_buf_set_msrs(X86CPU *cpu)
+     return 0;
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|2319| <<kvm_arch_init_vcpu>> kvm_init_msrs(cpu);
++ */
+ static void kvm_init_msrs(X86CPU *cpu)
+ {
+     CPUX86State *env = &cpu->env;
+@@ -3766,6 +4376,37 @@ static void kvm_init_msrs(X86CPU *cpu)
+     assert(kvm_buf_set_msrs(cpu) == 0);
+ }
+ 
++/*
++ * QEMU-7.1的例子:
++ *
++ * (gdb) bt
++ * #0  kvm_put_msrs (cpu=0x555556ae2360, level=2) at ../target/i386/kvm/kvm.c:3135
++ * #1  0x0000555555b1497a in kvm_arch_put_registers (cpu=0x555556ae2360, level=2) at ../target/i386/kvm/kvm.c:4559
++ * #2  0x0000555555d0de56 in do_kvm_cpu_synchronize_post_reset (cpu=0x555556ae2360, arg=...) at ../accel/kvm/kvm-all.c:2780
++ * #3  0x0000555555821f77 in process_queued_cpu_work (cpu=0x555556ae2360) at ../cpus-common.c:351
++ * #4  0x0000555555a717d4 in qemu_wait_io_event_common (cpu=0x555556ae2360) at ../softmmu/cpus.c:411
++ * #5  0x0000555555a71865 in qemu_wait_io_event (cpu=0x555556ae2360) at ../softmmu/cpus.c:435
++ * #6  0x0000555555d10fce in kvm_vcpu_thread_fn (arg=0x555556ae2360) at ../accel/kvm/kvm-accel-ops.c:54
++ * #7  0x0000555555eec4de in qemu_thread_start (args=0x555556af1620) at ../util/qemu-thread-posix.c:504
++ * #8  0x00007ffff55eeea5 in start_thread () at /lib64/libpthread.so.0
++ * #9  0x00007ffff53179fd in clone () at /lib64/libc.so.6
++ *
++ * (gdb) bt
++ * #0  kvm_put_msrs (cpu=0x555556ae2360, level=1) at ../target/i386/kvm/kvm.c:3135
++ * #1  0x0000555555b1497a in kvm_arch_put_registers (cpu=0x555556ae2360, level=1) at ../target/i386/kvm/kvm.c:4559
++ * #2  0x0000555555d0e12c in kvm_cpu_exec (cpu=0x555556ae2360) at ../accel/kvm/kvm-all.c:2884
++ * #3  0x0000555555d10faa in kvm_vcpu_thread_fn (arg=0x555556ae2360) at ../accel/kvm/kvm-accel-ops.c:49
++ * #4  0x0000555555eec4de in qemu_thread_start (args=0x555556af1620) at ../util/qemu-thread-posix.c:504
++ * #5  0x00007ffff55eeea5 in start_thread () at /lib64/libpthread.so.0
++ * #6  0x00007ffff53179fd in clone () at /lib64/libc.so.6
++ *
++ * called by:
++ *   - target/i386/kvm/kvm.c|5182| <<kvm_arch_put_registers>> ret = kvm_put_msrs(x86_cpu, level);
++ *
++ * 查看:
++ *
++ * https://github.com/finallyjustice/codereading/blob/master/comment/kvm/qemu_kvm_cpuid_features.txt
++ */
+ static int kvm_put_msrs(X86CPU *cpu, int level)
+ {
+     CPUX86State *env = &cpu->env;
+@@ -3870,6 +4511,35 @@ static int kvm_put_msrs(X86CPU *cpu, int level)
+             kvm_msr_entry_add(cpu, MSR_KVM_POLL_CONTROL, env->poll_control_msr);
+         }
+ 
++        /*
++         * 1. 如果guest_vendor和host_vendor不一样, 不支持PMU.
++	 * has_architectural_pmu_version = 0.
++	 * num_architectural_pmu_gp_counters = 0.
++	 * num_architectural_pmu_fixed_counters = 0.
++	 *
++	 * 2. 如果guest_vendor是Intel
++	 * 完全按照cpuid来算
++	 *
++	 * 3. 如果guest_vendor是AMD
++	 * 3.1. 查看cpuid是否支持X86_FEATURE_PERFMON_V2.
++	 *      如果支持, 根据0x80000022获取寄存器的数目.
++	 *      此外, 3个global的也支持!
++	 *      寄存器的base address和MSR_F15H_PERF_CTR5的一样(KVM svm其实限制了最多6个)
++	 * 3.2. 如果不是ver=2, 如果支持X86_FEATURE_PERFCTR_CORE,
++	 *      就是6个寄存器
++	 * 3.3. 默认只支持4个
++         */
++        /*
++	 * 在以下使用has_architectural_pmu_version:
++	 *   - target/i386/kvm/kvm.c|2162| <<kvm_x86_build_cpuid>> has_architectural_pmu_version = eax & 0xff;
++	 *   - target/i386/kvm/kvm.c|2163| <<kvm_x86_build_cpuid>> if (has_architectural_pmu_version > 0) {
++	 *   - target/i386/kvm/kvm.c|2174| <<kvm_x86_build_cpuid>> if (has_architectural_pmu_version > 1) {
++	 *   - target/i386/kvm/kvm.c|4316| <<kvm_put_msrs>> if (has_architectural_pmu_version > 0) {
++	 *   - target/i386/kvm/kvm.c|4317| <<kvm_put_msrs>> if (has_architectural_pmu_version > 1) {
++	 *   - target/i386/kvm/kvm.c|4334| <<kvm_put_msrs>> if (has_architectural_pmu_version > 1) {
++	 *   - target/i386/kvm/kvm.c|4820| <<kvm_get_msrs>> if (has_architectural_pmu_version > 0) {
++	 *   - target/i386/kvm/kvm.c|4821| <<kvm_get_msrs>> if (has_architectural_pmu_version > 1) {
++	 */
+         if (has_architectural_pmu_version > 0) {
+             if (has_architectural_pmu_version > 1) {
+                 /* Stop the counter.  */
+@@ -3878,25 +4548,90 @@ static int kvm_put_msrs(X86CPU *cpu, int level)
+             }
+ 
+             /* Set the counter values.  */
++            /*
++	     * 在以下使用num_architectural_pmu_fixed_counters:
++	     *   - target/i386/kvm/kvm.c|2175| <<kvm_x86_build_cpuid>> num_architectural_pmu_fixed_counters = edx & 0x1f;
++	     *   - target/i386/kvm/kvm.c|2177| <<kvm_x86_build_cpuid>> if (num_architectural_pmu_fixed_counters > MAX_FIXED_COUNTERS) {
++	     *   - target/i386/kvm/kvm.c|2178| <<kvm_x86_build_cpuid>> num_architectural_pmu_fixed_counters = MAX_FIXED_COUNTERS;
++	     *   - target/i386/kvm/kvm.c|4324| <<kvm_put_msrs>> for (i = 0; i < num_architectural_pmu_fixed_counters; i++) {
++	     *   - target/i386/kvm/kvm.c|4827| <<kvm_get_msrs>> for (i = 0; i < num_architectural_pmu_fixed_counters; i++) {
++	     */
+             for (i = 0; i < num_architectural_pmu_fixed_counters; i++) {
++                /*
++		 * 在以下使用CPUX86State->msr_fixed_counters[MAX_FIXED_COUNTERS]:
++		 *   - target/i386/machine.c|678| <<global>> VMSTATE_UINT64_ARRAY(env.msr_fixed_counters, X86CPU, MAX_FIXED_COUNTERS),
++		 *   - target/i386/kvm/kvm.c|4422| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_CORE_PERF_FIXED_CTR0 + i, env->msr_fixed_counters[i]);
++		 *   - target/i386/kvm/kvm.c|5270| <<kvm_get_msrs>> env->msr_fixed_counters[index - MSR_CORE_PERF_FIXED_CTR0] = msrs[i].data;
++		 *   - target/i386/machine.c|655| <<pmu_enable_needed>> if (env->msr_fixed_counters[i]) {
++		 */
+                 kvm_msr_entry_add(cpu, MSR_CORE_PERF_FIXED_CTR0 + i,
+                                   env->msr_fixed_counters[i]);
+             }
++            /*
++	     * 在以下使用num_architectural_pmu_gp_counters:
++	     *   - target/i386/kvm/kvm.c|2164| <<kvm_x86_build_cpuid>> num_architectural_pmu_gp_counters = (eax & 0xff00) >> 8;
++	     *   - target/i386/kvm/kvm.c|2170| <<kvm_x86_build_cpuid>> if (num_architectural_pmu_gp_counters > MAX_GP_COUNTERS) {
++	     *   - target/i386/kvm/kvm.c|2171| <<kvm_x86_build_cpuid>> num_architectural_pmu_gp_counters = MAX_GP_COUNTERS;
++	     *   - target/i386/kvm/kvm.c|4328| <<kvm_put_msrs>> for (i = 0; i < num_architectural_pmu_gp_counters; i++) {
++	     *   - target/i386/kvm/kvm.c|4830| <<kvm_get_msrs>> for (i = 0; i < num_architectural_pmu_gp_counters; i++) {
++	     */
+             for (i = 0; i < num_architectural_pmu_gp_counters; i++) {
++                /*
++		 * 在以下使用CPUX86State->msr_gp_counters[MAX_GP_COUNTERS]:
++		 *   - target/i386/machine.c|679| <<global>> VMSTATE_UINT64_ARRAY(env.msr_gp_counters, X86CPU, MAX_GP_COUNTERS),
++		 *   - target/i386/kvm/kvm.c|4418| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_P6_PERFCTR0 + i, env->msr_gp_counters[i]);
++		 *   - target/i386/kvm/kvm.c|5249| <<kvm_get_msrs>> env->msr_gp_counters[index - MSR_P6_PERFCTR0] = msrs[i].data;
++		 *   - target/i386/machine.c|660| <<pmu_enable_needed>> if (env->msr_gp_counters[i] || env->msr_gp_evtsel[i]) {
++		 */
+                 kvm_msr_entry_add(cpu, MSR_P6_PERFCTR0 + i,
+                                   env->msr_gp_counters[i]);
++                /*
++		 * 在以下使用CPUX86State->msr_gp_evtsel[MAX_GP_COUNTERS]:
++		 *   - target/i386/machine.c|680| <<global>> VMSTATE_UINT64_ARRAY(env.msr_gp_evtsel, X86CPU, MAX_GP_COUNTERS),
++		 *   - target/i386/kvm/kvm.c|4420| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_P6_EVNTSEL0 + i, env->msr_gp_evtsel[i]);
++		 *   - target/i386/kvm/kvm.c|5252| <<kvm_get_msrs>> env->msr_gp_evtsel[index - MSR_P6_EVNTSEL0] = msrs[i].data;
++		 *   - target/i386/machine.c|660| <<pmu_enable_needed>> if (env->msr_gp_counters[i] || env->msr_gp_evtsel[i]) {
++		 */
+                 kvm_msr_entry_add(cpu, MSR_P6_EVNTSEL0 + i,
+                                   env->msr_gp_evtsel[i]);
+             }
+             if (has_architectural_pmu_version > 1) {
++                /*
++		 * 在以下使用CPUX86State->msr_global_status:
++		 *   - target/i386/machine.c|676| <<global>> VMSTATE_UINT64(env.msr_global_status, X86CPU),
++		 *   - target/i386/kvm/kvm.c|4424| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_CORE_PERF_GLOBAL_STATUS, env->msr_global_status);
++		 *   - target/i386/kvm/kvm.c|5240| <<kvm_get_msrs>> env->msr_global_status = msrs[i].data;
++		 *   - target/i386/machine.c|651| <<pmu_enable_needed>> env->msr_global_status || env->msr_global_ovf_ctrl) {
++		 */
+                 kvm_msr_entry_add(cpu, MSR_CORE_PERF_GLOBAL_STATUS,
+                                   env->msr_global_status);
++                /*
++		 * 在以下使用CPUX86State->msr_global_ovf_ctrl:
++		 *   - target/i386/machine.c|677| <<global>> VMSTATE_UINT64(env.msr_global_ovf_ctrl, X86CPU),
++		 *   - target/i386/kvm/kvm.c|4426| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_CORE_PERF_GLOBAL_OVF_CTRL, env->msr_global_ovf_ctrl);
++		 *   - target/i386/kvm/kvm.c|5243| <<kvm_get_msrs>> env->msr_global_ovf_ctrl = msrs[i].data;
++		 *   - target/i386/machine.c|651| <<pmu_enable_needed>> env->msr_global_status || env->msr_global_ovf_ctrl) {
++		 */
+                 kvm_msr_entry_add(cpu, MSR_CORE_PERF_GLOBAL_OVF_CTRL,
+                                   env->msr_global_ovf_ctrl);
+ 
++		/*
++		 * 在以下使用CPUX86State->msr_fixed_ctr_ctrl:
++		 *   - target/i386/machine.c|674| <<global>> VMSTATE_UINT64(env.msr_fixed_ctr_ctrl, X86CPU),
++		 *   - target/i386/kvm/kvm.c|4430| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_CORE_PERF_FIXED_CTR_CTRL, env->msr_fixed_ctr_ctrl);
++		 *   - target/i386/kvm/kvm.c|5234| <<kvm_get_msrs>> env->msr_fixed_ctr_ctrl = msrs[i].data;
++		 *   - target/i386/machine.c|650| <<pmu_enable_needed>> if (env->msr_fixed_ctr_ctrl || env->msr_global_ctrl ||
++		 */
+                 /* Now start the PMU.  */
+                 kvm_msr_entry_add(cpu, MSR_CORE_PERF_FIXED_CTR_CTRL,
+                                   env->msr_fixed_ctr_ctrl);
++                /*
++		 * 在以下使用CPUX86State->msr_global_ctrl:
++		 *   - target/i386/machine.c|675| <<global>> VMSTATE_UINT64(env.msr_global_ctrl, X86CPU),
++		 *   - target/i386/kvm/kvm.c|4432| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_CORE_PERF_GLOBAL_CTRL, env->msr_global_ctrl);
++		 *   - target/i386/kvm/kvm.c|5237| <<kvm_get_msrs>> env->msr_global_ctrl = msrs[i].data;
++		 *   - target/i386/machine.c|650| <<pmu_enable_needed>> if (env->msr_fixed_ctr_ctrl || env->msr_global_ctrl ||
++		 */
+                 kvm_msr_entry_add(cpu, MSR_CORE_PERF_GLOBAL_CTRL,
+                                   env->msr_global_ctrl);
+             }
+@@ -4238,9 +4973,43 @@ static int kvm_get_sregs2(X86CPU *cpu)
+     return 0;
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|5243| <<kvm_arch_get_registers>> ret = kvm_get_msrs(cpu);
++ *
++ * 查看:
++ *
++ * https://github.com/finallyjustice/codereading/blob/master/comment/kvm/qemu_kvm_cpuid_features.txt
++ */
+ static int kvm_get_msrs(X86CPU *cpu)
+ {
+     CPUX86State *env = &cpu->env;
++    /*
++     * 在以下使用ArchCPU->kvm_msr_buf (struct kvm_msrs *):
++     *   - target/i386/kvm/kvm.c|2544| <<kvm_arch_init_vcpu>> cpu->kvm_msr_buf = g_malloc0(MSR_BUF_SIZE);
++     *   - target/i386/kvm/kvm.c|2571| <<kvm_arch_destroy_vcpu>> g_free(cpu->kvm_msr_buf);
++     *   - target/i386/kvm/kvm.c|2572| <<kvm_arch_destroy_vcpu>> cpu->kvm_msr_buf = NULL;
++     *   - target/i386/kvm/kvm.c|3757| <<kvm_msr_buf_reset>> memset(cpu->kvm_msr_buf, 0, MSR_BUF_SIZE);
++     *   - target/i386/kvm/kvm.c|3785| <<kvm_msr_entry_add>> struct kvm_msrs *msrs = cpu->kvm_msr_buf;
++     *   - target/i386/kvm/kvm.c|3808| <<kvm_put_one_msr>> return kvm_vcpu_ioctl(CPU(cpu), KVM_SET_MSRS, cpu->kvm_msr_buf);
++     *   - target/i386/kvm/kvm.c|4045| <<kvm_buf_set_msrs>> int ret = kvm_vcpu_ioctl(CPU(cpu), KVM_SET_MSRS, cpu->kvm_msr_buf);
++     *   - target/i386/kvm/kvm.c|4050| <<kvm_buf_set_msrs>> if (ret < cpu->kvm_msr_buf->nmsrs) {
++     *   - target/i386/kvm/kvm.c|4051| <<kvm_buf_set_msrs>> struct kvm_msr_entry *e = &cpu->kvm_msr_buf->entries[ret];
++     *   - target/i386/kvm/kvm.c|4056| <<kvm_buf_set_msrs>> assert(ret == cpu->kvm_msr_buf->nmsrs);
++     *   - target/i386/kvm/kvm.c|4581| <<kvm_get_msrs>> struct kvm_msr_entry *msrs = cpu->kvm_msr_buf->entries;
++     *   - target/i386/kvm/kvm.c|4819| <<kvm_get_msrs>> ret = kvm_vcpu_ioctl(CPU(cpu), KVM_GET_MSRS, cpu->kvm_msr_buf);
++     *   - target/i386/kvm/kvm.c|4824| <<kvm_get_msrs>> if (ret < cpu->kvm_msr_buf->nmsrs) {
++     *   - target/i386/kvm/kvm.c|4825| <<kvm_get_msrs>> struct kvm_msr_entry *e = &cpu->kvm_msr_buf->entries[ret];
++     *   - target/i386/kvm/kvm.c|4830| <<kvm_get_msrs>> assert(ret == cpu->kvm_msr_buf->nmsrs);
++     *
++     * // for KVM_GET_MSRS and KVM_SET_MSRS
++     * struct kvm_msrs {
++     *     __u32 nmsrs; // number of msrs in entries
++     *     __u32 pad;
++     *
++     *     struct kvm_msr_entry entries[];
++     * };
++     */
+     struct kvm_msr_entry *msrs = cpu->kvm_msr_buf->entries;
+     int ret, i;
+     uint64_t mtrr_top_bits;
+@@ -4344,6 +5113,35 @@ static int kvm_get_msrs(X86CPU *cpu)
+     if (env->features[FEAT_KVM] & (1 << KVM_FEATURE_POLL_CONTROL)) {
+         kvm_msr_entry_add(cpu, MSR_KVM_POLL_CONTROL, 1);
+     }
++    /*
++     * 1. 如果guest_vendor和host_vendor不一样, 不支持PMU.
++     * has_architectural_pmu_version = 0.
++     * num_architectural_pmu_gp_counters = 0.
++     * num_architectural_pmu_fixed_counters = 0.
++     *
++     * 2. 如果guest_vendor是Intel
++     * 完全按照cpuid来算
++     *
++     * 3. 如果guest_vendor是AMD
++     * 3.1. 查看cpuid是否支持X86_FEATURE_PERFMON_V2.
++     *      如果支持, 根据0x80000022获取寄存器的数目.
++     *      此外, 3个global的也支持!
++     *      寄存器的base address和MSR_F15H_PERF_CTR5的一样(KVM svm其实限制了最多6个)
++     * 3.2. 如果不是ver=2, 如果支持X86_FEATURE_PERFCTR_CORE,
++     *      就是6个寄存器
++     * 3.3. 默认只支持4个
++     */
++    /*
++     * 在以下使用has_architectural_pmu_version:
++     *   - target/i386/kvm/kvm.c|2162| <<kvm_x86_build_cpuid>> has_architectural_pmu_version = eax & 0xff;
++     *   - target/i386/kvm/kvm.c|2163| <<kvm_x86_build_cpuid>> if (has_architectural_pmu_version > 0) {
++     *   - target/i386/kvm/kvm.c|2174| <<kvm_x86_build_cpuid>> if (has_architectural_pmu_version > 1) {
++     *   - target/i386/kvm/kvm.c|4316| <<kvm_put_msrs>> if (has_architectural_pmu_version > 0) {
++     *   - target/i386/kvm/kvm.c|4317| <<kvm_put_msrs>> if (has_architectural_pmu_version > 1) {
++     *   - target/i386/kvm/kvm.c|4334| <<kvm_put_msrs>> if (has_architectural_pmu_version > 1) {
++     *   - target/i386/kvm/kvm.c|4820| <<kvm_get_msrs>> if (has_architectural_pmu_version > 0) {
++     *   - target/i386/kvm/kvm.c|4821| <<kvm_get_msrs>> if (has_architectural_pmu_version > 1) {
++     */
+     if (has_architectural_pmu_version > 0) {
+         if (has_architectural_pmu_version > 1) {
+             kvm_msr_entry_add(cpu, MSR_CORE_PERF_FIXED_CTR_CTRL, 0);
+@@ -4351,9 +5149,25 @@ static int kvm_get_msrs(X86CPU *cpu)
+             kvm_msr_entry_add(cpu, MSR_CORE_PERF_GLOBAL_STATUS, 0);
+             kvm_msr_entry_add(cpu, MSR_CORE_PERF_GLOBAL_OVF_CTRL, 0);
+         }
++        /*
++	 * 在以下使用num_architectural_pmu_fixed_counters:
++	 *   - target/i386/kvm/kvm.c|2175| <<kvm_x86_build_cpuid>> num_architectural_pmu_fixed_counters = edx & 0x1f;
++	 *   - target/i386/kvm/kvm.c|2177| <<kvm_x86_build_cpuid>> if (num_architectural_pmu_fixed_counters > MAX_FIXED_COUNTERS) {
++	 *   - target/i386/kvm/kvm.c|2178| <<kvm_x86_build_cpuid>> num_architectural_pmu_fixed_counters = MAX_FIXED_COUNTERS;
++	 *   - target/i386/kvm/kvm.c|4324| <<kvm_put_msrs>> for (i = 0; i < num_architectural_pmu_fixed_counters; i++) {
++	 *   - target/i386/kvm/kvm.c|4827| <<kvm_get_msrs>> for (i = 0; i < num_architectural_pmu_fixed_counters; i++) {
++	 */
+         for (i = 0; i < num_architectural_pmu_fixed_counters; i++) {
+             kvm_msr_entry_add(cpu, MSR_CORE_PERF_FIXED_CTR0 + i, 0);
+         }
++        /*
++	 * 在以下使用num_architectural_pmu_gp_counters:
++	 *   - target/i386/kvm/kvm.c|2164| <<kvm_x86_build_cpuid>> num_architectural_pmu_gp_counters = (eax & 0xff00) >> 8;
++	 *   - target/i386/kvm/kvm.c|2170| <<kvm_x86_build_cpuid>> if (num_architectural_pmu_gp_counters > MAX_GP_COUNTERS) {
++	 *   - target/i386/kvm/kvm.c|2171| <<kvm_x86_build_cpuid>> num_architectural_pmu_gp_counters = MAX_GP_COUNTERS;
++	 *   - target/i386/kvm/kvm.c|4328| <<kvm_put_msrs>> for (i = 0; i < num_architectural_pmu_gp_counters; i++) {
++	 *   - target/i386/kvm/kvm.c|4830| <<kvm_get_msrs>> for (i = 0; i < num_architectural_pmu_gp_counters; i++) {
++	 */
+         for (i = 0; i < num_architectural_pmu_gp_counters; i++) {
+             kvm_msr_entry_add(cpu, MSR_P6_PERFCTR0 + i, 0);
+             kvm_msr_entry_add(cpu, MSR_P6_EVNTSEL0 + i, 0);
+@@ -4651,24 +5465,73 @@ static int kvm_get_msrs(X86CPU *cpu)
+             break;
+         }
+         case MSR_CORE_PERF_FIXED_CTR_CTRL:
++            /*
++	     * 在以下使用CPUX86State->msr_fixed_ctr_ctrl:
++	     *   - target/i386/machine.c|674| <<global>> VMSTATE_UINT64(env.msr_fixed_ctr_ctrl, X86CPU),
++	     *   - target/i386/kvm/kvm.c|4430| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_CORE_PERF_FIXED_CTR_CTRL, env->msr_fixed_ctr_ctrl);
++	     *   - target/i386/kvm/kvm.c|5234| <<kvm_get_msrs>> env->msr_fixed_ctr_ctrl = msrs[i].data;
++	     *   - target/i386/machine.c|650| <<pmu_enable_needed>> if (env->msr_fixed_ctr_ctrl || env->msr_global_ctrl ||
++	     */
+             env->msr_fixed_ctr_ctrl = msrs[i].data;
+             break;
+         case MSR_CORE_PERF_GLOBAL_CTRL:
++            /*
++	     * 在以下使用CPUX86State->msr_global_ctrl:
++	     *   - target/i386/machine.c|675| <<global>> VMSTATE_UINT64(env.msr_global_ctrl, X86CPU),
++	     *   - target/i386/kvm/kvm.c|4432| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_CORE_PERF_GLOBAL_CTRL, env->msr_global_ctrl);
++	     *   - target/i386/kvm/kvm.c|5237| <<kvm_get_msrs>> env->msr_global_ctrl = msrs[i].data;
++	     *   - target/i386/machine.c|650| <<pmu_enable_needed>> if (env->msr_fixed_ctr_ctrl || env->msr_global_ctrl ||
++	     */
+             env->msr_global_ctrl = msrs[i].data;
+             break;
+         case MSR_CORE_PERF_GLOBAL_STATUS:
++            /*
++	     * 在以下使用CPUX86State->msr_global_status:
++	     *   - target/i386/machine.c|676| <<global>> VMSTATE_UINT64(env.msr_global_status, X86CPU),
++	     *   - target/i386/kvm/kvm.c|4424| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_CORE_PERF_GLOBAL_STATUS, env->msr_global_status);
++	     *   - target/i386/kvm/kvm.c|5240| <<kvm_get_msrs>> env->msr_global_status = msrs[i].data;
++	     *   - target/i386/machine.c|651| <<pmu_enable_needed>> env->msr_global_status || env->msr_global_ovf_ctrl) {
++	     */
+             env->msr_global_status = msrs[i].data;
+             break;
+         case MSR_CORE_PERF_GLOBAL_OVF_CTRL:
++            /*
++	     * 在以下使用CPUX86State->msr_global_ovf_ctrl:
++	     *   - target/i386/machine.c|677| <<global>> VMSTATE_UINT64(env.msr_global_ovf_ctrl, X86CPU),
++	     *   - target/i386/kvm/kvm.c|4426| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_CORE_PERF_GLOBAL_OVF_CTRL, env->msr_global_ovf_ctrl);
++	     *   - target/i386/kvm/kvm.c|5243| <<kvm_get_msrs>> env->msr_global_ovf_ctrl = msrs[i].data;
++	     *   - target/i386/machine.c|651| <<pmu_enable_needed>> env->msr_global_status || env->msr_global_ovf_ctrl) {
++	     */
+             env->msr_global_ovf_ctrl = msrs[i].data;
+             break;
+         case MSR_CORE_PERF_FIXED_CTR0 ... MSR_CORE_PERF_FIXED_CTR0 + MAX_FIXED_COUNTERS - 1:
++            /*
++	     * 在以下使用CPUX86State->msr_fixed_counters[MAX_FIXED_COUNTERS]:
++	     *   - target/i386/machine.c|678| <<global>> VMSTATE_UINT64_ARRAY(env.msr_fixed_counters, X86CPU, MAX_FIXED_COUNTERS),
++	     *   - target/i386/kvm/kvm.c|4422| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_CORE_PERF_FIXED_CTR0 + i, env->msr_fixed_counters[i]);
++	     *   - target/i386/kvm/kvm.c|5270| <<kvm_get_msrs>> env->msr_fixed_counters[index - MSR_CORE_PERF_FIXED_CTR0] = msrs[i].data;
++	     *   - target/i386/machine.c|655| <<pmu_enable_needed>> if (env->msr_fixed_counters[i]) {
++	     */
+             env->msr_fixed_counters[index - MSR_CORE_PERF_FIXED_CTR0] = msrs[i].data;
+             break;
+         case MSR_P6_PERFCTR0 ... MSR_P6_PERFCTR0 + MAX_GP_COUNTERS - 1:
++            /*
++	     * 在以下使用CPUX86State->msr_gp_counters[MAX_GP_COUNTERS]:
++	     *   - target/i386/machine.c|679| <<global>> VMSTATE_UINT64_ARRAY(env.msr_gp_counters, X86CPU, MAX_GP_COUNTERS),
++	     *   - target/i386/kvm/kvm.c|4418| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_P6_PERFCTR0 + i, env->msr_gp_counters[i]);
++	     *   - target/i386/kvm/kvm.c|5249| <<kvm_get_msrs>> env->msr_gp_counters[index - MSR_P6_PERFCTR0] = msrs[i].data;
++	     *   - target/i386/machine.c|660| <<pmu_enable_needed>> if (env->msr_gp_counters[i] || env->msr_gp_evtsel[i]) {
++	     */
+             env->msr_gp_counters[index - MSR_P6_PERFCTR0] = msrs[i].data;
+             break;
+         case MSR_P6_EVNTSEL0 ... MSR_P6_EVNTSEL0 + MAX_GP_COUNTERS - 1:
++            /*
++	     * 在以下使用CPUX86State->msr_gp_evtsel[MAX_GP_COUNTERS]:
++	     *   - target/i386/machine.c|680| <<global>> VMSTATE_UINT64_ARRAY(env.msr_gp_evtsel, X86CPU, MAX_GP_COUNTERS),
++	     *   - target/i386/kvm/kvm.c|4420| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_P6_EVNTSEL0 + i, env->msr_gp_evtsel[i]);
++	     *   - target/i386/kvm/kvm.c|5252| <<kvm_get_msrs>> env->msr_gp_evtsel[index - MSR_P6_EVNTSEL0] = msrs[i].data;
++	     *   - target/i386/machine.c|660| <<pmu_enable_needed>> if (env->msr_gp_counters[i] || env->msr_gp_evtsel[i]) {
++	     */
+             env->msr_gp_evtsel[index - MSR_P6_EVNTSEL0] = msrs[i].data;
+             break;
+         case HV_X64_MSR_HYPERCALL:
+@@ -5205,6 +6068,10 @@ int kvm_arch_put_registers(CPUState *cpu, int level)
+     return 0;
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|2769| <<do_kvm_cpu_synchronize_state>> int ret = kvm_arch_get_registers(cpu);
++ */
+ int kvm_arch_get_registers(CPUState *cs)
+ {
+     X86CPU *cpu = X86_CPU(cs);
+@@ -5360,6 +6227,10 @@ void kvm_arch_pre_run(CPUState *cpu, struct kvm_run *run)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|5388| <<kvm_arch_post_run>> kvm_rate_limit_on_bus_lock();
++ */
+ static void kvm_rate_limit_on_bus_lock(void)
+ {
+     uint64_t delay_ns = ratelimit_calculate_delay(&bus_lock_ratelimit_ctrl, 1);
+@@ -5369,6 +6240,10 @@ static void kvm_rate_limit_on_bus_lock(void)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|3027| <<kvm_cpu_exec>> attrs = kvm_arch_post_run(cpu, run);
++ */
+ MemTxAttrs kvm_arch_post_run(CPUState *cpu, struct kvm_run *run)
+ {
+     X86CPU *x86_cpu = X86_CPU(cpu);
+@@ -5414,6 +6289,10 @@ MemTxAttrs kvm_arch_post_run(CPUState *cpu, struct kvm_run *run)
+     return cpu_get_mem_attrs(env);
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|2986| <<kvm_cpu_exec>> if (kvm_arch_process_async_events(cpu)) {
++ */
+ int kvm_arch_process_async_events(CPUState *cs)
+ {
+     X86CPU *cpu = X86_CPU(cs);
+@@ -5475,6 +6354,10 @@ int kvm_arch_process_async_events(CPUState *cs)
+     return cs->halted;
+ }
+ 
++/*
++ * called by:
++ *   - target/i386/kvm/kvm.c|5890| <<kvm_arch_handle_exit(KVM_EXIT_HLT)>> ret = kvm_handle_halt(cpu);
++ */
+ static int kvm_handle_halt(X86CPU *cpu)
+ {
+     CPUState *cs = CPU(cpu);
+@@ -5875,6 +6758,11 @@ static int kvm_handle_hypercall(struct kvm_run *run)
+ 
+ #define VMX_INVALID_GUEST_STATE 0x80000021
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|3138| <<kvm_cpu_exec>> ret = kvm_arch_handle_exit(cpu, run);
++ *   - accel/kvm/kvm-all.c|3156| <<kvm_cpu_exec>> ret = kvm_arch_handle_exit(cpu, run);
++ */
+ int kvm_arch_handle_exit(CPUState *cs, struct kvm_run *run)
+ {
+     X86CPU *cpu = X86_CPU(cs);
+@@ -6387,6 +7275,10 @@ static void kvm_arch_set_xen_evtchn_max_pirq(Object *obj, Visitor *v,
+     s->xen_evtchn_max_pirq = value;
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|3882| <<kvm_accel_class_init>> kvm_arch_accel_class_init(oc);
++ */
+ void kvm_arch_accel_class_init(ObjectClass *oc)
+ {
+     object_class_property_add_enum(oc, "notify-vmexit", "NotifyVMexitOption",
+diff --git a/target/i386/kvm/vmsr_energy.c b/target/i386/kvm/vmsr_energy.c
+index 7e064c5aef..7bace5304c 100644
+--- a/target/i386/kvm/vmsr_energy.c
++++ b/target/i386/kvm/vmsr_energy.c
+@@ -20,6 +20,57 @@
+ #include "cpu.h"
+ #include "host-cpu.h"
+ 
++/*
++ * commit 0418f90809aea5b375c859e744c8e8610e9be446
++ * Author: Anthony Harivel <aharivel@redhat.com>
++ * Date:   Wed May 22 17:34:52 2024 +0200
++ *
++ * Add support for RAPL MSRs in KVM/Qemu
++ *
++ * Starting with the "Sandy Bridge" generation, Intel CPUs provide a RAPL
++ * interface (Running Average Power Limit) for advertising the accumulated
++ * energy consumption of various power domains (e.g. CPU packages, DRAM,
++ * etc.).
++ *
++ * The consumption is reported via MSRs (model specific registers) like
++ * MSR_PKG_ENERGY_STATUS for the CPU package power domain. These MSRs are
++ * 64 bits registers that represent the accumulated energy consumption in
++ * micro Joules. They are updated by microcode every ~1ms.
++ *
++ * For now, KVM always returns 0 when the guest requests the value of
++ * these MSRs. Use the KVM MSR filtering mechanism to allow QEMU handle
++ * these MSRs dynamically in userspace.
++ *
++ * To limit the amount of system calls for every MSR call, create a new
++ * thread in QEMU that updates the "virtual" MSR values asynchronously.
++ *
++ * Each vCPU has its own vMSR to reflect the independence of vCPUs. The
++ * thread updates the vMSR values with the ratio of energy consumed of
++ * the whole physical CPU package the vCPU thread runs on and the
++ * thread's utime and stime values.
++ *
++ * All other non-vCPU threads are also taken into account. Their energy
++ * consumption is evenly distributed among all vCPUs threads running on
++ * the same physical CPU package.
++ *
++ * To overcome the problem that reading the RAPL MSR requires priviliged
++ * access, a socket communication between QEMU and the qemu-vmsr-helper is
++ * mandatory. You can specified the socket path in the parameter.
++ *
++ * This feature is activated with -accel kvm,rapl=true,path=/path/sock.sock
++ *
++ * Actual limitation:
++ * - Works only on Intel host CPU because AMD CPUs are using different MSR
++ *   adresses.
++ *
++ * - Only the Package Power-Plane (MSR_PKG_ENERGY_STATUS) is reported at
++ *   the moment.
++ *
++ * Signed-off-by: Anthony Harivel <aharivel@redhat.com>
++ * Link: https://lore.kernel.org/r/20240522153453.1230389-4-aharivel@redhat.com
++ * Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
++ */
++
+ char *vmsr_compute_default_paths(void)
+ {
+     g_autofree char *state = qemu_get_local_state_dir();
+diff --git a/target/i386/machine.c b/target/i386/machine.c
+index 39f8294f27..46256f7a53 100644
+--- a/target/i386/machine.c
++++ b/target/i386/machine.c
+@@ -647,15 +647,60 @@ static bool pmu_enable_needed(void *opaque)
+     CPUX86State *env = &cpu->env;
+     int i;
+ 
++    /*
++     * 在以下使用CPUX86State->msr_fixed_ctr_ctrl:
++     *   - target/i386/machine.c|674| <<global>> VMSTATE_UINT64(env.msr_fixed_ctr_ctrl, X86CPU),
++     *   - target/i386/kvm/kvm.c|4430| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_CORE_PERF_FIXED_CTR_CTRL, env->msr_fixed_ctr_ctrl);
++     *   - target/i386/kvm/kvm.c|5234| <<kvm_get_msrs>> env->msr_fixed_ctr_ctrl = msrs[i].data;
++     *   - target/i386/machine.c|650| <<pmu_enable_needed>> if (env->msr_fixed_ctr_ctrl || env->msr_global_ctrl ||
++     *
++     * 在以下使用CPUX86State->msr_global_ctrl:
++     *   - target/i386/machine.c|675| <<global>> VMSTATE_UINT64(env.msr_global_ctrl, X86CPU),
++     *   - target/i386/kvm/kvm.c|4432| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_CORE_PERF_GLOBAL_CTRL, env->msr_global_ctrl);
++     *   - target/i386/kvm/kvm.c|5237| <<kvm_get_msrs>> env->msr_global_ctrl = msrs[i].data;
++     *   - target/i386/machine.c|650| <<pmu_enable_needed>> if (env->msr_fixed_ctr_ctrl || env->msr_global_ctrl ||
++     *
++     * 在以下使用CPUX86State->msr_global_status:
++     *   - target/i386/machine.c|676| <<global>> VMSTATE_UINT64(env.msr_global_status, X86CPU),
++     *   - target/i386/kvm/kvm.c|4424| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_CORE_PERF_GLOBAL_STATUS, env->msr_global_status);
++     *   - target/i386/kvm/kvm.c|5240| <<kvm_get_msrs>> env->msr_global_status = msrs[i].data;
++     *   - target/i386/machine.c|651| <<pmu_enable_needed>> env->msr_global_status || env->msr_global_ovf_ctrl) {
++     *
++     * 在以下使用CPUX86State->msr_global_ovf_ctrl:
++     *   - target/i386/machine.c|677| <<global>> VMSTATE_UINT64(env.msr_global_ovf_ctrl, X86CPU),
++     *   - target/i386/kvm/kvm.c|4426| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_CORE_PERF_GLOBAL_OVF_CTRL, env->msr_global_ovf_ctrl);
++     *   - target/i386/kvm/kvm.c|5243| <<kvm_get_msrs>> env->msr_global_ovf_ctrl = msrs[i].data;
++     *   - target/i386/machine.c|651| <<pmu_enable_needed>> env->msr_global_status || env->msr_global_ovf_ctrl) {
++     */
+     if (env->msr_fixed_ctr_ctrl || env->msr_global_ctrl ||
+         env->msr_global_status || env->msr_global_ovf_ctrl) {
+         return true;
+     }
++    /*
++     * 在以下使用CPUX86State->msr_fixed_counters[MAX_FIXED_COUNTERS]:
++     *   - target/i386/machine.c|678| <<global>> VMSTATE_UINT64_ARRAY(env.msr_fixed_counters, X86CPU, MAX_FIXED_COUNTERS),
++     *   - target/i386/kvm/kvm.c|4422| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_CORE_PERF_FIXED_CTR0 + i, env->msr_fixed_counters[i]);
++     *   - target/i386/kvm/kvm.c|5270| <<kvm_get_msrs>> env->msr_fixed_counters[index - MSR_CORE_PERF_FIXED_CTR0] = msrs[i].data;
++     *   - target/i386/machine.c|655| <<pmu_enable_needed>> if (env->msr_fixed_counters[i]) {
++     */
+     for (i = 0; i < MAX_FIXED_COUNTERS; i++) {
+         if (env->msr_fixed_counters[i]) {
+             return true;
+         }
+     }
++    /*
++     * 在以下使用CPUX86State->msr_gp_counters[MAX_GP_COUNTERS]:
++     *   - target/i386/machine.c|679| <<global>> VMSTATE_UINT64_ARRAY(env.msr_gp_counters, X86CPU, MAX_GP_COUNTERS),
++     *   - target/i386/kvm/kvm.c|4418| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_P6_PERFCTR0 + i, env->msr_gp_counters[i]);
++     *   - target/i386/kvm/kvm.c|5249| <<kvm_get_msrs>> env->msr_gp_counters[index - MSR_P6_PERFCTR0] = msrs[i].data;
++     *   - target/i386/machine.c|660| <<pmu_enable_needed>> if (env->msr_gp_counters[i] || env->msr_gp_evtsel[i]) {
++     *
++     * 在以下使用CPUX86State->msr_gp_evtsel[MAX_GP_COUNTERS]:
++     *   - target/i386/machine.c|680| <<global>> VMSTATE_UINT64_ARRAY(env.msr_gp_evtsel, X86CPU, MAX_GP_COUNTERS),
++     *   - target/i386/kvm/kvm.c|4420| <<kvm_put_msrs>> kvm_msr_entry_add(cpu, MSR_P6_EVNTSEL0 + i, env->msr_gp_evtsel[i]);
++     *   - target/i386/kvm/kvm.c|5252| <<kvm_get_msrs>> env->msr_gp_evtsel[index - MSR_P6_EVNTSEL0] = msrs[i].data;
++     *   - target/i386/machine.c|660| <<pmu_enable_needed>> if (env->msr_gp_counters[i] || env->msr_gp_evtsel[i]) {
++     */
+     for (i = 0; i < MAX_GP_COUNTERS; i++) {
+         if (env->msr_gp_counters[i] || env->msr_gp_evtsel[i]) {
+             return true;
+-- 
+2.39.3 (Apple Git-146)
+
