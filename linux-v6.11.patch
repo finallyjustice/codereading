@@ -1,0 +1,2474 @@
+From d068b18fb8a8acf3b8a2e761ed833880c222044d Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Mon, 23 Sep 2024 12:05:10 -0700
+Subject: [PATCH 1/1] linux-v6.11
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ arch/arm64/include/asm/kvm_host.h |  85 +++
+ arch/arm64/kvm/arm.c              |  72 +++
+ arch/arm64/kvm/guest.c            |   4 +
+ arch/arm64/kvm/pmu-emul.c         | 908 ++++++++++++++++++++++++++++++
+ arch/arm64/kvm/sys_regs.c         |  48 ++
+ arch/arm64/kvm/vgic/vgic.c        |  13 +
+ arch/x86/events/amd/core.c        |   5 +
+ arch/x86/events/core.c            |   5 +
+ arch/x86/events/perf_event.h      |  10 +
+ drivers/pci/setup-res.c           |   5 +
+ fs/locks.c                        | 117 ++++
+ fs/nfs/nfs4proc.c                 |   7 +
+ fs/nfsd/nfs4state.c               |  46 ++
+ include/kvm/arm_pmu.h             |  51 ++
+ include/linux/filelock.h          |  26 +
+ kernel/events/core.c              |  46 ++
+ 16 files changed, 1448 insertions(+)
+
+diff --git a/arch/arm64/include/asm/kvm_host.h b/arch/arm64/include/asm/kvm_host.h
+index a33f5996c..d7804263b 100644
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@ -44,10 +44,26 @@
+ 
+ #define KVM_REQ_SLEEP \
+ 	KVM_ARCH_REQ_FLAGS(0, KVM_REQUEST_WAIT | KVM_REQUEST_NO_WAKEUP)
++/*
++ * 在以下使用KVM_REQ_IRQ_PENDING:
++ *   - arch/arm64/kvm/arm.c|1009| <<check_vcpu_requests>> kvm_check_request(KVM_REQ_IRQ_PENDING, vcpu);
++ *   - arch/arm64/kvm/arm.c|1348| <<vcpu_interrupt_line>> kvm_make_request(KVM_REQ_IRQ_PENDING, vcpu);
++ *   - arch/arm64/kvm/pmu-emul.c|865| <<kvm_pmu_perf_overflow>> kvm_make_request(KVM_REQ_IRQ_PENDING, vcpu);
++ *   - arch/arm64/kvm/vgic/vgic-v4.c|102| <<vgic_v4_doorbell_handler>> kvm_make_request(KVM_REQ_IRQ_PENDING, vcpu);
++ *   - arch/arm64/kvm/vgic/vgic.c|351| <<vgic_queue_irq_unlock>> kvm_make_request(KVM_REQ_IRQ_PENDING, vcpu);
++ *   - arch/arm64/kvm/vgic/vgic.c|401| <<vgic_queue_irq_unlock>> kvm_make_request(KVM_REQ_IRQ_PENDING, vcpu);
++ *   - arch/arm64/kvm/vgic/vgic.c|717| <<vgic_prune_ap_list>> kvm_make_request(KVM_REQ_IRQ_PENDING, target_vcpu);
++ *   - arch/arm64/kvm/vgic/vgic.c|998| <<vgic_kick_vcpus>> kvm_make_request(KVM_REQ_IRQ_PENDING, vcpu);
++ */
+ #define KVM_REQ_IRQ_PENDING	KVM_ARCH_REQ(1)
+ #define KVM_REQ_VCPU_RESET	KVM_ARCH_REQ(2)
+ #define KVM_REQ_RECORD_STEAL	KVM_ARCH_REQ(3)
+ #define KVM_REQ_RELOAD_GICv4	KVM_ARCH_REQ(4)
++/*
++ * 在以下使用KVM_REQ_RELOAD_PMU:
++ *   - arch/arm64/kvm/arm.c|1022| <<check_vcpu_requests>> if (kvm_check_request(KVM_REQ_RELOAD_PMU, vcpu)) kvm_vcpu_reload_pmu(vcpu);
++ *   - arch/arm64/kvm/pmu-emul.c|1413| <<kvm_arm_pmu_v3_enable>> kvm_make_request(KVM_REQ_RELOAD_PMU, vcpu);
++ */
+ #define KVM_REQ_RELOAD_PMU	KVM_ARCH_REQ(5)
+ #define KVM_REQ_SUSPEND		KVM_ARCH_REQ(6)
+ #define KVM_REQ_RESYNC_PMU_EL0	KVM_ARCH_REQ(7)
+@@ -328,6 +344,23 @@ struct kvm_arch {
+ #define KVM_ARCH_FLAG_FGU_INITIALIZED			8
+ 	unsigned long flags;
+ 
++	/*
++	 * #define KVM_ARM_VCPU_POWER_OFF          0 // CPU is started in OFF state
++	 * #define KVM_ARM_VCPU_EL1_32BIT          1 // CPU running a 32bit VM
++	 * #define KVM_ARM_VCPU_PSCI_0_2           2 // CPU uses PSCI v0.2
++	 * #define KVM_ARM_VCPU_PMU_V3             3 // Support guest PMUv3
++	 * #define KVM_ARM_VCPU_SVE                4 // enable SVE for this CPU
++	 * #define KVM_ARM_VCPU_PTRAUTH_ADDRESS    5 // VCPU uses address authentication
++	 * #define KVM_ARM_VCPU_PTRAUTH_GENERIC    6 // VCPU uses generic authentication
++	 * #define KVM_ARM_VCPU_HAS_EL2            7 // Support nested virtualization
++	 *
++	 * 在以下使用kvm_arch->vcpu_features:
++	 *   - arch/arm64/include/asm/kvm_host.h|348| <<global>> DECLARE_BITMAP(vcpu_features, KVM_VCPU_MAX_FEATURES);
++	 *   - arch/arm64/include/asm/kvm_host.h|1427| <<__vcpu_has_feature>> return test_bit(feature, ka->vcpu_features);
++	 *   - arch/arm64/kvm/arm.c|212| <<kvm_arch_init_vm>> bitmap_zero(kvm->arch.vcpu_features, KVM_VCPU_MAX_FEATURES);
++	 *   - arch/arm64/kvm/arm.c|1480| <<kvm_vcpu_init_changed>> return !bitmap_equal(vcpu->kvm->arch.vcpu_features, &features, KVM_VCPU_MAX_FEATURES);
++	 *   - arch/arm64/kvm/arm.c|1516| <<__kvm_vcpu_set_target>> bitmap_copy(kvm->arch.vcpu_features, &features, KVM_VCPU_MAX_FEATURES);
++	 */
+ 	/* VM-wide vCPU feature set */
+ 	DECLARE_BITMAP(vcpu_features, KVM_VCPU_MAX_FEATURES);
+ 
+@@ -338,11 +371,42 @@ struct kvm_arch {
+ 	 * VM-wide PMU filter, implemented as a bitmap and big enough for
+ 	 * up to 2^10 events (ARMv8.0) or 2^16 events (ARMv8.1+).
+ 	 */
++	/*
++	 * 在以下使用kvm_arch->pmu_filter:
++	 *   - arch/arm64/kvm/arm.c|256| <<kvm_arch_destroy_vm>> bitmap_free(kvm->arch.pmu_filter);
++	 *   - arch/arm64/kvm/pmu-emul.c|1094| <<kvm_pmu_create_perf_event>> if (vcpu->kvm->arch.pmu_filter && !test_bit(eventsel, vcpu->kvm->arch.pmu_filter))
++	 *   - arch/arm64/kvm/pmu-emul.c|1095| <<kvm_pmu_create_perf_event>> !test_bit(eventsel, vcpu->kvm->arch.pmu_filter))
++	 *   - arch/arm64/kvm/pmu-emul.c|1234| <<kvm_pmu_get_pmceid>> unsigned long *bmap = vcpu->kvm->arch.pmu_filter;
++	 *   - arch/arm64/kvm/pmu-emul.c|1443| <<kvm_arm_pmu_v3_set_pmu>> (kvm->arch.pmu_filter && kvm->arch.arm_pmu != arm_pmu)) {
++	 *   - arch/arm64/kvm/pmu-emul.c|1522| <<kvm_arm_pmu_v3_set_attr>> if (!kvm->arch.pmu_filter) {
++	 *   - arch/arm64/kvm/pmu-emul.c|1523| <<kvm_arm_pmu_v3_set_attr>> kvm->arch.pmu_filter = bitmap_alloc(nr_events, GFP_KERNEL_ACCOUNT);
++	 *   - arch/arm64/kvm/pmu-emul.c|1524| <<kvm_arm_pmu_v3_set_attr>> if (!kvm->arch.pmu_filter)
++	 *   - arch/arm64/kvm/pmu-emul.c|1534| <<kvm_arm_pmu_v3_set_attr>> bitmap_zero(kvm->arch.pmu_filter, nr_events);
++	 *   - arch/arm64/kvm/pmu-emul.c|1536| <<kvm_arm_pmu_v3_set_attr>> bitmap_fill(kvm->arch.pmu_filter, nr_events);
++	 *   - arch/arm64/kvm/pmu-emul.c|1540| <<kvm_arm_pmu_v3_set_attr>> bitmap_set(kvm->arch.pmu_filter, filter.base_event, filter.nevents);
++	 *   - arch/arm64/kvm/pmu-emul.c|1542| <<kvm_arm_pmu_v3_set_attr>> bitmap_clear(kvm->arch.pmu_filter, filter.base_event, filter.nevents);
++	 */
+ 	unsigned long *pmu_filter;
+ 	struct arm_pmu *arm_pmu;
+ 
+ 	cpumask_var_t supported_cpus;
+ 
++	/*
++	 * 在以下使用kvm_arch->pmcr_n:
++	 *   - arch/arm64/kvm/pmu-emul.c|1682| <<kvm_arm_set_pmu>> kvm->arch.pmcr_n = kvm_arm_pmu_get_max_counters(kvm);
++	 *   - arch/arm64/kvm/pmu-emul.c|1969| <<kvm_vcpu_read_pmcr>> return u64_replace_bits(pmcr, vcpu->kvm->arch.pmcr_n, ARMV8_PMU_PMCR_N);
++	 *   - arch/arm64/kvm/sys_regs.c|862| <<reset_pmu_reg>> u8 n = vcpu->kvm->arch.pmcr_n;
++	 *   - arch/arm64/kvm/sys_regs.c|1321| <<set_pmcr>> kvm->arch.pmcr_n = new_n;
++	 *
++	 * PMCR寄存器:
++	 * PMCR_EL0, Performance Monitors Control Register
++	 *
++	 * Provides details of the Performance Monitors implementation, including the
++	 * number of counters implemented, and configures and controls the counters.
++	 *
++	 * 比方N是[15:11]: Indicates the number of event counters implemented. Reads of
++	 * this field from EL1 and EL0 return the value of AArch64-MDCR_EL2.HPMN.
++	 */
+ 	/* PMCR_EL0.N value for the guest */
+ 	u8 pmcr_n;
+ 
+@@ -1375,8 +1439,29 @@ bool kvm_arm_vcpu_is_finalized(struct kvm_vcpu *vcpu);
+ #define kvm_vm_has_ran_once(kvm)					\
+ 	(test_bit(KVM_ARCH_FLAG_HAS_RAN_ONCE, &(kvm)->arch.flags))
+ 
++/*
++ * #define KVM_ARM_VCPU_POWER_OFF          0 // CPU is started in OFF state
++ * #define KVM_ARM_VCPU_EL1_32BIT          1 // CPU running a 32bit VM
++ * #define KVM_ARM_VCPU_PSCI_0_2           2 // CPU uses PSCI v0.2
++ * #define KVM_ARM_VCPU_PMU_V3             3 // Support guest PMUv3
++ * #define KVM_ARM_VCPU_SVE                4 // enable SVE for this CPU
++ * #define KVM_ARM_VCPU_PTRAUTH_ADDRESS    5 // VCPU uses address authentication
++ * #define KVM_ARM_VCPU_PTRAUTH_GENERIC    6 // VCPU uses generic authentication
++ * #define KVM_ARM_VCPU_HAS_EL2            7 // Support nested virtualization
++ */
+ static inline bool __vcpu_has_feature(const struct kvm_arch *ka, int feature)
+ {
++	/*
++	 * 在以下使用kvm_arch->vcpu_features:
++	 *   - arch/arm64/include/asm/kvm_host.h|348| <<global>> DECLARE_BITMAP(vcpu_features, KVM_VCPU_MAX_FEATURES);
++	 *   - arch/arm64/include/asm/kvm_host.h|1427| <<__vcpu_has_feature>> return test_bit(feature, ka->vcpu_features);
++	 *   - arch/arm64/kvm/arm.c|212| <<kvm_arch_init_vm>> bitmap_zero(kvm->arch.vcpu_features, KVM_VCPU_MAX_FEATURES);
++	 *   - arch/arm64/kvm/arm.c|1480| <<kvm_vcpu_init_changed>> return !bitmap_equal(vcpu->kvm->arch.vcpu_features, &features, KVM_VCPU_MAX_FEATURES);
++	 *   - arch/arm64/kvm/arm.c|1516| <<__kvm_vcpu_set_target>> bitmap_copy(kvm->arch.vcpu_features, &features, KVM_VCPU_MAX_FEATURES);
++	 *
++	 * struct kvm_arch:
++	 * -> DECLARE_BITMAP(vcpu_features, KVM_VCPU_MAX_FEATURES)
++	 */
+ 	return test_bit(feature, ka->vcpu_features);
+ }
+ 
+diff --git a/arch/arm64/kvm/arm.c b/arch/arm64/kvm/arm.c
+index 9bef76383..3b11c0290 100644
+--- a/arch/arm64/kvm/arm.c
++++ b/arch/arm64/kvm/arm.c
+@@ -209,6 +209,23 @@ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
+ 
+ 	kvm_arm_init_hypercalls(kvm);
+ 
++	/*
++	 * #define KVM_ARM_VCPU_POWER_OFF          0 // CPU is started in OFF state
++	 * #define KVM_ARM_VCPU_EL1_32BIT          1 // CPU running a 32bit VM
++	 * #define KVM_ARM_VCPU_PSCI_0_2           2 // CPU uses PSCI v0.2
++	 * #define KVM_ARM_VCPU_PMU_V3             3 // Support guest PMUv3
++	 * #define KVM_ARM_VCPU_SVE                4 // enable SVE for this CPU
++	 * #define KVM_ARM_VCPU_PTRAUTH_ADDRESS    5 // VCPU uses address authentication
++	 * #define KVM_ARM_VCPU_PTRAUTH_GENERIC    6 // VCPU uses generic authentication
++	 * #define KVM_ARM_VCPU_HAS_EL2            7 // Support nested virtualization
++	 *
++	 * 在以下使用kvm_arch->vcpu_features:
++	 *   - arch/arm64/include/asm/kvm_host.h|348| <<global>> DECLARE_BITMAP(vcpu_features, KVM_VCPU_MAX_FEATURES);
++	 *   - arch/arm64/include/asm/kvm_host.h|1427| <<__vcpu_has_feature>> return test_bit(feature, ka->vcpu_features);
++	 *   - arch/arm64/kvm/arm.c|212| <<kvm_arch_init_vm>> bitmap_zero(kvm->arch.vcpu_features, KVM_VCPU_MAX_FEATURES);
++	 *   - arch/arm64/kvm/arm.c|1480| <<kvm_vcpu_init_changed>> return !bitmap_equal(vcpu->kvm->arch.vcpu_features, &features, KVM_VCPU_MAX_FEATURES);
++	 *   - arch/arm64/kvm/arm.c|1516| <<__kvm_vcpu_set_target>> bitmap_copy(kvm->arch.vcpu_features, &features, KVM_VCPU_MAX_FEATURES);
++	 */
+ 	bitmap_zero(kvm->arch.vcpu_features, KVM_VCPU_MAX_FEATURES);
+ 
+ 	return 0;
+@@ -1019,6 +1036,11 @@ static int check_vcpu_requests(struct kvm_vcpu *vcpu)
+ 			preempt_enable();
+ 		}
+ 
++		/*
++		 * 在以下使用KVM_REQ_RELOAD_PMU:
++		 *   - arch/arm64/kvm/arm.c|1022| <<check_vcpu_requests>> if (kvm_check_request(KVM_REQ_RELOAD_PMU, vcpu)) kvm_vcpu_reload_pmu(vcpu);
++		 *   - arch/arm64/kvm/pmu-emul.c|1413| <<kvm_arm_pmu_v3_enable>> kvm_make_request(KVM_REQ_RELOAD_PMU, vcpu);
++		 */
+ 		if (kvm_check_request(KVM_REQ_RELOAD_PMU, vcpu))
+ 			kvm_vcpu_reload_pmu(vcpu);
+ 
+@@ -1472,6 +1494,23 @@ static bool kvm_vcpu_init_changed(struct kvm_vcpu *vcpu,
+ {
+ 	unsigned long features = init->features[0];
+ 
++	/*
++	 * #define KVM_ARM_VCPU_POWER_OFF          0 // CPU is started in OFF state
++	 * #define KVM_ARM_VCPU_EL1_32BIT          1 // CPU running a 32bit VM
++	 * #define KVM_ARM_VCPU_PSCI_0_2           2 // CPU uses PSCI v0.2
++	 * #define KVM_ARM_VCPU_PMU_V3             3 // Support guest PMUv3
++	 * #define KVM_ARM_VCPU_SVE                4 // enable SVE for this CPU
++	 * #define KVM_ARM_VCPU_PTRAUTH_ADDRESS    5 // VCPU uses address authentication
++	 * #define KVM_ARM_VCPU_PTRAUTH_GENERIC    6 // VCPU uses generic authentication
++	 * #define KVM_ARM_VCPU_HAS_EL2            7 // Support nested virtualization
++	 *
++	 * 在以下使用kvm_arch->vcpu_features:
++	 *   - arch/arm64/include/asm/kvm_host.h|348| <<global>> DECLARE_BITMAP(vcpu_features, KVM_VCPU_MAX_FEATURES);
++	 *   - arch/arm64/include/asm/kvm_host.h|1427| <<__vcpu_has_feature>> return test_bit(feature, ka->vcpu_features);
++	 *   - arch/arm64/kvm/arm.c|212| <<kvm_arch_init_vm>> bitmap_zero(kvm->arch.vcpu_features, KVM_VCPU_MAX_FEATURES);
++	 *   - arch/arm64/kvm/arm.c|1480| <<kvm_vcpu_init_changed>> return !bitmap_equal(vcpu->kvm->arch.vcpu_features, &features, KVM_VCPU_MAX_FEATURES);
++	 *   - arch/arm64/kvm/arm.c|1516| <<__kvm_vcpu_set_target>> bitmap_copy(kvm->arch.vcpu_features, &features, KVM_VCPU_MAX_FEATURES);
++	 */
+ 	return !bitmap_equal(vcpu->kvm->arch.vcpu_features, &features,
+ 			     KVM_VCPU_MAX_FEATURES);
+ }
+@@ -1495,6 +1534,10 @@ static int kvm_setup_vcpu(struct kvm_vcpu *vcpu)
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/arm.c|1547| <<kvm_vcpu_set_target>> return __kvm_vcpu_set_target(vcpu, init);
++ */
+ static int __kvm_vcpu_set_target(struct kvm_vcpu *vcpu,
+ 				 const struct kvm_vcpu_init *init)
+ {
+@@ -1508,6 +1551,23 @@ static int __kvm_vcpu_set_target(struct kvm_vcpu *vcpu,
+ 	    kvm_vcpu_init_changed(vcpu, init))
+ 		goto out_unlock;
+ 
++	/*
++	 * #define KVM_ARM_VCPU_POWER_OFF          0 // CPU is started in OFF state
++	 * #define KVM_ARM_VCPU_EL1_32BIT          1 // CPU running a 32bit VM
++	 * #define KVM_ARM_VCPU_PSCI_0_2           2 // CPU uses PSCI v0.2
++	 * #define KVM_ARM_VCPU_PMU_V3             3 // Support guest PMUv3
++	 * #define KVM_ARM_VCPU_SVE                4 // enable SVE for this CPU
++	 * #define KVM_ARM_VCPU_PTRAUTH_ADDRESS    5 // VCPU uses address authentication
++	 * #define KVM_ARM_VCPU_PTRAUTH_GENERIC    6 // VCPU uses generic authentication
++	 * #define KVM_ARM_VCPU_HAS_EL2            7 // Support nested virtualization
++	 *
++	 * 在以下使用kvm_arch->vcpu_features:
++	 *   - arch/arm64/include/asm/kvm_host.h|348| <<global>> DECLARE_BITMAP(vcpu_features, KVM_VCPU_MAX_FEATURES);
++	 *   - arch/arm64/include/asm/kvm_host.h|1427| <<__vcpu_has_feature>> return test_bit(feature, ka->vcpu_features);
++	 *   - arch/arm64/kvm/arm.c|212| <<kvm_arch_init_vm>> bitmap_zero(kvm->arch.vcpu_features, KVM_VCPU_MAX_FEATURES);
++	 *   - arch/arm64/kvm/arm.c|1480| <<kvm_vcpu_init_changed>> return !bitmap_equal(vcpu->kvm->arch.vcpu_features, &features, KVM_VCPU_MAX_FEATURES);
++	 *   - arch/arm64/kvm/arm.c|1516| <<__kvm_vcpu_set_target>> bitmap_copy(kvm->arch.vcpu_features, &features, KVM_VCPU_MAX_FEATURES);
++	 */
+ 	bitmap_copy(kvm->arch.vcpu_features, &features, KVM_VCPU_MAX_FEATURES);
+ 
+ 	ret = kvm_setup_vcpu(vcpu);
+@@ -1525,6 +1585,10 @@ static int __kvm_vcpu_set_target(struct kvm_vcpu *vcpu,
+ 	return ret;
+ }
+ 
++/*
++ * 处理KVM_ARM_VCPU_INIT:
++ *   - arch/arm64/kvm/arm.c|1572| <<kvm_arch_vcpu_ioctl_vcpu_init(KVM_ARM_VCPU_INIT)>> ret = kvm_vcpu_set_target(vcpu, init);
++ */
+ static int kvm_vcpu_set_target(struct kvm_vcpu *vcpu,
+ 			       const struct kvm_vcpu_init *init)
+ {
+@@ -1602,6 +1666,10 @@ static int kvm_arch_vcpu_ioctl_vcpu_init(struct kvm_vcpu *vcpu,
+ 	return 0;
+ }
+ 
++/*
++ * 处理KVM_SET_DEVICE_ATTR:
++ *   - arch/arm64/kvm/arm.c|1753| <<kvm_arch_vcpu_ioctl(KVM_SET_DEVICE_ATTR)>> r = kvm_arm_vcpu_set_attr(vcpu, &attr);
++ */
+ static int kvm_arm_vcpu_set_attr(struct kvm_vcpu *vcpu,
+ 				 struct kvm_device_attr *attr)
+ {
+@@ -1670,6 +1738,10 @@ static int kvm_arm_vcpu_set_events(struct kvm_vcpu *vcpu,
+ 	return __kvm_arm_vcpu_set_events(vcpu, events);
+ }
+ 
++/*
++ * called by:
++ *   - virt/kvm/kvm_main.c|4654| <<kvm_vcpu_ioctl(default)>> r = kvm_arch_vcpu_ioctl(filp, ioctl, arg);
++ */
+ long kvm_arch_vcpu_ioctl(struct file *filp,
+ 			 unsigned int ioctl, unsigned long arg)
+ {
+diff --git a/arch/arm64/kvm/guest.c b/arch/arm64/kvm/guest.c
+index 11098eb7e..f04eb67b9 100644
+--- a/arch/arm64/kvm/guest.c
++++ b/arch/arm64/kvm/guest.c
+@@ -944,6 +944,10 @@ int kvm_arch_vcpu_ioctl_set_guest_debug(struct kvm_vcpu *vcpu,
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/arm.c|1617| <<kvm_arm_vcpu_set_attr>> ret = kvm_arm_vcpu_arch_set_attr(vcpu, attr);
++ */
+ int kvm_arm_vcpu_arch_set_attr(struct kvm_vcpu *vcpu,
+ 			       struct kvm_device_attr *attr)
+ {
+diff --git a/arch/arm64/kvm/pmu-emul.c b/arch/arm64/kvm/pmu-emul.c
+index 82a2a0032..937b6b972 100644
+--- a/arch/arm64/kvm/pmu-emul.c
++++ b/arch/arm64/kvm/pmu-emul.c
+@@ -17,24 +17,90 @@
+ 
+ #define PERF_ATTR_CFG1_COUNTER_64BIT	BIT(0)
+ 
++/*
++ * 在以下使用kvm_arm_pmu_available:
++ *   - arch/arm64/kernel/image-vars.h|114| <<global>> KVM_NVHE_ALIAS(kvm_arm_pmu_available);
++ *   - arch/arm64/kvm/pmu-emul.c|20| <<global>> DEFINE_STATIC_KEY_FALSE(kvm_arm_pmu_available);
++ *   - include/kvm/arm_pmu.h|40| <<global>> DECLARE_STATIC_KEY_FALSE(kvm_arm_pmu_available);
++ *   - arch/arm64/kvm/pmu-emul.c|714| <<kvm_host_pmu_init>> static_branch_enable(&kvm_arm_pmu_available);
++ *   - include/kvm/arm_pmu.h|44| <<kvm_arm_support_pmu_v3>> return static_branch_likely(&kvm_arm_pmu_available);
++ */
+ DEFINE_STATIC_KEY_FALSE(kvm_arm_pmu_available);
+ 
++/*
++ * 在以下使用LIST_HEAD(arm_pmus):
++ *   - arch/arm64/kvm/pmu-emul.c|22| <<global>> static LIST_HEAD(arm_pmus);
++ *   - arch/arm64/kvm/pmu-emul.c|711| <<kvm_host_pmu_init>> list_add_tail(&entry->entry, &arm_pmus);
++ *   - arch/arm64/kvm/pmu-emul.c|713| <<kvm_host_pmu_init>> if (list_is_singular(&arm_pmus))
++ *   - arch/arm64/kvm/pmu-emul.c|746| <<kvm_pmu_probe_armpmu>> list_for_each_entry(entry, &arm_pmus, entry) {
++ *   - arch/arm64/kvm/pmu-emul.c|960| <<kvm_arm_pmu_v3_set_pmu>> list_for_each_entry(entry, &arm_pmus, entry) {
++ */
+ static LIST_HEAD(arm_pmus);
+ static DEFINE_MUTEX(arm_pmus_lock);
+ 
+ static void kvm_pmu_create_perf_event(struct kvm_pmc *pmc);
+ static void kvm_pmu_release_perf_event(struct kvm_pmc *pmc);
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|84| <<kvm_pmc_is_64bit>> struct kvm_vcpu *vcpu = kvm_pmc_to_vcpu(pmc);
++ *   - arch/arm64/kvm/pmu-emul.c|92| <<kvm_pmc_has_64bit_overflow>> u64 val = kvm_vcpu_read_pmcr(kvm_pmc_to_vcpu(pmc));
++ *   - arch/arm64/kvm/pmu-emul.c|116| <<kvm_pmu_get_pmc_value>> struct kvm_vcpu *vcpu = kvm_pmc_to_vcpu(pmc);
++ *   - arch/arm64/kvm/pmu-emul.c|151| <<kvm_pmu_set_pmc_value>> struct kvm_vcpu *vcpu = kvm_pmc_to_vcpu(pmc);
++ *   - arch/arm64/kvm/pmu-emul.c|211| <<kvm_pmu_stop_counter>> struct kvm_vcpu *vcpu = kvm_pmc_to_vcpu(pmc);
++ *   - arch/arm64/kvm/pmu-emul.c|502| <<kvm_pmu_perf_overflow>> struct kvm_vcpu *vcpu = kvm_pmc_to_vcpu(pmc);
++ *   - arch/arm64/kvm/pmu-emul.c|587| <<kvm_pmu_counter_is_enabled>> struct kvm_vcpu *vcpu = kvm_pmc_to_vcpu(pmc);
++ *   - arch/arm64/kvm/pmu-emul.c|598| <<kvm_pmu_create_perf_event>> struct kvm_vcpu *vcpu = kvm_pmc_to_vcpu(pmc);
++ */
+ static struct kvm_vcpu *kvm_pmc_to_vcpu(const struct kvm_pmc *pmc)
+ {
++	/*
++	 * struct kvm_vcpu:
++	 * -> struct kvm_vcpu_arch arch;
++	 *    -> struct kvm_pmu pmu;
++	 *       -> struct irq_work overflow_work;
++	 *       -> struct kvm_pmu_events events;
++	 *       -> struct kvm_pmc pmc[ARMV8_PMU_MAX_COUNTERS];
++	 *       -> int irq_num;
++	 *       -> bool created;
++	 *       -> bool irq_level;
++	 */
+ 	return container_of(pmc, struct kvm_vcpu, arch.pmu.pmc[pmc->idx]);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|146| <<kvm_pmu_get_counter_value>> return kvm_pmu_get_pmc_value(kvm_vcpu_idx_to_pmc(vcpu, select_idx));
++ *   - arch/arm64/kvm/pmu-emul.c|187| <<kvm_pmu_set_counter_value>> kvm_pmu_set_pmc_value(kvm_vcpu_idx_to_pmc(vcpu, select_idx), val, false);
++ *   - arch/arm64/kvm/pmu-emul.c|251| <<kvm_pmu_vcpu_reset>> kvm_pmu_stop_counter(kvm_vcpu_idx_to_pmc(vcpu, i));
++ *   - arch/arm64/kvm/pmu-emul.c|264| <<kvm_pmu_vcpu_destroy>> kvm_pmu_release_perf_event(kvm_vcpu_idx_to_pmc(vcpu, i));
++ *   - arch/arm64/kvm/pmu-emul.c|300| <<kvm_pmu_enable_counter_mask>> pmc = kvm_vcpu_idx_to_pmc(vcpu, i);
++ *   - arch/arm64/kvm/pmu-emul.c|332| <<kvm_pmu_disable_counter_mask>> pmc = kvm_vcpu_idx_to_pmc(vcpu, i);
++ *   - arch/arm64/kvm/pmu-emul.c|452| <<kvm_pmu_counter_increment>> struct kvm_pmc *pmc = kvm_vcpu_idx_to_pmc(vcpu, i);
++ *   - arch/arm64/kvm/pmu-emul.c|580| <<kvm_pmu_handle_pmcr>> kvm_pmu_set_pmc_value(kvm_vcpu_idx_to_pmc(vcpu, i), 0, true);
++ *   - arch/arm64/kvm/pmu-emul.c|681| <<kvm_pmu_set_counter_event_type>> struct kvm_pmc *pmc = kvm_vcpu_idx_to_pmc(vcpu, select_idx);
++ */
+ static struct kvm_pmc *kvm_vcpu_idx_to_pmc(struct kvm_vcpu *vcpu, int cnt_idx)
+ {
++	/*
++	 * struct kvm_vcpu:
++	 * -> struct kvm_vcpu_arch arch;
++	 *    -> struct kvm_pmu pmu;
++	 *       -> struct irq_work overflow_work;
++	 *       -> struct kvm_pmu_events events;
++	 *       -> struct kvm_pmc pmc[ARMV8_PMU_MAX_COUNTERS];
++	 *       -> int irq_num;
++	 *       -> bool created;
++	 *       -> bool irq_level;
++	 */
+ 	return &vcpu->arch.pmu.pmc[cnt_idx];
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|59| <<kvm_pmu_event_mask>> return __kvm_pmu_event_mask(pmuver);
++ *   - arch/arm64/kvm/pmu-emul.c|1028| <<kvm_arm_pmu_v3_set_attr>> nr_events = __kvm_pmu_event_mask(pmuver) + 1;
++ */
+ static u32 __kvm_pmu_event_mask(unsigned int pmuver)
+ {
+ 	switch (pmuver) {
+@@ -51,6 +117,13 @@ static u32 __kvm_pmu_event_mask(unsigned int pmuver)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|65| <<kvm_pmu_evtyper_mask>> kvm_pmu_event_mask(kvm);
++ *   - arch/arm64/kvm/pmu-emul.c|457| <<kvm_pmu_counter_increment>> type &= kvm_pmu_event_mask(vcpu->kvm);
++ *   - arch/arm64/kvm/pmu-emul.c|612| <<kvm_pmu_create_perf_event>> eventsel = data & kvm_pmu_event_mask(vcpu->kvm);
++ *   - arch/arm64/kvm/pmu-emul.c|789| <<kvm_pmu_get_pmceid>> nr_events = kvm_pmu_event_mask(vcpu->kvm) + 1;
++ */
+ static u32 kvm_pmu_event_mask(struct kvm *kvm)
+ {
+ 	u64 dfr0 = kvm_read_vm_id_reg(kvm, SYS_ID_AA64DFR0_EL1);
+@@ -59,6 +132,11 @@ static u32 kvm_pmu_event_mask(struct kvm *kvm)
+ 	return __kvm_pmu_event_mask(pmuver);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|688| <<kvm_pmu_set_counter_event_type>> __vcpu_sys_reg(vcpu, reg) = data & kvm_pmu_evtyper_mask(vcpu->kvm);
++ *   - arch/arm64/kvm/sys_regs.c|888| <<reset_pmevtyper>> __vcpu_sys_reg(vcpu, r->reg) &= kvm_pmu_evtyper_mask(vcpu->kvm);
++ */
+ u64 kvm_pmu_evtyper_mask(struct kvm *kvm)
+ {
+ 	u64 mask = ARMV8_PMU_EXCLUDE_EL1 | ARMV8_PMU_EXCLUDE_EL0 |
+@@ -79,6 +157,13 @@ u64 kvm_pmu_evtyper_mask(struct kvm *kvm)
+  * kvm_pmc_is_64bit - determine if counter is 64bit
+  * @pmc: counter context
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|130| <<kvm_pmu_get_pmc_value>> if (!kvm_pmc_is_64bit(pmc))
++ *   - arch/arm64/kvm/pmu-emul.c|463| <<kvm_pmu_counter_increment>> if (!kvm_pmc_is_64bit(pmc))
++ *   - arch/arm64/kvm/pmu-emul.c|485| <<compute_period>> if (kvm_pmc_is_64bit(pmc) && kvm_pmc_has_64bit_overflow(pmc))
++ *   - arch/arm64/kvm/pmu-emul.c|651| <<kvm_pmu_create_perf_event>> if (kvm_pmc_is_64bit(pmc))
++ */
+ static bool kvm_pmc_is_64bit(struct kvm_pmc *pmc)
+ {
+ 	struct kvm_vcpu *vcpu = kvm_pmc_to_vcpu(pmc);
+@@ -87,30 +172,90 @@ static bool kvm_pmc_is_64bit(struct kvm_pmc *pmc)
+ 		kvm_has_feat(vcpu->kvm, ID_AA64DFR0_EL1, PMUVer, V3P5));
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|101| <<kvm_pmu_counter_can_chain>> return (!(pmc->idx & 1) && (pmc->idx + 1) < ARMV8_PMU_CYCLE_IDX && !kvm_pmc_has_64bit_overflow(pmc));
++ *   - arch/arm64/kvm/pmu-emul.c|468| <<kvm_pmu_counter_increment>> if (kvm_pmc_has_64bit_overflow(pmc) ? reg : lower_32_bits(reg))
++ *   - arch/arm64/kvm/pmu-emul.c|485| <<compute_period>> if (kvm_pmc_is_64bit(pmc) && kvm_pmc_has_64bit_overflow(pmc))
++ */
+ static bool kvm_pmc_has_64bit_overflow(struct kvm_pmc *pmc)
+ {
+ 	u64 val = kvm_vcpu_read_pmcr(kvm_pmc_to_vcpu(pmc));
+ 
++	/*
++	 * 207 //
++	 * 208 // Per-CPU PMCR: config reg
++	 * 209  //
++	 * 210 #define ARMV8_PMU_PMCR_E        (1 << 0) // Enable all counters
++	 * 211 #define ARMV8_PMU_PMCR_P        (1 << 1) // Reset all counters
++	 * 212 #define ARMV8_PMU_PMCR_C        (1 << 2) // Cycle counter reset
++	 * 213 #define ARMV8_PMU_PMCR_D        (1 << 3) // CCNT counts every 64th cpu cycle
++	 * 214 #define ARMV8_PMU_PMCR_X        (1 << 4) // Export to ETM
++	 * 215 #define ARMV8_PMU_PMCR_DP       (1 << 5) // Disable CCNT if non-invasive debug
++	 * 216 #define ARMV8_PMU_PMCR_LC       (1 << 6) // Overflow on 64 bit cycle counter
++	 * 217 #define ARMV8_PMU_PMCR_LP       (1 << 7) // Long event counter enable
++	 * 218 #define ARMV8_PMU_PMCR_N        GENMASK(15, 11) // Number of counters supported
++	 */
+ 	return (pmc->idx < ARMV8_PMU_CYCLE_IDX && (val & ARMV8_PMU_PMCR_LP)) ||
+ 	       (pmc->idx == ARMV8_PMU_CYCLE_IDX && (val & ARMV8_PMU_PMCR_LC));
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|474| <<kvm_pmu_counter_increment>> if (kvm_pmu_counter_can_chain(pmc))
++ *   - arch/arm64/kvm/pmu-emul.c|520| <<kvm_pmu_perf_overflow>> if (kvm_pmu_counter_can_chain(pmc))
++ */
+ static bool kvm_pmu_counter_can_chain(struct kvm_pmc *pmc)
+ {
+ 	return (!(pmc->idx & 1) && (pmc->idx + 1) < ARMV8_PMU_CYCLE_IDX &&
+ 		!kvm_pmc_has_64bit_overflow(pmc));
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|119| <<kvm_pmu_get_pmc_value>> reg = counter_index_to_reg(pmc->idx);
++ *   - arch/arm64/kvm/pmu-emul.c|156| <<kvm_pmu_set_pmc_value>> reg = counter_index_to_reg(pmc->idx);
++ *   - arch/arm64/kvm/pmu-emul.c|219| <<kvm_pmu_stop_counter>> reg = counter_index_to_reg(pmc->idx);
++ *   - arch/arm64/kvm/pmu-emul.c|462| <<kvm_pmu_counter_increment>> reg = __vcpu_sys_reg(vcpu, counter_index_to_reg(i)) + 1;
++ *   - arch/arm64/kvm/pmu-emul.c|465| <<kvm_pmu_counter_increment>> __vcpu_sys_reg(vcpu, counter_index_to_reg(i)) = reg;
++ */
+ static u32 counter_index_to_reg(u64 idx)
+ {
++	/*
++	 * 418         // Performance Monitors Registers
++	 * 419         PMCR_EL0,       // Control Register
++	 * 420         PMSELR_EL0,     // Event Counter Selection Register
++	 * 421         PMEVCNTR0_EL0,  // Event Counter Register (0-30)
++	 * 422         PMEVCNTR30_EL0 = PMEVCNTR0_EL0 + 30,
++	 * 423         PMCCNTR_EL0,    // Cycle Counter Register
++	 * 424         PMEVTYPER0_EL0, // Event Type Register (0-30)
++	 * 425         PMEVTYPER30_EL0 = PMEVTYPER0_EL0 + 30,
++	 * 426         PMCCFILTR_EL0,  // Cycle Count Filter Register
++	 * 427         PMCNTENSET_EL0, // Count Enable Set Register
++	 * 428         PMINTENSET_EL1, // Interrupt Enable Set Register
++	 * 429         PMOVSSET_EL0,   // Overflow Flag Status Set Register
++	 * 430         PMUSERENR_EL0,  // User Enable Register
++	 */
+ 	return (idx == ARMV8_PMU_CYCLE_IDX) ? PMCCNTR_EL0 : PMEVCNTR0_EL0 + idx;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|456| <<kvm_pmu_counter_increment>> type = __vcpu_sys_reg(vcpu, counter_index_to_evtreg(i));
++ *   - arch/arm64/kvm/pmu-emul.c|605| <<kvm_pmu_create_perf_event>> reg = counter_index_to_evtreg(pmc->idx);
++ *   - arch/arm64/kvm/pmu-emul.c|687| <<kvm_pmu_set_counter_event_type>> reg = counter_index_to_evtreg(pmc->idx);
++ */
+ static u32 counter_index_to_evtreg(u64 idx)
+ {
+ 	return (idx == ARMV8_PMU_CYCLE_IDX) ? PMCCFILTR_EL0 : PMEVTYPER0_EL0 + idx;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|146| <<kvm_pmu_get_counter_value>> return kvm_pmu_get_pmc_value(kvm_vcpu_idx_to_pmc(vcpu, select_idx));
++ *   - arch/arm64/kvm/pmu-emul.c|217| <<kvm_pmu_stop_counter>> val = kvm_pmu_get_pmc_value(pmc);
++ *   - arch/arm64/kvm/pmu-emul.c|654| <<kvm_pmu_create_perf_event>> attr.sample_period = compute_period(pmc, kvm_pmu_get_pmc_value(pmc));
++ */
+ static u64 kvm_pmu_get_pmc_value(struct kvm_pmc *pmc)
+ {
+ 	struct kvm_vcpu *vcpu = kvm_pmc_to_vcpu(pmc);
+@@ -123,6 +268,15 @@ static u64 kvm_pmu_get_pmc_value(struct kvm_pmc *pmc)
+ 	 * The real counter value is equal to the value of counter register plus
+ 	 * the value perf event counts.
+ 	 */
++	/*
++	 * called by:
++	 *   - arch/arm64/kvm/pmu-emul.c|127| <<kvm_pmu_get_pmc_value>> counter += perf_event_read_value(pmc->perf_event, &enabled,
++	 *   - arch/riscv/kvm/vcpu_pmu.c|249| <<pmu_ctr_read>> pmc->counter_val += perf_event_read_value(pmc->perf_event, &enabled, &running);
++	 *   - arch/riscv/kvm/vcpu_pmu.c|625| <<kvm_riscv_vcpu_pmu_ctr_stop>> pmc->counter_val += perf_event_read_value(pmc->perf_event,
++	 *   - arch/x86/kvm/pmu.h|112| <<pmc_read_counter>> counter += perf_event_read_value(pmc->perf_event,
++	 *   - include/uapi/linux/bpf.h|5852| <<___BPF_FUNC_MAPPER>> FN(perf_event_read_value, 55, ##ctx) \
++	 *   - tools/include/uapi/linux/bpf.h|5852| <<___BPF_FUNC_MAPPER>> FN(perf_event_read_value, 55, ##ctx) \
++	 */
+ 	if (pmc->perf_event)
+ 		counter += perf_event_read_value(pmc->perf_event, &enabled,
+ 						 &running);
+@@ -138,6 +292,11 @@ static u64 kvm_pmu_get_pmc_value(struct kvm_pmc *pmc)
+  * @vcpu: The vcpu pointer
+  * @select_idx: The counter index
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/sys_regs.c|1040| <<get_pmu_evcntr>> *val = kvm_pmu_get_counter_value(vcpu, idx);
++ *   - arch/arm64/kvm/sys_regs.c|1091| <<access_pmu_evcntr>> p->regval = kvm_pmu_get_counter_value(vcpu, idx);
++ */
+ u64 kvm_pmu_get_counter_value(struct kvm_vcpu *vcpu, u64 select_idx)
+ {
+ 	if (!kvm_vcpu_has_pmu(vcpu))
+@@ -146,11 +305,22 @@ u64 kvm_pmu_get_counter_value(struct kvm_vcpu *vcpu, u64 select_idx)
+ 	return kvm_pmu_get_pmc_value(kvm_vcpu_idx_to_pmc(vcpu, select_idx));
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|187| <<kvm_pmu_set_counter_value>> kvm_pmu_set_pmc_value(kvm_vcpu_idx_to_pmc(vcpu, select_idx), val, false);
++ *   - arch/arm64/kvm/pmu-emul.c|580| <<kvm_pmu_handle_pmcr>> kvm_pmu_set_pmc_value(kvm_vcpu_idx_to_pmc(vcpu, i), 0, true);
++ */
+ static void kvm_pmu_set_pmc_value(struct kvm_pmc *pmc, u64 val, bool force)
+ {
+ 	struct kvm_vcpu *vcpu = kvm_pmc_to_vcpu(pmc);
+ 	u64 reg;
+ 
++	/*
++	 * called by:
++	 *   - arch/arm64/kvm/pmu-emul.c|154| <<kvm_pmu_set_pmc_value>> kvm_pmu_release_perf_event(pmc);
++	 *   - arch/arm64/kvm/pmu-emul.c|223| <<kvm_pmu_stop_counter>> kvm_pmu_release_perf_event(pmc);
++	 *   - arch/arm64/kvm/pmu-emul.c|264| <<kvm_pmu_vcpu_destroy>> kvm_pmu_release_perf_event(kvm_vcpu_idx_to_pmc(vcpu, i));
++	 */
+ 	kvm_pmu_release_perf_event(pmc);
+ 
+ 	reg = counter_index_to_reg(pmc->idx);
+@@ -169,6 +339,13 @@ static void kvm_pmu_set_pmc_value(struct kvm_pmc *pmc, u64 val, bool force)
+ 
+ 	__vcpu_sys_reg(vcpu, reg) = val;
+ 
++	/*
++	 * called by:
++	 *   - arch/arm64/kvm/pmu-emul.c|25| <<global>> static void kvm_pmu_create_perf_event(struct kvm_pmc *pmc);
++	 *   - arch/arm64/kvm/pmu-emul.c|173| <<kvm_pmu_set_pmc_value>> kvm_pmu_create_perf_event(pmc);
++	 *   - arch/arm64/kvm/pmu-emul.c|303| <<kvm_pmu_enable_counter_mask>> kvm_pmu_create_perf_event(pmc);
++	 *   - arch/arm64/kvm/pmu-emul.c|690| <<kvm_pmu_set_counter_event_type>> kvm_pmu_create_perf_event(pmc);
++	 */
+ 	/* Recreate the perf event to reflect the updated sample_period */
+ 	kvm_pmu_create_perf_event(pmc);
+ }
+@@ -179,6 +356,11 @@ static void kvm_pmu_set_pmc_value(struct kvm_pmc *pmc, u64 val, bool force)
+  * @select_idx: The counter index
+  * @val: The counter value
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|574| <<kvm_pmu_handle_pmcr>> kvm_pmu_set_counter_value(vcpu, ARMV8_PMU_CYCLE_IDX, 0);
++ *   - arch/arm64/kvm/sys_regs.c|1089| <<access_pmu_evcntr>> kvm_pmu_set_counter_value(vcpu, idx, p->regval);
++ */
+ void kvm_pmu_set_counter_value(struct kvm_vcpu *vcpu, u64 select_idx, u64 val)
+ {
+ 	if (!kvm_vcpu_has_pmu(vcpu))
+@@ -191,10 +373,31 @@ void kvm_pmu_set_counter_value(struct kvm_vcpu *vcpu, u64 select_idx, u64 val)
+  * kvm_pmu_release_perf_event - remove the perf event
+  * @pmc: The PMU counter pointer
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|154| <<kvm_pmu_set_pmc_value>> kvm_pmu_release_perf_event(pmc);
++ *   - arch/arm64/kvm/pmu-emul.c|223| <<kvm_pmu_stop_counter>> kvm_pmu_release_perf_event(pmc);
++ *   - arch/arm64/kvm/pmu-emul.c|264| <<kvm_pmu_vcpu_destroy>> kvm_pmu_release_perf_event(kvm_vcpu_idx_to_pmc(vcpu, i));
++ */
+ static void kvm_pmu_release_perf_event(struct kvm_pmc *pmc)
+ {
+ 	if (pmc->perf_event) {
+ 		perf_event_disable(pmc->perf_event);
++		/*
++		 * called by:
++		 *   - arch/arm64/kvm/pmu-emul.c|386| <<kvm_pmu_release_perf_event>> perf_event_release_kernel(pmc->perf_event);
++		 *   - arch/riscv/kvm/vcpu_pmu.c|82| <<kvm_pmu_release_perf_event>> perf_event_release_kernel(pmc->perf_event);
++		 *   - arch/x86/kernel/cpu/resctrl/pseudo_lock.c|1058| <<measure_residency_fn>> perf_event_release_kernel(hit_event);
++		 *   - arch/x86/kernel/cpu/resctrl/pseudo_lock.c|1060| <<measure_residency_fn>> perf_event_release_kernel(miss_event);
++		 *   - arch/x86/kvm/pmu.c|281| <<pmc_release_perf_event>> perf_event_release_kernel(pmc->perf_event);
++		 *   - arch/x86/kvm/vmx/pmu_intel.c|198| <<intel_pmu_release_guest_lbr_event>> perf_event_release_kernel(lbr_desc->event);
++		 *   - kernel/events/core.c|5487| <<perf_release>> perf_event_release_kernel(file->private_data);
++		 *   - kernel/events/hw_breakpoint.c|829| <<unregister_hw_breakpoint>> perf_event_release_kernel(bp);
++		 *   - kernel/watchdog_perf.c|208| <<hardlockup_detector_perf_cleanup>> perf_event_release_kernel(event);
++		 *   - kernel/watchdog_perf.c|275| <<watchdog_hardlockup_probe>> perf_event_release_kernel(this_cpu_read(watchdog_ev));
++		 *
++		 * arm64只在这里调用release
++		 */
+ 		perf_event_release_kernel(pmc->perf_event);
+ 		pmc->perf_event = NULL;
+ 	}
+@@ -206,6 +409,11 @@ static void kvm_pmu_release_perf_event(struct kvm_pmc *pmc)
+  *
+  * If this counter has been configured to monitor some event, release it here.
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|439| <<kvm_pmu_vcpu_reset>> kvm_pmu_stop_counter(kvm_vcpu_idx_to_pmc(vcpu, i));
++ *   - arch/arm64/kvm/pmu-emul.c|825| <<kvm_pmu_create_perf_event>> kvm_pmu_stop_counter(pmc);
++ */
+ static void kvm_pmu_stop_counter(struct kvm_pmc *pmc)
+ {
+ 	struct kvm_vcpu *vcpu = kvm_pmc_to_vcpu(pmc);
+@@ -220,6 +428,12 @@ static void kvm_pmu_stop_counter(struct kvm_pmc *pmc)
+ 
+ 	__vcpu_sys_reg(vcpu, reg) = val;
+ 
++	/*
++	 * called by:
++	 *   - arch/arm64/kvm/pmu-emul.c|154| <<kvm_pmu_set_pmc_value>> kvm_pmu_release_perf_event(pmc);
++	 *   - arch/arm64/kvm/pmu-emul.c|223| <<kvm_pmu_stop_counter>> kvm_pmu_release_perf_event(pmc);
++	 *   - arch/arm64/kvm/pmu-emul.c|264| <<kvm_pmu_vcpu_destroy>> kvm_pmu_release_perf_event(kvm_vcpu_idx_to_pmc(vcpu, i));
++	 */
+ 	kvm_pmu_release_perf_event(pmc);
+ }
+ 
+@@ -228,11 +442,26 @@ static void kvm_pmu_stop_counter(struct kvm_pmc *pmc)
+  * @vcpu: The vcpu pointer
+  *
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/arm.c|475| <<kvm_arch_vcpu_create>> kvm_pmu_vcpu_init(vcpu);
++ */
+ void kvm_pmu_vcpu_init(struct kvm_vcpu *vcpu)
+ {
+ 	int i;
+ 	struct kvm_pmu *pmu = &vcpu->arch.pmu;
+ 
++	/*
++	 * struct kvm_vcpu:
++	 * -> struct kvm_vcpu_arch arch;
++	 *    -> struct kvm_pmu pmu;
++	 *       -> struct irq_work overflow_work;
++	 *       -> struct kvm_pmu_events events;
++	 *       -> struct kvm_pmc pmc[ARMV8_PMU_MAX_COUNTERS];
++	 *       -> int irq_num;
++	 *       -> bool created;
++	 *       -> bool irq_level;
++	 */
+ 	for (i = 0; i < ARMV8_PMU_MAX_COUNTERS; i++)
+ 		pmu->pmc[i].idx = i;
+ }
+@@ -242,11 +471,20 @@ void kvm_pmu_vcpu_init(struct kvm_vcpu *vcpu)
+  * @vcpu: The vcpu pointer
+  *
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/reset.c|205| <<kvm_reset_vcpu>> kvm_pmu_vcpu_reset(vcpu);
++ */
+ void kvm_pmu_vcpu_reset(struct kvm_vcpu *vcpu)
+ {
+ 	unsigned long mask = kvm_pmu_valid_counter_mask(vcpu);
+ 	int i;
+ 
++	/*
++	 * called by:
++	 *   - arch/arm64/kvm/pmu-emul.c|439| <<kvm_pmu_vcpu_reset>> kvm_pmu_stop_counter(kvm_vcpu_idx_to_pmc(vcpu, i));
++	 *   - arch/arm64/kvm/pmu-emul.c|825| <<kvm_pmu_create_perf_event>> kvm_pmu_stop_counter(pmc);
++	 */
+ 	for_each_set_bit(i, &mask, 32)
+ 		kvm_pmu_stop_counter(kvm_vcpu_idx_to_pmc(vcpu, i));
+ }
+@@ -256,15 +494,38 @@ void kvm_pmu_vcpu_reset(struct kvm_vcpu *vcpu)
+  * @vcpu: The vcpu pointer
+  *
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/arm.c|508| <<kvm_arch_vcpu_destroy>> kvm_pmu_vcpu_destroy(vcpu);
++ */
+ void kvm_pmu_vcpu_destroy(struct kvm_vcpu *vcpu)
+ {
+ 	int i;
+ 
+ 	for (i = 0; i < ARMV8_PMU_MAX_COUNTERS; i++)
+ 		kvm_pmu_release_perf_event(kvm_vcpu_idx_to_pmc(vcpu, i));
++	/*
++	 * 在以下使用kvm_pmu->overflow_work:
++	 *   - arch/arm64/kvm/pmu-emul.c|453| <<kvm_pmu_vcpu_destroy>> irq_work_sync(&vcpu->arch.pmu.overflow_work);
++	 *   - arch/arm64/kvm/pmu-emul.c|619| <<kvm_pmu_perf_overflow_notify_vcpu>> vcpu = container_of(work, struct kvm_vcpu, arch.pmu.overflow_work);
++	 *   - arch/arm64/kvm/pmu-emul.c|718| <<kvm_pmu_perf_overflow>> irq_work_queue(&vcpu->arch.pmu.overflow_work);
++	 *   - arch/arm64/kvm/pmu-emul.c|1092| <<kvm_arm_pmu_v3_init>> init_irq_work(&vcpu->arch.pmu.overflow_work, kvm_pmu_perf_overflow_notify_vcpu);
++	 */
+ 	irq_work_sync(&vcpu->arch.pmu.overflow_work);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|474| <<kvm_pmu_vcpu_reset>> unsigned long mask = kvm_pmu_valid_counter_mask(vcpu);
++ *   - arch/arm64/kvm/pmu-emul.c|835| <<kvm_pmu_handle_pmcr>> unsigned long mask = kvm_pmu_valid_counter_mask(vcpu);
++ *   - arch/arm64/kvm/pmu-emul.c|1076| <<kvm_vcpu_reload_pmu>> u64 mask = kvm_pmu_valid_counter_mask(vcpu);
++ *   - arch/arm64/kvm/sys_regs.c|1146| <<set_pmreg>> val &= kvm_pmu_valid_counter_mask(vcpu);
++ *   - arch/arm64/kvm/sys_regs.c|1169| <<get_pmreg>> u64 mask = kvm_pmu_valid_counter_mask(vcpu);
++ *   - arch/arm64/kvm/sys_regs.c|1183| <<access_pmcnten>> mask = kvm_pmu_valid_counter_mask(vcpu);
++ *   - arch/arm64/kvm/sys_regs.c|1206| <<access_pminten>> u64 mask = kvm_pmu_valid_counter_mask(vcpu);
++ *   - arch/arm64/kvm/sys_regs.c|1230| <<access_pmovs>> u64 mask = kvm_pmu_valid_counter_mask(vcpu);
++ *   - arch/arm64/kvm/sys_regs.c|1260| <<access_pmswinc>> mask = kvm_pmu_valid_counter_mask(vcpu);
++ */
+ u64 kvm_pmu_valid_counter_mask(struct kvm_vcpu *vcpu)
+ {
+ 	u64 val = FIELD_GET(ARMV8_PMU_PMCR_N, kvm_vcpu_read_pmcr(vcpu));
+@@ -282,6 +543,11 @@ u64 kvm_pmu_valid_counter_mask(struct kvm_vcpu *vcpu)
+  *
+  * Call perf_event_enable to start counting the perf event
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|821| <<kvm_pmu_handle_pmcr>> kvm_pmu_enable_counter_mask(vcpu,
++ *   - arch/arm64/kvm/sys_regs.c|1189| <<access_pmcnten>> kvm_pmu_enable_counter_mask(vcpu, val);
++ */
+ void kvm_pmu_enable_counter_mask(struct kvm_vcpu *vcpu, u64 val)
+ {
+ 	int i;
+@@ -300,8 +566,25 @@ void kvm_pmu_enable_counter_mask(struct kvm_vcpu *vcpu, u64 val)
+ 		pmc = kvm_vcpu_idx_to_pmc(vcpu, i);
+ 
+ 		if (!pmc->perf_event) {
++			/*
++			 * called by:
++			 *   - arch/arm64/kvm/pmu-emul.c|25| <<global>> static void kvm_pmu_create_perf_event(struct kvm_pmc *pmc);
++			 *   - arch/arm64/kvm/pmu-emul.c|173| <<kvm_pmu_set_pmc_value>> kvm_pmu_create_perf_event(pmc);
++			 *   - arch/arm64/kvm/pmu-emul.c|303| <<kvm_pmu_enable_counter_mask>> kvm_pmu_create_perf_event(pmc);
++			 *   - arch/arm64/kvm/pmu-emul.c|690| <<kvm_pmu_set_counter_event_type>> kvm_pmu_create_perf_event(pmc);
++			 */
+ 			kvm_pmu_create_perf_event(pmc);
+ 		} else {
++			/*
++			 * called by:
++			 *   - arch/arm64/kvm/pmu-emul.c|541| <<kvm_pmu_enable_counter_mask>> perf_event_enable(pmc->perf_event);
++			 *   - arch/riscv/kvm/vcpu_pmu.c|336| <<kvm_pmu_create_perf_event>> perf_event_enable(pmc->perf_event);
++			 *   - arch/riscv/kvm/vcpu_pmu.c|553| <<kvm_riscv_vcpu_pmu_ctr_start>> perf_event_enable(pmc->perf_event);
++			 *   - arch/x86/kvm/pmu.c|272| <<pmc_resume_counter>> perf_event_enable(pmc->perf_event);
++			 *   - kernel/events/hw_breakpoint.c|815| <<modify_user_hw_breakpoint>> perf_event_enable(bp);
++			 *   - kernel/watchdog_perf.c|169| <<watchdog_hardlockup_enable>> perf_event_enable(this_cpu_read(watchdog_ev));
++			 *   - kernel/watchdog_perf.c|251| <<hardlockup_detector_perf_restart>> perf_event_enable(event);
++			 */
+ 			perf_event_enable(pmc->perf_event);
+ 			if (pmc->perf_event->state != PERF_EVENT_STATE_ACTIVE)
+ 				kvm_debug("fail to enable perf event\n");
+@@ -316,6 +599,11 @@ void kvm_pmu_enable_counter_mask(struct kvm_vcpu *vcpu, u64 val)
+  *
+  * Call perf_event_disable to stop counting the perf event
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|824| <<kvm_pmu_handle_pmcr>> kvm_pmu_disable_counter_mask(vcpu, __vcpu_sys_reg(vcpu, PMCNTENSET_EL0));
++ *   - arch/arm64/kvm/sys_regs.c|1194| <<access_pmcnten>> kvm_pmu_disable_counter_mask(vcpu, val);
++ */
+ void kvm_pmu_disable_counter_mask(struct kvm_vcpu *vcpu, u64 val)
+ {
+ 	int i;
+@@ -336,10 +624,61 @@ void kvm_pmu_disable_counter_mask(struct kvm_vcpu *vcpu, u64 val)
+ 	}
+ }
+ 
++/*
++ * PMOVSSET_EL0寄存器:
++ * PMOVSSET_EL0, Performance Monitors Overflow Flag Status Set Register
++ *
++ * Sets the state of the overflow bit for the Cycle Count Register,
++ * AArch64-PMCCNTR_EL0, and each of the implemented event counters
++ * AArch64-PMEVCNTR<n>_EL0.
++ *
++ * 可写可读, 每个bit表示一个event的overflow status
++ *
++ * -----------
++ *      
++ * PMINTENSET_EL1寄存器:
++ * PMINTENSET_EL1, Performance Monitors Interrupt Enable Set Register
++ *
++ * Enables the generation of interrupt requests on overflows from the
++ * cycle counter, AArch64-PMCCNTR_EL0, and the event counters
++ * AArch64-PMEVCNTR<n>_EL0. Reading the register shows which overflow
++ * interrupt requests are enabled.
++ *
++ * 可读可写, 每个bit表示一个event overflow的时候中断吗
++ *
++ * -----------
++ *
++ * PMCNTENSET_EL0寄存器:
++ * PMCNTENSET_EL0, Performance Monitors Count Enable Set Register
++ *
++ * Enables the Cycle Count Register, AArch64-PMCCNTR_EL0, and any
++ * implemented event counters AArch64-PMEVCNTR<n>_EL0. Reading this
++ * register shows which counters are enabled.
++ *
++ * 可读可写, 激活对应的counter
++ *
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|596| <<kvm_pmu_update_state>> overflow = !!kvm_pmu_overflow_status(vcpu);
++ *   - arch/arm64/kvm/pmu-emul.c|760| <<kvm_pmu_perf_overflow>> if (kvm_pmu_overflow_status(vcpu)) {
++ */
+ static u64 kvm_pmu_overflow_status(struct kvm_vcpu *vcpu)
+ {
+ 	u64 reg = 0;
+ 
++	/*
++	 * 207 //
++	 * 208 // Per-CPU PMCR: config reg
++	 * 209 //
++	 * 210 #define ARMV8_PMU_PMCR_E        (1 << 0) // Enable all counters
++	 * 211 #define ARMV8_PMU_PMCR_P        (1 << 1) // Reset all counters
++	 * 212 #define ARMV8_PMU_PMCR_C        (1 << 2) // Cycle counter reset
++	 * 213 #define ARMV8_PMU_PMCR_D        (1 << 3) // CCNT counts every 64th cpu cycle
++	 * 214 #define ARMV8_PMU_PMCR_X        (1 << 4) // Export to ETM
++	 * 215 #define ARMV8_PMU_PMCR_DP       (1 << 5) // Disable CCNT if non-invasive debug
++	 * 216 #define ARMV8_PMU_PMCR_LC       (1 << 6) // Overflow on 64 bit cycle counter
++	 * 217 #define ARMV8_PMU_PMCR_LP       (1 << 7) // Long event counter enable
++	 * 218 #define ARMV8_PMU_PMCR_N        GENMASK(15, 11) // Number of counters supported
++	 */
+ 	if ((kvm_vcpu_read_pmcr(vcpu) & ARMV8_PMU_PMCR_E)) {
+ 		reg = __vcpu_sys_reg(vcpu, PMOVSSET_EL0);
+ 		reg &= __vcpu_sys_reg(vcpu, PMCNTENSET_EL0);
+@@ -349,6 +688,11 @@ static u64 kvm_pmu_overflow_status(struct kvm_vcpu *vcpu)
+ 	return reg;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|643| <<kvm_pmu_flush_hwstate>> kvm_pmu_update_state(vcpu);
++ *   - arch/arm64/kvm/pmu-emul.c|655| <<kvm_pmu_sync_hwstate>> kvm_pmu_update_state(vcpu);
++ */
+ static void kvm_pmu_update_state(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_pmu *pmu = &vcpu->arch.pmu;
+@@ -364,12 +708,33 @@ static void kvm_pmu_update_state(struct kvm_vcpu *vcpu)
+ 	pmu->irq_level = overflow;
+ 
+ 	if (likely(irqchip_in_kernel(vcpu->kvm))) {
++		/*
++		 * 在以下使用kvm_pmu->irq_num:
++		 *   - arch/arm64/kvm/pmu-emul.c|720| <<kvm_pmu_update_state>> int ret = kvm_vgic_inject_irq(vcpu->kvm, vcpu, pmu->irq_num, overflow, pmu);
++		 *   - arch/arm64/kvm/pmu-emul.c|1518| <<kvm_arm_pmu_v3_enable>> int irq = vcpu->arch.pmu.irq_num;
++		 *   - arch/arm64/kvm/pmu-emul.c|1567| <<kvm_arm_pmu_v3_init>> ret = kvm_vgic_set_owner(vcpu, vcpu->arch.pmu.irq_num,
++		 *   - arch/arm64/kvm/pmu-emul.c|1608| <<pmu_irq_is_valid>> if (vcpu->arch.pmu.irq_num != irq)
++		 *   - arch/arm64/kvm/pmu-emul.c|1611| <<pmu_irq_is_valid>> if (vcpu->arch.pmu.irq_num == irq)
++		 *   - arch/arm64/kvm/pmu-emul.c|1761| <<kvm_arm_pmu_v3_set_attr>> vcpu->arch.pmu.irq_num = irq;
++		 *   - arch/arm64/kvm/pmu-emul.c|1846| <<kvm_arm_pmu_v3_get_attr>> irq = vcpu->arch.pmu.irq_num;
++		 *
++		 * called by:
++		 *   - arch/arm64/kvm/arch_timer.c|455| <<kvm_timer_update_irq>> ret = kvm_vgic_inject_irq(vcpu->kvm, vcpu, timer_irq(timer_ctx), timer_ctx->irq.level, timer_ctx);
++		 *   - arch/arm64/kvm/arm.c|1393| <<kvm_vm_ioctl_irq_line>> return kvm_vgic_inject_irq(kvm, vcpu, irq_num, level, NULL);
++		 *   - arch/arm64/kvm/arm.c|1401| <<kvm_vm_ioctl_irq_line>> return kvm_vgic_inject_irq(kvm, NULL, irq_num, level, NULL);
++		 *   - arch/arm64/kvm/pmu-emul.c|603| <<kvm_pmu_update_state>> int ret = kvm_vgic_inject_irq(vcpu->kvm, vcpu, pmu->irq_num, overflow, pmu);
++		 *   - arch/arm64/kvm/vgic/vgic-irqfd.c|26| <<vgic_irqfd_set_irq>> return kvm_vgic_inject_irq(kvm, NULL, spi_id, level, NULL);
++		 */
+ 		int ret = kvm_vgic_inject_irq(vcpu->kvm, vcpu,
+ 					      pmu->irq_num, overflow, pmu);
+ 		WARN_ON(ret);
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/arm.c|1076| <<kvm_vcpu_exit_request>> if (kvm_timer_should_notify_user(vcpu) || kvm_pmu_should_notify_user(vcpu)) {
++ */
+ bool kvm_pmu_should_notify_user(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_pmu *pmu = &vcpu->arch.pmu;
+@@ -414,6 +779,11 @@ void kvm_pmu_flush_hwstate(struct kvm_vcpu *vcpu)
+  * Check if the PMU has overflowed while we were running in the guest, and
+  * inject an interrupt if that was the case.
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/arm.c|1195| <<kvm_arch_vcpu_ioctl_run>> kvm_pmu_sync_hwstate(vcpu);
++ *   - arch/arm64/kvm/arm.c|1228| <<kvm_arch_vcpu_ioctl_run>> kvm_pmu_sync_hwstate(vcpu);
++ */
+ void kvm_pmu_sync_hwstate(struct kvm_vcpu *vcpu)
+ {
+ 	kvm_pmu_update_state(vcpu);
+@@ -424,19 +794,75 @@ void kvm_pmu_sync_hwstate(struct kvm_vcpu *vcpu)
+  * to the event.
+  * This is why we need a callback to do it once outside of the NMI context.
+  */
++/*
++ * 在以下使用kvm_pmu_perf_overflow_notify_vcpu():
++ *   - arch/arm64/kvm/pmu-emul.c|1141| <<kvm_arm_pmu_v3_init>> init_irq_work(&vcpu->arch.pmu.overflow_work, kvm_pmu_perf_overflow_notify_vcpu);
++ */
+ static void kvm_pmu_perf_overflow_notify_vcpu(struct irq_work *work)
+ {
+ 	struct kvm_vcpu *vcpu;
+ 
++	/*
++	 * 在以下使用kvm_pmu->overflow_work:
++	 *   - arch/arm64/kvm/pmu-emul.c|453| <<kvm_pmu_vcpu_destroy>> irq_work_sync(&vcpu->arch.pmu.overflow_work);
++	 *   - arch/arm64/kvm/pmu-emul.c|619| <<kvm_pmu_perf_overflow_notify_vcpu>> vcpu = container_of(work, struct kvm_vcpu, arch.pmu.overflow_work);
++	 *   - arch/arm64/kvm/pmu-emul.c|718| <<kvm_pmu_perf_overflow>> irq_work_queue(&vcpu->arch.pmu.overflow_work);
++	 *   - arch/arm64/kvm/pmu-emul.c|1092| <<kvm_arm_pmu_v3_init>> init_irq_work(&vcpu->arch.pmu.overflow_work, kvm_pmu_perf_overflow_notify_vcpu);
++	 */
+ 	vcpu = container_of(work, struct kvm_vcpu, arch.pmu.overflow_work);
+ 	kvm_vcpu_kick(vcpu);
+ }
+ 
++/*
++ * 一些event的例子
++ *
++ * 12 //
++ * 13 // Common architectural and microarchitectural event numbers.
++ * 14 //
++ * 15 #define ARMV8_PMUV3_PERFCTR_SW_INCR                             0x0000
++ * 16 #define ARMV8_PMUV3_PERFCTR_L1I_CACHE_REFILL                    0x0001
++ * 17 #define ARMV8_PMUV3_PERFCTR_L1I_TLB_REFILL                      0x0002
++ * 18 #define ARMV8_PMUV3_PERFCTR_L1D_CACHE_REFILL                    0x0003
++ * 19 #define ARMV8_PMUV3_PERFCTR_L1D_CACHE                           0x0004
++ * 20 #define ARMV8_PMUV3_PERFCTR_L1D_TLB_REFILL                      0x0005
++ * 21 #define ARMV8_PMUV3_PERFCTR_LD_RETIRED                          0x0006
++ * 22 #define ARMV8_PMUV3_PERFCTR_ST_RETIRED                          0x0007
++ * 23 #define ARMV8_PMUV3_PERFCTR_INST_RETIRED                        0x0008
++ * 24 #define ARMV8_PMUV3_PERFCTR_EXC_TAKEN                           0x0009
++ * 25 #define ARMV8_PMUV3_PERFCTR_EXC_RETURN                          0x000A
++ * 26 #define ARMV8_PMUV3_PERFCTR_CID_WRITE_RETIRED                   0x000B
++ * 27 #define ARMV8_PMUV3_PERFCTR_PC_WRITE_RETIRED                    0x000C
++ * 28 #define ARMV8_PMUV3_PERFCTR_BR_IMMED_RETIRED                    0x000D
++ * 29 #define ARMV8_PMUV3_PERFCTR_BR_RETURN_RETIRED                   0x000E
++ * 30 #define ARMV8_PMUV3_PERFCTR_UNALIGNED_LDST_RETIRED              0x000F
++ * 31 #define ARMV8_PMUV3_PERFCTR_BR_MIS_PRED                         0x0010
++ * 32 #define ARMV8_PMUV3_PERFCTR_CPU_CYCLES                          0x0011
++ * 33 #define ARMV8_PMUV3_PERFCTR_BR_PRED                             0x0012
++ * 34 #define ARMV8_PMUV3_PERFCTR_MEM_ACCESS                          0x0013
++ * 35 #define ARMV8_PMUV3_PERFCTR_L1I_CACHE                           0x0014
++ * 36 #define ARMV8_PMUV3_PERFCTR_L1D_CACHE_WB                        0x0015
++ * 37 #define ARMV8_PMUV3_PERFCTR_L2D_CACHE                           0x0016
++ * 38 #define ARMV8_PMUV3_PERFCTR_L2D_CACHE_REFILL                    0x0017
++ * 39 #define ARMV8_PMUV3_PERFCTR_L2D_CACHE_WB                        0x0018
++ * 40 #define ARMV8_PMUV3_PERFCTR_BUS_ACCESS                          0x0019
++ * 41 #define ARMV8_PMUV3_PERFCTR_MEMORY_ERROR                        0x001A
++ * 42 #define ARMV8_PMUV3_PERFCTR_INST_SPEC                           0x001B
++ * 43 #define ARMV8_PMUV3_PERFCTR_TTBR_WRITE_RETIRED                  0x001C
++ * 44 #define ARMV8_PMUV3_PERFCTR_BUS_CYCLES                          0x001D
++ * 45 #define ARMV8_PMUV3_PERFCTR_CHAIN                               0x001E
++ */
++
+ /*
+  * Perform an increment on any of the counters described in @mask,
+  * generating the overflow if required, and propagate it as a chained
+  * event if possible.
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|711| <<kvm_pmu_counter_increment>> kvm_pmu_counter_increment(vcpu, BIT(i + 1), ARMV8_PMUV3_PERFCTR_CHAIN);
++ *   - arch/arm64/kvm/pmu-emul.c|757| <<kvm_pmu_perf_overflow>> kvm_pmu_counter_increment(vcpu, BIT(idx + 1), ARMV8_PMUV3_PERFCTR_CHAIN);
++ *   - arch/arm64/kvm/pmu-emul.c|779| <<kvm_pmu_software_increment>> kvm_pmu_counter_increment(vcpu, val, ARMV8_PMUV3_PERFCTR_SW_INCR);
++ */
+ static void kvm_pmu_counter_increment(struct kvm_vcpu *vcpu,
+ 				      unsigned long mask, u32 event)
+ {
+@@ -445,6 +871,17 @@ static void kvm_pmu_counter_increment(struct kvm_vcpu *vcpu,
+ 	if (!(kvm_vcpu_read_pmcr(vcpu) & ARMV8_PMU_PMCR_E))
+ 		return;
+ 
++	/*
++	 *
++	 * PMCNTENSET_EL0寄存器:
++	 * PMCNTENSET_EL0, Performance Monitors Count Enable Set Register
++	 *
++	 * Enables the Cycle Count Register, AArch64-PMCCNTR_EL0, and any
++	 * implemented event counters AArch64-PMEVCNTR<n>_EL0. Reading this
++	 * register shows which counters are enabled.
++	 *
++	 * 可读可写, 激活对应的counter
++	 */
+ 	/* Weed out disabled counters */
+ 	mask &= __vcpu_sys_reg(vcpu, PMCNTENSET_EL0);
+ 
+@@ -455,6 +892,9 @@ static void kvm_pmu_counter_increment(struct kvm_vcpu *vcpu,
+ 		/* Filter on event type */
+ 		type = __vcpu_sys_reg(vcpu, counter_index_to_evtreg(i));
+ 		type &= kvm_pmu_event_mask(vcpu->kvm);
++		/*
++		 * 只针对event
++		 */
+ 		if (type != event)
+ 			continue;
+ 
+@@ -468,6 +908,16 @@ static void kvm_pmu_counter_increment(struct kvm_vcpu *vcpu,
+ 		if (kvm_pmc_has_64bit_overflow(pmc) ? reg : lower_32_bits(reg))
+ 			continue;
+ 
++		/*
++		 * PMOVSSET_EL0寄存器:
++		 * PMOVSSET_EL0, Performance Monitors Overflow Flag Status Set Register
++		 *
++		 * Sets the state of the overflow bit for the Cycle Count Register,
++		 * AArch64-PMCCNTR_EL0, and each of the implemented event counters
++		 * AArch64-PMEVCNTR<n>_EL0.
++		 *
++		 * 可写可读, 每个bit表示一个event的overflow status
++		 */
+ 		/* Mark overflow */
+ 		__vcpu_sys_reg(vcpu, PMOVSSET_EL0) |= BIT(i);
+ 
+@@ -477,6 +927,11 @@ static void kvm_pmu_counter_increment(struct kvm_vcpu *vcpu,
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|852| <<kvm_pmu_perf_overflow>> period = compute_period(pmc, local64_read(&perf_event->count));
++ *   - arch/arm64/kvm/pmu-emul.c|1030| <<kvm_pmu_create_perf_event>> attr.sample_period = compute_period(pmc, kvm_pmu_get_pmc_value(pmc));
++ */
+ /* Compute the sample period for a given counter value */
+ static u64 compute_period(struct kvm_pmc *pmc, u64 counter)
+ {
+@@ -493,6 +948,10 @@ static u64 compute_period(struct kvm_pmc *pmc, u64 counter)
+ /*
+  * When the perf event overflows, set the overflow status and inform the vcpu.
+  */
++/*
++ * 在以下使用kvm_pmu_perf_overflow():
++ *   - arch/arm64/kvm/pmu-emul.c|1033| <<kvm_pmu_create_perf_event>> event = perf_event_create_kernel_counter(&attr, -1, current, kvm_pmu_perf_overflow, pmc);
++ */
+ static void kvm_pmu_perf_overflow(struct perf_event *perf_event,
+ 				  struct perf_sample_data *data,
+ 				  struct pt_regs *regs)
+@@ -503,6 +962,11 @@ static void kvm_pmu_perf_overflow(struct perf_event *perf_event,
+ 	int idx = pmc->idx;
+ 	u64 period;
+ 
++	/*
++	 * #define PERF_EF_START   0x01            // start the counter when adding
++	 * #define PERF_EF_RELOAD  0x02            // reload the counter when starting
++	 * #define PERF_EF_UPDATE  0x04            // update the counter when stopping
++	 */
+ 	cpu_pmu->pmu.stop(perf_event, PERF_EF_UPDATE);
+ 
+ 	/*
+@@ -515,6 +979,19 @@ static void kvm_pmu_perf_overflow(struct perf_event *perf_event,
+ 	perf_event->attr.sample_period = period;
+ 	perf_event->hw.sample_period = period;
+ 
++	/*
++	 * PMOVSSET_EL0寄存器:
++	 * PMOVSSET_EL0, Performance Monitors Overflow Flag Status Set Register
++	 *
++	 * Sets the state of the overflow bit for the Cycle Count Register,
++	 * AArch64-PMCCNTR_EL0, and each of the implemented event counters
++	 * AArch64-PMEVCNTR<n>_EL0.
++	 *      
++	 * 可写可读, 每个bit表示一个event的overflow status
++	 *
++	 *
++	 * PMOVSSET_EL0,   // Overflow Flag Status Set Register
++	 */
+ 	__vcpu_sys_reg(vcpu, PMOVSSET_EL0) |= BIT(idx);
+ 
+ 	if (kvm_pmu_counter_can_chain(pmc))
+@@ -522,14 +999,37 @@ static void kvm_pmu_perf_overflow(struct perf_event *perf_event,
+ 					  ARMV8_PMUV3_PERFCTR_CHAIN);
+ 
+ 	if (kvm_pmu_overflow_status(vcpu)) {
++		/*
++		 * 在以下使用KVM_REQ_IRQ_PENDING:
++		 *   - arch/arm64/kvm/arm.c|1009| <<check_vcpu_requests>> kvm_check_request(KVM_REQ_IRQ_PENDING, vcpu);
++		 *   - arch/arm64/kvm/arm.c|1348| <<vcpu_interrupt_line>> kvm_make_request(KVM_REQ_IRQ_PENDING, vcpu);
++		 *   - arch/arm64/kvm/pmu-emul.c|865| <<kvm_pmu_perf_overflow>> kvm_make_request(KVM_REQ_IRQ_PENDING, vcpu);
++		 *   - arch/arm64/kvm/vgic/vgic-v4.c|102| <<vgic_v4_doorbell_handler>> kvm_make_request(KVM_REQ_IRQ_PENDING, vcpu);
++		 *   - arch/arm64/kvm/vgic/vgic.c|351| <<vgic_queue_irq_unlock>> kvm_make_request(KVM_REQ_IRQ_PENDING, vcpu);
++		 *   - arch/arm64/kvm/vgic/vgic.c|401| <<vgic_queue_irq_unlock>> kvm_make_request(KVM_REQ_IRQ_PENDING, vcpu);
++		 *   - arch/arm64/kvm/vgic/vgic.c|717| <<vgic_prune_ap_list>> kvm_make_request(KVM_REQ_IRQ_PENDING, target_vcpu);
++		 *   - arch/arm64/kvm/vgic/vgic.c|998| <<vgic_kick_vcpus>> kvm_make_request(KVM_REQ_IRQ_PENDING, vcpu);
++		 */
+ 		kvm_make_request(KVM_REQ_IRQ_PENDING, vcpu);
+ 
++		/*
++		 * 在以下使用kvm_pmu->overflow_work:
++		 *   - arch/arm64/kvm/pmu-emul.c|453| <<kvm_pmu_vcpu_destroy>> irq_work_sync(&vcpu->arch.pmu.overflow_work);
++		 *   - arch/arm64/kvm/pmu-emul.c|619| <<kvm_pmu_perf_overflow_notify_vcpu>> vcpu = container_of(work, struct kvm_vcpu, arch.pmu.overflow_work);
++		 *   - arch/arm64/kvm/pmu-emul.c|718| <<kvm_pmu_perf_overflow>> irq_work_queue(&vcpu->arch.pmu.overflow_work);
++		 *   - arch/arm64/kvm/pmu-emul.c|1092| <<kvm_arm_pmu_v3_init>> init_irq_work(&vcpu->arch.pmu.overflow_work, kvm_pmu_perf_overflow_notify_vcpu);
++		 */
+ 		if (!in_nmi())
+ 			kvm_vcpu_kick(vcpu);
+ 		else
+ 			irq_work_queue(&vcpu->arch.pmu.overflow_work);
+ 	}
+ 
++	/*
++	 * #define PERF_EF_START   0x01            // start the counter when adding
++	 * #define PERF_EF_RELOAD  0x02            // reload the counter when starting
++	 * #define PERF_EF_UPDATE  0x04            // update the counter when stopping 
++	 */
+ 	cpu_pmu->pmu.start(perf_event, PERF_EF_RELOAD);
+ }
+ 
+@@ -538,8 +1038,18 @@ static void kvm_pmu_perf_overflow(struct perf_event *perf_event,
+  * @vcpu: The vcpu pointer
+  * @val: the value guest writes to PMSWINC register
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/sys_regs.c|1261| <<access_pmswinc>> kvm_pmu_software_increment(vcpu, p->regval & mask);
++ */
+ void kvm_pmu_software_increment(struct kvm_vcpu *vcpu, u64 val)
+ {
++	/*
++	 * called by:
++	 *   - arch/arm64/kvm/pmu-emul.c|711| <<kvm_pmu_counter_increment>> kvm_pmu_counter_increment(vcpu, BIT(i + 1), ARMV8_PMUV3_PERFCTR_CHAIN);
++	 *   - arch/arm64/kvm/pmu-emul.c|757| <<kvm_pmu_perf_overflow>> kvm_pmu_counter_increment(vcpu, BIT(idx + 1), ARMV8_PMUV3_PERFCTR_CHAIN);
++	 *   - arch/arm64/kvm/pmu-emul.c|779| <<kvm_pmu_software_increment>> kvm_pmu_counter_increment(vcpu, val, ARMV8_PMUV3_PERFCTR_SW_INCR);
++	 */
+ 	kvm_pmu_counter_increment(vcpu, val, ARMV8_PMUV3_PERFCTR_SW_INCR);
+ }
+ 
+@@ -548,6 +1058,20 @@ void kvm_pmu_software_increment(struct kvm_vcpu *vcpu, u64 val)
+  * @vcpu: The vcpu pointer
+  * @val: the value guest writes to PMCR register
+  */
++/*
++ * PMCR寄存器:
++ * PMCR_EL0, Performance Monitors Control Register
++ *
++ * Provides details of the Performance Monitors implementation, including the
++ * number of counters implemented, and configures and controls the counters.
++ *
++ * 比方N是[15:11]: Indicates the number of event counters implemented. Reads of
++ * this field from EL1 and EL0 return the value of AArch64-MDCR_EL2.HPMN.
++ *
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|809| <<kvm_vcpu_reload_pmu>> kvm_pmu_handle_pmcr(vcpu, kvm_vcpu_read_pmcr(vcpu));
++ *   - arch/arm64/kvm/sys_regs.c|966| <<access_pmcr>> kvm_pmu_handle_pmcr(vcpu, val);
++ */
+ void kvm_pmu_handle_pmcr(struct kvm_vcpu *vcpu, u64 val)
+ {
+ 	int i;
+@@ -562,7 +1086,31 @@ void kvm_pmu_handle_pmcr(struct kvm_vcpu *vcpu, u64 val)
+ 	/* The reset bits don't indicate any state, and shouldn't be saved. */
+ 	__vcpu_sys_reg(vcpu, PMCR_EL0) = val & ~(ARMV8_PMU_PMCR_C | ARMV8_PMU_PMCR_P);
+ 
++	/*
++	 * 207 //
++	 * 208 // Per-CPU PMCR: config reg
++	 * 209  //
++	 * 210 #define ARMV8_PMU_PMCR_E        (1 << 0) // Enable all counters
++	 * 211 #define ARMV8_PMU_PMCR_P        (1 << 1) // Reset all counters
++	 * 212 #define ARMV8_PMU_PMCR_C        (1 << 2) // Cycle counter reset
++	 * 213 #define ARMV8_PMU_PMCR_D        (1 << 3) // CCNT counts every 64th cpu cycle
++	 * 214 #define ARMV8_PMU_PMCR_X        (1 << 4) // Export to ETM
++	 * 215 #define ARMV8_PMU_PMCR_DP       (1 << 5) // Disable CCNT if non-invasive debug
++	 * 216 #define ARMV8_PMU_PMCR_LC       (1 << 6) // Overflow on 64 bit cycle counter
++	 * 217 #define ARMV8_PMU_PMCR_LP       (1 << 7) // Long event counter enable
++	 * 218 #define ARMV8_PMU_PMCR_N        GENMASK(15, 11) // Number of counters supported
++	 */
+ 	if (val & ARMV8_PMU_PMCR_E) {
++		/*
++		 * PMCNTENSET_EL0寄存器:
++		 * PMCNTENSET_EL0, Performance Monitors Count Enable Set Register
++		 *
++		 * Enables the Cycle Count Register, AArch64-PMCCNTR_EL0, and any
++		 * implemented event counters AArch64-PMEVCNTR<n>_EL0. Reading this
++		 * register shows which counters are enabled.
++		 *
++		 * 可读可写, 激活对应的counter
++		 */
+ 		kvm_pmu_enable_counter_mask(vcpu,
+ 		       __vcpu_sys_reg(vcpu, PMCNTENSET_EL0));
+ 	} else {
+@@ -570,6 +1118,9 @@ void kvm_pmu_handle_pmcr(struct kvm_vcpu *vcpu, u64 val)
+ 		       __vcpu_sys_reg(vcpu, PMCNTENSET_EL0));
+ 	}
+ 
++	/*
++	 * #define ARMV8_PMU_CYCLE_IDX             (ARMV8_PMU_MAX_COUNTERS - 1)
++	 */
+ 	if (val & ARMV8_PMU_PMCR_C)
+ 		kvm_pmu_set_counter_value(vcpu, ARMV8_PMU_CYCLE_IDX, 0);
+ 
+@@ -582,9 +1133,20 @@ void kvm_pmu_handle_pmcr(struct kvm_vcpu *vcpu, u64 val)
+ 	kvm_vcpu_pmu_restore_guest(vcpu);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|1090| <<kvm_pmu_create_perf_event>> attr.disabled = !kvm_pmu_counter_is_enabled(pmc);
++ */
+ static bool kvm_pmu_counter_is_enabled(struct kvm_pmc *pmc)
+ {
+ 	struct kvm_vcpu *vcpu = kvm_pmc_to_vcpu(pmc);
++	/*
++	 * PMCNTENSET_EL0, // Count Enable Set Register
++	 *
++	 * 0-30位表示对应的counter是否激活
++	 *
++	 * bit=31是给cycles用的(PMCCNTR_EL0)
++	 */
+ 	return (kvm_vcpu_read_pmcr(vcpu) & ARMV8_PMU_PMCR_E) &&
+ 	       (__vcpu_sys_reg(vcpu, PMCNTENSET_EL0) & BIT(pmc->idx));
+ }
+@@ -593,6 +1155,12 @@ static bool kvm_pmu_counter_is_enabled(struct kvm_pmc *pmc)
+  * kvm_pmu_create_perf_event - create a perf event for a counter
+  * @pmc: Counter context
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|173| <<kvm_pmu_set_pmc_value>> kvm_pmu_create_perf_event(pmc);
++ *   - arch/arm64/kvm/pmu-emul.c|303| <<kvm_pmu_enable_counter_mask>> kvm_pmu_create_perf_event(pmc);
++ *   - arch/arm64/kvm/pmu-emul.c|690| <<kvm_pmu_set_counter_event_type>> kvm_pmu_create_perf_event(pmc);
++ */
+ static void kvm_pmu_create_perf_event(struct kvm_pmc *pmc)
+ {
+ 	struct kvm_vcpu *vcpu = kvm_pmc_to_vcpu(pmc);
+@@ -605,6 +1173,11 @@ static void kvm_pmu_create_perf_event(struct kvm_pmc *pmc)
+ 	reg = counter_index_to_evtreg(pmc->idx);
+ 	data = __vcpu_sys_reg(vcpu, reg);
+ 
++	/*
++	 * called by:
++	 *   - arch/arm64/kvm/pmu-emul.c|439| <<kvm_pmu_vcpu_reset>> kvm_pmu_stop_counter(kvm_vcpu_idx_to_pmc(vcpu, i));
++	 *   - arch/arm64/kvm/pmu-emul.c|825| <<kvm_pmu_create_perf_event>> kvm_pmu_stop_counter(pmc);
++	 */
+ 	kvm_pmu_stop_counter(pmc);
+ 	if (pmc->idx == ARMV8_PMU_CYCLE_IDX)
+ 		eventsel = ARMV8_PMUV3_PERFCTR_CPU_CYCLES;
+@@ -619,6 +1192,21 @@ static void kvm_pmu_create_perf_event(struct kvm_pmc *pmc)
+ 	    eventsel == ARMV8_PMUV3_PERFCTR_CHAIN)
+ 		return;
+ 
++	/*
++	 * 在以下使用kvm_arch->pmu_filter:
++	 *   - arch/arm64/kvm/arm.c|256| <<kvm_arch_destroy_vm>> bitmap_free(kvm->arch.pmu_filter);
++	 *   - arch/arm64/kvm/pmu-emul.c|1094| <<kvm_pmu_create_perf_event>> if (vcpu->kvm->arch.pmu_filter && !test_bit(eventsel, vcpu->kvm->arch.pmu_filter))
++	 *   - arch/arm64/kvm/pmu-emul.c|1095| <<kvm_pmu_create_perf_event>> !test_bit(eventsel, vcpu->kvm->arch.pmu_filter))
++	 *   - arch/arm64/kvm/pmu-emul.c|1234| <<kvm_pmu_get_pmceid>> unsigned long *bmap = vcpu->kvm->arch.pmu_filter;
++	 *   - arch/arm64/kvm/pmu-emul.c|1443| <<kvm_arm_pmu_v3_set_pmu>> (kvm->arch.pmu_filter && kvm->arch.arm_pmu != arm_pmu)) {
++	 *   - arch/arm64/kvm/pmu-emul.c|1522| <<kvm_arm_pmu_v3_set_attr>> if (!kvm->arch.pmu_filter) {
++	 *   - arch/arm64/kvm/pmu-emul.c|1523| <<kvm_arm_pmu_v3_set_attr>> kvm->arch.pmu_filter = bitmap_alloc(nr_events, GFP_KERNEL_ACCOUNT);
++	 *   - arch/arm64/kvm/pmu-emul.c|1524| <<kvm_arm_pmu_v3_set_attr>> if (!kvm->arch.pmu_filter)
++	 *   - arch/arm64/kvm/pmu-emul.c|1534| <<kvm_arm_pmu_v3_set_attr>> bitmap_zero(kvm->arch.pmu_filter, nr_events);
++	 *   - arch/arm64/kvm/pmu-emul.c|1536| <<kvm_arm_pmu_v3_set_attr>> bitmap_fill(kvm->arch.pmu_filter, nr_events);
++	 *   - arch/arm64/kvm/pmu-emul.c|1540| <<kvm_arm_pmu_v3_set_attr>> bitmap_set(kvm->arch.pmu_filter, filter.base_event, filter.nevents);
++	 *   - arch/arm64/kvm/pmu-emul.c|1542| <<kvm_arm_pmu_v3_set_attr>> bitmap_clear(kvm->arch.pmu_filter, filter.base_event, filter.nevents);
++	 */
+ 	/*
+ 	 * If we have a filter in place and that the event isn't allowed, do
+ 	 * not install a perf event either.
+@@ -653,6 +1241,22 @@ static void kvm_pmu_create_perf_event(struct kvm_pmc *pmc)
+ 
+ 	attr.sample_period = compute_period(pmc, kvm_pmu_get_pmc_value(pmc));
+ 
++	/*
++	 * called by:
++	 *   - arch/arm64/kvm/pmu-emul.c|1124| <<kvm_pmu_create_perf_event>> event = perf_event_create_kernel_counter(&attr, -1, current, kvm_pmu_perf_overflow, pmc);
++	 *   - arch/riscv/kvm/vcpu_pmu.c|328| <<kvm_pmu_create_perf_event>> event = perf_event_create_kernel_counter(attr, -1, current, kvm_riscv_pmu_overflow, pmc);
++	 *   - arch/x86/kernel/cpu/resctrl/pseudo_lock.c|969| <<measure_residency_fn>> miss_event = perf_event_create_kernel_counter(miss_attr, plr->cpu, NULL, NULL, NULL);
++	 *   - arch/x86/kernel/cpu/resctrl/pseudo_lock.c|974| <<measure_residency_fn>> hit_event = perf_event_create_kernel_counter(hit_attr, plr->cpu, NULL, NULL, NULL);
++	 *   - arch/x86/kvm/pmu.c|215| <<pmc_reprogram_counter>> event = perf_event_create_kernel_counter(&attr, -1, current, kvm_perf_overflow, pmc);
++	 *   - arch/x86/kvm/vmx/pmu_intel.c|243| <<intel_pmu_create_guest_lbr_event>> event = perf_event_create_kernel_counter(&attr, -1, current, NULL, NULL);
++	 *   - kernel/events/hw_breakpoint.c|746| <<register_user_hw_breakpoint>> return perf_event_create_kernel_counter(attr, -1, tsk, triggered, context);
++	 *   - kernel/events/hw_breakpoint.c|856| <<register_wide_hw_breakpoint>> bp = perf_event_create_kernel_counter(attr, cpu, NULL, triggered, context);
++	 *   - kernel/events/hw_breakpoint_test.c|42| <<register_test_bp>> return perf_event_create_kernel_counter(&attr, cpu, tsk, NULL, NULL);
++	 *   - kernel/watchdog_perf.c|135| <<hardlockup_detector_event_create>> evt = perf_event_create_kernel_counter(wd_attr, cpu, NULL, watchdog_overflow_callback, NULL);
++	 *   - kernel/watchdog_perf.c|140| <<hardlockup_detector_event_create>> evt = perf_event_create_kernel_counter(wd_attr, cpu, NULL, watchdog_overflow_callback, NULL);
++	 *
++	 * arm64唯一调用的地方
++	 */
+ 	event = perf_event_create_kernel_counter(&attr, -1, current,
+ 						 kvm_pmu_perf_overflow, pmc);
+ 
+@@ -675,6 +1279,10 @@ static void kvm_pmu_create_perf_event(struct kvm_pmc *pmc)
+  * event with given hardware event number. Here we call perf_event API to
+  * emulate this action and create a kernel perf event for it.
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/sys_regs.c|1124| <<access_pmu_evtyper>> kvm_pmu_set_counter_event_type(vcpu, p->regval, idx);
++ */
+ void kvm_pmu_set_counter_event_type(struct kvm_vcpu *vcpu, u64 data,
+ 				    u64 select_idx)
+ {
+@@ -687,9 +1295,19 @@ void kvm_pmu_set_counter_event_type(struct kvm_vcpu *vcpu, u64 data,
+ 	reg = counter_index_to_evtreg(pmc->idx);
+ 	__vcpu_sys_reg(vcpu, reg) = data & kvm_pmu_evtyper_mask(vcpu->kvm);
+ 
++	/*
++	 * called by:
++	 *   - arch/arm64/kvm/pmu-emul.c|173| <<kvm_pmu_set_pmc_value>> kvm_pmu_create_perf_event(pmc);
++	 *   - arch/arm64/kvm/pmu-emul.c|303| <<kvm_pmu_enable_counter_mask>> kvm_pmu_create_perf_event(pmc);
++	 *   - arch/arm64/kvm/pmu-emul.c|690| <<kvm_pmu_set_counter_event_type>> kvm_pmu_create_perf_event(pmc);
++	 */
+ 	kvm_pmu_create_perf_event(pmc);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/perf/arm_pmu.c|931| <<armpmu_register>> kvm_host_pmu_init(pmu);
++ */
+ void kvm_host_pmu_init(struct arm_pmu *pmu)
+ {
+ 	struct arm_pmu_entry *entry;
+@@ -708,6 +1326,14 @@ void kvm_host_pmu_init(struct arm_pmu *pmu)
+ 		goto out_unlock;
+ 
+ 	entry->arm_pmu = pmu;
++	/*
++	 * 在以下使用LIST_HEAD(arm_pmus):
++	 *   - arch/arm64/kvm/pmu-emul.c|22| <<global>> static LIST_HEAD(arm_pmus);
++	 *   - arch/arm64/kvm/pmu-emul.c|711| <<kvm_host_pmu_init>> list_add_tail(&entry->entry, &arm_pmus);
++	 *   - arch/arm64/kvm/pmu-emul.c|713| <<kvm_host_pmu_init>> if (list_is_singular(&arm_pmus))
++	 *   - arch/arm64/kvm/pmu-emul.c|746| <<kvm_pmu_probe_armpmu>> list_for_each_entry(entry, &arm_pmus, entry) {
++	 *   - arch/arm64/kvm/pmu-emul.c|960| <<kvm_arm_pmu_v3_set_pmu>> list_for_each_entry(entry, &arm_pmus, entry) {
++	 */
+ 	list_add_tail(&entry->entry, &arm_pmus);
+ 
+ 	if (list_is_singular(&arm_pmus))
+@@ -717,6 +1343,10 @@ void kvm_host_pmu_init(struct arm_pmu *pmu)
+ 	mutex_unlock(&arm_pmus_lock);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|1450| <<kvm_arm_set_default_pmu>> struct arm_pmu *arm_pmu = kvm_pmu_probe_armpmu();
++ */
+ static struct arm_pmu *kvm_pmu_probe_armpmu(void)
+ {
+ 	struct arm_pmu *tmp, *pmu = NULL;
+@@ -743,6 +1373,14 @@ static struct arm_pmu *kvm_pmu_probe_armpmu(void)
+ 	 * carried here.
+ 	 */
+ 	cpu = raw_smp_processor_id();
++	/*
++	 * 在以下使用LIST_HEAD(arm_pmus):
++	 *   - arch/arm64/kvm/pmu-emul.c|22| <<global>> static LIST_HEAD(arm_pmus);
++	 *   - arch/arm64/kvm/pmu-emul.c|711| <<kvm_host_pmu_init>> list_add_tail(&entry->entry, &arm_pmus);
++	 *   - arch/arm64/kvm/pmu-emul.c|713| <<kvm_host_pmu_init>> if (list_is_singular(&arm_pmus))
++	 *   - arch/arm64/kvm/pmu-emul.c|746| <<kvm_pmu_probe_armpmu>> list_for_each_entry(entry, &arm_pmus, entry) {
++	 *   - arch/arm64/kvm/pmu-emul.c|960| <<kvm_arm_pmu_v3_set_pmu>> list_for_each_entry(entry, &arm_pmus, entry) {
++	 */
+ 	list_for_each_entry(entry, &arm_pmus, entry) {
+ 		tmp = entry->arm_pmu;
+ 
+@@ -757,6 +1395,24 @@ static struct arm_pmu *kvm_pmu_probe_armpmu(void)
+ 	return pmu;
+ }
+ 
++/*
++ * PMCEID1_EL0, Performance Monitors Common Event Identification register 1
++ *
++ * Defines which Common architectural events and Common microarchitectural
++ * events are implemented, or counted, using PMU events in the ranges 0x0020 to
++ * 0x003F and 0x4020 to 0x403F.
++ *
++ * 比如:
++ * ID0 corresponds to common event (0x20) L2D_CACHE_ALLOCATE
++ * ID1 corresponds to common event (0x21) BR_RETIRED
++ * ... ...
++ * ID12 corresponds to common event (0x2c) Reserved
++ * ... ...
++ * ID31 corresponds to common event (0x3f) STALL_SLOT
++ *
++ * called by:
++ *   - arch/arm64/kvm/sys_regs.c|1005| <<access_pmceid>> pmceid = kvm_pmu_get_pmceid(vcpu, (p->Op2 & 1));
++ */
+ u64 kvm_pmu_get_pmceid(struct kvm_vcpu *vcpu, bool pmceid1)
+ {
+ 	unsigned long *bmap = vcpu->kvm->arch.pmu_filter;
+@@ -802,22 +1458,72 @@ u64 kvm_pmu_get_pmceid(struct kvm_vcpu *vcpu, bool pmceid1)
+ 	return val & mask;
+ }
+ 
++/*
++ * 在以下使用KVM_REQ_RELOAD_PMU:
++ *   - arch/arm64/kvm/arm.c|1022| <<check_vcpu_requests>> if (kvm_check_request(KVM_REQ_RELOAD_PMU, vcpu)) kvm_vcpu_reload_pmu(vcpu);
++ *   - arch/arm64/kvm/pmu-emul.c|1413| <<kvm_arm_pmu_v3_enable>> kvm_make_request(KVM_REQ_RELOAD_PMU, vcpu);
++ *
++ * called by:
++ *   - arch/arm64/kvm/arm.c|1023| <<check_vcpu_requests>> if (kvm_check_request(KVM_REQ_RELOAD_PMU, vcpu)) kvm_vcpu_reload_pmu(vcpu);
++ */
+ void kvm_vcpu_reload_pmu(struct kvm_vcpu *vcpu)
+ {
+ 	u64 mask = kvm_pmu_valid_counter_mask(vcpu);
+ 
+ 	kvm_pmu_handle_pmcr(vcpu, kvm_vcpu_read_pmcr(vcpu));
+ 
++	/*
++	 * PMOVSSET_EL0寄存器:
++	 * PMOVSSET_EL0, Performance Monitors Overflow Flag Status Set Register
++	 *
++	 * Sets the state of the overflow bit for the Cycle Count Register,
++	 * AArch64-PMCCNTR_EL0, and each of the implemented event counters
++	 * AArch64-PMEVCNTR<n>_EL0.
++	 *
++	 * 可写可读, 每个bit表示一个event的overflow status
++	 *
++	 * -----------
++	 *
++	 * PMINTENSET_EL1寄存器:
++	 * PMINTENSET_EL1, Performance Monitors Interrupt Enable Set Register
++	 *
++	 * Enables the generation of interrupt requests on overflows from the
++	 * cycle counter, AArch64-PMCCNTR_EL0, and the event counters
++	 * AArch64-PMEVCNTR<n>_EL0. Reading the register shows which overflow
++	 * interrupt requests are enabled.
++	 *
++	 * 可读可写, 每个bit表示一个event overflow的时候中断吗
++	 *
++	 * -----------
++	 *
++	 * PMCNTENSET_EL0寄存器:
++	 * PMCNTENSET_EL0, Performance Monitors Count Enable Set Register
++	 *
++	 * Enables the Cycle Count Register, AArch64-PMCCNTR_EL0, and any
++	 * implemented event counters AArch64-PMEVCNTR<n>_EL0. Reading this
++	 * register shows which counters are enabled.
++	 *
++	 * 可读可写, 激活对应的counter
++	 */
+ 	__vcpu_sys_reg(vcpu, PMOVSSET_EL0) &= mask;
+ 	__vcpu_sys_reg(vcpu, PMINTENSET_EL1) &= mask;
+ 	__vcpu_sys_reg(vcpu, PMCNTENSET_EL0) &= mask;
+ }
+ 
++/*
++ * arch/arm64/kvm/arm.c|840| <<kvm_arch_vcpu_run_pid_change>> ret = kvm_arm_pmu_v3_enable(vcpu);
++ */
+ int kvm_arm_pmu_v3_enable(struct kvm_vcpu *vcpu)
+ {
+ 	if (!kvm_vcpu_has_pmu(vcpu))
+ 		return 0;
+ 
++	/*
++	 * 在以下使用kvm_pmu->created:
++	 *   - arch/arm64/kvm/pmu-emul.c|1503| <<kvm_arm_pmu_v3_enable>> if (!vcpu->arch.pmu.created) return -EINVAL;
++	 *   - arch/arm64/kvm/pmu-emul.c|1568| <<kvm_arm_pmu_v3_init>> vcpu->arch.pmu.created = true;
++	 *   - arch/arm64/kvm/pmu-emul.c|1709| <<kvm_arm_pmu_v3_set_attr>> if (vcpu->arch.pmu.created) return -EBUSY;
++	 */
+ 	if (!vcpu->arch.pmu.created)
+ 		return -EINVAL;
+ 
+@@ -827,6 +1533,16 @@ int kvm_arm_pmu_v3_enable(struct kvm_vcpu *vcpu)
+ 	 * irqchip, or to not have an in-kernel GIC and not set an IRQ.
+ 	 */
+ 	if (irqchip_in_kernel(vcpu->kvm)) {
++		/*
++		 * 在以下使用kvm_pmu->irq_num:
++		 *   - arch/arm64/kvm/pmu-emul.c|720| <<kvm_pmu_update_state>> int ret = kvm_vgic_inject_irq(vcpu->kvm, vcpu, pmu->irq_num, overflow, pmu);
++		 *   - arch/arm64/kvm/pmu-emul.c|1518| <<kvm_arm_pmu_v3_enable>> int irq = vcpu->arch.pmu.irq_num;
++		 *   - arch/arm64/kvm/pmu-emul.c|1567| <<kvm_arm_pmu_v3_init>> ret = kvm_vgic_set_owner(vcpu, vcpu->arch.pmu.irq_num,
++		 *   - arch/arm64/kvm/pmu-emul.c|1608| <<pmu_irq_is_valid>> if (vcpu->arch.pmu.irq_num != irq)
++		 *   - arch/arm64/kvm/pmu-emul.c|1611| <<pmu_irq_is_valid>> if (vcpu->arch.pmu.irq_num == irq)
++		 *   - arch/arm64/kvm/pmu-emul.c|1761| <<kvm_arm_pmu_v3_set_attr>> vcpu->arch.pmu.irq_num = irq;
++		 *   - arch/arm64/kvm/pmu-emul.c|1846| <<kvm_arm_pmu_v3_get_attr>> irq = vcpu->arch.pmu.irq_num;
++		 */
+ 		int irq = vcpu->arch.pmu.irq_num;
+ 		/*
+ 		 * If we are using an in-kernel vgic, at this point we know
+@@ -840,12 +1556,21 @@ int kvm_arm_pmu_v3_enable(struct kvm_vcpu *vcpu)
+ 		   return -EINVAL;
+ 	}
+ 
++	/*
++	 * 在以下使用KVM_REQ_RELOAD_PMU:
++	 *   - arch/arm64/kvm/arm.c|1022| <<check_vcpu_requests>> if (kvm_check_request(KVM_REQ_RELOAD_PMU, vcpu)) kvm_vcpu_reload_pmu(vcpu);
++	 *   - arch/arm64/kvm/pmu-emul.c|1413| <<kvm_arm_pmu_v3_enable>> kvm_make_request(KVM_REQ_RELOAD_PMU, vcpu);
++	 */
+ 	/* One-off reload of the PMU on first run */
+ 	kvm_make_request(KVM_REQ_RELOAD_PMU, vcpu);
+ 
+ 	return 0;
+ }
+ 
++/*
++ * 处理KVM_ARM_VCPU_PMU_V3_SET_PMU:
++ *   - arch/arm64/kvm/pmu-emul.c|1797| <<kvm_arm_pmu_v3_set_attr(KVM_ARM_VCPU_PMU_V3_SET_PMU)>> return kvm_arm_pmu_v3_init(vcpu);
++ */
+ static int kvm_arm_pmu_v3_init(struct kvm_vcpu *vcpu)
+ {
+ 	if (irqchip_in_kernel(vcpu->kvm)) {
+@@ -862,15 +1587,42 @@ static int kvm_arm_pmu_v3_init(struct kvm_vcpu *vcpu)
+ 		if (!kvm_arm_pmu_irq_initialized(vcpu))
+ 			return -ENXIO;
+ 
++		/*
++		 * 在以下使用kvm_pmu->irq_num:
++		 *   - arch/arm64/kvm/pmu-emul.c|720| <<kvm_pmu_update_state>> int ret = kvm_vgic_inject_irq(vcpu->kvm, vcpu, pmu->irq_num, overflow, pmu);
++		 *   - arch/arm64/kvm/pmu-emul.c|1518| <<kvm_arm_pmu_v3_enable>> int irq = vcpu->arch.pmu.irq_num;
++		 *   - arch/arm64/kvm/pmu-emul.c|1567| <<kvm_arm_pmu_v3_init>> ret = kvm_vgic_set_owner(vcpu, vcpu->arch.pmu.irq_num,
++		 *   - arch/arm64/kvm/pmu-emul.c|1608| <<pmu_irq_is_valid>> if (vcpu->arch.pmu.irq_num != irq)
++		 *   - arch/arm64/kvm/pmu-emul.c|1611| <<pmu_irq_is_valid>> if (vcpu->arch.pmu.irq_num == irq)
++		 *   - arch/arm64/kvm/pmu-emul.c|1761| <<kvm_arm_pmu_v3_set_attr>> vcpu->arch.pmu.irq_num = irq;
++		 *   - arch/arm64/kvm/pmu-emul.c|1846| <<kvm_arm_pmu_v3_get_attr>> irq = vcpu->arch.pmu.irq_num;
++		 *
++		 * called by:
++		 *   - arch/arm64/kvm/arch_timer.c|1465| <<timer_irqs_are_valid>> if (kvm_vgic_set_owner(vcpu, irq, ctx))
++		 *   - arch/arm64/kvm/pmu-emul.c|1552| <<kvm_arm_pmu_v3_init>> ret = kvm_vgic_set_owner(vcpu, vcpu->arch.pmu.irq_num, &vcpu->arch.pmu);
++		 */
+ 		ret = kvm_vgic_set_owner(vcpu, vcpu->arch.pmu.irq_num,
+ 					 &vcpu->arch.pmu);
+ 		if (ret)
+ 			return ret;
+ 	}
+ 
++	/*
++	 * 在以下使用kvm_pmu->overflow_work:
++	 *   - arch/arm64/kvm/pmu-emul.c|453| <<kvm_pmu_vcpu_destroy>> irq_work_sync(&vcpu->arch.pmu.overflow_work);
++	 *   - arch/arm64/kvm/pmu-emul.c|619| <<kvm_pmu_perf_overflow_notify_vcpu>> vcpu = container_of(work, struct kvm_vcpu, arch.pmu.overflow_work);
++	 *   - arch/arm64/kvm/pmu-emul.c|718| <<kvm_pmu_perf_overflow>> irq_work_queue(&vcpu->arch.pmu.overflow_work);
++	 *   - arch/arm64/kvm/pmu-emul.c|1092| <<kvm_arm_pmu_v3_init>> init_irq_work(&vcpu->arch.pmu.overflow_work, kvm_pmu_perf_overflow_notify_vcpu);
++	 */
+ 	init_irq_work(&vcpu->arch.pmu.overflow_work,
+ 		      kvm_pmu_perf_overflow_notify_vcpu);
+ 
++	/*
++	 * 在以下使用kvm_pmu->created:
++	 *   - arch/arm64/kvm/pmu-emul.c|1503| <<kvm_arm_pmu_v3_enable>> if (!vcpu->arch.pmu.created) return -EINVAL;
++	 *   - arch/arm64/kvm/pmu-emul.c|1568| <<kvm_arm_pmu_v3_init>> vcpu->arch.pmu.created = true;
++	 *   - arch/arm64/kvm/pmu-emul.c|1709| <<kvm_arm_pmu_v3_set_attr>> if (vcpu->arch.pmu.created) return -EBUSY;
++	 */
+ 	vcpu->arch.pmu.created = true;
+ 	return 0;
+ }
+@@ -880,6 +1632,10 @@ static int kvm_arm_pmu_v3_init(struct kvm_vcpu *vcpu)
+  * As a PPI, the interrupt number is the same for all vcpus,
+  * while as an SPI it must be a separate number per vcpu.
+  */
++/*
++ * 处理KVM_ARM_VCPU_PMU_V3_IRQ:
++ *   - arch/arm64/kvm/pmu-emul.c|1798| <<kvm_arm_pmu_v3_set_attr(KVM_ARM_VCPU_PMU_V3_IRQ)>> if (!pmu_irq_is_valid(kvm, irq))
++ */
+ static bool pmu_irq_is_valid(struct kvm *kvm, int irq)
+ {
+ 	unsigned long i;
+@@ -889,6 +1645,16 @@ static bool pmu_irq_is_valid(struct kvm *kvm, int irq)
+ 		if (!kvm_arm_pmu_irq_initialized(vcpu))
+ 			continue;
+ 
++		/*
++		 * 在以下使用kvm_pmu->irq_num:
++		 *   - arch/arm64/kvm/pmu-emul.c|720| <<kvm_pmu_update_state>> int ret = kvm_vgic_inject_irq(vcpu->kvm, vcpu, pmu->irq_num, overflow, pmu);
++		 *   - arch/arm64/kvm/pmu-emul.c|1518| <<kvm_arm_pmu_v3_enable>> int irq = vcpu->arch.pmu.irq_num;
++		 *   - arch/arm64/kvm/pmu-emul.c|1567| <<kvm_arm_pmu_v3_init>> ret = kvm_vgic_set_owner(vcpu, vcpu->arch.pmu.irq_num,
++		 *   - arch/arm64/kvm/pmu-emul.c|1608| <<pmu_irq_is_valid>> if (vcpu->arch.pmu.irq_num != irq)
++		 *   - arch/arm64/kvm/pmu-emul.c|1611| <<pmu_irq_is_valid>> if (vcpu->arch.pmu.irq_num == irq)
++		 *   - arch/arm64/kvm/pmu-emul.c|1761| <<kvm_arm_pmu_v3_set_attr>> vcpu->arch.pmu.irq_num = irq;
++		 *   - arch/arm64/kvm/pmu-emul.c|1846| <<kvm_arm_pmu_v3_get_attr>> irq = vcpu->arch.pmu.irq_num;
++		 */
+ 		if (irq_is_ppi(irq)) {
+ 			if (vcpu->arch.pmu.irq_num != irq)
+ 				return false;
+@@ -905,6 +1671,11 @@ static bool pmu_irq_is_valid(struct kvm *kvm, int irq)
+  * kvm_arm_pmu_get_max_counters - Return the max number of PMU counters.
+  * @kvm: The kvm pointer
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|1682| <<kvm_arm_set_pmu>> kvm->arch.pmcr_n = kvm_arm_pmu_get_max_counters(kvm);
++ *   - arch/arm64/kvm/sys_regs.c|1320| <<set_pmcr>> if (!kvm_vm_has_ran_once(kvm) && new_n <= kvm_arm_pmu_get_max_counters(kvm))
++ */
+ u8 kvm_arm_pmu_get_max_counters(struct kvm *kvm)
+ {
+ 	struct arm_pmu *arm_pmu = kvm->arch.arm_pmu;
+@@ -916,11 +1687,32 @@ u8 kvm_arm_pmu_get_max_counters(struct kvm *kvm)
+ 	return arm_pmu->num_events - 1;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|1526| <<kvm_arm_set_default_pmu>> kvm_arm_set_pmu(kvm, arm_pmu);
++ *   - arch/arm64/kvm/pmu-emul.c|1549| <<kvm_arm_pmu_v3_set_pmu>> kvm_arm_set_pmu(kvm, arm_pmu);
++ */
+ static void kvm_arm_set_pmu(struct kvm *kvm, struct arm_pmu *arm_pmu)
+ {
+ 	lockdep_assert_held(&kvm->arch.config_lock);
+ 
+ 	kvm->arch.arm_pmu = arm_pmu;
++	/*
++	 * PMCR寄存器:
++	 * PMCR_EL0, Performance Monitors Control Register
++	 *
++	 * Provides details of the Performance Monitors implementation, including the
++	 * number of counters implemented, and configures and controls the counters.
++	 *
++	 * 比方N是[15:11]: Indicates the number of event counters implemented. Reads of
++	 * this field from EL1 and EL0 return the value of AArch64-MDCR_EL2.HPMN.
++	 *
++	 * 在以下使用kvm_arch->pmcr_n:
++	 *   - arch/arm64/kvm/pmu-emul.c|1682| <<kvm_arm_set_pmu>> kvm->arch.pmcr_n = kvm_arm_pmu_get_max_counters(kvm);
++	 *   - arch/arm64/kvm/pmu-emul.c|1969| <<kvm_vcpu_read_pmcr>> return u64_replace_bits(pmcr, vcpu->kvm->arch.pmcr_n, ARMV8_PMU_PMCR_N);
++	 *   - arch/arm64/kvm/sys_regs.c|862| <<reset_pmu_reg>> u8 n = vcpu->kvm->arch.pmcr_n;
++	 *   - arch/arm64/kvm/sys_regs.c|1321| <<set_pmcr>> kvm->arch.pmcr_n = new_n;
++	 */
+ 	kvm->arch.pmcr_n = kvm_arm_pmu_get_max_counters(kvm);
+ }
+ 
+@@ -936,17 +1728,33 @@ static void kvm_arm_set_pmu(struct kvm *kvm, struct arm_pmu *arm_pmu)
+  * where vCPUs can be scheduled on any core but the guest
+  * counters could stop working.
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/arm.c|1489| <<kvm_setup_vcpu>> ret = kvm_arm_set_default_pmu(kvm);
++ */
+ int kvm_arm_set_default_pmu(struct kvm *kvm)
+ {
++	/*
++	 * 只在此处调用
++	 */
+ 	struct arm_pmu *arm_pmu = kvm_pmu_probe_armpmu();
+ 
+ 	if (!arm_pmu)
+ 		return -ENODEV;
+ 
++	/*
++	 * called by:
++	 *   - arch/arm64/kvm/pmu-emul.c|1526| <<kvm_arm_set_default_pmu>> kvm_arm_set_pmu(kvm, arm_pmu);
++	 *   - arch/arm64/kvm/pmu-emul.c|1549| <<kvm_arm_pmu_v3_set_pmu>> kvm_arm_set_pmu(kvm, arm_pmu);
++	 */
+ 	kvm_arm_set_pmu(kvm, arm_pmu);
+ 	return 0;
+ }
+ 
++/*
++ * 处理KVM_ARM_VCPU_PMU_V3_SET_PMU:
++ *   - arch/arm64/kvm/pmu-emul.c|1654| <<kvm_arm_pmu_v3_set_attr(KVM_ARM_VCPU_PMU_V3_SET_PMU)>> return kvm_arm_pmu_v3_set_pmu(vcpu, pmu_id);
++ */
+ static int kvm_arm_pmu_v3_set_pmu(struct kvm_vcpu *vcpu, int pmu_id)
+ {
+ 	struct kvm *kvm = vcpu->kvm;
+@@ -966,6 +1774,11 @@ static int kvm_arm_pmu_v3_set_pmu(struct kvm_vcpu *vcpu, int pmu_id)
+ 				break;
+ 			}
+ 
++			/*
++			 * called by:
++			 *   - arch/arm64/kvm/pmu-emul.c|1526| <<kvm_arm_set_default_pmu>> kvm_arm_set_pmu(kvm, arm_pmu);
++			 *   - arch/arm64/kvm/pmu-emul.c|1549| <<kvm_arm_pmu_v3_set_pmu>> kvm_arm_set_pmu(kvm, arm_pmu);
++			 */
+ 			kvm_arm_set_pmu(kvm, arm_pmu);
+ 			cpumask_copy(kvm->arch.supported_cpus, &arm_pmu->supported_cpus);
+ 			ret = 0;
+@@ -977,6 +1790,21 @@ static int kvm_arm_pmu_v3_set_pmu(struct kvm_vcpu *vcpu, int pmu_id)
+ 	return ret;
+ }
+ 
++/*
++ * #define   KVM_ARM_VCPU_PMU_V3_IRQ       0
++ * #define   KVM_ARM_VCPU_PMU_V3_INIT      1
++ * #define   KVM_ARM_VCPU_PMU_V3_FILTER    2 --> QEMU-9.1不使用
++ * #define   KVM_ARM_VCPU_PMU_V3_SET_PMU   3 --> QEMU-9.1不使用
++ *
++ * 处理KVM_ARM_VCPU_PMU_V3_CTRL:
++ *   - arch/arm64/kvm/guest.c|955| <<kvm_arm_vcpu_arch_set_attr>> ret = kvm_arm_pmu_v3_set_attr(vcpu, attr);
++ *
++ * kvm_arm_pmu_v3_set_attr()
++ * kvm_arm_vcpu_arch_set_attr(KVM_ARM_VCPU_PMU_V3_CTRL)
++ * kvm_arm_vcpu_set_attr()
++ * kvm_arch_vcpu_ioctl(KVM_SET_DEVICE_ATTR)
++ * kvm_vcpu_ioctl(default)
++ */
+ int kvm_arm_pmu_v3_set_attr(struct kvm_vcpu *vcpu, struct kvm_device_attr *attr)
+ {
+ 	struct kvm *kvm = vcpu->kvm;
+@@ -986,6 +1814,12 @@ int kvm_arm_pmu_v3_set_attr(struct kvm_vcpu *vcpu, struct kvm_device_attr *attr)
+ 	if (!kvm_vcpu_has_pmu(vcpu))
+ 		return -ENODEV;
+ 
++	/*
++	 * 在以下使用kvm_pmu->created:
++	 *   - arch/arm64/kvm/pmu-emul.c|1503| <<kvm_arm_pmu_v3_enable>> if (!vcpu->arch.pmu.created) return -EINVAL;
++	 *   - arch/arm64/kvm/pmu-emul.c|1568| <<kvm_arm_pmu_v3_init>> vcpu->arch.pmu.created = true;
++	 *   - arch/arm64/kvm/pmu-emul.c|1709| <<kvm_arm_pmu_v3_set_attr>> if (vcpu->arch.pmu.created) return -EBUSY;
++	 */
+ 	if (vcpu->arch.pmu.created)
+ 		return -EBUSY;
+ 
+@@ -1010,6 +1844,16 @@ int kvm_arm_pmu_v3_set_attr(struct kvm_vcpu *vcpu, struct kvm_device_attr *attr)
+ 		if (kvm_arm_pmu_irq_initialized(vcpu))
+ 			return -EBUSY;
+ 
++		/*
++		 * 在以下使用kvm_pmu->irq_num:
++		 *   - arch/arm64/kvm/pmu-emul.c|720| <<kvm_pmu_update_state>> int ret = kvm_vgic_inject_irq(vcpu->kvm, vcpu, pmu->irq_num, overflow, pmu);
++		 *   - arch/arm64/kvm/pmu-emul.c|1518| <<kvm_arm_pmu_v3_enable>> int irq = vcpu->arch.pmu.irq_num;
++		 *   - arch/arm64/kvm/pmu-emul.c|1567| <<kvm_arm_pmu_v3_init>> ret = kvm_vgic_set_owner(vcpu, vcpu->arch.pmu.irq_num,
++		 *   - arch/arm64/kvm/pmu-emul.c|1608| <<pmu_irq_is_valid>> if (vcpu->arch.pmu.irq_num != irq)
++		 *   - arch/arm64/kvm/pmu-emul.c|1611| <<pmu_irq_is_valid>> if (vcpu->arch.pmu.irq_num == irq)
++		 *   - arch/arm64/kvm/pmu-emul.c|1761| <<kvm_arm_pmu_v3_set_attr>> vcpu->arch.pmu.irq_num = irq;
++		 *   - arch/arm64/kvm/pmu-emul.c|1846| <<kvm_arm_pmu_v3_get_attr>> irq = vcpu->arch.pmu.irq_num;
++		 */
+ 		kvm_debug("Set kvm ARM PMU irq: %d\n", irq);
+ 		vcpu->arch.pmu.irq_num = irq;
+ 		return 0;
+@@ -1096,6 +1940,16 @@ int kvm_arm_pmu_v3_get_attr(struct kvm_vcpu *vcpu, struct kvm_device_attr *attr)
+ 		if (!kvm_arm_pmu_irq_initialized(vcpu))
+ 			return -ENXIO;
+ 
++		/*
++		 * 在以下使用kvm_pmu->irq_num:
++		 *   - arch/arm64/kvm/pmu-emul.c|720| <<kvm_pmu_update_state>> int ret = kvm_vgic_inject_irq(vcpu->kvm, vcpu, pmu->irq_num, overflow, pmu);
++		 *   - arch/arm64/kvm/pmu-emul.c|1518| <<kvm_arm_pmu_v3_enable>> int irq = vcpu->arch.pmu.irq_num;
++		 *   - arch/arm64/kvm/pmu-emul.c|1567| <<kvm_arm_pmu_v3_init>> ret = kvm_vgic_set_owner(vcpu, vcpu->arch.pmu.irq_num,
++		 *   - arch/arm64/kvm/pmu-emul.c|1608| <<pmu_irq_is_valid>> if (vcpu->arch.pmu.irq_num != irq)
++		 *   - arch/arm64/kvm/pmu-emul.c|1611| <<pmu_irq_is_valid>> if (vcpu->arch.pmu.irq_num == irq)
++		 *   - arch/arm64/kvm/pmu-emul.c|1761| <<kvm_arm_pmu_v3_set_attr>> vcpu->arch.pmu.irq_num = irq;
++		 *   - arch/arm64/kvm/pmu-emul.c|1846| <<kvm_arm_pmu_v3_get_attr>> irq = vcpu->arch.pmu.irq_num;
++		 */
+ 		irq = vcpu->arch.pmu.irq_num;
+ 		return put_user(irq, uaddr);
+ 	}
+@@ -1118,10 +1972,20 @@ int kvm_arm_pmu_v3_has_attr(struct kvm_vcpu *vcpu, struct kvm_device_attr *attr)
+ 	return -ENXIO;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|1319| <<kvm_host_pmu_init>> if (!pmuv3_implemented(kvm_arm_pmu_get_pmuver_limit()))
++ *   - arch/arm64/kvm/pmu-emul.c|1853| <<kvm_arm_pmu_v3_set_attr>> u8 pmuver = kvm_arm_pmu_get_pmuver_limit();
++ *   - arch/arm64/kvm/sys_regs.c|1784| <<read_sanitised_id_aa64dfr0_el1>> kvm_arm_pmu_get_pmuver_limit());
++ *   - arch/arm64/kvm/sys_regs.c|1829| <<read_sanitised_id_dfr0_el1>> u8 perfmon = pmuver_to_perfmon(kvm_arm_pmu_get_pmuver_limit());
++ */
+ u8 kvm_arm_pmu_get_pmuver_limit(void)
+ {
+ 	u64 tmp;
+ 
++	/*
++	 * PMUVer是[11:8]
++	 */
+ 	tmp = read_sanitised_ftr_reg(SYS_ID_AA64DFR0_EL1);
+ 	tmp = cpuid_feature_cap_perfmon_field(tmp,
+ 					      ID_AA64DFR0_EL1_PMUVer_SHIFT,
+@@ -1129,13 +1993,57 @@ u8 kvm_arm_pmu_get_pmuver_limit(void)
+ 	return FIELD_GET(ARM64_FEATURE_MASK(ID_AA64DFR0_EL1_PMUVer), tmp);
+ }
+ 
++/*
++ * PMCR寄存器:
++ * PMCR_EL0, Performance Monitors Control Register
++ *
++ * Provides details of the Performance Monitors implementation, including the
++ * number of counters implemented, and configures and controls the counters.
++ *
++ * 比方N是[15:11]: Indicates the number of event counters implemented. Reads of
++ * this field from EL1 and EL0 return the value of AArch64-MDCR_EL2.HPMN.
++ */
+ /**
+  * kvm_vcpu_read_pmcr - Read PMCR_EL0 register for the vCPU
+  * @vcpu: The vcpu pointer
+  */
+ u64 kvm_vcpu_read_pmcr(struct kvm_vcpu *vcpu)
+ {
++	/*
++	 * 404 enum vcpu_sysreg {
++	 * ... ...
++	 * 417
++	 * 418         // Performance Monitors Registers
++	 * 419         PMCR_EL0,       // Control Register
++	 * 420         PMSELR_EL0,     // Event Counter Selection Register
++	 * 421         PMEVCNTR0_EL0,  // Event Counter Register (0-30)
++	 * 422         PMEVCNTR30_EL0 = PMEVCNTR0_EL0 + 30,
++	 * 423         PMCCNTR_EL0,    // Cycle Counter Register
++	 * 424         PMEVTYPER0_EL0, // Event Type Register (0-30) 
++	 * 425         PMEVTYPER30_EL0 = PMEVTYPER0_EL0 + 30,
++	 * 426         PMCCFILTR_EL0,  // Cycle Count Filter Register
++	 * 427         PMCNTENSET_EL0, // Count Enable Set Register
++	 * 428         PMINTENSET_EL1, // Interrupt Enable Set Register
++	 * 429         PMOVSSET_EL0,   // Overflow Flag Status Set Register
++	 * 430         PMUSERENR_EL0,  // User Enable Register
++	 */
+ 	u64 pmcr = __vcpu_sys_reg(vcpu, PMCR_EL0);
+ 
++	/*
++	 * PMCR寄存器:
++	 * PMCR_EL0, Performance Monitors Control Register
++	 *
++	 * Provides details of the Performance Monitors implementation, including the
++	 * number of counters implemented, and configures and controls the counters.
++	 *
++	 * 比方N是[15:11]: Indicates the number of event counters implemented. Reads of
++	 * this field from EL1 and EL0 return the value of AArch64-MDCR_EL2.HPMN.
++	 *
++	 * 在以下使用kvm_arch->pmcr_n:
++	 *   - arch/arm64/kvm/pmu-emul.c|1682| <<kvm_arm_set_pmu>> kvm->arch.pmcr_n = kvm_arm_pmu_get_max_counters(kvm);
++	 *   - arch/arm64/kvm/pmu-emul.c|1969| <<kvm_vcpu_read_pmcr>> return u64_replace_bits(pmcr, vcpu->kvm->arch.pmcr_n, ARMV8_PMU_PMCR_N);
++	 *   - arch/arm64/kvm/sys_regs.c|862| <<reset_pmu_reg>> u8 n = vcpu->kvm->arch.pmcr_n;
++	 *   - arch/arm64/kvm/sys_regs.c|1321| <<set_pmcr>> kvm->arch.pmcr_n = new_n;
++	 */
+ 	return u64_replace_bits(pmcr, vcpu->kvm->arch.pmcr_n, ARMV8_PMU_PMCR_N);
+ }
+diff --git a/arch/arm64/kvm/sys_regs.c b/arch/arm64/kvm/sys_regs.c
+index 31e49da86..75922168a 100644
+--- a/arch/arm64/kvm/sys_regs.c
++++ b/arch/arm64/kvm/sys_regs.c
+@@ -859,6 +859,13 @@ static unsigned int pmu_visibility(const struct kvm_vcpu *vcpu,
+ static u64 reset_pmu_reg(struct kvm_vcpu *vcpu, const struct sys_reg_desc *r)
+ {
+ 	u64 mask = BIT(ARMV8_PMU_CYCLE_IDX);
++	/*
++	 * 在以下使用kvm_arch->pmcr_n:
++	 *   - arch/arm64/kvm/pmu-emul.c|1682| <<kvm_arm_set_pmu>> kvm->arch.pmcr_n = kvm_arm_pmu_get_max_counters(kvm);
++	 *   - arch/arm64/kvm/pmu-emul.c|1969| <<kvm_vcpu_read_pmcr>> return u64_replace_bits(pmcr, vcpu->kvm->arch.pmcr_n, ARMV8_PMU_PMCR_N);
++	 *   - arch/arm64/kvm/sys_regs.c|862| <<reset_pmu_reg>> u8 n = vcpu->kvm->arch.pmcr_n;
++	 *   - arch/arm64/kvm/sys_regs.c|1321| <<set_pmcr>> kvm->arch.pmcr_n = new_n;
++	 */
+ 	u8 n = vcpu->kvm->arch.pmcr_n;
+ 
+ 	if (n)
+@@ -1002,6 +1009,21 @@ static bool access_pmceid(struct kvm_vcpu *vcpu, struct sys_reg_params *p,
+ 
+ 	get_access_mask(r, &mask, &shift);
+ 
++	/*
++	 * PMCEID1_EL0, Performance Monitors Common Event Identification register 1
++	 *
++	 * Defines which Common architectural events and Common microarchitectural
++	 * events are implemented, or counted, using PMU events in the ranges 0x0020 to
++	 * 0x003F and 0x4020 to 0x403F.
++	 *
++	 * 比如:
++	 * ID0 corresponds to common event (0x20) L2D_CACHE_ALLOCATE
++	 * ID1 corresponds to common event (0x21) BR_RETIRED
++	 * ... ...
++	 * ID12 corresponds to common event (0x2c) Reserved
++	 * ... ...
++	 * ID31 corresponds to common event (0x3f) STALL_SLOT
++	 */
+ 	pmceid = kvm_pmu_get_pmceid(vcpu, (p->Op2 & 1));
+ 	pmceid &= mask;
+ 	pmceid >>= shift;
+@@ -1094,6 +1116,15 @@ static bool access_pmu_evcntr(struct kvm_vcpu *vcpu,
+ 	return true;
+ }
+ 
++/*
++ * 在以下使用access_pmu_evtyper():
++ *   - arch/arm64/kvm/sys_regs.c|2574| <<global>> .access = access_pmu_evtyper, .reset = NULL },
++ *   - arch/arm64/kvm/sys_regs.c|2740| <<global>> { PMU_SYS_REG(PMCCFILTR_EL0), .access = access_pmu_evtyper,
++ *   - arch/arm64/kvm/sys_regs.c|3425| <<global>> { CP15_PMU_SYS_REG(DIRECT, 0, 9, 13, 1), .access = access_pmu_evtyper },
++ *   - arch/arm64/kvm/sys_regs.c|3519| <<global>> { CP15_PMU_SYS_REG(DIRECT, 0, 14, 15, 7), .access = access_pmu_evtyper },
++ *   - arch/arm64/kvm/sys_regs.c|1345| <<PMU_PMEVTYPER_EL0>> .access = access_pmu_evtyper, .reg = (PMEVTYPER0_EL0 + n), }
++ *   - arch/arm64/kvm/sys_regs.c|3376| <<PMU_PMEVTYPER>> .access = access_pmu_evtyper }
++ */
+ static bool access_pmu_evtyper(struct kvm_vcpu *vcpu, struct sys_reg_params *p,
+ 			       const struct sys_reg_desc *r)
+ {
+@@ -1279,6 +1310,16 @@ static int get_pmcr(struct kvm_vcpu *vcpu, const struct sys_reg_desc *r,
+ 	return 0;
+ }
+ 
++/*
++ * PMCR寄存器:
++ * PMCR_EL0, Performance Monitors Control Register
++ *
++ * Provides details of the Performance Monitors implementation, including the
++ * number of counters implemented, and configures and controls the counters.
++ *
++ * 比方N是[15:11]: Indicates the number of event counters implemented. Reads of
++ * this field from EL1 and EL0 return the value of AArch64-MDCR_EL2.HPMN.
++ */
+ static int set_pmcr(struct kvm_vcpu *vcpu, const struct sys_reg_desc *r,
+ 		    u64 val)
+ {
+@@ -1287,6 +1328,13 @@ static int set_pmcr(struct kvm_vcpu *vcpu, const struct sys_reg_desc *r,
+ 
+ 	mutex_lock(&kvm->arch.config_lock);
+ 
++	/*
++	 * 在以下使用kvm_arch->pmcr_n:
++	 *   - arch/arm64/kvm/pmu-emul.c|1682| <<kvm_arm_set_pmu>> kvm->arch.pmcr_n = kvm_arm_pmu_get_max_counters(kvm);
++	 *   - arch/arm64/kvm/pmu-emul.c|1969| <<kvm_vcpu_read_pmcr>> return u64_replace_bits(pmcr, vcpu->kvm->arch.pmcr_n, ARMV8_PMU_PMCR_N);
++	 *   - arch/arm64/kvm/sys_regs.c|862| <<reset_pmu_reg>> u8 n = vcpu->kvm->arch.pmcr_n;
++	 *   - arch/arm64/kvm/sys_regs.c|1321| <<set_pmcr>> kvm->arch.pmcr_n = new_n;
++	 */
+ 	/*
+ 	 * The vCPU can't have more counters than the PMU hardware
+ 	 * implements. Ignore this error to maintain compatibility
+diff --git a/arch/arm64/kvm/vgic/vgic.c b/arch/arm64/kvm/vgic/vgic.c
+index abe29c7d8..41d26eb71 100644
+--- a/arch/arm64/kvm/vgic/vgic.c
++++ b/arch/arm64/kvm/vgic/vgic.c
+@@ -421,6 +421,14 @@ bool vgic_queue_irq_unlock(struct kvm *kvm, struct vgic_irq *irq,
+  * level-sensitive interrupts.  You can think of the level parameter as 1
+  * being HIGH and 0 being LOW and all devices being active-HIGH.
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/arch_timer.c|455| <<kvm_timer_update_irq>> ret = kvm_vgic_inject_irq(vcpu->kvm, vcpu, timer_irq(timer_ctx), timer_ctx->irq.level, timer_ctx);
++ *   - arch/arm64/kvm/arm.c|1393| <<kvm_vm_ioctl_irq_line>> return kvm_vgic_inject_irq(kvm, vcpu, irq_num, level, NULL);
++ *   - arch/arm64/kvm/arm.c|1401| <<kvm_vm_ioctl_irq_line>> return kvm_vgic_inject_irq(kvm, NULL, irq_num, level, NULL);
++ *   - arch/arm64/kvm/pmu-emul.c|603| <<kvm_pmu_update_state>> int ret = kvm_vgic_inject_irq(vcpu->kvm, vcpu, pmu->irq_num, overflow, pmu);
++ *   - arch/arm64/kvm/vgic/vgic-irqfd.c|26| <<vgic_irqfd_set_irq>> return kvm_vgic_inject_irq(kvm, NULL, spi_id, level, NULL);
++ */
+ int kvm_vgic_inject_irq(struct kvm *kvm, struct kvm_vcpu *vcpu,
+ 			unsigned int intid, bool level, void *owner)
+ {
+@@ -583,6 +591,11 @@ int kvm_vgic_get_map(struct kvm_vcpu *vcpu, unsigned int vintid)
+  * Returns 0 if intid is not already used by another in-kernel device and the
+  * owner is set, otherwise returns an error code.
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/arch_timer.c|1465| <<timer_irqs_are_valid>> if (kvm_vgic_set_owner(vcpu, irq, ctx))
++ *   - arch/arm64/kvm/pmu-emul.c|1552| <<kvm_arm_pmu_v3_init>> ret = kvm_vgic_set_owner(vcpu, vcpu->arch.pmu.irq_num, &vcpu->arch.pmu);
++ */
+ int kvm_vgic_set_owner(struct kvm_vcpu *vcpu, unsigned int intid, void *owner)
+ {
+ 	struct vgic_irq *irq;
+diff --git a/arch/x86/events/amd/core.c b/arch/x86/events/amd/core.c
+index 920e3a640..b53b9b20c 100644
+--- a/arch/x86/events/amd/core.c
++++ b/arch/x86/events/amd/core.c
+@@ -745,6 +745,11 @@ static void amd_pmu_check_overflow(void)
+ 	}
+ }
+ 
++/*
++ * 在以下使用amd_pmu_enable_event():
++ *   - arch/x86/events/amd/core.c|1309| <<global>> struct x86_pmu amd_pmu.enable = amd_pmu_enable_event,
++ *   - arch/x86/events/amd/core.c|765| <<amd_pmu_enable_all>> amd_pmu_enable_event(cpuc->events[idx]);
++ */
+ static void amd_pmu_enable_event(struct perf_event *event)
+ {
+ 	x86_pmu_enable_event(event);
+diff --git a/arch/x86/events/core.c b/arch/x86/events/core.c
+index be01823b1..98cb89163 100644
+--- a/arch/x86/events/core.c
++++ b/arch/x86/events/core.c
+@@ -1422,6 +1422,11 @@ int x86_perf_event_set_period(struct perf_event *event)
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/events/amd/core.c|750| <<amd_pmu_enable_event>> x86_pmu_enable_event(event);
++ *   - arch/x86/events/intel/core.c|4286| <<core_pmu_enable_event>> x86_pmu_enable_event(event);
++ */
+ void x86_pmu_enable_event(struct perf_event *event)
+ {
+ 	if (__this_cpu_read(cpu_hw_events.enabled))
+diff --git a/arch/x86/events/perf_event.h b/arch/x86/events/perf_event.h
+index ac1182141..27e64dff3 100644
+--- a/arch/x86/events/perf_event.h
++++ b/arch/x86/events/perf_event.h
+@@ -1187,6 +1187,16 @@ static inline bool is_counter_pair(struct hw_perf_event *hwc)
+ 	return hwc->flags & PERF_X86_EVENT_PAIR;
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/events/amd/core.c|781| <<amd_pmu_v2_enable_event>> __x86_pmu_enable_event(hwc, ARCH_PERFMON_EVENTSEL_ENABLE);
++ *   - arch/x86/events/core.c|750| <<x86_pmu_enable_all>> __x86_pmu_enable_event(hwc, ARCH_PERFMON_EVENTSEL_ENABLE);
++ *   - arch/x86/events/core.c|1428| <<x86_pmu_enable_event>> __x86_pmu_enable_event(&event->hw, ARCH_PERFMON_EVENTSEL_ENABLE);
++ *   - arch/x86/events/intel/core.c|2437| <<intel_pmu_nhm_workaround>> __x86_pmu_enable_event(&event->hw, ARCH_PERFMON_EVENTSEL_ENABLE);
++ *   - arch/x86/events/intel/core.c|2868| <<intel_pmu_enable_event>> __x86_pmu_enable_event(hwc, enable_mask);
++ *   - arch/x86/events/intel/core.c|4301| <<core_pmu_enable_all>> __x86_pmu_enable_event(hwc, ARCH_PERFMON_EVENTSEL_ENABLE);
++ *   - arch/x86/events/zhaoxin/core.c|347| <<zhaoxin_pmu_enable_event>> __x86_pmu_enable_event(hwc, ARCH_PERFMON_EVENTSEL_ENABLE);
++ */
+ static inline void __x86_pmu_enable_event(struct hw_perf_event *hwc,
+ 					  u64 enable_mask)
+ {
+diff --git a/drivers/pci/setup-res.c b/drivers/pci/setup-res.c
+index c6d933ddf..2f8ac228b 100644
+--- a/drivers/pci/setup-res.c
++++ b/drivers/pci/setup-res.c
+@@ -345,6 +345,11 @@ int pci_assign_resource(struct pci_dev *dev, int resno)
+ 	size = resource_size(res);
+ 	ret = _pci_assign_resource(dev, resno, size, align);
+ 
++	/*
++	 * 例子:
++	 * [   76.294540] pci 0000:01:00.0: BAR 0 [io  size 0x0040]: can't assign; no space
++	 * [   76.295401] pci 0000:01:00.0: BAR 0 [io  size 0x0040]: failed to assign
++	 */
+ 	/*
+ 	 * If we failed to assign anything, let's try the address
+ 	 * where firmware left it.  That at least has a chance of
+diff --git a/fs/locks.c b/fs/locks.c
+index e45cad40f..2bd4799b5 100644
+--- a/fs/locks.c
++++ b/fs/locks.c
+@@ -632,6 +632,10 @@ static int posix_same_owner(struct file_lock_core *fl1, struct file_lock_core *f
+ 	return fl1->flc_owner == fl2->flc_owner;
+ }
+ 
++/*
++ * called by:
++ *   - fs/locks.c|862| <<locks_insert_lock_ctx>> locks_insert_global_locks(fl);
++ */
+ /* Must be called with the flc_lock held! */
+ static void locks_insert_global_locks(struct file_lock_core *flc)
+ {
+@@ -855,6 +859,59 @@ static void locks_wake_up_blocks(struct file_lock_core *blocker)
+ 	spin_unlock(&blocked_lock_lock);
+ }
+ 
++/*
++ * [0] locks_insert_lock_ctx
++ * [0] posix_lock_inode
++ * [0] do_lock_file_wait
++ * [0] fcntl_setlk
++ * [0] do_fcntl
++ * [0] __x64_sys_fcntl
++ * [0] do_syscall_64
++ * [0] entry_SYSCALL_64_after_hwframe
++ *
++ * nfs的client.
++ *
++ * [0] locks_insert_lock_ctx
++ * [0] posix_lock_inode
++ * [0] locks_lock_inode_wait
++ * [0] nfs4_lock_done
++ * [0] rpc_exit_task
++ * [0] __rpc_execute
++ * [0] rpc_async_schedule
++ * [0] process_one_work
++ * [0] worker_thread
++ * [0] kthread
++ * [0] ret_from_fork
++ *
++ * NFS的server.
++ *
++ * [0] nfsd4_lock
++ * [0] nfsd4_proc_compound
++ * [0] nfsd_dispatch
++ * [0] svc_process_common
++ * [0] svc_process
++ * [0] nfsd
++ * [0] kthread
++ * [0] ret_from_fork
++ *
++ * [0] locks_insert_lock_ctx
++ * [0] posix_lock_inode
++ * [0] nfsd4_lock
++ * [0] nfsd4_proc_compound
++ * [0] nfsd_dispatch
++ * [0] svc_process_common
++ * [0] svc_process
++ * [0] nfsd
++ * [0] kthread
++ * [0] ret_from_fork
++ *
++ * called by:
++ *   - fs/locks.c|1132| <<flock_lock_inode>> locks_insert_lock_ctx(&new_fl->c, &ctx->flc_flock);
++ *   - fs/locks.c|1317| <<posix_lock_inode>> locks_insert_lock_ctx(&request->c, &fl->c.flc_list);
++ *   - fs/locks.c|1348| <<posix_lock_inode>> locks_insert_lock_ctx(&new_fl->c, &fl->c.flc_list);
++ *   - fs/locks.c|1360| <<posix_lock_inode>> locks_insert_lock_ctx(&left->c, &fl->c.flc_list);
++ *   - fs/locks.c|1851| <<generic_add_lease>> locks_insert_lock_ctx(&lease->c, &ctx->flc_lease);
++ */
+ static void
+ locks_insert_lock_ctx(struct file_lock_core *fl, struct list_head *before)
+ {
+@@ -1071,6 +1128,11 @@ static bool posix_locks_deadlock(struct file_lock *caller_fl,
+  * whether or not a lock was successfully freed by testing the return
+  * value for -ENOENT.
+  */
++/*
++ * called by:
++ *   - fs/locks.c|2080| <<flock_lock_inode_wait>> error = flock_lock_inode(inode, fl);
++ *   - fs/locks.c|2656| <<locks_remove_flock>> flock_lock_inode(inode, &fl);
++ */
+ static int flock_lock_inode(struct inode *inode, struct file_lock *request)
+ {
+ 	struct file_lock *new_fl = NULL;
+@@ -1143,6 +1205,11 @@ static int flock_lock_inode(struct inode *inode, struct file_lock *request)
+ 	return error;
+ }
+ 
++/*
++ * called by:
++ *   - fs/locks.c|1428| <<posix_lock_file>> return posix_lock_inode(file_inode(filp), fl, conflock);
++ *   - fs/locks.c|1444| <<posix_lock_inode_wait>> error = posix_lock_inode(inode, fl, NULL);
++ */
+ static int posix_lock_inode(struct inode *inode, struct file_lock *request,
+ 			    struct file_lock *conflock)
+ {
+@@ -1396,6 +1463,16 @@ static int posix_lock_inode(struct inode *inode, struct file_lock *request,
+  * whether or not a lock was successfully freed by testing the return
+  * value for -ENOENT.
+  */
++/*
++ * called by:
++ *   - fs/ceph/locks.c|278| <<ceph_lock>> posix_lock_file(file, fl, NULL);
++ *   - fs/ceph/locks.c|299| <<ceph_lock>> err = posix_lock_file(file, fl, NULL);
++ *   - fs/dlm/plock.c|262| <<dlm_plock_callback>> if (posix_lock_file(file, flc, NULL)) {
++ *   - fs/fuse/file.c|2714| <<fuse_file_lock>> err = posix_lock_file(file, fl, NULL);
++ *   - fs/locks.c|2395| <<vfs_lock_file>> return posix_lock_file(filp, fl, conf);
++ *   - fs/orangefs/file.c|545| <<orangefs_lock>> rc = posix_lock_file(filp, fl, NULL);
++ *   - fs/smb/client/file.c|1753| <<cifs_posix_lock_set>> rc = posix_lock_file(file, flock, NULL);
++ */
+ int posix_lock_file(struct file *filp, struct file_lock *fl,
+ 			struct file_lock *conflock)
+ {
+@@ -2072,6 +2149,10 @@ int fcntl_setlease(unsigned int fd, struct file *filp, int arg)
+  *
+  * Apply a FLOCK style lock request to an inode.
+  */
++/*
++ * called by:
++ *   - fs/locks.c|2107| <<locks_lock_inode_wait>> res = flock_lock_inode_wait(inode, fl);
++ */
+ static int flock_lock_inode_wait(struct inode *inode, struct file_lock *fl)
+ {
+ 	int error;
+@@ -2096,6 +2177,15 @@ static int flock_lock_inode_wait(struct inode *inode, struct file_lock *fl)
+  *
+  * Apply a POSIX or FLOCK style lock request to an inode.
+  */
++/*
++ * called by:
++ *   - fs/nfs/nfs4proc.c|7066| <<nfs4_locku_done>> locks_lock_inode_wait(calldata->lsp->ls_state->inode, &calldata->fl);
++ *   - fs/nfs/nfs4proc.c|7194| <<nfs4_proc_unlck>> if (locks_lock_inode_wait(inode, request) == -ENOENT) {
++ *   - fs/nfs/nfs4proc.c|7334| <<nfs4_lock_done>> if (locks_lock_inode_wait(lsp->ls_state->inode, &data->fl) < 0)
++ *   - fs/nfs/nfs4proc.c|7545| <<_nfs4_proc_setlk>> status = locks_lock_inode_wait(state->inode, request);
++ *   - fs/nfs/nfs4proc.c|7554| <<_nfs4_proc_setlk>> status = locks_lock_inode_wait(state->inode, request);
++ *   - include/linux/filelock.h|417| <<locks_lock_file_wait>> return locks_lock_inode_wait(file_inode(filp), fl);
++ */
+ int locks_lock_inode_wait(struct inode *inode, struct file_lock *fl)
+ {
+ 	int res = 0;
+@@ -2347,6 +2437,22 @@ int fcntl_getlk(struct file *filp, unsigned int cmd, struct flock *flock)
+  * ->lm_grant() before returning to the caller with a FILE_LOCK_DEFERRED
+  * return code.
+  */
++/*
++ * called by:
++ *   - fs/lockd/svclock.c|567| <<nlmsvc_lock>> error = vfs_lock_file(file->f_file[mode], F_SETLK, &lock->fl, NULL);
++ *   - fs/lockd/svclock.c|688| <<nlmsvc_unlock>> error = vfs_lock_file(lock->fl.c.flc_file, F_SETLK,
++ *   - fs/lockd/svclock.c|692| <<nlmsvc_unlock>> error |= vfs_lock_file(lock->fl.c.flc_file, F_SETLK,
++ *   - fs/lockd/svclock.c|872| <<nlmsvc_grant_blocked>> error = vfs_lock_file(file->f_file[mode], F_SETLK, &lock->fl, NULL);
++ *   - fs/lockd/svclock.c|999| <<nlmsvc_grant_reply>> error = vfs_lock_file(fl->c.flc_file, F_SETLK, fl, NULL);
++ *   - fs/lockd/svcsubs.c|192| <<nlm_unlock_files>> if (lock.c.flc_file && vfs_lock_file(lock.c.flc_file, F_SETLK, &lock, NULL))
++ *   - fs/lockd/svcsubs.c|195| <<nlm_unlock_files>> if (lock.c.flc_file && vfs_lock_file(lock.c.flc_file, F_SETLK, &lock, NULL))
++ *   - fs/locks.c|2414| <<do_lock_file_wait>> error = vfs_lock_file(filp, cmd, fl, NULL);
++ *   - fs/locks.c|2676| <<locks_remove_posix>> error = vfs_lock_file(filp, F_SETLK, &lock, NULL);
++ *   - fs/nfsd/nfs4state.c|8035| <<nfsd4_lock>> err = vfs_lock_file(nf->nf_file, F_SETLK, file_lock, conflock);
++ *   - fs/nfsd/nfs4state.c|8273| <<nfsd4_locku>> err = vfs_lock_file(nf->nf_file, F_SETLK, file_lock, NULL);
++ *   - fs/smb/server/smb2pdu.c|7394| <<smb2_lock>> rc = vfs_lock_file(filp, smb_lock->cmd, flock, NULL);
++ *   - fs/smb/server/smb2pdu.c|7507| <<smb2_lock>> rc = vfs_lock_file(filp, F_SETLK, rlock, NULL);
++ */
+ int vfs_lock_file(struct file *filp, unsigned int cmd, struct file_lock *fl, struct file_lock *conf)
+ {
+ 	WARN_ON_ONCE(filp != fl->c.flc_file);
+@@ -2357,6 +2463,11 @@ int vfs_lock_file(struct file *filp, unsigned int cmd, struct file_lock *fl, str
+ }
+ EXPORT_SYMBOL_GPL(vfs_lock_file);
+ 
++/*
++ * called by:
++ *   - fs/locks.c|2478| <<fcntl_setlk>> error = do_lock_file_wait(filp, cmd, file_lock);
++ *   - fs/locks.c|2600| <<fcntl_setlk64>> error = do_lock_file_wait(filp, cmd, file_lock);
++ */
+ static int do_lock_file_wait(struct file *filp, unsigned int cmd,
+ 			     struct file_lock *fl)
+ {
+@@ -2399,6 +2510,12 @@ check_fmode_for_setlk(struct file_lock *fl)
+ /* Apply the lock described by l to an open file descriptor.
+  * This implements both the F_SETLK and F_SETLKW commands of fcntl().
+  */
++/*
++ * called by:
++ *   - fs/fcntl.c|398| <<do_fcntl>> err = fcntl_setlk(fd, filp, cmd, &flock);
++ *   - fs/fcntl.c|684| <<do_compat_fcntl64>> err = fcntl_setlk(fd, f.file, convert_fcntl_cmd(cmd), &flock);
++ *   - fs/fcntl.c|693| <<do_compat_fcntl64>> err = fcntl_setlk(fd, f.file, convert_fcntl_cmd(cmd), &flock);
++ */
+ int fcntl_setlk(unsigned int fd, struct file *filp, unsigned int cmd,
+ 		struct flock *flock)
+ {
+diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
+index b8ffbe52b..8d171392b 100644
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -7411,6 +7411,13 @@ static void nfs4_handle_setlk_error(struct nfs_server *server, struct nfs4_lock_
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - fs/nfs/nfs4proc.c|7480| <<nfs4_lock_reclaim>> err = _nfs4_do_setlk(state, F_SETLK, request, NFS_LOCK_RECLAIM);
++ *   - fs/nfs/nfs4proc.c|7506| <<nfs4_lock_expired>> err = _nfs4_do_setlk(state, F_SETLK, request, NFS_LOCK_EXPIRED);
++ *   - fs/nfs/nfs4proc.c|7561| <<_nfs4_proc_setlk>> status = _nfs4_do_setlk(state, cmd, request, NFS_LOCK_NEW);
++ *   - fs/nfs/nfs4proc.c|7785| <<nfs4_lock_delegation_recall>> err = _nfs4_do_setlk(state, F_SETLK, fl, NFS_LOCK_NEW);
++ */
+ static int _nfs4_do_setlk(struct nfs4_state *state, int cmd, struct file_lock *fl, int recovery_type)
+ {
+ 	struct nfs4_lockdata *data;
+diff --git a/fs/nfsd/nfs4state.c b/fs/nfsd/nfs4state.c
+index a366fb1c1..51f02a24e 100644
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@ -7864,6 +7864,52 @@ lookup_or_create_lock_state(struct nfsd4_compound_state *cstate,
+ /*
+  *  LOCK operation 
+  */
++/*
++ * [0] locks_insert_lock_ctx
++ * [0] posix_lock_inode
++ * [0] do_lock_file_wait
++ * [0] fcntl_setlk
++ * [0] do_fcntl
++ * [0] __x64_sys_fcntl
++ * [0] do_syscall_64
++ * [0] entry_SYSCALL_64_after_hwframe
++ *
++ * nfs的client.
++ *
++ * [0] locks_insert_lock_ctx
++ * [0] posix_lock_inode
++ * [0] locks_lock_inode_wait
++ * [0] nfs4_lock_done
++ * [0] rpc_exit_task
++ * [0] __rpc_execute
++ * [0] rpc_async_schedule
++ * [0] process_one_work
++ * [0] worker_thread
++ * [0] kthread
++ * [0] ret_from_fork
++ *
++ * NFS的server.
++ *
++ * [0] nfsd4_lock
++ * [0] nfsd4_proc_compound
++ * [0] nfsd_dispatch
++ * [0] svc_process_common
++ * [0] svc_process
++ * [0] nfsd
++ * [0] kthread
++ * [0] ret_from_fork
++ *
++ * [0] locks_insert_lock_ctx
++ * [0] posix_lock_inode
++ * [0] nfsd4_lock
++ * [0] nfsd4_proc_compound
++ * [0] nfsd_dispatch
++ * [0] svc_process_common
++ * [0] svc_process
++ * [0] nfsd
++ * [0] kthread
++ * [0] ret_from_fork
++ */
+ __be32
+ nfsd4_lock(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+ 	   union nfsd4_op_u *u)
+diff --git a/include/kvm/arm_pmu.h b/include/kvm/arm_pmu.h
+index 35d4ca4f6..eb053d60f 100644
+--- a/include/kvm/arm_pmu.h
++++ b/include/kvm/arm_pmu.h
+@@ -24,10 +24,33 @@ struct kvm_pmu_events {
+ };
+ 
+ struct kvm_pmu {
++	/*
++	 * 在以下使用kvm_pmu->overflow_work:
++	 *   - arch/arm64/kvm/pmu-emul.c|453| <<kvm_pmu_vcpu_destroy>> irq_work_sync(&vcpu->arch.pmu.overflow_work);
++	 *   - arch/arm64/kvm/pmu-emul.c|619| <<kvm_pmu_perf_overflow_notify_vcpu>> vcpu = container_of(work, struct kvm_vcpu, arch.pmu.overflow_work);
++	 *   - arch/arm64/kvm/pmu-emul.c|718| <<kvm_pmu_perf_overflow>> irq_work_queue(&vcpu->arch.pmu.overflow_work);
++	 *   - arch/arm64/kvm/pmu-emul.c|1092| <<kvm_arm_pmu_v3_init>> init_irq_work(&vcpu->arch.pmu.overflow_work, kvm_pmu_perf_overflow_notify_vcpu);
++	 */
+ 	struct irq_work overflow_work;
+ 	struct kvm_pmu_events events;
+ 	struct kvm_pmc pmc[ARMV8_PMU_MAX_COUNTERS];
++	/*
++	 * 在以下使用kvm_pmu->irq_num:
++	 *   - arch/arm64/kvm/pmu-emul.c|720| <<kvm_pmu_update_state>> int ret = kvm_vgic_inject_irq(vcpu->kvm, vcpu, pmu->irq_num, overflow, pmu);
++	 *   - arch/arm64/kvm/pmu-emul.c|1518| <<kvm_arm_pmu_v3_enable>> int irq = vcpu->arch.pmu.irq_num;
++	 *   - arch/arm64/kvm/pmu-emul.c|1567| <<kvm_arm_pmu_v3_init>> ret = kvm_vgic_set_owner(vcpu, vcpu->arch.pmu.irq_num,
++	 *   - arch/arm64/kvm/pmu-emul.c|1608| <<pmu_irq_is_valid>> if (vcpu->arch.pmu.irq_num != irq)
++	 *   - arch/arm64/kvm/pmu-emul.c|1611| <<pmu_irq_is_valid>> if (vcpu->arch.pmu.irq_num == irq)
++	 *   - arch/arm64/kvm/pmu-emul.c|1761| <<kvm_arm_pmu_v3_set_attr>> vcpu->arch.pmu.irq_num = irq;
++	 *   - arch/arm64/kvm/pmu-emul.c|1846| <<kvm_arm_pmu_v3_get_attr>> irq = vcpu->arch.pmu.irq_num;
++	 */
+ 	int irq_num;
++	/*
++	 * 在以下使用kvm_pmu->created:
++	 *   - arch/arm64/kvm/pmu-emul.c|1503| <<kvm_arm_pmu_v3_enable>> if (!vcpu->arch.pmu.created) return -EINVAL;
++	 *   - arch/arm64/kvm/pmu-emul.c|1568| <<kvm_arm_pmu_v3_init>> vcpu->arch.pmu.created = true;
++	 *   - arch/arm64/kvm/pmu-emul.c|1709| <<kvm_arm_pmu_v3_set_attr>> if (vcpu->arch.pmu.created) return -EBUSY;
++	 */
+ 	bool created;
+ 	bool irq_level;
+ };
+@@ -44,6 +67,14 @@ static __always_inline bool kvm_arm_support_pmu_v3(void)
+ 	return static_branch_likely(&kvm_arm_pmu_available);
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|1555| <<kvm_arm_pmu_v3_enable>> } else if (kvm_arm_pmu_irq_initialized(vcpu)) {
++ *   - arch/arm64/kvm/pmu-emul.c|1587| <<kvm_arm_pmu_v3_init>> if (!kvm_arm_pmu_irq_initialized(vcpu))
++ *   - arch/arm64/kvm/pmu-emul.c|1645| <<pmu_irq_is_valid>> if (!kvm_arm_pmu_irq_initialized(vcpu))
++ *   - arch/arm64/kvm/pmu-emul.c|1835| <<kvm_arm_pmu_v3_set_attr>> if (kvm_arm_pmu_irq_initialized(vcpu))
++ *   - arch/arm64/kvm/pmu-emul.c|1931| <<kvm_arm_pmu_v3_get_attr>> if (!kvm_arm_pmu_irq_initialized(vcpu))
++ */
+ #define kvm_arm_pmu_irq_initialized(v)	((v)->arch.pmu.irq_num >= VGIC_NR_SGIS)
+ u64 kvm_pmu_get_counter_value(struct kvm_vcpu *vcpu, u64 select_idx);
+ void kvm_pmu_set_counter_value(struct kvm_vcpu *vcpu, u64 select_idx, u64 val);
+@@ -76,6 +107,26 @@ void kvm_vcpu_pmu_restore_guest(struct kvm_vcpu *vcpu);
+ void kvm_vcpu_pmu_restore_host(struct kvm_vcpu *vcpu);
+ void kvm_vcpu_pmu_resync_el0(void);
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/arm.c|1493| <<kvm_setup_vcpu>> if (kvm_vcpu_has_pmu(vcpu) && !kvm->arch.arm_pmu)
++ *   - arch/arm64/kvm/pmu-emul.c|302| <<kvm_pmu_get_counter_value>> if (!kvm_vcpu_has_pmu(vcpu))
++ *   - arch/arm64/kvm/pmu-emul.c|366| <<kvm_pmu_set_counter_value>> if (!kvm_vcpu_has_pmu(vcpu))
++ *   - arch/arm64/kvm/pmu-emul.c|554| <<kvm_pmu_enable_counter_mask>> if (!kvm_vcpu_has_pmu(vcpu))
++ *   - arch/arm64/kvm/pmu-emul.c|611| <<kvm_pmu_disable_counter_mask>> if (!kvm_vcpu_has_pmu(vcpu) || !val)
++ *   - arch/arm64/kvm/pmu-emul.c|701| <<kvm_pmu_update_state>> if (!kvm_vcpu_has_pmu(vcpu))
++ *   - arch/arm64/kvm/pmu-emul.c|1079| <<kvm_pmu_handle_pmcr>> if (!kvm_vcpu_has_pmu(vcpu))
++ *   - arch/arm64/kvm/pmu-emul.c|1292| <<kvm_pmu_set_counter_event_type>> if (!kvm_vcpu_has_pmu(vcpu))
++ *   - arch/arm64/kvm/pmu-emul.c|1422| <<kvm_pmu_get_pmceid>> if (!kvm_vcpu_has_pmu(vcpu))
++ *   - arch/arm64/kvm/pmu-emul.c|1518| <<kvm_arm_pmu_v3_enable>> if (!kvm_vcpu_has_pmu(vcpu))
++ *   - arch/arm64/kvm/pmu-emul.c|1808| <<kvm_arm_pmu_v3_set_attr>> if (!kvm_vcpu_has_pmu(vcpu))
++ *   - arch/arm64/kvm/pmu-emul.c|1931| <<kvm_arm_pmu_v3_get_attr>> if (!kvm_vcpu_has_pmu(vcpu))
++ *   - arch/arm64/kvm/pmu-emul.c|1962| <<kvm_arm_pmu_v3_has_attr>> if (kvm_vcpu_has_pmu(vcpu))
++ *   - arch/arm64/kvm/sys_regs.c|853| <<pmu_visibility>> if (kvm_vcpu_has_pmu(vcpu))
++ *   - arch/arm64/kvm/sys_regs.c|891| <<reset_pmevtyper>> if (!kvm_vcpu_has_pmu(vcpu))
++ *   - arch/arm64/kvm/sys_regs.c|1782| <<read_sanitised_id_aa64dfr0_el1>> if (kvm_vcpu_has_pmu(vcpu))
++ *   - arch/arm64/kvm/sys_regs.c|1833| <<read_sanitised_id_dfr0_el1>> if (kvm_vcpu_has_pmu(vcpu))
++ */
+ #define kvm_vcpu_has_pmu(vcpu)					\
+ 	(vcpu_has_feature(vcpu, KVM_ARM_VCPU_PMU_V3))
+ 
+diff --git a/include/linux/filelock.h b/include/linux/filelock.h
+index daee999d0..76998be05 100644
+--- a/include/linux/filelock.h
++++ b/include/linux/filelock.h
+@@ -412,6 +412,32 @@ locks_inode_context(const struct inode *inode)
+ /* for walking lists of file_locks linked by fl_list */
+ #define for_each_file_lock(_fl, _head)	list_for_each_entry(_fl, _head, c.flc_list)
+ 
++/*
++ * called by:
++ *   - fs/9p/vfs_file.c|131| <<v9fs_file_do_lock>> res = locks_lock_file_wait(filp, fl);
++ *   - fs/9p/vfs_file.c|214| <<v9fs_file_do_lock>> locks_lock_file_wait(filp, fl);
++ *   - fs/afs/flock.c|609| <<afs_do_setlk>> ret = locks_lock_file_wait(file, fl);
++ *   - fs/afs/flock.c|714| <<afs_do_unlk>> ret = locks_lock_file_wait(file, fl);
++ *   - fs/ceph/locks.c|233| <<try_unlock_file>> err = locks_lock_file_wait(file, fl);
++ *   - fs/ceph/locks.c|338| <<ceph_flock>> locks_lock_file_wait(file, fl);
++ *   - fs/ceph/locks.c|361| <<ceph_flock>> err = locks_lock_file_wait(file, fl);
++ *   - fs/dlm/plock.c|225| <<dlm_posix_lock>> if (locks_lock_file_wait(file, fl) < 0)
++ *   - fs/dlm/plock.c|309| <<dlm_posix_unlock>> rv = locks_lock_file_wait(file, fl);
++ *   - fs/fuse/file.c|2728| <<fuse_file_flock>> err = locks_lock_file_wait(file, fl);
++ *   - fs/gfs2/file.c|1448| <<gfs2_lock>> locks_lock_file_wait(file, fl);
++ *   - fs/gfs2/file.c|1501| <<do_flock>> locks_lock_file_wait(file, &request);
++ *   - fs/gfs2/file.c|1527| <<do_flock>> error = locks_lock_file_wait(file, fl);
++ *   - fs/gfs2/file.c|1542| <<do_unflock>> locks_lock_file_wait(file, fl);
++ *   - fs/lockd/clntproc.c|498| <<do_vfs_lock>> return locks_lock_file_wait(fl->c.flc_file, fl);
++ *   - fs/locks.c|2177| <<SYSCALL_DEFINE2(flock)>> error = locks_lock_file_wait(f.file, &fl);
++ *   - fs/nfs/file.c|782| <<do_unlk>> status = locks_lock_file_wait(filp, fl);
++ *   - fs/nfs/file.c|807| <<do_setlk>> status = locks_lock_file_wait(filp, fl);
++ *   - fs/ocfs2/locks.c|58| <<ocfs2_do_flock>> locks_lock_file_wait(file, &request);
++ *   - fs/ocfs2/locks.c|72| <<ocfs2_do_flock>> ret = locks_lock_file_wait(file, fl);
++ *   - fs/ocfs2/locks.c|89| <<ocfs2_do_funlock>> ret = locks_lock_file_wait(file, fl);
++ *   - fs/ocfs2/locks.c|108| <<ocfs2_flock>> return locks_lock_file_wait(file, fl);
++ *   - fs/smb/client/file.c|2317| <<cifs_setlk>> rc = locks_lock_file_wait(file, flock);
++ */
+ static inline int locks_lock_file_wait(struct file *filp, struct file_lock *fl)
+ {
+ 	return locks_lock_inode_wait(file_inode(filp), fl);
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 8a6c6bbcd..984bb692c 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -3012,6 +3012,16 @@ static void _perf_event_enable(struct perf_event *event)
+ /*
+  * See perf_event_disable();
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|541| <<kvm_pmu_enable_counter_mask>> perf_event_enable(pmc->perf_event);
++ *   - arch/riscv/kvm/vcpu_pmu.c|336| <<kvm_pmu_create_perf_event>> perf_event_enable(pmc->perf_event);
++ *   - arch/riscv/kvm/vcpu_pmu.c|553| <<kvm_riscv_vcpu_pmu_ctr_start>> perf_event_enable(pmc->perf_event);
++ *   - arch/x86/kvm/pmu.c|272| <<pmc_resume_counter>> perf_event_enable(pmc->perf_event);
++ *   - kernel/events/hw_breakpoint.c|815| <<modify_user_hw_breakpoint>> perf_event_enable(bp);
++ *   - kernel/watchdog_perf.c|169| <<watchdog_hardlockup_enable>> perf_event_enable(this_cpu_read(watchdog_ev));
++ *   - kernel/watchdog_perf.c|251| <<hardlockup_detector_perf_restart>> perf_event_enable(event);
++ */
+ void perf_event_enable(struct perf_event *event)
+ {
+ 	struct perf_event_context *ctx;
+@@ -5357,6 +5367,19 @@ static void put_event(struct perf_event *event)
+  * object, it will not preserve its functionality. Once the last 'user'
+  * gives up the object, we'll destroy the thing.
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|386| <<kvm_pmu_release_perf_event>> perf_event_release_kernel(pmc->perf_event);
++ *   - arch/riscv/kvm/vcpu_pmu.c|82| <<kvm_pmu_release_perf_event>> perf_event_release_kernel(pmc->perf_event);
++ *   - arch/x86/kernel/cpu/resctrl/pseudo_lock.c|1058| <<measure_residency_fn>> perf_event_release_kernel(hit_event);
++ *   - arch/x86/kernel/cpu/resctrl/pseudo_lock.c|1060| <<measure_residency_fn>> perf_event_release_kernel(miss_event);
++ *   - arch/x86/kvm/pmu.c|281| <<pmc_release_perf_event>> perf_event_release_kernel(pmc->perf_event);
++ *   - arch/x86/kvm/vmx/pmu_intel.c|198| <<intel_pmu_release_guest_lbr_event>> perf_event_release_kernel(lbr_desc->event);
++ *   - kernel/events/core.c|5487| <<perf_release>> perf_event_release_kernel(file->private_data);
++ *   - kernel/events/hw_breakpoint.c|829| <<unregister_hw_breakpoint>> perf_event_release_kernel(bp);
++ *   - kernel/watchdog_perf.c|208| <<hardlockup_detector_perf_cleanup>> perf_event_release_kernel(event);
++ *   - kernel/watchdog_perf.c|275| <<watchdog_hardlockup_probe>> perf_event_release_kernel(this_cpu_read(watchdog_ev));
++ */
+ int perf_event_release_kernel(struct perf_event *event)
+ {
+ 	struct perf_event_context *ctx = event->ctx;
+@@ -5517,6 +5540,15 @@ static u64 __perf_event_read_value(struct perf_event *event, u64 *enabled, u64 *
+ 	return total;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|127| <<kvm_pmu_get_pmc_value>> counter += perf_event_read_value(pmc->perf_event, &enabled,
++ *   - arch/riscv/kvm/vcpu_pmu.c|249| <<pmu_ctr_read>> pmc->counter_val += perf_event_read_value(pmc->perf_event, &enabled, &running);
++ *   - arch/riscv/kvm/vcpu_pmu.c|625| <<kvm_riscv_vcpu_pmu_ctr_stop>> pmc->counter_val += perf_event_read_value(pmc->perf_event,
++ *   - arch/x86/kvm/pmu.h|112| <<pmc_read_counter>> counter += perf_event_read_value(pmc->perf_event,
++ *   - include/uapi/linux/bpf.h|5852| <<___BPF_FUNC_MAPPER>> FN(perf_event_read_value, 55, ##ctx) \
++ *   - tools/include/uapi/linux/bpf.h|5852| <<___BPF_FUNC_MAPPER>> FN(perf_event_read_value, 55, ##ctx) \
++ */
+ u64 perf_event_read_value(struct perf_event *event, u64 *enabled, u64 *running)
+ {
+ 	struct perf_event_context *ctx;
+@@ -12874,6 +12906,20 @@ SYSCALL_DEFINE5(perf_event_open,
+  * @overflow_handler: callback to trigger when we hit the event
+  * @context: context data could be used in overflow_handler callback
+  */
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|1124| <<kvm_pmu_create_perf_event>> event = perf_event_create_kernel_counter(&attr, -1, current, kvm_pmu_perf_overflow, pmc);
++ *   - arch/riscv/kvm/vcpu_pmu.c|328| <<kvm_pmu_create_perf_event>> event = perf_event_create_kernel_counter(attr, -1, current, kvm_riscv_pmu_overflow, pmc);
++ *   - arch/x86/kernel/cpu/resctrl/pseudo_lock.c|969| <<measure_residency_fn>> miss_event = perf_event_create_kernel_counter(miss_attr, plr->cpu, NULL, NULL, NULL);
++ *   - arch/x86/kernel/cpu/resctrl/pseudo_lock.c|974| <<measure_residency_fn>> hit_event = perf_event_create_kernel_counter(hit_attr, plr->cpu, NULL, NULL, NULL);
++ *   - arch/x86/kvm/pmu.c|215| <<pmc_reprogram_counter>> event = perf_event_create_kernel_counter(&attr, -1, current, kvm_perf_overflow, pmc);
++ *   - arch/x86/kvm/vmx/pmu_intel.c|243| <<intel_pmu_create_guest_lbr_event>> event = perf_event_create_kernel_counter(&attr, -1, current, NULL, NULL);
++ *   - kernel/events/hw_breakpoint.c|746| <<register_user_hw_breakpoint>> return perf_event_create_kernel_counter(attr, -1, tsk, triggered, context);
++ *   - kernel/events/hw_breakpoint.c|856| <<register_wide_hw_breakpoint>> bp = perf_event_create_kernel_counter(attr, cpu, NULL, triggered, context);
++ *   - kernel/events/hw_breakpoint_test.c|42| <<register_test_bp>> return perf_event_create_kernel_counter(&attr, cpu, tsk, NULL, NULL);
++ *   - kernel/watchdog_perf.c|135| <<hardlockup_detector_event_create>> evt = perf_event_create_kernel_counter(wd_attr, cpu, NULL, watchdog_overflow_callback, NULL);
++ *   - kernel/watchdog_perf.c|140| <<hardlockup_detector_event_create>> evt = perf_event_create_kernel_counter(wd_attr, cpu, NULL, watchdog_overflow_callback, NULL);
++ */
+ struct perf_event *
+ perf_event_create_kernel_counter(struct perf_event_attr *attr, int cpu,
+ 				 struct task_struct *task,
+-- 
+2.39.3 (Apple Git-146)
+
