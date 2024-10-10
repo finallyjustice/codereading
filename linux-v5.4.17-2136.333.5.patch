@@ -1,0 +1,1197 @@
+From fef114362f7be5df04fb7e92771731eb9d712dbe Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Thu, 10 Oct 2024 00:17:48 -0700
+Subject: [PATCH 1/1] linux-v5.4.17-2136.333.5
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ arch/arm64/kvm/pmu-emul.c       |   5 +
+ arch/x86/kvm/pmu.c              |  16 ++
+ arch/x86/kvm/pmu.h              |  16 ++
+ arch/x86/kvm/svm/pmu.c          |  11 +
+ arch/x86/kvm/x86.c              |  69 +++++++
+ drivers/iommu/iommu.c           |  25 +++
+ drivers/vfio/vfio_iommu_type1.c | 348 ++++++++++++++++++++++++++++++++
+ include/linux/mm_types.h        |  18 ++
+ kernel/events/core.c            | 129 ++++++++++++
+ mm/util.c                       |  54 +++++
+ 10 files changed, 691 insertions(+)
+
+diff --git a/arch/arm64/kvm/pmu-emul.c b/arch/arm64/kvm/pmu-emul.c
+index 68409559aabd..f8db3d75c598 100644
+--- a/arch/arm64/kvm/pmu-emul.c
++++ b/arch/arm64/kvm/pmu-emul.c
+@@ -82,6 +82,11 @@ u64 kvm_pmu_get_counter_value(struct kvm_vcpu *vcpu, u64 select_idx)
+ 	 * The real counter value is equal to the value of counter register plus
+ 	 * the value perf event counts.
+ 	 */
++	/*
++	 * called by:
++	 *   - arch/arm64/kvm/pmu-emul.c|86| <<kvm_pmu_get_counter_value>> counter += perf_event_read_value(pmc->perf_event, &enabled, &running);
++	 *   - arch/x86/kvm/pmu.h|56| <<pmc_read_counter>> counter += perf_event_read_value(pmc->perf_event, &enabled, &running);
++	 */
+ 	if (pmc->perf_event)
+ 		counter += perf_event_read_value(pmc->perf_event, &enabled,
+ 						 &running);
+diff --git a/arch/x86/kvm/pmu.c b/arch/x86/kvm/pmu.c
+index b8eba33c0cf7..5c863fd1cd03 100644
+--- a/arch/x86/kvm/pmu.c
++++ b/arch/x86/kvm/pmu.c
+@@ -384,6 +384,13 @@ void kvm_pmu_deliver_pmi(struct kvm_vcpu *vcpu)
+ 		kvm_apic_local_deliver(vcpu->arch.apic, APIC_LVTPC);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|3073| <<kvm_set_msr_common>> if (kvm_pmu_is_valid_msr(vcpu, msr))
++ *   - arch/x86/kvm/x86.c|3134| <<kvm_set_msr_common>> if (kvm_pmu_is_valid_msr(vcpu, msr))
++ *   - arch/x86/kvm/x86.c|3220| <<kvm_get_msr_common>> if (kvm_pmu_is_valid_msr(vcpu, msr_info->index))
++ *   - arch/x86/kvm/x86.c|3403| <<kvm_get_msr_common>> if (kvm_pmu_is_valid_msr(vcpu, msr_info->index))
++ */
+ bool kvm_pmu_is_valid_msr(struct kvm_vcpu *vcpu, u32 msr)
+ {
+ 	return kvm_x86_ops.pmu_ops->msr_idx_to_pmc(vcpu, msr) ||
+@@ -404,9 +411,18 @@ int kvm_pmu_get_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 	return kvm_x86_ops.pmu_ops->get_msr(vcpu, msr_info);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|3074| <<kvm_set_msr_common>> return kvm_pmu_set_msr(vcpu, msr_info);
++ *   - arch/x86/kvm/x86.c|3135| <<kvm_set_msr_common>> return kvm_pmu_set_msr(vcpu, msr_info);
++ */
+ int kvm_pmu_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ {
+ 	kvm_pmu_mark_pmc_in_use(vcpu, msr_info->index);
++	/*
++	 * intel_pmu_set_msr()
++	 * amd_pmu_set_msr()
++	 */
+ 	return kvm_x86_ops.pmu_ops->set_msr(vcpu, msr_info);
+ }
+ 
+diff --git a/arch/x86/kvm/pmu.h b/arch/x86/kvm/pmu.h
+index f4fde6bcc8cc..4d63bd0c73de 100644
+--- a/arch/x86/kvm/pmu.h
++++ b/arch/x86/kvm/pmu.h
+@@ -47,11 +47,27 @@ static inline u64 pmc_bitmask(struct kvm_pmc *pmc)
+ 	return pmu->counter_bitmask[pmc->type];
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/pmu.c|377| <<kvm_pmu_rdpmc>> *data = pmc_read_counter(pmc) & mask;
++ *   - arch/x86/kvm/pmu.h|75| <<pmc_stop_counter>> pmc->counter = pmc_read_counter(pmc);
++ *   - arch/x86/kvm/svm/pmu.c|249| <<amd_pmu_get_msr>> msr_info->data = pmc_read_counter(pmc);
++ *   - arch/x86/kvm/svm/pmu.c|272| <<amd_pmu_set_msr>> pmc->counter += data - pmc_read_counter(pmc);
++ *   - arch/x86/kvm/vmx/pmu_intel.c|228| <<intel_pmu_get_msr>> u64 val = pmc_read_counter(pmc);
++ *   - arch/x86/kvm/vmx/pmu_intel.c|233| <<intel_pmu_get_msr>> u64 val = pmc_read_counter(pmc);
++ *   - arch/x86/kvm/vmx/pmu_intel.c|293| <<intel_pmu_set_msr>> pmc->counter += data - pmc_read_counter(pmc);
++ *   - arch/x86/kvm/vmx/pmu_intel.c|297| <<intel_pmu_set_msr>> pmc->counter += data - pmc_read_counter(pmc);
++ */
+ static inline u64 pmc_read_counter(struct kvm_pmc *pmc)
+ {
+ 	u64 counter, enabled, running;
+ 
+ 	counter = pmc->counter;
++	/*
++	 * called by:
++	 *   - arch/arm64/kvm/pmu-emul.c|86| <<kvm_pmu_get_counter_value>> counter += perf_event_read_value(pmc->perf_event, &enabled, &running);
++	 *   - arch/x86/kvm/pmu.h|56| <<pmc_read_counter>> counter += perf_event_read_value(pmc->perf_event, &enabled, &running);
++	 */
+ 	if (pmc->perf_event && !pmc->is_paused)
+ 		counter += perf_event_read_value(pmc->perf_event,
+ 						 &enabled, &running);
+diff --git a/arch/x86/kvm/svm/pmu.c b/arch/x86/kvm/svm/pmu.c
+index 663d943f85db..c2e35782cabd 100644
+--- a/arch/x86/kvm/svm/pmu.c
++++ b/arch/x86/kvm/svm/pmu.c
+@@ -269,6 +269,17 @@ static int amd_pmu_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 	/* MSR_PERFCTRn */
+ 	pmc = get_gp_pmc_amd(pmu, msr, PMU_TYPE_COUNTER);
+ 	if (pmc) {
++		/*
++		 * called by:
++		 *   - arch/x86/kvm/pmu.c|377| <<kvm_pmu_rdpmc>> *data = pmc_read_counter(pmc) & mask;
++		 *   - arch/x86/kvm/pmu.h|75| <<pmc_stop_counter>> pmc->counter = pmc_read_counter(pmc);
++		 *   - arch/x86/kvm/svm/pmu.c|249| <<amd_pmu_get_msr>> msr_info->data = pmc_read_counter(pmc);
++		 *   - arch/x86/kvm/svm/pmu.c|272| <<amd_pmu_set_msr>> pmc->counter += data - pmc_read_counter(pmc);
++		 *   - arch/x86/kvm/vmx/pmu_intel.c|228| <<intel_pmu_get_msr>> u64 val = pmc_read_counter(pmc);
++		 *   - arch/x86/kvm/vmx/pmu_intel.c|233| <<intel_pmu_get_msr>> u64 val = pmc_read_counter(pmc);
++		 *   - arch/x86/kvm/vmx/pmu_intel.c|293| <<intel_pmu_set_msr>> pmc->counter += data - pmc_read_counter(pmc);
++		 *   - arch/x86/kvm/vmx/pmu_intel.c|297| <<intel_pmu_set_msr>> pmc->counter += data - pmc_read_counter(pmc);
++		 */
+ 		pmc->counter += data - pmc_read_counter(pmc);
+ 		pmc_update_sample_period(pmc);
+ 		return 0;
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 45da303ced50..d5d638d9f4ee 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -278,6 +278,12 @@ EXPORT_SYMBOL_GPL(x86_fpu_cache);
+  * Return 0 if we want to ignore/silent this failed msr access, or 1 if we want
+  * to fail the caller.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|1464| <<do_get_msr_feature>> r = kvm_msr_ignored_check(vcpu, index, 0, false);
++ *   - arch/x86/kvm/x86.c|1592| <<kvm_set_msr_ignored_check>> ret = kvm_msr_ignored_check(vcpu, index, data, true);
++ *   - arch/x86/kvm/x86.c|1626| <<kvm_get_msr_ignored_check>> ret = kvm_msr_ignored_check(vcpu, index, 0, false);
++ */
+ static int kvm_msr_ignored_check(struct kvm_vcpu *vcpu, u32 msr,
+ 				 u64 data, bool write)
+ {
+@@ -1545,6 +1551,10 @@ EXPORT_SYMBOL_GPL(kvm_enable_efer_bits);
+  * Returns 0 on success, non-0 otherwise.
+  * Assumes vcpu_load() was already called.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|1589| <<kvm_set_msr_ignored_check>> int ret = __kvm_set_msr(vcpu, index, data, host_initiated);
++ */
+ static int __kvm_set_msr(struct kvm_vcpu *vcpu, u32 index, u64 data,
+ 			 bool host_initiated)
+ {
+@@ -1580,14 +1590,29 @@ static int __kvm_set_msr(struct kvm_vcpu *vcpu, u32 index, u64 data,
+ 	msr.index = index;
+ 	msr.host_initiated = host_initiated;
+ 
++	/*
++	 * vmx_set_msr()
++	 * svm_set_msr()
++	 */
+ 	return kvm_x86_ops.set_msr(vcpu, &msr);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|1640| <<kvm_set_msr>> return kvm_set_msr_ignored_check(vcpu, index, data, false);
++ *   - arch/x86/kvm/x86.c|1758| <<do_set_msr>> return kvm_set_msr_ignored_check(vcpu, index, *data, true);
++ */
+ static int kvm_set_msr_ignored_check(struct kvm_vcpu *vcpu,
+ 				     u32 index, u64 data, bool host_initiated)
+ {
+ 	int ret = __kvm_set_msr(vcpu, index, data, host_initiated);
+ 
++	/*
++	 * called by:
++	 *   - arch/x86/kvm/x86.c|1464| <<do_get_msr_feature>> r = kvm_msr_ignored_check(vcpu, index, 0, false);
++	 *   - arch/x86/kvm/x86.c|1592| <<kvm_set_msr_ignored_check>> ret = kvm_msr_ignored_check(vcpu, index, data, true);
++	 *   - arch/x86/kvm/x86.c|1626| <<kvm_get_msr_ignored_check>> ret = kvm_msr_ignored_check(vcpu, index, 0, false);
++	 */
+ 	if (ret == KVM_MSR_RET_INVALID)
+ 		ret = kvm_msr_ignored_check(vcpu, index, data, true);
+ 
+@@ -1753,6 +1778,10 @@ static int do_get_msr(struct kvm_vcpu *vcpu, unsigned index, u64 *data)
+ 	return kvm_get_msr_ignored_check(vcpu, index, data, true);
+ }
+ 
++/*
++ * 处理KVM_SET_MSRS:
++ *   - arch/x86/kvm/x86.c|4550| <<kvm_arch_vcpu_ioctl(KVM_SET_MSRS)>> r = msr_io(vcpu, argp, do_set_msr, 0);
++ */
+ static int do_set_msr(struct kvm_vcpu *vcpu, unsigned index, u64 *data)
+ {
+ 	return kvm_set_msr_ignored_check(vcpu, index, *data, true);
+@@ -2857,6 +2886,15 @@ static void record_steal_time(struct kvm_vcpu *vcpu)
+ 	kvm_unmap_gfn(vcpu, &map, &vcpu->arch.st.cache, true, false);
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kvm/svm/svm.c|2700| <<svm_set_msr>> return kvm_set_msr_common(vcpu, msr);
++ *   - arch/x86/kvm/vmx/vmx.c|2069| <<vmx_set_msr>> ret = kvm_set_msr_common(vcpu, msr_info);
++ *   - arch/x86/kvm/vmx/vmx.c|2104| <<vmx_set_msr>> ret = kvm_set_msr_common(vcpu, msr_info);
++ *   - arch/x86/kvm/vmx/vmx.c|2202| <<vmx_set_msr>> ret = kvm_set_msr_common(vcpu, msr_info);
++ *   - arch/x86/kvm/vmx/vmx.c|2205| <<vmx_set_msr>> ret = kvm_set_msr_common(vcpu, msr_info);
++ *   - arch/x86/kvm/vmx/vmx.c|2305| <<vmx_set_msr>> ret = kvm_set_msr_common(vcpu, msr_info);
++ */
+ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ {
+ 	bool pr = false;
+@@ -3131,6 +3169,13 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 	default:
+ 		if (msr && (msr == vcpu->kvm->arch.xen_hvm_config.msr))
+ 			return xen_hvm_config(vcpu, data);
++		/*
++		 * called by:
++		 *   - arch/x86/kvm/x86.c|3073| <<kvm_set_msr_common>> if (kvm_pmu_is_valid_msr(vcpu, msr))
++		 *   - arch/x86/kvm/x86.c|3134| <<kvm_set_msr_common>> if (kvm_pmu_is_valid_msr(vcpu, msr))
++		 *   - arch/x86/kvm/x86.c|3220| <<kvm_get_msr_common>> if (kvm_pmu_is_valid_msr(vcpu, msr_info->index))
++		 *   - arch/x86/kvm/x86.c|3403| <<kvm_get_msr_common>> if (kvm_pmu_is_valid_msr(vcpu, msr_info->index))
++		 */
+ 		if (kvm_pmu_is_valid_msr(vcpu, msr))
+ 			return kvm_pmu_set_msr(vcpu, msr_info);
+ 		return KVM_MSR_RET_INVALID;
+@@ -3432,6 +3477,12 @@ static int __msr_io(struct kvm_vcpu *vcpu, struct kvm_msrs *msrs,
+  *
+  * @return number of msrs set successfully.
+  */
++/*
++ * called by:
++ *   - arch/x86/kvm/x86.c|3697| <<kvm_arch_dev_ioctl(KVM_GET_MSRS)>> r = msr_io(NULL, argp, do_get_msr_feature, 1);
++ *   - arch/x86/kvm/x86.c|4544| <<kvm_arch_vcpu_ioctl(KVM_GET_MSRS)>> r = msr_io(vcpu, argp, do_get_msr, 1);
++ *   - arch/x86/kvm/x86.c|4550| <<kvm_arch_vcpu_ioctl(KVM_SET_MSRS)>> r = msr_io(vcpu, argp, do_set_msr, 0);
++ */
+ static int msr_io(struct kvm_vcpu *vcpu, struct kvm_msrs __user *user_msrs,
+ 		  int (*do_msr)(struct kvm_vcpu *vcpu,
+ 				unsigned index, u64 *data),
+@@ -3694,6 +3745,12 @@ long kvm_arch_dev_ioctl(struct file *filp,
+ 		break;
+ 	}
+ 	case KVM_GET_MSRS:
++		/*
++		 * called by:
++		 *   - arch/x86/kvm/x86.c|3697| <<kvm_arch_dev_ioctl(KVM_GET_MSRS)>> r = msr_io(NULL, argp, do_get_msr_feature, 1);
++		 *   - arch/x86/kvm/x86.c|4544| <<kvm_arch_vcpu_ioctl(KVM_GET_MSRS)>> r = msr_io(vcpu, argp, do_get_msr, 1);
++		 *   - arch/x86/kvm/x86.c|4550| <<kvm_arch_vcpu_ioctl(KVM_SET_MSRS)>> r = msr_io(vcpu, argp, do_set_msr, 0);
++		 */
+ 		r = msr_io(NULL, argp, do_get_msr_feature, 1);
+ 		break;
+ 	default:
+@@ -4541,12 +4598,24 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
+ 	}
+ 	case KVM_GET_MSRS: {
+ 		int idx = srcu_read_lock(&vcpu->kvm->srcu);
++		/*
++		 * called by:
++		 *   - arch/x86/kvm/x86.c|3697| <<kvm_arch_dev_ioctl(KVM_GET_MSRS)>> r = msr_io(NULL, argp, do_get_msr_feature, 1);
++		 *   - arch/x86/kvm/x86.c|4544| <<kvm_arch_vcpu_ioctl(KVM_GET_MSRS)>> r = msr_io(vcpu, argp, do_get_msr, 1);
++		 *   - arch/x86/kvm/x86.c|4550| <<kvm_arch_vcpu_ioctl(KVM_SET_MSRS)>> r = msr_io(vcpu, argp, do_set_msr, 0);
++		 */
+ 		r = msr_io(vcpu, argp, do_get_msr, 1);
+ 		srcu_read_unlock(&vcpu->kvm->srcu, idx);
+ 		break;
+ 	}
+ 	case KVM_SET_MSRS: {
+ 		int idx = srcu_read_lock(&vcpu->kvm->srcu);
++		/*
++		 * called by:
++		 *   - arch/x86/kvm/x86.c|3697| <<kvm_arch_dev_ioctl(KVM_GET_MSRS)>> r = msr_io(NULL, argp, do_get_msr_feature, 1);
++		 *   - arch/x86/kvm/x86.c|4544| <<kvm_arch_vcpu_ioctl(KVM_GET_MSRS)>> r = msr_io(vcpu, argp, do_get_msr, 1);
++		 *   - arch/x86/kvm/x86.c|4550| <<kvm_arch_vcpu_ioctl(KVM_SET_MSRS)>> r = msr_io(vcpu, argp, do_set_msr, 0);
++		 */
+ 		r = msr_io(vcpu, argp, do_set_msr, 0);
+ 		srcu_read_unlock(&vcpu->kvm->srcu, idx);
+ 		break;
+diff --git a/drivers/iommu/iommu.c b/drivers/iommu/iommu.c
+index c5758fb696cc..b5e52a20bc1b 100644
+--- a/drivers/iommu/iommu.c
++++ b/drivers/iommu/iommu.c
+@@ -1858,6 +1858,31 @@ static size_t iommu_pgsize(struct iommu_domain *domain,
+ 	return pgsize;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm/mm/dma-mapping.c|1374| <<__iommu_create_mapping>> ret = iommu_map(mapping->domain, iova, phys, len, __dma_info_to_prot(DMA_BIDIRECTIONAL, attrs));
++  4 arch/arm/mm/dma-mapping.c|1643| <<__map_sg_chunk>> ret = iommu_map(mapping->domain, iova, phys, len, prot);
++  5 arch/arm/mm/dma-mapping.c|1851| <<arm_coherent_iommu_map_page>> ret = iommu_map(mapping->domain, dma_addr, page_to_phys(page), len, prot);
++  6 arch/arm/mm/dma-mapping.c|1957| <<arm_iommu_map_resource>> ret = iommu_map(mapping->domain, dma_addr, addr, len, prot);
++  7 drivers/gpu/drm/msm/adreno/a6xx_gmu.c|947| <<a6xx_gmu_memory_alloc>> ret = iommu_map(gmu->domain, bo->iova + (PAGE_SIZE * i), page_to_phys(bo->pages[i]), PAGE_SIZE, IOMMU_READ | IOMMU_WRITE);
++  8 drivers/gpu/drm/nouveau/nvkm/subdev/instmem/gk20a.c|477| <<gk20a_instobj_ctor_iommu>> ret = iommu_map(imem->domain, offset, node->dma_addrs[i], PAGE_SIZE, IOMMU_READ | IOMMU_WRITE);
++  9 drivers/gpu/drm/tegra/drm.c|1168| <<tegra_drm_alloc>> err = iommu_map(tegra->domain, *dma, virt_to_phys(virt), size, IOMMU_READ | IOMMU_WRITE);
++ 10 drivers/gpu/host1x/cdma.c|107| <<host1x_pushbuffer_init>> err = iommu_map(host1x->domain, pb->dma, pb->phys, size, IOMMU_READ);
++ *   - drivers/infiniband/hw/usnic/usnic_uiom.c|284| <<usnic_uiom_map_sorted_intervals>> err = iommu_map(pd->domain, va_start, pa_start,
++ 12 drivers/infiniband/hw/usnic/usnic_uiom.c|301| <<usnic_uiom_map_sorted_intervals>> err = iommu_map(pd->domain, va_start, pa_start,
++ 13 drivers/iommu/dma-iommu.c|479| <<__iommu_dma_map>> if (iommu_map(domain, iova, phys - iova_off, size, prot)) {
++ 14 drivers/iommu/dma-iommu.c|1163| <<iommu_dma_get_msi_page>> if (iommu_map(domain, iova, msi_addr, size, prot))
++ 15 drivers/iommu/iommu.c|663| <<iommu_group_create_direct_mappings>> ret = iommu_map(domain, addr, addr, pg_size, entry->prot);
++ *   - drivers/iommu/iommu.c|2010| <<iommu_map_sg>> ret = iommu_map(domain, iova + mapped, start, len, prot);
++ 18 drivers/media/platform/qcom/venus/firmware.c|144| <<venus_boot_no_tz>> ret = iommu_map(iommu, VENUS_FW_START_ADDR, mem_phys, mem_size,
++ 19 drivers/remoteproc/remoteproc_core.c|703| <<rproc_handle_devmem>> ret = iommu_map(rproc->domain, rsc->da, rsc->pa, rsc->len, rsc->flags);
++ 20 drivers/remoteproc/remoteproc_core.c|793| <<rproc_alloc_carveout>> ret = iommu_map(rproc->domain, mem->da, dma, mem->len,
++ 21 drivers/vfio/vfio_iommu_type1.c|1245| <<vfio_iommu_map>> ret = iommu_map(d->domain, iova, (phys_addr_t)pfn << PAGE_SHIFT,
++ 22 drivers/vfio/vfio_iommu_type1.c|1675| <<vfio_iommu_replay>> ret = iommu_map(domain->domain, iova, phys,
++ 23 drivers/vfio/vfio_iommu_type1.c|1759| <<vfio_test_domain_fgsp>> ret = iommu_map(domain->domain, 0, page_to_phys(pages), PAGE_SIZE * 2,
++ 24 drivers/vhost/vdpa.c|825| <<vhost_vdpa_map>> r = iommu_map(v->domain, iova, pa, size,
++ 25 include/linux/iommu.h|659| <<iommu_map>> static inline int iommu_map(struct iommu_domain *domain, unsigned long iova,
++ */
+ int iommu_map(struct iommu_domain *domain, unsigned long iova,
+ 	      phys_addr_t paddr, size_t size, int prot)
+ {
+diff --git a/drivers/vfio/vfio_iommu_type1.c b/drivers/vfio/vfio_iommu_type1.c
+index 0befe9185b16..a7b5b26f0bfe 100644
+--- a/drivers/vfio/vfio_iommu_type1.c
++++ b/drivers/vfio/vfio_iommu_type1.c
+@@ -141,6 +141,32 @@ static int put_pfn(unsigned long pfn, int prot);
+  * into DMA'ble space using the IOMMU
+  */
+ 
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|513| <<vfio_find_dma_valid>> *dma_p = vfio_find_dma(iommu, start, size);
++ *   - drivers/vfio/vfio_iommu_type1.c|757| <<vfio_iommu_type1_pin_pages>> dma = vfio_find_dma(iommu, iova, PAGE_SIZE);
++ *   - drivers/vfio/vfio_iommu_type1.c|797| <<vfio_iommu_type1_pin_pages>> dma = vfio_find_dma(iommu, iova, PAGE_SIZE);
++ *   - drivers/vfio/vfio_iommu_type1.c|829| <<vfio_iommu_type1_unpin_pages>> dma = vfio_find_dma(iommu, iova, PAGE_SIZE);
++ *   - drivers/vfio/vfio_iommu_type1.c|1117| <<vfio_dma_do_unmap>> dma = vfio_find_dma(iommu, iova, 1);
++ *   - drivers/vfio/vfio_iommu_type1.c|1121| <<vfio_dma_do_unmap>> dma = vfio_find_dma(iommu, iova + size - 1, 0);
++ *   - drivers/vfio/vfio_iommu_type1.c|1410| <<vfio_dma_do_map>> dma = vfio_find_dma(iommu, iova, size);
++ *   - drivers/vfio/vfio_iommu_type1.c|1865| <<vfio_iommu_aper_conflict>> if (vfio_find_dma(iommu, first->start, start - first->start))
++ *   - drivers/vfio/vfio_iommu_type1.c|1871| <<vfio_iommu_aper_conflict>> if (vfio_find_dma(iommu, end + 1, last->end - end))
++ *   - drivers/vfio/vfio_iommu_type1.c|1932| <<vfio_iommu_resv_conflict>> if (vfio_find_dma(iommu, region->start, region->length))
++ *
++ *  90 struct vfio_dma {
++ *  91         struct rb_node          node;
++ *  92         dma_addr_t              iova;           // Device address
++ *  93         unsigned long           vaddr;          // Process virtual addr
++ *  94         size_t                  size;           // Map size (bytes)
++ *  95         int                     prot;           // IOMMU_READ/WRITE
++ *  96         bool                    iommu_mapped;
++ *  97         bool                    lock_cap;       // capable(CAP_IPC_LOCK)
++ *  98         bool                    vaddr_invalid;
++ *  99         struct task_struct      *task;
++ * 100         struct rb_root          pfn_list;       // Ex-user pinned pfn list
++ * 101 };
++ */
+ static struct vfio_dma *vfio_find_dma(struct vfio_iommu *iommu,
+ 				      dma_addr_t start, size_t size)
+ {
+@@ -185,6 +211,10 @@ static struct rb_node *vfio_find_dma_first_node(struct vfio_iommu *iommu,
+ 	return res;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|1482| <<vfio_dma_do_map>> vfio_link_dma(iommu, dma);
++ */
+ static void vfio_link_dma(struct vfio_iommu *iommu, struct vfio_dma *new)
+ {
+ 	struct rb_node **link = &iommu->dma_list.rb_node, *parent = NULL;
+@@ -212,6 +242,14 @@ static void vfio_unlink_dma(struct vfio_iommu *iommu, struct vfio_dma *old)
+ /*
+  * Helper Functions for host iova-pfn list
+  */
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|315| <<vfio_iova_get_vfio_pfn>> struct vfio_pfn *vpfn = vfio_find_vpfn(dma, iova);
++ *   - drivers/vfio/vfio_iommu_type1.c|616| <<vfio_pin_pages_remote>> if (!rsvd && !vfio_find_vpfn(dma, iova)) {
++ *   - drivers/vfio/vfio_iommu_type1.c|647| <<vfio_pin_pages_remote>> if (!rsvd && !vfio_find_vpfn(dma, iova)) {
++ *   - drivers/vfio/vfio_iommu_type1.c|703| <<vfio_unpin_pages_remote>> if (vfio_find_vpfn(dma, iova))
++ *   - drivers/vfio/vfio_iommu_type1.c|745| <<vfio_unpin_page_external>> struct vfio_pfn *vpfn = vfio_find_vpfn(dma, iova);
++ */
+ static struct vfio_pfn *vfio_find_vpfn(struct vfio_dma *dma, dma_addr_t iova)
+ {
+ 	struct vfio_pfn *vpfn;
+@@ -300,6 +338,18 @@ static int vfio_iova_put_vfio_pfn(struct vfio_dma *dma, struct vfio_pfn *vpfn)
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|611| <<vfio_pin_pages_remote>> ret = vfio_lock_acct(dma, lock_acct, false);
++ *   - drivers/vfio/vfio_iommu_type1.c|642| <<vfio_unpin_pages_remote>> vfio_lock_acct(dma, locked - unlocked, true);
++ *   - drivers/vfio/vfio_iommu_type1.c|659| <<vfio_pin_page_external>> ret = vfio_lock_acct(dma, 1, true);
++ *   - drivers/vfio/vfio_iommu_type1.c|686| <<vfio_unpin_page_external>> vfio_lock_acct(dma, -unlocked, true);
++ *   - drivers/vfio/vfio_iommu_type1.c|771| <<vfio_iommu_type1_pin_pages>> vfio_lock_acct(dma, -1, true);
++ *   - drivers/vfio/vfio_iommu_type1.c|997| <<vfio_unmap_unpin>> vfio_lock_acct(dma, -unlocked, true);
++ *   - drivers/vfio/vfio_iommu_type1.c|1255| <<vfio_pin_map_dma_chunk>> ret = vfio_lock_acct(dma, cache_size, false);
++ *   - drivers/vfio/vfio_iommu_type1.c|1285| <<vfio_pin_map_dma_chunk>> vfio_lock_acct(dma, -lock_cache, false);
++ *   - drivers/vfio/vfio_iommu_type1.c|2246| <<vfio_iommu_unmap_unpin_reaccount>> vfio_lock_acct(dma, locked - unlocked, true);
++ */
+ static int vfio_lock_acct(struct vfio_dma *dma, long npage, bool async)
+ {
+ 	struct mm_struct *mm;
+@@ -313,7 +363,16 @@ static int vfio_lock_acct(struct vfio_dma *dma, long npage, bool async)
+ 		return -ESRCH; /* process exited */
+ 
+ 	ret = down_write_killable(&mm->mmap_sem);
++	/*
++	 * 返回0说明lock成功了
++	 */
+ 	if (!ret) {
++		/*
++		 * called by:
++		 *   - drivers/vfio/vfio_iommu_type1.c|359| <<vfio_lock_acct>> ret = __account_locked_vm(mm, abs(npage), npage > 0,
++		 *                 dma->task, dma->lock_cap);
++		 *   - mm/util.c|507| <<account_locked_vm>> ret = __account_locked_vm(mm, pages, inc, current, capable(CAP_IPC_LOCK));
++		 */
+ 		ret = __account_locked_vm(mm, abs(npage), npage > 0, dma->task,
+ 					  dma->lock_cap);
+ 		if (!ret)
+@@ -332,6 +391,15 @@ static int vfio_lock_acct(struct vfio_dma *dma, long npage, bool async)
+  * MMIO range for our own or another device.  These use a different
+  * pfn conversion and shouldn't be tracked as locked pages.
+  */
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|413| <<put_pfn>> if (!is_invalid_reserved_pfn(pfn)) {
++ *   - drivers/vfio/vfio_iommu_type1.c|512| <<vaddr_get_pfn>> if (!ret && !is_invalid_reserved_pfn(*pfn))
++ *   - drivers/vfio/vfio_iommu_type1.c|610| <<vfio_pin_pages_remote>> rsvd = is_invalid_reserved_pfn(*pfn_base);
++ *   - drivers/vfio/vfio_iommu_type1.c|642| <<vfio_pin_pages_remote>> rsvd != is_invalid_reserved_pfn(pfn)) {
++ *   - drivers/vfio/vfio_iommu_type1.c|725| <<vfio_pin_page_external>> if (!ret && do_accounting && !is_invalid_reserved_pfn(*pfn_base)) {
++ *   - drivers/vfio/vfio_iommu_type1.c|2404| <<vfio_iommu_unmap_unpin_reaccount>> if (!is_invalid_reserved_pfn(vpfn->pfn))
++ */
+ static bool is_invalid_reserved_pfn(unsigned long pfn)
+ {
+ 	if (pfn_valid(pfn)) {
+@@ -408,6 +476,12 @@ static int follow_fault_pfn(struct vm_area_struct *vma, struct mm_struct *mm,
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|623| <<vfio_pin_pages_remote>> ret = vaddr_get_pfn(mm, vaddr, dma->prot, pfn_base, false);
++ *   - drivers/vfio/vfio_iommu_type1.c|674| <<vfio_pin_pages_remote>> ret = vaddr_get_pfn(mm, vaddr, dma->prot, &pfn, false);
++ *   - drivers/vfio/vfio_iommu_type1.c|782| <<vfio_pin_page_external>> ret = vaddr_get_pfn(mm, vaddr, dma->prot, pfn_base, true);
++ */
+ static int vaddr_get_pfn(struct mm_struct *mm, unsigned long vaddr,
+ 			 int prot, unsigned long *pfn, bool handle_mmap_sem)
+ {
+@@ -530,6 +604,13 @@ static int vfio_wait_all_valid(struct vfio_iommu *iommu)
+  * the iommu can only map chunks of consecutive pfns anyway, so get the
+  * first page and all consecutive pages with the same locking.
+  */
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|1278| <<vfio_pin_map_dma_chunk>> npage = vfio_pin_pages_remote(dma, start_vaddr + mapped_size,
++ *                                                unmapped_size >> PAGE_SHIFT, &pfn, args->limit, args->mm, &lock_cache);
++ *   - drivers/vfio/vfio_iommu_type1.c|1570| <<vfio_iommu_replay>> npage = vfio_pin_pages_remote(dma, vaddr, n >> PAGE_SHIFT,
++ *                                                &pfn, limit, current->mm, &lock_cache);
++ */
+ static long vfio_pin_pages_remote(struct vfio_dma *dma, unsigned long vaddr,
+ 				  long npage, unsigned long *pfn_base,
+ 				  unsigned long limit, struct mm_struct *mm,
+@@ -552,12 +633,29 @@ static long vfio_pin_pages_remote(struct vfio_dma *dma, unsigned long vaddr,
+ 	}
+ 
+ 	pinned++;
++	/*
++	 * called by:
++	 *   - drivers/vfio/vfio_iommu_type1.c|413| <<put_pfn>> if (!is_invalid_reserved_pfn(pfn)) {
++	 *   - drivers/vfio/vfio_iommu_type1.c|512| <<vaddr_get_pfn>> if (!ret && !is_invalid_reserved_pfn(*pfn))
++	 *   - drivers/vfio/vfio_iommu_type1.c|610| <<vfio_pin_pages_remote>> rsvd = is_invalid_reserved_pfn(*pfn_base);
++	 *   - drivers/vfio/vfio_iommu_type1.c|642| <<vfio_pin_pages_remote>> rsvd != is_invalid_reserved_pfn(pfn)) {
++	 *   - drivers/vfio/vfio_iommu_type1.c|725| <<vfio_pin_page_external>> if (!ret && do_accounting && !is_invalid_reserved_pfn(*pfn_base)) {
++	 *   - drivers/vfio/vfio_iommu_type1.c|2404| <<vfio_iommu_unmap_unpin_reaccount>> if (!is_invalid_reserved_pfn(vpfn->pfn))
++	 */
+ 	rsvd = is_invalid_reserved_pfn(*pfn_base);
+ 
+ 	/*
+ 	 * Reserved pages aren't counted against the user, externally pinned
+ 	 * pages are already counted against the user.
+ 	 */
++	/*
++	 * called by:
++	 *   - drivers/vfio/vfio_iommu_type1.c|315| <<vfio_iova_get_vfio_pfn>> struct vfio_pfn *vpfn = vfio_find_vpfn(dma, iova);
++	 *   - drivers/vfio/vfio_iommu_type1.c|616| <<vfio_pin_pages_remote>> if (!rsvd && !vfio_find_vpfn(dma, iova)) {
++	 *   - drivers/vfio/vfio_iommu_type1.c|647| <<vfio_pin_pages_remote>> if (!rsvd && !vfio_find_vpfn(dma, iova)) {
++	 *   - drivers/vfio/vfio_iommu_type1.c|703| <<vfio_unpin_pages_remote>> if (vfio_find_vpfn(dma, iova))
++	 *   - drivers/vfio/vfio_iommu_type1.c|745| <<vfio_unpin_page_external>> struct vfio_pfn *vpfn = vfio_find_vpfn(dma, iova);
++	 */
+ 	if (!rsvd && !vfio_find_vpfn(dma, iova)) {
+ 		if (!dma->lock_cap && *lock_cache == 0 &&
+ 		    mm->locked_vm + 1 > limit) {
+@@ -583,12 +681,29 @@ static long vfio_pin_pages_remote(struct vfio_dma *dma, unsigned long vaddr,
+ 		if (ret)
+ 			break;
+ 
++		/*
++		 * called by:
++		 *   - drivers/vfio/vfio_iommu_type1.c|413| <<put_pfn>> if (!is_invalid_reserved_pfn(pfn)) {
++		 *   - drivers/vfio/vfio_iommu_type1.c|512| <<vaddr_get_pfn>> if (!ret && !is_invalid_reserved_pfn(*pfn))
++		 *   - drivers/vfio/vfio_iommu_type1.c|610| <<vfio_pin_pages_remote>> rsvd = is_invalid_reserved_pfn(*pfn_base);
++		 *   - drivers/vfio/vfio_iommu_type1.c|642| <<vfio_pin_pages_remote>> rsvd != is_invalid_reserved_pfn(pfn)) {
++		 *   - drivers/vfio/vfio_iommu_type1.c|725| <<vfio_pin_page_external>> if (!ret && do_accounting && !is_invalid_reserved_pfn(*pfn_base)) {
++		 *   - drivers/vfio/vfio_iommu_type1.c|2404| <<vfio_iommu_unmap_unpin_reaccount>> if (!is_invalid_reserved_pfn(vpfn->pfn))
++		 */
+ 		if (pfn != *pfn_base + pinned ||
+ 		    rsvd != is_invalid_reserved_pfn(pfn)) {
+ 			put_pfn(pfn, dma->prot);
+ 			break;
+ 		}
+ 
++		/*
++		 * called by:
++		 *   - drivers/vfio/vfio_iommu_type1.c|315| <<vfio_iova_get_vfio_pfn>> struct vfio_pfn *vpfn = vfio_find_vpfn(dma, iova);
++		 *   - drivers/vfio/vfio_iommu_type1.c|616| <<vfio_pin_pages_remote>> if (!rsvd && !vfio_find_vpfn(dma, iova)) {
++		 *   - drivers/vfio/vfio_iommu_type1.c|647| <<vfio_pin_pages_remote>> if (!rsvd && !vfio_find_vpfn(dma, iova)) {
++		 *   - drivers/vfio/vfio_iommu_type1.c|703| <<vfio_unpin_pages_remote>> if (vfio_find_vpfn(dma, iova))
++		 *   - drivers/vfio/vfio_iommu_type1.c|745| <<vfio_unpin_page_external>> struct vfio_pfn *vpfn = vfio_find_vpfn(dma, iova);
++		 */
+ 		if (!rsvd && !vfio_find_vpfn(dma, iova)) {
+ 			if (!dma->lock_cap && *lock_cache == 0 &&
+ 			    mm->locked_vm + lock_acct + 1 > limit) {
+@@ -608,6 +723,18 @@ static long vfio_pin_pages_remote(struct vfio_dma *dma, unsigned long vaddr,
+ 
+ out:
+ 	up_read(&mm->mmap_sem);
++	/*
++	 * called by:
++	 *   - drivers/vfio/vfio_iommu_type1.c|611| <<vfio_pin_pages_remote>> ret = vfio_lock_acct(dma, lock_acct, false);
++	 *   - drivers/vfio/vfio_iommu_type1.c|642| <<vfio_unpin_pages_remote>> vfio_lock_acct(dma, locked - unlocked, true);
++	 *   - drivers/vfio/vfio_iommu_type1.c|659| <<vfio_pin_page_external>> ret = vfio_lock_acct(dma, 1, true);
++	 *   - drivers/vfio/vfio_iommu_type1.c|686| <<vfio_unpin_page_external>> vfio_lock_acct(dma, -unlocked, true);
++	 *   - drivers/vfio/vfio_iommu_type1.c|771| <<vfio_iommu_type1_pin_pages>> vfio_lock_acct(dma, -1, true);
++	 *   - drivers/vfio/vfio_iommu_type1.c|997| <<vfio_unmap_unpin>> vfio_lock_acct(dma, -unlocked, true);
++	 *   - drivers/vfio/vfio_iommu_type1.c|1255| <<vfio_pin_map_dma_chunk>> ret = vfio_lock_acct(dma, cache_size, false);
++	 *   - drivers/vfio/vfio_iommu_type1.c|1285| <<vfio_pin_map_dma_chunk>> vfio_lock_acct(dma, -lock_cache, false);
++	 *   - drivers/vfio/vfio_iommu_type1.c|2246| <<vfio_iommu_unmap_unpin_reaccount>> vfio_lock_acct(dma, locked - unlocked, true);
++	 */
+ 	ret = vfio_lock_acct(dma, lock_acct, false);
+ 
+ unpin_out:
+@@ -644,6 +771,10 @@ static long vfio_unpin_pages_remote(struct vfio_dma *dma, dma_addr_t iova,
+ 	return unlocked;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|881| <<vfio_iommu_type1_pin_pages>> ret = vfio_pin_page_external(dma, remote_vaddr, &phys_pfn[i], do_accounting);
++ */
+ static int vfio_pin_page_external(struct vfio_dma *dma, unsigned long vaddr,
+ 				  unsigned long *pfn_base, bool do_accounting)
+ {
+@@ -688,6 +819,11 @@ static int vfio_unpin_page_external(struct vfio_dma *dma, dma_addr_t iova,
+ 	return unlocked;
+ }
+ 
++/*
++ * 一般没有调用
++ *
++ * struct vfio_iommu_driver_ops vfio_iommu_driver_ops_type1.pin_pages = vfio_iommu_type1_pin_pages()
++ */
+ static int vfio_iommu_type1_pin_pages(void *iommu_data,
+ 				      unsigned long *user_pfn,
+ 				      int npage, int prot,
+@@ -1189,6 +1325,10 @@ static int vfio_dma_do_unmap(struct vfio_iommu *iommu,
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|1323| <<vfio_pin_map_dma_chunk>> ret = vfio_iommu_map(args->iommu, iova + mapped_size, pfn, npage, dma->prot);
++ */
+ static int vfio_iommu_map(struct vfio_iommu *iommu, dma_addr_t iova,
+ 			  unsigned long pfn, long npage, int prot)
+ {
+@@ -1228,6 +1368,27 @@ static void vfio_pin_map_dma_undo(unsigned long start_vaddr,
+ 	vfio_unmap_unpin(args->iommu, args->dma, true);
+ }
+ 
++/*
++ * commit bf5042499e6b62291438daa65ee844e25f594aeb
++ * Author: Daniel Jordan <daniel.m.jordan@oracle.com>
++ * Date:   Tue Oct 23 16:44:14 2018 -0400
++ *
++ * vfio: ease mmap_sem writer contention by caching locked_vm
++ *
++ * ktask threads hold mmap_sem as reader for the majority of their runtime
++ * but also periodically take mmap_sem as writer for short periods, hurting
++ * parallelism.
++ *
++ * Alleviate the write-side contention with a per-thread cache of locked_vm.
++ *
++ * Signed-off-by: Daniel Jordan <daniel.m.jordan@oracle.com>
++ * Reviewed-by: Khalid Aziz <khalid.aziz@oracle.com>
++ * Reviewed-by: Prasad Singamsetty <prasad.singamsetty@oracle.com>
++ *
++ * Orabug: 29708084
++ * Signed-off-by: Daniel Jordan <daniel.m.jordan@oracle.com>
++ * Reviewed-by: Khalid Aziz <khalid.aziz@oracle.com> 
++ */
+ /*
+  * Relieve mmap_sem contention when multithreading page pinning by caching
+  * locked_vm locally.  Bound the locked_vm that a thread will cache but not use
+@@ -1236,9 +1397,39 @@ static void vfio_pin_map_dma_undo(unsigned long start_vaddr,
+  */
+ #define LOCK_CACHE_MAX	16384
+ 
++/*
++ * 1471 static int vfio_pin_map_dma(struct vfio_iommu *iommu, struct vfio_dma *dma,
++ * 1472                             size_t map_size)
++ * 1473 {       
++ * 1474         unsigned long limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
++ * 1475         int ret = 0;
++ * 1476         struct vfio_pin_args args = { iommu, dma, limit, current->mm };
++ * 1477         // Stay on PMD boundary in case THP is being used.
++ * 1478         struct padata_mt_job job = {
++ * 1479                 .thread_fn   = vfio_pin_map_dma_chunk,
++ * 1480                 .fn_arg      = &args,
++ * 1481                 .start       = dma->vaddr,
++ * 1482                 .size        = map_size,
++ * 1483                 .align       = PMD_SIZE,
++ * 1484                 .min_chunk   = (1ul << 27),
++ * 1485                 .undo_fn     = vfio_pin_map_dma_undo,
++ * 1486                 .max_threads = 16,
++ * 1487         };
++ *
++ * 在以下使用vfio_pin_map_dma_chunk():
++ *   - drivers/vfio/vfio_iommu_type1.c|1306| <<vfio_pin_map_dma>> .thread_fn = vfio_pin_map_dma_chunk,
++ */
+ static int vfio_pin_map_dma_chunk(unsigned long start_vaddr,
+ 				  unsigned long end_vaddr, void *arg)
+ {
++	/*
++	 * 1347 struct vfio_pin_args {
++	 * 1348         struct vfio_iommu *iommu;
++	 * 1349         struct vfio_dma *dma;
++	 * 1350         unsigned long limit;
++	 * 1351         struct mm_struct *mm;
++	 * 1352 };
++	 */
+ 	struct vfio_pin_args *args = arg;
+ 	struct vfio_dma *dma = args->dma;
+ 	dma_addr_t iova = dma->iova + (start_vaddr - dma->vaddr);
+@@ -1250,14 +1441,40 @@ static int vfio_pin_map_dma_chunk(unsigned long start_vaddr,
+ 
+ 	while (unmapped_size) {
+ 		if (lock_cache == 0) {
++			/*
++			 * 注释:
++			 * Relieve mmap_sem contention when multithreading page pinning by caching
++			 * locked_vm locally.  Bound the locked_vm that a thread will cache but not use
++			 * with this constant, which is the smallest value that worked well in testing.
++			 * NOTE - LOCK_CACHE_MAX is in pages.
++			 */
+ 			cache_size = min_t(long, unmapped_size >> PAGE_SHIFT,
+ 					   LOCK_CACHE_MAX);
++			/*
++			 * called by:
++			 *   - drivers/vfio/vfio_iommu_type1.c|611| <<vfio_pin_pages_remote>> ret = vfio_lock_acct(dma, lock_acct, false);
++			 *   - drivers/vfio/vfio_iommu_type1.c|642| <<vfio_unpin_pages_remote>> vfio_lock_acct(dma, locked - unlocked, true);
++			 *   - drivers/vfio/vfio_iommu_type1.c|659| <<vfio_pin_page_external>> ret = vfio_lock_acct(dma, 1, true);
++			 *   - drivers/vfio/vfio_iommu_type1.c|686| <<vfio_unpin_page_external>> vfio_lock_acct(dma, -unlocked, true);
++			 *   - drivers/vfio/vfio_iommu_type1.c|771| <<vfio_iommu_type1_pin_pages>> vfio_lock_acct(dma, -1, true);
++			 *   - drivers/vfio/vfio_iommu_type1.c|997| <<vfio_unmap_unpin>> vfio_lock_acct(dma, -unlocked, true);
++			 *   - drivers/vfio/vfio_iommu_type1.c|1255| <<vfio_pin_map_dma_chunk>> ret = vfio_lock_acct(dma, cache_size, false);
++			 *   - drivers/vfio/vfio_iommu_type1.c|1285| <<vfio_pin_map_dma_chunk>> vfio_lock_acct(dma, -lock_cache, false);
++			 *   - drivers/vfio/vfio_iommu_type1.c|2246| <<vfio_iommu_unmap_unpin_reaccount>> vfio_lock_acct(dma, locked - unlocked, true);
++			 */
+ 			ret = vfio_lock_acct(dma, cache_size, false);
+ 			if (ret)
+ 				break;
+ 			lock_cache = cache_size;
+ 		}
+ 
++		/*
++		 * called by:
++		 *   - drivers/vfio/vfio_iommu_type1.c|1278| <<vfio_pin_map_dma_chunk>> npage = vfio_pin_pages_remote(dma, start_vaddr + mapped_size,
++		 *                                                unmapped_size >> PAGE_SHIFT, &pfn, args->limit, args->mm, &lock_cache);
++		 *   - drivers/vfio/vfio_iommu_type1.c|1570| <<vfio_iommu_replay>> npage = vfio_pin_pages_remote(dma, vaddr, n >> PAGE_SHIFT,
++		 *                                                &pfn, limit, current->mm, &lock_cache);
++		 */
+ 		/* Pin a contiguous chunk of memory */
+ 		npage = vfio_pin_pages_remote(dma, start_vaddr + mapped_size,
+ 					      unmapped_size >> PAGE_SHIFT,
+@@ -1269,6 +1486,9 @@ static int vfio_pin_map_dma_chunk(unsigned long start_vaddr,
+ 			break;
+ 		}
+ 
++		/*
++		 * 只在此处调用
++		 */
+ 		/* Map it! */
+ 		ret = vfio_iommu_map(args->iommu, iova + mapped_size, pfn,
+ 				     npage, dma->prot);
+@@ -1282,6 +1502,20 @@ static int vfio_pin_map_dma_chunk(unsigned long start_vaddr,
+ 		mapped_size   += npage << PAGE_SHIFT;
+ 	}
+ 
++	/*
++	 * called by:
++	 *   - drivers/vfio/vfio_iommu_type1.c|611| <<vfio_pin_pages_remote>> ret = vfio_lock_acct(dma, lock_acct, false);
++	 *   - drivers/vfio/vfio_iommu_type1.c|642| <<vfio_unpin_pages_remote>> vfio_lock_acct(dma, locked - unlocked, true);
++	 *   - drivers/vfio/vfio_iommu_type1.c|659| <<vfio_pin_page_external>> ret = vfio_lock_acct(dma, 1, true);
++	 *   - drivers/vfio/vfio_iommu_type1.c|686| <<vfio_unpin_page_external>> vfio_lock_acct(dma, -unlocked, true);
++	 *   - drivers/vfio/vfio_iommu_type1.c|771| <<vfio_iommu_type1_pin_pages>> vfio_lock_acct(dma, -1, true);
++	 *   - drivers/vfio/vfio_iommu_type1.c|997| <<vfio_unmap_unpin>> vfio_lock_acct(dma, -unlocked, true);
++	 *   - drivers/vfio/vfio_iommu_type1.c|1255| <<vfio_pin_map_dma_chunk>> ret = vfio_lock_acct(dma, cache_size, false);
++	 *   - drivers/vfio/vfio_iommu_type1.c|1285| <<vfio_pin_map_dma_chunk>> vfio_lock_acct(dma, -lock_cache, false);
++	 *   - drivers/vfio/vfio_iommu_type1.c|2246| <<vfio_iommu_unmap_unpin_reaccount>> vfio_lock_acct(dma, locked - unlocked, true);
++	 *
++	 * 这个是在while循环外面
++	 */
+ 	vfio_lock_acct(dma, -lock_cache, false);
+ 
+ 	/*
+@@ -1295,6 +1529,10 @@ static int vfio_pin_map_dma_chunk(unsigned long start_vaddr,
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|1464| <<vfio_dma_do_map>> ret = vfio_pin_map_dma(iommu, dma, size);
++ */
+ static int vfio_pin_map_dma(struct vfio_iommu *iommu, struct vfio_dma *dma,
+ 			    size_t map_size)
+ {
+@@ -1328,6 +1566,10 @@ static int vfio_pin_map_dma(struct vfio_iommu *iommu, struct vfio_dma *dma,
+ /*
+  * Check dma map request is within a valid iova range
+  */
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|1625| <<vfio_dma_do_map>> if (!vfio_iommu_iova_dma_valid(iommu, iova, iova + size - 1)) {
++ */
+ static bool vfio_iommu_iova_dma_valid(struct vfio_iommu *iommu,
+ 				      dma_addr_t start, dma_addr_t end)
+ {
+@@ -1346,9 +1588,25 @@ static bool vfio_iommu_iova_dma_valid(struct vfio_iommu *iommu,
+ 	return list_empty(iova);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|2675| <<vfio_iommu_type1_ioctl(VFIO_IOMMU_MAP_DMA)>> return vfio_dma_do_map(iommu, &map);
++ */
+ static int vfio_dma_do_map(struct vfio_iommu *iommu,
+ 			   struct vfio_iommu_type1_dma_map *map)
+ {
++	/*
++	 * 2829 struct vfio_iommu_type1_dma_map {
++	 * 2691                  * 830         __u32   argsz;
++	 * 2692                  * 831         __u32   flags;
++	 * 2693                  * 832 #define VFIO_DMA_MAP_FLAG_READ (1 << 0)         // readable from device
++	 * 2694                  * 833 #define VFIO_DMA_MAP_FLAG_WRITE (1 << 1)        // writable from device
++	 * 2695                  * 834 #define VFIO_DMA_MAP_FLAG_VADDR (1 << 2)
++	 * 2696                  * 835         __u64   vaddr;                          // Process virtual address
++	 * 2697                  * 836         __u64   iova;                           // IO virtual address
++	 * 2698                  * 837         __u64   size;                           // Size of mapping (bytes)
++	 * 2699                  * 838 };
++	 */
+ 	bool set_vaddr = map->flags & VFIO_DMA_MAP_FLAG_VADDR;
+ 	dma_addr_t iova = map->iova;
+ 	unsigned long vaddr = map->vaddr;
+@@ -1383,6 +1641,32 @@ static int vfio_dma_do_map(struct vfio_iommu *iommu,
+ 
+ 	mutex_lock(&iommu->lock);
+ 
++	/*
++	 * called by:
++	 *   - drivers/vfio/vfio_iommu_type1.c|513| <<vfio_find_dma_valid>> *dma_p = vfio_find_dma(iommu, start, size);
++	 *   - drivers/vfio/vfio_iommu_type1.c|757| <<vfio_iommu_type1_pin_pages>> dma = vfio_find_dma(iommu, iova, PAGE_SIZE);
++	 *   - drivers/vfio/vfio_iommu_type1.c|797| <<vfio_iommu_type1_pin_pages>> dma = vfio_find_dma(iommu, iova, PAGE_SIZE);
++	 *   - drivers/vfio/vfio_iommu_type1.c|829| <<vfio_iommu_type1_unpin_pages>> dma = vfio_find_dma(iommu, iova, PAGE_SIZE);
++	 *   - drivers/vfio/vfio_iommu_type1.c|1117| <<vfio_dma_do_unmap>> dma = vfio_find_dma(iommu, iova, 1);
++	 *   - drivers/vfio/vfio_iommu_type1.c|1121| <<vfio_dma_do_unmap>> dma = vfio_find_dma(iommu, iova + size - 1, 0);
++	 *   - drivers/vfio/vfio_iommu_type1.c|1410| <<vfio_dma_do_map>> dma = vfio_find_dma(iommu, iova, size);
++	 *   - drivers/vfio/vfio_iommu_type1.c|1865| <<vfio_iommu_aper_conflict>> if (vfio_find_dma(iommu, first->start, start - first->start))
++	 *   - drivers/vfio/vfio_iommu_type1.c|1871| <<vfio_iommu_aper_conflict>> if (vfio_find_dma(iommu, end + 1, last->end - end))
++	 *   - drivers/vfio/vfio_iommu_type1.c|1932| <<vfio_iommu_resv_conflict>> if (vfio_find_dma(iommu, region->start, region->length))
++	 *
++	 *  90 struct vfio_dma {
++	 *  91         struct rb_node          node;
++	 *  92         dma_addr_t              iova;           // Device address
++	 *  93         unsigned long           vaddr;          // Process virtual addr
++	 *  94         size_t                  size;           // Map size (bytes)
++	 *  95         int                     prot;           // IOMMU_READ/WRITE
++	 *  96         bool                    iommu_mapped;
++	 *  97         bool                    lock_cap;       // capable(CAP_IPC_LOCK)
++	 *  98         bool                    vaddr_invalid;
++	 *  99         struct task_struct      *task;
++	 * 100         struct rb_root          pfn_list;       // Ex-user pinned pfn list
++	 * 101 };
++	 */
+ 	dma = vfio_find_dma(iommu, iova, size);
+ 	if (set_vaddr) {
+ 		if (!dma) {
+@@ -1407,6 +1691,9 @@ static int vfio_dma_do_map(struct vfio_iommu *iommu,
+ 		goto out_unlock;
+ 	}
+ 
++	/*
++	 * 只在此处调用
++	 */
+ 	if (!vfio_iommu_iova_dma_valid(iommu, iova, iova + size - 1)) {
+ 		ret = -EINVAL;
+ 		goto out_unlock;
+@@ -1454,9 +1741,17 @@ static int vfio_dma_do_map(struct vfio_iommu *iommu,
+ 
+ 	dma->pfn_list = RB_ROOT;
+ 
++	/*
++	 * 只在此处调用
++	 *
++	 * 插入vfio_iommu的rb tree!
++	 */
+ 	/* Insert zero-sized and grow as we map chunks of it */
+ 	vfio_link_dma(iommu, dma);
+ 
++	/*
++	 * vfio_pin_map_dma()只在此处调用
++	 */
+ 	/* Don't pin and map if container doesn't contain IOMMU capable domain*/
+ 	if (!IS_IOMMU_CAP_DOMAIN_IN_CONTAINER(iommu))
+ 		dma->size = size;
+@@ -2580,6 +2875,44 @@ static int vfio_iommu_dma_avail_build_caps(struct vfio_iommu *iommu,
+ 	return ret;
+ }
+ 
++/*
++ * 1166 
++1167 static long vfio_fops_unl_ioctl(struct file *filep,
++1168                                 unsigned int cmd, unsigned long arg)
++1169 {
++1170         struct vfio_container *container = filep->private_data;
++1171         struct vfio_iommu_driver *driver;
++1172         void *data;
++1173         long ret = -EINVAL;
++1174 
++1175         if (!container)
++1176                 return ret;
++1177        
++1178         switch (cmd) {
++1179         case VFIO_GET_API_VERSION:
++1180                 ret = VFIO_API_VERSION;
++1181                 break; 
++1182         case VFIO_CHECK_EXTENSION:
++1183                 ret = vfio_ioctl_check_extension(container, arg);
++1184                 break;
++1185         case VFIO_SET_IOMMU:
++1186                 ret = vfio_ioctl_set_iommu(container, arg);
++1187                 break;
++1188         default:       
++1189                 driver = container->iommu_driver;
++1190                 data = container->iommu_data;
++1191        
++1192                 if (driver) // passthrough all unrecognized ioctls
++1193                         ret = driver->ops->ioctl(data, cmd, arg);
++1194         }
++1195 
++1196         return ret;
++1197 }
++ *
++ * struct vfio_iommu_driver_ops vfio_iommu_driver_ops_type1.ioctl = vfio_iommu_type1_ioctl()
++ *
++ * 可以参考open
++ */
+ static long vfio_iommu_type1_ioctl(void *iommu_data,
+ 				   unsigned int cmd, unsigned long arg)
+ {
+@@ -2659,6 +2992,18 @@ static long vfio_iommu_type1_ioctl(void *iommu_data,
+ 			-EFAULT : 0;
+ 
+ 	} else if (cmd == VFIO_IOMMU_MAP_DMA) {
++		/*
++		 * 829 struct vfio_iommu_type1_dma_map {
++		 * 830         __u32   argsz;
++		 * 831         __u32   flags;
++		 * 832 #define VFIO_DMA_MAP_FLAG_READ (1 << 0)         // readable from device
++		 * 833 #define VFIO_DMA_MAP_FLAG_WRITE (1 << 1)        // writable from device
++		 * 834 #define VFIO_DMA_MAP_FLAG_VADDR (1 << 2)
++		 * 835         __u64   vaddr;                          // Process virtual address
++		 * 836         __u64   iova;                           // IO virtual address
++		 * 837         __u64   size;                           // Size of mapping (bytes)
++		 * 838 };
++		 */
+ 		struct vfio_iommu_type1_dma_map map;
+ 		uint32_t mask = VFIO_DMA_MAP_FLAG_READ |
+ 				VFIO_DMA_MAP_FLAG_WRITE |
+@@ -2672,6 +3017,9 @@ static long vfio_iommu_type1_ioctl(void *iommu_data,
+ 		if (map.argsz < minsz || map.flags & ~mask)
+ 			return -EINVAL;
+ 
++		/*
++		 * 只在此处调用
++		 */
+ 		return vfio_dma_do_map(iommu, &map);
+ 
+ 	} else if (cmd == VFIO_IOMMU_UNMAP_DMA) {
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index 5083ccf04d9f..c82885a15278 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -453,6 +453,24 @@ struct mm_struct {
+ 		unsigned long hiwater_vm;  /* High-water virtual memory usage */
+ 
+ 		unsigned long total_vm;	   /* Total pages mapped */
++		/*
++		 * 在以下修改mm_struct->locked_vm:
++		 *   - fs/exec.c|1087| <<exec_mmap>> mm->locked_vm = old_mm->locked_vm;
++		 *   - fs/exec.c|1371| <<flush_old_exec>> current->mm->locked_vm = current->mm->driver_pinned_vm;
++		 *   - kernel/fork.c|1029| <<mm_init>> mm->locked_vm = 0;
++		 *   - mm/debug.c|175| <<dump_mm>> pr_emerg(" ... mm->hiwater_rss, mm->hiwater_vm, mm->total_vm, mm->locked_vm,
++		 *   - mm/mlock.c|565| <<mlock_fixup>> mm->locked_vm += nr_pages;
++		 *   - mm/mlock.c|692| <<do_mlock>> locked += current->mm->locked_vm;
++		 *   - mm/mmap.c|2002| <<mmap_region>> mm->locked_vm += (len >> PAGE_SHIFT);
++		 *   - mm/mmap.c|2567| <<expand_upwards>> mm->locked_vm += grow;
++		 *   - mm/mmap.c|2647| <<expand_downwards>> mm->locked_vm += grow;
++		 *   - mm/mmap.c|3031| <<__do_munmap>> mm->locked_vm -= vma_pages(tmp);
++		 *   - mm/mmap.c|3273| <<do_brk_flags>> mm->locked_vm += (len >> PAGE_SHIFT);
++		 *   - mm/mremap.c|435| <<move_vma>> mm->locked_vm += new_len >> PAGE_SHIFT;
++		 *   - mm/mremap.c|726| <<SYSCALL_DEFINE5(mremap)>> mm->locked_vm += pages;
++		 *   - mm/util.c|492| <<__account_locked_vm>> mm->locked_vm = locked_vm + pages;
++		 *   - mm/util.c|495| <<__account_locked_vm>> mm->locked_vm = locked_vm - pages;
++		 */
+ 		unsigned long locked_vm;   /* Pages that have PG_mlocked set */
+ 		atomic64_t    pinned_vm;   /* Refcount permanently increased */
+ 		unsigned long data_vm;	   /* VM_WRITE & ~VM_SHARED & ~VM_STACK */
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index c820b89db5cc..d5c30f5ad4e5 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -4037,6 +4037,18 @@ static void __perf_event_read(void *info)
+ 	raw_spin_unlock(&ctx->lock);
+ }
+ 
++/*
++ * called by:
++ *   - kernel/events/core.c|4836| <<__perf_event_read_value>> total += perf_event_count(event);
++ *   - kernel/events/core.c|4845| <<__perf_event_read_value>> total += perf_event_count(child);
++ *   - kernel/events/core.c|4927| <<__perf_read_group_add>> values[n++] += perf_event_count(leader);
++ *   - kernel/events/core.c|4932| <<__perf_read_group_add>> values[n++] += perf_event_count(sub);
++ *   - kernel/events/core.c|5497| <<perf_event_update_userpage>> userpg->offset = perf_event_count(event);
++ *   - kernel/events/core.c|6363| <<perf_output_read_one>> values[n++] = perf_event_count(event);
++ *   - kernel/events/core.c|6407| <<perf_output_read_group>> values[n++] = perf_event_count(leader);
++ *   - kernel/events/core.c|6420| <<perf_output_read_group>> values[n++] = perf_event_count(sub);
++ *   - kernel/events/core.c|11667| <<sync_child_event>> child_val = perf_event_count(child_event);
++ */
+ static inline u64 perf_event_count(struct perf_event *event)
+ {
+ 	return local64_read(&event->count) + atomic64_read(&event->child_count);
+@@ -4116,6 +4128,13 @@ int perf_event_read_local(struct perf_event *event, u64 *value,
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - kernel/events/core.c|4852| <<__perf_event_read_value>> (void )perf_event_read(event, false);
++ *   - kernel/events/core.c|4861| <<__perf_event_read_value>> (void )perf_event_read(child, false);
++ *   - kernel/events/core.c|4903| <<__perf_read_group_add>> ret = perf_event_read(leader, true);
++ *   - kernel/events/core.c|5118| <<_perf_event_reset>> (void )perf_event_read(event, false);
++ */
+ static int perf_event_read(struct perf_event *event, bool group)
+ {
+ 	enum perf_event_state state = READ_ONCE(event->state);
+@@ -4822,6 +4841,11 @@ static int perf_release(struct inode *inode, struct file *file)
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - kernel/events/core.c|4860| <<perf_event_read_value>> count = __perf_event_read_value(event, enabled, running);
++ *   - kernel/events/core.c|4991| <<perf_read_one>> values[n++] = __perf_event_read_value(event, &enabled, &running);
++ */
+ static u64 __perf_event_read_value(struct perf_event *event, u64 *enabled, u64 *running)
+ {
+ 	struct perf_event *child;
+@@ -4832,7 +4856,26 @@ static u64 __perf_event_read_value(struct perf_event *event, u64 *enabled, u64 *
+ 
+ 	mutex_lock(&event->child_mutex);
+ 
++	/*
++	 * called by:
++	 *   - kernel/events/core.c|4852| <<__perf_event_read_value>> (void )perf_event_read(event, false);
++	 *   - kernel/events/core.c|4861| <<__perf_event_read_value>> (void )perf_event_read(child, false);
++	 *   - kernel/events/core.c|4903| <<__perf_read_group_add>> ret = perf_event_read(leader, true);
++	 *   - kernel/events/core.c|5118| <<_perf_event_reset>> (void )perf_event_read(event, false);
++	 */
+ 	(void)perf_event_read(event, false);
++	/*
++	 * called by:
++	 *   - kernel/events/core.c|4836| <<__perf_event_read_value>> total += perf_event_count(event);
++	 *   - kernel/events/core.c|4845| <<__perf_event_read_value>> total += perf_event_count(child);
++	 *   - kernel/events/core.c|4927| <<__perf_read_group_add>> values[n++] += perf_event_count(leader);
++	 *   - kernel/events/core.c|4932| <<__perf_read_group_add>> values[n++] += perf_event_count(sub);
++	 *   - kernel/events/core.c|5497| <<perf_event_update_userpage>> userpg->offset = perf_event_count(event);
++	 *   - kernel/events/core.c|6363| <<perf_output_read_one>> values[n++] = perf_event_count(event);
++	 *   - kernel/events/core.c|6407| <<perf_output_read_group>> values[n++] = perf_event_count(leader);
++	 *   - kernel/events/core.c|6420| <<perf_output_read_group>> values[n++] = perf_event_count(sub);
++	 *   - kernel/events/core.c|11667| <<sync_child_event>> child_val = perf_event_count(child_event);
++	 */
+ 	total += perf_event_count(event);
+ 
+ 	*enabled += event->total_time_enabled +
+@@ -4851,12 +4894,22 @@ static u64 __perf_event_read_value(struct perf_event *event, u64 *enabled, u64 *
+ 	return total;
+ }
+ 
++/*
++ * called by:
++ *   - arch/arm64/kvm/pmu-emul.c|86| <<kvm_pmu_get_counter_value>> counter += perf_event_read_value(pmc->perf_event, &enabled, &running);
++ *   - arch/x86/kvm/pmu.h|56| <<pmc_read_counter>> counter += perf_event_read_value(pmc->perf_event, &enabled, &running);
++ */
+ u64 perf_event_read_value(struct perf_event *event, u64 *enabled, u64 *running)
+ {
+ 	struct perf_event_context *ctx;
+ 	u64 count;
+ 
+ 	ctx = perf_event_ctx_lock(event);
++	/*
++	 * called by:
++	 *   - kernel/events/core.c|4860| <<perf_event_read_value>> count = __perf_event_read_value(event, enabled, running);
++	 *   - kernel/events/core.c|4991| <<perf_read_one>> values[n++] = __perf_event_read_value(event, &enabled, &running);
++	 */
+ 	count = __perf_event_read_value(event, enabled, running);
+ 	perf_event_ctx_unlock(event, ctx);
+ 
+@@ -4988,6 +5041,11 @@ static int perf_read_one(struct perf_event *event,
+ 	u64 values[4];
+ 	int n = 0;
+ 
++	/*
++	 * called by:
++	 *   - kernel/events/core.c|4860| <<perf_event_read_value>> count = __perf_event_read_value(event, enabled, running);
++	 *   - kernel/events/core.c|4991| <<perf_read_one>> values[n++] = __perf_event_read_value(event, &enabled, &running);
++	 */
+ 	values[n++] = __perf_event_read_value(event, &enabled, &running);
+ 	if (read_format & PERF_FORMAT_TOTAL_TIME_ENABLED)
+ 		values[n++] = enabled;
+@@ -5141,6 +5199,72 @@ static void perf_event_for_each(struct perf_event *event,
+ 		perf_event_for_each_child(sibling, func);
+ }
+ 
++/*
++ * 908 static __initconst const struct x86_pmu amd_pmu = {
++ * 909         .name                   = "AMD",
++ * 910         .handle_irq             = amd_pmu_handle_irq,
++ * 911         .disable_all            = amd_pmu_disable_all,
++ * 912         .enable_all             = x86_pmu_enable_all,
++ * 913         .enable                 = x86_pmu_enable_event,
++ * 914         .disable                = amd_pmu_disable_event,
++ * 915         .hw_config              = amd_pmu_hw_config,
++ * 916         .schedule_events        = x86_schedule_events,
++ * 917         .eventsel               = MSR_K7_EVNTSEL0,
++ * 918         .perfctr                = MSR_K7_PERFCTR0,
++ * 919         .addr_offset            = amd_pmu_addr_offset,
++ * 920         .event_map              = amd_pmu_event_map,
++ * 921         .max_events             = ARRAY_SIZE(amd_perfmon_event_map),
++ * 922         .num_counters           = AMD64_NUM_COUNTERS,
++ * 923         .cntval_bits            = 48,
++ * 924         .cntval_mask            = (1ULL << 48) - 1,
++ * 925         .apic                   = 1,
++ * 926         // use highest bit to detect overflow
++ * 927         .max_period             = (1ULL << 47) - 1,
++ * 928         .get_event_constraints  = amd_get_event_constraints,
++ * 929         .put_event_constraints  = amd_put_event_constraints,
++ * 930
++ * 931         .format_attrs           = amd_format_attr,
++ * 932         .events_sysfs_show      = amd_event_sysfs_show,
++ * 933
++ * 934         .cpu_prepare            = amd_pmu_cpu_prepare,
++ * 935         .cpu_starting           = amd_pmu_cpu_starting,
++ * 936         .cpu_dead               = amd_pmu_cpu_dead,
++ * 937
++ * 938         .amd_nb_constraints     = 1,
++ * 939 };
++ *
++ *
++ * arch/x86/events/core.c
++ * 2395 static struct pmu pmu = {
++ * 2396         .pmu_enable             = x86_pmu_enable,
++ * 2397         .pmu_disable            = x86_pmu_disable,
++ * 2398
++ * 2399         .attr_groups            = x86_pmu_attr_groups,
++ * 2400
++ * 2401         .event_init             = x86_pmu_event_init,
++ * 2402
++ * 2403         .event_mapped           = x86_pmu_event_mapped,
++ * 2404         .event_unmapped         = x86_pmu_event_unmapped,
++ * 2405
++ * 2406         .add                    = x86_pmu_add,
++ * 2407         .del                    = x86_pmu_del,
++ * 2408         .start                  = x86_pmu_start,
++ * 2409         .stop                   = x86_pmu_stop,
++ * 2410         .read                   = x86_pmu_read,
++ * 2411
++ * 2412         .start_txn              = x86_pmu_start_txn,
++ * 2413         .cancel_txn             = x86_pmu_cancel_txn,
++ * 2414         .commit_txn             = x86_pmu_commit_txn,
++ * 2415
++ * 2416         .event_idx              = x86_pmu_event_idx,
++ * 2417         .sched_task             = x86_pmu_sched_task,
++ * 2418         .task_ctx_size          = sizeof(struct x86_perf_task_context),
++ * 2419         .check_period           = x86_pmu_check_period,
++ * 2420
++ * 2421         .aux_output_match       = x86_pmu_aux_output_match,
++ * 2422 };
++ */
++
+ static void __perf_event_period(struct perf_event *event,
+ 				struct perf_cpu_context *cpuctx,
+ 				struct perf_event_context *ctx,
+@@ -5173,6 +5297,11 @@ static void __perf_event_period(struct perf_event *event,
+ 	local64_set(&event->hw.period_left, 0);
+ 
+ 	if (active) {
++		/*
++		 * struct perf_event *event:
++		 * -> struct pmu *pmu;
++		 *    -> void (*start) (struct perf_event *event, int flags);
++		 */
+ 		event->pmu->start(event, PERF_EF_RELOAD);
+ 		perf_pmu_enable(ctx->pmu);
+ 	}
+diff --git a/mm/util.c b/mm/util.c
+index 04ebc76588aa..9e39e24f0e92 100644
+--- a/mm/util.c
++++ b/mm/util.c
+@@ -453,6 +453,26 @@ void arch_pick_mmap_layout(struct mm_struct *mm, struct rlimit *rlim_stack)
+  * * 0       on success
+  * * -ENOMEM if RLIMIT_MEMLOCK would be exceeded.
+  */
++/*
++ * 在以下调用account_locked_vm():
++ *   - arch/powerpc/kvm/book3s_64_vio.c|266| <<kvm_spapr_tce_release>> account_locked_vm(current->mm, kvmppc_stt_pages(kvmppc_tce_pages(stt->size)), false);
++ *   - arch/powerpc/kvm/book3s_64_vio.c|291| <<kvm_vm_ioctl_create_spapr_tce>> ret = account_locked_vm(current->mm, kvmppc_stt_pages(npages), true);
++ *   - arch/powerpc/kvm/book3s_64_vio.c|337| <<kvm_vm_ioctl_create_spapr_tce>> account_locked_vm(current->mm, kvmppc_stt_pages(npages), false);
++ *   - arch/powerpc/mm/book3s64/iommu_api.c|66| <<mm_iommu_do_alloc>> ret = account_locked_vm(mm, entries, true);
++ *   - arch/powerpc/mm/book3s64/iommu_api.c|181| <<mm_iommu_do_alloc>> account_locked_vm(mm, locked_entries, false);
++ *   - arch/powerpc/mm/book3s64/iommu_api.c|281| <<mm_iommu_put>> account_locked_vm(mm, unlock_entries, false);
++ *   - drivers/fpga/dfl-afu-dma-region.c|50| <<afu_dma_pin_pages>> ret = account_locked_vm(current->mm, npages, true);
++ *   - drivers/fpga/dfl-afu-dma-region.c|79| <<afu_dma_pin_pages>> account_locked_vm(current->mm, npages, false);
++ *   - drivers/fpga/dfl-afu-dma-region.c|99| <<afu_dma_unpin_pages>> account_locked_vm(current->mm, npages, false);
++ *   - drivers/vfio/vfio_iommu_spapr_tce.c|292| <<tce_iommu_enable>> ret = account_locked_vm(container->mm, locked, true);
++ *   - drivers/vfio/vfio_iommu_spapr_tce.c|311| <<tce_iommu_disable>> account_locked_vm(container->mm, container->locked_pages, false);
++ *   - drivers/vfio/vfio_iommu_spapr_tce.c|621| <<tce_iommu_create_table>> ret = account_locked_vm(container->mm, table_size >> PAGE_SHIFT, true);
++ *   - drivers/vfio/vfio_iommu_spapr_tce.c|640| <<tce_iommu_free_table>> account_locked_vm(container->mm, pages, false);
++ *
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|359| <<vfio_lock_acct>> ret = __account_locked_vm(mm, abs(npage), npage > 0, dma->task, dma->lock_cap);
++ *   - mm/util.c|507| <<account_locked_vm>> ret = __account_locked_vm(mm, pages, inc, current, capable(CAP_IPC_LOCK));
++ */
+ int __account_locked_vm(struct mm_struct *mm, unsigned long pages, bool inc,
+ 			struct task_struct *task, bool bypass_rlim)
+ {
+@@ -461,6 +481,24 @@ int __account_locked_vm(struct mm_struct *mm, unsigned long pages, bool inc,
+ 
+ 	lockdep_assert_held_write(&mm->mmap_sem);
+ 
++	/*
++	 * 在以下修改mm_struct->locked_vm:
++	 *   - fs/exec.c|1087| <<exec_mmap>> mm->locked_vm = old_mm->locked_vm;
++	 *   - fs/exec.c|1371| <<flush_old_exec>> current->mm->locked_vm = current->mm->driver_pinned_vm;
++	 *   - kernel/fork.c|1029| <<mm_init>> mm->locked_vm = 0;
++	 *   - mm/debug.c|175| <<dump_mm>> pr_emerg(" ... mm->hiwater_rss, mm->hiwater_vm, mm->total_vm, mm->locked_vm,
++	 *   - mm/mlock.c|565| <<mlock_fixup>> mm->locked_vm += nr_pages;
++	 *   - mm/mlock.c|692| <<do_mlock>> locked += current->mm->locked_vm;
++	 *   - mm/mmap.c|2002| <<mmap_region>> mm->locked_vm += (len >> PAGE_SHIFT);
++	 *   - mm/mmap.c|2567| <<expand_upwards>> mm->locked_vm += grow;
++	 *   - mm/mmap.c|2647| <<expand_downwards>> mm->locked_vm += grow;
++	 *   - mm/mmap.c|3031| <<__do_munmap>> mm->locked_vm -= vma_pages(tmp);
++	 *   - mm/mmap.c|3273| <<do_brk_flags>> mm->locked_vm += (len >> PAGE_SHIFT);
++	 *   - mm/mremap.c|435| <<move_vma>> mm->locked_vm += new_len >> PAGE_SHIFT;
++	 *   - mm/mremap.c|726| <<SYSCALL_DEFINE5(mremap)>> mm->locked_vm += pages;
++	 *   - mm/util.c|492| <<__account_locked_vm>> mm->locked_vm = locked_vm + pages;
++	 *   - mm/util.c|495| <<__account_locked_vm>> mm->locked_vm = locked_vm - pages;
++	 */
+ 	locked_vm = mm->locked_vm;
+ 	if (inc) {
+ 		if (!bypass_rlim) {
+@@ -496,6 +534,22 @@ EXPORT_SYMBOL_GPL(__account_locked_vm);
+  * * 0       on success, or if mm is NULL
+  * * -ENOMEM if RLIMIT_MEMLOCK would be exceeded.
+  */
++/*
++ * called by:
++ *   - arch/powerpc/kvm/book3s_64_vio.c|266| <<kvm_spapr_tce_release>> account_locked_vm(current->mm, kvmppc_stt_pages(kvmppc_tce_pages(stt->size)), false);
++ *   - arch/powerpc/kvm/book3s_64_vio.c|291| <<kvm_vm_ioctl_create_spapr_tce>> ret = account_locked_vm(current->mm, kvmppc_stt_pages(npages), true);
++ *   - arch/powerpc/kvm/book3s_64_vio.c|337| <<kvm_vm_ioctl_create_spapr_tce>> account_locked_vm(current->mm, kvmppc_stt_pages(npages), false);
++ *   - arch/powerpc/mm/book3s64/iommu_api.c|66| <<mm_iommu_do_alloc>> ret = account_locked_vm(mm, entries, true);
++ *   - arch/powerpc/mm/book3s64/iommu_api.c|181| <<mm_iommu_do_alloc>> account_locked_vm(mm, locked_entries, false);
++ *   - arch/powerpc/mm/book3s64/iommu_api.c|281| <<mm_iommu_put>> account_locked_vm(mm, unlock_entries, false);
++ *   - drivers/fpga/dfl-afu-dma-region.c|50| <<afu_dma_pin_pages>> ret = account_locked_vm(current->mm, npages, true);
++ *   - drivers/fpga/dfl-afu-dma-region.c|79| <<afu_dma_pin_pages>> account_locked_vm(current->mm, npages, false);
++ *   - drivers/fpga/dfl-afu-dma-region.c|99| <<afu_dma_unpin_pages>> account_locked_vm(current->mm, npages, false);
++ *   - drivers/vfio/vfio_iommu_spapr_tce.c|292| <<tce_iommu_enable>> ret = account_locked_vm(container->mm, locked, true);
++ *   - drivers/vfio/vfio_iommu_spapr_tce.c|311| <<tce_iommu_disable>> account_locked_vm(container->mm, container->locked_pages, false);
++ *   - drivers/vfio/vfio_iommu_spapr_tce.c|621| <<tce_iommu_create_table>> ret = account_locked_vm(container->mm, table_size >> PAGE_SHIFT, true);
++ *   - drivers/vfio/vfio_iommu_spapr_tce.c|640| <<tce_iommu_free_table>> account_locked_vm(container->mm, pages, false);
++ */
+ int account_locked_vm(struct mm_struct *mm, unsigned long pages, bool inc)
+ {
+ 	int ret;
+-- 
+2.39.3 (Apple Git-146)
+
