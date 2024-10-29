@@ -1,0 +1,72 @@
+[PATCH v4 0/4] KVM: Dynamic sized memslots array
+
+... Peter Xu <peterx@redhat.com> ...
+
+https://lore.kernel.org/all/20240917163835.194664-1-peterx@redhat.com/
+
+---------------------------
+
+Performance improvement:
+
+"reducing precopy dirty sync process from ~86ms to ~3ms each time."
+
+---------------------------
+
+在kvm_memory_listener_register()一个KVMMemoryListener的时候,
+会提前分配所有的KVMSlot (line=47). 这样很占用内存并且影响性能.
+
+45 typedef struct KVMMemoryListener {
+46     MemoryListener listener;
+47     KVMSlot *slots;
+48     unsigned int nr_used_slots;
+49     int as_id;
+50     QSIMPLEQ_HEAD(, KVMMemoryUpdate) transaction_add;
+51     QSIMPLEQ_HEAD(, KVMMemoryUpdate) transaction_del;
+52 } KVMMemoryListener;
+
+
+当前的代码默认分配KVMState->nr_slots个.
+
+@@ -1839,12 +1899,9 @@ void kvm_memory_listener_register(KVMState *s, KVMMemoryListener *kml,
+ {
+     int i;
+
+-    kml->slots = g_new0(KVMSlot, s->nr_slots);
+     kml->as_id = as_id;
+
+-    for (i = 0; i < s->nr_slots; i++) {
+-        kml->slots[i].slot = i;
+-    }
++    kvm_slots_grow(kml, KVM_MEMSLOTS_NR_ALLOC_DEFAULT);
+
+
+现在改成了动态的. 分配的时候动态增加.
+
+@@ -193,15 +247,26 @@ unsigned int kvm_get_free_memslots(void)
+ /* Called with KVMMemoryListener.slots_lock held */
+ static KVMSlot *kvm_get_free_slot(KVMMemoryListener *kml)
+ {
+-    KVMState *s = kvm_state;
++    unsigned int n;
+     int i;
+
+-    for (i = 0; i < s->nr_slots; i++) {
++    for (i = 0; i < kml->nr_slots_allocated; i++) {
+         if (kml->slots[i].memory_size == 0) {
+             return &kml->slots[i];
+         }
+     }
+
++    /*
++     * If no free slots, try to grow first by doubling.  Cache the old size
++     * here to avoid another round of search: if the grow succeeded, it
++     * means slots[] now must have the existing "n" slots occupied,
++     * followed by one or more free slots starting from slots[n].
++     */
++    n = kml->nr_slots_allocated;
++    if (kvm_slots_double(kml)) {
++        return &kml->slots[n];
++    }
++
+     return NULL;
+ }

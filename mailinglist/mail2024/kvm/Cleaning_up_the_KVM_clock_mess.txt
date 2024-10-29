@@ -1,0 +1,206 @@
+[RFC PATCH v3 00/21] Cleaning up the KVM clock mess
+
+... David Woodhouse <dwmw2@infradead.org> ...
+
+https://lore.kernel.org/all/20240522001817.619072-2-dwmw2@infradead.org/
+
+--------------------------
+
+[RFC PATCH v3 01/21] KVM: x86/xen: Do not corrupt KVM clock in kvm_xen_shared_info_init()
+
+No idea on Xen/KVM.
+
+--------------------------
+
+[RFC PATCH v3 02/21] KVM: x86: Improve accuracy of KVM clock when TSC scaling is in force
+
+With the patch: 2,499,999,999 HZ
+
+Without the patch: 2,499,999,000 Hz
+
+Seems only tsc scaling is impacted!
+
+--------------------------
+
+[RFC PATCH v3 03/21] KVM: x86: Add KVM_[GS]ET_CLOCK_GUEST for accurate KVM clock migration
+
++static int kvm_vcpu_ioctl_set_clock_guest(struct kvm_vcpu *v, void __user *argp)
++{
++	struct pvclock_vcpu_time_info user_hv_clock;
++	struct kvm *kvm = v->kvm;
++	struct kvm_arch *ka = &kvm->arch;
++	uint64_t curr_tsc_hz, user_tsc_hz;
++	uint64_t user_clk_ns;
++	uint64_t guest_tsc;
++	int rc = 0;
++
++	if (copy_from_user(&user_hv_clock, argp, sizeof(user_hv_clock)))
++		return -EFAULT;
++
++	if (!user_hv_clock.tsc_to_system_mul)
++		return -EINVAL;
++
++	user_tsc_hz = hvclock_to_hz(user_hv_clock.tsc_to_system_mul,
++				    user_hv_clock.tsc_shift);
++
++
++	kvm_hv_request_tsc_page_update(kvm);
++	kvm_start_pvclock_update(kvm);
++	pvclock_update_vm_gtod_copy(kvm);
++
++	/*
++	 * If not in use_master_clock mode, do not allow userspace to set
++	 * the clock in terms of the guest TSC. Userspace should either
++	 * fail the migration (to a host with suboptimal TSCs), or should
++	 * knowingly restore the KVM clock using KVM_SET_CLOCK instead.
++	 */
++	if (!ka->use_master_clock) {
++		rc = -EINVAL;
++		goto out;
++	}
++
++	curr_tsc_hz = get_cpu_tsc_khz() * 1000LL;
++	if (unlikely(curr_tsc_hz == 0)) {
++		rc = -EINVAL;
++		goto out;
++	}
++
++	if (kvm_caps.has_tsc_control)
++		curr_tsc_hz = kvm_scale_tsc(curr_tsc_hz,
++					    v->arch.l1_tsc_scaling_ratio);
++
++	/*
++	 * The scaling factors in the hv_clock do not depend solely on the
++	 * TSC frequency *requested* by userspace. They actually use the
++	 * host TSC frequency that was measured/detected by the host kernel,
++	 * scaled by kvm_scale_tsc() with the vCPU's l1_tsc_scaling_ratio.
++	 *
++	 * So a sanity check that they *precisely* match would have false
++	 * negatives. Allow for a discrepancy of 1 kHz either way.
++	 */
++	if (user_tsc_hz < curr_tsc_hz - 1000 ||
++	    user_tsc_hz > curr_tsc_hz + 1000) {
++		rc = -ERANGE;
++		goto out;
++	}
++
++	/*
++	 * The call to pvclock_update_vm_gtod_copy() has created a new time
++	 * reference point in ka->master_cycle_now and ka->master_kernel_ns.
++	 *
++	 * Calculate the guest TSC at that moment, and the corresponding KVM
++	 * clock value according to user_hv_clock. The value according to the
++	 * current hv_clock will of course be ka->master_kernel_ns since no
++	 * TSC cycles have elapsed.
++	 *
++	 * Adjust ka->kvmclock_offset to the delta, so that both definitions
++	 * of the clock give precisely the same reading at the reference time.
++	 */
++	guest_tsc = kvm_read_l1_tsc(v, ka->master_cycle_now);
++	user_clk_ns = __pvclock_read_cycles(&user_hv_clock, guest_tsc);
++	ka->kvmclock_offset = user_clk_ns - ka->master_kernel_ns;
++
++out:
++	kvm_end_pvclock_update(kvm);
++	return rc;
++}
++#endif
+
+
+Use ka->kvmclock_offset to account the drift.
+
+--------------------------
+
+[RFC PATCH v3 04/21] UAPI: x86: Move pvclock-abi to UAPI for x86 platforms
+
+No functional change.
+
+--------------------------
+
+[RFC PATCH v3 05/21] KVM: selftests: Add KVM/PV clock selftest to prove timer correction
+
+Test there isn't obvious clock drift.
+
+--------------------------
+
+[RFC PATCH v3 06/21] KVM: x86: Explicitly disable TSC scaling without CONSTANT_TSC
+
+--------------------------
+
+[RFC PATCH v3 07/21] KVM: x86: Add KVM_VCPU_TSC_SCALE and fix the documentation on TSC migration
+
+Migrate TSC scaling info as well.
+
+--------------------------
+
+[RFC PATCH v3 08/21] KVM: x86: Avoid NTP frequency skew for KVM clock on 32-bit host
+
+--------------------------
+
+[RFC PATCH v3 09/21] KVM: x86: Fix KVM clock precision in __get_kvmclock()
+
+--------------------------
+
+[RFC PATCH v3 10/21] KVM: x86: Fix software TSC upscaling in kvm_update_guest_time()
+
+More about scaling.
+
+--------------------------
+
+[RFC PATCH v3 11/21] KVM: x86: Simplify and comment kvm_get_time_scale()
+
+Interesting patch, to explain and help understanding of kvm_get_time_scale().
+
+--------------------------
+
+[RFC PATCH v3 12/21] KVM: x86: Remove implicit rdtsc() from kvm_compute_l1_tsc_offset()
+
+No functional change.
+
+--------------------------
+
+[RFC PATCH v3 13/21] KVM: x86: Improve synchronization in kvm_synchronize_tsc()
+
+--------------------------
+
+[RFC PATCH v3 14/21] KVM: x86: Kill cur_tsc_{nsec,offset,write} fields
+
+--------------------------
+
+[RFC PATCH v3 15/21] KVM: x86: Allow KVM master clock mode when TSCs are offset from each other
+
+I don't agree.
+
+--------------------------
+
+[RFC PATCH v3 16/21] KVM: x86: Factor out kvm_use_master_clock()
+
+SImplify the code.
+
+--------------------------
+
+[RFC PATCH v3 17/21] KVM: x86: Avoid global clock update on setting KVM clock MSR
+
+--------------------------
+
+[RFC PATCH v3 18/21] KVM: x86: Avoid gratuitous global clock reload in kvm_arch_vcpu_load()
+
+--------------------------
+
+[RFC PATCH v3 19/21] KVM: x86: Avoid periodic KVM clock updates in master clock mode
+
+I agree.
+
+--------------------------
+
+[RFC PATCH v3 20/21] KVM: x86/xen: Prevent runstate times from becoming negative
+
+No idea on Xen.
+
+--------------------------
+
+[RFC PATCH v3 21/21] sched/cputime: Cope with steal time going backwards or negative
+
+High steal time during PV clock change???
+
+--------------------------
