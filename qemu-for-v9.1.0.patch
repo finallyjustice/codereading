@@ -1,22 +1,29 @@
-From 8817fec05424d5dde1120402d70fafe5bb18795e Mon Sep 17 00:00:00 2001
+From 5994d927bf7ea1d9cbb1751643d7d88e95345413 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Mon, 30 Sep 2024 11:34:59 -0700
+Date: Tue, 29 Oct 2024 16:48:42 -0700
 Subject: [PATCH 1/1] qemu for v9.1.0
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
  accel/kvm/kvm-accel-ops.c     |   7 +
- accel/kvm/kvm-all.c           |  35 ++
+ accel/kvm/kvm-all.c           |  94 ++++
  block.c                       | 130 +++++
  block/file-posix.c            |  50 ++
- block/io.c                    |   9 +
+ block/io.c                    |  13 +
  block/mirror.c                |  77 +++
  blockdev.c                    |  55 ++
+ dump/dump.c                   |   8 +
+ hw/acpi/aml-build.c           |   5 +
  hw/acpi/cpu.c                 | 173 ++++++
  hw/acpi/memory_hotplug.c      |   5 +
+ hw/acpi/pcihp.c               |  18 +
+ hw/acpi/piix4.c               |  92 ++++
+ hw/arm/virt-acpi-build.c      |   5 +
  hw/block/virtio-blk.c         |  41 ++
+ hw/core/machine.c             |   9 +
  hw/core/nmi.c                 |  12 +
  hw/core/qdev.c                |   3 +
+ hw/i386/pc_piix.c             |   4 +
  hw/nvram/fw_cfg.c             |  59 +++
  hw/pci/pci_bridge.c           |   6 +
  hw/pci/pcie.c                 |  11 +
@@ -29,12 +36,21 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  hw/scsi/virtio-scsi.c         |   6 +
  hw/vfio/container.c           |   4 +
  hw/vfio/pci.c                 |  13 +
+ hw/virtio/virtio-pci.c        |   9 +
+ hw/virtio/virtio.c            |   4 +
+ include/hw/acpi/pcihp.h       |  21 +
  include/hw/block/block.h      |  32 ++
+ include/hw/core/cpu.h         |  14 +
  include/hw/virtio/virtio.h    |  33 ++
  include/sysemu/accel-ops.h    |  27 +
+ include/sysemu/kvm_int.h      |  16 +
+ migration/ram.c               |   4 +
  qom/object.c                  |  26 +
- target/arm/cpu.c              |   3 +
- target/arm/cpu.h              |  11 +
+ system/cpus.c                 |  29 +
+ system/globals.c              |   7 +
+ system/runstate.c             |  35 ++
+ target/arm/cpu.c              |   9 +
+ target/arm/cpu.h              |  21 +
  target/i386/cpu.c             | 869 ++++++++++++++++++++++++++++++
  target/i386/cpu.h             | 142 +++++
  target/i386/host-cpu.c        |  25 +
@@ -43,7 +59,8 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  target/i386/kvm/vmsr_energy.c |  51 ++
  target/i386/machine.c         |  45 ++
  util/oslib-posix.c            |   7 +
- 38 files changed, 3040 insertions(+)
+ util/qemu-coroutine.c         | 337 ++++++++++++
+ 55 files changed, 3736 insertions(+)
 
 diff --git a/accel/kvm/kvm-accel-ops.c b/accel/kvm/kvm-accel-ops.c
 index c239dfc87..ea6884b3e 100644
@@ -71,7 +88,7 @@ index c239dfc87..ea6884b3e 100644
      kvm_init_cpu_signals(cpu);
  
 diff --git a/accel/kvm/kvm-all.c b/accel/kvm/kvm-all.c
-index 75d11a07b..2e1a71a57 100644
+index 75d11a07b..36e834a6d 100644
 --- a/accel/kvm/kvm-all.c
 +++ b/accel/kvm/kvm-all.c
 @@ -105,6 +105,13 @@ static const KVMCapabilityInfo kvm_required_capabilites[] = {
@@ -88,7 +105,60 @@ index 75d11a07b..2e1a71a57 100644
  static NotifierList kvm_irqchip_change_notifiers =
      NOTIFIER_LIST_INITIALIZER(kvm_irqchip_change_notifiers);
  
-@@ -456,6 +463,10 @@ void kvm_destroy_vcpu(CPUState *cpu)
+@@ -190,6 +197,10 @@ unsigned int kvm_get_free_memslots(void)
+     return s->nr_slots - used_slots;
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|218| <<kvm_alloc_slot>> KVMSlot *slot = kvm_get_free_slot(kml);
++ */
+ /* Called with KVMMemoryListener.slots_lock held */
+ static KVMSlot *kvm_get_free_slot(KVMMemoryListener *kml)
+ {
+@@ -198,6 +209,16 @@ static KVMSlot *kvm_get_free_slot(KVMMemoryListener *kml)
+ 
+     for (i = 0; i < s->nr_slots; i++) {
+         if (kml->slots[i].memory_size == 0) {
++            /*
++	     * typedef struct KVMMemoryListener {
++	     *     MemoryListener listener;
++	     *     KVMSlot *slots;
++	     *     unsigned int nr_used_slots;
++	     *     int as_id;
++	     *     QSIMPLEQ_HEAD(, KVMMemoryUpdate) transaction_add;
++	     *     QSIMPLEQ_HEAD(, KVMMemoryUpdate) transaction_del;
++	     * } KVMMemoryListener;
++	     */
+             return &kml->slots[i];
+         }
+     }
+@@ -205,6 +226,10 @@ static KVMSlot *kvm_get_free_slot(KVMMemoryListener *kml)
+     return NULL;
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|1511| <<kvm_set_phys_mem>> mem = kvm_alloc_slot(kml);
++ */
+ /* Called with KVMMemoryListener.slots_lock held */
+ static KVMSlot *kvm_alloc_slot(KVMMemoryListener *kml)
+ {
+@@ -218,6 +243,13 @@ static KVMSlot *kvm_alloc_slot(KVMMemoryListener *kml)
+     abort();
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|604| <<kvm_section_update_flags>> mem = kvm_lookup_matching_slot(kml, start_addr, slot_size);
++ *   - accel/kvm/kvm-all.c|944| <<kvm_physical_sync_dirty_bitmap>> mem = kvm_lookup_matching_slot(kml, start_addr, slot_size);
++ *   - accel/kvm/kvm-all.c|1473| <<kvm_set_phys_mem>> mem = kvm_lookup_matching_slot(kml, start_addr, slot_size);
++ *   - accel/kvm/kvm-all.c|3727| <<kvm_accel_has_memory>> return NULL != kvm_lookup_matching_slot(kvm->as[i].ml, start_addr, size);
++ */
+ static KVMSlot *kvm_lookup_matching_slot(KVMMemoryListener *kml,
+                                          hwaddr start_addr,
+                                          hwaddr size)
+@@ -456,6 +488,10 @@ void kvm_destroy_vcpu(CPUState *cpu)
      }
  }
  
@@ -99,7 +169,7 @@ index 75d11a07b..2e1a71a57 100644
  int kvm_init_vcpu(CPUState *cpu, Error **errp)
  {
      KVMState *s = kvm_state;
-@@ -507,6 +518,16 @@ int kvm_init_vcpu(CPUState *cpu, Error **errp)
+@@ -507,6 +543,16 @@ int kvm_init_vcpu(CPUState *cpu, Error **errp)
          }
      }
  
@@ -116,7 +186,55 @@ index 75d11a07b..2e1a71a57 100644
      ret = kvm_arch_init_vcpu(cpu);
      if (ret < 0) {
          error_setg_errno(errp, -ret,
-@@ -2763,6 +2784,10 @@ void kvm_flush_coalesced_mmio_buffer(void)
+@@ -1180,6 +1226,35 @@ int kvm_check_extension(KVMState *s, unsigned int extension)
+     return ret;
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|1584| <<kvm_dirty_ring_init>> ret = kvm_vm_check_extension(s, capability);
++ *   - accel/kvm/kvm-all.c|1587| <<kvm_dirty_ring_init>> ret = kvm_vm_check_extension(s, capability);
++ *   - accel/kvm/kvm-all.c|1610| <<kvm_dirty_ring_init>> ret = kvm_vm_check_extension(s, KVM_CAP_DIRTY_LOG_RING_WITH_BITMAP);
++ *   - accel/kvm/kvm-all.c|2373| <<kvm_recommended_vcpus>> int ret = kvm_vm_check_extension(s, KVM_CAP_NR_VCPUS);
++ *   - accel/kvm/kvm-all.c|2681| <<kvm_init>> s->sync_mmu = !!kvm_vm_check_extension(kvm_state, KVM_CAP_SYNC_MMU);
++ *   - target/arm/kvm.c|587| <<kvm_arch_init>> sizes = kvm_vm_check_extension(s, KVM_CAP_ARM_SUPPORTED_BLOCK_SIZES);
++ *   - target/i386/kvm/kvm.c|336| <<kvm_has_smm>> return kvm_vm_check_extension(kvm_state, KVM_CAP_X86_SMM);
++ *   - target/i386/kvm/kvm.c|3669| <<kvm_arch_init>> if (kvm_vm_check_extension(s, KVM_CAP_X86_USER_SPACE_MSR)) {
++ *   - target/i386/kvm/kvm.c|6757| <<__kvm_enable_sgx_provisioning>> if (!kvm_vm_check_extension(s, KVM_CAP_SGX_ATTRIBUTE)) {
++ *   - target/ppc/kvm.c|113| <<kvmppc_is_pr>> return kvm_vm_check_extension(ks, KVM_CAP_PPC_GET_PVINFO) != 0;
++ *   - target/ppc/kvm.c|130| <<kvm_arch_init>> cap_ppc_smt_possible = kvm_vm_check_extension(s, KVM_CAP_PPC_SMT_POSSIBLE);
++ *   - target/ppc/kvm.c|134| <<kvm_arch_init>> cap_spapr_vfio = kvm_vm_check_extension(s, KVM_CAP_SPAPR_TCE_VFIO);
++ *   - target/ppc/kvm.c|143| <<kvm_arch_init>> cap_htab_fd = kvm_vm_check_extension(s, KVM_CAP_PPC_HTAB_FD);
++ *   - target/ppc/kvm.c|145| <<kvm_arch_init>> cap_ppc_smt = kvm_vm_check_extension(s, KVM_CAP_PPC_SMT);
++ *   - target/ppc/kvm.c|146| <<kvm_arch_init>> cap_htm = kvm_vm_check_extension(s, KVM_CAP_PPC_HTM);
++ *   - target/ppc/kvm.c|147| <<kvm_arch_init>> cap_mmu_radix = kvm_vm_check_extension(s, KVM_CAP_PPC_MMU_RADIX);
++ *   - target/ppc/kvm.c|148| <<kvm_arch_init>> cap_mmu_hash_v3 = kvm_vm_check_extension(s, KVM_CAP_PPC_MMU_HASH_V3);
++ *   - target/ppc/kvm.c|149| <<kvm_arch_init>> cap_xive = kvm_vm_check_extension(s, KVM_CAP_PPC_IRQ_XIVE);
++ *   - target/ppc/kvm.c|150| <<kvm_arch_init>> cap_resize_hpt = kvm_vm_check_extension(s, KVM_CAP_SPAPR_RESIZE_HPT);
++ *   - target/ppc/kvm.c|152| <<kvm_arch_init>> cap_ppc_nested_kvm_hv = kvm_vm_check_extension(s, KVM_CAP_PPC_NESTED_HV);
++ *   - target/ppc/kvm.c|154| <<kvm_arch_init>> cap_fwnmi = kvm_vm_check_extension(s, KVM_CAP_PPC_FWNMI);
++ *   - target/ppc/kvm.c|169| <<kvm_arch_init>> cap_rpt_invalidate = kvm_vm_check_extension(s, KVM_CAP_PPC_RPT_INVALIDATE);
++ *   - target/ppc/kvm.c|170| <<kvm_arch_init>> cap_ail_mode_3 = kvm_vm_check_extension(s, KVM_CAP_PPC_AIL_MODE_3);
++ *   - target/ppc/kvm.c|1979| <<kvmppc_get_pvinfo>> if (kvm_vm_check_extension(cs->kvm_state, KVM_CAP_PPC_GET_PVINFO) &&
++ *   - target/ppc/kvm.c|2301| <<kvmppc_reset_htab>> if (kvm_vm_check_extension(kvm_state, KVM_CAP_PPC_ALLOC_HTAB)) {
++ *   - target/ppc/kvm.c|2510| <<kvmppc_get_cpu_characteristics>> ret = kvm_vm_check_extension(s, KVM_CAP_PPC_GET_CPU_CHAR);
++ */
+ int kvm_vm_check_extension(KVMState *s, unsigned int extension)
+ {
+     int ret;
+@@ -1369,6 +1444,11 @@ int kvm_set_memory_attributes_shared(hwaddr start, uint64_t size)
+     return kvm_set_memory_attributes(start, size, 0);
+ }
+ 
++/*
++ * called by:
++ *   - accel/kvm/kvm-all.c|1731| <<kvm_region_commit(处理QSIMPLEQ_EMPTY(&kml->transaction_del))>> kvm_set_phys_mem(kml, &u1->section, false);
++ *   - accel/kvm/kvm-all.c|1741| <<kvm_region_commit(处理QSIMPLEQ_EMPTY(&kml->transaction_del))>> kvm_set_phys_mem(kml, &u1->section, true);
++ */
+ /* Called with KVMMemoryListener.slots_lock held */
+ static void kvm_set_phys_mem(KVMMemoryListener *kml,
+                              MemoryRegionSection *section, bool add)
+@@ -2763,6 +2843,10 @@ void kvm_flush_coalesced_mmio_buffer(void)
      s->coalesced_flush_in_progress = false;
  }
  
@@ -127,7 +245,7 @@ index 75d11a07b..2e1a71a57 100644
  static void do_kvm_cpu_synchronize_state(CPUState *cpu, run_on_cpu_data arg)
  {
      if (!cpu->vcpu_dirty && !kvm_state->guest_state_protected) {
-@@ -2777,6 +2802,16 @@ static void do_kvm_cpu_synchronize_state(CPUState *cpu, run_on_cpu_data arg)
+@@ -2777,6 +2861,16 @@ static void do_kvm_cpu_synchronize_state(CPUState *cpu, run_on_cpu_data arg)
      }
  }
  
@@ -389,7 +507,7 @@ index ff928b5e8..ec168f9ab 100644
                            Error **errp)
  {
 diff --git a/block/io.c b/block/io.c
-index 301514c88..6e7505ee1 100644
+index 301514c88..eec1fcf8a 100644
 --- a/block/io.c
 +++ b/block/io.c
 @@ -570,6 +570,15 @@ void bdrv_drain_all_end(void)
@@ -408,6 +526,17 @@ index 301514c88..6e7505ee1 100644
  void bdrv_drain_all(void)
  {
      GLOBAL_STATE_CODE();
+@@ -762,6 +771,10 @@ static int coroutine_fn GRAPH_RDLOCK bdrv_get_cluster_size(BlockDriverState *bs)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - 
++ */
+ void bdrv_inc_in_flight(BlockDriverState *bs)
+ {
+     IO_CODE();
 diff --git a/block/mirror.c b/block/mirror.c
 index 61f0a717b..8dcd1a39d 100644
 --- a/block/mirror.c
@@ -590,6 +719,48 @@ index 835064ed0..59bbb8e56 100644
          commit_active_start(job_id, top_bs, base_bs, job_flags, speed, on_error,
                              filter_node_name, NULL, NULL, false, &local_err);
      } else {
+diff --git a/dump/dump.c b/dump/dump.c
+index 45e84428a..cd32522ff 100644
+--- a/dump/dump.c
++++ b/dump/dump.c
+@@ -527,6 +527,10 @@ static void write_data(DumpState *s, void *buf, int length, Error **errp)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - dump/dump.c|770| <<dump_iterate>> write_memory(s, block, memblock_start, memblock_size, errp);
++ */
+ /* write the memory to vmcore. 1 page per I/O. */
+ static void write_memory(DumpState *s, GuestPhysBlock *block, ram_addr_t start,
+                          int64_t size, Error **errp)
+@@ -654,6 +658,10 @@ static void write_elf_notes(DumpState *s, Error **errp)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - dump/dump.c|805| <<create_vmcore>> dump_begin(s, errp);
++ */
+ /* write elf header, PT_NOTE and elf note to vmcore. */
+ static void dump_begin(DumpState *s, Error **errp)
+ {
+diff --git a/hw/acpi/aml-build.c b/hw/acpi/aml-build.c
+index 6d4517cfb..c8a69238a 100644
+--- a/hw/acpi/aml-build.c
++++ b/hw/acpi/aml-build.c
+@@ -2051,6 +2051,11 @@ void build_spcr(GArray *table_data, BIOSLinker *linker,
+  * ACPI spec, Revision 6.3
+  * 5.2.29 Processor Properties Topology Table (PPTT)
+  */
++/*
++ * called by:
++ *   - hw/arm/virt-acpi-build.c|922| <<virt_acpi_build>> build_pptt(tables_blob, tables->linker, ms, vms->oem_id, vms->oem_table_id);
++ *   - hw/loongarch/acpi-build.c|475| <<acpi_build>> build_pptt(tables_blob, tables->linker, machine, lvms->oem_id, lvms->oem_table_id);
++ */
+ void build_pptt(GArray *table_data, BIOSLinker *linker, MachineState *ms,
+                 const char *oem_id, const char *oem_table_id)
+ {
 diff --git a/hw/acpi/cpu.c b/hw/acpi/cpu.c
 index 5cb60ca8b..92e22a64a 100644
 --- a/hw/acpi/cpu.c
@@ -797,6 +968,178 @@ index 9b974b727..d917031f5 100644
          qapi_event_send_acpi_device_ost(info);
          qapi_free_ACPIOSTInfo(info);
          break;
+diff --git a/hw/acpi/pcihp.c b/hw/acpi/pcihp.c
+index 5f79c9016..11cee3126 100644
+--- a/hw/acpi/pcihp.c
++++ b/hw/acpi/pcihp.c
+@@ -442,6 +442,15 @@ static void pci_write(void *opaque, hwaddr addr, uint64_t data,
+     BusChild *kid, *next;
+     AcpiPciHpState *s = opaque;
+ 
++    /*
++     * 在以下使用AcpiPciHpState->acpi_index:
++     *   - hw/acpi/pcihp.c|426| <<pci_read>> val = s->acpi_index;
++     *   - hw/acpi/pcihp.c|427| <<pci_read>> s->acpi_index = 0;
++     *   - hw/acpi/pcihp.c|445| <<pci_write>> s->acpi_index = 0;
++     *   - hw/acpi/pcihp.c|466| <<pci_write>> s->acpi_index = object_property_get_uint(o, "acpi-index", NULL);
++     *   - hw/acpi/pcihp.c|470| <<pci_write>> trace_acpi_pci_acpi_index_write(s->hotplug_select, slot, s->acpi_index);
++     *   - include/hw/acpi/pcihp.h|99| <<VMSTATE_PCI_HOTPLUG>> VMSTATE_UINT32_TEST(pcihp.acpi_index, state, \
++     */
+     s->acpi_index = 0;
+     switch (addr) {
+     case PCI_AIDX_BASE:
+@@ -463,6 +472,15 @@ static void pci_write(void *opaque, hwaddr addr, uint64_t data,
+             Object *o = OBJECT(kid->child);
+             PCIDevice *dev = PCI_DEVICE(o);
+             if (PCI_SLOT(dev->devfn) == slot) {
++                /*
++		 * 在以下使用AcpiPciHpState->acpi_index:
++		 *   - hw/acpi/pcihp.c|426| <<pci_read>> val = s->acpi_index;
++		 *   - hw/acpi/pcihp.c|427| <<pci_read>> s->acpi_index = 0;
++		 *   - hw/acpi/pcihp.c|445| <<pci_write>> s->acpi_index = 0;
++		 *   - hw/acpi/pcihp.c|466| <<pci_write>> s->acpi_index = object_property_get_uint(o, "acpi-index", NULL);
++		 *   - hw/acpi/pcihp.c|470| <<pci_write>> trace_acpi_pci_acpi_index_write(s->hotplug_select, slot, s->acpi_index);
++		 *   - include/hw/acpi/pcihp.h|99| <<VMSTATE_PCI_HOTPLUG>> VMSTATE_UINT32_TEST(pcihp.acpi_index, state, \
++		 */
+                 s->acpi_index = object_property_get_uint(o, "acpi-index", NULL);
+                 break;
+             }
+diff --git a/hw/acpi/piix4.c b/hw/acpi/piix4.c
+index debe1adb8..3877847cc 100644
+--- a/hw/acpi/piix4.c
++++ b/hw/acpi/piix4.c
+@@ -225,10 +225,48 @@ static bool piix4_vmstate_need_smbus(void *opaque, int version_id)
+     return pm_smbus_vmstate_needed();
+ }
+ 
++/*
++ * struct VMStateDescription:
++ * -> const VMStateField *fields;
++ *        struct VMStateField {
++ *            const char *name;
++ *    	      const char *err_hint;
++ * 	      size_t offset;
++ * 	      size_t size;
++ * 	      size_t start;
++ * 	      int num;
++ * 	      size_t num_offset;
++ * 	      size_t size_offset;
++ * 	      const VMStateInfo *info;
++ * 	      enum VMStateFlags flags;
++ * 	      const VMStateDescription *vmsd;
++ * 	      int version_id;
++ * 	      int struct_version_id;
++ * 	      bool (*field_exists)(void *opaque, int version_id);
++ *        };
++ * -> const VMStateDescription * const *subsections;
++ *
++ * 266 static const VMStateDescription vmstate_acpi = {
++ * 267     .name = "piix4_pm",
++ * 268     .version_id = 3,
++ * 269     .minimum_version_id = 3,
++ * 270     .post_load = vmstate_acpi_post_load,
++ * 271     .fields = (const VMStateField[]) {
++ * 272         VMSTATE_PCI_DEVICE(parent_obj, PIIX4PMState),
++ * ... ...
++ * 288         VMSTATE_PCI_HOTPLUG(acpi_pci_hotplug, PIIX4PMState,
++ * 289                             vmstate_test_use_acpi_hotplug_bridge,
++ * 290                             vmstate_test_migrate_acpi_index),
++ */
+ /*
+  * This is a fudge to turn off the acpi_index field,
+  * whose test was always broken on piix4 with 6.2 and older machine types.
+  */
++/*
++ * struct PIIX4PMState:
++ * -> AcpiPciHpState acpi_pci_hotplug;
++ *    -> uint32_t acpi_index;
++ */
+ static bool vmstate_test_migrate_acpi_index(void *opaque, int version_id)
+ {
+     PIIX4PMState *s = PIIX4_PM(opaque);
+@@ -236,12 +274,66 @@ static bool vmstate_test_migrate_acpi_index(void *opaque, int version_id)
+            !s->not_migrate_acpi_index;
+ }
+ 
++/*
++ * struct VMStateDescription:
++ * -> const VMStateField *fields;
++ *        struct VMStateField {
++ *            const char *name;
++ *            const char *err_hint;
++ *            size_t offset;
++ *            size_t size;
++ *            size_t start;
++ *            int num;
++ *            size_t num_offset;
++ *            size_t size_offset;
++ *            const VMStateInfo *info;
++ *            enum VMStateFlags flags;
++ *            const VMStateDescription *vmsd;
++ *            int version_id;
++ *            int struct_version_id;
++ *            bool (*field_exists)(void *opaque, int version_id);
++ *        };
++ * -> const VMStateDescription * const *subsections;
++ *
++ * 266 static const VMStateDescription vmstate_acpi = {
++ * 267     .name = "piix4_pm",
++ * 268     .version_id = 3,
++ * 269     .minimum_version_id = 3,
++ * 270     .post_load = vmstate_acpi_post_load,
++ * 271     .fields = (const VMStateField[]) {
++ * 272         VMSTATE_PCI_DEVICE(parent_obj, PIIX4PMState),
++ * ... ...
++ * 288         VMSTATE_PCI_HOTPLUG(acpi_pci_hotplug, PIIX4PMState,
++ * 289                             vmstate_test_use_acpi_hotplug_bridge,
++ * 290                             vmstate_test_migrate_acpi_index),
++ */
+ /* qemu-kvm 1.2 uses version 3 but advertised as 2
+  * To support incoming qemu-kvm 1.2 migration, change version_id
+  * and minimum_version_id to 2 below (which breaks migration from
+  * qemu 1.2).
+  *
+  */
++/*
++ * 167 struct VMStateField {
++ * 168     const char *name;
++ * 169     const char *err_hint;  
++ * 170     size_t offset;
++ * 171     size_t size;
++ * 172     size_t start;
++ * 173     int num;
++ * 174     size_t num_offset;
++ * 175     size_t size_offset;
++ * 176     const VMStateInfo *info;
++ * 177     enum VMStateFlags flags;
++ * 178     const VMStateDescription *vmsd;
++ * 179     int version_id;
++ * 180     int struct_version_id; 
++ * 181     bool (*field_exists)(void *opaque, int version_id);
++ * 182 };
++ *
++ * 在以下使用vmstate_acpi:
++ *   - hw/acpi/piix4.c|638| <<piix4_pm_class_init>> dc->vmsd = &vmstate_acpi;
++ */
+ static const VMStateDescription vmstate_acpi = {
+     .name = "piix4_pm",
+     .version_id = 3,
+diff --git a/hw/arm/virt-acpi-build.c b/hw/arm/virt-acpi-build.c
+index f76fb117a..65e958ce6 100644
+--- a/hw/arm/virt-acpi-build.c
++++ b/hw/arm/virt-acpi-build.c
+@@ -890,6 +890,11 @@ static void acpi_align_size(GArray *blob, unsigned align)
+     g_array_set_size(blob, ROUND_UP(acpi_data_len(blob), align));
+ }
+ 
++/*
++ * called by:
++ *   - hw/arm/virt-acpi-build.c|1052| <<virt_acpi_build_update>> virt_acpi_build(VIRT_MACHINE(qdev_get_machine()), &tables);
++ *   - hw/arm/virt-acpi-build.c|1096| <<virt_acpi_setup>> virt_acpi_build(vms, &tables);
++ */
+ static
+ void virt_acpi_build(VirtMachineState *vms, AcpiBuildTables *tables)
+ {
 diff --git a/hw/block/virtio-blk.c b/hw/block/virtio-blk.c
 index 73bdfd612..19fd25ddb 100644
 --- a/hw/block/virtio-blk.c
@@ -849,6 +1192,26 @@ index 73bdfd612..19fd25ddb 100644
  static void virtio_blk_ioeventfd_attach(VirtIOBlock *s);
  
  static void virtio_blk_init_request(VirtIOBlock *s, VirtQueue *vq,
+diff --git a/hw/core/machine.c b/hw/core/machine.c
+index 27dcda024..e9ac54646 100644
+--- a/hw/core/machine.c
++++ b/hw/core/machine.c
+@@ -91,6 +91,15 @@ GlobalProperty hw_compat_7_0[] = {
+ };
+ const size_t hw_compat_7_0_len = G_N_ELEMENTS(hw_compat_7_0);
+ 
++/*
++ * 在以下使用hw_compat_6_2[]:
++ *   - hw/arm/virt.c|3376| <<virt_machine_6_2_options>> compat_props_add(mc->compat_props, hw_compat_6_2, hw_compat_6_2_len);
++ *   - hw/i386/pc_piix.c|575| <<pc_i440fx_machine_6_2_options>> compat_props_add(m->compat_props, hw_compat_6_2, hw_compat_6_2_len);
++ *   - hw/i386/pc_q35.c|451| <<pc_q35_machine_6_2_options>> compat_props_add(m->compat_props, hw_compat_6_2, hw_compat_6_2_len);
++ *   - hw/m68k/virt.c|426| <<virt_machine_6_2_options>> compat_props_add(mc->compat_props, hw_compat_6_2, hw_compat_6_2_len);
++ *   - hw/ppc/spapr.c|4933| <<spapr_machine_6_2_class_options>> compat_props_add(mc->compat_props, hw_compat_6_2, hw_compat_6_2_len);
++ *   - hw/s390x/s390-virtio-ccw.c|1000| <<ccw_machine_6_2_class_options>> compat_props_add(mc->compat_props, hw_compat_6_2, hw_compat_6_2_len);
++ */
+ GlobalProperty hw_compat_6_2[] = {
+     { "PIIX4_PM", "x-not-migrate-acpi-index", "on"},
+ };
 diff --git a/hw/core/nmi.c b/hw/core/nmi.c
 index a7bce8a04..306ebf601 100644
 --- a/hw/core/nmi.c
@@ -886,6 +1249,21 @@ index f3a996f57..26c4b08e2 100644
          qapi_event_send_device_deleted(dev->id, dev->canonical_path);
          g_free(dev->canonical_path);
          dev->canonical_path = NULL;
+diff --git a/hw/i386/pc_piix.c b/hw/i386/pc_piix.c
+index 347afa4c3..2e2d86542 100644
+--- a/hw/i386/pc_piix.c
++++ b/hw/i386/pc_piix.c
+@@ -569,6 +569,10 @@ static void pc_i440fx_machine_7_0_options(MachineClass *m)
+ 
+ DEFINE_I440FX_MACHINE(7, 0);
+ 
++/*
++ * 在以下使用pc_i440fx_machine_6_2_options():
++ *   - hw/i386/pc_piix.c|583| <<pc_i440fx_machine_6_1_options>> pc_i440fx_machine_6_2_options(m);
++ */
+ static void pc_i440fx_machine_6_2_options(MachineClass *m)
+ {
+     pc_i440fx_machine_7_0_options(m);
 diff --git a/hw/nvram/fw_cfg.c b/hw/nvram/fw_cfg.c
 index fc0263f34..a221c155c 100644
 --- a/hw/nvram/fw_cfg.c
@@ -1203,6 +1581,87 @@ index 2407720c3..bfe3c088f 100644
      /* Disable PBA emulation when nothing more is pending. */
      clear_bit(nr, vdev->msix->pending);
      if (find_first_bit(vdev->msix->pending,
+diff --git a/hw/virtio/virtio-pci.c b/hw/virtio/virtio-pci.c
+index 524b63e5c..751a17fa3 100644
+--- a/hw/virtio/virtio-pci.c
++++ b/hw/virtio/virtio-pci.c
+@@ -131,6 +131,11 @@ static const VMStateDescription vmstate_virtio_pci_modern_state_sub = {
+     }
+ };
+ 
++/*
++ * 在以下使用vmstate_virtio_pci:
++ *   - hw/virtio/virtio-pci.c|158| <<virtio_pci_save_extra_state>> vmstate_save_state(f, &vmstate_virtio_pci, proxy, NULL);
++ *   - hw/virtio/virtio-pci.c|165| <<virtio_pci_load_extra_state>> return vmstate_load_state(f, &vmstate_virtio_pci, proxy, 1);
++ */
+ static const VMStateDescription vmstate_virtio_pci = {
+     .name = "virtio_pci",
+     .version_id = 1,
+@@ -151,6 +156,10 @@ static bool virtio_pci_has_extra_state(DeviceState *d)
+     return proxy->flags & VIRTIO_PCI_FLAG_MIGRATE_EXTRA;
+ }
+ 
++/*
++ * 在以下使用virtio_pci_save_extra_state():
++ *   - hw/virtio/virtio-pci.c|2581| <<virtio_pci_bus_class_init>> k->save_extra_state = virtio_pci_save_extra_state;
++ */
+ static void virtio_pci_save_extra_state(DeviceState *d, QEMUFile *f)
+ {
+     VirtIOPCIProxy *proxy = to_virtio_pci_proxy(d);
+diff --git a/hw/virtio/virtio.c b/hw/virtio/virtio.c
+index 9e10cbc05..8ba0daae0 100644
+--- a/hw/virtio/virtio.c
++++ b/hw/virtio/virtio.c
+@@ -2999,6 +2999,10 @@ static const VMStateDescription vmstate_virtio = {
+     }
+ };
+ 
++/*
++ * called by:
++ *   - hw/virtio/virtio.c|3066| <<virtio_device_put>> return virtio_save(VIRTIO_DEVICE(opaque), f);
++ */
+ int virtio_save(VirtIODevice *vdev, QEMUFile *f)
+ {
+     BusState *qbus = qdev_get_parent_bus(DEVICE(vdev));
+diff --git a/include/hw/acpi/pcihp.h b/include/hw/acpi/pcihp.h
+index ac21a9591..12add5eda 100644
+--- a/include/hw/acpi/pcihp.h
++++ b/include/hw/acpi/pcihp.h
+@@ -46,6 +46,15 @@ typedef struct AcpiPciHpPciStatus {
+ typedef struct AcpiPciHpState {
+     AcpiPciHpPciStatus acpi_pcihp_pci_status[ACPI_PCIHP_MAX_HOTPLUG_BUS];
+     uint32_t hotplug_select;
++    /*
++     * 在以下使用AcpiPciHpState->acpi_index:
++     *   - hw/acpi/pcihp.c|426| <<pci_read>> val = s->acpi_index;
++     *   - hw/acpi/pcihp.c|427| <<pci_read>> s->acpi_index = 0;
++     *   - hw/acpi/pcihp.c|445| <<pci_write>> s->acpi_index = 0;
++     *   - hw/acpi/pcihp.c|466| <<pci_write>> s->acpi_index = object_property_get_uint(o, "acpi-index", NULL);
++     *   - hw/acpi/pcihp.c|470| <<pci_write>> trace_acpi_pci_acpi_index_write(s->hotplug_select, slot, s->acpi_index);
++     *   - include/hw/acpi/pcihp.h|99| <<VMSTATE_PCI_HOTPLUG>> VMSTATE_UINT32_TEST(pcihp.acpi_index, state, \
++     */
+     uint32_t acpi_index;
+     PCIBus *root;
+     MemoryRegion io;
+@@ -76,6 +85,18 @@ void build_append_pcihp_slots(Aml *parent_scope, PCIBus *bus);
+ 
+ extern const VMStateDescription vmstate_acpi_pcihp_pci_status;
+ 
++/*
++ * 266 static const VMStateDescription vmstate_acpi = {
++ * 267     .name = "piix4_pm",
++ * 268     .version_id = 3,
++ * 269     .minimum_version_id = 3,
++ * 270     .post_load = vmstate_acpi_post_load,
++ * ... ...
++ * 288         VMSTATE_PCI_HOTPLUG(acpi_pci_hotplug, PIIX4PMState,
++ * 289                             vmstate_test_use_acpi_hotplug_bridge,
++ * 290                             vmstate_test_migrate_acpi_index),
++ * ... ...
++ */
+ #define VMSTATE_PCI_HOTPLUG(pcihp, state, test_pcihp, test_acpi_index) \
+         VMSTATE_UINT32_TEST(pcihp.hotplug_select, state, \
+                             test_pcihp), \
 diff --git a/include/hw/block/block.h b/include/hw/block/block.h
 index de3946a5f..2a50a8c16 100644
 --- a/include/hw/block/block.h
@@ -1246,6 +1705,31 @@ index de3946a5f..2a50a8c16 100644
  #define DEFINE_BLOCK_PROPERTIES(_state, _conf)                          \
      DEFINE_PROP_DRIVE("drive", _state, _conf.blk),                      \
      DEFINE_BLOCK_PROPERTIES_BASE(_state, _conf)
+diff --git a/include/hw/core/cpu.h b/include/hw/core/cpu.h
+index 1c9c775df..668204cba 100644
+--- a/include/hw/core/cpu.h
++++ b/include/hw/core/cpu.h
+@@ -529,6 +529,20 @@ struct CPUState {
+     uint32_t kvm_fetch_index;
+     uint64_t dirty_pages;
+     int kvm_vcpu_stats_fd;
++    /*
++     * 在以下使用CPUState->vcpu_dirty:
++     *   - accel/kvm/kvm-all.c|425| <<kvm_create_vcpu>> cpu->vcpu_dirty = true;
++     *   - accel/kvm/kvm-all.c|2852| <<do_kvm_cpu_synchronize_state>> if (!cpu->vcpu_dirty && !kvm_state->guest_state_protected) {
++     *   - accel/kvm/kvm-all.c|2860| <<do_kvm_cpu_synchronize_state>> cpu->vcpu_dirty = true;
++     *   - accel/kvm/kvm-all.c|2876| <<kvm_cpu_synchronize_state>> if (!cpu->vcpu_dirty && !kvm_state->guest_state_protected) {
++     *   - accel/kvm/kvm-all.c|2890| <<do_kvm_cpu_synchronize_post_reset>> cpu->vcpu_dirty = false;
++     *   - accel/kvm/kvm-all.c|2906| <<do_kvm_cpu_synchronize_post_init>> cpu->vcpu_dirty = false;
++     *   - accel/kvm/kvm-all.c|2922| <<do_kvm_cpu_synchronize_pre_loadvm>> cpu->vcpu_dirty = true;
++     *   - accel/kvm/kvm-all.c|3091| <<kvm_cpu_exec>> if (cpu->vcpu_dirty) {
++     *   - accel/kvm/kvm-all.c|3100| <<kvm_cpu_exec>> cpu->vcpu_dirty = false;
++     *   - target/mips/kvm.c|563| <<kvm_mips_update_state>> if (!cs->vcpu_dirty) {
++     *   - target/mips/kvm.c|579| <<kvm_mips_update_state>> if (!cs->vcpu_dirty) {
++     */
+     bool vcpu_dirty;
+ 
+     /* Use by accel-block: CPU is executing an ioctl() */
 diff --git a/include/hw/virtio/virtio.h b/include/hw/virtio/virtio.h
 index 0fcbc5c0c..491cfeeb5 100644
 --- a/include/hw/virtio/virtio.h
@@ -1332,6 +1816,48 @@ index a08867223..1ddde9436 100644
      void (*synchronize_state)(CPUState *cpu);
      void (*synchronize_pre_loadvm)(CPUState *cpu);
      void (*synchronize_pre_resume)(bool step_pending);
+diff --git a/include/sysemu/kvm_int.h b/include/sysemu/kvm_int.h
+index 1d8fb1473..c0ac8996a 100644
+--- a/include/sysemu/kvm_int.h
++++ b/include/sysemu/kvm_int.h
+@@ -103,6 +103,22 @@ struct KVMState
+ {
+     AccelState parent_obj;
+ 
++    /*
++     * 在以下设置KVMState->nr_slots:
++     *   - accel/kvm/kvm-all.c|2520| <<kvm_init>> s->nr_slots = kvm_check_extension(s, KVM_CAP_NR_MEMSLOTS);
++     *   - accel/kvm/kvm-all.c|2524| <<kvm_init>> s->nr_slots = 32;
++     * 在以下使用KVMState->nr_slots:
++     *   - accel/kvm/kvm-all.c|179| <<kvm_get_max_memslots>> return s->nr_slots;
++     *   - accel/kvm/kvm-all.c|197| <<kvm_get_free_memslots>> return s->nr_slots - used_slots;
++     *   - accel/kvm/kvm-all.c|210| <<kvm_get_free_slot>> for (i = 0; i < s->nr_slots; i++) {
++     *   - accel/kvm/kvm-all.c|243| <<kvm_lookup_matching_slot>> for (i = 0; i < s->nr_slots; i++) {
++     *   - accel/kvm/kvm-all.c|285| <<kvm_physical_memory_addr_from_host>> for (i = 0; i < s->nr_slots; i++) {
++     *   - accel/kvm/kvm-all.c|1103| <<kvm_physical_log_clear>> for (i = 0; i < s->nr_slots; i++) {
++     *   - accel/kvm/kvm-all.c|1790| <<kvm_log_sync_global>> for (i = 0; i < s->nr_slots; i++) {
++     *   - accel/kvm/kvm-all.c|1905| <<kvm_memory_listener_register>> kml->slots = g_new0(KVMSlot, s->nr_slots);
++     *   - accel/kvm/kvm-all.c|1908| <<kvm_memory_listener_register>> for (i = 0; i < s->nr_slots; i++) {
++     *   - accel/kvm/kvm-all.c|2523| <<kvm_init>> if (!s->nr_slots) {
++     */
+     int nr_slots;
+     int fd;
+     int vmfd;
+diff --git a/migration/ram.c b/migration/ram.c
+index edec1a2d0..fc68be9ed 100644
+--- a/migration/ram.c
++++ b/migration/ram.c
+@@ -1013,6 +1013,10 @@ static void migration_dirty_limit_guest(void)
+     trace_migration_dirty_limit_guest(quota_dirtyrate);
+ }
+ 
++/*
++ * called by:
++ *   - migration/ram.c|1074| <<migration_bitmap_sync>> migration_trigger_throttle(rs);
++ */
+ static void migration_trigger_throttle(RAMState *rs)
+ {
+     uint64_t threshold = migrate_throttle_trigger_threshold();
 diff --git a/qom/object.c b/qom/object.c
 index 157a45c5f..41622d3d8 100644
 --- a/qom/object.c
@@ -1369,11 +1895,128 @@ index 157a45c5f..41622d3d8 100644
  bool object_property_parse(Object *obj, const char *name,
                             const char *string, Error **errp)
  {
+diff --git a/system/cpus.c b/system/cpus.c
+index 1c818ff68..25a63e5a9 100644
+--- a/system/cpus.c
++++ b/system/cpus.c
+@@ -486,6 +486,35 @@ void cpus_kick_thread(CPUState *cpu)
+ #endif
+ }
+ 
++/*
++ * called by:
++ *   - accel/accel-blocker.c|92| <<accel_has_to_wait>> qemu_cpu_kick(cpu);
++ *   - accel/tcg/icount-common.c|499| <<icount_notify_exit>> qemu_cpu_kick(current_cpu);
++ *   - accel/tcg/tcg-accel-ops.c|102| <<tcg_handle_interrupt>> qemu_cpu_kick(cpu);
++ *   - cpu-common.c|141| <<queue_work_on_cpu>> qemu_cpu_kick(cpu);
++ *   - cpu-common.c|215| <<start_exclusive>> qemu_cpu_kick(other_cpu);
++ *   - gdbstub/system.c|118| <<gdb_syscall_handling>> qemu_cpu_kick(gdbserver_state.c_cpu);
++ *   - hw/openrisc/cputimer.c|123| <<openrisc_timer_cb>> qemu_cpu_kick(CPU(cpu));
++ *   - hw/ppc/ppc.c|195| <<ppc970_set_irq>> qemu_cpu_kick(cs);
++ *   - hw/ppc/ppc.c|392| <<ppc40x_set_irq>> qemu_cpu_kick(cs);
++ *   - hw/ppc/ppce500_spin.c|115| <<spin_kick>> qemu_cpu_kick(cs);
++ *   - hw/ppc/spapr_hcall.c|646| <<h_prod>> qemu_cpu_kick(cs);
++ *   - hw/ppc/spapr_rtas.c|198| <<rtas_start_cpu>> qemu_cpu_kick(CPU(newcpu));
++ *   - hw/ppc/spapr_rtas.c|221| <<rtas_stop_self>> qemu_cpu_kick(cs);
++ *   - hw/sparc/sun4m.c|179| <<cpu_kick_irq>> qemu_cpu_kick(cs);
++ *   - hw/sparc64/sparc64.c|45| <<cpu_kick_irq>> qemu_cpu_kick(cs);
++ *   - replay/replay-events.c|130| <<replay_add_event>> qemu_cpu_kick(first_cpu);
++ *   - semihosting/console.c|55| <<console_wake_up>> qemu_cpu_kick(cs);
++ *   - system/cpu-timers.c|253| <<qemu_timer_notify_cb>> qemu_cpu_kick(current_cpu);
++ *   - system/cpus.c|261| <<generic_handle_interrupt>> qemu_cpu_kick(cpu);
++ *   - system/cpus.c|577| <<cpu_pause>> qemu_cpu_kick(cpu);
++ *   - system/cpus.c|585| <<cpu_resume>> qemu_cpu_kick(cpu);
++ *   - system/cpus.c|618| <<pause_all_vcpus>> qemu_cpu_kick(cpu);
++ *   - system/cpus.c|645| <<cpu_remove_sync>> qemu_cpu_kick(cpu);
++ *   - target/arm/tcg/mte_helper.c|588| <<mte_async_check_fail>> qemu_cpu_kick(env_cpu(env));
++ *   - target/i386/kvm/xen-emu.c|462| <<kvm_xen_inject_vcpu_callback_vector>> qemu_cpu_kick(cs);
++ *   - target/xtensa/helper.c|317| <<xtensa_runstall>> qemu_cpu_kick(cpu);
++ */
+ void qemu_cpu_kick(CPUState *cpu)
+ {
+     qemu_cond_broadcast(cpu->halt_cond);
+diff --git a/system/globals.c b/system/globals.c
+index d602a04fa..9a052a307 100644
+--- a/system/globals.c
++++ b/system/globals.c
+@@ -34,6 +34,13 @@
+ enum vga_retrace_method vga_retrace_method = VGA_RETRACE_DUMB;
+ int display_opengl;
+ const char* keyboard_layout;
++/*
++ * 在以下使用enable_mlock:
++ *   - hw/virtio/virtio-mem.c|993| <<virtio_mem_device_realize>> if (enable_mlock) {
++ *   - migration/postcopy-ram.c|654| <<postcopy_ram_incoming_cleanup>> if (enable_mlock) {
++ *   - system/vl.c|795| <<realtime_init>> if (enable_mlock) {
++ *   - system/vl.c|3556| <<qemu_init>> enable_mlock = qemu_opt_get_bool(opts, "mem-lock", enable_mlock);
++ */
+ bool enable_mlock;
+ bool enable_cpu_pm;
+ int autostart = 1;
+diff --git a/system/runstate.c b/system/runstate.c
+index a0e2a5fd2..62a4751d9 100644
+--- a/system/runstate.c
++++ b/system/runstate.c
+@@ -225,6 +225,41 @@ static void runstate_init(void)
+     qemu_mutex_init(&vmstop_lock);
+ }
+ 
++/*
++ * (gdb) bt
++ * #0  runstate_set (new_state=RUN_STATE_RUNNING) at ../system/runstate.c:231
++ * #1  0x0000555555bd1bd7 in vm_prepare_start (step_pending=false) at ../system/cpus.c:754
++ * #2  0x0000555555bd1c1d in vm_start () at ../system/cpus.c:762
++ * #3  0x0000555555c13324 in process_incoming_migration_bh (opaque=0x555557691cc0) at ../migration/migration.c:757
++ * #4  0x0000555555c120bb in migration_bh_dispatch_bh (opaque=0x5555576736c0) at ../migration/migration.c:284
++ * #5  0x0000555556186520 in aio_bh_call (bh=0x5555583ab510) at ../util/async.c:171
++ * #6  0x000055555618666e in aio_bh_poll (ctx=0x5555573fd590) at ../util/async.c:218
++ * #7  0x0000555556165595 in aio_dispatch (ctx=0x5555573fd590) at ../util/aio-posix.c:423
++ * #8  0x0000555556186b3d in aio_ctx_dispatch (source=0x5555573fd590, callback=0x0, user_data=0x0) at ../util/async.c:360
++ * #9  0x00007ffff6fd494b in g_main_dispatch (context=0x5555573fdab0) at ../glib/gmain.c:3325
++ * #10 g_main_context_dispatch (context=0x5555573fdab0) at ../glib/gmain.c:4043
++ * #11 0x0000555556188215 in glib_pollfds_poll () at ../util/main-loop.c:287
++ * #12 0x00005555561882a3 in os_host_main_loop_wait (timeout=0) at ../util/main-loop.c:310
++ * #13 0x00005555561883d2 in main_loop_wait (nonblocking=0) at ../util/main-loop.c:589
++ * #14 0x0000555555be0f17 in qemu_main_loop () at ../system/runstate.c:826
++ * #15 0x0000555556093994 in qemu_default_main () at ../system/main.c:37
++ * #16 0x00005555560939d1 in main (argc=18, argv=0x7fffffffdc68) at ../system/main.c:48
++ *
++ * called by:
++ *   - migration/migration.c|759| <<process_incoming_migration_bh>> runstate_set(RUN_STATE_PAUSED);
++ *   - migration/migration.c|765| <<process_incoming_migration_bh>> runstate_set(global_state_get_runstate());
++ *   - migration/migration.c|3292| <<migration_iteration_finish>> runstate_set(RUN_STATE_POSTMIGRATE);
++ *   - migration/migration.c|3308| <<migration_iteration_finish>> runstate_set(s->vm_old_state);
++ *   - migration/savevm.c|2177| <<loadvm_postcopy_handle_run_bh>> runstate_set(RUN_STATE_PAUSED);
++ *   - system/cpus.c|296| <<do_vm_stop>> runstate_set(state);
++ *   - system/cpus.c|754| <<vm_prepare_start>> runstate_set(state);
++ *   - system/cpus.c|772| <<vm_resume>> runstate_set(state);
++ *   - system/cpus.c|784| <<vm_stop_force_state>> runstate_set(state);
++ *   - system/runstate.c|637| <<qemu_system_suspend>> runstate_set(RUN_STATE_SUSPENDED);
++ *   - system/runstate.c|668| <<qemu_system_wakeup_request>> runstate_set(RUN_STATE_RUNNING);
++ *   - system/runstate.c|801| <<main_loop_should_exit>> runstate_set(RUN_STATE_PRELAUNCH);
++ *   - system/vl.c|3464| <<qemu_init>> runstate_set(RUN_STATE_INMIGRATE);
++ */
+ /* This function will abort() on invalid state transitions */
+ void runstate_set(RunState new_state)
+ {
 diff --git a/target/arm/cpu.c b/target/arm/cpu.c
-index 19191c239..328c479b9 100644
+index 19191c239..1709ffdf4 100644
 --- a/target/arm/cpu.c
 +++ b/target/arm/cpu.c
-@@ -1770,6 +1770,9 @@ void arm_cpu_post_init(Object *obj)
+@@ -1467,6 +1467,12 @@ static void arm_cpu_dump_state(CPUState *cs, FILE *f, int flags)
+     }
+ }
+ 
++/*
++ * called by:
++ *   -  hw/arm/sbsa-ref.c|162| <<sbsa_ref_cpu_mp_affinity>> return arm_build_mp_affinity(idx, clustersz);
++ *   - hw/arm/virt.c|1774| <<virt_cpu_mp_affinity>> return arm_build_mp_affinity(idx, clustersz);
++ *   - target/arm/cpu.c|2311| <<arm_cpu_realizefn>> cpu->mp_affinity = arm_build_mp_affinity(cs->cpu_index, ARM_DEFAULT_CPUS_PER_CLUSTER);
++ */
+ uint64_t arm_build_mp_affinity(int idx, uint8_t clustersz)
+ {
+     uint32_t Aff1 = idx / clustersz;
+@@ -1770,6 +1776,9 @@ void arm_cpu_post_init(Object *obj)
  
      if (arm_feature(&cpu->env, ARM_FEATURE_PMU)) {
          cpu->has_pmu = true;
@@ -1384,7 +2027,7 @@ index 19191c239..328c479b9 100644
      }
  
 diff --git a/target/arm/cpu.h b/target/arm/cpu.h
-index 9a3fd5956..70f692157 100644
+index 9a3fd5956..8de764d39 100644
 --- a/target/arm/cpu.h
 +++ b/target/arm/cpu.h
 @@ -945,6 +945,17 @@ struct ArchCPU {
@@ -1405,6 +2048,23 @@ index 9a3fd5956..70f692157 100644
      /* KVM init features for this CPU */
      uint32_t kvm_init_features[7];
  
+@@ -1043,6 +1054,16 @@ struct ArchCPU {
+     uint64_t id_aa64afr0;
+     uint64_t id_aa64afr1;
+     uint64_t clidr;
++    /*
++     * 在以下使用ARMCPU->mp_affinity:
++     *   - target/arm/cpu.c|2626| <<global>> DEFINE_PROP_UINT64("mp-affinity", ARMCPU, mp_affinity, ARM64_AFFINITY_INVALID),
++     *   - target/arm/cpu.c|1479| <<arm_cpu_mp_affinity>> return cpu->mp_affinity;
++     *   - target/arm/cpu.c|2310| <<arm_cpu_realizefn>> if (cpu->mp_affinity == ARM64_AFFINITY_INVALID) {
++     *   - target/arm/cpu.c|2311| <<arm_cpu_realizefn>> cpu->mp_affinity = arm_build_mp_affinity(cs->cpu_index, ARM_DEFAULT_CPUS_PER_CLUSTER);
++     *   - target/arm/helper.c|4677| <<mpidr_read_val>> uint64_t mpidr = cpu->mp_affinity;
++     *   - target/arm/hvf/hvf.c|984| <<hvf_arch_init_vcpu>> ret = hv_vcpu_set_sys_reg(cpu->accel->fd, HV_SYS_REG_MPIDR_EL1, arm_cpu->mp_affinity);
++     *   - target/arm/kvm.c|1940| <<kvm_arch_init_vcpu>> cpu->mp_affinity = mpidr & ARM64_AFFINITY_MASK;
++     */
+     uint64_t mp_affinity; /* MP ID without feature bits */
+     /* The elements of this array are the CCSIDR values for each cache,
+      * in the order L1DCache, L1ICache, L2DCache, L2ICache, etc.
 diff --git a/target/i386/cpu.c b/target/i386/cpu.c
 index 85ef7452c..1fd6e2a06 100644
 --- a/target/i386/cpu.c
@@ -4460,6 +5120,556 @@ index 11b35e48f..6c9a96d2e 100644
  void *qemu_alloc_stack(size_t *sz)
  {
      void *ptr;
+diff --git a/util/qemu-coroutine.c b/util/qemu-coroutine.c
+index eb4eebefd..7feee25e6 100644
+--- a/util/qemu-coroutine.c
++++ b/util/qemu-coroutine.c
+@@ -21,6 +21,11 @@
+ #include "qemu/cutils.h"
+ #include "block/aio.h"
+ 
++/*
++ * 在以下使用COROUTINE_POOL_BATCH_MAX_SIZE:
++ *   - util/qemu-coroutine.c|65| <<QSLIST_HEAD>> static unsigned int global_pool_max_size = COROUTINE_POOL_BATCH_MAX_SIZE;
++ *   - util/qemu-coroutine.c|200| <<coroutine_pool_put>> if (unlikely(batch->size >= COROUTINE_POOL_BATCH_MAX_SIZE)) {
++ */
+ enum {
+     COROUTINE_POOL_BATCH_MAX_SIZE = 128,
+ };
+@@ -54,21 +59,82 @@ typedef struct CoroutinePoolBatch {
+     unsigned int size;
+ } CoroutinePoolBatch;
+ 
++/*
++ * 一个链接着CoroutinePoolBatch的链表
++ */
+ typedef QSLIST_HEAD(, CoroutinePoolBatch) CoroutinePool;
+ 
++/*
++ * 在以下使用global_pool_hard_max_size:
++ *   - util/qemu-coroutine.c|200| <<coroutine_pool_put_global>> unsigned int max = MIN(global_pool_max_size, global_pool_hard_max_size);
++ *   - util/qemu-coroutine.c|546| <<qemu_coroutine_init>> global_pool_hard_max_size = get_global_pool_hard_max_size();
++ */
+ /* Host operating system limit on number of pooled coroutines */
+ static unsigned int global_pool_hard_max_size;
+ 
++/*
++ * 在以下使用global_pool_lock:
++ *   - util/qemu-coroutine.c|72| <<QSLIST_HEAD>> static QemuMutex global_pool_lock;
++ *   - util/qemu-coroutine.c|233| <<coroutine_pool_refill_local>> WITH_QEMU_LOCK_GUARD(&global_pool_lock) {
++ *   - util/qemu-coroutine.c|255| <<coroutine_pool_put_global>> WITH_QEMU_LOCK_GUARD(&global_pool_lock) {
++ *   - util/qemu-coroutine.c|546| <<qemu_coroutine_inc_pool_size>> QEMU_LOCK_GUARD(&global_pool_lock);
++ *   - util/qemu-coroutine.c|556| <<qemu_coroutine_dec_pool_size>> QEMU_LOCK_GUARD(&global_pool_lock);
++ *   - util/qemu-coroutine.c|602| <<qemu_coroutine_init>> qemu_mutex_init(&global_pool_lock);
++ */
+ static QemuMutex global_pool_lock; /* protects the following variables */
++/*
++ * 在以下使用global_pool:
++ *   - util/qemu-coroutine.c|68| <<QSLIST_HEAD>> static CoroutinePool global_pool = QSLIST_HEAD_INITIALIZER(global_pool);
++ *   - util/qemu-coroutine.c|147| <<coroutine_pool_refill_local>> batch = QSLIST_FIRST(&global_pool);
++ *   - util/qemu-coroutine.c|150| <<coroutine_pool_refill_local>> QSLIST_REMOVE_HEAD(&global_pool, next);
++ *   - util/qemu-coroutine.c|169| <<coroutine_pool_put_global>> QSLIST_INSERT_HEAD(&global_pool, batch, next);
++ *
++ * 一个链接着CoroutinePoolBatch的链表
++ */
+ static CoroutinePool global_pool = QSLIST_HEAD_INITIALIZER(global_pool);
++/*
++ * 在以下使用global_pool_size:
++ *   - util/qemu-coroutine.c|69| <<QSLIST_HEAD>> static unsigned int global_pool_size;
++ *   - util/qemu-coroutine.c|151| <<coroutine_pool_refill_local>> global_pool_size -= batch->size;
++ *   - util/qemu-coroutine.c|168| <<coroutine_pool_put_global>> if (global_pool_size < max) {
++ *   - util/qemu-coroutine.c|172| <<coroutine_pool_put_global>> global_pool_size += batch->size;
++ */
+ static unsigned int global_pool_size;
++/*
++ * 在以下使用global_pool_max_size:
++ *   - util/qemu-coroutine.c|70| <<QSLIST_HEAD>> static unsigned int global_pool_max_size = COROUTINE_POOL_BATCH_MAX_SIZE;
++ *   - util/qemu-coroutine.c|165| <<coroutine_pool_put_global>> unsigned int max = MIN(global_pool_max_size, global_pool_hard_max_size);
++ *   - util/qemu-coroutine.c|360| <<qemu_coroutine_inc_pool_size>> global_pool_max_size += additional_pool_size;
++ *   - util/qemu-coroutine.c|366| <<qemu_coroutine_dec_pool_size>> global_pool_max_size -= removing_pool_size;
++ */
+ static unsigned int global_pool_max_size = COROUTINE_POOL_BATCH_MAX_SIZE;
+ 
++/*
++ * 一个链接着CoroutinePoolBatch的链表
++ */
+ QEMU_DEFINE_STATIC_CO_TLS(CoroutinePool, local_pool);
++/*
++ * 查看local_pool_cleanup_init_once()
++ */
+ QEMU_DEFINE_STATIC_CO_TLS(Notifier, local_pool_cleanup_notifier);
+ 
++/*
++ * called by:
++ *   - util/qemu-coroutine.c|229| <<coroutine_pool_put>> batch = coroutine_pool_batch_new();
++ *   - util/qemu-coroutine.c|243| <<coroutine_pool_put>> batch = coroutine_pool_batch_new();
++ */
+ static CoroutinePoolBatch *coroutine_pool_batch_new(void)
+ {
++    /*
++     * 53 typedef struct CoroutinePoolBatch {
++     * 54     // Batches are kept in a list
++     * 55     QSLIST_ENTRY(CoroutinePoolBatch) next;
++     * 56
++     * 57     // This batch holds up to @COROUTINE_POOL_BATCH_MAX_SIZE coroutines
++     * 58     QSLIST_HEAD(, Coroutine) list;
++     * 59     unsigned int size;
++     * 60 } CoroutinePoolBatch;
++     */
+     CoroutinePoolBatch *batch = g_new(CoroutinePoolBatch, 1);
+ 
+     QSLIST_INIT(&batch->list);
+@@ -76,11 +142,29 @@ static CoroutinePoolBatch *coroutine_pool_batch_new(void)
+     return batch;
+ }
+ 
++/*
++ * called by:
++ *   - util/qemu-coroutine.c|133| <<local_pool_cleanup>> coroutine_pool_batch_delete(batch);
++ *   - util/qemu-coroutine.c|169| <<coroutine_pool_get_local>> coroutine_pool_batch_delete(batch);
++ *   - util/qemu-coroutine.c|212| <<coroutine_pool_put_global>> coroutine_pool_batch_delete(batch);
++ *
++ * 把一个CoroutinePoolBatch上所有的Coroutine清空
++ */
+ static void coroutine_pool_batch_delete(CoroutinePoolBatch *batch)
+ {
+     Coroutine *co;
+     Coroutine *tmp;
+ 
++    /*
++     * 53 typedef struct CoroutinePoolBatch {
++     * 54     // Batches are kept in a list
++     * 55     QSLIST_ENTRY(CoroutinePoolBatch) next;
++     * 56
++     * 57     // This batch holds up to @COROUTINE_POOL_BATCH_MAX_SIZE coroutines
++     * 58     QSLIST_HEAD(, Coroutine) list;
++     * 59     unsigned int size;
++     * 60 } CoroutinePoolBatch;
++     */
+     QSLIST_FOREACH_SAFE(co, &batch->list, pool_next, tmp) {
+         QSLIST_REMOVE_HEAD(&batch->list, pool_next);
+         qemu_coroutine_delete(co);
+@@ -88,21 +172,51 @@ static void coroutine_pool_batch_delete(CoroutinePoolBatch *batch)
+     g_free(batch);
+ }
+ 
++/*
++ * 在以下使用local_pool_cleanup():
++ *   - util/qemu-coroutine.c|147| <<local_pool_cleanup_init_once>> notifier->notify = local_pool_cleanup;
++ */
+ static void local_pool_cleanup(Notifier *n, void *value)
+ {
+     CoroutinePool *local_pool = get_ptr_local_pool();
+     CoroutinePoolBatch *batch;
+     CoroutinePoolBatch *tmp;
+ 
++    /*
++     * 53 typedef struct CoroutinePoolBatch {
++     * 54     // Batches are kept in a list
++     * 55     QSLIST_ENTRY(CoroutinePoolBatch) next;
++     * 56
++     * 57     // This batch holds up to @COROUTINE_POOL_BATCH_MAX_SIZE coroutines
++     * 58     QSLIST_HEAD(, Coroutine) list;
++     * 59     unsigned int size;
++     * 60 } CoroutinePoolBatch;
++     */
+     QSLIST_FOREACH_SAFE(batch, local_pool, next, tmp) {
+         QSLIST_REMOVE_HEAD(local_pool, next);
++        /*
++	 * called by:
++	 *   - util/qemu-coroutine.c|133| <<local_pool_cleanup>> coroutine_pool_batch_delete(batch);
++	 *   - util/qemu-coroutine.c|169| <<coroutine_pool_get_local>> coroutine_pool_batch_delete(batch);
++	 *   - util/qemu-coroutine.c|212| <<coroutine_pool_put_global>> coroutine_pool_batch_delete(batch);
++	 *
++	 * 把一个CoroutinePoolBatch上所有的Coroutine清空
++	 */
+         coroutine_pool_batch_delete(batch);
+     }
+ }
+ 
++/*
++ * called by:
++ *   - util/qemu-coroutine.c|178| <<coroutine_pool_refill_local>> local_pool_cleanup_init_once();
++ *   - util/qemu-coroutine.c|223| <<coroutine_pool_put>> local_pool_cleanup_init_once();
++ */
+ /* Ensure the atexit notifier is registered */
+ static void local_pool_cleanup_init_once(void)
+ {
++    /*
++     * 声明: QEMU_DEFINE_STATIC_CO_TLS(CoroutinePool, local_pool);
++     */
+     Notifier *notifier = get_ptr_local_pool_cleanup_notifier();
+     if (!notifier->notify) {
+         notifier->notify = local_pool_cleanup;
+@@ -110,6 +224,11 @@ static void local_pool_cleanup_init_once(void)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - util/qemu-coroutine.c|224| <<coroutine_pool_get>> co = coroutine_pool_get_local();
++ *   - util/qemu-coroutine.c|227| <<coroutine_pool_get>> co = coroutine_pool_get_local();
++ */
+ /* Helper to get the next unused coroutine from the local pool */
+ static Coroutine *coroutine_pool_get_local(void)
+ {
+@@ -132,17 +251,44 @@ static Coroutine *coroutine_pool_get_local(void)
+     return co;
+ }
+ 
++/*
++ * called by:
++ *   - util/qemu-coroutine.c|226| <<coroutine_pool_get>> coroutine_pool_refill_local();
++ */
+ /* Get the next batch from the global pool */
+ static void coroutine_pool_refill_local(void)
+ {
+     CoroutinePool *local_pool = get_ptr_local_pool();
+     CoroutinePoolBatch *batch;
+ 
++    /*
++     * 在以下使用global_pool_lock:
++     *   - util/qemu-coroutine.c|72| <<QSLIST_HEAD>> static QemuMutex global_pool_lock;
++     *   - util/qemu-coroutine.c|233| <<coroutine_pool_refill_local>> WITH_QEMU_LOCK_GUARD(&global_pool_lock) {
++     *   - util/qemu-coroutine.c|255| <<coroutine_pool_put_global>> WITH_QEMU_LOCK_GUARD(&global_pool_lock) {
++     *   - util/qemu-coroutine.c|546| <<qemu_coroutine_inc_pool_size>> QEMU_LOCK_GUARD(&global_pool_lock);
++     *   - util/qemu-coroutine.c|556| <<qemu_coroutine_dec_pool_size>> QEMU_LOCK_GUARD(&global_pool_lock);
++     *   - util/qemu-coroutine.c|602| <<qemu_coroutine_init>> qemu_mutex_init(&global_pool_lock);
++     */
+     WITH_QEMU_LOCK_GUARD(&global_pool_lock) {
++        /*
++	 * 在以下使用global_pool:
++	 *   - util/qemu-coroutine.c|68| <<QSLIST_HEAD>> static CoroutinePool global_pool = QSLIST_HEAD_INITIALIZER(global_pool);
++	 *   - util/qemu-coroutine.c|147| <<coroutine_pool_refill_local>> batch = QSLIST_FIRST(&global_pool);
++	 *   - util/qemu-coroutine.c|150| <<coroutine_pool_refill_local>> QSLIST_REMOVE_HEAD(&global_pool, next);
++	 *   - util/qemu-coroutine.c|169| <<coroutine_pool_put_global>> QSLIST_INSERT_HEAD(&global_pool, batch, next);
++	 */
+         batch = QSLIST_FIRST(&global_pool);
+ 
+         if (batch) {
+             QSLIST_REMOVE_HEAD(&global_pool, next);
++            /*
++	     * 在以下使用global_pool_size:
++	     *   - util/qemu-coroutine.c|69| <<QSLIST_HEAD>> static unsigned int global_pool_size;
++	     *   - util/qemu-coroutine.c|151| <<coroutine_pool_refill_local>> global_pool_size -= batch->size;
++	     *   - util/qemu-coroutine.c|168| <<coroutine_pool_put_global>> if (global_pool_size < max) {
++	     *   - util/qemu-coroutine.c|172| <<coroutine_pool_put_global>> global_pool_size += batch->size;
++	     */
+             global_pool_size -= batch->size;
+         }
+     }
+@@ -153,16 +299,55 @@ static void coroutine_pool_refill_local(void)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - util/qemu-coroutine.c|253| <<coroutine_pool_put>> coroutine_pool_put_global(batch);
++ */
+ /* Add a batch of coroutines to the global pool */
+ static void coroutine_pool_put_global(CoroutinePoolBatch *batch)
+ {
++    /*
++     * 在以下使用global_pool_lock:
++     *   - util/qemu-coroutine.c|72| <<QSLIST_HEAD>> static QemuMutex global_pool_lock;
++     *   - util/qemu-coroutine.c|233| <<coroutine_pool_refill_local>> WITH_QEMU_LOCK_GUARD(&global_pool_lock) {
++     *   - util/qemu-coroutine.c|255| <<coroutine_pool_put_global>> WITH_QEMU_LOCK_GUARD(&global_pool_lock) {
++     *   - util/qemu-coroutine.c|546| <<qemu_coroutine_inc_pool_size>> QEMU_LOCK_GUARD(&global_pool_lock);
++     *   - util/qemu-coroutine.c|556| <<qemu_coroutine_dec_pool_size>> QEMU_LOCK_GUARD(&global_pool_lock);
++     *   - util/qemu-coroutine.c|602| <<qemu_coroutine_init>> qemu_mutex_init(&global_pool_lock);
++     */
+     WITH_QEMU_LOCK_GUARD(&global_pool_lock) {
++        /*
++	 * 在以下使用global_pool_hard_max_size:
++	 *   - util/qemu-coroutine.c|200| <<coroutine_pool_put_global>> unsigned int max = MIN(global_pool_max_size, global_pool_hard_max_size);
++	 *   - util/qemu-coroutine.c|546| <<qemu_coroutine_init>> global_pool_hard_max_size = get_global_pool_hard_max_size();
++	 */
+         unsigned int max = MIN(global_pool_max_size,
+                                global_pool_hard_max_size);
+ 
++        /*
++	 * 在以下使用global_pool_size:
++	 *   - util/qemu-coroutine.c|69| <<QSLIST_HEAD>> static unsigned int global_pool_size;
++	 *   - util/qemu-coroutine.c|151| <<coroutine_pool_refill_local>> global_pool_size -= batch->size;
++	 *   - util/qemu-coroutine.c|168| <<coroutine_pool_put_global>> if (global_pool_size < max) {
++	 *   - util/qemu-coroutine.c|172| <<coroutine_pool_put_global>> global_pool_size += batch->size;
++	 */
+         if (global_pool_size < max) {
++            /*
++	     * 在以下使用global_pool:
++	     *   - util/qemu-coroutine.c|68| <<QSLIST_HEAD>> static CoroutinePool global_pool = QSLIST_HEAD_INITIALIZER(global_pool);
++	     *   - util/qemu-coroutine.c|147| <<coroutine_pool_refill_local>> batch = QSLIST_FIRST(&global_pool);
++	     *   - util/qemu-coroutine.c|150| <<coroutine_pool_refill_local>> QSLIST_REMOVE_HEAD(&global_pool, next);
++	     *   - util/qemu-coroutine.c|169| <<coroutine_pool_put_global>> QSLIST_INSERT_HEAD(&global_pool, batch, next);
++	     */
+             QSLIST_INSERT_HEAD(&global_pool, batch, next);
+ 
++            /*
++	     * 在以下使用global_pool_size:
++	     *   - util/qemu-coroutine.c|69| <<QSLIST_HEAD>> static unsigned int global_pool_size;
++	     *   - util/qemu-coroutine.c|151| <<coroutine_pool_refill_local>> global_pool_size -= batch->size;
++	     *   - util/qemu-coroutine.c|168| <<coroutine_pool_put_global>> if (global_pool_size < max) {
++	     *   - util/qemu-coroutine.c|172| <<coroutine_pool_put_global>> global_pool_size += batch->size;
++	     */
+             /* Overshooting the max pool size is allowed */
+             global_pool_size += batch->size;
+             return;
+@@ -173,6 +358,10 @@ static void coroutine_pool_put_global(CoroutinePoolBatch *batch)
+     coroutine_pool_batch_delete(batch);
+ }
+ 
++/*
++ * called by:
++ *   - util/qemu-coroutine.c|256| <<qemu_coroutine_create>> co = coroutine_pool_get();
++ */
+ /* Get the next unused coroutine from the pool or return NULL */
+ static Coroutine *coroutine_pool_get(void)
+ {
+@@ -186,6 +375,10 @@ static Coroutine *coroutine_pool_get(void)
+     return co;
+ }
+ 
++/*
++ * called by:
++ *   - util/qemu-coroutine.c|274| <<coroutine_delete>> coroutine_pool_put(co);
++ */
+ static void coroutine_pool_put(Coroutine *co)
+ {
+     CoroutinePool *local_pool = get_ptr_local_pool();
+@@ -203,6 +396,9 @@ static void coroutine_pool_put(Coroutine *co)
+         /* Is the local pool full? */
+         if (next) {
+             QSLIST_REMOVE_HEAD(local_pool, next);
++            /*
++	     * 只在此处调用
++	     */
+             coroutine_pool_put_global(batch);
+         }
+ 
+@@ -214,11 +410,17 @@ static void coroutine_pool_put(Coroutine *co)
+     batch->size++;
+ }
+ 
++/*
++ * 非常多的调用qemu_coroutine_create()
++ */
+ Coroutine *qemu_coroutine_create(CoroutineEntry *entry, void *opaque)
+ {
+     Coroutine *co = NULL;
+ 
+     if (IS_ENABLED(CONFIG_COROUTINE_POOL)) {
++        /*
++	 * 只在此处调用
++	 */
+         co = coroutine_pool_get();
+     }
+ 
+@@ -232,6 +434,10 @@ Coroutine *qemu_coroutine_create(CoroutineEntry *entry, void *opaque)
+     return co;
+ }
+ 
++/*
++ * called by:
++ *   - util/qemu-coroutine.c|340| <<qemu_aio_coroutine_enter>> coroutine_delete(to);
++ */
+ static void coroutine_delete(Coroutine *co)
+ {
+     co->caller = NULL;
+@@ -243,6 +449,12 @@ static void coroutine_delete(Coroutine *co)
+     }
+ }
+ 
++/*
++ * called by:
++ *   - util/async.c|570| <<co_schedule_bh_cb>> qemu_aio_coroutine_enter(ctx, co);
++ *   - util/async.c|710| <<aio_co_enter>> qemu_aio_coroutine_enter(ctx, co);
++ *   - util/qemu-coroutine.c|350| <<qemu_coroutine_enter>> qemu_aio_coroutine_enter(qemu_get_current_aio_context(), co);
++ */
+ void qemu_aio_coroutine_enter(AioContext *ctx, Coroutine *co)
+ {
+     QSIMPLEQ_HEAD(, Coroutine) pending = QSIMPLEQ_HEAD_INITIALIZER(pending);
+@@ -311,11 +523,54 @@ void qemu_aio_coroutine_enter(AioContext *ctx, Coroutine *co)
+     }
+ }
+ 
++/*
++ * 除了unit tests, 在以下调用qemu_coroutine_enter():
++ *   - block/aio_task.c|94| <<aio_task_pool_start_task>> qemu_coroutine_enter(qemu_coroutine_create(aio_task_co, task));
++ *   - block/blkdebug.c|915| <<resume_req_by_tag>> qemu_coroutine_enter(co);
++ *   - block/blkverify.c|217| <<blkverify_co_prwv>> qemu_coroutine_enter(co_a);
++ *   - block/blkverify.c|218| <<blkverify_co_prwv>> qemu_coroutine_enter(co_b);
++ *   - block/block-copy.c|976| <<block_copy_async>> qemu_coroutine_enter(call_state->co);
++ *   - block/export/vduse-blk.c|112| <<vduse_blk_vq_handler>> qemu_coroutine_enter(co);
++ *   - block/export/vhost-user-blk-server.c|102| <<vu_blk_process_vq>> qemu_coroutine_enter(co);
++ *   - block/mirror.c|469| <<mirror_perform>> qemu_coroutine_enter(co);
++ *   - block/nvme.c|1169| <<nvme_rw_cb_bh>> qemu_coroutine_enter(data->co);
++ *   - block/qed.c|329| <<qed_need_check_timer_cb>> qemu_coroutine_enter(co);
++ *   - block/qed.c|593| <<bdrv_qed_open>> qemu_coroutine_enter(qemu_coroutine_create(bdrv_qed_open_entry, &qoc));
++ *   - block/quorum.c|332| <<quorum_rewrite_bad_versions>> qemu_coroutine_enter(co);
++ *   - block/quorum.c|630| <<read_quorum_children>> qemu_coroutine_enter(co);
++ *   - block/quorum.c|744| <<quorum_co_pwritev>> qemu_coroutine_enter(co);
++ *   - hw/9pfs/9p.c|4181| <<pdu_submit>> qemu_coroutine_enter(co);
++ *   - hw/9pfs/9p.c|4338| <<v9fs_reset>> qemu_coroutine_enter(co);
++ *   - hw/9pfs/coth.c|30| <<coroutine_enter_cb>> qemu_coroutine_enter(co);
++ *   - hw/9pfs/coth.c|37| <<coroutine_enter_func>> qemu_coroutine_enter(co);
++ *   - hw/remote/remote-obj.c|125| <<remote_object_machine_done>> qemu_coroutine_enter(co);
++ *   - migration/colo.c|153| <<secondary_vm_do_failover>> qemu_coroutine_enter(mis->colo_incoming_co);
++ *   - migration/migration.c|868| <<migration_incoming_process>> qemu_coroutine_enter(co);
++ *   - migration/rdma.c|3328| <<rdma_cm_poll_handler>> qemu_coroutine_enter(mis->loadvm_co);
++ *   - nbd/server.c|3270| <<rdma_cm_poll_handler>> qemu_coroutine_enter(co);
++ *   - net/colo-compare.c|825| <<compare_chr_send>> qemu_coroutine_enter(sendco->co);
++ *   - net/filter-mirror.c|128| <<filter_send>> qemu_coroutine_enter(co);
++ *   - qemu-img.c|2079| <<convert_co_do_copy>> qemu_coroutine_enter(s->co[i]);
++ *   - qemu-img.c|2140| <<convert_do_copy>> qemu_coroutine_enter(s->co[i]);
++ *   - scsi/qemu-pr-helper.c|817| <<accept_client>> qemu_coroutine_enter(prh->co);
++ *   - tools/i386/qemu-vmsr-helper.c|296| <<accept_client>> qemu_coroutine_enter(vmsrh->co);
++ *   - util/qemu-coroutine-io.c|78| <<fd_coroutine_enter>> qemu_coroutine_enter(data->co);
++ *   - util/qemu-coroutine.c|356| <<qemu_coroutine_enter_if_inactive>> qemu_coroutine_enter(co);
++ */
+ void qemu_coroutine_enter(Coroutine *co)
+ {
+     qemu_aio_coroutine_enter(qemu_get_current_aio_context(), co);
+ }
+ 
++/*
++ * called by:
++ *   - block/blkverify.c|179| <<blkverify_do_test_req>> qemu_coroutine_enter_if_inactive(r->co);
++ *   - block/blkverify.c|192| <<blkverify_do_raw_req>> qemu_coroutine_enter_if_inactive(r->co);
++ *   - block/quorum.c|293| <<quorum_rewrite_entry>> qemu_coroutine_enter_if_inactive(acb->co);
++ *   - block/quorum.c|606| <<read_quorum_children_entry>> qemu_coroutine_enter_if_inactive(acb->co);
++ *   - block/quorum.c|724| <<write_quorum_entry>> qemu_coroutine_enter_if_inactive(acb->co);
++ *   - hw/9pfs/xen-9p-backend.c|321| <<xen_9pfs_bh>> qemu_coroutine_enter_if_inactive(ring->co);
++ */
+ void qemu_coroutine_enter_if_inactive(Coroutine *co)
+ {
+     if (!qemu_coroutine_entered(co)) {
+@@ -323,6 +578,9 @@ void qemu_coroutine_enter_if_inactive(Coroutine *co)
+     }
+ }
+ 
++/*
++ * 特别多qemu_coroutine_yield()的调用
++ */
+ void coroutine_fn qemu_coroutine_yield(void)
+ {
+     Coroutine *self = qemu_coroutine_self();
+@@ -339,28 +597,90 @@ void coroutine_fn qemu_coroutine_yield(void)
+     qemu_coroutine_switch(self, to, COROUTINE_YIELD);
+ }
+ 
++/*
++ * called by:
++ *   - block/io_uring.c|219| <<luring_process_completions>> if (!qemu_coroutine_entered(luringcb->co)) {
++ *   - block/linux-aio.c|108| <<qemu_laio_process_completion>> if (!qemu_coroutine_entered(laiocb->co)) {
++ *   - hw/9pfs/xen-9p-backend.c|312| <<xen_9pfs_bh>> wait = ring->co != NULL && qemu_coroutine_entered(ring->co);
++ *   - nbd/server.c|776| <<nbd_server_tls_handshake>> if (!qemu_coroutine_entered(data->co)) {
++ *   - tests/unit/test-coroutine.c|62| <<verify_entered_step_2>> g_assert(qemu_coroutine_entered(caller));
++ *   - tests/unit/test-coroutine.c|63| <<verify_entered_step_2>> g_assert(qemu_coroutine_entered(qemu_coroutine_self()));
++ *   - tests/unit/test-coroutine.c|67| <<verify_entered_step_2>> g_assert(qemu_coroutine_entered(caller));
++ *   - tests/unit/test-coroutine.c|68| <<verify_entered_step_2>> g_assert(qemu_coroutine_entered(qemu_coroutine_self()));
++ *   - tests/unit/test-coroutine.c|76| <<verify_entered_step_1>> g_assert(qemu_coroutine_entered(self));
++ *   - tests/unit/test-coroutine.c|79| <<verify_entered_step_1>> g_assert(!qemu_coroutine_entered(coroutine));
++ *   - tests/unit/test-coroutine.c|81| <<verify_entered_step_1>> g_assert(!qemu_coroutine_entered(coroutine));
++ *   - tests/unit/test-coroutine.c|90| <<test_entered>> g_assert(!qemu_coroutine_entered(coroutine));
++ *   - util/qemu-coroutine.c|355| <<qemu_coroutine_enter_if_inactive>> if (!qemu_coroutine_entered(co)) {
++ */
+ bool qemu_coroutine_entered(Coroutine *co)
+ {
+     return co->caller;
+ }
+ 
++/*
++ * called by:
++ *   - block.c|7561| <<bdrv_co_enter>> AioContext *old_ctx = qemu_coroutine_get_aio_context(self);
++ *   - io/channel.c|605| <<qio_channel_restart_read>> qemu_coroutine_get_aio_context(co));
++ *   - io/channel.c|620| <<qio_channel_restart_write>> qemu_coroutine_get_aio_context(co));
++ *   - io/channel.c|628| <<qio_channel_set_fd_handlers>> qemu_coroutine_get_aio_context(qemu_coroutine_self()) :
++ *   - io/channel.c|709| <<qio_channel_yield>> ioc_ctx = qemu_coroutine_get_aio_context(qemu_coroutine_self());
++ *   - util/vhost-user-server.c|441| <<vhost_user_server_attach_aio_context>> AioContext *co_ctx = qemu_coroutine_get_aio_context(server->co_trip);
++ */
+ AioContext *qemu_coroutine_get_aio_context(Coroutine *co)
+ {
+     return co->ctx;
+ }
+ 
++/*
++ * called by:
++ *   - hw/block/virtio-blk.c|1954| <<virtio_blk_device_realize>> qemu_coroutine_inc_pool_size(conf->num_queues * conf->queue_size / 2);
++ */
+ void qemu_coroutine_inc_pool_size(unsigned int additional_pool_size)
+ {
++    /*
++     * 在以下使用global_pool_lock:
++     *   - util/qemu-coroutine.c|72| <<QSLIST_HEAD>> static QemuMutex global_pool_lock;
++     *   - util/qemu-coroutine.c|233| <<coroutine_pool_refill_local>> WITH_QEMU_LOCK_GUARD(&global_pool_lock) {
++     *   - util/qemu-coroutine.c|255| <<coroutine_pool_put_global>> WITH_QEMU_LOCK_GUARD(&global_pool_lock) {
++     *   - util/qemu-coroutine.c|546| <<qemu_coroutine_inc_pool_size>> QEMU_LOCK_GUARD(&global_pool_lock);
++     *   - util/qemu-coroutine.c|556| <<qemu_coroutine_dec_pool_size>> QEMU_LOCK_GUARD(&global_pool_lock);
++     *   - util/qemu-coroutine.c|602| <<qemu_coroutine_init>> qemu_mutex_init(&global_pool_lock);
++     */
+     QEMU_LOCK_GUARD(&global_pool_lock);
++    /*
++     * 在以下使用global_pool_max_size:
++     *   - util/qemu-coroutine.c|70| <<QSLIST_HEAD>> static unsigned int global_pool_max_size = COROUTINE_POOL_BATCH_MAX_SIZE;
++     *   - util/qemu-coroutine.c|165| <<coroutine_pool_put_global>> unsigned int max = MIN(global_pool_max_size, global_pool_hard_max_size);
++     *   - util/qemu-coroutine.c|360| <<qemu_coroutine_inc_pool_size>> global_pool_max_size += additional_pool_size;
++     *   - util/qemu-coroutine.c|366| <<qemu_coroutine_dec_pool_size>> global_pool_max_size -= removing_pool_size;
++     */
+     global_pool_max_size += additional_pool_size;
+ }
+ 
++/*
++ * called by:
++ *   - hw/block/virtio-blk.c|2002| <<virtio_blk_device_unrealize>> qemu_coroutine_dec_pool_size(conf->num_queues * conf->queue_size / 2)
++ */
+ void qemu_coroutine_dec_pool_size(unsigned int removing_pool_size)
+ {
++    /*
++     * 在以下使用global_pool_lock:
++     *   - util/qemu-coroutine.c|72| <<QSLIST_HEAD>> static QemuMutex global_pool_lock;
++     *   - util/qemu-coroutine.c|233| <<coroutine_pool_refill_local>> WITH_QEMU_LOCK_GUARD(&global_pool_lock) {
++     *   - util/qemu-coroutine.c|255| <<coroutine_pool_put_global>> WITH_QEMU_LOCK_GUARD(&global_pool_lock) {
++     *   - util/qemu-coroutine.c|546| <<qemu_coroutine_inc_pool_size>> QEMU_LOCK_GUARD(&global_pool_lock);
++     *   - util/qemu-coroutine.c|556| <<qemu_coroutine_dec_pool_size>> QEMU_LOCK_GUARD(&global_pool_lock);
++     *   - util/qemu-coroutine.c|602| <<qemu_coroutine_init>> qemu_mutex_init(&global_pool_lock);
++     */
+     QEMU_LOCK_GUARD(&global_pool_lock);
+     global_pool_max_size -= removing_pool_size;
+ }
+ 
++/*
++ * called by:
++ *   - util/qemu-coroutine.c|400| <<qemu_coroutine_init>> global_pool_hard_max_size = get_global_pool_hard_max_size();
++ */
+ static unsigned int get_global_pool_hard_max_size(void)
+ {
+ #ifdef __linux__
+@@ -394,8 +714,25 @@ static unsigned int get_global_pool_hard_max_size(void)
+     return UINT_MAX;
+ }
+ 
++/*
++ * 只在此处使用qemu_coroutine_init()
++ */
+ static void __attribute__((constructor)) qemu_coroutine_init(void)
+ {
++    /*
++     * 在以下使用global_pool_lock:
++     *   - util/qemu-coroutine.c|72| <<QSLIST_HEAD>> static QemuMutex global_pool_lock;
++     *   - util/qemu-coroutine.c|233| <<coroutine_pool_refill_local>> WITH_QEMU_LOCK_GUARD(&global_pool_lock) {
++     *   - util/qemu-coroutine.c|255| <<coroutine_pool_put_global>> WITH_QEMU_LOCK_GUARD(&global_pool_lock) {
++     *   - util/qemu-coroutine.c|546| <<qemu_coroutine_inc_pool_size>> QEMU_LOCK_GUARD(&global_pool_lock);
++     *   - util/qemu-coroutine.c|556| <<qemu_coroutine_dec_pool_size>> QEMU_LOCK_GUARD(&global_pool_lock);
++     *   - util/qemu-coroutine.c|602| <<qemu_coroutine_init>> qemu_mutex_init(&global_pool_lock);
++     */
+     qemu_mutex_init(&global_pool_lock);
++    /*
++     * 在以下使用global_pool_hard_max_size:
++     *   - util/qemu-coroutine.c|200| <<coroutine_pool_put_global>> unsigned int max = MIN(global_pool_max_size, global_pool_hard_max_size);
++     *   - util/qemu-coroutine.c|546| <<qemu_coroutine_init>> global_pool_hard_max_size = get_global_pool_hard_max_size();
++     */
+     global_pool_hard_max_size = get_global_pool_hard_max_size();
+ }
 -- 
 2.39.3 (Apple Git-146)
 
