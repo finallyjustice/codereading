@@ -1,0 +1,238 @@
+[PATCH v3 0/9] vhost: Add support of kthread API
+
+... from Cindy Lu <lulu@redhat.com> ...
+
+https://lore.kernel.org/all/20241105072642.898710-1-lulu@redhat.com/
+
+--------------------------
+
+Introduce a module_param that allows users to select the operating mode.
+
+---------------
+
+[PATCH v3 1/9] vhost: Add a new parameter to allow user select kthread
+
+添加一个vhost_dev->inheric_owner, 从新创建的全局inherit_owner_default获取结果.
+
+---------------
+
+[PATCH v3 2/9] vhost: Add the vhost_worker to support kthread
+
+把之前被删掉的kthread(vhost处理work->fn的)加回来.
+
++static int vhost_run_work_kthread_list(void *data)
++{
++	struct vhost_worker *worker = data;
++	struct vhost_work *work, *work_next;
++	struct vhost_dev *dev = worker->dev;
++	struct llist_node *node;
++
++	kthread_use_mm(dev->mm);
++
++	for (;;) {
++		/* mb paired w/ kthread_stop */
++		set_current_state(TASK_INTERRUPTIBLE);
++
++		if (kthread_should_stop()) {
++			__set_current_state(TASK_RUNNING);
++			break;
++		}
++		node = llist_del_all(&worker->work_list);
++		if (!node)
++			schedule();
++
++		node = llist_reverse_order(node);
++		/* make sure flag is seen after deletion */
++		smp_wmb();
++		llist_for_each_entry_safe(work, work_next, node, node) {
++			clear_bit(VHOST_WORK_QUEUED, &work->flags);
++			__set_current_state(TASK_RUNNING);
++			kcov_remote_start_common(worker->kcov_handle);
++			work->fn(work);
++			kcov_remote_stop();
++			cond_resched();
++		}
++	}
++	kthread_unuse_mm(dev->mm);
++
++	return 0;
++}
+
+---------------
+
+[PATCH v3 3/9] vhost: Add the cgroup related function
+
+把之前被删掉的cgroup的函数加回来, 比如vhost_attach_cgroups().
+
+---------------
+
+[PATCH v3 4/9] vhost: Add kthread support in function vhost_worker_create
+
+核心思想是在vhost_worker_create()中根据patch 1/9中的vhost_dev->inheric_owner
+决定创建vhost thread的方式.
+
+ static struct vhost_worker *vhost_worker_create(struct vhost_dev *dev)
+ {
+ 	struct vhost_worker *worker;
+-	struct vhost_task *vtsk;
++	struct vhost_task *vtsk = NULL;
++	struct task_struct *task = NULL;
+ 	char name[TASK_COMM_LEN];
+ 	int ret;
+ 	u32 id;
+ 
++	/* Allocate resources for the worker */
+ 	worker = kzalloc(sizeof(*worker), GFP_KERNEL_ACCOUNT);
+ 	if (!worker)
+ 		return NULL;
+ 
++	worker->fn = kzalloc(sizeof(struct vhost_task_fn), GFP_KERNEL_ACCOUNT);
++	if (!worker->fn) {
++		kfree(worker);
++		return NULL;
++	}
++
+ 	worker->dev = dev;
+ 	snprintf(name, sizeof(name), "vhost-%d", current->pid);
+ 
+-	vtsk = vhost_task_create(vhost_run_work_list, vhost_worker_killed,
+-				 worker, name);
+-	if (!vtsk)
+-		goto free_worker;
+-
+ 	mutex_init(&worker->mutex);
+ 	init_llist_head(&worker->work_list);
+ 	worker->kcov_handle = kcov_common_handle();
+-	worker->vtsk = vtsk;
+ 
+-	vhost_task_start(vtsk);
++	if (dev->inherit_owner) {
++		/* Create and start a vhost task */
++		vtsk = vhost_task_create(vhost_run_work_list,
++					 vhost_worker_killed, worker, name);
++		if (!vtsk)
++			goto free_worker;
++
++		worker->vtsk = vtsk;
++		worker->fn->wakeup = vhost_task_wakeup_fn;
++		worker->fn->stop = vhost_task_stop_fn;
++
++		vhost_task_start(vtsk);
++	} else {
++		/* Create and start a kernel thread */
++		task = kthread_create(vhost_run_work_kthread_list, worker,
++				      "vhost-%d", current->pid);
++		if (IS_ERR(task)) {
++			ret = PTR_ERR(task);
++			goto free_worker;
++		}
++		worker->task = task;
++		worker->fn->wakeup = vhost_kthread_wakeup_fn;
++		worker->fn->stop = vhost_kthread_stop_fn;
++
++		wake_up_process(task);
++		/* Attach to the vhost cgroup */
++		ret = vhost_attach_cgroups(dev);
++		if (ret)
++			goto stop_worker;
++	}
+ 
+ 	ret = xa_alloc(&dev->worker_xa, &id, worker, xa_limit_32b, GFP_KERNEL);
+ 	if (ret < 0)
+ 		goto stop_worker;
+ 	worker->id = id;
+-
+ 	return worker;
+-
+ stop_worker:
+-	vhost_task_stop(vtsk);
++	worker->fn->stop(dev->inherit_owner ? (void *)vtsk : (void *)task);
+ free_worker:
++	kfree(worker->fn);
+ 	kfree(worker);
+ 	return NULL;
+ }
+
+---------------
+
+[PATCH v3 5/9] vhost: Add kthread support in function vhost_worker_queue()
+
+让vhost_worker_queue()也支持两种模式.
+
+ static void vhost_worker_queue(struct vhost_worker *worker,
+ 			       struct vhost_work *work)
+ {
++	if (!worker && !worker->fn)
++		return;
++
+ 	if (!test_and_set_bit(VHOST_WORK_QUEUED, &work->flags)) {
+ 		/* We can only add the work to the list after we're
+ 		 * sure it was not in the list.
+ 		 * test_and_set_bit() implies a memory barrier.
+ 		 */
+ 		llist_add(&work->node, &worker->work_list);
+-		vhost_task_wake(worker->vtsk);
++		worker->fn->wakeup(worker->dev->inherit_owner ?
++					   (void *)worker->vtsk :
++					   (void *)worker->task);
+ 	}
+ }
+
+---------------
+
+[PATCH v3 6/9] vhost: Add kthread support in function vhost_worker_destroy()
+
+让vhost_worker_destroy()也支持两种模式.
+
+diff --git a/drivers/vhost/vhost.c b/drivers/vhost/vhost.c
+index 8b7ddfb33c61..c17dc01febcc 100644
+--- a/drivers/vhost/vhost.c
++++ b/drivers/vhost/vhost.c
+@@ -718,12 +718,14 @@ static void vhost_detach_mm(struct vhost_dev *dev)
+ static void vhost_worker_destroy(struct vhost_dev *dev,
+ 				 struct vhost_worker *worker)
+ {
+-	if (!worker)
++	if (!worker && !worker->fn)
+ 		return;
+
+ 	WARN_ON(!llist_empty(&worker->work_list));
+ 	xa_erase(&dev->worker_xa, worker->id);
+-	vhost_task_stop(worker->vtsk);
++	worker->fn->stop(dev->inherit_owner ? (void *)worker->vtsk :
++					      (void *)worker->task);
++	kfree(worker->fn);
+ 	kfree(worker);
+ }
+
+---------------
+
+[PATCH v3 7/9] vhost: Add new UAPI to support change to task mode
+
+添加VHOST_SET_INHERIT_FROM_OWNER这个ioctl来设置vhost_dev->inheric_owner.
+
+---------------
+
+[PATCH v3 8/9] vhost_scsi: Add check for inherit_owner status
+
+确保legacy的mode不能使用VHOST_NEW_WORKER.
+
+ 	case VHOST_NEW_WORKER:
++		/*vhost-scsi VHOST_NEW_WORKER requires inherit_owner to be true*/
++		if (vs->dev.inherit_owner != true)
++			return -EFAULT;
++
++		fallthrough;
+
+---------------
+
+[PATCH v3 9/9] vhost: Expose the modparam inherit_owner_default
+
+添加module param来控制vhost_dev->inheric_owner.
+
+ static bool inherit_owner_default = true;
++module_param(inherit_owner_default, bool, 0444);
++MODULE_PARM_DESC(inherit_owner_default,
++		 "Set vhost_task mode as the default(default: Y)");
+
+---------------
