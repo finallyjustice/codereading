@@ -1,18 +1,20 @@
-From 5a2abc35ff3b853d268140fcb3c6ffdc40c6ba11 Mon Sep 17 00:00:00 2001
+From 1644a45f8dd741526114633c705c40287036d93c Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Mon, 18 Nov 2024 13:33:32 -0800
+Date: Wed, 4 Dec 2024 16:23:05 -0800
 Subject: [PATCH 1/1] linux-v4.14.35-2047.528.2.3
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
- drivers/xen/ovmapi.c              |   4 +
- drivers/xen/xenbus/xenbus.h       |  21 ++
- drivers/xen/xenbus/xenbus_comms.c | 132 +++++++
- drivers/xen/xenbus/xenbus_xs.c    | 590 ++++++++++++++++++++++++++++++
- 4 files changed, 747 insertions(+)
+ drivers/xen/ovmapi.c              |  36 ++
+ drivers/xen/xenbus/xenbus.h       |  21 +
+ drivers/xen/xenbus/xenbus_comms.c | 401 ++++++++++++++++
+ drivers/xen/xenbus/xenbus_probe.c |  16 +
+ drivers/xen/xenbus/xenbus_xs.c    | 769 ++++++++++++++++++++++++++++++
+ include/xen/events.h              |  14 +
+ 6 files changed, 1257 insertions(+)
 
 diff --git a/drivers/xen/ovmapi.c b/drivers/xen/ovmapi.c
-index 718c1ea4f588..f74099f03c86 100644
+index 718c1ea4f588..4ed6184b0591 100644
 --- a/drivers/xen/ovmapi.c
 +++ b/drivers/xen/ovmapi.c
 @@ -263,6 +263,10 @@ static int ovmapi_read_name(const char *pathname, char *name,
@@ -26,6 +28,45 @@ index 718c1ea4f588..f74099f03c86 100644
  static int ovmapi_read_name_value(const char *pathname, char *value,
  				  unsigned long *value_len)
  {
+@@ -273,6 +277,38 @@ static int ovmapi_read_name_value(const char *pathname, char *value,
+ 	int n;
+ 	char num[8];
+ 
++	/*
++	 * ovmapi_receive_dom0_message()
++	 * -> ovmapi_read_name_value()
++	 *    -> xenbus_directory()
++	 *       -> xs_single()
++	 *          -> xs_talkv()
++	 *             -> req->cb = xs_wake_up; ---> cb is set here !!!
++	 *             -> xs_send()
++	 *                -> add the req to xb_write_list
++	 *             -> xs_wait_for_reply()
++	 *                -> read_reply()
++	 *                   -> wait_event(req->wq, test_reply(req));
++	 *                   -> while (req->state != xb_req_state_got_reply);
++	 *
++	 *
++	 * xenbus_thread()
++	 * -> process_writes()
++	 *    -> submit to xenstore
++	 *    -> list_del(&state.req->list);
++	 *    -> state.req->state = xb_req_state_wait_reply;
++	 *    -> list_add_tail(&state.req->list, &xs_reply_list);
++	 *
++	 *
++	 * xenbus_thread()
++	 * -> wait_event_interruptible(xb_waitq, xb_thread_work())
++	 * -> process_msg()
++	 *    -> req->cb(req) = xs_wake_up()
++	 *       -> wake_up(&req->wq)
++	 *          -> __wake_up(x, TASK_NORMAL, 1, NULL)
++	 *             -> __wake_up_common_lock(wq_head, mode, nr_exclusive, 0, key);
++	 *                -> spin_lock_irqsave(&wq_head->lock, flags);
++	 */
+ 	dir = xenbus_directory(XBT_NIL, pathname, "", &dir_n);
+ 	if (IS_ERR(dir)) {
+ 		OVMLOG(DGBLVL_ERROR, "OVMAPI: unable to read %s\n", pathname);
 diff --git a/drivers/xen/xenbus/xenbus.h b/drivers/xen/xenbus/xenbus.h
 index 139539b0ab20..4afb402328dd 100644
 --- a/drivers/xen/xenbus/xenbus.h
@@ -59,13 +100,46 @@ index 139539b0ab20..4afb402328dd 100644
  	xb_req_state_queued,
  	xb_req_state_wait_reply,
 diff --git a/drivers/xen/xenbus/xenbus_comms.c b/drivers/xen/xenbus/xenbus_comms.c
-index e5fda0256feb..6051f3f0a9b8 100644
+index e5fda0256feb..bd839acc4a44 100644
 --- a/drivers/xen/xenbus/xenbus_comms.c
 +++ b/drivers/xen/xenbus/xenbus_comms.c
-@@ -43,11 +43,38 @@
+@@ -43,12 +43,87 @@
  #include <xen/page.h>
  #include "xenbus.h"
  
++/*
++ * ovmapi_receive_dom0_message()
++ * -> ovmapi_read_name_value()
++ *    -> xenbus_directory()
++ *       -> xs_single()
++ *          -> xs_talkv()
++ *             -> req->cb = xs_wake_up; ---> cb is set here !!!
++ *             -> xs_send()
++ *                -> add the req to xb_write_list
++ *             -> xs_wait_for_reply()
++ *                -> read_reply()
++ *                   -> wait_event(req->wq, test_reply(req));
++ *                   -> while (req->state != xb_req_state_got_reply);
++ *
++ *
++ * xenbus_thread()
++ * -> process_writes()
++ *    -> submit to xenstore
++ *    -> list_del(&state.req->list);
++ *    -> state.req->state = xb_req_state_wait_reply;
++ *    -> list_add_tail(&state.req->list, &xs_reply_list);
++ *
++ *
++ * xenbus_thread()
++ * -> wait_event_interruptible(xb_waitq, xb_thread_work())
++ * -> process_msg()
++ *    -> req->cb(req) = xs_wake_up()
++ *       -> wake_up(&req->wq)
++ *          -> __wake_up(x, TASK_NORMAL, 1, NULL)
++ *             -> __wake_up_common_lock(wq_head, mode, nr_exclusive, 0, key);
++ *                -> spin_lock_irqsave(&wq_head->lock, flags);
++ */
++
 +/*
 + * 在以下使用xs_reply_list:
 + *   - drivers/xen/xenbus/xenbus_comms.c|47| <<global>> LIST_HEAD(xs_reply_list);
@@ -99,9 +173,25 @@ index e5fda0256feb..6051f3f0a9b8 100644
 + *   - drivers/xen/xenbus/xenbus_xs.c|414| <<xs_send>> wake_up(&xb_waitq);
 + */
  DECLARE_WAIT_QUEUE_HEAD(xb_waitq);
++/*
++ * 在以下使用xb_write_mutex:
++ *   - drivers/xen/xenbus/xenbus_comms.c|112| <<global>> DEFINE_MUTEX(xb_write_mutex);
++ *   - drivers/xen/xenbus/xenbus_comms.c|474| <<process_msg>> mutex_lock(&xb_write_mutex);
++ *   - drivers/xen/xenbus/xenbus_comms.c|489| <<process_msg>> mutex_unlock(&xb_write_mutex);
++ *   - drivers/xen/xenbus/xenbus_comms.c|607| <<process_writes>> mutex_lock(&xb_write_mutex);
++ *   - drivers/xen/xenbus/xenbus_comms.c|687| <<process_writes>> mutex_unlock(&xb_write_mutex);
++ *   - drivers/xen/xenbus/xenbus_comms.c|716| <<process_writes>> mutex_unlock(&xb_write_mutex);
++ *   - drivers/xen/xenbus/xenbus_xs.c|452| <<xs_send>> mutex_lock(&xb_write_mutex);
++ *   - drivers/xen/xenbus/xenbus_xs.c|464| <<xs_send>> mutex_unlock(&xb_write_mutex);
++ *   - drivers/xen/xenbus/xenbus_xs.c|493| <<xs_wait_for_reply>> mutex_lock(&xb_write_mutex);
++ *   - drivers/xen/xenbus/xenbus_xs.c|520| <<xs_wait_for_reply>> mutex_unlock(&xb_write_mutex);
++ *   - drivers/xen/xenbus/xenbus_xs.c|1679| <<xs_reboot_notify>> mutex_lock(&xb_write_mutex);
++ *   - drivers/xen/xenbus/xenbus_xs.c|1684| <<xs_reboot_notify>> mutex_unlock(&xb_write_mutex);
++ */
  DEFINE_MUTEX(xb_write_mutex);
  
-@@ -59,6 +86,17 @@ static struct task_struct *xenbus_task;
+ /* Protect xenbus reader thread against save/restore. */
+@@ -59,15 +134,35 @@ static struct task_struct *xenbus_task;
  
  static irqreturn_t wake_waiting(int irq, void *unused)
  {
@@ -119,7 +209,62 @@ index e5fda0256feb..6051f3f0a9b8 100644
  	wake_up(&xb_waitq);
  	return IRQ_HANDLED;
  }
-@@ -103,6 +141,10 @@ static int xb_data_to_write(void)
+ 
++/*
++ * called by:
++ *   - drivers/xen/xenbus/xenbus_comms.c|194| <<xb_write>> if (!check_indexes(cons, prod)) {
++ *   - drivers/xen/xenbus/xenbus_comms.c|254| <<xb_read>> if (!check_indexes(cons, prod)) {
++ */
+ static int check_indexes(XENSTORE_RING_IDX cons, XENSTORE_RING_IDX prod)
+ {
+ 	return ((prod - cons) <= XENSTORE_RING_SIZE);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/xen/xenbus/xenbus_comms.c|247| <<xb_write>> dst = get_output_chunk(cons, prod, intf->req, &avail);
++ */
+ static void *get_output_chunk(XENSTORE_RING_IDX cons,
+ 			      XENSTORE_RING_IDX prod,
+ 			      char *buf, uint32_t *len)
+@@ -78,6 +173,10 @@ static void *get_output_chunk(XENSTORE_RING_IDX cons,
+ 	return buf + MASK_XENSTORE_IDX(prod);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/xen/xenbus/xenbus_comms.c|316| <<xb_read>> src = get_input_chunk(cons, prod, intf->rsp, &avail);
++ */
+ static const void *get_input_chunk(XENSTORE_RING_IDX cons,
+ 				   XENSTORE_RING_IDX prod,
+ 				   const char *buf, uint32_t *len)
+@@ -88,10 +187,25 @@ static const void *get_input_chunk(XENSTORE_RING_IDX cons,
+ 	return buf + MASK_XENSTORE_IDX(cons);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/xen/xenbus/xenbus_comms.c|198| <<xb_write>> if (!xb_data_to_write())
++ *   - drivers/xen/xenbus/xenbus_comms.c|533| <<process_writes>> if (!xb_data_to_write())
++ *   - drivers/xen/xenbus/xenbus_comms.c|633| <<xb_thread_work>> return xb_data_to_read() || xb_data_to_write();
++ */
+ static int xb_data_to_write(void)
+ {
+ 	struct xenstore_domain_interface *intf = xen_store_interface;
+ 
++	/*
++	 * 在以下使用xb_write_list:
++	 *   - drivers/xen/xenbus/xenbus_comms.c|50| <<global>> LIST_HEAD(xb_write_list);
++	 *   - drivers/xen/xenbus/xenbus_comms.c|96| <<xb_data_to_write>> !list_empty(&xb_write_list);
++	 *   - drivers/xen/xenbus/xenbus_comms.c|347| <<process_writes>> state.req = list_first_entry(&xb_write_list,
++	 *   - drivers/xen/xenbus/xenbus_xs.c|409| <<xs_send>> list_add_tail(&req->list, &xb_write_list);
++	 *   - drivers/xen/xenbus/xenbus_xs.c|410| <<xs_send>> notify = list_is_singular(&xb_write_list);
++	 *   - drivers/xen/xenbus/xenbus_xs.c|1404| <<xs_reboot_notify>> list_for_each_entry(req, &xb_write_list, list)
++	 */
+ 	return (intf->req_prod - intf->req_cons) != XENSTORE_RING_SIZE &&
+ 		!list_empty(&xb_write_list);
+ }
+@@ -103,8 +217,35 @@ static int xb_data_to_write(void)
   *
   * Returns number of bytes written or -err.
   */
@@ -129,8 +274,75 @@ index e5fda0256feb..6051f3f0a9b8 100644
 + */
  static int xb_write(const void *data, unsigned int len)
  {
++	/*
++	 * 在以下使用全局的xen_store_interface:
++	 *   - drivers/xen/xenbus/xenbus_probe.c|71| <<global>> struct xenstore_domain_interface *xen_store_interface;
++	 *   - drivers/xen/xenbus/xenbus_comms.c|164| <<xb_data_to_write>> struct xenstore_domain_interface *intf = xen_store_interface;
++	 *   - drivers/xen/xenbus/xenbus_comms.c|183| <<xb_write>> struct xenstore_domain_interface *intf = xen_store_interface;
++	 *   - drivers/xen/xenbus/xenbus_comms.c|229| <<xb_data_to_read>> struct xenstore_domain_interface *intf = xen_store_interface;
++	 *   - drivers/xen/xenbus/xenbus_comms.c|240| <<xb_read>> struct xenstore_domain_interface *intf = xen_store_interface;
++	 *   - drivers/xen/xenbus/xenbus_comms.c|714| <<xb_init_comms>> struct xenstore_domain_interface *intf = xen_store_interface;
++	 *   - drivers/xen/xenbus/xenbus_dev_backend.c|51| <<xenbus_alloc>> gnttab_grant_foreign_access_ref(GNTTAB_RESERVED_XENSTORE, domid, virt_to_gfn(xen_store_interface), 0 );
++	 *   - drivers/xen/xenbus/xenbus_dev_backend.c|103| <<xenbus_backend_mmap>> if (remap_pfn_range(vma, vma->vm_start, virt_to_pfn(xen_store_interface), size, vma->vm_page_prot))
++	 *   - drivers/xen/xenbus/xenbus_probe.c|874| <<xenbus_init>> xen_store_interface = gfn_to_virt(xen_store_gfn);
++	 *   - drivers/xen/xenbus/xenbus_probe.c|879| <<xenbus_init>> xen_store_interface = gfn_to_virt(xen_store_gfn);
++	 *   - drivers/xen/xenbus/xenbus_probe.c|913| <<xenbus_init>> xen_store_interface = xen_remap(xen_store_gfn << XEN_PAGE_SHIFT, XEN_PAGE_SIZE);
++	 *   - drivers/xen/xenfs/xenstored.c|28| <<xsd_kva_open>> file->private_data = (void *)kasprintf(GFP_KERNEL, "0x%p", xen_store_interface);
++	 *   - drivers/xen/xenfs/xenstored.c|42| <<xsd_kva_mmap>> if (remap_pfn_range(vma, vma->vm_start, virt_to_pfn(xen_store_interface), size, vma->vm_page_prot))
++	 *
++	 * struct xenstore_domain_interface {
++	 *     char req[XENSTORE_RING_SIZE]; // Requests to xenstore daemon.
++	 *     char rsp[XENSTORE_RING_SIZE]; // Replies and async watch events.
++	 *     XENSTORE_RING_IDX req_cons, req_prod;
++	 *     XENSTORE_RING_IDX rsp_cons, rsp_prod;
++	 * };
++	 */
  	struct xenstore_domain_interface *intf = xen_store_interface;
-@@ -155,6 +197,11 @@ static int xb_data_to_read(void)
+ 	XENSTORE_RING_IDX cons, prod;
+ 	unsigned int bytes = 0;
+@@ -126,6 +267,9 @@ static int xb_write(const void *data, unsigned int len)
+ 		/* Must write data /after/ reading the consumer index. */
+ 		virt_mb();
+ 
++		/*
++		 * 只在此处调用
++		 */
+ 		dst = get_output_chunk(cons, prod, intf->req, &avail);
+ 		if (avail == 0)
+ 			continue;
+@@ -141,6 +285,20 @@ static int xb_write(const void *data, unsigned int len)
+ 		virt_wmb();
+ 		intf->req_prod += avail;
+ 
++		/*
++		 * called by:
++		 *   - drivers/char/tpm/xen-tpmfront.c|68| <<vtpm_cancel>> notify_remote_via_evtchn(priv->evtchn);
++		 *   - drivers/char/tpm/xen-tpmfront.c|103| <<vtpm_send>> notify_remote_via_evtchn(priv->evtchn);
++		 *   - drivers/pci/xen-pcifront.c|130| <<do_pci_op>> notify_remote_via_evtchn(port);
++		 *   - drivers/pci/xen-pcifront.c|675| <<pcifront_do_aer>> notify_remote_via_evtchn(pdev->evtchn);
++		 *   - drivers/tty/hvc/hvc_xen.c|97| <<notify_daemon>> notify_remote_via_evtchn(cons->evtchn);
++		 *   - drivers/xen/events/events_base.c|437| <<notify_remote_via_irq>> notify_remote_via_evtchn(evtchn);
++		 *   - drivers/xen/evtchn.c|576| <<evtchn_ioctl>> notify_remote_via_evtchn(notify.port);
++		 *   - drivers/xen/gntalloc.c|186| <<__del_gref>> notify_remote_via_evtchn(gref->notify.event);
++		 *   - drivers/xen/gntdev.c|284| <<gntdev_put_map>> notify_remote_via_evtchn(map->notify.event);
++		 *   - drivers/xen/xenbus/xenbus_comms.c|221| <<xb_write>> notify_remote_via_evtchn(xen_store_evtchn);
++		 *   - drivers/xen/xenbus/xenbus_comms.c|279| <<xb_read>> notify_remote_via_evtchn(xen_store_evtchn);
++		 */
+ 		/* Implies mb(): other side will see the updated producer. */
+ 		if (prod <= intf->req_cons)
+ 			notify_remote_via_evtchn(xen_store_evtchn);
+@@ -149,12 +307,22 @@ static int xb_write(const void *data, unsigned int len)
+ 	return bytes;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/xen/xenbus/xenbus_comms.c|417| <<process_msg>> if (!xb_data_to_read()) {
++ *   - drivers/xen/xenbus/xenbus_comms.c|725| <<xb_thread_work>> return xb_data_to_read() || xb_data_to_write();
++ */
+ static int xb_data_to_read(void)
+ {
+ 	struct xenstore_domain_interface *intf = xen_store_interface;
  	return (intf->rsp_cons != intf->rsp_prod);
  }
  
@@ -142,7 +354,89 @@ index e5fda0256feb..6051f3f0a9b8 100644
  static int xb_read(void *data, unsigned int len)
  {
  	struct xenstore_domain_interface *intf = xen_store_interface;
-@@ -289,6 +336,13 @@ static int process_msg(void)
+@@ -202,6 +370,38 @@ static int xb_read(void *data, unsigned int len)
+ 	return bytes;
+ }
+ 
++/*
++ * ovmapi_receive_dom0_message()
++ * -> ovmapi_read_name_value()
++ *    -> xenbus_directory()
++ *       -> xs_single()
++ *          -> xs_talkv()
++ *             -> req->cb = xs_wake_up; ---> cb is set here !!!
++ *             -> xs_send()
++ *                -> add the req to xb_write_list
++ *             -> xs_wait_for_reply()
++ *                -> read_reply()
++ *                   -> wait_event(req->wq, test_reply(req));
++ *                   -> while (req->state != xb_req_state_got_reply);
++ *
++ *
++ * xenbus_thread()
++ * -> process_writes()
++ *    -> submit to xenstore
++ *    -> list_del(&state.req->list);
++ *    -> state.req->state = xb_req_state_wait_reply;
++ *    -> list_add_tail(&state.req->list, &xs_reply_list);
++ *
++ *
++ * xenbus_thread()
++ * -> wait_event_interruptible(xb_waitq, xb_thread_work())
++ * -> process_msg()
++ *    -> req->cb(req) = xs_wake_up()
++ *       -> wake_up(&req->wq)
++ *          -> __wake_up(x, TASK_NORMAL, 1, NULL)
++ *             -> __wake_up_common_lock(wq_head, mode, nr_exclusive, 0, key);
++ *                -> spin_lock_irqsave(&wq_head->lock, flags);
++ */
+ static int process_msg(void)
+ {
+ 	static struct {
+@@ -234,6 +434,11 @@ static int process_msg(void)
+ 		 */
+ 		mutex_lock(&xs_response_mutex);
+ 
++		/*
++		 * called by:
++		 *   - drivers/xen/xenbus/xenbus_comms.c|417| <<process_msg>> if (!xb_data_to_read()) {
++		 *   - drivers/xen/xenbus/xenbus_comms.c|725| <<xb_thread_work>> return xb_data_to_read() || xb_data_to_write();
++		 */
+ 		if (!xb_data_to_read()) {
+ 			/* We raced with save/restore: pending data 'gone'. */
+ 			mutex_unlock(&xs_response_mutex);
+@@ -244,6 +449,11 @@ static int process_msg(void)
+ 
+ 	if (state.in_hdr) {
+ 		if (state.read != sizeof(state.msg)) {
++			/*
++			 * called by:
++			 *   - drivers/xen/xenbus/xenbus_comms.c|267| <<process_msg>> err = xb_read((void *)&state.msg + state.read, sizeof(state.msg) - state.read);
++			 *   - drivers/xen/xenbus/xenbus_comms.c|296| <<process_msg>> err = xb_read(state.body + state.read, state.msg.len - state.read);
++			 */
+ 			err = xb_read((void *)&state.msg + state.read,
+ 				      sizeof(state.msg) - state.read);
+ 			if (err < 0)
+@@ -273,10 +483,18 @@ static int process_msg(void)
+ 		state.read = 0;
+ 	}
+ 
++	/*
++	 * called by:
++	 *   - drivers/xen/xenbus/xenbus_comms.c|267| <<process_msg>> err = xb_read((void *)&state.msg + state.read, sizeof(state.msg) - state.read);
++	 *   - drivers/xen/xenbus/xenbus_comms.c|296| <<process_msg>> err = xb_read(state.body + state.read, state.msg.len - state.read);
++	 */
+ 	err = xb_read(state.body + state.read, state.msg.len - state.read);
+ 	if (err < 0)
+ 		goto out;
+ 
++	/*
++	 * 返回的信息长度不够就要返回
++	 */
+ 	state.read += err;
+ 	if (state.read != state.msg.len)
+ 		return 0;
+@@ -289,6 +507,13 @@ static int process_msg(void)
  	} else {
  		err = -ENOENT;
  		mutex_lock(&xb_write_mutex);
@@ -156,7 +450,7 @@ index e5fda0256feb..6051f3f0a9b8 100644
  		list_for_each_entry(req, &xs_reply_list, list) {
  			if (req->msg.req_id == state.msg.req_id) {
  				list_del(&req->list);
-@@ -300,6 +354,27 @@ static int process_msg(void)
+@@ -300,6 +525,27 @@ static int process_msg(void)
  		if (err)
  			goto out;
  
@@ -184,11 +478,63 @@ index e5fda0256feb..6051f3f0a9b8 100644
  		if (req->state == xb_req_state_wait_reply) {
  			req->msg.req_id = req->caller_req_id;
  			req->msg.type = state.msg.type;
-@@ -327,8 +402,15 @@ static int process_msg(void)
+@@ -308,6 +554,20 @@ static int process_msg(void)
+ 			/* write body, then update state */
+ 			virt_wmb();
+ 			req->state = xb_req_state_got_reply;
++			/*
++			 * ovmapi_receive_dom0_message()
++			 * -> ovmapi_read_name_value()
++			 *    -> xenbus_directory()
++			 *       -> xs_single()
++			 *          -> xs_talkv()
++			 *             -> req->cb = xs_wake_up; ---> cb is set here !!!
++			 *             -> xs_send()
++			 *                -> add the req to xb_write_list
++			 *             -> xs_wait_for_reply()
++			 *                -> read_reply()
++			 *                   -> wait_event(req->wq, test_reply(req));
++			 *                   -> while (req->state != xb_req_state_got_reply);
++			 */
+ 			req->cb(req);
+ 		} else
+ 			kfree(req);
+@@ -327,8 +587,46 @@ static int process_msg(void)
  	return err;
  }
  
 +/*
++ * ovmapi_receive_dom0_message()
++ * -> ovmapi_read_name_value()
++ *    -> xenbus_directory()
++ *       -> xs_single()
++ *          -> xs_talkv()
++ *             -> req->cb = xs_wake_up; ---> cb is set here !!!
++ *             -> xs_send()
++ *                -> add the req to xb_write_list
++ *             -> xs_wait_for_reply()
++ *                -> read_reply()
++ *                   -> wait_event(req->wq, test_reply(req));
++ *                   -> while (req->state != xb_req_state_got_reply);
++ *
++ *
++ * xenbus_thread()
++ * -> process_writes()
++ *    -> submit to xenstore
++ *    -> list_del(&state.req->list);
++ *    -> state.req->state = xb_req_state_wait_reply;
++ *    -> list_add_tail(&state.req->list, &xs_reply_list);
++ *
++ *
++ * xenbus_thread()
++ * -> wait_event_interruptible(xb_waitq, xb_thread_work())
++ * -> process_msg()
++ *    -> req->cb(req) = xs_wake_up()
++ *       -> wake_up(&req->wq)
++ *          -> __wake_up(x, TASK_NORMAL, 1, NULL)
++ *             -> __wake_up_common_lock(wq_head, mode, nr_exclusive, 0, key);
++ *                -> spin_lock_irqsave(&wq_head->lock, flags);
++ *
 + * called by:
 + *   - drivers/xen/xenbus/xenbus_comms.c|445| <<xenbus_thread>> err = process_writes();
 + */
@@ -200,7 +546,22 @@ index e5fda0256feb..6051f3f0a9b8 100644
  	static struct {
  		struct xb_req_data *req;
  		int idx;
-@@ -350,17 +432,44 @@ static int process_writes(void)
+@@ -344,23 +642,59 @@ static int process_writes(void)
+ 	mutex_lock(&xb_write_mutex);
+ 
+ 	if (!state.req) {
++		/*
++		 * 在以下使用xb_write_list:
++		 *   - drivers/xen/xenbus/xenbus_comms.c|50| <<global>> LIST_HEAD(xb_write_list);
++		 *   - drivers/xen/xenbus/xenbus_comms.c|96| <<xb_data_to_write>> !list_empty(&xb_write_list);
++		 *   - drivers/xen/xenbus/xenbus_comms.c|347| <<process_writes>> state.req = list_first_entry(&xb_write_list,
++		 *   - drivers/xen/xenbus/xenbus_xs.c|409| <<xs_send>> list_add_tail(&req->list, &xb_write_list);
++		 *   - drivers/xen/xenbus/xenbus_xs.c|410| <<xs_send>> notify = list_is_singular(&xb_write_list);
++		 *   - drivers/xen/xenbus/xenbus_xs.c|1404| <<xs_reboot_notify>> list_for_each_entry(req, &xb_write_list, list)
++		 */
+ 		state.req = list_first_entry(&xb_write_list,
+ 					     struct xb_req_data, list);
+ 		state.idx = -1;
  		state.written = 0;
  	}
  
@@ -245,7 +606,7 @@ index e5fda0256feb..6051f3f0a9b8 100644
  		err = xb_write(base + state.written, len - state.written);
  		if (err < 0)
  			goto out_err;
-@@ -374,6 +483,13 @@ static int process_writes(void)
+@@ -374,6 +708,13 @@ static int process_writes(void)
  
  	list_del(&state.req->list);
  	state.req->state = xb_req_state_wait_reply;
@@ -259,7 +620,63 @@ index e5fda0256feb..6051f3f0a9b8 100644
  	list_add_tail(&state.req->list, &xs_reply_list);
  	state.req = NULL;
  
-@@ -412,6 +528,17 @@ static int xenbus_thread(void *unused)
+@@ -383,6 +724,18 @@ static int process_writes(void)
+ 	return 0;
+ 
+  out_err:
++	/*
++	 * static struct {
++	 *     struct xb_req_data *req;
++	 *     int idx;
++	 *     unsigned int written;
++	 * } state;
++	 *
++	 * struct xb_req_data *req;
++	 * -> struct xsd_sockmsg msg;
++	 * -> int err;
++	 * -> enum xb_req_state state;
++	 */
+ 	state.req->msg.type = XS_ERROR;
+ 	state.req->err = err;
+ 	list_del(&state.req->list);
+@@ -407,11 +760,54 @@ static int xb_thread_work(void)
+ 	return xb_data_to_read() || xb_data_to_write();
+ }
+ 
++/*
++ * ovmapi_receive_dom0_message()
++ * -> ovmapi_read_name_value()
++ *    -> xenbus_directory()
++ *       -> xs_single()
++ *          -> xs_talkv()
++ *             -> req->cb = xs_wake_up; ---> cb is set here !!!
++ *             -> xs_send()
++ *                -> add the req to xb_write_list
++ *             -> xs_wait_for_reply()
++ *                -> read_reply()
++ *                   -> wait_event(req->wq, test_reply(req));
++ *                   -> while (req->state != xb_req_state_got_reply);
++ *
++ *
++ * xenbus_thread()
++ * -> process_writes()
++ *    -> submit to xenstore
++ *    -> list_del(&state.req->list);
++ *    -> state.req->state = xb_req_state_wait_reply;
++ *    -> list_add_tail(&state.req->list, &xs_reply_list);
++ *
++ *
++ * xenbus_thread()
++ * -> wait_event_interruptible(xb_waitq, xb_thread_work())
++ * -> process_msg()
++ *    -> req->cb(req) = xs_wake_up()
++ *       -> wake_up(&req->wq)
++ *          -> __wake_up(x, TASK_NORMAL, 1, NULL)
++ *             -> __wake_up_common_lock(wq_head, mode, nr_exclusive, 0, key);
++ *                -> spin_lock_irqsave(&wq_head->lock, flags);
++ */
+ static int xenbus_thread(void *unused)
+ {
  	int err;
  
  	while (!kthread_should_stop()) {
@@ -277,7 +694,7 @@ index e5fda0256feb..6051f3f0a9b8 100644
  		if (wait_event_interruptible(xb_waitq, xb_thread_work()))
  			continue;
  
-@@ -435,6 +562,11 @@ static int xenbus_thread(void *unused)
+@@ -435,6 +831,11 @@ static int xenbus_thread(void *unused)
  /**
   * xb_init_comms - Set up interrupt handler off store event channel.
   */
@@ -289,8 +706,35 @@ index e5fda0256feb..6051f3f0a9b8 100644
  int xb_init_comms(void)
  {
  	struct xenstore_domain_interface *intf = xen_store_interface;
+diff --git a/drivers/xen/xenbus/xenbus_probe.c b/drivers/xen/xenbus/xenbus_probe.c
+index b911a91bce6b..43acb7e42a6d 100644
+--- a/drivers/xen/xenbus/xenbus_probe.c
++++ b/drivers/xen/xenbus/xenbus_probe.c
+@@ -68,6 +68,22 @@
+ int xen_store_evtchn;
+ EXPORT_SYMBOL_GPL(xen_store_evtchn);
+ 
++/*
++ * 在以下使用全局的xen_store_interface:
++ *   - drivers/xen/xenbus/xenbus_probe.c|71| <<global>> struct xenstore_domain_interface *xen_store_interface;
++ *   - drivers/xen/xenbus/xenbus_comms.c|164| <<xb_data_to_write>> struct xenstore_domain_interface *intf = xen_store_interface;
++ *   - drivers/xen/xenbus/xenbus_comms.c|183| <<xb_write>> struct xenstore_domain_interface *intf = xen_store_interface;
++ *   - drivers/xen/xenbus/xenbus_comms.c|229| <<xb_data_to_read>> struct xenstore_domain_interface *intf = xen_store_interface;
++ *   - drivers/xen/xenbus/xenbus_comms.c|240| <<xb_read>> struct xenstore_domain_interface *intf = xen_store_interface;
++ *   - drivers/xen/xenbus/xenbus_comms.c|714| <<xb_init_comms>> struct xenstore_domain_interface *intf = xen_store_interface;
++ *   - drivers/xen/xenbus/xenbus_dev_backend.c|51| <<xenbus_alloc>> gnttab_grant_foreign_access_ref(GNTTAB_RESERVED_XENSTORE, domid, virt_to_gfn(xen_store_interface), 0 );
++ *   - drivers/xen/xenbus/xenbus_dev_backend.c|103| <<xenbus_backend_mmap>> if (remap_pfn_range(vma, vma->vm_start, virt_to_pfn(xen_store_interface), size, vma->vm_page_prot))
++ *   - drivers/xen/xenbus/xenbus_probe.c|874| <<xenbus_init>> xen_store_interface = gfn_to_virt(xen_store_gfn);
++ *   - drivers/xen/xenbus/xenbus_probe.c|879| <<xenbus_init>> xen_store_interface = gfn_to_virt(xen_store_gfn);
++ *   - drivers/xen/xenbus/xenbus_probe.c|913| <<xenbus_init>> xen_store_interface = xen_remap(xen_store_gfn << XEN_PAGE_SHIFT, XEN_PAGE_SIZE);
++ *   - drivers/xen/xenfs/xenstored.c|28| <<xsd_kva_open>> file->private_data = (void *)kasprintf(GFP_KERNEL, "0x%p", xen_store_interface);
++ *   - drivers/xen/xenfs/xenstored.c|42| <<xsd_kva_mmap>> if (remap_pfn_range(vma, vma->vm_start, virt_to_pfn(xen_store_interface), size, vma->vm_page_prot))
++ */
+ struct xenstore_domain_interface *xen_store_interface;
+ EXPORT_SYMBOL_GPL(xen_store_interface);
+ 
 diff --git a/drivers/xen/xenbus/xenbus_xs.c b/drivers/xen/xenbus/xenbus_xs.c
-index 5c4a72ddada5..9a1eac325c0b 100644
+index 5c4a72ddada5..5cd88e8c7d77 100644
 --- a/drivers/xen/xenbus/xenbus_xs.c
 +++ b/drivers/xen/xenbus/xenbus_xs.c
 @@ -60,28 +60,127 @@
@@ -547,11 +991,22 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  static void *read_reply(struct xb_req_data *req)
  {
  	do {
-@@ -223,12 +387,38 @@ static void *read_reply(struct xb_req_data *req)
+@@ -223,20 +387,78 @@ static void *read_reply(struct xb_req_data *req)
  	return req->body;
  }
  
 +/*
++ * 65 struct xsd_sockmsg
++ * 66 {
++ * 67     uint32_t type;  // XS_???
++ * 68     uint32_t req_id;// Request identifier, echoed in daemon's response.
++ * 69     uint32_t tx_id; // Transaction id (0 if not related to a transaction).
++ * 70     uint32_t len;   // Length of data following this.
++ * 71 
++ * 72     // Generally followed by nul-terminated string(s).
++ * 73 };
++ *
++ *
 + * called by:
 + *   - drivers/xen/xenbus/xenbus_xs.c|426| <<xenbus_dev_request_and_reply>> xs_send(req, msg);
 + *   - drivers/xen/xenbus/xenbus_xs.c|467| <<xs_talkv>> xs_send(req, &msg);
@@ -584,9 +1039,22 @@ index 5c4a72ddada5..9a1eac325c0b 100644
 +	 *   - drivers/xen/xenbus/xenbus_xs.c|452| <<xs_wait_for_reply>> req->state = xb_req_state_aborted;
 +	 */
  	req->state = xb_req_state_queued;
++	/*
++	 * 核心的:
++	 * 16 void __init_waitqueue_head(struct wait_queue_head *wq_head, const char *name, struct lock_class_key *key)
++	 * 17 {
++	 * 18         spin_lock_init(&wq_head->lock);
++	 * 19         lockdep_set_class_and_name(&wq_head->lock, key, name);
++	 * 20         INIT_LIST_HEAD(&wq_head->head);
++	 * 21 }
++	 */
  	init_waitqueue_head(&req->wq);
  
-@@ -237,6 +427,15 @@ static void xs_send(struct xb_req_data *req, struct xsd_sockmsg *msg)
+ 	/* Save the caller req_id and restore it later in the reply */
+ 	req->caller_req_id = req->msg.req_id;
++	/*
++	 * 只在此处调用
++	 */
  	req->msg.req_id = xs_request_enter(req);
  
  	mutex_lock(&xb_write_mutex);
@@ -602,7 +1070,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  	list_add_tail(&req->list, &xb_write_list);
  	notify = list_is_singular(&xb_write_list);
  	mutex_unlock(&xb_write_mutex);
-@@ -245,12 +444,24 @@ static void xs_send(struct xb_req_data *req, struct xsd_sockmsg *msg)
+@@ -245,18 +467,51 @@ static void xs_send(struct xb_req_data *req, struct xsd_sockmsg *msg)
  		wake_up(&xb_waitq);
  }
  
@@ -627,7 +1095,34 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  	xs_request_exit(req);
  
  	msg->type = req->msg.type;
-@@ -267,11 +478,19 @@ static void *xs_wait_for_reply(struct xb_req_data *req, struct xsd_sockmsg *msg)
+ 	msg->len = req->msg.len;
+ 
+ 	mutex_lock(&xb_write_mutex);
++	/*
++	 * 在以下使用xb_req_state_queued:
++	 *   - drivers/xen/xenbus/xenbus_xs.c|401| <<xs_send>> req->state = xb_req_state_queued;
++	 *   - drivers/xen/xenbus/xenbus_xs.c|450| <<xs_wait_for_reply>> if (req->state == xb_req_state_queued ||
++	 *
++	 * 在以下使用xb_req_state_wait_reply:
++	 *   - drivers/xen/xenbus/xenbus_comms.c|357| <<process_msg>> if (req->state == xb_req_state_wait_reply) {
++	 *   - drivers/xen/xenbus/xenbus_comms.c|440| <<process_writes>> state.req->state = xb_req_state_wait_reply;
++	 *   - drivers/xen/xenbus/xenbus_xs.c|451| <<xs_wait_for_reply>> req->state == xb_req_state_wait_reply)
++	 *
++	 * 在以下使用xb_req_state_got_reply:
++	 *   - drivers/xen/xenbus/xenbus_comms.c|364| <<process_msg>> req->state = xb_req_state_got_reply;
++	 *   - drivers/xen/xenbus/xenbus_comms.c|465| <<process_writes>> state.req->state = xb_req_state_got_reply;
++	 *   - drivers/xen/xenbus/xenbus_xs.c|353| <<test_reply>> if (req->state == xb_req_state_got_reply || !xenbus_ok()) {
++	 *   - drivers/xen/xenbus/xenbus_xs.c|385| <<read_reply>> } while (req->state != xb_req_state_got_reply);
++	 *
++	 * 在以下使用xb_req_state_aborted:
++	 *   - drivers/xen/xenbus/xenbus_comms.c|414| <<process_writes>> if (state.req->state == xb_req_state_aborted)
++	 *   - drivers/xen/xenbus/xenbus_comms.c|460| <<process_writes>> if (state.req->state == xb_req_state_aborted)
++	 *   - drivers/xen/xenbus/xenbus_xs.c|452| <<xs_wait_for_reply>> req->state = xb_req_state_aborted;
++	 */
+ 	if (req->state == xb_req_state_queued ||
+ 	    req->state == xb_req_state_wait_reply)
+ 		req->state = xb_req_state_aborted;
+@@ -267,11 +522,19 @@ static void *xs_wait_for_reply(struct xb_req_data *req, struct xsd_sockmsg *msg)
  	return ret;
  }
  
@@ -647,21 +1142,59 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  int xenbus_dev_request_and_reply(struct xsd_sockmsg *msg, void *par)
  {
  	struct xb_req_data *req;
-@@ -296,6 +515,13 @@ int xenbus_dev_request_and_reply(struct xsd_sockmsg *msg, void *par)
+@@ -296,6 +559,51 @@ int xenbus_dev_request_and_reply(struct xsd_sockmsg *msg, void *par)
  }
  EXPORT_SYMBOL(xenbus_dev_request_and_reply);
  
 +/*
++ * ovmapi_receive_dom0_message()
++ * -> ovmapi_read_name_value()
++ *    -> xenbus_directory()
++ *       -> xs_single()
++ *          -> xs_talkv()
++ *             -> req->cb = xs_wake_up; ---> cb is set here !!!
++ *             -> xs_send()
++ *                -> add the req to xb_write_list
++ *             -> xs_wait_for_reply()
++ *                -> read_reply()
++ *                   -> wait_event(req->wq, test_reply(req));
++ *                   -> while (req->state != xb_req_state_got_reply);
++ *
++ *
++ * xenbus_thread()
++ * -> process_writes()
++ *    -> submit to xenstore
++ *    -> list_del(&state.req->list);
++ *    -> state.req->state = xb_req_state_wait_reply;
++ *    -> list_add_tail(&state.req->list, &xs_reply_list);
++ *
++ *
++ * xenbus_thread()
++ * -> wait_event_interruptible(xb_waitq, xb_thread_work())
++ * -> process_msg()
++ *    -> req->cb(req) = xs_wake_up()
++ *       -> wake_up(&req->wq)
++ *          -> __wake_up(x, TASK_NORMAL, 1, NULL)
++ *             -> __wake_up_common_lock(wq_head, mode, nr_exclusive, 0, key);
++ *                -> spin_lock_irqsave(&wq_head->lock, flags);
++ *
 + * called by:
 + *   - drivers/xen/xenbus/xenbus_xs.c|361| <<xs_single>> return xs_talkv(t, type, &iovec, 1, len);
 + *   - drivers/xen/xenbus/xenbus_xs.c|492| <<xenbus_write>> ret = xs_error(xs_talkv(t, XS_WRITE, iovec, ARRAY_SIZE(iovec), NULL));
 + *   - drivers/xen/xenbus/xenbus_xs.c|664| <<xs_watch>> return xs_error(xs_talkv(XBT_NIL, XS_WATCH, iov, ARRAY_SIZE(iov), NULL));
 + *   - drivers/xen/xenbus/xenbus_xs.c|677| <<xs_unwatch>> return xs_error(xs_talkv(XBT_NIL, XS_UNWATCH, iov, ARRAY_SIZE(iov), NULL));
++ *
++ * 比如:
++ * t    = XBT_NIL
++ * type = XS_DIRECTORY
++ * path = 要list的路径 (有ovmapi)
++ * 1    = 就1个iovec (num_iovec)
++ * len  = 要返回的长度
 + */
  /* Send message to xs, get kmalloc'ed reply.  ERR_PTR() on error. */
  static void *xs_talkv(struct xenbus_transaction t,
  		      enum xsd_sockmsg_type type,
-@@ -303,7 +529,34 @@ static void *xs_talkv(struct xenbus_transaction t,
+@@ -303,7 +611,34 @@ static void *xs_talkv(struct xenbus_transaction t,
  		      unsigned int num_vecs,
  		      unsigned int *len)
  {
@@ -696,7 +1229,32 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  	struct xsd_sockmsg msg;
  	void *ret = NULL;
  	unsigned int i;
-@@ -324,8 +577,16 @@ static void *xs_talkv(struct xenbus_transaction t,
+@@ -313,10 +648,24 @@ static void *xs_talkv(struct xenbus_transaction t,
+ 	if (!req)
+ 		return ERR_PTR(-ENOMEM);
+ 
++	/*
++	 * 19 struct kvec {
++	 * 20         void *iov_base; // and that should *never* hold a userland pointer
++	 * 21         size_t iov_len;
++	 * 22 };
++	 */
+ 	req->vec = iovec;
+ 	req->num_vecs = num_vecs;
++	/*
++	 * 在以下使用xs_wake_up():
++	 *   - drivers/xen/xenbus/xenbus_xs.c|318| <<xs_talkv>> req->cb = xs_wake_up;
++	 */
+ 	req->cb = xs_wake_up;
+ 
++	/*
++	 * 上面定义
++	 * struct xsd_sockmsg msg;
++	 */
+ 	msg.req_id = 0;
+ 	msg.tx_id = t.id;
+ 	msg.type = type;
+@@ -324,8 +673,16 @@ static void *xs_talkv(struct xenbus_transaction t,
  	for (i = 0; i < num_vecs; i++)
  		msg.len += iovec[i].iov_len;
  
@@ -713,11 +1271,43 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  	ret = xs_wait_for_reply(req, &msg);
  	if (len)
  		*len = msg.len;
-@@ -348,6 +609,42 @@ static void *xs_talkv(struct xenbus_transaction t,
+@@ -348,6 +705,77 @@ static void *xs_talkv(struct xenbus_transaction t,
  	return ret;
  }
  
 +/*
++ * ovmapi_receive_dom0_message()
++ * -> ovmapi_read_name_value()
++ *    -> xenbus_directory()
++ *       -> xs_single()
++ *          -> xs_talkv()
++ *             -> req->cb = xs_wake_up; ---> cb is set here !!!
++ *             -> xs_send()
++ *                -> add the req to xb_write_list
++ *             -> xs_wait_for_reply()
++ *                -> read_reply()
++ *                   -> wait_event(req->wq, test_reply(req));
++ *                   -> while (req->state != xb_req_state_got_reply);
++ *
++ *
++ * xenbus_thread()
++ * -> process_writes()
++ *    -> submit to xenstore
++ *    -> list_del(&state.req->list);
++ *    -> state.req->state = xb_req_state_wait_reply;
++ *    -> list_add_tail(&state.req->list, &xs_reply_list);
++ *
++ *
++ * xenbus_thread()
++ * -> wait_event_interruptible(xb_waitq, xb_thread_work())
++ * -> process_msg()
++ *    -> req->cb(req) = xs_wake_up()
++ *       -> wake_up(&req->wq)
++ *          -> __wake_up(x, TASK_NORMAL, 1, NULL)
++ *             -> __wake_up_common_lock(wq_head, mode, nr_exclusive, 0, key);
++ *                -> spin_lock_irqsave(&wq_head->lock, flags);
++ *
++ *
 + * 11 enum xsd_sockmsg_type                
 + * 12 {                
 + * 13     XS_DEBUG,    
@@ -752,11 +1342,14 @@ index 5c4a72ddada5..9a1eac325c0b 100644
 + *   - drivers/xen/xenbus/xenbus_xs.c|674| <<xenbus_transaction_start>> id_str = xs_single(XBT_NIL, XS_TRANSACTION_START, "", NULL);
 + *   - drivers/xen/xenbus/xenbus_xs.c|696| <<xenbus_transaction_end>> return xs_error(xs_single(t, XS_TRANSACTION_END, abortstr, NULL));
 + *   - drivers/xen/xenbus/xenbus_xs.c|895| <<xs_reset_watches>> err = xs_error(xs_single(XBT_NIL, XS_RESET_WATCHES, "", NULL));
++ *
++ * 如果是xenbus_directory()来的, string就是path
++ * len是要返回的长度
 + */
  /* Simplified version of xs_talkv: single message. */
  static void *xs_single(struct xenbus_transaction t,
  		       enum xsd_sockmsg_type type,
-@@ -358,9 +655,26 @@ static void *xs_single(struct xenbus_transaction t,
+@@ -358,9 +786,33 @@ static void *xs_single(struct xenbus_transaction t,
  
  	iovec.iov_base = (void *)string;
  	iovec.iov_len = strlen(string) + 1;
@@ -766,6 +1359,13 @@ index 5c4a72ddada5..9a1eac325c0b 100644
 +	 *   - drivers/xen/xenbus/xenbus_xs.c|492| <<xenbus_write>> ret = xs_error(xs_talkv(t, XS_WRITE, iovec, ARRAY_SIZE(iovec), NULL));
 +	 *   - drivers/xen/xenbus/xenbus_xs.c|664| <<xs_watch>> return xs_error(xs_talkv(XBT_NIL, XS_WATCH, iov, ARRAY_SIZE(iov), NULL));
 +	 *   - drivers/xen/xenbus/xenbus_xs.c|677| <<xs_unwatch>> return xs_error(xs_talkv(XBT_NIL, XS_UNWATCH, iov, ARRAY_SIZE(iov), NULL));
++	 *
++	 * 比如:
++	 * t    = XBT_NIL
++	 * type = XS_DIRECTORY
++	 * path = 要list的路径 (有ovmapi)
++	 * 1    = 就1个iovec (num_iovec)
++	 * len  = 要返回的长度
 +	 */
  	return xs_talkv(t, type, &iovec, 1, len);
  }
@@ -783,7 +1383,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  /* Many commands only need an ack, don't care what it says. */
  static int xs_error(char *reply)
  {
-@@ -370,6 +684,11 @@ static int xs_error(char *reply)
+@@ -370,6 +822,11 @@ static int xs_error(char *reply)
  	return 0;
  }
  
@@ -795,7 +1395,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  static unsigned int count_strings(const char *strings, unsigned int len)
  {
  	unsigned int num;
-@@ -381,6 +700,14 @@ static unsigned int count_strings(const char *strings, unsigned int len)
+@@ -381,6 +838,14 @@ static unsigned int count_strings(const char *strings, unsigned int len)
  	return num;
  }
  
@@ -810,7 +1410,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  /* Return the path to dir with /name appended. Buffer must be kfree()'ed. */
  static char *join(const char *dir, const char *name)
  {
-@@ -393,6 +720,10 @@ static char *join(const char *dir, const char *name)
+@@ -393,6 +858,10 @@ static char *join(const char *dir, const char *name)
  	return (!buffer) ? ERR_PTR(-ENOMEM) : buffer;
  }
  
@@ -821,11 +1421,42 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  static char **split(char *strings, unsigned int len, unsigned int *num)
  {
  	char *p, **ret;
-@@ -416,6 +747,18 @@ static char **split(char *strings, unsigned int len, unsigned int *num)
+@@ -416,6 +885,49 @@ static char **split(char *strings, unsigned int len, unsigned int *num)
  	return ret;
  }
  
 +/*
++ * ovmapi_receive_dom0_message()
++ * -> ovmapi_read_name_value()
++ *    -> xenbus_directory()
++ *       -> xs_single()
++ *          -> xs_talkv()
++ *             -> req->cb = xs_wake_up; ---> cb is set here !!!
++ *             -> xs_send()
++ *                -> add the req to xb_write_list
++ *             -> xs_wait_for_reply()
++ *                -> read_reply()
++ *                   -> wait_event(req->wq, test_reply(req));
++ *                   -> while (req->state != xb_req_state_got_reply);
++ *
++ *
++ * xenbus_thread()
++ * -> process_writes()
++ *    -> submit to xenstore
++ *    -> list_del(&state.req->list);
++ *    -> state.req->state = xb_req_state_wait_reply;
++ *    -> list_add_tail(&state.req->list, &xs_reply_list);
++ *
++ *
++ * xenbus_thread()
++ * -> wait_event_interruptible(xb_waitq, xb_thread_work())
++ * -> process_msg()
++ *    -> req->cb(req) = xs_wake_up()
++ *       -> wake_up(&req->wq)
++ *          -> __wake_up(x, TASK_NORMAL, 1, NULL)
++ *             -> __wake_up_common_lock(wq_head, mode, nr_exclusive, 0, key);
++ *                -> spin_lock_irqsave(&wq_head->lock, flags);
++ *
 + * called by:
 + *   - drivers/scsi/xen-scsifront.c|979| <<scsifront_do_lun_hotplug>> dir = xenbus_directory(XBT_NIL, dev->otherend, "vscsi-devs", &dir_n);
 + *   - drivers/xen/ovmapi.c|276| <<ovmapi_read_name_value>> dir = xenbus_directory(XBT_NIL, pathname, "", &dir_n);
@@ -840,7 +1471,24 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  char **xenbus_directory(struct xenbus_transaction t,
  			const char *dir, const char *node, unsigned int *num)
  {
-@@ -435,6 +778,13 @@ char **xenbus_directory(struct xenbus_transaction t,
+@@ -426,6 +938,16 @@ char **xenbus_directory(struct xenbus_transaction t,
+ 	if (IS_ERR(path))
+ 		return (char **)path;
+ 
++	/*
++	 * 在以下调用xs_single():
++	 *   - drivers/xen/xenbus/xenbus_xs.c|565| <<xenbus_directory>> strings = xs_single(t, XS_DIRECTORY, path, &len);
++	 *   - drivers/xen/xenbus/xenbus_xs.c|603| <<xenbus_read>> ret = xs_single(t, XS_READ, path, len);
++	 *   - drivers/xen/xenbus/xenbus_xs.c|645| <<xenbus_mkdir>> ret = xs_error(xs_single(t, XS_MKDIR, path, NULL));
++	 *   - drivers/xen/xenbus/xenbus_xs.c|661| <<xenbus_rm>> ret = xs_error(xs_single(t, XS_RM, path, NULL));
++	 *   - drivers/xen/xenbus/xenbus_xs.c|674| <<xenbus_transaction_start>> id_str = xs_single(XBT_NIL, XS_TRANSACTION_START, "", NULL);
++	 *   - drivers/xen/xenbus/xenbus_xs.c|696| <<xenbus_transaction_end>> return xs_error(xs_single(t, XS_TRANSACTION_END, abortstr, NULL));
++	 *   - drivers/xen/xenbus/xenbus_xs.c|895| <<xs_reset_watches>> err = xs_error(xs_single(XBT_NIL, XS_RESET_WATCHES, "", NULL));
++	 */
+ 	strings = xs_single(t, XS_DIRECTORY, path, &len);
+ 	kfree(path);
+ 	if (IS_ERR(strings))
+@@ -435,6 +957,13 @@ char **xenbus_directory(struct xenbus_transaction t,
  }
  EXPORT_SYMBOL_GPL(xenbus_directory);
  
@@ -854,7 +1502,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  /* Check if a path exists. Return 1 if it does. */
  int xenbus_exists(struct xenbus_transaction t,
  		  const char *dir, const char *node)
-@@ -454,6 +804,30 @@ EXPORT_SYMBOL_GPL(xenbus_exists);
+@@ -454,6 +983,30 @@ EXPORT_SYMBOL_GPL(xenbus_exists);
   * Returns a kmalloced value: call free() on it after use.
   * len indicates length in bytes.
   */
@@ -885,7 +1533,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  void *xenbus_read(struct xenbus_transaction t,
  		  const char *dir, const char *node, unsigned int *len)
  {
-@@ -470,6 +844,20 @@ void *xenbus_read(struct xenbus_transaction t,
+@@ -470,6 +1023,20 @@ void *xenbus_read(struct xenbus_transaction t,
  }
  EXPORT_SYMBOL_GPL(xenbus_read);
  
@@ -906,7 +1554,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  /* Write the value of a single file.
   * Returns -err on failure.
   */
-@@ -495,6 +883,9 @@ int xenbus_write(struct xenbus_transaction t,
+@@ -495,6 +1062,9 @@ int xenbus_write(struct xenbus_transaction t,
  }
  EXPORT_SYMBOL_GPL(xenbus_write);
  
@@ -916,7 +1564,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  /* Create a new directory. */
  int xenbus_mkdir(struct xenbus_transaction t,
  		 const char *dir, const char *node)
-@@ -512,6 +903,17 @@ int xenbus_mkdir(struct xenbus_transaction t,
+@@ -512,6 +1082,17 @@ int xenbus_mkdir(struct xenbus_transaction t,
  }
  EXPORT_SYMBOL_GPL(xenbus_mkdir);
  
@@ -934,7 +1582,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  /* Destroy a file or directory (directories must be empty). */
  int xenbus_rm(struct xenbus_transaction t, const char *dir, const char *node)
  {
-@@ -528,6 +930,9 @@ int xenbus_rm(struct xenbus_transaction t, const char *dir, const char *node)
+@@ -528,6 +1109,9 @@ int xenbus_rm(struct xenbus_transaction t, const char *dir, const char *node)
  }
  EXPORT_SYMBOL_GPL(xenbus_rm);
  
@@ -944,7 +1592,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  /* Start a transaction: changes by others will not be seen during this
   * transaction, and changes will not be visible to others until end.
   */
-@@ -545,6 +950,9 @@ int xenbus_transaction_start(struct xenbus_transaction *t)
+@@ -545,6 +1129,9 @@ int xenbus_transaction_start(struct xenbus_transaction *t)
  }
  EXPORT_SYMBOL_GPL(xenbus_transaction_start);
  
@@ -954,7 +1602,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  /* End a transaction.
   * If abandon is true, transaction is discarded instead of committed.
   */
-@@ -561,6 +969,9 @@ int xenbus_transaction_end(struct xenbus_transaction t, int abort)
+@@ -561,6 +1148,9 @@ int xenbus_transaction_end(struct xenbus_transaction t, int abort)
  }
  EXPORT_SYMBOL_GPL(xenbus_transaction_end);
  
@@ -964,7 +1612,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  /* Single read and scanf: returns -errno or num scanned. */
  int xenbus_scanf(struct xenbus_transaction t,
  		 const char *dir, const char *node, const char *fmt, ...)
-@@ -584,6 +995,9 @@ int xenbus_scanf(struct xenbus_transaction t,
+@@ -584,6 +1174,9 @@ int xenbus_scanf(struct xenbus_transaction t,
  }
  EXPORT_SYMBOL_GPL(xenbus_scanf);
  
@@ -974,7 +1622,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  /* Read an (optional) unsigned value. */
  unsigned int xenbus_read_unsigned(const char *dir, const char *node,
  				  unsigned int default_val)
-@@ -599,6 +1013,9 @@ unsigned int xenbus_read_unsigned(const char *dir, const char *node,
+@@ -599,6 +1192,9 @@ unsigned int xenbus_read_unsigned(const char *dir, const char *node,
  }
  EXPORT_SYMBOL_GPL(xenbus_read_unsigned);
  
@@ -984,7 +1632,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  /* Single printf and write: returns -errno or 0. */
  int xenbus_printf(struct xenbus_transaction t,
  		  const char *dir, const char *node, const char *fmt, ...)
-@@ -622,6 +1039,23 @@ int xenbus_printf(struct xenbus_transaction t,
+@@ -622,6 +1218,23 @@ int xenbus_printf(struct xenbus_transaction t,
  }
  EXPORT_SYMBOL_GPL(xenbus_printf);
  
@@ -1008,7 +1656,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  /* Takes tuples of names, scanf-style args, and void **, NULL terminated. */
  int xenbus_gather(struct xenbus_transaction t, const char *dir, ...)
  {
-@@ -652,6 +1086,11 @@ int xenbus_gather(struct xenbus_transaction t, const char *dir, ...)
+@@ -652,6 +1265,11 @@ int xenbus_gather(struct xenbus_transaction t, const char *dir, ...)
  }
  EXPORT_SYMBOL_GPL(xenbus_gather);
  
@@ -1020,7 +1668,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  static int xs_watch(const char *path, const char *token)
  {
  	struct kvec iov[2];
-@@ -661,10 +1100,21 @@ static int xs_watch(const char *path, const char *token)
+@@ -661,10 +1279,21 @@ static int xs_watch(const char *path, const char *token)
  	iov[1].iov_base = (void *)token;
  	iov[1].iov_len = strlen(token) + 1;
  
@@ -1042,7 +1690,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  static int xs_unwatch(const char *path, const char *token)
  {
  	struct kvec iov[2];
-@@ -678,12 +1128,25 @@ static int xs_unwatch(const char *path, const char *token)
+@@ -678,12 +1307,25 @@ static int xs_unwatch(const char *path, const char *token)
  				 ARRAY_SIZE(iov), NULL));
  }
  
@@ -1068,7 +1716,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  	list_for_each_entry(i, &watches, list)
  		if (i == cmp)
  			return i;
-@@ -691,8 +1154,22 @@ static struct xenbus_watch *find_watch(const char *token)
+@@ -691,8 +1333,22 @@ static struct xenbus_watch *find_watch(const char *token)
  	return NULL;
  }
  
@@ -1091,7 +1739,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  	if (count_strings(event->body, event->len) != 2) {
  		kfree(event);
  		return -EINVAL;
-@@ -707,8 +1184,22 @@ int xs_watch_msg(struct xs_watch_event *event)
+@@ -707,8 +1363,22 @@ int xs_watch_msg(struct xs_watch_event *event)
  			 event->handle->will_handle(event->handle,
  				 event->path, event->token))) {
  		spin_lock(&watch_events_lock);
@@ -1114,7 +1762,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  		wake_up(&watch_events_waitq);
  		spin_unlock(&watch_events_lock);
  	} else
-@@ -724,6 +1215,10 @@ int xs_watch_msg(struct xs_watch_event *event)
+@@ -724,6 +1394,10 @@ int xs_watch_msg(struct xs_watch_event *event)
   * so if we are running on anything older than 4 do not attempt to read
   * control/platform-feature-xs_reset_watches.
   */
@@ -1125,7 +1773,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  static bool xen_strict_xenbus_quirk(void)
  {
  #ifdef CONFIG_X86
-@@ -738,6 +1233,10 @@ static bool xen_strict_xenbus_quirk(void)
+@@ -738,6 +1412,10 @@ static bool xen_strict_xenbus_quirk(void)
  	return false;
  
  }
@@ -1136,7 +1784,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  static void xs_reset_watches(void)
  {
  	int err;
-@@ -757,6 +1256,26 @@ static void xs_reset_watches(void)
+@@ -757,6 +1435,26 @@ static void xs_reset_watches(void)
  		pr_warn("xs_reset_watches failed: %d\n", err);
  }
  
@@ -1163,7 +1811,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  /* Register callback to watch this node. */
  int register_xenbus_watch(struct xenbus_watch *watch)
  {
-@@ -772,6 +1291,13 @@ int register_xenbus_watch(struct xenbus_watch *watch)
+@@ -772,6 +1470,13 @@ int register_xenbus_watch(struct xenbus_watch *watch)
  
  	spin_lock(&watches_lock);
  	BUG_ON(find_watch(token));
@@ -1177,7 +1825,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  	list_add(&watch->list, &watches);
  	spin_unlock(&watches_lock);
  
-@@ -789,6 +1315,18 @@ int register_xenbus_watch(struct xenbus_watch *watch)
+@@ -789,6 +1494,18 @@ int register_xenbus_watch(struct xenbus_watch *watch)
  }
  EXPORT_SYMBOL_GPL(register_xenbus_watch);
  
@@ -1196,7 +1844,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  void unregister_xenbus_watch(struct xenbus_watch *watch)
  {
  	struct xs_watch_event *event, *tmp;
-@@ -833,6 +1371,11 @@ void unregister_xenbus_watch(struct xenbus_watch *watch)
+@@ -833,6 +1550,11 @@ void unregister_xenbus_watch(struct xenbus_watch *watch)
  }
  EXPORT_SYMBOL_GPL(unregister_xenbus_watch);
  
@@ -1208,7 +1856,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  void xs_suspend(void)
  {
  	xs_suspend_enter();
-@@ -841,6 +1384,11 @@ void xs_suspend(void)
+@@ -841,6 +1563,11 @@ void xs_suspend(void)
  	mutex_lock(&xs_response_mutex);
  }
  
@@ -1220,7 +1868,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  void xs_resume(void)
  {
  	struct xenbus_watch *watch;
-@@ -861,6 +1409,11 @@ void xs_resume(void)
+@@ -861,6 +1588,11 @@ void xs_resume(void)
  	up_write(&xs_watch_rwsem);
  }
  
@@ -1232,7 +1880,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  void xs_suspend_cancel(void)
  {
  	mutex_unlock(&xs_response_mutex);
-@@ -869,13 +1422,40 @@ void xs_suspend_cancel(void)
+@@ -869,13 +1601,40 @@ void xs_suspend_cancel(void)
  	xs_suspend_exit();
  }
  
@@ -1273,7 +1921,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  		wait_event_interruptible(watch_events_waitq,
  					 !list_empty(&watch_events));
  
-@@ -930,6 +1510,11 @@ static struct notifier_block xs_reboot_nb = {
+@@ -930,6 +1689,11 @@ static struct notifier_block xs_reboot_nb = {
  	.notifier_call = xs_reboot_notify,
  };
  
@@ -1285,7 +1933,7 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  int xs_init(void)
  {
  	int err;
-@@ -937,6 +1522,11 @@ int xs_init(void)
+@@ -937,6 +1701,11 @@ int xs_init(void)
  
  	register_reboot_notifier(&xs_reboot_nb);
  
@@ -1297,6 +1945,31 @@ index 5c4a72ddada5..9a1eac325c0b 100644
  	/* Initialize the shared memory rings to talk to xenstored */
  	err = xb_init_comms();
  	if (err)
+diff --git a/include/xen/events.h b/include/xen/events.h
+index 31952308a6d5..b57e6b2824a5 100644
+--- a/include/xen/events.h
++++ b/include/xen/events.h
+@@ -83,6 +83,20 @@ void xen_send_IPI_one(unsigned int cpu, enum ipi_vector vector);
+ void rebind_evtchn_irq(int evtchn, int irq);
+ int xen_set_affinity_evtchn(struct irq_desc *desc, unsigned int tcpu);
+ 
++/*
++ * called by:
++ *   - drivers/char/tpm/xen-tpmfront.c|68| <<vtpm_cancel>> notify_remote_via_evtchn(priv->evtchn);
++ *   - drivers/char/tpm/xen-tpmfront.c|103| <<vtpm_send>> notify_remote_via_evtchn(priv->evtchn);
++ *   - drivers/pci/xen-pcifront.c|130| <<do_pci_op>> notify_remote_via_evtchn(port);
++ *   - drivers/pci/xen-pcifront.c|675| <<pcifront_do_aer>> notify_remote_via_evtchn(pdev->evtchn);
++ *   - drivers/tty/hvc/hvc_xen.c|97| <<notify_daemon>> notify_remote_via_evtchn(cons->evtchn);
++ *   - drivers/xen/events/events_base.c|437| <<notify_remote_via_irq>> notify_remote_via_evtchn(evtchn);
++ *   - drivers/xen/evtchn.c|576| <<evtchn_ioctl>> notify_remote_via_evtchn(notify.port);
++ *   - drivers/xen/gntalloc.c|186| <<__del_gref>> notify_remote_via_evtchn(gref->notify.event);
++ *   - drivers/xen/gntdev.c|284| <<gntdev_put_map>> notify_remote_via_evtchn(map->notify.event);
++ *   - drivers/xen/xenbus/xenbus_comms.c|221| <<xb_write>> notify_remote_via_evtchn(xen_store_evtchn);
++ *   - drivers/xen/xenbus/xenbus_comms.c|279| <<xb_read>> notify_remote_via_evtchn(xen_store_evtchn);
++ */
+ static inline void notify_remote_via_evtchn(int port)
+ {
+ 	struct evtchn_send send = { .port = port };
 -- 
 2.39.5 (Apple Git-154)
 
