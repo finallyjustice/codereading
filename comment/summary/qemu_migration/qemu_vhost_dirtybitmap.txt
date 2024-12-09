@@ -1,0 +1,304 @@
+
+
+struct vhost_virtqueue有两组field.
+
+/* Log writes to used structure. */
+bool log_used;
+u64 log_addr;
+
+/* Log write descriptors */
+void __user *log_base;
+struct vhost_log *log;    --> 临时使用的数组
+struct iovec log_iov[64]; --> 临时使用的数组
+
+
+其实注释有一些问题. 并且, 主要用到下面的field.
+
+1. bool log_used;         ---> VHOST_SET_VRING_ADDR
+2. u64 log_addr;          ---> VHOST_SET_VRING_ADDR
+3. void __user *log_base; ---> VHOST_SET_LOG_BASE
+
+1. log_used通过VHOST_SET_VRING_ADDR设置. 如果参数的struct
+vhost_vring_addr设置了VHOST_VRING_F_LOG, 就设置vq->log_used=true,
+标志着会记录所有的针对used ring本身的修改.
+
+used ring包括
+
+struct vring_used {
+    __virtio16 flags;
+    __virtio16 idx;
+    vring_used_elem_t ring[];
+};
+
+2. log_addr是used ring在guest VM中的base物理地址, 也是VHOST_SET_VRING_ADDR设置.
+在记录针对vring_used修改的时候,往往是vring_used内部的offset,
+比如offsetof(struct vring_used, idx).
+
+加上vring_used的base, 就是真正的gpa了.
+
+return log_write(vq->log_base, vq->log_addr + used_offset, len);
+
+3. log_base是一段共享内存, 可以供当前vhost给所有它可以访问的内存页面设置dirty
+page bit. vq->log_base是通过VHOST_SET_LOG_BASE设置的. 奇怪的是,
+QEMU并没有把log_base这段内存的长度传下来.
+
+在QEMU分配这段记录log的连续内存的地方.
+log内存的size是根据所有vhost可以访问的memsection的sum得到的.
+
+(gdb) bt
+#0  vhost_log_alloc (size=28672, share=false) at ../hw/virtio/vhost.c:342
+#1  0x0000555555b8fda2 in vhost_log_get (backend_type=VHOST_BACKEND_TYPE_KERNEL, size=28672, share=false) at ../hw/virtio/vhost.c:381
+#2  0x0000555555b90071 in vhost_dev_log_resize (dev=0x55555767da60, size=28672) at ../hw/virtio/vhost.c:443
+#3  0x0000555555b91c49 in vhost_migration_log (listener=0x55555767da68, enable=true) at ../hw/virtio/vhost.c:1092
+#4  0x0000555555b91ccf in vhost_log_global_start (listener=0x55555767da68, errp=0x7ffe247ff628) at ../hw/virtio/vhost.c:1125
+#5  0x0000555555e6b859 in memory_global_dirty_log_do_start (errp=0x7ffe247ff628) at ../system/memory.c:2902
+#6  0x0000555555e6b98d in memory_global_dirty_log_start (flags=1, errp=0x7ffe247ff628) at ../system/memory.c:2941
+#7  0x0000555555e84d5d in ram_init_bitmaps (rs=0x7fffdc008410, errp=0x7ffe247ff628) at ../migration/ram.c:2782
+#8  0x0000555555e84e6e in ram_init_all (rsp=0x555557328500 <ram_state>, errp=0x7ffe247ff628) at ../migration/ram.c:2816
+#9  0x0000555555e854fc in ram_save_setup (f=0x555557671f70, opaque=0x555557328500 <ram_state>, errp=0x7ffe247ff628) at ../migration/ram.c:3010
+#10 0x0000555555c2fe16 in qemu_savevm_state_setup (f=0x555557671f70, errp=0x7ffe247ff628) at ../migration/savevm.c:1346
+#11 0x0000555555c19305 in migration_thread (opaque=0x5555573fe6a0) at ../migration/migration.c:3507
+#12 0x000055555616b040 in qemu_thread_start (args=0x555557c465e0) at ../util/qemu-thread-posix.c:541
+#13 0x00007ffff5c081da in start_thread () from /lib/../lib64/libpthread.so.0
+#14 0x00007ffff3839e73 in clone () from /lib/../lib64/libc.so.6
+
+每次有内存的修改vhost都会得到消息.
+
+(gdb) bt
+#0  vhost_region_addnop (listener=0x5555573f9c58, section=0x7fffffffd310) at ../hw/virtio/vhost.c:853
+#1  0x0000555555e65d32 in address_space_update_topology_pass (as=0x555557328200 <address_space_memory>, old_view=0x55555781a740, new_view=0x555557836260, adding=true) at ../system/memory.c:985
+#2  0x0000555555e66292 in address_space_set_flatview (as=0x555557328200 <address_space_memory>) at ../system/memory.c:1080
+#3  0x0000555555e6646f in memory_region_transaction_commit () at ../system/memory.c:1132
+#4  0x0000555555aafe56 in init_pam (mem=0x55555778b3b0, owner=0x55555778a480, ram_memory=0x555557526ee0, system_memory=0x5555576486e0, pci_address_space=0x5555573fa000, start=786432, size=16384)
+    at ../hw/pci-host/pam.c:59
+#5  0x0000555555ab54cc in i440fx_pcihost_realize (dev=0x555557753090, errp=0x7fffffffd550) at ../hw/pci-host/i440fx.c:303
+#6  0x0000555555eecf82 in device_set_realized (obj=0x555557753090, value=true, errp=0x7fffffffd660) at ../hw/core/qdev.c:510
+#7  0x0000555555ef8021 in property_set_bool (obj=0x555557753090, v=0x555557754570, name=0x55555639c861 "realized", opaque=0x555557400680, errp=0x7fffffffd660) at ../qom/object.c:2354
+#8  0x0000555555ef5b6f in object_property_set (obj=0x555557753090, name=0x55555639c861 "realized", v=0x555557754570, errp=0x7fffffffd660) at ../qom/object.c:1463
+#9  0x0000555555efa89c in object_property_set_qobject (obj=0x555557753090, name=0x55555639c861 "realized", value=0x5555577543d0, errp=0x5555573440c0 <error_fatal>) at ../qom/qom-qobject.c:28
+#10 0x0000555555ef5f14 in object_property_set_bool (obj=0x555557753090, name=0x55555639c861 "realized", value=true, errp=0x5555573440c0 <error_fatal>) at ../qom/object.c:1533
+#11 0x0000555555eec66f in qdev_realize (dev=0x555557753090, bus=0x555557670c70, errp=0x5555573440c0 <error_fatal>) at ../hw/core/qdev.c:291
+#12 0x0000555555eec6a8 in qdev_realize_and_unref (dev=0x555557753090, bus=0x555557670c70, errp=0x5555573440c0 <error_fatal>) at ../hw/core/qdev.c:298
+#13 0x0000555555952b57 in sysbus_realize_and_unref (dev=0x555557753090, errp=0x5555573440c0 <error_fatal>) at ../hw/core/sysbus.c:261
+#14 0x0000555555cf6ac7 in pc_init1 (machine=0x555557668000, pci_type=0x55555634cc4a "i440FX") at ../hw/i386/pc_piix.c:211
+#15 0x0000555555cf7512 in pc_i440fx_init (machine=0x555557668000) at ../hw/i386/pc_piix.c:445
+#16 0x0000555555cf770a in pc_i440fx_machine_9_1_init (machine=0x555557668000) at ../hw/i386/pc_piix.c:484
+#17 0x000055555594ae1d in machine_run_board_init (machine=0x555557668000, mem_path=0x0, errp=0x7fffffffd950) at ../hw/core/machine.c:1593
+#18 0x0000555555be812e in qemu_init_board () at ../system/vl.c:2628
+#19 0x0000555555be8441 in qmp_x_exit_preconfig (errp=0x5555573440c0 <error_fatal>) at ../system/vl.c:2720
+#20 0x0000555555beb015 in qemu_init (argc=16, argv=0x7fffffffdc48) at ../system/vl.c:3766
+#21 0x00005555560939c8 in main (argc=16, argv=0x7fffffffdc48) at ../system/main.c:47
+
+QEMU通过VHOST_SET_LOG_BASE把这段内存分享给vhost.
+
+(gdb) bt
+#0  vhost_kernel_set_log_base (dev=0x5555573f9c50, base=140729502631248, log=0x7ffe24004fd0) at ../hw/virtio/vhost-backend.c:98
+#1  0x0000555555b900ac in vhost_dev_log_resize (dev=0x5555573f9c50, size=28672) at ../hw/virtio/vhost.c:450
+#2  0x0000555555b91c49 in vhost_migration_log (listener=0x5555573f9c58, enable=true) at ../hw/virtio/vhost.c:1092
+#3  0x0000555555b91ccf in vhost_log_global_start (listener=0x5555573f9c58, errp=0x7ffe23dff628) at ../hw/virtio/vhost.c:1125
+#4  0x0000555555e6b859 in memory_global_dirty_log_do_start (errp=0x7ffe23dff628) at ../system/memory.c:2902
+#5  0x0000555555e6b98d in memory_global_dirty_log_start (flags=1, errp=0x7ffe23dff628) at ../system/memory.c:2941
+#6  0x0000555555e84d5d in ram_init_bitmaps (rs=0x7ffe240081b0, errp=0x7ffe23dff628) at ../migration/ram.c:2782
+#7  0x0000555555e84e6e in ram_init_all (rsp=0x555557328500 <ram_state>, errp=0x7ffe23dff628) at ../migration/ram.c:2816
+#8  0x0000555555e854fc in ram_save_setup (f=0x555557671f70, opaque=0x555557328500 <ram_state>, errp=0x7ffe23dff628) at ../migration/ram.c:3010
+#9  0x0000555555c2fe16 in qemu_savevm_state_setup (f=0x555557671f70, errp=0x7ffe23dff628) at ../migration/savevm.c:1346
+#10 0x0000555555c19305 in migration_thread (opaque=0x5555573fe6a0) at ../migration/migration.c:3507
+#11 0x000055555616b040 in qemu_thread_start (args=0x55555777a310) at ../util/qemu-thread-posix.c:541
+#12 0x00007ffff5c081da in start_thread () from /lib/../lib64/libpthread.so.0
+#13 0x00007ffff3839e73 in clone () from /lib/../lib64/libc.so.6
+
+vhost把所有要dirty的page通过vq->log_base共享给QEMU.
+
+=================
+
+vhost有两个宏: VHOST_F_LOG_ALL和VHOST_VRING_F_LOG.
+
+VHOST_F_LOG_ALL是dev->features的一部分, 用来告诉vhost,
+想要log所有因DMA造成的dirty page. 也就是"Log all write descriptors. Can be
+changed while device is active."
+
+QEMU用vhost_dev_set_features()设置.
+
+(gdb) bt
+#0  vhost_dev_set_features (dev=0x5555573f9c50, enable_log=false) at ../hw/virtio/vhost.c:989
+#1  0x0000555555b94909 in vhost_dev_start (hdev=0x5555573f9c50, vdev=0x555558419170, vrings=false) at ../hw/virtio/vhost.c:2082
+#2  0x0000555555a47c24 in vhost_net_start_one (net=0x5555573f9c50, dev=0x555558419170) at ../hw/net/vhost_net.c:280
+#3  0x0000555555a48278 in vhost_net_start (dev=0x555558419170, ncs=0x555558424898, data_queue_pairs=2, cvq=0) at ../hw/net/vhost_net.c:421
+#4  0x0000555555df0a1b in virtio_net_vhost_status (n=0x555558419170, status=15 '\017') at ../hw/net/virtio-net.c:311
+#5  0x0000555555df0d2b in virtio_net_set_status (vdev=0x555558419170, status=15 '\017') at ../hw/net/virtio-net.c:393
+#6  0x0000555555e33c08 in virtio_set_status (vdev=0x555558419170, val=15 '\017') at ../hw/virtio/virtio.c:2242
+#7  0x0000555555b7b531 in virtio_pci_common_write (opaque=0x555558410cf0, addr=20, val=15, size=1) at ../hw/virtio/virtio-pci.c:1608
+#8  0x0000555555e63c32 in memory_region_write_accessor (mr=0x5555584118e0, addr=20, value=0x7fffe3dff3f8, size=1, shift=0, mask=255, attrs=...) at ../system/memory.c:497
+#9  0x0000555555e63f79 in access_with_adjusted_size (addr=20, value=0x7fffe3dff3f8, size=1, access_size_min=1, access_size_max=4, access_fn=0x555555e63b3c <memory_region_write_accessor>, mr=0x5555584118e0, attrs=...) at ../system/memory.c:573
+#10 0x0000555555e674ae in memory_region_dispatch_write (mr=0x5555584118e0, addr=20, data=15, op=MO_8, attrs=...) at ../system/memory.c:1521
+#11 0x0000555555e76bdc in flatview_write_continue_step (attrs=..., buf=0x7ffff7e39028 "\017", len=1, mr_addr=20, l=0x7fffe3dff4e0, mr=0x5555584118e0) at ../system/physmem.c:2803
+#12 0x0000555555e76cae in flatview_write_continue (fv=0x7ffe48003990, addr=4261412884, attrs=..., ptr=0x7ffff7e39028, len=1, mr_addr=20, l=1, mr=0x5555584118e0) at ../system/physmem.c:2833
+#13 0x0000555555e76dd6 in flatview_write (fv=0x7ffe48003990, addr=4261412884, attrs=..., buf=0x7ffff7e39028, len=1) at ../system/physmem.c:2864
+#14 0x0000555555e77250 in address_space_write (as=0x555557328200 <address_space_memory>, addr=4261412884, attrs=..., buf=0x7ffff7e39028, len=1) at ../system/physmem.c:2984
+#15 0x0000555555e772c8 in address_space_rw (as=0x555557328200 <address_space_memory>, addr=4261412884, attrs=..., buf=0x7ffff7e39028, len=1, is_write=true) at ../system/physmem.c:2994
+#16 0x0000555555ed4d63 in kvm_cpu_exec (cpu=0x555557748910) at ../accel/kvm/kvm-all.c:3075
+#17 0x0000555555ed8469 in kvm_vcpu_thread_fn (arg=0x555557748910) at ../accel/kvm/kvm-accel-ops.c:50
+#18 0x000055555616b040 in qemu_thread_start (args=0x555557752230) at ../util/qemu-thread-posix.c:541
+#19 0x00007ffff5c081da in start_thread () from /lib/../lib64/libpthread.so.0
+#20 0x00007ffff3839e73 in clone () from /lib/../lib64/libc.so.6
+
+(gdb) bt
+#0  vhost_dev_set_features (dev=0x5555573f9c50, enable_log=true) at ../hw/virtio/vhost.c:989
+#1  0x0000555555b919e5 in vhost_dev_set_log (dev=0x5555573f9c50, enable_log=true) at ../hw/virtio/vhost.c:1024
+#2  0x0000555555b91c5a in vhost_migration_log (listener=0x5555573f9c58, enable=true) at ../hw/virtio/vhost.c:1093
+#3  0x0000555555b91ccf in vhost_log_global_start (listener=0x5555573f9c58, errp=0x7ffe359ff628) at ../hw/virtio/vhost.c:1125
+#4  0x0000555555e6b859 in memory_global_dirty_log_do_start (errp=0x7ffe359ff628) at ../system/memory.c:2902
+#5  0x0000555555e6b98d in memory_global_dirty_log_start (flags=1, errp=0x7ffe359ff628) at ../system/memory.c:2941
+#6  0x0000555555e84d5d in ram_init_bitmaps (rs=0x7fffdc008440, errp=0x7ffe359ff628) at ../migration/ram.c:2782
+#7  0x0000555555e84e6e in ram_init_all (rsp=0x555557328500 <ram_state>, errp=0x7ffe359ff628) at ../migration/ram.c:2816
+#8  0x0000555555e854fc in ram_save_setup (f=0x555557671f70, opaque=0x555557328500 <ram_state>, errp=0x7ffe359ff628) at ../migration/ram.c:3010
+#9  0x0000555555c2fe16 in qemu_savevm_state_setup (f=0x555557671f70, errp=0x7ffe359ff628) at ../migration/savevm.c:1346
+#10 0x0000555555c19305 in migration_thread (opaque=0x5555573fe6a0) at ../migration/migration.c:3507
+#11 0x000055555616b040 in qemu_thread_start (args=0x55555770bc30) at ../util/qemu-thread-posix.c:541
+#12 0x00007ffff5c081da in start_thread () from /lib/../lib64/libpthread.so.0
+#13 0x00007ffff3839e73 in clone () from /lib/../lib64/libc.so.6
+
+VHOST_VRING_F_LOG只是用在vring上的, 激活vq->log_used,
+告诉vhost要log所有在DMA之后对used vring的修改.
+
+QEMU用vhost_kernel_set_vring_addr():VHOST_SET_VRING_ADDR设置.
+
+(gdb) bt
+#0  vhost_kernel_set_vring_addr (dev=0x5555573f9c50, addr=0x7fffe3dfefd0) at ../hw/virtio/vhost-backend.c:110
+#1  0x0000555555b917d9 in vhost_virtqueue_set_addr (dev=0x5555573f9c50, vq=0x5555573f9f60, idx=1, enable_log=false) at ../hw/virtio/vhost.c:979
+#2  0x0000555555b92541 in vhost_virtqueue_start (dev=0x5555573f9c50, vdev=0x555558419170, vq=0x5555573f9f60, idx=3) at ../hw/virtio/vhost.c:1321
+#3  0x0000555555b949e8 in vhost_dev_start (hdev=0x5555573f9c50, vdev=0x555558419170, vrings=false) at ../hw/virtio/vhost.c:2097
+#4  0x0000555555a47c24 in vhost_net_start_one (net=0x5555573f9c50, dev=0x555558419170) at ../hw/net/vhost_net.c:280
+#5  0x0000555555a48278 in vhost_net_start (dev=0x555558419170, ncs=0x555558424898, data_queue_pairs=2, cvq=0) at ../hw/net/vhost_net.c:421
+#6  0x0000555555df0a1b in virtio_net_vhost_status (n=0x555558419170, status=15 '\017') at ../hw/net/virtio-net.c:311
+#7  0x0000555555df0d2b in virtio_net_set_status (vdev=0x555558419170, status=15 '\017') at ../hw/net/virtio-net.c:393
+#8  0x0000555555e33c08 in virtio_set_status (vdev=0x555558419170, val=15 '\017') at ../hw/virtio/virtio.c:2242
+#9  0x0000555555b7b531 in virtio_pci_common_write (opaque=0x555558410cf0, addr=20, val=15, size=1) at ../hw/virtio/virtio-pci.c:1608
+#10 0x0000555555e63c32 in memory_region_write_accessor (mr=0x5555584118e0, addr=20, value=0x7fffe3dff3f8, size=1, shift=0, mask=255, attrs=...) at ../system/memory.c:497
+#11 0x0000555555e63f79 in access_with_adjusted_size (addr=20, value=0x7fffe3dff3f8, size=1, access_size_min=1, access_size_max=4, access_fn=0x555555e63b3c <memory_region_write_accessor>, mr=0x5555584118e0, attrs=...) at ../system/memory.c:573
+#12 0x0000555555e674ae in memory_region_dispatch_write (mr=0x5555584118e0, addr=20, data=15, op=MO_8, attrs=...) at ../system/memory.c:1521
+#13 0x0000555555e76bdc in flatview_write_continue_step (attrs=..., buf=0x7ffff7e39028 "\017", len=1, mr_addr=20, l=0x7fffe3dff4e0, mr=0x5555584118e0) at ../system/physmem.c:2803
+#14 0x0000555555e76cae in flatview_write_continue (fv=0x7ffe542b6060, addr=4261412884, attrs=..., ptr=0x7ffff7e39028, len=1, mr_addr=20, l=1, mr=0x5555584118e0) at ../system/physmem.c:2833
+#15 0x0000555555e76dd6 in flatview_write (fv=0x7ffe542b6060, addr=4261412884, attrs=..., buf=0x7ffff7e39028, len=1) at ../system/physmem.c:2864
+#16 0x0000555555e77250 in address_space_write (as=0x555557328200 <address_space_memory>, addr=4261412884, attrs=..., buf=0x7ffff7e39028, len=1) at ../system/physmem.c:2984
+#17 0x0000555555e772c8 in address_space_rw (as=0x555557328200 <address_space_memory>, addr=4261412884, attrs=..., buf=0x7ffff7e39028, len=1, is_write=true) at ../system/physmem.c:2994
+#18 0x0000555555ed4d63 in kvm_cpu_exec (cpu=0x555557748910) at ../accel/kvm/kvm-all.c:3075
+#19 0x0000555555ed8469 in kvm_vcpu_thread_fn (arg=0x555557748910) at ../accel/kvm/kvm-accel-ops.c:50
+#20 0x000055555616b040 in qemu_thread_start (args=0x555557752230) at ../util/qemu-thread-posix.c:541
+#21 0x00007ffff5c081da in start_thread () from /lib/../lib64/libpthread.so.0
+#22 0x00007ffff3839e73 in clone () from /lib/../lib64/libc.so.6
+
+(gdb) bt
+#0  vhost_kernel_set_vring_addr (dev=0x5555573f9c50, addr=0x7ffe253ff350) at ../hw/virtio/vhost-backend.c:110
+#1  0x0000555555b917d9 in vhost_virtqueue_set_addr (dev=0x5555573f9c50, vq=0x5555573f9f60, idx=1, enable_log=true) at ../hw/virtio/vhost.c:979
+#2  0x0000555555b91a76 in vhost_dev_set_log (dev=0x5555573f9c50, enable_log=true) at ../hw/virtio/vhost.c:1040
+#3  0x0000555555b91c5a in vhost_migration_log (listener=0x5555573f9c58, enable=true) at ../hw/virtio/vhost.c:1093
+#4  0x0000555555b91ccf in vhost_log_global_start (listener=0x5555573f9c58, errp=0x7ffe253ff628) at ../hw/virtio/vhost.c:1125
+#5  0x0000555555e6b859 in memory_global_dirty_log_do_start (errp=0x7ffe253ff628) at ../system/memory.c:2902
+#6  0x0000555555e6b98d in memory_global_dirty_log_start (flags=1, errp=0x7ffe253ff628) at ../system/memory.c:2941
+#7  0x0000555555e84d5d in ram_init_bitmaps (rs=0x7fffdc008420, errp=0x7ffe253ff628) at ../migration/ram.c:2782
+#8  0x0000555555e84e6e in ram_init_all (rsp=0x555557328500 <ram_state>, errp=0x7ffe253ff628) at ../migration/ram.c:2816
+#9  0x0000555555e854fc in ram_save_setup (f=0x555557671f70, opaque=0x555557328500 <ram_state>, errp=0x7ffe253ff628) at ../migration/ram.c:3010
+#10 0x0000555555c2fe16 in qemu_savevm_state_setup (f=0x555557671f70, errp=0x7ffe253ff628) at ../migration/savevm.c:1346
+#11 0x0000555555c19305 in migration_thread (opaque=0x5555573fe6a0) at ../migration/migration.c:3507
+#12 0x000055555616b040 in qemu_thread_start (args=0x555558115c40) at ../util/qemu-thread-posix.c:541
+#13 0x00007ffff5c081da in start_thread () from /lib/../lib64/libpthread.so.0
+#14 0x00007ffff3839e73 in clone () from /lib/../lib64/libc.so.6
+
+
+KVM在以下使用VHOST_F_LOG_ALL:
+  - drivers/vhost/vhost.h|301| <<global>> (1ULL << VHOST_F_LOG_ALL) |
+  - drivers/vhost/net.c|1188| <<handle_rx>> vq_log = unlikely(vhost_has_feature(vq, VHOST_F_LOG_ALL)) ?
+  - drivers/vhost/net.c|1693| <<vhost_net_set_features>> if ((features & (1 << VHOST_F_LOG_ALL)) &&
+  - drivers/vhost/scsi.c|1946| <<vhost_scsi_set_features>> if ((features & (1 << VHOST_F_LOG_ALL)) &&
+  - drivers/vhost/test.c|246| <<vhost_test_set_features>> if ((features & (1 << VHOST_F_LOG_ALL)) &&
+  - drivers/vhost/vhost.c|1220| <<memory_access_ok>> log = log_all || vhost_has_feature(d->vqs[i], VHOST_F_LOG_ALL);
+  - drivers/vhost/vhost.c|1878| <<vq_log_access_ok>> vhost_has_feature(vq, VHOST_F_LOG_ALL)) &&
+  - drivers/vhost/vsock.c|806| <<vhost_vsock_set_features>> if ((features & (1 << VHOST_F_LOG_ALL)) &&
+
+QEMU在以下使用VHOST_F_LOG_ALL:
+  - net/vhost-vdpa.c|126| <<global>> BIT_ULL(VHOST_F_LOG_ALL) |
+  - hw/virtio/vhost-user.c|1428| <<vhost_user_set_features>> bool log_enabled = features & (0x1ULL << VHOST_F_LOG_ALL);
+  - hw/virtio/vhost-vdpa.c|819| <<vhost_vdpa_set_features>> if ((v->acked_features ^ features) == BIT_ULL(VHOST_F_LOG_ALL)) {
+  - hw/virtio/vhost-vdpa.c|831| <<vhost_vdpa_set_features>> features &= ~BIT_ULL(VHOST_F_LOG_ALL);
+  - hw/virtio/vhost-vdpa.c|1513| <<vhost_vdpa_get_features>> *features |= BIT_ULL(VHOST_F_LOG_ALL);
+  - hw/virtio/vhost.c|1475| <<vhost_dev_set_features>> features |= 0x1ULL << VHOST_F_LOG_ALL;
+  - hw/virtio/vhost.c|2144| <<vhost_dev_init>> if (!(hdev->features & (0x1ULL << VHOST_F_LOG_ALL))) {
+  - subprojects/libvhost-user/libvhost-user.c|733| <<vu_log_write>> if (!(dev->features & (1ULL << VHOST_F_LOG_ALL)) ||
+  - subprojects/libvhost-user/libvhost-user.c|785| <<vu_get_features_exec>> 1ULL << VHOST_F_LOG_ALL |
+  - tests/qtest/vhost-user-test.c|1046| <<vu_net_get_features>> uint64_t features = 0x1ULL << VHOST_F_LOG_ALL |
+
+=================
+
+Again, 几个有趣的QEMU函数.
+
+vhost_dev_set_features()
+vhost_kernel_set_vring_addr()
+vhost_kernel_set_log_base()
+vhost_log_alloc()
+vhost_region_addnop()
+
+=================
+
+QEMU在每一次iteration的时候从vhost获取bitmap的callstacks.
+
+(gdb) bt
+#0  vhost_sync_dirty_bitmap (dev=0x5555573f9c50, section=0x7ffe2d1ff390, first=0, last=18446744073709551615) at ../hw/virtio/vhost.c:198
+#1  0x0000555555b8f997 in vhost_log_sync (listener=0x5555573f9c58, section=0x7ffe2d1ff390) at ../hw/virtio/vhost.c:281
+#2  0x0000555555e6956c in memory_region_sync_dirty_bitmap (mr=0x0, last_stage=false) at ../system/memory.c:2274
+#3  0x0000555555e6b7af in memory_global_dirty_log_sync (last_stage=false) at ../system/memory.c:2880
+#4  0x0000555555e8168b in migration_bitmap_sync (rs=0x7ffe1c0081c0, last_stage=false) at ../migration/ram.c:1056
+#5  0x0000555555e818f7 in migration_bitmap_sync_precopy (rs=0x7ffe1c0081c0, last_stage=false) at ../migration/ram.c:1104
+#6  0x0000555555e84d83 in ram_init_bitmaps (rs=0x7ffe1c0081c0, errp=0x7ffe2d1ff628) at ../migration/ram.c:2786
+#7  0x0000555555e84e6e in ram_init_all (rsp=0x555557328500 <ram_state>, errp=0x7ffe2d1ff628) at ../migration/ram.c:2816
+#8  0x0000555555e854fc in ram_save_setup (f=0x555557671f70, opaque=0x555557328500 <ram_state>, errp=0x7ffe2d1ff628) at ../migration/ram.c:3010
+#9  0x0000555555c2fe16 in qemu_savevm_state_setup (f=0x555557671f70, errp=0x7ffe2d1ff628) at ../migration/savevm.c:1346
+#10 0x0000555555c19305 in migration_thread (opaque=0x5555573fe6a0) at ../migration/migration.c:3507
+#11 0x000055555616b040 in qemu_thread_start (args=0x555557b1b070) at ../util/qemu-thread-posix.c:541
+#12 0x00007ffff5c081da in start_thread () from /lib/../lib64/libpthread.so.0
+#13 0x00007ffff3839e73 in clone () from /lib/../lib64/libc.so.6
+
+(gdb) bt
+#0  vhost_sync_dirty_bitmap (dev=0x55555767da60, section=0x7ffe2d1ff400, first=0, last=18446744073709551615) at ../hw/virtio/vhost.c:198
+#1  0x0000555555b8f997 in vhost_log_sync (listener=0x55555767da68, section=0x7ffe2d1ff400) at ../hw/virtio/vhost.c:281
+#2  0x0000555555e6956c in memory_region_sync_dirty_bitmap (mr=0x0, last_stage=false) at ../system/memory.c:2274
+#3  0x0000555555e6b7af in memory_global_dirty_log_sync (last_stage=false) at ../system/memory.c:2880
+#4  0x0000555555e8168b in migration_bitmap_sync (rs=0x7ffe1c0081c0, last_stage=false) at ../migration/ram.c:1056
+#5  0x0000555555e818f7 in migration_bitmap_sync_precopy (rs=0x7ffe1c0081c0, last_stage=false) at ../migration/ram.c:1104
+#6  0x0000555555e8615f in ram_state_pending_exact (opaque=0x555557328500 <ram_state>, must_precopy=0x7ffe2d1ff5c8, can_postcopy=0x7ffe2d1ff5d0) at ../migration/ram.c:3333
+#7  0x0000555555c30b9c in qemu_savevm_state_pending_exact (must_precopy=0x7ffe2d1ff5c8, can_postcopy=0x7ffe2d1ff5d0) at ../migration/savevm.c:1683
+#8  0x0000555555c18bfe in migration_iteration_run (s=0x5555573fe6a0) at ../migration/migration.c:3258
+#9  0x0000555555c193b8 in migration_thread (opaque=0x5555573fe6a0) at ../migration/migration.c:3531
+#10 0x000055555616b040 in qemu_thread_start (args=0x555557b1b070) at ../util/qemu-thread-posix.c:541
+#11 0x00007ffff5c081da in start_thread () from /lib/../lib64/libpthread.so.0
+#12 0x00007ffff3839e73 in clone () from /lib/../lib64/libc.so.6
+
+=================
+
+virtio-scsi下发的request.
+
+关于virtio-scsi下发的request
+
+在scsi_alloc_sgtables()中把request给map到scsi_cmnd上的
+
+struct scsi_cmnd *cmd:
+-> struct scsi_data_buffer sdb;
+   -> struct sg_table table;
+      -> struct scatterlist *sgl;        // the list
+      -> unsigned int nents;             // number of mapped entries
+      -> unsigned int orig_nents;        // original size of list
+   -> unsigned length;
+
+假设没有prot
+
+struct scatterlist *sgs[6].
+
+如果是READ的
+sgs[0] : request header
+sgs[1] : response header
+sgs[2] : sc->sdb.table.sgl (in buffer)
+
+如果是WRITE的
+sgs[0] : request header
+sgs[1] : sc->sdb.table.sgl (out buffer)
+sgs[2] : response header

@@ -1,23 +1,23 @@
-From 94ded4d990127b787e7661755b83882ec0913ac9 Mon Sep 17 00:00:00 2001
+From 54fa5f8059b92c7a0104e9ca95a5a371e828aaf3 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Sat, 23 Nov 2024 09:59:39 -0800
+Date: Mon, 9 Dec 2024 09:35:00 -0800
 Subject: [PATCH 1/1] linux-v5.4.17-2136.333.5
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
 ---
  arch/arm64/kvm/pmu-emul.c       |   5 +
- arch/x86/kvm/pmu.c              |  16 ++
- arch/x86/kvm/pmu.h              |  16 ++
+ arch/x86/kvm/pmu.c              |  16 +
+ arch/x86/kvm/pmu.h              |  16 +
  arch/x86/kvm/svm/pmu.c          |  11 +
- arch/x86/kvm/x86.c              |  69 +++++
- drivers/iommu/iommu.c           |  24 ++
- drivers/vfio/vfio.c             |  16 ++
- drivers/vfio/vfio_iommu_type1.c | 466 ++++++++++++++++++++++++++++++++
- include/linux/mm_types.h        |  18 ++
+ arch/x86/kvm/x86.c              |  69 +++
+ drivers/iommu/iommu.c           |  24 +
+ drivers/vfio/vfio.c             |  16 +
+ drivers/vfio/vfio_iommu_type1.c | 917 ++++++++++++++++++++++++++++++++
+ include/linux/mm_types.h        |  18 +
  include/linux/vfio.h            |   8 +
- kernel/events/core.c            | 129 +++++++++
- mm/util.c                       |  54 ++++
- 12 files changed, 832 insertions(+)
+ kernel/events/core.c            | 129 +++++
+ mm/util.c                       |  54 ++
+ 12 files changed, 1283 insertions(+)
 
 diff --git a/arch/arm64/kvm/pmu-emul.c b/arch/arm64/kvm/pmu-emul.c
 index 68409559aabd..f8db3d75c598 100644
@@ -346,10 +346,26 @@ index e3016e1f4041..86c8280246a2 100644
  						group->iommu_group);
  		if (ret)
 diff --git a/drivers/vfio/vfio_iommu_type1.c b/drivers/vfio/vfio_iommu_type1.c
-index 0befe9185b16..f8fdca34f52e 100644
+index 0befe9185b16..4d48a43946d2 100644
 --- a/drivers/vfio/vfio_iommu_type1.c
 +++ b/drivers/vfio/vfio_iommu_type1.c
-@@ -93,6 +93,16 @@ struct vfio_dma {
+@@ -73,6 +73,15 @@ struct vfio_iommu {
+ 	struct blocking_notifier_head notifier;
+ 	unsigned int		dma_avail;
+ 	unsigned int		vaddr_invalid_count;
++	/*
++	 * 在以下使用vfio_iommu->vaddr_wait:
++	 *   - drivers/vfio/vfio_iommu_type1.c|634| <<vfio_wait>> prepare_to_wait(&iommu->vaddr_wait, &wait, TASK_KILLABLE);
++	 *   - drivers/vfio/vfio_iommu_type1.c|638| <<vfio_wait>> finish_wait(&iommu->vaddr_wait, &wait);
++	 *   - drivers/vfio/vfio_iommu_type1.c|1296| <<vfio_remove_dma>> wake_up_all(&iommu->vaddr_wait);
++	 *   - drivers/vfio/vfio_iommu_type1.c|1853| <<vfio_dma_do_map>> wake_up_all(&iommu->vaddr_wait);
++	 *   - drivers/vfio/vfio_iommu_type1.c|2982| <<vfio_iommu_type1_open>> init_waitqueue_head(&iommu->vaddr_wait);
++	 *   - drivers/vfio/vfio_iommu_type1.c|3353| <<vfio_iommu_type1_notify>> wake_up_all(&iommu->vaddr_wait);
++	 */
+ 	wait_queue_head_t	vaddr_wait;
+ 	bool			v2;
+ 	bool			nesting;
+@@ -93,10 +102,37 @@ struct vfio_dma {
  	unsigned long		vaddr;		/* Process virtual addr */
  	size_t			size;		/* Map size (bytes) */
  	int			prot;		/* IOMMU_READ/WRITE */
@@ -366,7 +382,28 @@ index 0befe9185b16..f8fdca34f52e 100644
  	bool			iommu_mapped;
  	bool			lock_cap;	/* capable(CAP_IPC_LOCK) */
  	bool			vaddr_invalid;
-@@ -141,6 +151,32 @@ static int put_pfn(unsigned long pfn, int prot);
+ 	struct task_struct	*task;
++	/*
++	 * 在以下使用vfio_dma->pfn_list:
++	 *   - drivers/vfio/vfio_iommu_type1.c|266| <<vfio_find_vpfn>> struct rb_node *node = dma->pfn_list.rb_node;
++	 *   - drivers/vfio/vfio_iommu_type1.c|287| <<vfio_link_pfn>> link = &dma->pfn_list.rb_node;
++	 *   - drivers/vfio/vfio_iommu_type1.c|299| <<vfio_link_pfn>> rb_insert_color(&new->node, &dma->pfn_list);
++	 *   - drivers/vfio/vfio_iommu_type1.c|304| <<vfio_unlink_pfn>> rb_erase(&old->node, &dma->pfn_list);
++	 *   - drivers/vfio/vfio_iommu_type1.c|1178| <<vfio_remove_dma>> WARN_ON(!RB_EMPTY_ROOT(&dma->pfn_list));
++	 *   - drivers/vfio/vfio_iommu_type1.c|1325| <<vfio_dma_do_unmap>> if (!RB_EMPTY_ROOT(&dma->pfn_list)) {
++	 *   - drivers/vfio/vfio_iommu_type1.c|1789| <<vfio_dma_do_map>> dma->pfn_list = RB_ROOT;
++	 *   - drivers/vfio/vfio_iommu_type1.c|2633| <<vfio_iommu_unmap_unpin_reaccount>> p = rb_first(&dma->pfn_list);
++	 *
++	 * 一般没有调用
++	 * struct vfio_iommu_driver_ops vfio_iommu_driver_ops_type1.pin_pages = vfio_iommu_type1_pin_pages()
++	 * -> vfio_add_to_pfn_list()
++	 *    -> vfio_link_pfn()
++	 *       -> rb_insert_color(&new->node, &dma->pfn_list);
++	 */
+ 	struct rb_root		pfn_list;	/* Ex-user pinned pfn list */
+ };
+ 
+@@ -141,9 +177,40 @@ static int put_pfn(unsigned long pfn, int prot);
   * into DMA'ble space using the IOMMU
   */
  
@@ -399,18 +436,53 @@ index 0befe9185b16..f8fdca34f52e 100644
  static struct vfio_dma *vfio_find_dma(struct vfio_iommu *iommu,
  				      dma_addr_t start, size_t size)
  {
-@@ -185,6 +221,10 @@ static struct rb_node *vfio_find_dma_first_node(struct vfio_iommu *iommu,
++	/*
++	 * struct vfio_iommu *iommu:
++	 * -> struct rb_root dma_list;
++	 *    -> struct rb_node *rb_node;
++	 */
+ 	struct rb_node *node = iommu->dma_list.rb_node;
+ 
+ 	while (node) {
+@@ -160,6 +227,10 @@ static struct vfio_dma *vfio_find_dma(struct vfio_iommu *iommu,
+ 	return NULL;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|1288| <<vfio_dma_do_unmap>> n = first_n = vfio_find_dma_first_node(iommu, iova, size);
++ */
+ static struct rb_node *vfio_find_dma_first_node(struct vfio_iommu *iommu,
+ 						dma_addr_t start, u64 size)
+ {
+@@ -185,6 +256,15 @@ static struct rb_node *vfio_find_dma_first_node(struct vfio_iommu *iommu,
  	return res;
  }
  
 +/*
 + * called by:
 + *   - drivers/vfio/vfio_iommu_type1.c|1482| <<vfio_dma_do_map>> vfio_link_dma(iommu, dma);
++ *
++ * 把vfio_dma插入到vfio_mmu
++ * struct vfio_iommu *iommu:
++ * -> struct rb_root dma_list;
++ *    -> struct rb_node *rb_node;
 + */
  static void vfio_link_dma(struct vfio_iommu *iommu, struct vfio_dma *new)
  {
  	struct rb_node **link = &iommu->dma_list.rb_node, *parent = NULL;
-@@ -212,6 +252,14 @@ static void vfio_unlink_dma(struct vfio_iommu *iommu, struct vfio_dma *old)
+@@ -204,6 +284,10 @@ static void vfio_link_dma(struct vfio_iommu *iommu, struct vfio_dma *new)
+ 	rb_insert_color(&new->node, &iommu->dma_list);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|1180| <<vfio_remove_dma>> vfio_unlink_dma(iommu, dma);
++ */
+ static void vfio_unlink_dma(struct vfio_iommu *iommu, struct vfio_dma *old)
+ {
+ 	rb_erase(&old->node, &iommu->dma_list);
+@@ -212,9 +296,30 @@ static void vfio_unlink_dma(struct vfio_iommu *iommu, struct vfio_dma *old)
  /*
   * Helper Functions for host iova-pfn list
   */
@@ -425,7 +497,144 @@ index 0befe9185b16..f8fdca34f52e 100644
  static struct vfio_pfn *vfio_find_vpfn(struct vfio_dma *dma, dma_addr_t iova)
  {
  	struct vfio_pfn *vpfn;
-@@ -300,6 +348,18 @@ static int vfio_iova_put_vfio_pfn(struct vfio_dma *dma, struct vfio_pfn *vpfn)
++	/*
++	 * 在以下使用vfio_dma->pfn_list:
++	 *   - drivers/vfio/vfio_iommu_type1.c|266| <<vfio_find_vpfn>> struct rb_node *node = dma->pfn_list.rb_node;
++	 *   - drivers/vfio/vfio_iommu_type1.c|287| <<vfio_link_pfn>> link = &dma->pfn_list.rb_node;
++	 *   - drivers/vfio/vfio_iommu_type1.c|299| <<vfio_link_pfn>> rb_insert_color(&new->node, &dma->pfn_list);
++	 *   - drivers/vfio/vfio_iommu_type1.c|304| <<vfio_unlink_pfn>> rb_erase(&old->node, &dma->pfn_list);
++	 *   - drivers/vfio/vfio_iommu_type1.c|1178| <<vfio_remove_dma>> WARN_ON(!RB_EMPTY_ROOT(&dma->pfn_list));
++	 *   - drivers/vfio/vfio_iommu_type1.c|1325| <<vfio_dma_do_unmap>> if (!RB_EMPTY_ROOT(&dma->pfn_list)) {
++	 *   - drivers/vfio/vfio_iommu_type1.c|1789| <<vfio_dma_do_map>> dma->pfn_list = RB_ROOT;
++	 *   - drivers/vfio/vfio_iommu_type1.c|2633| <<vfio_iommu_unmap_unpin_reaccount>> p = rb_first(&dma->pfn_list);
++	 *
++	 * Ex-user pinned pfn list
++	 */
+ 	struct rb_node *node = dma->pfn_list.rb_node;
+ 
+ 	while (node) {
+@@ -230,12 +335,36 @@ static struct vfio_pfn *vfio_find_vpfn(struct vfio_dma *dma, dma_addr_t iova)
+ 	return NULL;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|381| <<vfio_add_to_pfn_list>> vfio_link_pfn(dma, vpfn);
++ *
++ * struct vfio_pfn {
++ *     struct rb_node          node;
++ *     dma_addr_t              iova;           // Device address
++ *     unsigned long           pfn;            // Host pfn
++ *     atomic_t                ref_count;
++ * };
++ */
+ static void vfio_link_pfn(struct vfio_dma *dma,
+ 			  struct vfio_pfn *new)
+ {
+ 	struct rb_node **link, *parent = NULL;
+ 	struct vfio_pfn *vpfn;
+ 
++	/*
++	 * 在以下使用vfio_dma->pfn_list:
++	 *   - drivers/vfio/vfio_iommu_type1.c|266| <<vfio_find_vpfn>> struct rb_node *node = dma->pfn_list.rb_node;
++	 *   - drivers/vfio/vfio_iommu_type1.c|287| <<vfio_link_pfn>> link = &dma->pfn_list.rb_node;
++	 *   - drivers/vfio/vfio_iommu_type1.c|299| <<vfio_link_pfn>> rb_insert_color(&new->node, &dma->pfn_list);
++	 *   - drivers/vfio/vfio_iommu_type1.c|304| <<vfio_unlink_pfn>> rb_erase(&old->node, &dma->pfn_list);
++	 *   - drivers/vfio/vfio_iommu_type1.c|1178| <<vfio_remove_dma>> WARN_ON(!RB_EMPTY_ROOT(&dma->pfn_list));
++	 *   - drivers/vfio/vfio_iommu_type1.c|1325| <<vfio_dma_do_unmap>> if (!RB_EMPTY_ROOT(&dma->pfn_list)) {
++	 *   - drivers/vfio/vfio_iommu_type1.c|1789| <<vfio_dma_do_map>> dma->pfn_list = RB_ROOT;
++	 *   - drivers/vfio/vfio_iommu_type1.c|2633| <<vfio_iommu_unmap_unpin_reaccount>> p = rb_first(&dma->pfn_list);
++	 *
++	 * Ex-user pinned pfn list
++	 */
+ 	link = &dma->pfn_list.rb_node;
+ 	while (*link) {
+ 		parent = *link;
+@@ -248,14 +377,43 @@ static void vfio_link_pfn(struct vfio_dma *dma,
+ 	}
+ 
+ 	rb_link_node(&new->node, parent, link);
++	/*
++	 * 一般没有调用
++	 * struct vfio_iommu_driver_ops vfio_iommu_driver_ops_type1.pin_pages = vfio_iommu_type1_pin_pages()
++	 * -> vfio_add_to_pfn_list()
++	 *    -> vfio_link_pfn()
++	 *       -> rb_insert_color(&new->node, &dma->pfn_list);
++	 */
+ 	rb_insert_color(&new->node, &dma->pfn_list);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|388| <<vfio_remove_from_pfn_list>> vfio_unlink_pfn(dma, vpfn);
++ */
+ static void vfio_unlink_pfn(struct vfio_dma *dma, struct vfio_pfn *old)
+ {
++	/*
++	 * 在以下使用vfio_dma->pfn_list:
++	 *   - drivers/vfio/vfio_iommu_type1.c|266| <<vfio_find_vpfn>> struct rb_node *node = dma->pfn_list.rb_node;
++	 *   - drivers/vfio/vfio_iommu_type1.c|287| <<vfio_link_pfn>> link = &dma->pfn_list.rb_node;
++	 *   - drivers/vfio/vfio_iommu_type1.c|299| <<vfio_link_pfn>> rb_insert_color(&new->node, &dma->pfn_list);
++	 *   - drivers/vfio/vfio_iommu_type1.c|304| <<vfio_unlink_pfn>> rb_erase(&old->node, &dma->pfn_list);
++	 *   - drivers/vfio/vfio_iommu_type1.c|1178| <<vfio_remove_dma>> WARN_ON(!RB_EMPTY_ROOT(&dma->pfn_list));
++	 *   - drivers/vfio/vfio_iommu_type1.c|1325| <<vfio_dma_do_unmap>> if (!RB_EMPTY_ROOT(&dma->pfn_list)) {
++	 *   - drivers/vfio/vfio_iommu_type1.c|1789| <<vfio_dma_do_map>> dma->pfn_list = RB_ROOT;
++	 *   - drivers/vfio/vfio_iommu_type1.c|2633| <<vfio_iommu_unmap_unpin_reaccount>> p = rb_first(&dma->pfn_list);
++	 */
+ 	rb_erase(&old->node, &dma->pfn_list);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|1000| <<vfio_iommu_type1_pin_pages>> ret = vfio_add_to_pfn_list(dma, iova, phys_pfn[i]);
++ *
++ * vfio_add_to_pfn_list()只被一般没有调用的vfio_iommu_type1_pin_pages()调用
++ * 所以vfio_add_to_pfn_list()一般不被调用
++ */
+ static int vfio_add_to_pfn_list(struct vfio_dma *dma, dma_addr_t iova,
+ 				unsigned long pfn)
+ {
+@@ -268,10 +426,17 @@ static int vfio_add_to_pfn_list(struct vfio_dma *dma, dma_addr_t iova,
+ 	vpfn->iova = iova;
+ 	vpfn->pfn = pfn;
+ 	atomic_set(&vpfn->ref_count, 1);
++	/*
++	 * 只在此处调用
++	 */
+ 	vfio_link_pfn(dma, vpfn);
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|408| <<vfio_iova_put_vfio_pfn>> vfio_remove_from_pfn_list(dma, vpfn);
++ */
+ static void vfio_remove_from_pfn_list(struct vfio_dma *dma,
+ 				      struct vfio_pfn *vpfn)
+ {
+@@ -279,6 +444,10 @@ static void vfio_remove_from_pfn_list(struct vfio_dma *dma,
+ 	kfree(vpfn);
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|988| <<vfio_iommu_type1_pin_pages>> vpfn = vfio_iova_get_vfio_pfn(dma, iova);
++ */
+ static struct vfio_pfn *vfio_iova_get_vfio_pfn(struct vfio_dma *dma,
+ 					       unsigned long iova)
+ {
+@@ -289,6 +458,10 @@ static struct vfio_pfn *vfio_iova_get_vfio_pfn(struct vfio_dma *dma,
+ 	return vpfn;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|910| <<vfio_unpin_page_external>> unlocked = vfio_iova_put_vfio_pfn(dma, vpfn);
++ */
+ static int vfio_iova_put_vfio_pfn(struct vfio_dma *dma, struct vfio_pfn *vpfn)
+ {
+ 	int ret = 0;
+@@ -300,6 +473,18 @@ static int vfio_iova_put_vfio_pfn(struct vfio_dma *dma, struct vfio_pfn *vpfn)
  	return ret;
  }
  
@@ -444,7 +653,7 @@ index 0befe9185b16..f8fdca34f52e 100644
  static int vfio_lock_acct(struct vfio_dma *dma, long npage, bool async)
  {
  	struct mm_struct *mm;
-@@ -313,7 +373,16 @@ static int vfio_lock_acct(struct vfio_dma *dma, long npage, bool async)
+@@ -313,7 +498,16 @@ static int vfio_lock_acct(struct vfio_dma *dma, long npage, bool async)
  		return -ESRCH; /* process exited */
  
  	ret = down_write_killable(&mm->mmap_sem);
@@ -461,7 +670,7 @@ index 0befe9185b16..f8fdca34f52e 100644
  		ret = __account_locked_vm(mm, abs(npage), npage > 0, dma->task,
  					  dma->lock_cap);
  		if (!ret)
-@@ -332,6 +401,15 @@ static int vfio_lock_acct(struct vfio_dma *dma, long npage, bool async)
+@@ -332,6 +526,20 @@ static int vfio_lock_acct(struct vfio_dma *dma, long npage, bool async)
   * MMIO range for our own or another device.  These use a different
   * pfn conversion and shouldn't be tracked as locked pages.
   */
@@ -473,11 +682,45 @@ index 0befe9185b16..f8fdca34f52e 100644
 + *   - drivers/vfio/vfio_iommu_type1.c|642| <<vfio_pin_pages_remote>> rsvd != is_invalid_reserved_pfn(pfn)) {
 + *   - drivers/vfio/vfio_iommu_type1.c|725| <<vfio_pin_page_external>> if (!ret && do_accounting && !is_invalid_reserved_pfn(*pfn_base)) {
 + *   - drivers/vfio/vfio_iommu_type1.c|2404| <<vfio_iommu_unmap_unpin_reaccount>> if (!is_invalid_reserved_pfn(vpfn->pfn))
++ *
++ * 注释:
++ * Some mappings aren't backed by a struct page, for example an mmap'd
++ * MMIO range for our own or another device.  These use a different
++ * pfn conversion and shouldn't be tracked as locked pages.
 + */
  static bool is_invalid_reserved_pfn(unsigned long pfn)
  {
  	if (pfn_valid(pfn)) {
-@@ -408,6 +486,12 @@ static int follow_fault_pfn(struct vm_area_struct *vma, struct mm_struct *mm,
+@@ -360,6 +568,17 @@ static bool is_invalid_reserved_pfn(unsigned long pfn)
+ 	return true;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|345| <<vfio_iova_put_vfio_pfn>> ret = put_pfn(vpfn->pfn, dma->prot);
++ *   - drivers/vfio/vfio_iommu_type1.c|672| <<vfio_pin_pages_remote>> put_pfn(*pfn_base, dma->prot);
++ *   - drivers/vfio/vfio_iommu_type1.c|705| <<vfio_pin_pages_remote>> put_pfn(pfn, dma->prot);
++ *   - drivers/vfio/vfio_iommu_type1.c|720| <<vfio_pin_pages_remote>> put_pfn(pfn, dma->prot);
++ *   - drivers/vfio/vfio_iommu_type1.c|754| <<vfio_pin_pages_remote>> put_pfn(pfn, dma->prot);
++ *   - drivers/vfio/vfio_iommu_type1.c|771| <<vfio_unpin_pages_remote>> if (put_pfn(pfn++, dma->prot)) {
++ *   - drivers/vfio/vfio_iommu_type1.c|802| <<vfio_pin_page_external>> put_pfn(*pfn_base, dma->prot);
++ *   - drivers/vfio/vfio_iommu_type1.c|916| <<vfio_iommu_type1_pin_pages>> if (put_pfn(phys_pfn[i], dma->prot) && do_accounting)
++ */
+ static int put_pfn(unsigned long pfn, int prot)
+ {
+ 	if (!is_invalid_reserved_pfn(pfn)) {
+@@ -372,6 +591,10 @@ static int put_pfn(unsigned long pfn, int prot)
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|617| <<vaddr_get_pfn>> ret = follow_fault_pfn(vma, mm, vaddr, pfn, prot & IOMMU_WRITE);
++ */
+ static int follow_fault_pfn(struct vm_area_struct *vma, struct mm_struct *mm,
+ 			    unsigned long vaddr, unsigned long *pfn,
+ 			    bool write_fault)
+@@ -408,6 +631,12 @@ static int follow_fault_pfn(struct vm_area_struct *vma, struct mm_struct *mm,
  	return ret;
  }
  
@@ -490,7 +733,53 @@ index 0befe9185b16..f8fdca34f52e 100644
  static int vaddr_get_pfn(struct mm_struct *mm, unsigned long vaddr,
  			 int prot, unsigned long *pfn, bool handle_mmap_sem)
  {
-@@ -530,6 +614,13 @@ static int vfio_wait_all_valid(struct vfio_iommu *iommu)
+@@ -457,6 +686,9 @@ static int vaddr_get_pfn(struct mm_struct *mm, unsigned long vaddr,
+ 	vma = find_vma_intersection(mm, vaddr, vaddr + 1);
+ 
+ 	if (vma && vma->vm_flags & VM_PFNMAP) {
++		/*
++		 * 只在此处调用
++		 */
+ 		ret = follow_fault_pfn(vma, mm, vaddr, pfn, prot & IOMMU_WRITE);
+ 		if (ret == -EAGAIN)
+ 			goto retry;
+@@ -470,10 +702,24 @@ static int vaddr_get_pfn(struct mm_struct *mm, unsigned long vaddr,
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|664| <<vfio_find_dma_valid>> ret = vfio_wait(iommu);
++ *   - drivers/vfio/vfio_iommu_type1.c|680| <<vfio_wait_all_valid>> ret = vfio_wait(iommu);
++ */
+ static int vfio_wait(struct vfio_iommu *iommu)
+ {
+ 	DEFINE_WAIT(wait);
+ 
++	/*
++	 * 在以下使用vfio_iommu->vaddr_wait:
++	 *   - drivers/vfio/vfio_iommu_type1.c|634| <<vfio_wait>> prepare_to_wait(&iommu->vaddr_wait, &wait, TASK_KILLABLE);
++	 *   - drivers/vfio/vfio_iommu_type1.c|638| <<vfio_wait>> finish_wait(&iommu->vaddr_wait, &wait);
++	 *   - drivers/vfio/vfio_iommu_type1.c|1296| <<vfio_remove_dma>> wake_up_all(&iommu->vaddr_wait);
++	 *   - drivers/vfio/vfio_iommu_type1.c|1853| <<vfio_dma_do_map>> wake_up_all(&iommu->vaddr_wait);
++	 *   - drivers/vfio/vfio_iommu_type1.c|2982| <<vfio_iommu_type1_open>> init_waitqueue_head(&iommu->vaddr_wait);
++	 *   - drivers/vfio/vfio_iommu_type1.c|3353| <<vfio_iommu_type1_notify>> wake_up_all(&iommu->vaddr_wait);
++	 */
+ 	prepare_to_wait(&iommu->vaddr_wait, &wait, TASK_KILLABLE);
+ 	mutex_unlock(&iommu->lock);
+ 	schedule();
+@@ -492,6 +738,10 @@ static int vfio_wait(struct vfio_iommu *iommu)
+  * Return 0 on success with no waiting, WAITED on success if waited, and -errno
+  * on error.
+  */
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|952| <<vfio_iommu_type1_pin_pages>> ret = vfio_find_dma_valid(iommu, iova, PAGE_SIZE, &dma);
++ */
+ static int vfio_find_dma_valid(struct vfio_iommu *iommu, dma_addr_t start,
+ 			       size_t size, struct vfio_dma **dma_p)
+ {
+@@ -530,6 +780,13 @@ static int vfio_wait_all_valid(struct vfio_iommu *iommu)
   * the iommu can only map chunks of consecutive pfns anyway, so get the
   * first page and all consecutive pages with the same locking.
   */
@@ -504,7 +793,7 @@ index 0befe9185b16..f8fdca34f52e 100644
  static long vfio_pin_pages_remote(struct vfio_dma *dma, unsigned long vaddr,
  				  long npage, unsigned long *pfn_base,
  				  unsigned long limit, struct mm_struct *mm,
-@@ -552,12 +643,29 @@ static long vfio_pin_pages_remote(struct vfio_dma *dma, unsigned long vaddr,
+@@ -552,12 +809,33 @@ static long vfio_pin_pages_remote(struct vfio_dma *dma, unsigned long vaddr,
  	}
  
  	pinned++;
@@ -530,22 +819,41 @@ index 0befe9185b16..f8fdca34f52e 100644
 +	 *   - drivers/vfio/vfio_iommu_type1.c|647| <<vfio_pin_pages_remote>> if (!rsvd && !vfio_find_vpfn(dma, iova)) {
 +	 *   - drivers/vfio/vfio_iommu_type1.c|703| <<vfio_unpin_pages_remote>> if (vfio_find_vpfn(dma, iova))
 +	 *   - drivers/vfio/vfio_iommu_type1.c|745| <<vfio_unpin_page_external>> struct vfio_pfn *vpfn = vfio_find_vpfn(dma, iova);
++	 *
++	 * 要满足两个条件:
++	 * 1. !rsvd --> 不是reserved
++	 * 2. !vfio_find_vpfn(dma, iova) --> 不是externally pinned (Ex-user pinned pfn list)
 +	 */
  	if (!rsvd && !vfio_find_vpfn(dma, iova)) {
  		if (!dma->lock_cap && *lock_cache == 0 &&
  		    mm->locked_vm + 1 > limit) {
-@@ -583,12 +691,29 @@ static long vfio_pin_pages_remote(struct vfio_dma *dma, unsigned long vaddr,
+@@ -579,16 +857,44 @@ static long vfio_pin_pages_remote(struct vfio_dma *dma, unsigned long vaddr,
+ 	/* Lock all the consecutive pages from pfn_base */
+ 	for (vaddr += PAGE_SIZE, iova += PAGE_SIZE; pinned < npage;
+ 	     pinned++, vaddr += PAGE_SIZE, iova += PAGE_SIZE) {
++		/*
++		 * called by:
++		 *   - drivers/vfio/vfio_iommu_type1.c|623| <<vfio_pin_pages_remote>> ret = vaddr_get_pfn(mm, vaddr, dma->prot, pfn_base, false);
++		 *   - drivers/vfio/vfio_iommu_type1.c|674| <<vfio_pin_pages_remote>> ret = vaddr_get_pfn(mm, vaddr, dma->prot, &pfn, false);
++		 *   - drivers/vfio/vfio_iommu_type1.c|782| <<vfio_pin_page_external>> ret = vaddr_get_pfn(mm, vaddr, dma->prot, pfn_base, true);
++		 */
+ 		ret = vaddr_get_pfn(mm, vaddr, dma->prot, &pfn, false);
  		if (ret)
  			break;
  
 +		/*
-+		 * called by:
++		 * 在以下调用is_invalid_reserved_pfn():
 +		 *   - drivers/vfio/vfio_iommu_type1.c|413| <<put_pfn>> if (!is_invalid_reserved_pfn(pfn)) {
 +		 *   - drivers/vfio/vfio_iommu_type1.c|512| <<vaddr_get_pfn>> if (!ret && !is_invalid_reserved_pfn(*pfn))
 +		 *   - drivers/vfio/vfio_iommu_type1.c|610| <<vfio_pin_pages_remote>> rsvd = is_invalid_reserved_pfn(*pfn_base);
 +		 *   - drivers/vfio/vfio_iommu_type1.c|642| <<vfio_pin_pages_remote>> rsvd != is_invalid_reserved_pfn(pfn)) {
 +		 *   - drivers/vfio/vfio_iommu_type1.c|725| <<vfio_pin_page_external>> if (!ret && do_accounting && !is_invalid_reserved_pfn(*pfn_base)) {
 +		 *   - drivers/vfio/vfio_iommu_type1.c|2404| <<vfio_iommu_unmap_unpin_reaccount>> if (!is_invalid_reserved_pfn(vpfn->pfn))
++		 *
++		 * 注释:
++		 * Some mappings aren't backed by a struct page, for example an mmap'd
++		 * MMIO range for our own or another device.  These use a different
++		 * pfn conversion and shouldn't be tracked as locked pages.
 +		 */
  		if (pfn != *pfn_base + pinned ||
  		    rsvd != is_invalid_reserved_pfn(pfn)) {
@@ -564,7 +872,7 @@ index 0befe9185b16..f8fdca34f52e 100644
  		if (!rsvd && !vfio_find_vpfn(dma, iova)) {
  			if (!dma->lock_cap && *lock_cache == 0 &&
  			    mm->locked_vm + lock_acct + 1 > limit) {
-@@ -608,6 +733,18 @@ static long vfio_pin_pages_remote(struct vfio_dma *dma, unsigned long vaddr,
+@@ -608,6 +914,18 @@ static long vfio_pin_pages_remote(struct vfio_dma *dma, unsigned long vaddr,
  
  out:
  	up_read(&mm->mmap_sem);
@@ -583,7 +891,45 @@ index 0befe9185b16..f8fdca34f52e 100644
  	ret = vfio_lock_acct(dma, lock_acct, false);
  
  unpin_out:
-@@ -644,6 +781,10 @@ static long vfio_unpin_pages_remote(struct vfio_dma *dma, dma_addr_t iova,
+@@ -623,6 +941,19 @@ static long vfio_pin_pages_remote(struct vfio_dma *dma, unsigned long vaddr,
+ 	return pinned;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|989| <<vfio_sync_unpin>> unlocked += vfio_unpin_pages_remote(dma, entry->iova,
++ *                                                entry->phys >> PAGE_SHIFT, entry->len >> PAGE_SHIFT, false);
++ *   - drivers/vfio/vfio_iommu_type1.c|1060| <<unmap_unpin_slow>> *unlocked += vfio_unpin_pages_remote(dma, *iova,
++ *                                                phys >> PAGE_SHIFT, unmapped >> PAGE_SHIFT, false);
++ *   - drivers/vfio/vfio_iommu_type1.c|1533| <<vfio_pin_map_dma_chunk>> vfio_unpin_pages_remote(dma, iova + mapped_size,
++ *                                                pfn, npage, true);
++ *   - drivers/vfio/vfio_iommu_type1.c|1921| <<vfio_iommu_replay>> vfio_unpin_pages_remote(dma, iova, phys >> PAGE_SHIFT,
++ *                                                size >> PAGE_SHIFT, true);
++ *   - drivers/vfio/vfio_iommu_type1.c|1974| <<vfio_iommu_replay>> vfio_unpin_pages_remote(dma, iova, phys >> PAGE_SHIFT,
++ *                                                size >> PAGE_SHIFT, true);
++ */
+ static long vfio_unpin_pages_remote(struct vfio_dma *dma, dma_addr_t iova,
+ 				    unsigned long pfn, long npage,
+ 				    bool do_accounting)
+@@ -638,12 +969,28 @@ static long vfio_unpin_pages_remote(struct vfio_dma *dma, dma_addr_t iova,
+ 		}
+ 	}
+ 
++	/*
++	 * called by:
++	 *   - drivers/vfio/vfio_iommu_type1.c|611| <<vfio_pin_pages_remote>> ret = vfio_lock_acct(dma, lock_acct, false);
++	 *   - drivers/vfio/vfio_iommu_type1.c|642| <<vfio_unpin_pages_remote>> vfio_lock_acct(dma, locked - unlocked, true);
++	 *   - drivers/vfio/vfio_iommu_type1.c|659| <<vfio_pin_page_external>> ret = vfio_lock_acct(dma, 1, true);
++	 *   - drivers/vfio/vfio_iommu_type1.c|686| <<vfio_unpin_page_external>> vfio_lock_acct(dma, -unlocked, true);
++	 *   - drivers/vfio/vfio_iommu_type1.c|771| <<vfio_iommu_type1_pin_pages>> vfio_lock_acct(dma, -1, true);
++	 *   - drivers/vfio/vfio_iommu_type1.c|997| <<vfio_unmap_unpin>> vfio_lock_acct(dma, -unlocked, true);
++	 *   - drivers/vfio/vfio_iommu_type1.c|1255| <<vfio_pin_map_dma_chunk>> ret = vfio_lock_acct(dma, cache_size, false);
++	 *   - drivers/vfio/vfio_iommu_type1.c|1285| <<vfio_pin_map_dma_chunk>> vfio_lock_acct(dma, -lock_cache, false);
++	 *   - drivers/vfio/vfio_iommu_type1.c|2246| <<vfio_iommu_unmap_unpin_reaccount>> vfio_lock_acct(dma, locked - unlocked, true);
++	 */
+ 	if (do_accounting)
+ 		vfio_lock_acct(dma, locked - unlocked, true);
+ 
  	return unlocked;
  }
  
@@ -594,11 +940,38 @@ index 0befe9185b16..f8fdca34f52e 100644
  static int vfio_pin_page_external(struct vfio_dma *dma, unsigned long vaddr,
  				  unsigned long *pfn_base, bool do_accounting)
  {
-@@ -688,6 +829,11 @@ static int vfio_unpin_page_external(struct vfio_dma *dma, dma_addr_t iova,
+@@ -671,6 +1018,11 @@ static int vfio_pin_page_external(struct vfio_dma *dma, unsigned long vaddr,
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|1115| <<vfio_iommu_type1_pin_pages>> vfio_unpin_page_external(dma, iova, do_accounting);
++ *   - drivers/vfio/vfio_iommu_type1.c|1165| <<vfio_iommu_type1_unpin_pages>> vfio_unpin_page_external(dma, iova, do_accounting);
++ */
+ static int vfio_unpin_page_external(struct vfio_dma *dma, dma_addr_t iova,
+ 				    bool do_accounting)
+ {
+@@ -688,6 +1040,26 @@ static int vfio_unpin_page_external(struct vfio_dma *dma, dma_addr_t iova,
  	return unlocked;
  }
  
 +/*
++ * 3478 static const struct vfio_iommu_driver_ops vfio_iommu_driver_ops_type1 = {
++ * 3479         .name                   = "vfio-iommu-type1",
++ * 3480         .owner                  = THIS_MODULE,
++ * 3481         .open                   = vfio_iommu_type1_open,
++ * 3482         .release                = vfio_iommu_type1_release,
++ * 3483         .ioctl                  = vfio_iommu_type1_ioctl,
++ * 3484         .attach_group           = vfio_iommu_type1_attach_group,
++ * 3485         .detach_group           = vfio_iommu_type1_detach_group,
++ * 3486         .pin_pages              = vfio_iommu_type1_pin_pages,
++ * 3487         .unpin_pages            = vfio_iommu_type1_unpin_pages,
++ * 3488         .register_notifier      = vfio_iommu_type1_register_notifier,
++ * 3489         .unregister_notifier    = vfio_iommu_type1_unregister_notifier,
++ * 3490         .notify                 = vfio_iommu_type1_notify,
++ * 3491 };
++ *
 + * 一般没有调用
 + *
 + * struct vfio_iommu_driver_ops vfio_iommu_driver_ops_type1.pin_pages = vfio_iommu_type1_pin_pages()
@@ -606,7 +979,51 @@ index 0befe9185b16..f8fdca34f52e 100644
  static int vfio_iommu_type1_pin_pages(void *iommu_data,
  				      unsigned long *user_pfn,
  				      int npage, int prot,
-@@ -825,6 +971,11 @@ static int vfio_iommu_type1_unpin_pages(void *iommu_data,
+@@ -760,11 +1132,18 @@ static int vfio_iommu_type1_pin_pages(void *iommu_data,
+ 		}
+ 
+ 		remote_vaddr = dma->vaddr + (iova - dma->iova);
++		/*
++		 * 只在此处调用
++		 */
+ 		ret = vfio_pin_page_external(dma, remote_vaddr, &phys_pfn[i],
+ 					     do_accounting);
+ 		if (ret)
+ 			goto pin_unwind;
+ 
++		/*
++		 * vfio_add_to_pfn_list()只被一般没有调用的vfio_iommu_type1_pin_pages()调用
++		 * 所以vfio_add_to_pfn_list()一般不被调用
++		 */
+ 		ret = vfio_add_to_pfn_list(dma, iova, phys_pfn[i]);
+ 		if (ret) {
+ 			if (put_pfn(phys_pfn[i], dma->prot) && do_accounting)
+@@ -791,6 +1170,24 @@ static int vfio_iommu_type1_pin_pages(void *iommu_data,
+ 	return ret;
+ }
+ 
++/*
++ * 3478 static const struct vfio_iommu_driver_ops vfio_iommu_driver_ops_type1 = {
++ * 3479         .name                   = "vfio-iommu-type1",
++ * 3480         .owner                  = THIS_MODULE,
++ * 3481         .open                   = vfio_iommu_type1_open,
++ * 3482         .release                = vfio_iommu_type1_release,
++ * 3483         .ioctl                  = vfio_iommu_type1_ioctl,
++ * 3484         .attach_group           = vfio_iommu_type1_attach_group,
++ * 3485         .detach_group           = vfio_iommu_type1_detach_group,
++ * 3486         .pin_pages              = vfio_iommu_type1_pin_pages,
++ * 3487         .unpin_pages            = vfio_iommu_type1_unpin_pages,
++ * 3488         .register_notifier      = vfio_iommu_type1_register_notifier,
++ * 3489         .unregister_notifier    = vfio_iommu_type1_unregister_notifier,
++ * 3490         .notify                 = vfio_iommu_type1_notify,
++ * 3491 };
++ *
++ * struct vfio_iommu_driver_ops vfio_iommu_driver_ops_type1.unpin_pages = vfio_iommu_type1_unpin_pages()
++ */
+ static int vfio_iommu_type1_unpin_pages(void *iommu_data,
+ 					unsigned long *user_pfn,
+ 					int npage)
+@@ -825,6 +1222,11 @@ static int vfio_iommu_type1_unpin_pages(void *iommu_data,
  	return i > npage ? npage : (i > 0 ? i : -EINVAL);
  }
  
@@ -618,7 +1035,58 @@ index 0befe9185b16..f8fdca34f52e 100644
  static long vfio_sync_unpin(struct vfio_dma *dma, struct vfio_domain *domain,
  			    struct list_head *regions,
  			    struct iommu_iotlb_gather *iotlb_gather)
-@@ -916,6 +1067,12 @@ static size_t unmap_unpin_slow(struct vfio_domain *domain,
+@@ -835,6 +1237,19 @@ static long vfio_sync_unpin(struct vfio_dma *dma, struct vfio_domain *domain,
+ 	iommu_tlb_sync(domain->domain, iotlb_gather);
+ 
+ 	list_for_each_entry_safe(entry, next, regions, list) {
++		/*
++		 * called by:
++		 *   - drivers/vfio/vfio_iommu_type1.c|989| <<vfio_sync_unpin>> unlocked += vfio_unpin_pages_remote(dma, entry->iova,
++		 *                                                entry->phys >> PAGE_SHIFT, entry->len >> PAGE_SHIFT, false);
++		 *   - drivers/vfio/vfio_iommu_type1.c|1060| <<unmap_unpin_slow>> *unlocked += vfio_unpin_pages_remote(dma, *iova,
++		 *                                                phys >> PAGE_SHIFT, unmapped >> PAGE_SHIFT, false);
++		 *   - drivers/vfio/vfio_iommu_type1.c|1533| <<vfio_pin_map_dma_chunk>> vfio_unpin_pages_remote(dma, iova + mapped_size,
++		 *                                                pfn, npage, true);
++		 *   - drivers/vfio/vfio_iommu_type1.c|1921| <<vfio_iommu_replay>> vfio_unpin_pages_remote(dma, iova, phys >> PAGE_SHIFT,
++		 *                                                size >> PAGE_SHIFT, true);
++		 *   - drivers/vfio/vfio_iommu_type1.c|1974| <<vfio_iommu_replay>> vfio_unpin_pages_remote(dma, iova, phys >> PAGE_SHIFT,
++		 *                                                size >> PAGE_SHIFT, true);
++		 */
+ 		unlocked += vfio_unpin_pages_remote(dma,
+ 						    entry->iova,
+ 						    entry->phys >> PAGE_SHIFT,
+@@ -898,6 +1313,10 @@ static size_t unmap_unpin_fast(struct vfio_domain *domain,
+ 	return unmapped;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|1251| <<vfio_unmap_unpin>> unmapped = unmap_unpin_slow(domain, dma, &iova, len, phys, &unlocked);
++ */
+ static size_t unmap_unpin_slow(struct vfio_domain *domain,
+ 			       struct vfio_dma *dma, dma_addr_t *iova,
+ 			       size_t len, phys_addr_t phys,
+@@ -906,6 +1325,19 @@ static size_t unmap_unpin_slow(struct vfio_domain *domain,
+ 	size_t unmapped = iommu_unmap(domain->domain, *iova, len);
+ 
+ 	if (unmapped) {
++		/*
++		 * called by:
++		 *   - drivers/vfio/vfio_iommu_type1.c|989| <<vfio_sync_unpin>> unlocked += vfio_unpin_pages_remote(dma, entry->iova,
++		 *                                                entry->phys >> PAGE_SHIFT, entry->len >> PAGE_SHIFT, false);
++		 *   - drivers/vfio/vfio_iommu_type1.c|1060| <<unmap_unpin_slow>> *unlocked += vfio_unpin_pages_remote(dma, *iova,
++		 *                                                phys >> PAGE_SHIFT, unmapped >> PAGE_SHIFT, false);
++		 *   - drivers/vfio/vfio_iommu_type1.c|1533| <<vfio_pin_map_dma_chunk>> vfio_unpin_pages_remote(dma, iova + mapped_size,
++		 *                                                pfn, npage, true);
++		 *   - drivers/vfio/vfio_iommu_type1.c|1921| <<vfio_iommu_replay>> vfio_unpin_pages_remote(dma, iova, phys >> PAGE_SHIFT,
++		 *                                                size >> PAGE_SHIFT, true);
++		 *   - drivers/vfio/vfio_iommu_type1.c|1974| <<vfio_iommu_replay>> vfio_unpin_pages_remote(dma, iova, phys >> PAGE_SHIFT,
++		 *                                                size >> PAGE_SHIFT, true);
++		 */
+ 		*unlocked += vfio_unpin_pages_remote(dma, *iova,
+ 						     phys >> PAGE_SHIFT,
+ 						     unmapped >> PAGE_SHIFT,
+@@ -916,6 +1348,12 @@ static size_t unmap_unpin_slow(struct vfio_domain *domain,
  	return unmapped;
  }
  
@@ -631,7 +1099,7 @@ index 0befe9185b16..f8fdca34f52e 100644
  static long vfio_unmap_unpin(struct vfio_iommu *iommu, struct vfio_dma *dma,
  			     bool do_accounting)
  {
-@@ -986,6 +1143,16 @@ static long vfio_unmap_unpin(struct vfio_iommu *iommu, struct vfio_dma *dma,
+@@ -986,6 +1424,16 @@ static long vfio_unmap_unpin(struct vfio_iommu *iommu, struct vfio_dma *dma,
  		}
  	}
  
@@ -648,7 +1116,7 @@ index 0befe9185b16..f8fdca34f52e 100644
  	dma->iommu_mapped = false;
  
  	if (unmapped_region_cnt) {
-@@ -1000,6 +1167,12 @@ static long vfio_unmap_unpin(struct vfio_iommu *iommu, struct vfio_dma *dma,
+@@ -1000,6 +1448,12 @@ static long vfio_unmap_unpin(struct vfio_iommu *iommu, struct vfio_dma *dma,
  	return unlocked;
  }
  
@@ -661,7 +1129,23 @@ index 0befe9185b16..f8fdca34f52e 100644
  static void vfio_remove_dma(struct vfio_iommu *iommu, struct vfio_dma *dma)
  {
  	WARN_ON(!RB_EMPTY_ROOT(&dma->pfn_list));
-@@ -1189,6 +1362,10 @@ static int vfio_dma_do_unmap(struct vfio_iommu *iommu,
+@@ -1008,6 +1462,15 @@ static void vfio_remove_dma(struct vfio_iommu *iommu, struct vfio_dma *dma)
+ 	put_task_struct(dma->task);
+ 	if (dma->vaddr_invalid) {
+ 		iommu->vaddr_invalid_count--;
++		/*
++		 * 在以下使用vfio_iommu->vaddr_wait:
++		 *   - drivers/vfio/vfio_iommu_type1.c|634| <<vfio_wait>> prepare_to_wait(&iommu->vaddr_wait, &wait, TASK_KILLABLE);
++		 *   - drivers/vfio/vfio_iommu_type1.c|638| <<vfio_wait>> finish_wait(&iommu->vaddr_wait, &wait);
++		 *   - drivers/vfio/vfio_iommu_type1.c|1296| <<vfio_remove_dma>> wake_up_all(&iommu->vaddr_wait);
++		 *   - drivers/vfio/vfio_iommu_type1.c|1853| <<vfio_dma_do_map>> wake_up_all(&iommu->vaddr_wait);
++		 *   - drivers/vfio/vfio_iommu_type1.c|2982| <<vfio_iommu_type1_open>> init_waitqueue_head(&iommu->vaddr_wait);
++		 *   - drivers/vfio/vfio_iommu_type1.c|3353| <<vfio_iommu_type1_notify>> wake_up_all(&iommu->vaddr_wait);
++		 */
+ 		wake_up_all(&iommu->vaddr_wait);
+ 	}
+ 	kfree(dma);
+@@ -1189,6 +1652,10 @@ static int vfio_dma_do_unmap(struct vfio_iommu *iommu,
  	return ret;
  }
  
@@ -672,7 +1156,7 @@ index 0befe9185b16..f8fdca34f52e 100644
  static int vfio_iommu_map(struct vfio_iommu *iommu, dma_addr_t iova,
  			  unsigned long pfn, long npage, int prot)
  {
-@@ -1228,6 +1405,27 @@ static void vfio_pin_map_dma_undo(unsigned long start_vaddr,
+@@ -1228,6 +1695,27 @@ static void vfio_pin_map_dma_undo(unsigned long start_vaddr,
  	vfio_unmap_unpin(args->iommu, args->dma, true);
  }
  
@@ -700,7 +1184,7 @@ index 0befe9185b16..f8fdca34f52e 100644
  /*
   * Relieve mmap_sem contention when multithreading page pinning by caching
   * locked_vm locally.  Bound the locked_vm that a thread will cache but not use
-@@ -1236,9 +1434,39 @@ static void vfio_pin_map_dma_undo(unsigned long start_vaddr,
+@@ -1236,9 +1724,39 @@ static void vfio_pin_map_dma_undo(unsigned long start_vaddr,
   */
  #define LOCK_CACHE_MAX	16384
  
@@ -740,7 +1224,7 @@ index 0befe9185b16..f8fdca34f52e 100644
  	struct vfio_pin_args *args = arg;
  	struct vfio_dma *dma = args->dma;
  	dma_addr_t iova = dma->iova + (start_vaddr - dma->vaddr);
-@@ -1250,14 +1478,40 @@ static int vfio_pin_map_dma_chunk(unsigned long start_vaddr,
+@@ -1250,14 +1768,40 @@ static int vfio_pin_map_dma_chunk(unsigned long start_vaddr,
  
  	while (unmapped_size) {
  		if (lock_cache == 0) {
@@ -781,7 +1265,7 @@ index 0befe9185b16..f8fdca34f52e 100644
  		/* Pin a contiguous chunk of memory */
  		npage = vfio_pin_pages_remote(dma, start_vaddr + mapped_size,
  					      unmapped_size >> PAGE_SHIFT,
-@@ -1269,6 +1523,9 @@ static int vfio_pin_map_dma_chunk(unsigned long start_vaddr,
+@@ -1269,10 +1813,26 @@ static int vfio_pin_map_dma_chunk(unsigned long start_vaddr,
  			break;
  		}
  
@@ -791,7 +1275,24 @@ index 0befe9185b16..f8fdca34f52e 100644
  		/* Map it! */
  		ret = vfio_iommu_map(args->iommu, iova + mapped_size, pfn,
  				     npage, dma->prot);
-@@ -1282,6 +1539,20 @@ static int vfio_pin_map_dma_chunk(unsigned long start_vaddr,
+ 		if (ret) {
++			/*
++			 * called by:
++			 *   - drivers/vfio/vfio_iommu_type1.c|989| <<vfio_sync_unpin>> unlocked += vfio_unpin_pages_remote(dma, entry->iova,
++			 *                                                entry->phys >> PAGE_SHIFT, entry->len >> PAGE_SHIFT, false);
++			 *   - drivers/vfio/vfio_iommu_type1.c|1060| <<unmap_unpin_slow>> *unlocked += vfio_unpin_pages_remote(dma, *iova,
++			 *                                                phys >> PAGE_SHIFT, unmapped >> PAGE_SHIFT, false);
++			 *   - drivers/vfio/vfio_iommu_type1.c|1533| <<vfio_pin_map_dma_chunk>> vfio_unpin_pages_remote(dma, iova + mapped_size,
++			 *                                                pfn, npage, true);
++			 *   - drivers/vfio/vfio_iommu_type1.c|1921| <<vfio_iommu_replay>> vfio_unpin_pages_remote(dma, iova, phys >> PAGE_SHIFT,
++			 *                                                size >> PAGE_SHIFT, true);
++			 *   - drivers/vfio/vfio_iommu_type1.c|1974| <<vfio_iommu_replay>> vfio_unpin_pages_remote(dma, iova, phys >> PAGE_SHIFT,
++			 *                                                size >> PAGE_SHIFT, true);
++			 */
+ 			vfio_unpin_pages_remote(dma, iova + mapped_size, pfn,
+ 						npage, true);
+ 			break;
+@@ -1282,6 +1842,20 @@ static int vfio_pin_map_dma_chunk(unsigned long start_vaddr,
  		mapped_size   += npage << PAGE_SHIFT;
  	}
  
@@ -812,7 +1313,7 @@ index 0befe9185b16..f8fdca34f52e 100644
  	vfio_lock_acct(dma, -lock_cache, false);
  
  	/*
-@@ -1295,6 +1566,10 @@ static int vfio_pin_map_dma_chunk(unsigned long start_vaddr,
+@@ -1295,6 +1869,10 @@ static int vfio_pin_map_dma_chunk(unsigned long start_vaddr,
  	return ret;
  }
  
@@ -823,7 +1324,7 @@ index 0befe9185b16..f8fdca34f52e 100644
  static int vfio_pin_map_dma(struct vfio_iommu *iommu, struct vfio_dma *dma,
  			    size_t map_size)
  {
-@@ -1315,6 +1590,16 @@ static int vfio_pin_map_dma(struct vfio_iommu *iommu, struct vfio_dma *dma,
+@@ -1315,6 +1893,16 @@ static int vfio_pin_map_dma(struct vfio_iommu *iommu, struct vfio_dma *dma,
  
  	ret = padata_do_multithreaded(&job);
  
@@ -840,7 +1341,7 @@ index 0befe9185b16..f8fdca34f52e 100644
  	dma->iommu_mapped = true;
  
  	if (ret)
-@@ -1328,6 +1613,10 @@ static int vfio_pin_map_dma(struct vfio_iommu *iommu, struct vfio_dma *dma,
+@@ -1328,6 +1916,10 @@ static int vfio_pin_map_dma(struct vfio_iommu *iommu, struct vfio_dma *dma,
  /*
   * Check dma map request is within a valid iova range
   */
@@ -851,7 +1352,7 @@ index 0befe9185b16..f8fdca34f52e 100644
  static bool vfio_iommu_iova_dma_valid(struct vfio_iommu *iommu,
  				      dma_addr_t start, dma_addr_t end)
  {
-@@ -1346,9 +1635,25 @@ static bool vfio_iommu_iova_dma_valid(struct vfio_iommu *iommu,
+@@ -1346,9 +1938,25 @@ static bool vfio_iommu_iova_dma_valid(struct vfio_iommu *iommu,
  	return list_empty(iova);
  }
  
@@ -877,7 +1378,7 @@ index 0befe9185b16..f8fdca34f52e 100644
  	bool set_vaddr = map->flags & VFIO_DMA_MAP_FLAG_VADDR;
  	dma_addr_t iova = map->iova;
  	unsigned long vaddr = map->vaddr;
-@@ -1383,6 +1688,32 @@ static int vfio_dma_do_map(struct vfio_iommu *iommu,
+@@ -1383,6 +1991,32 @@ static int vfio_dma_do_map(struct vfio_iommu *iommu,
  
  	mutex_lock(&iommu->lock);
  
@@ -910,7 +1411,23 @@ index 0befe9185b16..f8fdca34f52e 100644
  	dma = vfio_find_dma(iommu, iova, size);
  	if (set_vaddr) {
  		if (!dma) {
-@@ -1407,6 +1738,9 @@ static int vfio_dma_do_map(struct vfio_iommu *iommu,
+@@ -1394,6 +2028,15 @@ static int vfio_dma_do_map(struct vfio_iommu *iommu,
+ 			dma->vaddr = vaddr;
+ 			dma->vaddr_invalid = false;
+ 			iommu->vaddr_invalid_count--;
++			/*
++			 * 在以下使用vfio_iommu->vaddr_wait:
++			 *   - drivers/vfio/vfio_iommu_type1.c|634| <<vfio_wait>> prepare_to_wait(&iommu->vaddr_wait, &wait, TASK_KILLABLE);
++			 *   - drivers/vfio/vfio_iommu_type1.c|638| <<vfio_wait>> finish_wait(&iommu->vaddr_wait, &wait);
++			 *   - drivers/vfio/vfio_iommu_type1.c|1296| <<vfio_remove_dma>> wake_up_all(&iommu->vaddr_wait);
++			 *   - drivers/vfio/vfio_iommu_type1.c|1853| <<vfio_dma_do_map>> wake_up_all(&iommu->vaddr_wait);
++			 *   - drivers/vfio/vfio_iommu_type1.c|2982| <<vfio_iommu_type1_open>> init_waitqueue_head(&iommu->vaddr_wait);
++			 *   - drivers/vfio/vfio_iommu_type1.c|3353| <<vfio_iommu_type1_notify>> wake_up_all(&iommu->vaddr_wait);
++			 */
+ 			wake_up_all(&iommu->vaddr_wait);
+ 		}
+ 		goto out_unlock;
+@@ -1407,6 +2050,9 @@ static int vfio_dma_do_map(struct vfio_iommu *iommu,
  		goto out_unlock;
  	}
  
@@ -920,7 +1437,7 @@ index 0befe9185b16..f8fdca34f52e 100644
  	if (!vfio_iommu_iova_dma_valid(iommu, iova, iova + size - 1)) {
  		ret = -EINVAL;
  		goto out_unlock;
-@@ -1454,9 +1788,17 @@ static int vfio_dma_do_map(struct vfio_iommu *iommu,
+@@ -1454,9 +2100,17 @@ static int vfio_dma_do_map(struct vfio_iommu *iommu,
  
  	dma->pfn_list = RB_ROOT;
  
@@ -938,7 +1455,7 @@ index 0befe9185b16..f8fdca34f52e 100644
  	/* Don't pin and map if container doesn't contain IOMMU capable domain*/
  	if (!IS_IOMMU_CAP_DOMAIN_IN_CONTAINER(iommu))
  		dma->size = size;
-@@ -1480,6 +1822,10 @@ static int vfio_bus_type(struct device *dev, void *data)
+@@ -1480,6 +2134,10 @@ static int vfio_bus_type(struct device *dev, void *data)
  	return 0;
  }
  
@@ -949,7 +1466,7 @@ index 0befe9185b16..f8fdca34f52e 100644
  static int vfio_iommu_replay(struct vfio_iommu *iommu,
  			     struct vfio_domain *domain)
  {
-@@ -1511,6 +1857,16 @@ static int vfio_iommu_replay(struct vfio_iommu *iommu,
+@@ -1511,6 +2169,16 @@ static int vfio_iommu_replay(struct vfio_iommu *iommu,
  			phys_addr_t phys;
  			size_t size;
  
@@ -966,7 +1483,47 @@ index 0befe9185b16..f8fdca34f52e 100644
  			if (dma->iommu_mapped) {
  				phys_addr_t p;
  				dma_addr_t i;
-@@ -2013,6 +2369,31 @@ static void vfio_iommu_iova_insert_copy(struct vfio_iommu *iommu,
+@@ -1561,6 +2229,19 @@ static int vfio_iommu_replay(struct vfio_iommu *iommu,
+ 			ret = iommu_map(domain->domain, iova, phys,
+ 					size, dma->prot | domain->prot);
+ 			if (ret) {
++				/*
++				 * called by:
++				 *   - drivers/vfio/vfio_iommu_type1.c|989| <<vfio_sync_unpin>> unlocked += vfio_unpin_pages_remote(dma, entry->iova,
++				 *                                                entry->phys >> PAGE_SHIFT, entry->len >> PAGE_SHIFT, false);
++				 *   - drivers/vfio/vfio_iommu_type1.c|1060| <<unmap_unpin_slow>> *unlocked += vfio_unpin_pages_remote(dma, *iova,
++				 *                                                phys >> PAGE_SHIFT, unmapped >> PAGE_SHIFT, false);
++				 *   - drivers/vfio/vfio_iommu_type1.c|1533| <<vfio_pin_map_dma_chunk>> vfio_unpin_pages_remote(dma, iova + mapped_size,
++				 *                                                pfn, npage, true);
++				 *   - drivers/vfio/vfio_iommu_type1.c|1921| <<vfio_iommu_replay>> vfio_unpin_pages_remote(dma, iova, phys >> PAGE_SHIFT,
++				 *                                                size >> PAGE_SHIFT, true);
++				 *   - drivers/vfio/vfio_iommu_type1.c|1974| <<vfio_iommu_replay>> vfio_unpin_pages_remote(dma, iova, phys >> PAGE_SHIFT,
++				 *                                                size >> PAGE_SHIFT, true);
++				 */
+ 				if (!dma->iommu_mapped)
+ 					vfio_unpin_pages_remote(dma, iova,
+ 							phys >> PAGE_SHIFT,
+@@ -1615,6 +2296,19 @@ static int vfio_iommu_replay(struct vfio_iommu *iommu,
+ 			}
+ 
+ 			iommu_unmap(domain->domain, iova, size);
++			/*
++			 * called by:
++			 *   - drivers/vfio/vfio_iommu_type1.c|989| <<vfio_sync_unpin>> unlocked += vfio_unpin_pages_remote(dma, entry->iova,
++			 *                                                entry->phys >> PAGE_SHIFT, entry->len >> PAGE_SHIFT, false);
++			 *   - drivers/vfio/vfio_iommu_type1.c|1060| <<unmap_unpin_slow>> *unlocked += vfio_unpin_pages_remote(dma, *iova,
++			 *                                                phys >> PAGE_SHIFT, unmapped >> PAGE_SHIFT, false);
++			 *   - drivers/vfio/vfio_iommu_type1.c|1533| <<vfio_pin_map_dma_chunk>> vfio_unpin_pages_remote(dma, iova + mapped_size,
++			 *                                                pfn, npage, true);
++			 *   - drivers/vfio/vfio_iommu_type1.c|1921| <<vfio_iommu_replay>> vfio_unpin_pages_remote(dma, iova, phys >> PAGE_SHIFT,
++			 *                                                size >> PAGE_SHIFT, true);
++			 *   - drivers/vfio/vfio_iommu_type1.c|1974| <<vfio_iommu_replay>> vfio_unpin_pages_remote(dma, iova, phys >> PAGE_SHIFT,
++			 *                                                size >> PAGE_SHIFT, true);
++			 */
+ 			vfio_unpin_pages_remote(dma, iova, phys >> PAGE_SHIFT,
+ 						size >> PAGE_SHIFT, true);
+ 		}
+@@ -2013,6 +2707,31 @@ static void vfio_iommu_iova_insert_copy(struct vfio_iommu *iommu,
  
  	list_splice_tail(iova_copy, iova);
  }
@@ -998,7 +1555,20 @@ index 0befe9185b16..f8fdca34f52e 100644
  static int vfio_iommu_type1_attach_group(void *iommu_data,
  					 struct iommu_group *iommu_group)
  {
-@@ -2223,6 +2604,10 @@ static void vfio_iommu_unmap_unpin_all(struct vfio_iommu *iommu)
+@@ -2215,6 +2934,12 @@ static int vfio_iommu_type1_attach_group(void *iommu_data,
+ 	return ret;
+ }
+ 
++/*
++ * called by:
++ *   - drivers/vfio/vfio_iommu_type1.c|3046| <<vfio_iommu_type1_detach_group>> vfio_iommu_unmap_unpin_all(iommu);
++ *   - drivers/vfio/vfio_iommu_type1.c|3082| <<vfio_iommu_type1_detach_group>> vfio_iommu_unmap_unpin_all(iommu);
++ *   - drivers/vfio/vfio_iommu_type1.c|3207| <<vfio_iommu_type1_release>> vfio_iommu_unmap_unpin_all(iommu);
++ */
+ static void vfio_iommu_unmap_unpin_all(struct vfio_iommu *iommu)
+ {
+ 	struct rb_node *node;
+@@ -2223,6 +2948,10 @@ static void vfio_iommu_unmap_unpin_all(struct vfio_iommu *iommu)
  		vfio_remove_dma(iommu, rb_entry(node, struct vfio_dma, node));
  }
  
@@ -1009,7 +1579,7 @@ index 0befe9185b16..f8fdca34f52e 100644
  static void vfio_iommu_unmap_unpin_reaccount(struct vfio_iommu *iommu)
  {
  	struct rb_node *n, *p;
-@@ -2234,6 +2619,16 @@ static void vfio_iommu_unmap_unpin_reaccount(struct vfio_iommu *iommu)
+@@ -2234,6 +2963,16 @@ static void vfio_iommu_unmap_unpin_reaccount(struct vfio_iommu *iommu)
  
  		dma = rb_entry(n, struct vfio_dma, node);
  		unlocked += vfio_unmap_unpin(iommu, dma, false);
@@ -1026,7 +1596,73 @@ index 0befe9185b16..f8fdca34f52e 100644
  		dma->iommu_mapped = false;
  		p = rb_first(&dma->pfn_list);
  		for (; p; p = rb_next(p)) {
-@@ -2454,6 +2849,24 @@ static void vfio_release_domain(struct vfio_domain *domain, bool external)
+@@ -2327,6 +3066,24 @@ static int vfio_iommu_resv_refresh(struct vfio_iommu *iommu,
+ 	return ret;
+ }
+ 
++/*
++ * 3478 static const struct vfio_iommu_driver_ops vfio_iommu_driver_ops_type1 = {
++ * 3479         .name                   = "vfio-iommu-type1",
++ * 3480         .owner                  = THIS_MODULE,
++ * 3481         .open                   = vfio_iommu_type1_open,
++ * 3482         .release                = vfio_iommu_type1_release,
++ * 3483         .ioctl                  = vfio_iommu_type1_ioctl,
++ * 3484         .attach_group           = vfio_iommu_type1_attach_group,
++ * 3485         .detach_group           = vfio_iommu_type1_detach_group,
++ * 3486         .pin_pages              = vfio_iommu_type1_pin_pages,
++ * 3487         .unpin_pages            = vfio_iommu_type1_unpin_pages,
++ * 3488         .register_notifier      = vfio_iommu_type1_register_notifier,
++ * 3489         .unregister_notifier    = vfio_iommu_type1_unregister_notifier,
++ * 3490         .notify                 = vfio_iommu_type1_notify,
++ * 3491 };
++ *
++ * struct vfio_iommu_driver_ops vfio_iommu_driver_ops_type1.detach_group = vfio_iommu_type1_detach_group()
++ */
+ static void vfio_iommu_type1_detach_group(void *iommu_data,
+ 					  struct iommu_group *iommu_group)
+ {
+@@ -2404,6 +3161,24 @@ static void vfio_iommu_type1_detach_group(void *iommu_data,
+ 	mutex_unlock(&iommu->lock);
+ }
+ 
++/*
++ * 3478 static const struct vfio_iommu_driver_ops vfio_iommu_driver_ops_type1 = {
++ * 3479         .name                   = "vfio-iommu-type1",
++ * 3480         .owner                  = THIS_MODULE,
++ * 3481         .open                   = vfio_iommu_type1_open,
++ * 3482         .release                = vfio_iommu_type1_release,
++ * 3483         .ioctl                  = vfio_iommu_type1_ioctl,
++ * 3484         .attach_group           = vfio_iommu_type1_attach_group,
++ * 3485         .detach_group           = vfio_iommu_type1_detach_group,
++ * 3486         .pin_pages              = vfio_iommu_type1_pin_pages,
++ * 3487         .unpin_pages            = vfio_iommu_type1_unpin_pages,
++ * 3488         .register_notifier      = vfio_iommu_type1_register_notifier,
++ * 3489         .unregister_notifier    = vfio_iommu_type1_unregister_notifier,
++ * 3490         .notify                 = vfio_iommu_type1_notify,
++ * 3491 };
++ *
++ * struct vfio_iommu_driver_ops vfio_iommu_driver_ops_type1.open = vfio_iommu_type1_open()
++ */
+ static void *vfio_iommu_type1_open(unsigned long arg)
+ {
+ 	struct vfio_iommu *iommu;
+@@ -2433,6 +3208,15 @@ static void *vfio_iommu_type1_open(unsigned long arg)
+ 	iommu->container_open = true;
+ 	mutex_init(&iommu->lock);
+ 	BLOCKING_INIT_NOTIFIER_HEAD(&iommu->notifier);
++	/*
++	 * 在以下使用vfio_iommu->vaddr_wait:
++	 *   - drivers/vfio/vfio_iommu_type1.c|634| <<vfio_wait>> prepare_to_wait(&iommu->vaddr_wait, &wait, TASK_KILLABLE);
++	 *   - drivers/vfio/vfio_iommu_type1.c|638| <<vfio_wait>> finish_wait(&iommu->vaddr_wait, &wait);
++	 *   - drivers/vfio/vfio_iommu_type1.c|1296| <<vfio_remove_dma>> wake_up_all(&iommu->vaddr_wait);
++	 *   - drivers/vfio/vfio_iommu_type1.c|1853| <<vfio_dma_do_map>> wake_up_all(&iommu->vaddr_wait);
++	 *   - drivers/vfio/vfio_iommu_type1.c|2982| <<vfio_iommu_type1_open>> init_waitqueue_head(&iommu->vaddr_wait);
++	 *   - drivers/vfio/vfio_iommu_type1.c|3353| <<vfio_iommu_type1_notify>> wake_up_all(&iommu->vaddr_wait);
++	 */
+ 	init_waitqueue_head(&iommu->vaddr_wait);
+ 
+ 	return iommu;
+@@ -2454,6 +3238,24 @@ static void vfio_release_domain(struct vfio_domain *domain, bool external)
  		iommu_domain_free(domain->domain);
  }
  
@@ -1051,43 +1687,42 @@ index 0befe9185b16..f8fdca34f52e 100644
  static void vfio_iommu_type1_release(void *iommu_data)
  {
  	struct vfio_iommu *iommu = iommu_data;
-@@ -2580,6 +2993,44 @@ static int vfio_iommu_dma_avail_build_caps(struct vfio_iommu *iommu,
+@@ -2580,6 +3382,43 @@ static int vfio_iommu_dma_avail_build_caps(struct vfio_iommu *iommu,
  	return ret;
  }
  
 +/*
-+ * 1166 
-+1167 static long vfio_fops_unl_ioctl(struct file *filep,
-+1168                                 unsigned int cmd, unsigned long arg)
-+1169 {
-+1170         struct vfio_container *container = filep->private_data;
-+1171         struct vfio_iommu_driver *driver;
-+1172         void *data;
-+1173         long ret = -EINVAL;
-+1174 
-+1175         if (!container)
-+1176                 return ret;
-+1177        
-+1178         switch (cmd) {
-+1179         case VFIO_GET_API_VERSION:
-+1180                 ret = VFIO_API_VERSION;
-+1181                 break; 
-+1182         case VFIO_CHECK_EXTENSION:
-+1183                 ret = vfio_ioctl_check_extension(container, arg);
-+1184                 break;
-+1185         case VFIO_SET_IOMMU:
-+1186                 ret = vfio_ioctl_set_iommu(container, arg);
-+1187                 break;
-+1188         default:       
-+1189                 driver = container->iommu_driver;
-+1190                 data = container->iommu_data;
-+1191        
-+1192                 if (driver) // passthrough all unrecognized ioctls
-+1193                         ret = driver->ops->ioctl(data, cmd, arg);
-+1194         }
-+1195 
-+1196         return ret;
-+1197 }
++ * 1167 static long vfio_fops_unl_ioctl(struct file *filep,
++ * 1168                                 unsigned int cmd, unsigned long arg)
++ * 1169 {
++ * 1170         struct vfio_container *container = filep->private_data;
++ * 1171         struct vfio_iommu_driver *driver;
++ * 1172         void *data;
++ * 1173         long ret = -EINVAL;
++ * 1174 
++ * 1175         if (!container)
++ * 1176                 return ret;
++ * 1177        
++ * 1178         switch (cmd) {
++ * 1179         case VFIO_GET_API_VERSION:
++ * 1180                 ret = VFIO_API_VERSION;
++ * 1181                 break; 
++ * 1182         case VFIO_CHECK_EXTENSION:
++ * 1183                 ret = vfio_ioctl_check_extension(container, arg);
++ * 1184                 break;
++ * 1185         case VFIO_SET_IOMMU:
++ * 1186                 ret = vfio_ioctl_set_iommu(container, arg);
++ * 1187                 break;
++ * 1188         default:       
++ * 1189                 driver = container->iommu_driver;
++ * 1190                 data = container->iommu_data;
++ * 1191        
++ * 1192                 if (driver) // passthrough all unrecognized ioctls
++ * 1193                         ret = driver->ops->ioctl(data, cmd, arg);
++ * 1194         }
++ * 1195 
++ * 1196         return ret;
++ * 1197 }
 + *
 + * struct vfio_iommu_driver_ops vfio_iommu_driver_ops_type1.ioctl = vfio_iommu_type1_ioctl()
 + *
@@ -1096,7 +1731,7 @@ index 0befe9185b16..f8fdca34f52e 100644
  static long vfio_iommu_type1_ioctl(void *iommu_data,
  				   unsigned int cmd, unsigned long arg)
  {
-@@ -2659,6 +3110,18 @@ static long vfio_iommu_type1_ioctl(void *iommu_data,
+@@ -2659,6 +3498,18 @@ static long vfio_iommu_type1_ioctl(void *iommu_data,
  			-EFAULT : 0;
  
  	} else if (cmd == VFIO_IOMMU_MAP_DMA) {
@@ -1115,7 +1750,7 @@ index 0befe9185b16..f8fdca34f52e 100644
  		struct vfio_iommu_type1_dma_map map;
  		uint32_t mask = VFIO_DMA_MAP_FLAG_READ |
  				VFIO_DMA_MAP_FLAG_WRITE |
-@@ -2672,6 +3135,9 @@ static long vfio_iommu_type1_ioctl(void *iommu_data,
+@@ -2672,6 +3523,9 @@ static long vfio_iommu_type1_ioctl(void *iommu_data,
  		if (map.argsz < minsz || map.flags & ~mask)
  			return -EINVAL;
  
@@ -1125,6 +1760,97 @@ index 0befe9185b16..f8fdca34f52e 100644
  		return vfio_dma_do_map(iommu, &map);
  
  	} else if (cmd == VFIO_IOMMU_UNMAP_DMA) {
+@@ -2699,6 +3553,24 @@ static long vfio_iommu_type1_ioctl(void *iommu_data,
+ 	return -ENOTTY;
+ }
+ 
++/*
++ * 3478 static const struct vfio_iommu_driver_ops vfio_iommu_driver_ops_type1 = {
++ * 3479         .name                   = "vfio-iommu-type1",
++ * 3480         .owner                  = THIS_MODULE,
++ * 3481         .open                   = vfio_iommu_type1_open,
++ * 3482         .release                = vfio_iommu_type1_release,
++ * 3483         .ioctl                  = vfio_iommu_type1_ioctl,
++ * 3484         .attach_group           = vfio_iommu_type1_attach_group,
++ * 3485         .detach_group           = vfio_iommu_type1_detach_group,
++ * 3486         .pin_pages              = vfio_iommu_type1_pin_pages,
++ * 3487         .unpin_pages            = vfio_iommu_type1_unpin_pages,
++ * 3488         .register_notifier      = vfio_iommu_type1_register_notifier,
++ * 3489         .unregister_notifier    = vfio_iommu_type1_unregister_notifier,
++ * 3490         .notify                 = vfio_iommu_type1_notify,
++ * 3491 };
++ *
++ * struct vfio_iommu_driver_ops vfio_iommu_driver_ops_type1.register_notifier = vfio_iommu_type1_register_notifier()
++ */
+ static int vfio_iommu_type1_register_notifier(void *iommu_data,
+ 					      unsigned long *events,
+ 					      struct notifier_block *nb)
+@@ -2715,6 +3587,24 @@ static int vfio_iommu_type1_register_notifier(void *iommu_data,
+ 	return blocking_notifier_chain_register(&iommu->notifier, nb);
+ }
+ 
++/*
++ * 3478 static const struct vfio_iommu_driver_ops vfio_iommu_driver_ops_type1 = {
++ * 3479         .name                   = "vfio-iommu-type1",
++ * 3480         .owner                  = THIS_MODULE,
++ * 3481         .open                   = vfio_iommu_type1_open,
++ * 3482         .release                = vfio_iommu_type1_release,
++ * 3483         .ioctl                  = vfio_iommu_type1_ioctl,
++ * 3484         .attach_group           = vfio_iommu_type1_attach_group,
++ * 3485         .detach_group           = vfio_iommu_type1_detach_group,
++ * 3486         .pin_pages              = vfio_iommu_type1_pin_pages,
++ * 3487         .unpin_pages            = vfio_iommu_type1_unpin_pages,
++ * 3488         .register_notifier      = vfio_iommu_type1_register_notifier,
++ * 3489         .unregister_notifier    = vfio_iommu_type1_unregister_notifier,
++ * 3490         .notify                 = vfio_iommu_type1_notify,
++ * 3491 };
++ *
++ * struct vfio_iommu_driver_ops vfio_iommu_driver_ops_type1.unregister_notifier = vfio_iommu_type1_unregister_notifier()
++ */
+ static int vfio_iommu_type1_unregister_notifier(void *iommu_data,
+ 						struct notifier_block *nb)
+ {
+@@ -2723,6 +3613,24 @@ static int vfio_iommu_type1_unregister_notifier(void *iommu_data,
+ 	return blocking_notifier_chain_unregister(&iommu->notifier, nb);
+ }
+ 
++/*
++ * 3478 static const struct vfio_iommu_driver_ops vfio_iommu_driver_ops_type1 = {
++ * 3479         .name                   = "vfio-iommu-type1",
++ * 3480         .owner                  = THIS_MODULE,
++ * 3481         .open                   = vfio_iommu_type1_open,
++ * 3482         .release                = vfio_iommu_type1_release,
++ * 3483         .ioctl                  = vfio_iommu_type1_ioctl,
++ * 3484         .attach_group           = vfio_iommu_type1_attach_group,
++ * 3485         .detach_group           = vfio_iommu_type1_detach_group,
++ * 3486         .pin_pages              = vfio_iommu_type1_pin_pages,
++ * 3487         .unpin_pages            = vfio_iommu_type1_unpin_pages,
++ * 3488         .register_notifier      = vfio_iommu_type1_register_notifier,
++ * 3489         .unregister_notifier    = vfio_iommu_type1_unregister_notifier,
++ * 3490         .notify                 = vfio_iommu_type1_notify,
++ * 3491 };
++ *
++ * struct vfio_iommu_driver_ops vfio_iommu_driver_ops_type1.notify = = vfio_iommu_type1_notify()
++ */
+ static void vfio_iommu_type1_notify(void *iommu_data,
+ 				    enum vfio_iommu_notify_type event)
+ {
+@@ -2733,6 +3641,15 @@ static void vfio_iommu_type1_notify(void *iommu_data,
+ 	mutex_lock(&iommu->lock);
+ 	iommu->container_open = false;
+ 	mutex_unlock(&iommu->lock);
++	/*
++	 * 在以下使用vfio_iommu->vaddr_wait:
++	 *   - drivers/vfio/vfio_iommu_type1.c|634| <<vfio_wait>> prepare_to_wait(&iommu->vaddr_wait, &wait, TASK_KILLABLE);
++	 *   - drivers/vfio/vfio_iommu_type1.c|638| <<vfio_wait>> finish_wait(&iommu->vaddr_wait, &wait);
++	 *   - drivers/vfio/vfio_iommu_type1.c|1296| <<vfio_remove_dma>> wake_up_all(&iommu->vaddr_wait);
++	 *   - drivers/vfio/vfio_iommu_type1.c|1853| <<vfio_dma_do_map>> wake_up_all(&iommu->vaddr_wait);
++	 *   - drivers/vfio/vfio_iommu_type1.c|2982| <<vfio_iommu_type1_open>> init_waitqueue_head(&iommu->vaddr_wait);
++	 *   - drivers/vfio/vfio_iommu_type1.c|3353| <<vfio_iommu_type1_notify>> wake_up_all(&iommu->vaddr_wait);
++	 */
+ 	wake_up_all(&iommu->vaddr_wait);
+ }
+ 
 diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
 index 5083ccf04d9f..c82885a15278 100644
 --- a/include/linux/mm_types.h
