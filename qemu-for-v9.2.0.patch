@@ -1,0 +1,395 @@
+From 66a35f6acc0f47fa662285dfb52efdfe233a8dc8 Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Mon, 23 Dec 2024 10:44:43 -0800
+Subject: [PATCH 1/1] qemu for v9.2.0
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ hw/scsi/vhost-scsi-common.c |   3 +
+ hw/virtio/vhost.c           | 211 ++++++++++++++++++++++++++++++++++++
+ include/hw/virtio/vhost.h   |  19 ++++
+ migration/savevm.c          |  12 ++
+ 4 files changed, 245 insertions(+)
+
+diff --git a/hw/scsi/vhost-scsi-common.c b/hw/scsi/vhost-scsi-common.c
+index 4c8637045..652390edb 100644
+--- a/hw/scsi/vhost-scsi-common.c
++++ b/hw/scsi/vhost-scsi-common.c
+@@ -78,6 +78,9 @@ int vhost_scsi_common_start(VHostSCSICommon *vsc, Error **errp)
+         }
+     }
+ 
++    /*
++     * 里面会调用vhost_dev_set_features()
++     */
+     ret = vhost_dev_start(&vsc->dev, vdev, true);
+     if (ret < 0) {
+         error_setg_errno(errp, -ret, "Error starting vhost dev");
+diff --git a/hw/virtio/vhost.c b/hw/virtio/vhost.c
+index c40f48ac4..9ae1af2ef 100644
+--- a/hw/virtio/vhost.c
++++ b/hw/virtio/vhost.c
+@@ -338,6 +338,86 @@ static int vhost_set_backend_type(struct vhost_dev *dev,
+     return r;
+ }
+ 
++/*
++ * 关于cancel migration.
++ *
++ * vhost_net启动的时候.
++ *
++ * (gdb) bt
++ * #0  vhost_dev_set_features (dev=0x555557686cc0, enable_log=false) at ../hw/virtio/vhost.c:989
++ * #1  0x0000555555b94909 in vhost_dev_start (hdev=0x555557686cc0, vdev=0x555558428ba0, vrings=false) at ../hw/virtio/vhost.c:2082
++ * #2  0x0000555555a47c24 in vhost_net_start_one (net=0x555557686cc0, dev=0x555558428ba0) at ../hw/net/vhost_net.c:280
++ * #3  0x0000555555a48278 in vhost_net_start (dev=0x555558428ba0, ncs=0x555558459418, data_queue_pairs=2, cvq=0) at ../hw/net/vhost_net.c:421
++ * #4  0x0000555555df0a1b in virtio_net_vhost_status (n=0x555558428ba0, status=15 '\017') at ../hw/net/virtio-net.c:311
++ * #5  0x0000555555df0d2b in virtio_net_set_status (vdev=0x555558428ba0, status=15 '\017') at ../hw/net/virtio-net.c:393
++ * #6  0x0000555555e33c08 in virtio_set_status (vdev=0x555558428ba0, val=15 '\017') at ../hw/virtio/virtio.c:2242
++ * #7  0x0000555555b7b531 in virtio_pci_common_write (opaque=0x555558420720, addr=20, val=15, size=1) at ../hw/virtio/virtio-pci.c:1608
++ * #8  0x0000555555e63c32 in memory_region_write_accessor (mr=0x555558421310, addr=20, value=0x7fffe9ed43f8, size=1, shift=0, mask=255, attrs=...)
++ *     at ../system/memory.c:497
++ * #9  0x0000555555e63f79 in access_with_adjusted_size (addr=20, value=0x7fffe9ed43f8, size=1, access_size_min=1, access_size_max=4,
++ *     access_fn=0x555555e63b3c <memory_region_write_accessor>, mr=0x555558421310, attrs=...) at ../system/memory.c:573
++ * #10 0x0000555555e674ae in memory_region_dispatch_write (mr=0x555558421310, addr=20, data=15, op=MO_8, attrs=...) at ../system/memory.c:1521
++ * #11 0x0000555555e76bdc in flatview_write_continue_step (attrs=..., buf=0x7ffff0036028 "\017", len=1, mr_addr=20, l=0x7fffe9ed44e0, mr=0x555558421310)
++ *     at ../system/physmem.c:2803
++ * #12 0x0000555555e76cae in flatview_write_continue (fv=0x7ffe4c000fc0, addr=4261412884, attrs=..., ptr=0x7ffff0036028, len=1, mr_addr=20, l=1,
++ *     mr=0x555558421310) at ../system/physmem.c:2833
++ * #13 0x0000555555e76dd6 in flatview_write (fv=0x7ffe4c000fc0, addr=4261412884, attrs=..., buf=0x7ffff0036028, len=1) at ../system/physmem.c:2864
++ * #14 0x0000555555e77250 in address_space_write (as=0x555557328200 <address_space_memory>, addr=4261412884, attrs=..., buf=0x7ffff0036028, len=1)
++ *     at ../system/physmem.c:2984
++ * #15 0x0000555555e772c8 in address_space_rw (as=0x555557328200 <address_space_memory>, addr=4261412884, attrs=..., buf=0x7ffff0036028, len=1,
++ *     is_write=true) at ../system/physmem.c:2994
++ * #16 0x0000555555ed4d63 in kvm_cpu_exec (cpu=0x5555577413a0) at ../accel/kvm/kvm-all.c:3075
++ * #17 0x0000555555ed8469 in kvm_vcpu_thread_fn (arg=0x5555577413a0) at ../accel/kvm/kvm-accel-ops.c:50
++ * #18 0x000055555616b040 in qemu_thread_start (args=0x55555774a370) at ../util/qemu-thread-posix.c:541
++ * #19 0x00007ffff68aa1da in start_thread () from /lib/../lib64/libpthread.so.0
++ * #20 0x00007ffff525ae73 in clone () from /lib/../lib64/libc.so.6
++ *
++ * vhost_net开始迁移的时候.
++ *
++ * (gdb) bt
++ * #0  vhost_dev_set_features (dev=0x555557686cc0, enable_log=true) at ../hw/virtio/vhost.c:989
++ * #1  0x0000555555b919e5 in vhost_dev_set_log (dev=0x555557686cc0, enable_log=true) at ../hw/virtio/vhost.c:1024
++#2  0x0000555555b91c5a in vhost_migration_log (listener=0x555557686cc8, enable=true) at ../hw/virtio/vhost.c:1093
++#3  0x0000555555b91ccf in vhost_log_global_start (listener=0x555557686cc8, errp=0x7ffe2fbfa628) at ../hw/virtio/vhost.c:1125
++#4  0x0000555555e6b859 in memory_global_dirty_log_do_start (errp=0x7ffe2fbfa628) at ../system/memory.c:2902
++#5  0x0000555555e6b98d in memory_global_dirty_log_start (flags=1, errp=0x7ffe2fbfa628) at ../system/memory.c:2941
++#6  0x0000555555e84d5d in ram_init_bitmaps (rs=0x7ffe20007d40, errp=0x7ffe2fbfa628) at ../migration/ram.c:2782
++#7  0x0000555555e84e6e in ram_init_all (rsp=0x555557328500 <ram_state>, errp=0x7ffe2fbfa628) at ../migration/ram.c:2816
++#8  0x0000555555e854fc in ram_save_setup (f=0x555557674610, opaque=0x555557328500 <ram_state>, errp=0x7ffe2fbfa628) at ../migration/ram.c:3010
++#9  0x0000555555c2fe16 in qemu_savevm_state_setup (f=0x555557674610, errp=0x7ffe2fbfa628) at ../migration/savevm.c:1346
++#10 0x0000555555c19305 in migration_thread (opaque=0x5555573fe000) at ../migration/migration.c:3507
++#11 0x000055555616b040 in qemu_thread_start (args=0x555557753b70) at ../util/qemu-thread-posix.c:541
++#12 0x00007ffff68aa1da in start_thread () from /lib/../lib64/libpthread.so.0
++#13 0x00007ffff525ae73 in clone () from /lib/../lib64/libc.so.6
++
++vhost_net cancel迁移的时候.
++
++(gdb) bt
++#0  vhost_dev_set_features (dev=0x5555573f9850, enable_log=false) at ../hw/virtio/vhost.c:989
++#1  0x0000555555b919e5 in vhost_dev_set_log (dev=0x5555573f9850, enable_log=false) at ../hw/virtio/vhost.c:1024
++#2  0x0000555555b91c0f in vhost_migration_log (listener=0x5555573f9858, enable=false) at ../hw/virtio/vhost.c:1086
++#3  0x0000555555b91d0c in vhost_log_global_stop (listener=0x5555573f9858) at ../hw/virtio/vhost.c:1136
++#4  0x0000555555e6bacd in memory_global_dirty_log_do_stop (flags=1) at ../system/memory.c:2966
++#5  0x0000555555e6bc06 in memory_global_dirty_log_stop (flags=1) at ../system/memory.c:3012
++#6  0x0000555555e84004 in ram_save_cleanup (opaque=0x555557328500 <ram_state>) at ../migration/ram.c:2383
++#7  0x0000555555c30c66 in qemu_savevm_state_cleanup () at ../migration/savevm.c:1699
++#8  0x0000555555c1494a in migrate_fd_cleanup (s=0x5555573fe000) at ../migration/migration.c:1409
++#9  0x0000555555c14b5e in migrate_fd_cleanup_bh (opaque=0x5555573fe000) at ../migration/migration.c:1456
++#10 0x0000555555c120bb in migration_bh_dispatch_bh (opaque=0x7ffe20002cf0) at ../migration/migration.c:284
++#11 0x0000555556186520 in aio_bh_call (bh=0x7ffe2011c7d0) at ../util/async.c:171
++#12 0x000055555618666e in aio_bh_poll (ctx=0x5555573fd770) at ../util/async.c:218
++#13 0x0000555556165595 in aio_dispatch (ctx=0x5555573fd770) at ../util/aio-posix.c:423
++#14 0x0000555556186b3d in aio_ctx_dispatch (source=0x5555573fd770, callback=0x0, user_data=0x0) at ../util/async.c:360
++#15 0x00007ffff6fd494b in g_main_dispatch (context=0x5555573fdcb0) at ../glib/gmain.c:3325
++#16 g_main_context_dispatch (context=0x5555573fdcb0) at ../glib/gmain.c:4043
++#17 0x0000555556188215 in glib_pollfds_poll () at ../util/main-loop.c:287
++#18 0x00005555561882a3 in os_host_main_loop_wait (timeout=942440) at ../util/main-loop.c:310
++#19 0x00005555561883d2 in main_loop_wait (nonblocking=0) at ../util/main-loop.c:589
++#20 0x0000555555be0f17 in qemu_main_loop () at ../system/runstate.c:826
++#21 0x0000555556093994 in qemu_default_main () at ../system/main.c:37
++#22 0x00005555560939d1 in main (argc=16, argv=0x7fffffffdc68) at ../system/main.c:48
++ */
++
+ static struct vhost_log *vhost_log_alloc(uint64_t size, bool share)
+ {
+     Error *err = NULL;
+@@ -367,6 +447,11 @@ static struct vhost_log *vhost_log_alloc(uint64_t size, bool share)
+     return log;
+ }
+ 
++/*
++ * called by:
++ *   - hw/virtio/vhost.c|443| <<vhost_dev_log_resize>> struct vhost_log *log = vhost_log_get(dev->vhost_ops->backend_type,
++ *   - hw/virtio/vhost.c|2114| <<vhost_dev_start>> hdev->log = vhost_log_get(hdev->vhost_ops->backend_type,
++ */
+ static struct vhost_log *vhost_log_get(VhostBackendType backend_type,
+                                        uint64_t size, bool share)
+ {
+@@ -391,6 +476,13 @@ static struct vhost_log *vhost_log_get(VhostBackendType backend_type,
+     return log;
+ }
+ 
++/*
++ * called by:
++ *   - hw/virtio/vhost.c|455| <<vhost_dev_log_resize>> vhost_log_put(dev, true);
++ *   - hw/virtio/vhost.c|1139| <<vhost_migration_log>> vhost_log_put(dev, false);
++ *   - hw/virtio/vhost.c|2168| <<vhost_dev_start>> vhost_log_put(hdev, false);
++ *   - hw/virtio/vhost.c|2225| <<vhost_dev_stop>> vhost_log_put(hdev, true);
++ */
+ static void vhost_log_put(struct vhost_dev *dev, bool sync)
+ {
+     struct vhost_log *log = dev->log;
+@@ -438,8 +530,19 @@ static bool vhost_dev_log_is_shared(struct vhost_dev *dev)
+            dev->vhost_ops->vhost_requires_shm_log(dev);
+ }
+ 
++/*
++ * called by:
++ *   - hw/virtio/vhost.c|715| <<vhost_commit>> vhost_dev_log_resize(dev, log_size + VHOST_LOG_BUFFER);
++ *   - hw/virtio/vhost.c|723| <<vhost_commit>> vhost_dev_log_resize(dev, log_size);
++ *   - hw/virtio/vhost.c|1141| <<vhost_migration_log>> vhost_dev_log_resize(dev, vhost_get_log_size(dev));
++ */
+ static inline void vhost_dev_log_resize(struct vhost_dev *dev, uint64_t size)
+ {
++    /*
++     * called by:
++     *   - hw/virtio/vhost.c|443| <<vhost_dev_log_resize>> struct vhost_log *log = vhost_log_get(dev->vhost_ops->backend_type,
++     *   - hw/virtio/vhost.c|2114| <<vhost_dev_start>> hdev->log = vhost_log_get(hdev->vhost_ops->backend_type,
++     */
+     struct vhost_log *log = vhost_log_get(dev->vhost_ops->backend_type,
+                                           size, vhost_dev_log_is_shared(dev));
+     uint64_t log_base = (uintptr_t)log->log;
+@@ -447,11 +550,23 @@ static inline void vhost_dev_log_resize(struct vhost_dev *dev, uint64_t size)
+ 
+     /* inform backend of log switching, this must be done before
+        releasing the current log, to ensure no logging is lost */
++    /*
++     * vhost_kernel_set_log_base() -> VHOST_SET_LOG_BASE
++     * vhost_user_set_log_base()
++     * vhost_vdpa_set_log_base()
++     */
+     r = dev->vhost_ops->vhost_set_log_base(dev, log_base, log);
+     if (r < 0) {
+         VHOST_OPS_DEBUG(r, "vhost_set_log_base failed");
+     }
+ 
++    /*
++     * called by:
++     *   - hw/virtio/vhost.c|455| <<vhost_dev_log_resize>> vhost_log_put(dev, true);
++     *   - hw/virtio/vhost.c|1139| <<vhost_migration_log>> vhost_log_put(dev, false);
++     *   - hw/virtio/vhost.c|2168| <<vhost_dev_start>> vhost_log_put(hdev, false);
++     *   - hw/virtio/vhost.c|2225| <<vhost_dev_stop>> vhost_log_put(hdev, true);
++     */
+     vhost_log_put(dev, true);
+     dev->log = log;
+     dev->log_size = size;
+@@ -954,6 +1069,55 @@ void vhost_toggle_device_iotlb(VirtIODevice *vdev)
+     }
+ }
+ 
++/*
++ * (gdb) bt
++ * #0  vhost_kernel_set_vring_addr (dev=0x5555573f9c50, addr=0x7fffe3dfefd0) at ../hw/virtio/vhost-backend.c:110
++ * #1  0x0000555555b917d9 in vhost_virtqueue_set_addr (dev=0x5555573f9c50, vq=0x5555573f9f60, idx=1, enable_log=false) at ../hw/virtio/vhost.c:979
++ * #2  0x0000555555b92541 in vhost_virtqueue_start (dev=0x5555573f9c50, vdev=0x555558419170, vq=0x5555573f9f60, idx=3) at ../hw/virtio/vhost.c:1321
++ * #3  0x0000555555b949e8 in vhost_dev_start (hdev=0x5555573f9c50, vdev=0x555558419170, vrings=false) at ../hw/virtio/vhost.c:2097
++ * #4  0x0000555555a47c24 in vhost_net_start_one (net=0x5555573f9c50, dev=0x555558419170) at ../hw/net/vhost_net.c:280
++ * #5  0x0000555555a48278 in vhost_net_start (dev=0x555558419170, ncs=0x555558424898, data_queue_pairs=2, cvq=0) at ../hw/net/vhost_net.c:421
++ * #6  0x0000555555df0a1b in virtio_net_vhost_status (n=0x555558419170, status=15 '\017') at ../hw/net/virtio-net.c:311
++ * #7  0x0000555555df0d2b in virtio_net_set_status (vdev=0x555558419170, status=15 '\017') at ../hw/net/virtio-net.c:393
++ * #8  0x0000555555e33c08 in virtio_set_status (vdev=0x555558419170, val=15 '\017') at ../hw/virtio/virtio.c:2242
++ * #9  0x0000555555b7b531 in virtio_pci_common_write (opaque=0x555558410cf0, addr=20, val=15, size=1) at ../hw/virtio/virtio-pci.c:1608
++ * #10 0x0000555555e63c32 in memory_region_write_accessor (mr=0x5555584118e0, addr=20, value=0x7fffe3dff3f8, size=1, shift=0, mask=255, attrs=...)
++ *                           at ../system/memory.c:497
++ * #11 0x0000555555e63f79 in access_with_adjusted_size (addr=20, value=0x7fffe3dff3f8, size=1, access_size_min=1, access_size_max=4,
++ *                           access_fn=0x555555e63b3c <memory_region_write_accessor>, mr=0x5555584118e0, attrs=...) at ../system/memory.c:573
++ * #12 0x0000555555e674ae in memory_region_dispatch_write (mr=0x5555584118e0, addr=20, data=15, op=MO_8, attrs=...) at ../system/memory.c:1521
++ * #13 0x0000555555e76bdc in flatview_write_continue_step (attrs=..., buf=0x7ffff7e39028 "\017", len=1, mr_addr=20,
++ *                           l=0x7fffe3dff4e0, mr=0x5555584118e0) at ../system/physmem.c:2803
++ * #14 0x0000555555e76cae in flatview_write_continue (fv=0x7ffe542b6060, addr=4261412884, attrs=..., ptr=0x7ffff7e39028, len=1, mr_addr=20,
++ *                           l=1, mr=0x5555584118e0) at ../system/physmem.c:2833
++ * #15 0x0000555555e76dd6 in flatview_write (fv=0x7ffe542b6060, addr=4261412884, attrs=..., buf=0x7ffff7e39028, len=1) at ../system/physmem.c:2864
++ * #16 0x0000555555e77250 in address_space_write (as=0x555557328200 <address_space_memory>, addr=4261412884, attrs=..., buf=0x7ffff7e39028, len=1)
++ *                           at ../system/physmem.c:2984
++ * #17 0x0000555555e772c8 in address_space_rw (as=0x555557328200 <address_space_memory>, addr=4261412884, attrs=..., buf=0x7ffff7e39028, len=1,
++ *                           is_write=true) at ../system/physmem.c:2994
++ * #18 0x0000555555ed4d63 in kvm_cpu_exec (cpu=0x555557748910) at ../accel/kvm/kvm-all.c:3075
++ * #19 0x0000555555ed8469 in kvm_vcpu_thread_fn (arg=0x555557748910) at ../accel/kvm/kvm-accel-ops.c:50
++ * #20 0x000055555616b040 in qemu_thread_start (args=0x555557752230) at ../util/qemu-thread-posix.c:541
++ * #21 0x00007ffff5c081da in start_thread () from /lib/../lib64/libpthread.so.0
++ * #22 0x00007ffff3839e73 in clone () from /lib/../lib64/libc.so.6
++ *
++ * (gdb) bt
++ * #0  vhost_kernel_set_vring_addr (dev=0x5555573f9c50, addr=0x7ffe253ff350) at ../hw/virtio/vhost-backend.c:110
++ * #1  0x0000555555b917d9 in vhost_virtqueue_set_addr (dev=0x5555573f9c50, vq=0x5555573f9f60, idx=1, enable_log=true) at ../hw/virtio/vhost.c:979
++ * #2  0x0000555555b91a76 in vhost_dev_set_log (dev=0x5555573f9c50, enable_log=true) at ../hw/virtio/vhost.c:1040
++ * #3  0x0000555555b91c5a in vhost_migration_log (listener=0x5555573f9c58, enable=true) at ../hw/virtio/vhost.c:1093
++ * #4  0x0000555555b91ccf in vhost_log_global_start (listener=0x5555573f9c58, errp=0x7ffe253ff628) at ../hw/virtio/vhost.c:1125
++ * #5  0x0000555555e6b859 in memory_global_dirty_log_do_start (errp=0x7ffe253ff628) at ../system/memory.c:2902
++ * #6  0x0000555555e6b98d in memory_global_dirty_log_start (flags=1, errp=0x7ffe253ff628) at ../system/memory.c:2941
++ * #7  0x0000555555e84d5d in ram_init_bitmaps (rs=0x7fffdc008420, errp=0x7ffe253ff628) at ../migration/ram.c:2782
++ * #8  0x0000555555e84e6e in ram_init_all (rsp=0x555557328500 <ram_state>, errp=0x7ffe253ff628) at ../migration/ram.c:2816
++ * #9  0x0000555555e854fc in ram_save_setup (f=0x555557671f70, opaque=0x555557328500 <ram_state>, errp=0x7ffe253ff628) at ../migration/ram.c:3010
++ * #10 0x0000555555c2fe16 in qemu_savevm_state_setup (f=0x555557671f70, errp=0x7ffe253ff628) at ../migration/savevm.c:1346
++ * #11 0x0000555555c19305 in migration_thread (opaque=0x5555573fe6a0) at ../migration/migration.c:3507
++ * #12 0x000055555616b040 in qemu_thread_start (args=0x555558115c40) at ../util/qemu-thread-posix.c:541
++ * #13 0x00007ffff5c081da in start_thread () from /lib/../lib64/libpthread.so.0
++ * #14 0x00007ffff3839e73 in clone () from /lib/../lib64/libc.so.6
++ */
+ static int vhost_virtqueue_set_addr(struct vhost_dev *dev,
+                                     struct vhost_virtqueue *vq,
+                                     unsigned idx, bool enable_log)
+@@ -983,6 +1147,13 @@ static int vhost_virtqueue_set_addr(struct vhost_dev *dev,
+     return r;
+ }
+ 
++/*
++ * called by:
++ *   - hw/virtio/vhost.c|1188| <<vhost_dev_set_log>> r = vhost_dev_set_features(dev, enable_log);
++ *   - hw/virtio/vhost.c|1230| <<vhost_dev_set_log>> vhost_dev_set_features(dev, dev->log_enabled);
++ *   - hw/virtio/vhost.c|2118| <<vhost_dev_prepare_inflight>> r = vhost_dev_set_features(hdev, hdev->log_enabled);
++ *   - hw/virtio/vhost.c|2200| <<vhost_dev_start>> r = vhost_dev_set_features(hdev, hdev->log_enabled);
++ */
+ static int vhost_dev_set_features(struct vhost_dev *dev,
+                                   bool enable_log)
+ {
+@@ -1016,6 +1187,11 @@ out:
+     return r;
+ }
+ 
++/*
++ * called by:
++ *   - hw/virtio/vhost.c|1153| <<vhost_migration_log>> r = vhost_dev_set_log(dev, false);
++ *   - hw/virtio/vhost.c|1160| <<vhost_migration_log>> r = vhost_dev_set_log(dev, true);
++ */
+ static int vhost_dev_set_log(struct vhost_dev *dev, bool enable_log)
+ {
+     int r, i, idx;
+@@ -1068,6 +1244,11 @@ err_features:
+     return r;
+ }
+ 
++/*
++ * called by:
++ *   - hw/virtio/vhost.c|1192| <<vhost_log_global_start>> r = vhost_migration_log(listener, true);
++ *   - hw/virtio/vhost.c|1203| <<vhost_log_global_stop>> r = vhost_migration_log(listener, false);
++ */
+ static int vhost_migration_log(MemoryListener *listener, bool enable)
+ {
+     struct vhost_dev *dev = container_of(listener, struct vhost_dev,
+@@ -1083,12 +1264,23 @@ static int vhost_migration_log(MemoryListener *listener, bool enable)
+ 
+     r = 0;
+     if (!enable) {
++        /*
++	 * called by:
++	 *   - hw/virtio/vhost.c|1153| <<vhost_migration_log>> r = vhost_dev_set_log(dev, false);
++	 *   - hw/virtio/vhost.c|1160| <<vhost_migration_log>> r = vhost_dev_set_log(dev, true);
++	 */
+         r = vhost_dev_set_log(dev, false);
+         if (r < 0) {
+             goto check_dev_state;
+         }
+         vhost_log_put(dev, false);
+     } else {
++        /*
++	 * called by:
++	 *   - hw/virtio/vhost.c|715| <<vhost_commit>> vhost_dev_log_resize(dev, log_size + VHOST_LOG_BUFFER);
++	 *   - hw/virtio/vhost.c|723| <<vhost_commit>> vhost_dev_log_resize(dev, log_size);
++	 *   - hw/virtio/vhost.c|1141| <<vhost_migration_log>> vhost_dev_log_resize(dev, vhost_get_log_size(dev));
++	 */
+         vhost_dev_log_resize(dev, vhost_get_log_size(dev));
+         r = vhost_dev_set_log(dev, true);
+         if (r < 0) {
+@@ -1097,6 +1289,25 @@ static int vhost_migration_log(MemoryListener *listener, bool enable)
+     }
+ 
+ check_dev_state:
++    /*
++     * 在以下设置vhost_dev->log_enabled;
++     *   - hw/virtio/vhost.c|1261| <<vhost_migration_log>> dev->log_enabled = enable;
++     *   - hw/virtio/vhost.c|1301| <<vhost_migration_log>> dev->log_enabled = enable;
++     *   - hw/virtio/vhost.c|1316| <<vhost_migration_log>> dev->log_enabled = false;
++     *   - hw/virtio/vhost.c|1817| <<vhost_dev_init>> hdev->log_enabled = false;
++     * 在以下使用vhost_dev->log_enabled;
++     *   - hw/virtio/vhost.c|203| <<vhost_sync_dirty_bitmap>> if (!dev->log_enabled || !dev->started) {
++     *   - hw/virtio/vhost.c|817| <<vhost_commit>> if (!dev->log_enabled) {
++     *   - hw/virtio/vhost.c|1240| <<vhost_dev_set_log>> vhost_virtqueue_set_addr(dev, dev->vqs + i, idx, dev->log_enabled);
++     *   - hw/virtio/vhost.c|1242| <<vhost_dev_set_log>> vhost_dev_set_features(dev, dev->log_enabled);
++     *   - hw/virtio/vhost.c|1257| <<vhost_migration_log>> if (enable == dev->log_enabled) {
++     *   - hw/virtio/vhost.c|1522| <<vhost_virtqueue_start>> r = vhost_virtqueue_set_addr(dev, vq, vhost_vq_index, dev->log_enabled);
++     *   - hw/virtio/vhost.c|2145| <<vhost_dev_prepare_inflight>> r = vhost_dev_set_features(hdev, hdev->log_enabled);
++     *   - hw/virtio/vhost.c|2227| <<vhost_dev_start>> r = vhost_dev_set_features(hdev, hdev->log_enabled);
++     *   - hw/virtio/vhost.c|2262| <<vhost_dev_start>> if (hdev->log_enabled) {
++     *   - hw/virtio/virtio-hmp-cmds.c|171| <<hmp_virtio_status>> s->vhost_dev->log_enabled ? "true" : "false");
++     *   - hw/virtio/virtio-qmp.c|791| <<qmp_x_query_virtio_status>> status->vhost_dev->log_enabled = hdev->log_enabled;
++     */
+     dev->log_enabled = enable;
+     /*
+      * vhost-user-* devices could change their state during log
+diff --git a/include/hw/virtio/vhost.h b/include/hw/virtio/vhost.h
+index 461c168c3..ff4f012bd 100644
+--- a/include/hw/virtio/vhost.h
++++ b/include/hw/virtio/vhost.h
+@@ -122,6 +122,25 @@ struct vhost_dev {
+     uint64_t backend_cap;
+     /* @started: is the vhost device started? */
+     bool started;
++    /*
++     * 在以下设置vhost_dev->log_enabled;
++     *   - hw/virtio/vhost.c|1261| <<vhost_migration_log>> dev->log_enabled = enable;
++     *   - hw/virtio/vhost.c|1301| <<vhost_migration_log>> dev->log_enabled = enable;
++     *   - hw/virtio/vhost.c|1316| <<vhost_migration_log>> dev->log_enabled = false;
++     *   - hw/virtio/vhost.c|1817| <<vhost_dev_init>> hdev->log_enabled = false;
++     * 在以下使用vhost_dev->log_enabled;
++     *   - hw/virtio/vhost.c|203| <<vhost_sync_dirty_bitmap>> if (!dev->log_enabled || !dev->started) {
++     *   - hw/virtio/vhost.c|817| <<vhost_commit>> if (!dev->log_enabled) {
++     *   - hw/virtio/vhost.c|1240| <<vhost_dev_set_log>> vhost_virtqueue_set_addr(dev, dev->vqs + i, idx, dev->log_enabled);
++     *   - hw/virtio/vhost.c|1242| <<vhost_dev_set_log>> vhost_dev_set_features(dev, dev->log_enabled);
++     *   - hw/virtio/vhost.c|1257| <<vhost_migration_log>> if (enable == dev->log_enabled) {
++     *   - hw/virtio/vhost.c|1522| <<vhost_virtqueue_start>> r = vhost_virtqueue_set_addr(dev, vq, vhost_vq_index, dev->log_enabled);
++     *   - hw/virtio/vhost.c|2145| <<vhost_dev_prepare_inflight>> r = vhost_dev_set_features(hdev, hdev->log_enabled);
++     *   - hw/virtio/vhost.c|2227| <<vhost_dev_start>> r = vhost_dev_set_features(hdev, hdev->log_enabled);
++     *   - hw/virtio/vhost.c|2262| <<vhost_dev_start>> if (hdev->log_enabled) {
++     *   - hw/virtio/virtio-hmp-cmds.c|171| <<hmp_virtio_status>> s->vhost_dev->log_enabled ? "true" : "false");
++     *   - hw/virtio/virtio-qmp.c|791| <<qmp_x_query_virtio_status>> status->vhost_dev->log_enabled = hdev->log_enabled;
++     */
+     bool log_enabled;
+     uint64_t log_size;
+     Error *migration_blocker;
+diff --git a/migration/savevm.c b/migration/savevm.c
+index 98821c812..70953e5c8 100644
+--- a/migration/savevm.c
++++ b/migration/savevm.c
+@@ -2558,6 +2558,10 @@ static bool check_section_footer(QEMUFile *f, SaveStateEntry *se)
+     return true;
+ }
+ 
++/*
++ * called by:
++ *   - migration/savevm.c|2873| <<qemu_loadvm_state_main>> ret = qemu_loadvm_section_start_full(f, section_type);
++ */
+ static int
+ qemu_loadvm_section_start_full(QEMUFile *f, uint8_t type)
+ {
+@@ -2852,6 +2856,14 @@ static bool postcopy_pause_incoming(MigrationIncomingState *mis)
+     return true;
+ }
+ 
++/*
++ * called by:
++ *   - migration/colo.c|686| <<colo_incoming_process_checkpoint>> ret = qemu_loadvm_state_main(mis->from_src_file, mis);
++ *   - migration/savevm.c|1999| <<postcopy_ram_listen_thread>> load_res = qemu_loadvm_state_main(f, mis);
++ *   - migration/savevm.c|2351| <<loadvm_handle_cmd_packaged>> ret = qemu_loadvm_state_main(packf, mis);
++ *   - migration/savevm.c|2957| <<qemu_loadvm_state>> ret = qemu_loadvm_state_main(f, mis);
++ *   - migration/savevm.c|3020| <<qemu_load_device_state>> ret = qemu_loadvm_state_main(f, mis);
++ */
+ int qemu_loadvm_state_main(QEMUFile *f, MigrationIncomingState *mis)
+ {
+     uint8_t section_type;
+-- 
+2.39.5 (Apple Git-154)
+
