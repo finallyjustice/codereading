@@ -1,0 +1,71 @@
+QEMU通过ioctl(VFIO_IOMMU_MAP_DMA)要求KVM去map一段内存.
+
+struct vfio_iommu_type1_dma_map {
+	__u32   argsz;
+	__u32   flags;
+#define VFIO_DMA_MAP_FLAG_READ (1 << 0)         /* readable from device */
+#define VFIO_DMA_MAP_FLAG_WRITE (1 << 1)        /* writable from device */
+#define VFIO_DMA_MAP_FLAG_VADDR (1 << 2)
+	__u64   vaddr;                          /* Process virtual address */
+	__u64   iova;                           /* IO virtual address */
+	__u64   size;                           /* Size of mapping (bytes) */
+};
+
+下面是KVM的callstack.
+
+vfio_iommu_type1_ioctl
+vfio_fops_unl_ioctl
+do_vfs_ioctl
+ksys_ioctl
+__x64_sys_ioctl
+do_syscall_64
+entry_SYSCALL_64_after_hwframe
+
+最终在KVM生成vfio_dma, 插入到vfio_iommu->dma_list.
+
+struct vfio_dma {
+	struct rb_node          node;
+	dma_addr_t              iova;           /* Device address */
+	unsigned long           vaddr;          /* Process virtual addr */
+	size_t                  size;           /* Map size (bytes) */
+	int                     prot;           /* IOMMU_READ/WRITE */
+	bool                    iommu_mapped;
+	bool                    lock_cap;       /* capable(CAP_IPC_LOCK) */
+	bool                    vaddr_invalid;
+	struct task_struct      *task;
+	struct rb_root          pfn_list;       /* Ex-user pinned pfn list */
+};
+
+所以如果ioctl完成的时候, 这段内存要么全被pin, 要么全部unpin.
+并且, 要么vfio_dma在vfio_iommu->dma_list, 要么被移除被free.
+
+
+PADATA会把这个range分割成好几个部分并行pin. 只有全部成功了才会设置/增加dma->size.
+有一个失败了也不会设置dma->size.
+
+2225         ret = padata_do_multithreaded(&job);
+2226
+2227         dma->iommu_mapped = true;
+2228
+2229         if (ret)
+2230                 vfio_remove_dma(iommu, dma);
+2231         else
+2232                 dma->size += map_size;
+2233
+2234         return ret;
+
+
+1. 把pin的range分成好几个parallel的helper.
+
+2. 每个helper执行vfio_pin_map_dma_chunk().
+如果失败了在vfio_pin_map_dma_chunk()内部调用.
+
+3. 对于那些成功了的, 会在__padata_do_multithreaded()->padata_undo()统一unpin.
+
+4. 关于每一个helper的vfio_pin_map_dma_chunk()
+
+vfio_pin_map_dma_chunk()
+-> while (unmapped_size)
+   -> vfio_pin_pages_remote()
+      unpin_out: unpin当前while iteration的page
+   -> vfio_pin_map_dma_undo() unpin之前成功的iteration.

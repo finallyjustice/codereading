@@ -1,0 +1,224 @@
+The Linux clocksource and vDSO
+
+QEMU: 9.2.0
+KVM: 5.15.0-305.171.1.el8uek.x86_64
+VM: 5.15.0-300.163.18.3.el8uek.x86_64
+
+Dump vDSO.
+
+https://github.com/travisdowns/dump-vdso
+
+# ./dump-vdso > vdso.so
+
+# objdump -T vdso.so
+
+vdso.so:     file format elf64-x86-64
+
+DYNAMIC SYMBOL TABLE:
+0000000000000c90  w   DF .text	0000000000000005  LINUX_2.6   clock_gettime
+0000000000000c50 g    DF .text	0000000000000005  LINUX_2.6   __vdso_gettimeofday
+0000000000000ca0  w   DF .text	0000000000000084  LINUX_2.6   clock_getres
+0000000000000ca0 g    DF .text	0000000000000084  LINUX_2.6   __vdso_clock_getres
+0000000000000c50  w   DF .text	0000000000000005  LINUX_2.6   gettimeofday
+0000000000000c60 g    DF .text	000000000000002e  LINUX_2.6   __vdso_time
+0000000000000d60 g    DF .text	000000000000009d  LINUX_2.6   __vdso_sgx_enter_enclave
+0000000000000c60  w   DF .text	000000000000002e  LINUX_2.6   time
+0000000000000c90 g    DF .text	0000000000000005  LINUX_2.6   __vdso_clock_gettime
+0000000000000000 g    DO *ABS*	0000000000000000  LINUX_2.6   LINUX_2.6
+0000000000000d30 g    DF .text	000000000000002c  LINUX_2.6   __vdso_getcpu
+0000000000000d30  w   DF .text	000000000000002c  LINUX_2.6   getcpu
+
+
+This is the source code analysis.
+
+clock_gettime()
+-> __vdso_clock_gettime()
+   -> __cvdso_clock_gettime()
+      -> __cvdso_clock_gettime_data()
+         -> __cvdso_clock_gettime_common()
+            -> do_hres()
+               -> __arch_get_hw_counter() ==> core!
+         -> clock_gettime_fallback()
+            -> syscall/__kernel_vsyscall ==> legacy!
+
+
+gettimeofday()
+-> __vdso_gettimeofday()
+   -> __cvdso_gettimeofday()
+      -> __cvdso_clock_gettime_data()
+         -> __cvdso_clock_gettime_common()
+            -> do_hres()
+               -> __arch_get_hw_counter() ==> core!
+         -> clock_gettime_fallback()
+            -> syscall/__kernel_vsyscall ==> legacy!
+
+
+Only tsc, pvclock and hvclock support vDSO.
+
+250 static inline u64 __arch_get_hw_counter(s32 clock_mode,
+251                                         const struct vdso_data *vd)
+252 {
+253         if (likely(clock_mode == VDSO_CLOCKMODE_TSC))
+254                 return (u64)rdtsc_ordered() & S64_MAX;
+255         /*
+256          * For any memory-mapped vclock type, we need to make sure that gcc
+257          * doesn't cleverly hoist a load before the mode check.  Otherwise we
+258          * might end up touching the memory-mapped page even if the vclock in
+259          * question isn't enabled, which will segfault.  Hence the barriers.
+260          */     
+261 #ifdef CONFIG_PARAVIRT_CLOCK
+262         if (clock_mode == VDSO_CLOCKMODE_PVCLOCK) {
+263                 barrier();
+264                 return vread_pvclock();
+265         }       
+266 #endif
+267 #ifdef CONFIG_HYPERV_TIMER
+268         if (clock_mode == VDSO_CLOCKMODE_HVCLOCK) {
+269                 barrier();
+270                 return vread_hvclock();
+271         }
+272 #endif
+273         return U64_MAX;
+274 }
+
+
+Here is the code to test at VM.
+
+# cat gettimeofday.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/time.h>
+
+int main(int argc, char **argv)
+{
+    struct timeval tv;
+
+    for(int i = 0; i < 100; i++) {
+        gettimeofday(&tv, NULL);
+    }
+
+    return 0;
+}
+
+
+The clocksource is kvm-clock (stable).
+
+# cat /sys/devices/system/clocksource/clocksource0/current_clocksource 
+kvm-clock
+
+# strace ./gettimeofday
+--> no relevant system call
+
+
+The clocksource is kvm-clock (unstable).
+
+# cat /sys/devices/system/clocksource/clocksource0/current_clocksource 
+kvm-clock
+
+# strace ./gettimeofday
+... ...
+gettimeofday({tv_sec=1736543911, tv_usec=42746}, NULL) = 0
+gettimeofday({tv_sec=1736543911, tv_usec=42866}, NULL) = 0
+gettimeofday({tv_sec=1736543911, tv_usec=42930}, NULL) = 0
+gettimeofday({tv_sec=1736543911, tv_usec=43011}, NULL) = 0
+gettimeofday({tv_sec=1736543911, tv_usec=43058}, NULL) = 0
+gettimeofday({tv_sec=1736543911, tv_usec=43266}, NULL) = 0
+... ...
+
+
+From the source code, vread_pvclock() returns U64_MAX when it isn't stable (line 228). 
+
+196 #ifdef CONFIG_PARAVIRT_CLOCK
+197 static u64 vread_pvclock(void)
+198 {
+199         const struct pvclock_vcpu_time_info *pvti = &pvclock_page.pvti;
+200         u32 version;
+201         u64 ret;
+202 
+203         /*
+204          * Note: The kernel and hypervisor must guarantee that cpu ID
+205          * number maps 1:1 to per-CPU pvclock time info.
+206          *
+207          * Because the hypervisor is entirely unaware of guest userspace
+208          * preemption, it cannot guarantee that per-CPU pvclock time
+209          * info is updated if the underlying CPU changes or that that
+210          * version is increased whenever underlying CPU changes.
+211          *
+212          * On KVM, we are guaranteed that pvti updates for any vCPU are
+213          * atomic as seen by *all* vCPUs.  This is an even stronger
+214          * guarantee than we get with a normal seqlock.
+215          *
+216          * On Xen, we don't appear to have that guarantee, but Xen still
+217          * supplies a valid seqlock using the version field.
+218          *
+219          * We only do pvclock vdso timing at all if
+220          * PVCLOCK_TSC_STABLE_BIT is set, and we interpret that bit to
+221          * mean that all vCPUs have matching pvti and that the TSC is
+222          * synced, so we can just look at vCPU 0's pvti.
+223          */
+224 
+225         do {
+226                 version = pvclock_read_begin(pvti);
+227 
+228                 if (unlikely(!(pvti->flags & PVCLOCK_TSC_STABLE_BIT)))
+229                         return U64_MAX;
+230 
+231                 ret = __pvclock_read_cycles(pvti, rdtsc_ordered());
+232         } while (pvclock_read_retry(pvti, version));
+233 
+234         return ret & S64_MAX;
+235 }
+236 #endif
+
+
+The clocksource is TSC.
+
+# cat /sys/devices/system/clocksource/clocksource0/current_clocksource
+tsc
+
+# strace ./gettimeofday
+--> no relevant system call
+
+
+The clocksource is hpet.
+
+# cat /sys/devices/system/clocksource/clocksource0/current_clocksource
+hpet
+... ...
+gettimeofday({tv_sec=1736544382, tv_usec=202342}, NULL) = 0
+gettimeofday({tv_sec=1736544382, tv_usec=202436}, NULL) = 0
+gettimeofday({tv_sec=1736544382, tv_usec=202523}, NULL) = 0
+gettimeofday({tv_sec=1736544382, tv_usec=202661}, NULL) = 0
+gettimeofday({tv_sec=1736544382, tv_usec=202767}, NULL) = 0
+gettimeofday({tv_sec=1736544382, tv_usec=202820}, NULL) = 0
+gettimeofday({tv_sec=1736544382, tv_usec=202902}, NULL) = 0
+gettimeofday({tv_sec=1736544382, tv_usec=203001}, NULL) = 0
+gettimeofday({tv_sec=1736544382, tv_usec=203176}, NULL) = 0
+... ...
+
+
+The clocksource is hyperv_clocksource_tsc_page (host stable TSC). To used hyper-v: -cpu host,-kvm,+hv-vpindex,+hv-time.
+
+# cat /sys/devices/system/clocksource/clocksource0/current_clocksource
+hyperv_clocksource_tsc_page
+
+# strace ./gettimeofday
+--> no relevant system call
+
+
+The clocksource is hyperv_clocksource_tsc_page (host TSC unstable).
+
+# cat /sys/devices/system/clocksource/clocksource0/current_clocksource
+hyperv_clocksource_tsc_page
+
+# strace ./gettimeofday
+... ...
+gettimeofday({tv_sec=1736546378, tv_usec=723381}, NULL) = 0
+gettimeofday({tv_sec=1736546378, tv_usec=723466}, NULL) = 0
+gettimeofday({tv_sec=1736546378, tv_usec=723574}, NULL) = 0
+gettimeofday({tv_sec=1736546378, tv_usec=723636}, NULL) = 0
+gettimeofday({tv_sec=1736546378, tv_usec=723764}, NULL) = 0
+gettimeofday({tv_sec=1736546378, tv_usec=723825}, NULL) = 0
+gettimeofday({tv_sec=1736546378, tv_usec=723930}, NULL) = 0
+gettimeofday({tv_sec=1736546378, tv_usec=723985}, NULL) = 0
+... ...
