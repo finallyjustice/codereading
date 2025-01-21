@@ -1,0 +1,1074 @@
+From 6f81e8bb76d26d6ff80cc226698f02353a51963e Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Mon, 20 Jan 2025 22:11:22 -0800
+Subject: [PATCH 1/1] spdk-24.09
+
+DPDK: 8d8db71763
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ dpdk/lib/vhost/rte_vhost.h  |  43 +++++++
+ dpdk/lib/vhost/vhost.c      |  33 ++++++
+ dpdk/lib/vhost/vhost.h      |  22 ++++
+ dpdk/lib/vhost/vhost_user.c |  83 +++++++++++++
+ lib/vhost/rte_vhost_user.c  | 121 +++++++++++++++++++
+ lib/vhost/vhost.c           |   5 +
+ lib/vhost/vhost_blk.c       |  64 ++++++++++
+ lib/vhost/vhost_internal.h  |   9 ++
+ lib/vhost/vhost_scsi.c      | 228 ++++++++++++++++++++++++++++++++++++
+ 9 files changed, 608 insertions(+)
+
+diff --git a/dpdk/lib/vhost/rte_vhost.h b/dpdk/lib/vhost/rte_vhost.h
+index db92f05..abd7274 100644
+--- a/dpdk/lib/vhost/rte_vhost.h
++++ b/dpdk/lib/vhost/rte_vhost.h
+@@ -205,6 +205,28 @@ struct rte_vhost_ring_inflight {
+ 		struct rte_vhost_inflight_info_packed *inflight_packed;
+ 	};
+ 
++	/*
++	 * 在以下使用vhost_virtqueue->resubmit_inflight:
++	 *   - dpdk/lib/vhost/vhost.c|364| <<cleanup_vq_inflight>> if (vq->resubmit_inflight) {
++	 *   - dpdk/lib/vhost/vhost.c|365| <<cleanup_vq_inflight>> if (vq->resubmit_inflight->resubmit_list) {
++	 *   - dpdk/lib/vhost/vhost.c|366| <<cleanup_vq_inflight>> rte_free(vq->resubmit_inflight->resubmit_list);
++	 *   - dpdk/lib/vhost/vhost.c|367| <<cleanup_vq_inflight>> vq->resubmit_inflight->resubmit_list = NULL;
++	 *   - dpdk/lib/vhost/vhost.c|369| <<cleanup_vq_inflight>> rte_free(vq->resubmit_inflight);
++	 *   - dpdk/lib/vhost/vhost.c|370| <<cleanup_vq_inflight>> vq->resubmit_inflight = NULL;
++	 *   - dpdk/lib/vhost/vhost.c|1050| <<rte_vhost_get_vhost_ring_inflight>> vring->resubmit_inflight = vq->resubmit_inflight;
++	 *   - dpdk/lib/vhost/vhost_user.c|655| <<numa_realloc>> if (vq->resubmit_inflight) {
++	 *   - dpdk/lib/vhost/vhost_user.c|658| <<numa_realloc>> ri = rte_realloc_socket(vq->resubmit_inflight, sizeof(*ri), 0, node);
++	 *   - dpdk/lib/vhost/vhost_user.c|665| <<numa_realloc>> vq->resubmit_inflight = ri;
++	 *   - dpdk/lib/vhost/vhost_user.c|1980| <<vhost_check_queue_inflights_split>> if (vq->resubmit_inflight)
++	 *   - dpdk/lib/vhost/vhost_user.c|2036| <<vhost_check_queue_inflights_split>> vq->resubmit_inflight = resubmit;
++	 *   - dpdk/lib/vhost/vhost_user.c|2066| <<vhost_check_queue_inflights_packed>> if (vq->resubmit_inflight)
++	 *   - dpdk/lib/vhost/vhost_user.c|2132| <<vhost_check_queue_inflights_packed>> vq->resubmit_inflight = resubmit;
++	 *
++	 * 在以下使用rte_vhost_ring_inflight->resubmit_inflight:
++	 *   - dpdk/lib/vhost/vhost.c|1050| <<rte_vhost_get_vhost_ring_inflight>> vring->resubmit_inflight = vq->resubmit_inflight;
++	 *   - lib/vhost/vhost_blk.c|840| <<submit_inflight_desc>> resubmit = vq->vring_inflight.resubmit_inflight;
++	 *   - lib/vhost/vhost_scsi.c|850| <<submit_inflight_desc>> resubmit = vq->vring_inflight.resubmit_inflight;
++	 */
+ 	struct rte_vhost_resubmit_info *resubmit_inflight;
+ };
+ 
+@@ -370,6 +392,27 @@ struct rte_vhost_stat_name {
+  * @return
+  *  the host virtual address on success, 0 on failure
+  */
++/*
++ * struct rte_vhost_mem_region {
++ *     uint64_t guest_phys_addr;
++ *     uint64_t guest_user_addr;
++ *     uint64_t host_user_addr;
++ *     uint64_t size;
++ *     void     *mmap_addr;
++ *     uint64_t mmap_size;
++ *     int fd;     
++ * };
++ *
++ * struct rte_vhost_memory {
++ *     uint32_t nregions;      
++ *     struct rte_vhost_mem_region regions[];
++ * };
++ *
++ * called by:
++ *   - dpdk/lib/vhost/vhost.h|914| <<vhost_iova_to_vva>> return rte_vhost_va_from_guest_pa(dev->mem, iova, len);
++ *   - lib/vhost/rte_vhost_user.c|56| <<vhost_gpa_to_vva>> vva = (void *)rte_vhost_va_from_guest_pa(vsession->mem, addr, &newlen);
++ *   - lib/vhost/rte_vhost_user.c|691| <<vhost_vring_desc_payload_to_iov>> vva = (uintptr_t)rte_vhost_va_from_guest_pa(vsession->mem, payload, &len);
++ */
+ static __rte_always_inline uint64_t
+ rte_vhost_va_from_guest_pa(struct rte_vhost_memory *mem,
+ 						   uint64_t gpa, uint64_t *len)
+diff --git a/dpdk/lib/vhost/vhost.c b/dpdk/lib/vhost/vhost.c
+index ac71d17..bb73fbe 100644
+--- a/dpdk/lib/vhost/vhost.c
++++ b/dpdk/lib/vhost/vhost.c
+@@ -486,6 +486,10 @@ translate_log_addr(struct virtio_net *dev, struct vhost_virtqueue *vq,
+ 		return log_addr;
+ }
+ 
++/*
++ * called by:
++ *   - dpdk/lib/vhost/vhost.c|572| <<vring_translate>> if (vring_translate_split(dev, vq) < 0)
++ */
+ static int
+ vring_translate_split(struct virtio_net *dev, struct vhost_virtqueue *vq)
+ 	__rte_shared_locks_required(&vq->iotlb_lock)
+@@ -981,10 +985,26 @@ rte_vhost_get_mem_table(int vid, struct rte_vhost_memory **mem)
+ 	return 0;
+ }
+ 
++/*
++ * (gdb) bt
++ * #0  rte_vhost_get_vhost_vring (vid=0, vring_idx=3, vring=0x7f24a402d800) at ../lib/vhost/vhost.c:991
++ * #1  0x000000000054e5f7 in enable_device_vq (vsession=0x7f24a402d5c0, qid=3) at rte_vhost_user.c:1047
++ * #2  0x000000000054f81d in extern_vhost_post_msg_handler (vid=0, _msg=0x7f24a92c7800) at rte_vhost_user.c:1547
++ * #3  0x00000000007677d1 in vhost_user_msg_handler (vid=0, fd=71) at ../lib/vhost/vhost_user.c:3236
++ * #4  0x0000000000711435 in vhost_user_read_cb (connfd=71, dat=0x7f24a4000de0, remove=0x7f24a92c7b94) at ../lib/vhost/socket.c:319
++ * #5  0x000000000070f31b in fdset_event_dispatch (arg=0x9ab8e0 <vhost_user+8192>) at ../lib/vhost/fd_man.c:282
++ * #6  0x000000000060e267 in control_thread_start (arg=0x3cd70530) at ../lib/eal/common/eal_common_thread.c:282
++ * #7  0x0000000000626dbc in thread_start_wrapper (arg=0x7ffe23597880) at ../lib/eal/unix/rte_thread.c:114
++ * #8  0x00007f24aac0b1da in start_thread () from /lib64/libpthread.so.0
++ * #9  0x00007f24aa8668d3 in clone () from /lib64/libc.so.6
++ */
+ int
+ rte_vhost_get_vhost_vring(int vid, uint16_t vring_idx,
+ 			  struct rte_vhost_vring *vring)
+ {
++	/*
++	 * 有意思, 是virtio_net
++	 */
+ 	struct virtio_net *dev;
+ 	struct vhost_virtqueue *vq;
+ 
+@@ -1017,6 +1037,10 @@ rte_vhost_get_vhost_vring(int vid, uint16_t vring_idx,
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - lib/vhost/rte_vhost_user.c|1076| <<enable_device_vq>> rte_vhost_get_vhost_ring_inflight(vsession->vid, qid, &q->vring_inflight);
++ */
+ int
+ rte_vhost_get_vhost_ring_inflight(int vid, uint16_t vring_idx,
+ 				  struct rte_vhost_ring_inflight *vring)
+@@ -1052,6 +1076,11 @@ rte_vhost_get_vhost_ring_inflight(int vid, uint16_t vring_idx,
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - lib/vhost/vhost_blk.c|932| <<process_vq>> rte_vhost_set_inflight_desc_split(vsession->vid, vq->vring_idx, reqs[i]);
++ *   - lib/vhost/vhost_scsi.c|966| <<process_vq>> rte_vhost_set_inflight_desc_split(vsession->vid, vq->vring_idx, reqs[i]);
++ */
+ int
+ rte_vhost_set_inflight_desc_split(int vid, uint16_t vring_idx,
+ 				  uint16_t idx)
+@@ -1566,6 +1595,10 @@ rte_vhost_notify_guest(int vid, uint16_t queue_id)
+ 	rte_rwlock_read_unlock(&vq->access_lock);
+ }
+ 
++/*
++ * called by:
++ *   - lib/vhost/rte_vhost_user.c|93| <<vhost_log_req_desc>> rte_vhost_log_write(vsession->vid, desc->addr, desc->len);
++ */
+ void
+ rte_vhost_log_write(int vid, uint64_t addr, uint64_t len)
+ {
+diff --git a/dpdk/lib/vhost/vhost.h b/dpdk/lib/vhost/vhost.h
+index cd3fa55..1c9aed5 100644
+--- a/dpdk/lib/vhost/vhost.h
++++ b/dpdk/lib/vhost/vhost.h
+@@ -339,6 +339,28 @@ struct __rte_cache_aligned vhost_virtqueue {
+ 		struct rte_vhost_inflight_info_split *inflight_split;
+ 		struct rte_vhost_inflight_info_packed *inflight_packed;
+ 	};
++	/*
++	 * 在以下使用vhost_virtqueue->resubmit_inflight:
++	 *   - dpdk/lib/vhost/vhost.c|364| <<cleanup_vq_inflight>> if (vq->resubmit_inflight) {
++	 *   - dpdk/lib/vhost/vhost.c|365| <<cleanup_vq_inflight>> if (vq->resubmit_inflight->resubmit_list) {
++	 *   - dpdk/lib/vhost/vhost.c|366| <<cleanup_vq_inflight>> rte_free(vq->resubmit_inflight->resubmit_list);
++	 *   - dpdk/lib/vhost/vhost.c|367| <<cleanup_vq_inflight>> vq->resubmit_inflight->resubmit_list = NULL;
++	 *   - dpdk/lib/vhost/vhost.c|369| <<cleanup_vq_inflight>> rte_free(vq->resubmit_inflight);
++	 *   - dpdk/lib/vhost/vhost.c|370| <<cleanup_vq_inflight>> vq->resubmit_inflight = NULL;
++	 *   - dpdk/lib/vhost/vhost.c|1050| <<rte_vhost_get_vhost_ring_inflight>> vring->resubmit_inflight = vq->resubmit_inflight;
++	 *   - dpdk/lib/vhost/vhost_user.c|655| <<numa_realloc>> if (vq->resubmit_inflight) {
++	 *   - dpdk/lib/vhost/vhost_user.c|658| <<numa_realloc>> ri = rte_realloc_socket(vq->resubmit_inflight, sizeof(*ri), 0, node);
++	 *   - dpdk/lib/vhost/vhost_user.c|665| <<numa_realloc>> vq->resubmit_inflight = ri;
++	 *   - dpdk/lib/vhost/vhost_user.c|1980| <<vhost_check_queue_inflights_split>> if (vq->resubmit_inflight)
++	 *   - dpdk/lib/vhost/vhost_user.c|2036| <<vhost_check_queue_inflights_split>> vq->resubmit_inflight = resubmit;
++	 *   - dpdk/lib/vhost/vhost_user.c|2066| <<vhost_check_queue_inflights_packed>> if (vq->resubmit_inflight)
++	 *   - dpdk/lib/vhost/vhost_user.c|2132| <<vhost_check_queue_inflights_packed>> vq->resubmit_inflight = resubmit;
++	 *
++	 * 在以下使用rte_vhost_ring_inflight->resubmit_inflight:
++	 *   - dpdk/lib/vhost/vhost.c|1050| <<rte_vhost_get_vhost_ring_inflight>> vring->resubmit_inflight = vq->resubmit_inflight;
++	 *   - lib/vhost/vhost_blk.c|840| <<submit_inflight_desc>> resubmit = vq->vring_inflight.resubmit_inflight;
++	 *   - lib/vhost/vhost_scsi.c|850| <<submit_inflight_desc>> resubmit = vq->vring_inflight.resubmit_inflight;
++	 */
+ 	struct rte_vhost_resubmit_info *resubmit_inflight;
+ 	uint64_t		global_counter;
+ 
+diff --git a/dpdk/lib/vhost/vhost_user.c b/dpdk/lib/vhost/vhost_user.c
+index 4141925..aacbc2d 100644
+--- a/dpdk/lib/vhost/vhost_user.c
++++ b/dpdk/lib/vhost/vhost_user.c
+@@ -737,6 +737,11 @@ numa_realloc(struct virtio_net **pdev, struct vhost_virtqueue **pvq)
+ }
+ #endif
+ 
++/*
++ * called by:
++ *   - dpdk/lib/vhost/vhost_user.c|804| <<ring_addr_to_vva>> return qva_to_vva(dev, ra, size);
++ *   - dpdk/lib/vhost/vhost_user.c|2782| <<vhost_user_iotlb_msg>> vva = qva_to_vva(dev, imsg->uaddr, &len);
++ */
+ /* Converts QEMU virtual address to Vhost virtual address. */
+ static uint64_t
+ qva_to_vva(struct virtio_net *dev, uint64_t qva, uint64_t *len)
+@@ -768,6 +773,19 @@ qva_to_vva(struct virtio_net *dev, uint64_t qva, uint64_t *len)
+ }
+ 
+ 
++/*
++ * (gdb) bt
++ * #0  ring_addr_to_vva (dev=0x201000bfcfc0, vq=0x2000138f2a40, ra=140634551873536, size=0x7f24a92c7748) at ../lib/vhost/vhost_user.c:780
++ * #1  0x0000000000761b0d in translate_ring_addresses (pdev=0x7f24a92c77c8, pvq=0x7f24a92c77b8) at ../lib/vhost/vhost_user.c:913
++ * #2  0x0000000000764e5b in vhost_user_set_vring_kick (pdev=0x7f24a92c7ab0, ctx=0x7f24a92c7800, main_fd=71) at ../lib/vhost/vhost_user.c:2163
++ * #3  0x0000000000767678 in vhost_user_msg_handler (vid=0, fd=71) at ../lib/vhost/vhost_user.c:3205
++ * #4  0x0000000000711435 in vhost_user_read_cb (connfd=71, dat=0x7f24a4000de0, remove=0x7f24a92c7b94) at ../lib/vhost/socket.c:319
++ * #5  0x000000000070f31b in fdset_event_dispatch (arg=0x9ab8e0 <vhost_user+8192>) at ../lib/vhost/fd_man.c:282
++ * #6  0x000000000060e267 in control_thread_start (arg=0x3cd70530) at ../lib/eal/common/eal_common_thread.c:282
++ * #7  0x0000000000626dbc in thread_start_wrapper (arg=0x7ffe23597880) at ../lib/eal/unix/rte_thread.c:114
++ * #8  0x00007f24aac0b1da in start_thread () from /lib64/libpthread.so.0
++ * #9  0x00007f24aa8668d3 in clone () from /lib64/libc.so.6
++ */
+ /*
+  * Converts ring address to Vhost virtual address.
+  * If IOMMU is enabled, the ring address is a guest IO virtual address,
+@@ -837,6 +855,24 @@ mem_set_dump(struct virtio_net *dev, void *ptr, size_t size, bool enable, uint64
+ #endif
+ }
+ 
++/*
++ * (gdb) bt
++ * #0  translate_ring_addresses (pdev=0x7f24a92c77c8, pvq=0x7f24a92c77b8) at ../lib/vhost/vhost_user.c:847
++ * #1  0x0000000000764e5b in vhost_user_set_vring_kick (pdev=0x7f24a92c7ab0, ctx=0x7f24a92c7800, main_fd=71) at ../lib/vhost/vhost_user.c:2163
++ * #2  0x0000000000767678 in vhost_user_msg_handler (vid=0, fd=71) at ../lib/vhost/vhost_user.c:3205
++ * #3  0x0000000000711435 in vhost_user_read_cb (connfd=71, dat=0x7f24a4000de0, remove=0x7f24a92c7b94) at ../lib/vhost/socket.c:319
++ * #4  0x000000000070f31b in fdset_event_dispatch (arg=0x9ab8e0 <vhost_user+8192>) at ../lib/vhost/fd_man.c:282
++ * #5  0x000000000060e267 in control_thread_start (arg=0x3cd70530) at ../lib/eal/common/eal_common_thread.c:282
++ * #6  0x0000000000626dbc in thread_start_wrapper (arg=0x7ffe23597880) at ../lib/eal/unix/rte_thread.c:114
++ * #7  0x00007f24aac0b1da in start_thread () from /lib64/libpthread.so.0
++ * #8  0x00007f24aa8668d3 in clone () from /lib64/libc.so.6
++ *
++ * called by:
++ *   - dpdk/lib/vhost/vhost_user.c|1038| <<vhost_user_set_vring_addr>> translate_ring_addresses(&dev, &vq);
++ *   - dpdk/lib/vhost/vhost_user.c|1591| <<vhost_user_set_mem_table>> translate_ring_addresses(&dev, &vq);
++ *   - dpdk/lib/vhost/vhost_user.c|2236| <<vhost_user_set_vring_kick>> translate_ring_addresses(&dev, &vq);
++ *   - dpdk/lib/vhost/vhost_user.c|2803| <<vhost_user_iotlb_msg>> translate_ring_addresses(&dev, &vq);
++ */
+ static void
+ translate_ring_addresses(struct virtio_net **pdev, struct vhost_virtqueue **pvq)
+ {
+@@ -1284,6 +1320,32 @@ vhost_user_postcopy_register(struct virtio_net *dev, int main_fd,
+ 	return 0;
+ }
+ 
++/*
++ * (gdb) bt
++ * #0  vhost_user_mmap_region (dev=0x2000138f2c40, region=0x2000138f1d08, mmap_offset=0) at ../lib/vhost/vhost_user.c:1298
++ * #1  0x00000000007632f0 in vhost_user_set_mem_table (pdev=0x7f24a92c7ab0, ctx=0x7f24a92c7800, main_fd=71) at ../lib/vhost/vhost_user.c:1487
++ * #2  0x0000000000767678 in vhost_user_msg_handler (vid=0, fd=71) at ../lib/vhost/vhost_user.c:3205
++ * #3  0x0000000000711435 in vhost_user_read_cb (connfd=71, dat=0x7f24a4000de0, remove=0x7f24a92c7b94) at ../lib/vhost/socket.c:319
++ * #4  0x000000000070f31b in fdset_event_dispatch (arg=0x9ab8e0 <vhost_user+8192>) at ../lib/vhost/fd_man.c:282
++ * #5  0x000000000060e267 in control_thread_start (arg=0x3cd70530) at ../lib/eal/common/eal_common_thread.c:282
++ * #6  0x0000000000626dbc in thread_start_wrapper (arg=0x7ffe23597880) at ../lib/eal/unix/rte_thread.c:114
++ * #7  0x00007f24aac0b1da in start_thread () from /lib64/libpthread.so.0
++ * #8  0x00007f24aa8668d3 in clone () from /lib64/libc.so.6
++ * 
++ * (gdb) bt
++ * #0  vhost_user_mmap_region (dev=0x2000138f2c40, region=0x2000138f1d40, mmap_offset=2147483648) at ../lib/vhost/vhost_user.c:1298
++ * #1  0x00000000007632f0 in vhost_user_set_mem_table (pdev=0x7f24a92c7ab0, ctx=0x7f24a92c7800, main_fd=71) at ../lib/vhost/vhost_user.c:1487
++ * #2  0x0000000000767678 in vhost_user_msg_handler (vid=0, fd=71) at ../lib/vhost/vhost_user.c:3205
++ * #3  0x0000000000711435 in vhost_user_read_cb (connfd=71, dat=0x7f24a4000de0, remove=0x7f24a92c7b94) at ../lib/vhost/socket.c:319
++ * #4  0x000000000070f31b in fdset_event_dispatch (arg=0x9ab8e0 <vhost_user+8192>) at ../lib/vhost/fd_man.c:282
++ * #5  0x000000000060e267 in control_thread_start (arg=0x3cd70530) at ../lib/eal/common/eal_common_thread.c:282
++ * #6  0x0000000000626dbc in thread_start_wrapper (arg=0x7ffe23597880) at ../lib/eal/unix/rte_thread.c:114
++ * #7  0x00007f24aac0b1da in start_thread () from /lib64/libpthread.so.0=
++ * #8  0x00007f24aa8668d3 in clone () from /lib64/libc.so.6
++ *
++ * called by:
++ *   - dpdk/lib/vhost/vhost_user.c|1487| <<vhost_user_set_mem_table>> if (vhost_user_mmap_region(dev, reg, mmap_offset) < 0) {
++ */
+ static int
+ vhost_user_mmap_region(struct virtio_net *dev,
+ 		struct rte_vhost_mem_region *region,
+@@ -1332,6 +1394,17 @@ vhost_user_mmap_region(struct virtio_net *dev,
+ 	}
+ 
+ 	populate = dev->async_copy ? MAP_POPULATE : 0;
++	/*
++	 * struct rte_vhost_mem_region {
++	 *     uint64_t guest_phys_addr;
++	 *     uint64_t guest_user_addr;
++	 *     uint64_t host_user_addr;
++	 *     uint64_t size;
++	 *     void     *mmap_addr;
++	 *     uint64_t mmap_size;
++	 *     int fd;
++	 * };
++	 */
+ 	mmap_addr = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE,
+ 			MAP_SHARED | populate, region->fd, 0);
+ 
+@@ -1381,6 +1454,9 @@ vhost_user_mmap_region(struct virtio_net *dev,
+ 	return 0;
+ }
+ 
++/*
++ * dpdk/lib/vhost/vhost_user.c|75| <<VHOST_MESSAGE_HANDLERS>> VHOST_MESSAGE_HANDLER(VHOST_USER_SET_MEM_TABLE, vhost_user_set_mem_table, true, true) \
++ */
+ static int
+ vhost_user_set_mem_table(struct virtio_net **pdev,
+ 			struct vhu_msg_context *ctx,
+@@ -1484,6 +1560,9 @@ vhost_user_set_mem_table(struct virtio_net **pdev,
+ 
+ 		mmap_offset = memory->regions[i].mmap_offset;
+ 
++		/*
++		 * 只在此处调用
++		 */
+ 		if (vhost_user_mmap_region(dev, reg, mmap_offset) < 0) {
+ 			VHOST_CONFIG_LOG(dev->ifname, ERR, "failed to mmap region %u", i);
+ 			goto free_mem_table;
+@@ -3096,6 +3175,10 @@ vhost_user_unlock_all_queue_pairs(struct virtio_net *dev)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - dpdk/lib/vhost/socket.c|319| <<vhost_user_read_cb>> ret = vhost_user_msg_handler(conn->vid, connfd);
++ */
+ int
+ vhost_user_msg_handler(int vid, int fd)
+ {
+diff --git a/lib/vhost/rte_vhost_user.c b/lib/vhost/rte_vhost_user.c
+index 06f5f73..318b557 100644
+--- a/lib/vhost/rte_vhost_user.c
++++ b/lib/vhost/rte_vhost_user.c
+@@ -46,6 +46,19 @@ struct vhost_session_fn_ctx {
+ static int vhost_user_wait_for_session_stop(struct spdk_vhost_session *vsession,
+ 		unsigned timeout_sec, const char *errmsg);
+ 
++/*
++ * called by:
++ *   - lib/vhost/rte_vhost_user.c|254| <<vhost_vq_get_desc>> *desc_table = vhost_gpa_to_vva(vsession, (*desc)->addr,
++ *   - lib/vhost/rte_vhost_user.c|278| <<vhost_packed_desc_indirect_to_desc_table>> *desc_table = vhost_gpa_to_vva(vsession, addr, len);
++ *   - lib/vhost/vhost_internal.h|277| <<vhost_packed_desc_indirect_to_desc_table>> void *vhost_gpa_to_vva(struct spdk_vhost_session *vsession, uint64_t addr, uint64_t len);
++ *   - lib/vhost/vhost_scsi.c|320| <<eventq_enqueue>> desc_ev = vhost_gpa_to_vva(vsession, desc->addr, sizeof(*desc_ev));
++ *   - lib/vhost/vhost_scsi.c|513| <<process_ctrl_request>> ctrl_req = vhost_gpa_to_vva(vsession, desc->addr, sizeof(*ctrl_req));
++ *   - lib/vhost/vhost_scsi.c|538| <<process_ctrl_request>> task->tmf_resp = vhost_gpa_to_vva(vsession, desc->addr, sizeof(*task->tmf_resp));
++ *   - lib/vhost/vhost_scsi.c|568| <<process_ctrl_request>> an_resp = vhost_gpa_to_vva(vsession, desc->addr, sizeof(*an_resp));
++ *   - lib/vhost/vhost_scsi.c|637| <<task_data_setup>> *req = vhost_gpa_to_vva(vsession, desc->addr, sizeof(**req));
++ *   - lib/vhost/vhost_scsi.c|659| <<task_data_setup>> task->resp = vhost_gpa_to_vva(vsession, desc->addr, sizeof(*task->resp));
++ *   - lib/vhost/vhost_scsi.c|730| <<task_data_setup>> task->resp = vhost_gpa_to_vva(vsession, desc->addr, sizeof(*task->resp));
++ */
+ void *
+ vhost_gpa_to_vva(struct spdk_vhost_session *vsession, uint64_t addr, uint64_t len)
+ {
+@@ -62,6 +75,10 @@ vhost_gpa_to_vva(struct spdk_vhost_session *vsession, uint64_t addr, uint64_t le
+ 
+ }
+ 
++/*
++ * called by:
++ *   - lib/vhost/rte_vhost_user.c|456| <<vhost_vq_used_ring_enqueue>> vhost_log_req_desc(vsession, virtqueue, id);
++ */
+ static void
+ vhost_log_req_desc(struct spdk_vhost_session *vsession, struct spdk_vhost_virtqueue *virtqueue,
+ 		   uint16_t req_id)
+@@ -70,10 +87,27 @@ vhost_log_req_desc(struct spdk_vhost_session *vsession, struct spdk_vhost_virtqu
+ 	uint32_t desc_table_size;
+ 	int rc;
+ 
++	/*
++	 * called by:
++	 *   - lib/vhost/rte_vhost_user.c|77| <<vhost_log_req_desc>> if (spdk_likely(!vhost_dev_has_feature(vsession, VHOST_F_LOG_ALL))) {
++	 *   - lib/vhost/rte_vhost_user.c|106| <<vhost_log_used_vring_elem>> if (spdk_likely(!vhost_dev_has_feature(vsession, VHOST_F_LOG_ALL))) {
++	 *   - lib/vhost/rte_vhost_user.c|128| <<vhost_log_used_vring_idx>> if (spdk_likely(!vhost_dev_has_feature(vsession, VHOST_F_LOG_ALL))) {
++	 *   - lib/vhost/vhost_scsi.c|1306| <<vhost_scsi_session_add_tgt>> if (vhost_dev_has_feature(vsession, VIRTIO_SCSI_F_HOTPLUG)) {
++	 *   - lib/vhost/vhost_scsi.c|1439| <<vhost_scsi_session_remove_tgt>> if (vhost_dev_has_feature(vsession, VIRTIO_SCSI_F_HOTPLUG)) {
++	 *   - lib/vhost/vhost_scsi.c|1514| <<vhost_scsi_session_param_changed>> if (vhost_dev_has_feature(vsession, VIRTIO_SCSI_F_CHANGE)) {
++	 */
+ 	if (spdk_likely(!vhost_dev_has_feature(vsession, VHOST_F_LOG_ALL))) {
+ 		return;
+ 	}
+ 
++	/*
++	 * called by:
++	 *   - lib/vhost/rte_vhost_user.c|90| <<vhost_log_req_desc>> rc = vhost_vq_get_desc(vsession, virtqueue, req_id, &desc, &desc_table, &desc_table_size);
++	 *   - lib/vhost/vhost_blk.c|226| <<blk_iovs_split_queue_setup>> rc = vhost_vq_get_desc(vsession, vq, req_idx, &desc, &desc_table, &desc_table_size);
++	 *   - lib/vhost/vhost_scsi.c|313| <<eventq_enqueue>> rc = vhost_vq_get_desc(vsession, vq, req, &desc, &desc_table, &desc_table_size);
++	 *   - lib/vhost/vhost_scsi.c|505| <<process_ctrl_request>> rc = vhost_vq_get_desc(vsession, task->vq, task->req_idx, &desc, &desc_table,
++	 *   - lib/vhost/vhost_scsi.c|628| <<task_data_setup>> rc = vhost_vq_get_desc(vsession, task->vq, task->req_idx, &desc, &desc_table, &desc_table_len);
++	 */
+ 	rc = vhost_vq_get_desc(vsession, virtqueue, req_id, &desc, &desc_table, &desc_table_size);
+ 	if (spdk_unlikely(rc != 0)) {
+ 		SPDK_ERRLOG("Can't log used ring descriptors!\n");
+@@ -88,6 +122,16 @@ vhost_log_req_desc(struct spdk_vhost_session *vsession, struct spdk_vhost_virtqu
+ 			 * for lets assume we touched all pages passed to as writeable buffers. */
+ 			rte_vhost_log_write(vsession->vid, desc->addr, desc->len);
+ 		}
++		/*
++		 * called by:
++		 *   - lib/vhost/rte_vhost_user.c|104| <<vhost_log_req_desc>> vhost_vring_desc_get_next(&desc, desc_table, desc_table_size);
++		 *   - lib/vhost/vhost_blk.c|254| <<blk_iovs_split_queue_setup>> rc = vhost_vring_desc_get_next(&desc, desc_table, desc_table_size);
++		 *   - lib/vhost/vhost_scsi.c|528| <<process_ctrl_request>> vhost_vring_desc_get_next(&desc, desc_table, desc_table_size);
++		 *   - lib/vhost/vhost_scsi.c|645| <<task_data_setup>> vhost_vring_desc_get_next(&desc, desc_table, desc_table_len);
++		 *   - lib/vhost/vhost_scsi.c|665| <<task_data_setup>> rc = vhost_vring_desc_get_next(&desc, desc_table, desc_table_len);
++		 *   - lib/vhost/vhost_scsi.c|700| <<task_data_setup>> rc = vhost_vring_desc_get_next(&desc, desc_table, desc_table_len);
++		 *   - lib/vhost/vhost_scsi.c|723| <<task_data_setup>> vhost_vring_desc_get_next(&desc, desc_table, desc_table_len);
++		 */
+ 		vhost_vring_desc_get_next(&desc, desc_table, desc_table_size);
+ 	} while (desc);
+ }
+@@ -135,6 +179,13 @@ vhost_log_used_vring_idx(struct spdk_vhost_session *vsession,
+ /*
+  * Get available requests from avail ring.
+  */
++/*
++ * called by:
++ *   - lib/vhost/vhost_blk.c|901| <<process_vq>> reqs_cnt = vhost_vq_avail_ring_get(vq, reqs, SPDK_COUNTOF(reqs));
++ *   - lib/vhost/vhost_blk.c|1012| <<no_bdev_process_vq>> if (vhost_vq_avail_ring_get(vq, &req_idx, 1) != 1) {
++ *   - lib/vhost/vhost_scsi.c|299| <<eventq_enqueue>> if (vq->vring.desc == NULL || vhost_vq_avail_ring_get(vq, &req, 1) != 1) {
++ *   - lib/vhost/vhost_scsi.c|937| <<process_vq>> reqs_cnt = vhost_vq_avail_ring_get(vq, reqs, SPDK_COUNTOF(reqs));
++ */
+ uint16_t
+ vhost_vq_avail_ring_get(struct spdk_vhost_virtqueue *virtqueue, uint16_t *reqs,
+ 			uint16_t reqs_len)
+@@ -218,6 +269,14 @@ vhost_inflight_packed_desc_is_indirect(spdk_vhost_inflight_desc *cur_desc)
+ 	return (cur_desc->flags & VRING_DESC_F_INDIRECT) != 0;
+ }
+ 
++/*
++ * called by:
++ *   - lib/vhost/rte_vhost_user.c|90| <<vhost_log_req_desc>> rc = vhost_vq_get_desc(vsession, virtqueue, req_id, &desc, &desc_table, &desc_table_size);
++ *   - lib/vhost/vhost_blk.c|226| <<blk_iovs_split_queue_setup>> rc = vhost_vq_get_desc(vsession, vq, req_idx, &desc, &desc_table, &desc_table_size);
++ *   - lib/vhost/vhost_scsi.c|313| <<eventq_enqueue>> rc = vhost_vq_get_desc(vsession, vq, req, &desc, &desc_table, &desc_table_size);
++ *   - lib/vhost/vhost_scsi.c|505| <<process_ctrl_request>> rc = vhost_vq_get_desc(vsession, task->vq, task->req_idx, &desc, &desc_table,
++ *   - lib/vhost/vhost_scsi.c|628| <<task_data_setup>> rc = vhost_vq_get_desc(vsession, task->vq, task->req_idx, &desc, &desc_table, &desc_table_len);
++ */
+ int
+ vhost_vq_get_desc(struct spdk_vhost_session *vsession, struct spdk_vhost_virtqueue *virtqueue,
+ 		  uint16_t req_idx, struct vring_desc **desc, struct vring_desc **desc_table,
+@@ -397,6 +456,12 @@ vhost_vq_event_is_suppressed(struct spdk_vhost_virtqueue *vq)
+ 	return false;
+ }
+ 
++/*
++ * called by:
++ *   - lib/vhost/vhost_blk.c|975| <<_vdev_vq_worker>> vhost_session_vq_used_signal(vq);
++ *   - lib/vhost/vhost_blk.c|1097| <<_no_bdev_vdev_vq_worker>> vhost_session_vq_used_signal(vq);
++ *   - lib/vhost/vhost_scsi.c|966| <<vdev_worker>> vhost_session_vq_used_signal(&vsession->virtqueue[q_idx]);
++ */
+ void
+ vhost_session_vq_used_signal(struct spdk_vhost_virtqueue *virtqueue)
+ {
+@@ -439,11 +504,52 @@ vhost_session_vq_used_signal(struct spdk_vhost_virtqueue *virtqueue)
+ /*
+  * Enqueue id and len to used ring.
+  */
++/*
++ * (gdb) bt
++ * #0  vhost_vq_used_ring_enqueue (vsession=0x7f24a402d5c0, virtqueue=0x7f24a402d780, id=0, len=124) at rte_vhost_user.c:447
++ * #1  0x0000000000543f3a in submit_completion (task=0x2000138a7f00) at vhost_scsi.c:332
++ * #2  0x0000000000544107 in vhost_scsi_task_cpl (scsi_task=0x2000138a7f00) at vhost_scsi.c:366
++ * #3  0x000000000055c436 in scsi_lun_complete_task (lun=0x3ceaa080, task=0x2000138a7f00) at lun.c:24
++ * #4  0x000000000055cae0 in _scsi_lun_execute_task (lun=0x3ceaa080, task=0x2000138a7f00) at lun.c:222
++ * #5  0x000000000055cc78 in scsi_lun_execute_task (lun=0x3ceaa080, task=0x2000138a7f00) at lun.c:264
++ * #6  0x000000000055bd5a in spdk_scsi_dev_queue_task (dev=0x9ce440 <g_devs>, task=0x2000138a7f00) at dev.c:291
++ * #7  0x000000000054413f in task_submit (task=0x2000138a7f00) at vhost_scsi.c:373
++ * #8  0x0000000000545316 in process_scsi_task (vsession=0x7f24a402d5c0, vq=0x7f24a402d780, req_idx=0) at vhost_scsi.c:716
++ * #9  0x00000000005457be in process_vq (svsession=0x7f24a402d5c0, vq=0x7f24a402d780) at vhost_scsi.c:795
++ * #10 0x00000000005458e4 in vdev_worker (arg=0x7f24a402d5c0) at vhost_scsi.c:831
++ * #11 0x00000000005a7f20 in thread_execute_poller (thread=0x3cd79ec0, poller=0x3ceab170) at thread.c:965
++ * #12 0x00000000005a84d1 in thread_poll (thread=0x3cd79ec0, max_msgs=0, now=34107644502554278) at thread.c:1091
++ * #13 0x00000000005a87a6 in spdk_thread_poll (thread=0x3cd79ec0, max_msgs=0, now=34107644502554278) at thread.c:1179
++ * #14 0x00000000005571bc in _reactor_run (reactor=0x3cd66b80) at reactor.c:967
++ * #15 0x00000000005572b0 in reactor_run (arg=0x3cd66b80) at reactor.c:1005
++ * #16 0x0000000000557752 in spdk_reactors_start () at reactor.c:1121
++ * #17 0x000000000055359f in spdk_app_start (opts_user=0x7ffe235984f0, start_fn=0x409a9a <vhost_started>, arg1=0x0) at app.c:988
++ * #18 0x0000000000409b9c in main (argc=3, argv=0x7ffe235986c8) at vhost.c:77
++ *
++ * called by:
++ *   - lib/vhost/vhost_blk.c|161| <<blk_task_enqueue>> vhost_vq_used_ring_enqueue(&task->bvsession->vsession,
++ *                                    task->vq, task->req_idx, task->blk_task.used_len);
++ *   - lib/vhost/vhost_blk.c|842| <<submit_inflight_desc>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++ *   - lib/vhost/vhost_blk.c|879| <<process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
++ *   - lib/vhost/vhost_blk.c|973| <<no_bdev_process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++ *   - lib/vhost/vhost_scsi.c|324| <<eventq_enqueue>> vhost_vq_used_ring_enqueue(vsession, vq, req, req_size);
++ *   - lib/vhost/vhost_scsi.c|332| <<submit_completion>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, task->used_len);
++ *   - lib/vhost/vhost_scsi.c|389| <<invalid_request>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, task->used_len);
++ *   - lib/vhost/vhost_scsi.c|517| <<process_ctrl_request>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, used_len);
++ *   - lib/vhost/vhost_scsi.c|704| <<process_scsi_task>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++ *   - lib/vhost/vhost_scsi.c|758| <<submit_inflight_desc>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++ *   - lib/vhost/vhost_scsi.c|789| <<process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
++ */
+ void
+ vhost_vq_used_ring_enqueue(struct spdk_vhost_session *vsession,
+ 			   struct spdk_vhost_virtqueue *virtqueue,
+ 			   uint16_t id, uint32_t len)
+ {
++	/*
++	 * struct spdk_vhost_virtqueue *virtqueue:
++	 * -> struct rte_vhost_vring vring;
++	 *    -> struct vring_used *used;
++	 */
+ 	struct rte_vhost_vring *vring = &virtqueue->vring;
+ 	struct vring_used *used = vring->used;
+ 	uint16_t last_idx = virtqueue->last_used_idx & (vring->size - 1);
+@@ -686,6 +792,16 @@ vhost_vring_packed_desc_get_buffer_id(struct spdk_vhost_virtqueue *vq, uint16_t
+ 	return desc->id;
+ }
+ 
++/*
++ * called by:
++ *   - lib/vhost/rte_vhost_user.c|104| <<vhost_log_req_desc>> vhost_vring_desc_get_next(&desc, desc_table, desc_table_size);
++ *   - lib/vhost/vhost_blk.c|254| <<blk_iovs_split_queue_setup>> rc = vhost_vring_desc_get_next(&desc, desc_table, desc_table_size);
++ *   - lib/vhost/vhost_scsi.c|528| <<process_ctrl_request>> vhost_vring_desc_get_next(&desc, desc_table, desc_table_size);
++ *   - lib/vhost/vhost_scsi.c|645| <<task_data_setup>> vhost_vring_desc_get_next(&desc, desc_table, desc_table_len);
++ *   - lib/vhost/vhost_scsi.c|665| <<task_data_setup>> rc = vhost_vring_desc_get_next(&desc, desc_table, desc_table_len);
++ *   - lib/vhost/vhost_scsi.c|700| <<task_data_setup>> rc = vhost_vring_desc_get_next(&desc, desc_table, desc_table_len);
++ *   - lib/vhost/vhost_scsi.c|723| <<task_data_setup>> vhost_vring_desc_get_next(&desc, desc_table, desc_table_len);
++ */
+ int
+ vhost_vring_desc_get_next(struct vring_desc **desc,
+ 			  struct vring_desc *desc_table, uint32_t desc_table_size)
+@@ -1026,6 +1142,11 @@ set_device_vq_callfd(struct spdk_vhost_session *vsession, uint16_t qid)
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - lib/vhost/rte_vhost_user.c|1572| <<extern_vhost_post_msg_handler>> rc = enable_device_vq(vsession, qid);
++ *   - lib/vhost/rte_vhost_user.c|1594| <<extern_vhost_post_msg_handler>> enable_device_vq(vsession, qid);
++ */
+ static int
+ enable_device_vq(struct spdk_vhost_session *vsession, uint16_t qid)
+ {
+diff --git a/lib/vhost/vhost.c b/lib/vhost/vhost.c
+index 46311d6..a4a3379 100644
+--- a/lib/vhost/vhost.c
++++ b/lib/vhost/vhost.c
+@@ -256,6 +256,11 @@ spdk_vhost_unlock(void)
+ 	pthread_mutex_unlock(&g_vhost_mutex);
+ }
+ 
++/*
++ * called by:
++ *   - module/event/subsystems/vhost_scsi/vhost_scsi.c|21| <<vhost_scsi_subsystem_init>> spdk_vhost_scsi_init(vhost_scsi_subsystem_init_done);
++ *   - test/unit/lib/vhost/vhost.c/vhost_ut.c|166| <<test_setup>> spdk_vhost_scsi_init(init_cb);
++ */
+ void
+ spdk_vhost_scsi_init(spdk_vhost_init_cb init_cb)
+ {
+diff --git a/lib/vhost/vhost_blk.c b/lib/vhost/vhost_blk.c
+index 0a0b67c..8bcf4a7 100644
+--- a/lib/vhost/vhost_blk.c
++++ b/lib/vhost/vhost_blk.c
+@@ -158,6 +158,21 @@ blk_task_enqueue(struct spdk_vhost_user_blk_task *task)
+ 					     task->buffer_id, task->blk_task.used_len,
+ 					     task->inflight_head);
+ 	} else {
++		/*
++		 * called by:
++		 *   - lib/vhost/vhost_blk.c|161| <<blk_task_enqueue>> vhost_vq_used_ring_enqueue(&task->bvsession->vsession,
++		 *                                    task->vq, task->req_idx, task->blk_task.used_len);
++		 *   - lib/vhost/vhost_blk.c|842| <<submit_inflight_desc>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++		 *   - lib/vhost/vhost_blk.c|879| <<process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
++		 *   - lib/vhost/vhost_blk.c|973| <<no_bdev_process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++		 *   - lib/vhost/vhost_scsi.c|324| <<eventq_enqueue>> vhost_vq_used_ring_enqueue(vsession, vq, req, req_size);
++		 *   - lib/vhost/vhost_scsi.c|332| <<submit_completion>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, task->used_len);
++		 *   - lib/vhost/vhost_scsi.c|389| <<invalid_request>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, task->used_len);
++		 *   - lib/vhost/vhost_scsi.c|517| <<process_ctrl_request>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, used_len);
++		 *   - lib/vhost/vhost_scsi.c|704| <<process_scsi_task>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++		 *   - lib/vhost/vhost_scsi.c|758| <<submit_inflight_desc>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++		 *   - lib/vhost/vhost_scsi.c|789| <<process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
++		 */
+ 		vhost_vq_used_ring_enqueue(&task->bvsession->vsession, task->vq,
+ 					   task->req_idx, task->blk_task.used_len);
+ 	}
+@@ -839,6 +854,21 @@ submit_inflight_desc(struct spdk_vhost_blk_session *bvsession,
+ 		if (spdk_unlikely(req_idx >= vq->vring.size)) {
+ 			SPDK_ERRLOG("%s: request idx '%"PRIu16"' exceeds virtqueue size (%"PRIu16").\n",
+ 				    vsession->name, req_idx, vq->vring.size);
++			/*
++			 * called by:
++			 *   - lib/vhost/vhost_blk.c|161| <<blk_task_enqueue>> vhost_vq_used_ring_enqueue(&task->bvsession->vsession,
++			 *                                    task->vq, task->req_idx, task->blk_task.used_len);
++			 *   - lib/vhost/vhost_blk.c|842| <<submit_inflight_desc>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++			 *   - lib/vhost/vhost_blk.c|879| <<process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
++			 *   - lib/vhost/vhost_blk.c|973| <<no_bdev_process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++			 *   - lib/vhost/vhost_scsi.c|324| <<eventq_enqueue>> vhost_vq_used_ring_enqueue(vsession, vq, req, req_size);
++			 *   - lib/vhost/vhost_scsi.c|332| <<submit_completion>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, task->used_len);
++			 *   - lib/vhost/vhost_scsi.c|389| <<invalid_request>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, task->used_len);
++			 *   - lib/vhost/vhost_scsi.c|517| <<process_ctrl_request>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, used_len);
++			 *   - lib/vhost/vhost_scsi.c|704| <<process_scsi_task>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++			 *   - lib/vhost/vhost_scsi.c|758| <<submit_inflight_desc>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++			 *   - lib/vhost/vhost_scsi.c|789| <<process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
++			 */
+ 			vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
+ 			continue;
+ 		}
+@@ -854,6 +884,10 @@ submit_inflight_desc(struct spdk_vhost_blk_session *bvsession,
+ 	return resubmit_cnt;
+ }
+ 
++/*
++ * called by:
++ *   - lib/vhost/vhost_blk.c|968| <<_vdev_vq_worker>> rc = process_vq(bvsession, vq);
++ */
+ static int
+ process_vq(struct spdk_vhost_blk_session *bvsession, struct spdk_vhost_virtqueue *vq)
+ {
+@@ -876,6 +910,21 @@ process_vq(struct spdk_vhost_blk_session *bvsession, struct spdk_vhost_virtqueue
+ 		if (spdk_unlikely(reqs[i] >= vq->vring.size)) {
+ 			SPDK_ERRLOG("%s: request idx '%"PRIu16"' exceeds virtqueue size (%"PRIu16").\n",
+ 				    vsession->name, reqs[i], vq->vring.size);
++			/*
++			 * called by:
++			 *   - lib/vhost/vhost_blk.c|161| <<blk_task_enqueue>> vhost_vq_used_ring_enqueue(&task->bvsession->vsession,
++			 *                                    task->vq, task->req_idx, task->blk_task.used_len);
++			 *   - lib/vhost/vhost_blk.c|842| <<submit_inflight_desc>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++			 *   - lib/vhost/vhost_blk.c|879| <<process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
++			 *   - lib/vhost/vhost_blk.c|973| <<no_bdev_process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++			 *   - lib/vhost/vhost_scsi.c|324| <<eventq_enqueue>> vhost_vq_used_ring_enqueue(vsession, vq, req, req_size);
++			 *   - lib/vhost/vhost_scsi.c|332| <<submit_completion>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, task->used_len);
++			 *   - lib/vhost/vhost_scsi.c|389| <<invalid_request>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, task->used_len);
++			 *   - lib/vhost/vhost_scsi.c|517| <<process_ctrl_request>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, used_len);
++			 *   - lib/vhost/vhost_scsi.c|704| <<process_scsi_task>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++			 *   - lib/vhost/vhost_scsi.c|758| <<submit_inflight_desc>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++			 *   - lib/vhost/vhost_scsi.c|789| <<process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
++			 */
+ 			vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
+ 			continue;
+ 		}
+@@ -970,6 +1019,21 @@ no_bdev_process_vq(struct spdk_vhost_blk_session *bvsession, struct spdk_vhost_v
+ 		SPDK_DEBUGLOG(vhost_blk_data, "Aborting request %" PRIu16"\n", req_idx);
+ 	}
+ 
++	/*
++	 * called by:   
++	 *   - lib/vhost/vhost_blk.c|161| <<blk_task_enqueue>> vhost_vq_used_ring_enqueue(&task->bvsession->vsession,
++	 *                                    task->vq, task->req_idx, task->blk_task.used_len);
++	 *   - lib/vhost/vhost_blk.c|842| <<submit_inflight_desc>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++	 *   - lib/vhost/vhost_blk.c|879| <<process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
++	 *   - lib/vhost/vhost_blk.c|973| <<no_bdev_process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++	 *   - lib/vhost/vhost_scsi.c|324| <<eventq_enqueue>> vhost_vq_used_ring_enqueue(vsession, vq, req, req_size);
++	 *   - lib/vhost/vhost_scsi.c|332| <<submit_completion>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, task->used_len);
++	 *   - lib/vhost/vhost_scsi.c|389| <<invalid_request>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, task->used_len);
++	 *   - lib/vhost/vhost_scsi.c|517| <<process_ctrl_request>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, used_len);
++	 *   - lib/vhost/vhost_scsi.c|704| <<process_scsi_task>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++	 *   - lib/vhost/vhost_scsi.c|758| <<submit_inflight_desc>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++	 *   - lib/vhost/vhost_scsi.c|789| <<process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
++	 */
+ 	vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
+ }
+ 
+diff --git a/lib/vhost/vhost_internal.h b/lib/vhost/vhost_internal.h
+index ff26b9f..d8beaf0 100644
+--- a/lib/vhost/vhost_internal.h
++++ b/lib/vhost/vhost_internal.h
+@@ -418,6 +418,15 @@ int vhost_vring_inflight_desc_to_iov(struct spdk_vhost_session *vsession, struct
+ uint16_t vhost_vring_packed_desc_get_buffer_id(struct spdk_vhost_virtqueue *vq, uint16_t req_idx,
+ 		uint16_t *num_descs);
+ 
++/*
++ * called by:
++ *   - lib/vhost/rte_vhost_user.c|77| <<vhost_log_req_desc>> if (spdk_likely(!vhost_dev_has_feature(vsession, VHOST_F_LOG_ALL))) {
++ *   - lib/vhost/rte_vhost_user.c|106| <<vhost_log_used_vring_elem>> if (spdk_likely(!vhost_dev_has_feature(vsession, VHOST_F_LOG_ALL))) {
++ *   - lib/vhost/rte_vhost_user.c|128| <<vhost_log_used_vring_idx>> if (spdk_likely(!vhost_dev_has_feature(vsession, VHOST_F_LOG_ALL))) {
++ *   - lib/vhost/vhost_scsi.c|1306| <<vhost_scsi_session_add_tgt>> if (vhost_dev_has_feature(vsession, VIRTIO_SCSI_F_HOTPLUG)) {
++ *   - lib/vhost/vhost_scsi.c|1439| <<vhost_scsi_session_remove_tgt>> if (vhost_dev_has_feature(vsession, VIRTIO_SCSI_F_HOTPLUG)) {
++ *   - lib/vhost/vhost_scsi.c|1514| <<vhost_scsi_session_param_changed>> if (vhost_dev_has_feature(vsession, VIRTIO_SCSI_F_CHANGE)) {
++ */
+ static inline bool
+ __attribute__((always_inline))
+ vhost_dev_has_feature(struct spdk_vhost_session *vsession, unsigned feature_id)
+diff --git a/lib/vhost/vhost_scsi.c b/lib/vhost/vhost_scsi.c
+index 4e03a1c..2b6f615 100644
+--- a/lib/vhost/vhost_scsi.c
++++ b/lib/vhost/vhost_scsi.c
+@@ -17,6 +17,14 @@
+ #include "spdk/vhost.h"
+ #include "vhost_internal.h"
+ 
++/*
++ * (gdb) info threads
++ *   Id   Target Id                                           Frame
++ * * 1    Thread 0x7f24ac9a49c0 (LWP 212939) "reactor_0"      0x000000000054544e in submit_inflight_desc (svsession=0x7f24a402d880, vq=0x7ffe23597f80) at vhost_scsi.c:734
++ *   2    Thread 0x7f24aa614700 (LWP 212940) "dpdk-intr"      0x00007f24aa96c387 in epoll_wait () from /lib64/libc.so.6
++ *   3    Thread 0x7f24a92c9700 (LWP 213383) "dpdk-vhost-evt" 0x00007f24aa95fb41 in poll () from /lib64/libc.so.6
++ */
++
+ /* Features supported by SPDK VHOST lib. */
+ #define SPDK_VHOST_SCSI_FEATURES	(SPDK_VHOST_FEATURES | \
+ 					(1ULL << VIRTIO_SCSI_F_INOUT) | \
+@@ -91,6 +99,14 @@ struct spdk_vhost_scsi_session {
+ 
+ struct spdk_vhost_scsi_task {
+ 	struct spdk_scsi_task	scsi;
++	/*
++	 * 在以下使用spdk_vhost_scsi_task->iovs[SPDK_VHOST_IOVS_MAX]
++	 *   - lib/vhost/vhost_scsi.c|593| <<task_data_setup>> struct iovec *iovs = task->iovs;
++	 *   - lib/vhost/vhost_scsi.c|625| <<task_data_setup>> task->scsi.iovs = iovs;
++	 *   - lib/vhost/vhost_scsi.c|653| <<task_data_setup>> task->scsi.iovs[0].iov_len = 0;
++	 *   - lib/vhost/vhost_scsi.c|667| <<task_data_setup>> if (spdk_unlikely(vhost_vring_desc_to_iov(vsession, iovs, &iovcnt, desc))) {
++	 *   - lib/vhost/vhost_scsi.c|690| <<task_data_setup>> if (spdk_unlikely(vhost_vring_desc_to_iov(vsession, iovs, &iovcnt, desc))) {
++	 */
+ 	struct iovec iovs[SPDK_VHOST_IOVS_MAX];
+ 
+ 	union {
+@@ -125,6 +141,10 @@ static int vhost_scsi_dev_param_changed(struct spdk_vhost_dev *vdev,
+ 					unsigned scsi_tgt_num);
+ static int alloc_vq_task_pool(struct spdk_vhost_session *vsession, uint16_t qid);
+ 
++/*
++ * called by:
++ *   - lib/vhost/vhost_scsi.c|1015| <<vhost_scsi_dev_construct>> &spdk_vhost_scsi_user_device_backend, delay);
++ */
+ static const struct spdk_vhost_user_dev_backend spdk_vhost_scsi_user_device_backend = {
+ 	.session_ctx_size = sizeof(struct spdk_vhost_scsi_session) - sizeof(struct spdk_vhost_session),
+ 	.start_session =  vhost_scsi_start,
+@@ -321,6 +341,21 @@ eventq_enqueue(struct spdk_vhost_scsi_session *svsession, unsigned scsi_dev_num,
+ 	req_size = sizeof(*desc_ev);
+ 
+ out:
++	/*
++	 * called by:
++	 *   - lib/vhost/vhost_blk.c|161| <<blk_task_enqueue>> vhost_vq_used_ring_enqueue(&task->bvsession->vsession,
++	 *                                    task->vq, task->req_idx, task->blk_task.used_len);
++	 *   - lib/vhost/vhost_blk.c|842| <<submit_inflight_desc>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++	 *   - lib/vhost/vhost_blk.c|879| <<process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
++	 *   - lib/vhost/vhost_blk.c|973| <<no_bdev_process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++	 *   - lib/vhost/vhost_scsi.c|324| <<eventq_enqueue>> vhost_vq_used_ring_enqueue(vsession, vq, req, req_size);
++	 *   - lib/vhost/vhost_scsi.c|332| <<submit_completion>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, task->used_len);
++	 *   - lib/vhost/vhost_scsi.c|389| <<invalid_request>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, task->used_len);
++	 *   - lib/vhost/vhost_scsi.c|517| <<process_ctrl_request>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, used_len);
++	 *   - lib/vhost/vhost_scsi.c|704| <<process_scsi_task>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++	 *   - lib/vhost/vhost_scsi.c|758| <<submit_inflight_desc>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++	 *   - lib/vhost/vhost_scsi.c|789| <<process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
++	 */
+ 	vhost_vq_used_ring_enqueue(vsession, vq, req, req_size);
+ }
+ 
+@@ -329,6 +364,21 @@ submit_completion(struct spdk_vhost_scsi_task *task)
+ {
+ 	struct spdk_vhost_session *vsession = &task->svsession->vsession;
+ 
++	/*
++	 * called by:
++	 *   - lib/vhost/vhost_blk.c|161| <<blk_task_enqueue>> vhost_vq_used_ring_enqueue(&task->bvsession->vsession,
++	 *                                    task->vq, task->req_idx, task->blk_task.used_len);
++	 *   - lib/vhost/vhost_blk.c|842| <<submit_inflight_desc>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++	 *   - lib/vhost/vhost_blk.c|879| <<process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
++	 *   - lib/vhost/vhost_blk.c|973| <<no_bdev_process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++	 *   - lib/vhost/vhost_scsi.c|324| <<eventq_enqueue>> vhost_vq_used_ring_enqueue(vsession, vq, req, req_size);
++	 *   - lib/vhost/vhost_scsi.c|332| <<submit_completion>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, task->used_len);
++	 *   - lib/vhost/vhost_scsi.c|389| <<invalid_request>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, task->used_len);
++	 *   - lib/vhost/vhost_scsi.c|517| <<process_ctrl_request>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, used_len);
++	 *   - lib/vhost/vhost_scsi.c|704| <<process_scsi_task>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++	 *   - lib/vhost/vhost_scsi.c|758| <<submit_inflight_desc>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++	 *   - lib/vhost/vhost_scsi.c|789| <<process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
++	 */
+ 	vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx,
+ 				   task->used_len);
+ 	SPDK_DEBUGLOG(vhost_scsi, "Finished task (%p) req_idx=%d\n", task, task->req_idx);
+@@ -366,6 +416,10 @@ vhost_scsi_task_cpl(struct spdk_scsi_task *scsi_task)
+ 	submit_completion(task);
+ }
+ 
++/*
++ * called by:
++ *   - lib/vhost/vhost_scsi.c|816| <<process_scsi_task>> task_submit(task);
++ */
+ static void
+ task_submit(struct spdk_vhost_scsi_task *task)
+ {
+@@ -386,6 +440,21 @@ invalid_request(struct spdk_vhost_scsi_task *task)
+ {
+ 	struct spdk_vhost_session *vsession = &task->svsession->vsession;
+ 
++	/*
++	 * called by:
++	 *   - lib/vhost/vhost_blk.c|161| <<blk_task_enqueue>> vhost_vq_used_ring_enqueue(&task->bvsession->vsession,
++	 *                                    task->vq, task->req_idx, task->blk_task.used_len);
++	 *   - lib/vhost/vhost_blk.c|842| <<submit_inflight_desc>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++	 *   - lib/vhost/vhost_blk.c|879| <<process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
++	 *   - lib/vhost/vhost_blk.c|973| <<no_bdev_process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++	 *   - lib/vhost/vhost_scsi.c|324| <<eventq_enqueue>> vhost_vq_used_ring_enqueue(vsession, vq, req, req_size);
++	 *   - lib/vhost/vhost_scsi.c|332| <<submit_completion>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, task->used_len);
++	 *   - lib/vhost/vhost_scsi.c|389| <<invalid_request>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, task->used_len);
++	 *   - lib/vhost/vhost_scsi.c|517| <<process_ctrl_request>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, used_len);
++	 *   - lib/vhost/vhost_scsi.c|704| <<process_scsi_task>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++	 *   - lib/vhost/vhost_scsi.c|758| <<submit_inflight_desc>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++	 *   - lib/vhost/vhost_scsi.c|789| <<process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
++	 */
+ 	vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx,
+ 				   task->used_len);
+ 	vhost_scsi_task_put(task);
+@@ -514,6 +583,21 @@ process_ctrl_request(struct spdk_vhost_scsi_task *task)
+ 
+ 	used_len = sizeof(struct virtio_scsi_ctrl_tmf_resp);
+ out:
++	/*
++	 * called by:
++	 *   - lib/vhost/vhost_blk.c|161| <<blk_task_enqueue>> vhost_vq_used_ring_enqueue(&task->bvsession->vsession,
++	 *                                    task->vq, task->req_idx, task->blk_task.used_len);
++	 *   - lib/vhost/vhost_blk.c|842| <<submit_inflight_desc>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++	 *   - lib/vhost/vhost_blk.c|879| <<process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
++	 *   - lib/vhost/vhost_blk.c|973| <<no_bdev_process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++	 *   - lib/vhost/vhost_scsi.c|324| <<eventq_enqueue>> vhost_vq_used_ring_enqueue(vsession, vq, req, req_size);
++	 *   - lib/vhost/vhost_scsi.c|332| <<submit_completion>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, task->used_len);
++	 *   - lib/vhost/vhost_scsi.c|389| <<invalid_request>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, task->used_len);
++	 *   - lib/vhost/vhost_scsi.c|517| <<process_ctrl_request>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, used_len);
++	 *   - lib/vhost/vhost_scsi.c|704| <<process_scsi_task>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++	 *   - lib/vhost/vhost_scsi.c|758| <<submit_inflight_desc>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++	 *   - lib/vhost/vhost_scsi.c|789| <<process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
++	 */
+ 	vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, used_len);
+ 	vhost_scsi_task_put(task);
+ }
+@@ -524,6 +608,10 @@ out:
+  *   -1 if request is invalid and must be aborted,
+  *    0 if all data are set.
+  */
++/*
++ * called by:
++ *   - lib/vhost/vhost_scsi.c|729| <<process_request>> result = task_data_setup(task, &req);
++ */
+ static int
+ task_data_setup(struct spdk_vhost_scsi_task *task,
+ 		struct virtio_scsi_cmd_req **req)
+@@ -660,6 +748,10 @@ invalid_task:
+ 	return -1;
+ }
+ 
++/*
++ * called by:
++ *   - lib/vhost/vhost_scsi.c|805| <<process_scsi_task>> result = process_request(task);
++ */
+ static int
+ process_request(struct spdk_vhost_scsi_task *task)
+ {
+@@ -689,6 +781,11 @@ process_request(struct spdk_vhost_scsi_task *task)
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - lib/vhost/vhost_scsi.c|872| <<submit_inflight_desc>> process_scsi_task(vsession, vq, req_idx);
++ *   - lib/vhost/vhost_scsi.c|925| <<process_vq>> process_scsi_task(vsession, vq, reqs[i]);
++ */
+ static void
+ process_scsi_task(struct spdk_vhost_session *vsession,
+ 		  struct spdk_vhost_virtqueue *vq,
+@@ -701,6 +798,21 @@ process_scsi_task(struct spdk_vhost_session *vsession,
+ 	if (spdk_unlikely(task->used)) {
+ 		SPDK_ERRLOG("%s: request with idx '%"PRIu16"' is already pending.\n",
+ 			    vsession->name, req_idx);
++		/*
++		 * called by:
++		 *   - lib/vhost/vhost_blk.c|161| <<blk_task_enqueue>> vhost_vq_used_ring_enqueue(&task->bvsession->vsession,
++		 *                                    task->vq, task->req_idx, task->blk_task.used_len);
++		 *   - lib/vhost/vhost_blk.c|842| <<submit_inflight_desc>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++		 *   - lib/vhost/vhost_blk.c|879| <<process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
++		 *   - lib/vhost/vhost_blk.c|973| <<no_bdev_process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++		 *   - lib/vhost/vhost_scsi.c|324| <<eventq_enqueue>> vhost_vq_used_ring_enqueue(vsession, vq, req, req_size);
++		 *   - lib/vhost/vhost_scsi.c|332| <<submit_completion>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, task->used_len);
++		 *   - lib/vhost/vhost_scsi.c|389| <<invalid_request>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, task->used_len);
++		 *   - lib/vhost/vhost_scsi.c|517| <<process_ctrl_request>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, used_len);
++		 *   - lib/vhost/vhost_scsi.c|704| <<process_scsi_task>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++		 *   - lib/vhost/vhost_scsi.c|758| <<submit_inflight_desc>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++		 *   - lib/vhost/vhost_scsi.c|789| <<process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
++		 */
+ 		vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
+ 		return;
+ 	}
+@@ -728,6 +840,10 @@ process_scsi_task(struct spdk_vhost_session *vsession,
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - lib/vhost/vhost_scsi.c|867| <<process_vq>> resubmit_cnt = submit_inflight_desc(svsession, vq);
++ */
+ static int
+ submit_inflight_desc(struct spdk_vhost_scsi_session *svsession,
+ 		     struct spdk_vhost_virtqueue *vq)
+@@ -738,6 +854,33 @@ submit_inflight_desc(struct spdk_vhost_scsi_session *svsession,
+ 	uint16_t req_idx;
+ 	int i, resubmit_cnt;
+ 
++	/*
++	 * 在以下使用vhost_virtqueue->resubmit_inflight:
++	 *   - dpdk/lib/vhost/vhost.c|364| <<cleanup_vq_inflight>> if (vq->resubmit_inflight) {
++	 *   - dpdk/lib/vhost/vhost.c|365| <<cleanup_vq_inflight>> if (vq->resubmit_inflight->resubmit_list) {
++	 *   - dpdk/lib/vhost/vhost.c|366| <<cleanup_vq_inflight>> rte_free(vq->resubmit_inflight->resubmit_list);
++	 *   - dpdk/lib/vhost/vhost.c|367| <<cleanup_vq_inflight>> vq->resubmit_inflight->resubmit_list = NULL;
++	 *   - dpdk/lib/vhost/vhost.c|369| <<cleanup_vq_inflight>> rte_free(vq->resubmit_inflight);
++	 *   - dpdk/lib/vhost/vhost.c|370| <<cleanup_vq_inflight>> vq->resubmit_inflight = NULL;
++	 *   - dpdk/lib/vhost/vhost.c|1050| <<rte_vhost_get_vhost_ring_inflight>> vring->resubmit_inflight = vq->resubmit_inflight;
++	 *   - dpdk/lib/vhost/vhost_user.c|655| <<numa_realloc>> if (vq->resubmit_inflight) {
++	 *   - dpdk/lib/vhost/vhost_user.c|658| <<numa_realloc>> ri = rte_realloc_socket(vq->resubmit_inflight, sizeof(*ri), 0, node);
++	 *   - dpdk/lib/vhost/vhost_user.c|665| <<numa_realloc>> vq->resubmit_inflight = ri;
++	 *   - dpdk/lib/vhost/vhost_user.c|1980| <<vhost_check_queue_inflights_split>> if (vq->resubmit_inflight)
++	 *   - dpdk/lib/vhost/vhost_user.c|2036| <<vhost_check_queue_inflights_split>> vq->resubmit_inflight = resubmit;
++	 *   - dpdk/lib/vhost/vhost_user.c|2066| <<vhost_check_queue_inflights_packed>> if (vq->resubmit_inflight)
++	 *   - dpdk/lib/vhost/vhost_user.c|2132| <<vhost_check_queue_inflights_packed>> vq->resubmit_inflight = resubmit;
++	 *
++	 * 在以下使用rte_vhost_ring_inflight->resubmit_inflight:
++	 *   - dpdk/lib/vhost/vhost.c|1050| <<rte_vhost_get_vhost_ring_inflight>> vring->resubmit_inflight = vq->resubmit_inflight;
++	 *   - lib/vhost/vhost_blk.c|840| <<submit_inflight_desc>> resubmit = vq->vring_inflight.resubmit_inflight;
++	 *   - lib/vhost/vhost_scsi.c|850| <<submit_inflight_desc>> resubmit = vq->vring_inflight.resubmit_inflight;
++	 *
++	 * struct spdk_vhost_virtqueue *vq:
++	 * -> struct rte_vhost_vring vring;
++	 * -> struct rte_vhost_ring_inflight vring_inflight;
++	 *    -> struct rte_vhost_resubmit_info *resubmit_inflight;
++	 */
+ 	resubmit = vq->vring_inflight.resubmit_inflight;
+ 	if (spdk_likely(resubmit == NULL || resubmit->resubmit_list == NULL ||
+ 			resubmit->resubmit_num == 0)) {
+@@ -755,6 +898,21 @@ submit_inflight_desc(struct spdk_vhost_scsi_session *svsession,
+ 		if (spdk_unlikely(req_idx >= vq->vring.size)) {
+ 			SPDK_ERRLOG("%s: request idx '%"PRIu16"' exceeds virtqueue size (%"PRIu16").\n",
+ 				    vsession->name, req_idx, vq->vring.size);
++			/*
++			 * called by:
++			 *   - lib/vhost/vhost_blk.c|161| <<blk_task_enqueue>> vhost_vq_used_ring_enqueue(&task->bvsession->vsession,
++			 *                                    task->vq, task->req_idx, task->blk_task.used_len);
++			 *   - lib/vhost/vhost_blk.c|842| <<submit_inflight_desc>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++			 *   - lib/vhost/vhost_blk.c|879| <<process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
++			 *   - lib/vhost/vhost_blk.c|973| <<no_bdev_process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++			 *   - lib/vhost/vhost_scsi.c|324| <<eventq_enqueue>> vhost_vq_used_ring_enqueue(vsession, vq, req, req_size);
++			 *   - lib/vhost/vhost_scsi.c|332| <<submit_completion>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, task->used_len);
++			 *   - lib/vhost/vhost_scsi.c|389| <<invalid_request>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, task->used_len);
++			 *   - lib/vhost/vhost_scsi.c|517| <<process_ctrl_request>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, used_len);
++			 *   - lib/vhost/vhost_scsi.c|704| <<process_scsi_task>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++			 *   - lib/vhost/vhost_scsi.c|758| <<submit_inflight_desc>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++			 *   - lib/vhost/vhost_scsi.c|789| <<process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
++			 */
+ 			vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
+ 			continue;
+ 		}
+@@ -766,6 +924,15 @@ submit_inflight_desc(struct spdk_vhost_scsi_session *svsession,
+ 	return resubmit_cnt;
+ }
+ 
++/*
++ * struct spdk_vhost_scsi_session *svsession:
++ * -> struct spdk_vhost_session vsession;
++ *    -> struct spdk_vhost_virtqueue virtqueue[SPDK_VHOST_MAX_VQUEUES];
++ *
++ * called by:
++ *   - lib/vhost/vhost_scsi.c|920| <<vdev_mgmt_worker>> rc = process_vq(svsession, &vsession->virtqueue[VIRTIO_SCSI_CONTROLQ]);
++ *   - lib/vhost/vhost_scsi.c|936| <<vdev_worker>> rc = process_vq(svsession, &vsession->virtqueue[q_idx]);
++ */
+ static int
+ process_vq(struct spdk_vhost_scsi_session *svsession, struct spdk_vhost_virtqueue *vq)
+ {
+@@ -774,8 +941,18 @@ process_vq(struct spdk_vhost_scsi_session *svsession, struct spdk_vhost_virtqueu
+ 	uint16_t reqs_cnt, i;
+ 	int resubmit_cnt;
+ 
++	/*
++	 * 只在此处调用
++	 */
+ 	resubmit_cnt = submit_inflight_desc(svsession, vq);
+ 
++	/*
++	 * called by:
++	 *   - lib/vhost/vhost_blk.c|901| <<process_vq>> reqs_cnt = vhost_vq_avail_ring_get(vq, reqs, SPDK_COUNTOF(reqs));
++	 *   - lib/vhost/vhost_blk.c|1012| <<no_bdev_process_vq>> if (vhost_vq_avail_ring_get(vq, &req_idx, 1) != 1) {
++	 *   - lib/vhost/vhost_scsi.c|299| <<eventq_enqueue>> if (vq->vring.desc == NULL || vhost_vq_avail_ring_get(vq, &req, 1) != 1) {
++	 *   - lib/vhost/vhost_scsi.c|937| <<process_vq>> reqs_cnt = vhost_vq_avail_ring_get(vq, reqs, SPDK_COUNTOF(reqs));
++	 */
+ 	reqs_cnt = vhost_vq_avail_ring_get(vq, reqs, SPDK_COUNTOF(reqs));
+ 	assert(reqs_cnt <= 32);
+ 
+@@ -786,10 +963,30 @@ process_vq(struct spdk_vhost_scsi_session *svsession, struct spdk_vhost_virtqueu
+ 		if (spdk_unlikely(reqs[i] >= vq->vring.size)) {
+ 			SPDK_ERRLOG("%s: request idx '%"PRIu16"' exceeds virtqueue size (%"PRIu16").\n",
+ 				    vsession->name, reqs[i], vq->vring.size);
++			/*
++			 * called by:
++			 *   - lib/vhost/vhost_blk.c|161| <<blk_task_enqueue>> vhost_vq_used_ring_enqueue(&task->bvsession->vsession,
++			 *                                    task->vq, task->req_idx, task->blk_task.used_len);
++			 *   - lib/vhost/vhost_blk.c|842| <<submit_inflight_desc>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++			 *   - lib/vhost/vhost_blk.c|879| <<process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
++			 *   - lib/vhost/vhost_blk.c|973| <<no_bdev_process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++			 *   - lib/vhost/vhost_scsi.c|324| <<eventq_enqueue>> vhost_vq_used_ring_enqueue(vsession, vq, req, req_size);
++			 *   - lib/vhost/vhost_scsi.c|332| <<submit_completion>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, task->used_len);
++			 *   - lib/vhost/vhost_scsi.c|389| <<invalid_request>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, task->used_len);
++			 *   - lib/vhost/vhost_scsi.c|517| <<process_ctrl_request>> vhost_vq_used_ring_enqueue(vsession, task->vq, task->req_idx, used_len);
++			 *   - lib/vhost/vhost_scsi.c|704| <<process_scsi_task>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++			 *   - lib/vhost/vhost_scsi.c|758| <<submit_inflight_desc>> vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
++			 *   - lib/vhost/vhost_scsi.c|789| <<process_vq>> vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
++			 */
+ 			vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
+ 			continue;
+ 		}
+ 
++		/*
++		 * called by:
++		 *   - lib/vhost/vhost_blk.c|932| <<process_vq>> rte_vhost_set_inflight_desc_split(vsession->vid, vq->vring_idx, reqs[i]);
++		 *   - lib/vhost/vhost_scsi.c|966| <<process_vq>> rte_vhost_set_inflight_desc_split(vsession->vid, vq->vring_idx, reqs[i]);
++		 */
+ 		rte_vhost_set_inflight_desc_split(vsession->vid, vq->vring_idx, reqs[i]);
+ 
+ 		process_scsi_task(vsession, vq, reqs[i]);
+@@ -819,16 +1016,34 @@ vdev_mgmt_worker(void *arg)
+ 	return rc > 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
+ }
+ 
++/*
++ * 在以下使用vdev_worker():
++ *   - lib/vhost/vhost_scsi.c|1571| <<vhost_scsi_start>> svsession->requestq_poller = SPDK_POLLER_REGISTER(vdev_worker, svsession, 0);
++ */
+ static int
+ vdev_worker(void *arg)
+ {
++	/*
++	 * struct spdk_vhost_scsi_session *svsession:
++	 * -> struct spdk_vhost_session vsession;
++	 *    -> struct spdk_vhost_virtqueue virtqueue[SPDK_VHOST_MAX_VQUEUES];
++	 */
+ 	struct spdk_vhost_scsi_session *svsession = arg;
+ 	struct spdk_vhost_session *vsession = &svsession->vsession;
+ 	uint32_t q_idx;
+ 	int rc = 0;
+ 
++	/*
++	 * #define VIRTIO_SCSI_REQUESTQ 2
++	 */
+ 	for (q_idx = VIRTIO_SCSI_REQUESTQ; q_idx < vsession->max_queues; q_idx++) {
+ 		rc = process_vq(svsession, &vsession->virtqueue[q_idx]);
++		/*
++		 * called by:
++		 *   - lib/vhost/vhost_blk.c|975| <<_vdev_vq_worker>> vhost_session_vq_used_signal(vq);
++		 *   - lib/vhost/vhost_blk.c|1097| <<_no_bdev_vdev_vq_worker>> vhost_session_vq_used_signal(vq);
++		 *   - lib/vhost/vhost_scsi.c|966| <<vdev_worker>> vhost_session_vq_used_signal(&vsession->virtqueue[q_idx]);
++		 */
+ 		vhost_session_vq_used_signal(&vsession->virtqueue[q_idx]);
+ 	}
+ 
+@@ -891,6 +1106,11 @@ vhost_scsi_controller_start(const char *name)
+ 	return 0;
+ }
+ 
++/*
++ * called by:
++ *   - lib/vhost/vhost_scsi.c|1031| <<spdk_vhost_scsi_dev_construct>> return vhost_scsi_dev_construct(name, cpumask, false);
++ *   - lib/vhost/vhost_scsi.c|1037| <<spdk_vhost_scsi_dev_construct_no_start>> return vhost_scsi_dev_construct(name, cpumask, true);
++ */
+ static int
+ vhost_scsi_dev_construct(const char *name, const char *cpumask, bool delay)
+ {
+@@ -1406,6 +1626,14 @@ alloc_vq_task_pool(struct spdk_vhost_session *vsession, uint16_t qid)
+ 	return 0;
+ }
+ 
++/*
++ * 128 static const struct spdk_vhost_user_dev_backend spdk_vhost_scsi_user_device_backend = {
++ * 129         .session_ctx_size = sizeof(struct spdk_vhost_scsi_session) - sizeof(struct spdk_vhost_session),
++ * 130         .start_session =  vhost_scsi_start,
++ * 131         .stop_session = vhost_scsi_stop,
++ * 132         .alloc_vq_tasks = alloc_vq_task_pool,
++ * 133 };
++ */
+ static int
+ vhost_scsi_start(struct spdk_vhost_dev *vdev,
+ 		 struct spdk_vhost_session *vsession, void *unused)
+-- 
+2.39.5 (Apple Git-154)
+
