@@ -1,0 +1,74 @@
+[PATCH 0/3] KVM: SVM: Zero DEBUGCTL before VMRUN if necessary
+
+... from Sean Christopherson <seanjc@google.com> ...
+
+https://lore.kernel.org/all/20250224181315.2376869-1-seanjc@google.com/
+
+--------------------------
+
+Fix a long-lurking bug in SVM where KVM runs the guest with the host's
+DEBUGCTL if LBR virtualization is disabled.  AMD CPUs rather stupidly
+context switch DEBUGCTL if and only if LBR virtualization is enabled (not
+just supported, but fully enabled).
+
+The bug has gone unnoticed because until recently, the only bits that
+KVM would leave set were things like BTF, which are guest visible but
+won't cause functional problems unless guest software is being especially
+particular about #DBs.
+
+The bug was exposed by the addition of BusLockTrap ("Detect" in the kernel),
+as the resulting #DBs due to split-lock accesses in guest userspace (lol
+Steam) get reflected into the guest by KVM.
+
+--------------------------
+
+There is a more thorough explanation in PATCH 2.
+
+Manually zero DEBUGCTL prior to VMRUN if the host's value is non-zero and
+LBR virtualization is disabled, as hardware only context switches DEBUGCTL
+if LBR virtualization is fully enabled.  Running the guest with the host's
+value has likely been mildly problematic for quite some time, e.g. it will
+result in undesirable behavior if host is running with BTF=1.
+
+But the bug became fatal with the introduction of Bus Lock Trap ("Detect"
+in kernel paralance) support for AMD (commit 408eb7417a92
+("x86/bus_lock: Add support for AMD")), as a bus lock in the guest will
+trigger an unexpected #DB.
+
+Note, suppressing the bus lock #DB, i.e. simply resuming the guest without
+injecting a #DB, is not an option.  It wouldn't address the general issue
+with DEBUGCTL, e.g. for things like BTF, and there are other guest-visible
+side effects if BusLockTrap is left enabled.
+
+If BusLockTrap is disabled, then DR6.BLD is reserved-to-1; any attempts to
+clear it by software are ignored.  But if BusLockTrap is enabled, software
+can clear DR6.BLD:
+
+  Software enables bus lock trap by setting DebugCtl MSR[BLCKDB] (bit 2)
+  to 1.  When bus lock trap is enabled, ... The processor indicates that
+  this #DB was caused by a bus lock by clearing DR6[BLD] (bit 11).  DR6[11]
+  previously had been defined to be always 1.
+
+and clearing DR6.BLD is "sticky" in that it's not set (i.e. lowered) by
+other #DBs:
+
+  All other #DB exceptions leave DR6[BLD] unmodified
+
+E.g. leaving BusLockTrap enable can confuse a legacy guest that writes '0'
+to reset DR6.
+
+---------------------
+
+Indeed this is my favorite explanation.
+
+BusLockTrap is controlled through DEBUGCTL MSR and currently DEBUGCTL MSR is
+saved/restored on guest entry/exit only if LBRV is enabled. So, if BusLockTrap
+is enabled on the host, it will remain enabled even after guest entry and thus,
+if some process inside the guest causes a BusLock, KVM will inject #DB from
+host to the guest.
+
+https://bugzilla.kernel.org/show_bug.cgi?id=219787
+
+https://lore.kernel.org/all/20250224112601.6504-1-ravi.bangoria@amd.com/
+
+

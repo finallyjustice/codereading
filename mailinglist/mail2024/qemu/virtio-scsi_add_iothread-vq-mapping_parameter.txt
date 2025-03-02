@@ -1,0 +1,187 @@
+[PATCH 00/12] virtio-scsi: add iothread-vq-mapping parameter
+
+... Stefan Hajnoczi <stefanha@redhat.com> ...
+
+https://lore.kernel.org/qemu-devel/20250213180043.713434-1-stefanha@redhat.com/
+
+----------
+
+[PATCH 01/12] scsi-disk: drop unused SCSIDiskState->bh field
+
+No one uses it.
+
+diff --git a/hw/scsi/scsi-disk.c b/hw/scsi/scsi-disk.c
+index e7f738b484..caf6c1437f 100644
+--- a/hw/scsi/scsi-disk.c
++++ b/hw/scsi/scsi-disk.c
+@@ -106,7 +106,6 @@ struct SCSIDiskState {
+     uint64_t max_unmap_size;
+     uint64_t max_io_size;
+     uint32_t quirks;
+-    QEMUBH *bh;
+     char *version;
+     char *serial;
+     char *vendor;
+
+----------
+
+[PATCH 02/12] dma: use current AioContext for dma_blk_io()
+
+Always use the current context.
+
+-BlockAIOCB *dma_blk_io(AioContext *ctx,
++BlockAIOCB *dma_blk_io(
+     QEMUSGList *sg, uint64_t offset, uint32_t align,
+     DMAIOFunc *io_func, void *io_func_opaque,
+     BlockCompletionFunc *cb,
+@@ -223,7 +223,7 @@ BlockAIOCB *dma_blk_io(AioContext *ctx,
+ 
+     dbs->acb = NULL;
+     dbs->sg = sg;
+-    dbs->ctx = ctx;
++    dbs->ctx = qemu_get_current_aio_context();
+     dbs->offset = offset;
+     dbs->align = align;
+
+----------
+
+[PATCH 03/12] scsi: track per-SCSIRequest AioContext
+
+Save the context in each request/cmd.
+
+diff --git a/hw/scsi/scsi-bus.c b/hw/scsi/scsi-bus.c
+index 7d4546800f..846bbbf0ec 100644
+--- a/hw/scsi/scsi-bus.c
++++ b/hw/scsi/scsi-bus.c
+@@ -868,6 +868,7 @@ invalid_opcode:
+         }
+     }
+
++    req->ctx = qemu_get_current_aio_context();
+     req->cmd = cmd;
+     req->residual = req->cmd.xfer;
+
+727 AioContext *qemu_get_current_aio_context(void)
+728 {
+729     AioContext *ctx = get_my_aiocontext();
+730     if (ctx) {
+731         return ctx;
+732     }
+733     if (bql_locked()) {
+734         /* Possibly in a vCPU thread.  */
+735         return qemu_get_aio_context();
+736     }
+737     return NULL;
+738 }
+
+----------
+
+[PATCH 04/12] scsi: introduce requests_lock
+
+Now it is mutiqueue. We need a lock to protect per-device request list.
+
+diff --git a/include/hw/scsi/scsi.h b/include/hw/scsi/scsi.h
+index ffc48203f9..90ee192b4d 100644
+--- a/include/hw/scsi/scsi.h
++++ b/include/hw/scsi/scsi.h
+@@ -49,6 +49,8 @@ struct SCSIRequest {
+     bool              dma_started;
+     BlockAIOCB        *aiocb;
+     QEMUSGList        *sg;
++
++    /* Protected by SCSIDevice->requests_lock */
+     QTAILQ_ENTRY(SCSIRequest) next;
+ };
+
+@@ -77,10 +79,7 @@ struct SCSIDevice
+     uint8_t sense[SCSI_SENSE_BUF_SIZE];
+     uint32_t sense_len;
+
+-    /*
+-     * The requests list is only accessed from the AioContext that executes
+-     * requests or from the main loop when IOThread processing is stopped.
+-     */
++    QemuMutex requests_lock; /* protects the requests list */
+     QTAILQ_HEAD(, SCSIRequest) requests;
+
+----------
+
+[PATCH 05/12] virtio-scsi: introduce event and ctrl virtqueue locks
+
+Add per-hba lock for ctrl/event queue.
+
+diff --git a/include/hw/virtio/virtio-scsi.h b/include/hw/virtio/virtio-scsi.h
+index be230cd4bf..4ee98ebf63 100644
+--- a/include/hw/virtio/virtio-scsi.h
++++ b/include/hw/virtio/virtio-scsi.h
+@@ -84,6 +84,9 @@ struct VirtIOSCSI {
+     int resetting; /* written from main loop thread, read from any thread */
+     bool events_dropped;
+
++    QemuMutex ctrl_lock; /* protects ctrl_vq */
++    QemuMutex event_lock; /* protects event_vq */
++
+     /*
+      * TMFs deferred to main loop BH. These fields are protected by
+      * tmf_bh_lock.
+
+----------
+
+[PATCH 06/12] virtio-scsi: protect events_dropped field
+
+Related to patch 05. Now use event_lock to protect s->events_dropped too.
+
+----------
+
+[PATCH 07/12] virtio-scsi: perform TMFs in appropriate AioContexts
+
+----------
+
+[PATCH 08/12] virtio-blk: extract cleanup_iothread_vq_mapping() function
+
+Extract some code as a shared function from virtio-blk. The function
+will be used by virtio-scsi soon.
+
++/**
++ * cleanup_iothread_vq_mapping:
++ * @list: The mapping of virtqueues to IOThreads.
++ *
++ * Release IOThread object references that were acquired by
++ * apply_iothread_vq_mapping().
++ */
++static void cleanup_iothread_vq_mapping(IOThreadVirtQueueMappingList *list)
++{
++    IOThreadVirtQueueMappingList *node;
++
++    for (node = list; node; node = node->next) {
++        IOThread *iothread = iothread_by_id(node->value->iothread);
++        object_unref(OBJECT(iothread));
++    }
++}
++
+
+----------
+
+[PATCH 09/12] virtio-blk: tidy up iothread_vq_mapping functions
+
+Rename a function in virtio-blk, to be used by virtio-scsi.
+
+----------
+
+[PATCH 10/12] virtio: extract iothread-vq-mapping.h API
+
+Move some API from virtio-blk to virtio-scsi.
+
+----------
+
+[PATCH 11/12] virtio-scsi: add iothread-vq-mapping parameter
+
+Main patch of the entire patchset.
+
+----------
+
+[PATCH 12/12] virtio-scsi: handle ctrl virtqueue in main loop
+
+----------
+
+

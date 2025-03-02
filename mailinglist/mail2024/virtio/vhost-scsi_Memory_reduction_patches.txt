@@ -1,0 +1,218 @@
+[PATCH v2 0/8] vhost-scsi: Memory reduction patches
+
+... from Mike Christie <michael.christie@oracle.com> ...
+
+https://lore.kernel.org/all/20241203191705.19431-1-michael.christie@oracle.com/
+
+--------------------------
+
+For a simple device with 1 queue and 128 cmds we use around 25 MB. These
+patches allow us to reduce that to 8.2 MB when supporting up to 128 8 MB
+IOs (the current passthrough max size).
+
+For a more complex device with 16 queues we use around 2.5 GB. These
+patches allow us to reduce that to 77.1 MB when supporting 1024 8 MB IOs.
+
+--------------------------
+
+[PATCH v2 1/8] vhost-scsi: Reduce mem use by moving upages to per queue
+
+vhost_scsi_cmd->tvc_upages is used only temporarily in submission.
+
+Make it per vq, not per cmd.
+
+--------------------------
+
+[PATCH v2 2/8] vhost-scsi: Allocate T10 PI structs only when enabled
+
+Allocate vhost_scsi_cmd->tvc_prot_sgl only when VIRTIO_SCSI_F_T10_PI is set.
+
+--------------------------
+
+[PATCH v2 3/8] vhost-scsi: Add better resource allocation failure handling
+
+Introduce a new function to handler ENOMEM.
+
+This implementation is buggy.
+
++static void
++vhost_scsi_send_status(struct vhost_scsi *vs, struct vhost_virtqueue *vq,
++		       int head, unsigned int out, u8 status)
++{
++	struct virtio_scsi_cmd_resp __user *resp;
++	struct virtio_scsi_cmd_resp rsp;
++	int ret;
++
++	memset(&rsp, 0, sizeof(rsp));
++	rsp.status = status;
++	resp = vq->iov[out].iov_base;
++	ret = __copy_to_user(resp, &rsp, sizeof(rsp));
++	if (!ret)
++		vhost_add_used_and_signal(&vs->dev, vq, head, 0);
++	else
++		pr_err("Faulted on virtio_scsi_cmd_resp\n");
++}
+
+Return SAM_STAT_TASK_SET_FULL on ENOMEM.
+
+--------------------------
+
+[PATCH v2 4/8] vhost-scsi: Return queue full for page alloc failures during copy
+
+Return ENOMEM in more places so that vhost_scsi_send_status() can return SAM_STAT_TASK_SET_FULL.
+
+--------------------------
+
+[PATCH v2 5/8] vhost-scsi: Dynamically allocate scatterlists
+
+1. Create inline sgl.
+
+2. Use sg_alloc_table_chained() to allocate sgl. If inline if enough use inline.
+
+Otherwise, allocate.
+
+3. Iterate sg with for_each_sgtable_sg().
+
+4. Use sg_free_table_chained() to free.
+
+--------------------------
+
+[PATCH v2 6/8] vhost-scsi: Stop duplicating se_cmd fields
+
+Remove duplicate fields in both vhost_scsi_cmd and vhost_scsi_cmd.tvc_se_cmd (se_cmd).
+
+I.e. tvc_tag.
+
+--------------------------
+
+[PATCH v2 7/8] vhost-scsi: Allocate iov_iter used for unaligned copies when needed
+
+vhost_scsi_cmd->saved_iter is used only is rare case. It takes almost 5% of
+the mem used for the vhost_scsi_cmd.
+
+@@ -112,8 +112,8 @@ struct vhost_scsi_cmd {
+ 	u32 tvc_sgl_count;
+ 	u32 tvc_prot_sgl_count;
+ 	u32 copied_iov:1;
+-	const void *saved_iter_addr;
+-	struct iov_iter saved_iter;
++	const void *read_iov;
++	struct iov_iter *read_iter;
+ 	struct scatterlist *sgl;
+ 	struct sg_table table;
+ 	struct scatterlist *prot_sgl;
+
+ 43 struct iov_iter {
+ 44         u8 iter_type;
+ 45         bool nofault;
+ 46         bool data_source;
+ 47         size_t iov_offset;
+ 48         /*
+ 49          * Hack alert: overlay ubuf_iovec with iovec + count, so
+ 50          * that the members resolve correctly regardless of the type
+ 51          * of iterator used. This means that you can use:
+ 52          *
+ 53          * &iter->__ubuf_iovec or iter->__iov
+ 54          *
+ 55          * interchangably for the user_backed cases, hence simplifying
+ 56          * some of the cases that need to deal with both.
+ 57          */
+ 58         union {
+ 59                 /*
+ 60                  * This really should be a const, but we cannot do that without
+ 61                  * also modifying any of the zero-filling iter init functions.
+ 62                  * Leave it non-const for now, but it should be treated as such.
+ 63                  */
+ 64                 struct iovec __ubuf_iovec;
+ 65                 struct {
+ 66                         union {
+ 67                                 /* use iter_iov() to get the current vec */
+ 68                                 const struct iovec *__iov;
+ 69                                 const struct kvec *kvec;
+ 70                                 const struct bio_vec *bvec;
+ 71                                 const struct folio_queue *folioq;
+ 72                                 struct xarray *xarray;
+ 73                                 void __user *ubuf;
+ 74                         };
+ 75                         size_t count;
+ 76                 };
+ 77         };
+ 78         union {
+ 79                 unsigned long nr_segs;
+ 80                 u8 folioq_slot;
+ 81                 loff_t xarray_start;
+ 82         };
+ 83 };
+
+--------------------------
+
+[PATCH v2 8/8] vhost-scsi: Reduce response iov mem use
+
+tv_cmd->tvc_resp_iov takes a lot of memory.
+
+Create inline resp iov. If the resp header takes one iovec, use inline.
+Otherwise, allocate on-deman.
+
+@@ -106,8 +111,6 @@ struct vhost_scsi_inflight {
+ struct vhost_scsi_cmd {
+ 	/* Descriptor from vhost_get_vq_desc() for virt_queue segment */
+ 	int tvc_vq_desc;
+-	/* virtio-scsi response incoming iovecs */
+-	int tvc_in_iovs;
+ 	/* The number of scatterlists associated with this cmd */
+ 	u32 tvc_sgl_count;
+ 	u32 tvc_prot_sgl_count;
+@@ -118,8 +121,12 @@ struct vhost_scsi_cmd {
+ 	struct sg_table table;
+ 	struct scatterlist *prot_sgl;
+ 	struct sg_table prot_table;
+-	/* Pointer to response header iovec */
+-	struct iovec *tvc_resp_iov;
++	/* Fast path response header iovec used when only one vec is needed */
++	struct iovec tvc_resp_iov;
++	/* Number of iovs for response */
++	unsigned int tvc_resp_iovs_cnt;
++	/* Pointer to response header iovecs if more than one is needed */
++	struct iovec *tvc_resp_iovs;
+ 	/* Pointer to vhost_virtqueue for the cmd */
+ 	struct vhost_virtqueue *tvc_vq;
+ 	/* The TCM I/O descriptor that is accessed via container_of() */
+
++static int
++vhost_scsi_setup_resp_iovs(struct vhost_scsi_cmd *cmd, struct iovec *in_iovs,
++			   unsigned int in_iovs_cnt)
++{
++	int i, cnt;
++
++	if (!in_iovs_cnt)
++		return 0;
++	/*
++	 * Initiator's normally just put the virtio_scsi_cmd_resp in the first
++	 * iov, but just in case they wedged in some data with it we check for
++	 * greater than or equal to the response struct.
++	 */
++	if (in_iovs[0].iov_len >= sizeof(struct virtio_scsi_cmd_resp)) {
++		cmd->tvc_resp_iovs = &cmd->tvc_resp_iov;
++		cmd->tvc_resp_iovs_cnt = 1;
++	} else {
++		/*
++		 * Legacy descriptor layouts didn't specify that we must put
++		 * the entire response in one iov. Worst case we have a
++		 * iov per byte.
++		 */
++		cnt = min(VHOST_SCSI_MAX_RESP_IOVS, in_iovs_cnt);
++		cmd->tvc_resp_iovs = kcalloc(cnt, sizeof(struct iovec),
++					     GFP_KERNEL);
++		if (!cmd->tvc_resp_iovs)
++			return -ENOMEM;
++
++		cmd->tvc_resp_iovs_cnt = cnt;
++	}
++
++	for (i = 0; i < cmd->tvc_resp_iovs_cnt; i++)
++		cmd->tvc_resp_iovs[i] = in_iovs[i];
++
++	return 0;
++}
+
+--------------------------
