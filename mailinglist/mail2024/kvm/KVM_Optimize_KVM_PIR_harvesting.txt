@@ -1,0 +1,216 @@
+[PATCH 0/8] x86/irq: KVM: Optimize KVM's PIR harvesting
+
+... from Sean Christopherson <seanjc@google.com> ...
+
+https://lore.kernel.org/all/20250315030630.2371712-1-seanjc@google.com/
+
+--------------------------
+
+Indeed the core change is based on this one:
+
+[PATCH v3  00/12] Coalesced Interrupt Delivery with posted MSI
+https://lore.kernel.org/all/20240423174114.526704-1-jacob.jun.pan@linux.intel.com/
+
+This patchset borrows the same techniques from the above patchset.
+
+That is:
+
+Optimizing KVM's PIR harvesting using the same techniques as posted MSIs,
+most notably to use 8-byte accesses on 64-bit kernels (/facepalm).
+
+--------------------------
+
+[PATCH 1/8] x86/irq: Ensure initial PIR loads are performed exactly once
+
+diff --git a/arch/x86/kernel/irq.c b/arch/x86/kernel/irq.c
+index 385e3a5fc304..9e5263887ff6 100644
+--- a/arch/x86/kernel/irq.c
++++ b/arch/x86/kernel/irq.c
+@@ -412,7 +412,7 @@ static __always_inline bool handle_pending_pir(u64 *pir, struct pt_regs *regs)
+ 	bool handled = false;
+ 
+ 	for (i = 0; i < 4; i++)
+-		pir_copy[i] = pir[i];
++		pir_copy[i] = READ_ONCE(pir[i]);
+ 
+ 	for (i = 0; i < 4; i++) {
+ 		if (!pir_copy[i])
+
+--------------------------
+
+[PATCH 2/8] x86/irq: Track if IRQ was found in PIR during initial loop (to load PIR vals)
+
+The core idea is to move 'handled' as 'found_irq' earlier to the beginning of
+function, in order to skip more un-used code.
+
+diff --git a/arch/x86/kernel/irq.c b/arch/x86/kernel/irq.c
+index 9e5263887ff6..3f95b00ccd7f 100644
+--- a/arch/x86/kernel/irq.c
++++ b/arch/x86/kernel/irq.c
+@@ -409,25 +409,28 @@ static __always_inline bool handle_pending_pir(u64 *pir, struct pt_regs *regs)
+ {
+ 	int i, vec = FIRST_EXTERNAL_VECTOR;
+ 	unsigned long pir_copy[4];
+-	bool handled = false;
++	bool found_irq = false;
+ 
+-	for (i = 0; i < 4; i++)
++	for (i = 0; i < 4; i++) {
+ 		pir_copy[i] = READ_ONCE(pir[i]);
++		if (pir_copy[i])
++			found_irq = true;
++	}
++
++	if (!found_irq)
++		return false;
+ 
+ 	for (i = 0; i < 4; i++) {
+ 		if (!pir_copy[i])
+ 			continue;
+ 
+ 		pir_copy[i] = arch_xchg(&pir[i], 0);
+-		handled = true;
+ 	}
+ 
+-	if (handled) {
+-		for_each_set_bit_from(vec, pir_copy, FIRST_SYSTEM_VECTOR)
+-			call_irq_handler(vec, regs);
+-	}
++	for_each_set_bit_from(vec, pir_copy, FIRST_SYSTEM_VECTOR)
++		call_irq_handler(vec, regs);
+ 
+-	return handled;
++	return true;
+ }
+
+--------------------------
+
+[PATCH 3/8] KVM: VMX: Ensure vIRR isn't reloaded at odd times when sync'ing PIR
+
+The original code.
+
+672 bool __kvm_apic_update_irr(u32 *pir, void *regs, int *max_irr)
+673 {
+674         u32 i, vec;
+675         u32 pir_val, irr_val, prev_irr_val;
+676         int max_updated_irr;
+677
+678         max_updated_irr = -1;
+679         *max_irr = -1;
+680
+681         for (i = vec = 0; i <= 7; i++, vec += 32) {
+682                 u32 *p_irr = (u32 *)(regs + APIC_IRR + i * 0x10);
+683
+684                 irr_val = *p_irr;  ===> the change is to read once here to avoid reload.
+685                 pir_val = READ_ONCE(pir[i]);
+
+
+In practice, a reload is functionally benign as vcpu->mutex is held and so IRQs
+can be consumed, i.e. new IRQs can appear, but existing IRQs can't disappear.
+
+--------------------------
+
+[PATCH 4/8] x86/irq: KVM: Track PIR bitmap as an "unsigned long" array
+
+No functional change.
+
+Change layout format of pi_desc.
+
+ #define PID_TABLE_ENTRY_VALID 1
+ 
++#define NR_PIR_VECTORS	256
++#define NR_PIR_WORDS	(NR_PIR_VECTORS / BITS_PER_LONG)
++
+ /* Posted-Interrupt Descriptor */
+ struct pi_desc {
+-	union {
+-		u32 pir[8];     /* Posted interrupt requested */
+-		u64 pir64[4];
+-	};
++	unsigned long pir[NR_PIR_WORDS];     /* Posted interrupt requested */
+ 	union {
+ 		struct {
+ 			u16	notifications; /* Suppress and outstanding bits */
+
+--------------------------
+
+[PATCH 5/8] KVM: VMX: Process PIR using 64-bit accesses on 64-bit kernels
+
+Change the way reading PIR. Make it more similar to kernel posted interrupt.
+
+--------------------------
+
+[PATCH 6/8] KVM: VMX: Isolate pure loads from atomic XCHG when processing PIR
+
+Make it as the same as [PATCH 2/8].
+
+--------------------------
+
+[PATCH 7/8] KVM: VMX: Use arch_xchg() when processing PIR to avoid instrumentation
+
+Replace xchg() with arch_xchg().
+
+4753 #define xchg(ptr, ...) \
+4754 ({ \
+4755         typeof(ptr) __ai_ptr = (ptr); \
+4756         kcsan_mb(); \
+4757         instrument_atomic_read_write(__ai_ptr, sizeof(*__ai_ptr)); \
+4758         raw_xchg(__ai_ptr, __VA_ARGS__); \
+4759 })
+
+
+38 /* 
+39  * An exchange-type operation, which takes a value and a pointer, and
+40  * returns the old value.
+41  */
+42 #define __xchg_op(ptr, arg, op, lock)                                   \
+43         ({                                                              \
+44                 __typeof__ (*(ptr)) __ret = (arg);                      \
+45                 switch (sizeof(*(ptr))) {                               \
+46                 case __X86_CASE_B:                                      \
+47                         asm volatile (lock #op "b %b0, %1\n"            \
+48                                       : "+q" (__ret), "+m" (*(ptr))     \
+49                                       : : "memory", "cc");              \
+50                         break;                                          \
+51                 case __X86_CASE_W:                                      \
+52                         asm volatile (lock #op "w %w0, %1\n"            \
+53                                       : "+r" (__ret), "+m" (*(ptr))     \
+54                                       : : "memory", "cc");              \
+55                         break;                                          \
+56                 case __X86_CASE_L:                                      \
+57                         asm volatile (lock #op "l %0, %1\n"             \
+58                                       : "+r" (__ret), "+m" (*(ptr))     \
+59                                       : : "memory", "cc");              \
+60                         break;                                          \
+61                 case __X86_CASE_Q:                                      \
+62                         asm volatile (lock #op "q %q0, %1\n"            \
+63                                       : "+r" (__ret), "+m" (*(ptr))     \
+64                                       : : "memory", "cc");              \
+65                         break;                                          \
+66                 default:                                                \
+67                         __ ## op ## _wrong_size();                      \
+68                 }                                                       \
+69                 __ret;                                                  \
+70         })
+71 
+72 /*
+73  * Note: no "lock" prefix even on SMP: xchg always implies lock anyway.
+74  * Since this is generally used to protect other memory information, we
+75  * use "asm volatile" and "memory" clobbers to prevent gcc from moving
+76  * information around.
+77  */
+78 #define arch_xchg(ptr, v)       __xchg_op((ptr), (v), xchg, "")
+
+--------------------------
+
+[PATCH 8/8] x86/irq: KVM: Add helper for harvesting PIR to deduplicate KVM and posted MSIs
+
+Now both kernel and KVM posted interrupt handling code are similar.
+
+Exract the common part.
+
+No functional change.
+
+--------------------------
+
+
