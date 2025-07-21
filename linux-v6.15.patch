@@ -1,6 +1,6 @@
-From a239a9d0ff0790f22b92e1027ae997a56be59304 Mon Sep 17 00:00:00 2001
+From 5d9930166b44c5b4e4fc2fc6e7c6b040f2bdf056 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Fri, 27 Jun 2025 10:13:49 -0700
+Date: Mon, 21 Jul 2025 15:11:08 -0700
 Subject: [PATCH 1/1] linux-v6.15
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
@@ -9,12 +9,14 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  arch/x86/kernel/apic/apic_flat_64.c |  57 ++++++
  arch/x86/kernel/apic/probe_64.c     |  54 ++++++
  arch/x86/kernel/apic/x2apic_phys.c  |  59 +++++++
+ arch/x86/kernel/cpu/bus_lock.c      |  47 +++++
+ arch/x86/kernel/traps.c             |   6 +
  arch/x86/kvm/irq.c                  |  12 ++
  arch/x86/kvm/irq_comm.c             |  10 ++
  arch/x86/kvm/lapic.c                | 261 ++++++++++++++++++++++++++++
  arch/x86/kvm/lapic.h                |  30 ++++
  arch/x86/kvm/x86.c                  |   7 +
- 9 files changed, 510 insertions(+)
+ 11 files changed, 563 insertions(+)
 
 diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
 index 7bc174a1f..7e949cd95 100644
@@ -271,6 +273,137 @@ index 12d4c3554..9f904028e 100644
  static struct apic apic_x2apic_phys __ro_after_init = {
  
  	.name				= "physical x2apic",
+diff --git a/arch/x86/kernel/cpu/bus_lock.c b/arch/x86/kernel/cpu/bus_lock.c
+index 237faf7e7..264b7908b 100644
+--- a/arch/x86/kernel/cpu/bus_lock.c
++++ b/arch/x86/kernel/cpu/bus_lock.c
+@@ -46,6 +46,12 @@ static const struct {
+ static struct ratelimit_state bld_ratelimit;
+ 
+ static unsigned int sysctl_sld_mitigate = 1;
++/*
++ * 在以下使用buslock_sem:
++ *   - arch/x86/kernel/cpu/bus_lock.c|49| <<global>> static DEFINE_SEMAPHORE(buslock_sem, 1);
++ *   - arch/x86/kernel/cpu/bus_lock.c|186| <<__split_lock_reenable_unlock>> up(&buslock_sem);
++ *   - arch/x86/kernel/cpu/bus_lock.c|262| <<split_lock_warn>> if (down_interruptible(&buslock_sem) == -EINTR)
++ */
+ static DEFINE_SEMAPHORE(buslock_sem, 1);
+ 
+ #ifdef CONFIG_PROC_SYSCTL
+@@ -130,6 +136,10 @@ static void __init sld_state_setup(void)
+ 	sld_state = state;
+ }
+ 
++/*
++ * 在以下使用__split_lock_setup():
++ *   - arch/x86/kernel/cpu/bus_lock.c|387| <<split_lock_setup>> __split_lock_setup();
++ */
+ static void __init __split_lock_setup(void)
+ {
+ 	if (!split_lock_verify_msr(false)) {
+@@ -155,6 +165,13 @@ static void __init __split_lock_setup(void)
+  * is not implemented as one thread could undo the setting of the other
+  * thread immediately after dropping the lock anyway.
+  */
++/*
++ * 在以下使用sld_update_msr():
++ *   - arch/x86/kernel/cpu/bus_lock.c|185| <<__split_lock_reenable_unlock>> sld_update_msr(true);
++ *   - arch/x86/kernel/cpu/bus_lock.c|193| <<__split_lock_reenable>> sld_update_msr(true);
++ *   - arch/x86/kernel/cpu/bus_lock.c|235| <<splitlock_cpu_offline>> sld_update_msr(true);
++ *   - arch/x86/kernel/cpu/bus_lock.c|271| <<split_lock_warn>> sld_update_msr(false);
++ */
+ static void sld_update_msr(bool on)
+ {
+ 	u64 test_ctrl_val = msr_test_ctrl_cache;
+@@ -183,6 +200,12 @@ void split_lock_init(void)
+ static void __split_lock_reenable_unlock(struct work_struct *work)
+ {
+ 	sld_update_msr(true);
++	/*
++	 * 在以下使用buslock_sem:
++	 *   - arch/x86/kernel/cpu/bus_lock.c|49| <<global>> static DEFINE_SEMAPHORE(buslock_sem, 1);
++	 *   - arch/x86/kernel/cpu/bus_lock.c|186| <<__split_lock_reenable_unlock>> up(&buslock_sem);
++	 *   - arch/x86/kernel/cpu/bus_lock.c|262| <<split_lock_warn>> if (down_interruptible(&buslock_sem) == -EINTR)
++	 */
+ 	up(&buslock_sem);
+ }
+ 
+@@ -255,6 +278,12 @@ static void split_lock_warn(unsigned long ip)
+ 		 */
+ 		if (msleep_interruptible(10) > 0)
+ 			return;
++		/*
++		 * 在以下使用buslock_sem:
++		 *   - arch/x86/kernel/cpu/bus_lock.c|49| <<global>> static DEFINE_SEMAPHORE(buslock_sem, 1);
++		 *   - arch/x86/kernel/cpu/bus_lock.c|186| <<__split_lock_reenable_unlock>> up(&buslock_sem);
++		 *   - arch/x86/kernel/cpu/bus_lock.c|262| <<split_lock_warn>> if (down_interruptible(&buslock_sem) == -EINTR)
++		 */
+ 		/*
+ 		 * Misery factor #2:
+ 		 * only allow one buslocked disabled core at a time.
+@@ -322,6 +351,10 @@ bool handle_user_split_lock(struct pt_regs *regs, long error_code)
+ 	return true;
+ }
+ 
++/*
++ * 在以下调用handle_bus_lock():
++ *   - arch/x86/kernel/traps.c|1223| <<exc_debug_user>> handle_bus_lock(regs);
++ */
+ void handle_bus_lock(struct pt_regs *regs)
+ {
+ 	switch (sld_state) {
+@@ -354,6 +387,10 @@ static const struct x86_cpu_id split_lock_cpu_ids[] __initconst = {
+ 	{}
+ };
+ 
++/*
++ * 在以下使用split_lock_setup():
++ *   - arch/x86/kernel/cpu/bus_lock.c|428| <<sld_setup>> split_lock_setup(c);
++ */
+ static void __init split_lock_setup(struct cpuinfo_x86 *c)
+ {
+ 	const struct x86_cpu_id *m;
+@@ -362,6 +399,12 @@ static void __init split_lock_setup(struct cpuinfo_x86 *c)
+ 	if (boot_cpu_has(X86_FEATURE_HYPERVISOR))
+ 		return;
+ 
++	/*
++	 * 只有三个免检的:
++	 * - INTEL_ICELAKE_X
++	 * - INTEL_ICELAKE_L
++	 * - INTEL_ICELAKE_D
++	 */
+ 	/* Check for CPUs that have support but do not enumerate it: */
+ 	m = x86_match_cpu(split_lock_cpu_ids);
+ 	if (m)
+@@ -423,6 +466,10 @@ static void sld_state_show(void)
+ 	}
+ }
+ 
++/*
++ * called by:
++ *   - arch/x86/kernel/cpu/common.c|1709| <<early_identify_cpu>> sld_setup(c);
++ */
+ void __init sld_setup(struct cpuinfo_x86 *c)
+ {
+ 	split_lock_setup(c);
+diff --git a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
+index 9f88b8a78..a0aa50611 100644
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@ -1162,6 +1162,12 @@ static noinstr void exc_debug_kernel(struct pt_regs *regs, unsigned long dr6)
+ 	local_db_restore(dr7);
+ }
+ 
++/*
++ * 在以下使用exc_debug_user():
++ *   - arch/x86/kernel/traps.c|1247| <<DEFINE_IDTENTRY_DEBUG_USER(exc_debug)>> exc_debug_user(regs, debug_read_clear_dr6());
++ *   - arch/x86/kernel/traps.c|1271| <<DEFINE_FREDENTRY_DEBUG(exc_debug)>> exc_debug_user(regs, dr6);
++ *   - arch/x86/kernel/traps.c|1284| <<DEFINE_IDTENTRY_RAW(exc_debug)>> exc_debug_user(regs, dr6);
++ */
+ static noinstr void exc_debug_user(struct pt_regs *regs, unsigned long dr6)
+ {
+ 	bool icebp;
 diff --git a/arch/x86/kvm/irq.c b/arch/x86/kvm/irq.c
 index 63f66c519..e9093f4d2 100644
 --- a/arch/x86/kvm/irq.c
