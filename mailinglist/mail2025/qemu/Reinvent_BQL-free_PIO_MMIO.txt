@@ -1,0 +1,125 @@
+[PATCH v2 0/6] Reinvent BQL-free PIO/MMIO
+
+... Igor Mammedov <imammedo@redhat.com> ...
+
+https://lore.kernel.org/all/20250730123934.1787379-1-imammedo@redhat.com/
+
+----------
+
+When booting WS2025 with following CLI
+ 1)   -M q35,hpet=off -cpu host -enable-kvm -smp 240,sockets=4
+the guest boots very slow and is sluggish after boot
+or it's stuck on boot at spinning circle (most of the time).
+
+
+It is very painful to encounter BQL lock contension during MMIO.
+
+----------
+
+[PATCH v2 1/6] memory: reintroduce BQL-free fine-grained PIO/MMIO
+
+Add a new field to each MemoryRegion.
+
+@@ -833,6 +833,7 @@ struct MemoryRegion {
+     bool nonvolatile;
+     bool rom_device;
+     bool flush_coalesced_mmio;
++    bool lockless_io;
+
+
+Add a function to configure the new field.
+
++void memory_region_enable_lockless_io(MemoryRegion *mr)
++{
++    mr->lockless_io = true;
++    mr->disable_reentrancy_guard = true;
++}
+
+
+Lock BQL only conditionally now!
+
+@@ -2909,7 +2909,7 @@ bool prepare_mmio_access(MemoryRegion *mr)
+ {
+     bool release_lock = false;
+ 
+-    if (!bql_locked()) {
++    if (!bql_locked() && !mr->lockless_io) {
+         bql_lock();
+         release_lock = true;
+
+----------
+
+[PATCH v2 2/6] acpi: mark PMTIMER as unlocked
+
+Don't use BQL to protec READ of QEMU_CLOCK_VIRTUAL.
+
+@@ -547,6 +547,7 @@ void acpi_pm_tmr_init(ACPIREGS *ar, acpi_update_sci_fn update_sci,
+     ar->tmr.timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, acpi_pm_tmr_timer, ar);
+     memory_region_init_io(&ar->tmr.io, memory_region_owner(parent),
+                           &acpi_pm_tmr_ops, ar, "acpi-tmr", 4);
++    memory_region_enable_lockless_io(&ar->tmr.io);
+     memory_region_add_subregion(parent, 8, &ar->tmr.io);
+ }
+
+----------
+
+[PATCH v2 3/6] hpet: switch to fain-grained device locking
+
+Since [PATCH v2 2/6] made ar->tmr.io lockless, add new lock to protect HPET.
+
+@@ -69,6 +70,7 @@ struct HPETState {
+     SysBusDevice parent_obj;
+     /*< public >*/
+
++    QemuMutex lock;
+     MemoryRegion iomem;
+     uint64_t hpet_offset;
+     bool hpet_offset_saved;
+
+----------
+
+[PATCH v2 4/6] hpet: move out main counter read into a separate block
+
+No funtional change.
+
+Only to extract some code to prepare for not protected.
+
+----------
+
+[PATCH v2 5/6] hpet: make main counter read lock-less
+
+Now HPET main counter read is lock-less.
+
+As result micro benchmark of concurrent reading of HPET counter
+with large number of vCPU shows over 80% better (less) latency.
+
+----------
+
+[PATCH v2 6/6] kvm: i386: irqchip: take BQL only if there is an interrupt
+
+Even when READING PM/HPET timers is lockless, there is still lock contention when kernel-irqchip=split.
+
+Problematic path is in kvm_arch_pre_run() where BQL is taken
+unconditionally when split irqchip is in use.
+
+There are a few parts tha BQL protects there:
+  1. interrupt check and injecting
+
+    however we do not take BQL when checking for pending
+    interrupt (even within the same function), so the patch
+    takes the same approach for cpu->interrupt_request checks
+    and takes BQL only if there is a job to do.
+
+  2. request_interrupt_window access
+      CPUState::kvm_run::request_interrupt_window doesn't need BQL
+      as it's accessed on side QEMU only by its own vCPU thread.
+      The only thing that BQL provides there is implict barrier.
+      Which can be done by using cheaper explicit barrier there.
+
+  3. cr8/cpu_get_apic_tpr access
+      the same (as #2) applies to CPUState::kvm_run::cr8 write,
+      and APIC registers are also cached/synced (get/put) within
+      the vCPU thread it belongs to.
+
+
+----------

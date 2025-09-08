@@ -1,0 +1,2206 @@
+From fa031f624187318c339ba073dce00c45aadb92f9 Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Sun, 7 Sep 2025 18:26:22 -0700
+Subject: [PATCH 1/1] linux v5.15.0-312.185.1
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ arch/x86/entry/vdso/vma.c                |  25 ++
+ arch/x86/include/asm/kvm_host.h          |  79 ++++
+ arch/x86/include/asm/pvclock.h           |  39 ++
+ arch/x86/include/asm/vdso/gettimeofday.h |  16 +
+ arch/x86/kernel/kvmclock.c               |  27 ++
+ arch/x86/kernel/pvclock.c                |  68 +++
+ arch/x86/kvm/hyperv.c                    |   9 +
+ arch/x86/kvm/lapic.c                     |  60 +++
+ arch/x86/kvm/mmu/mmu.c                   |  67 +++
+ arch/x86/kvm/x86.c                       | 543 +++++++++++++++++++++++
+ arch/x86/kvm/x86.h                       |   9 +
+ arch/x86/xen/time.c                      |   6 +
+ drivers/net/virtio_net.c                 |  72 +++
+ drivers/ptp/ptp_kvm_x86.c                |   5 +
+ include/linux/kvm_host.h                 |  39 ++
+ lib/vdso/gettimeofday.c                  |   5 +
+ virt/kvm/kvm_main.c                      | 168 +++++++
+ 17 files changed, 1237 insertions(+)
+
+diff --git a/arch/x86/entry/vdso/vma.c b/arch/x86/entry/vdso/vma.c
+index a380f7ecdd54..7bc77056ef20 100644
+--- a/arch/x86/entry/vdso/vma.c
++++ b/arch/x86/entry/vdso/vma.c
+@@ -56,6 +56,13 @@ void __init init_vdso_image(const struct vdso_image *image)
+ static const struct vm_special_mapping vvar_mapping;
+ struct linux_binprm;
+ 
++/*
++ * 236 static const struct vm_special_mapping vdso_mapping = {
++ * 237         .name = "[vdso]",
++ * 238         .fault = vdso_fault,
++ * 239         .mremap = vdso_mremap,
++ * 240 };
++ */
+ static vm_fault_t vdso_fault(const struct vm_special_mapping *sm,
+ 		      struct vm_area_struct *vma, struct vm_fault *vmf)
+ {
+@@ -86,6 +93,13 @@ static void vdso_fix_landing(const struct vdso_image *image,
+ #endif
+ }
+ 
++/*
++ * 236 static const struct vm_special_mapping vdso_mapping = {
++ * 237         .name = "[vdso]",
++ * 238         .fault = vdso_fault,
++ * 239         .mremap = vdso_mremap,
++ * 240 };
++ */
+ static int vdso_mremap(const struct vm_special_mapping *sm,
+ 		struct vm_area_struct *new_vma)
+ {
+@@ -147,6 +161,12 @@ static inline struct page *find_timens_vvar_page(struct vm_area_struct *vma)
+ }
+ #endif
+ 
++/*
++ * 255 static const struct vm_special_mapping vvar_mapping = {
++ * 256         .name = "[vvar]",
++ * 257         .fault = vvar_fault,
++ * 258 };
++ */
+ static vm_fault_t vvar_fault(const struct vm_special_mapping *sm,
+ 		      struct vm_area_struct *vma, struct vm_fault *vmf)
+ {
+@@ -202,6 +222,11 @@ static vm_fault_t vvar_fault(const struct vm_special_mapping *sm,
+ 
+ 		return vmf_insert_pfn(vma, vmf->address, pfn);
+ 	} else if (sym_offset == image->sym_pvclock_page) {
++		/*
++		 * 在以下使用pvclock_get_pvti_cpu0_va():
++		 *   - arch/x86/entry/vdso/vma.c|206| <<vvar_fault>> pvclock_get_pvti_cpu0_va();
++		 *   - drivers/ptp/ptp_kvm_x86.c|48| <<kvm_arch_ptp_init>> if (!pvclock_get_pvti_cpu0_va()) {
++		 */
+ 		struct pvclock_vsyscall_time_info *pvti =
+ 			pvclock_get_pvti_cpu0_va();
+ 		if (pvti && vclock_was_used(VDSO_CLOCKMODE_PVCLOCK)) {
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 8b6149faa33f..829e0458d1a0 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -70,6 +70,26 @@
+ #define KVM_REQ_REPORT_TPR_ACCESS	KVM_ARCH_REQ(1)
+ #define KVM_REQ_TRIPLE_FAULT		KVM_ARCH_REQ(2)
+ #define KVM_REQ_MMU_SYNC		KVM_ARCH_REQ(3)
++/*
++ * 在以下使用KVM_REQ_CLOCK_UPDATE:
++ *   - arch/x86/kvm/x86.c|2881| <<kvm_gen_update_masterclock>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/x86.c|3030| <<kvm_guest_time_update>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, v);
++ *   - arch/x86/kvm/x86.c|3122| <<kvmclock_update_fn>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/x86.c|3131| <<kvm_gen_kvmclock_update>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, v);
++ *   - arch/x86/kvm/x86.c|3515| <<kvm_set_msr_common(MSR_IA32_TSC_ADJUST)>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/x86.c|4547| <<kvm_arch_vcpu_load>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/x86.c|5107| <<kvm_set_guest_paused>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/x86.c|6436| <<kvm_arch_vm_ioctl(KVM_SET_CLOCK)>> kvm_make_all_cpus_request(kvm, KVM_REQ_CLOCK_UPDATE);
++ *   - arch/x86/kvm/x86.c|8594| <<kvm_hyperv_tsc_notifier>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/x86.c|8655| <<__kvmclock_cpufreq_notifier>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/x86.c|9990| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_CLOCK_UPDATE, vcpu)) {
++ *   - arch/x86/kvm/x86.c|10312| <<vcpu_enter_guest>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/x86.c|11569| <<kvm_arch_hardware_enable>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/xen.c|371| <<kvm_xen_vcpu_set_attr>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/xen.c|394| <<kvm_xen_vcpu_set_attr>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++ *
++ * 处理的函数kvm_guest_time_update()
++ */
+ #define KVM_REQ_CLOCK_UPDATE		KVM_ARCH_REQ(4)
+ #define KVM_REQ_LOAD_MMU_PGD		KVM_ARCH_REQ(5)
+ #define KVM_REQ_EVENT			KVM_ARCH_REQ(6)
+@@ -79,11 +99,32 @@
+ #define KVM_REQ_PMU			KVM_ARCH_REQ(10)
+ #define KVM_REQ_PMI			KVM_ARCH_REQ(11)
+ #define KVM_REQ_SMI			KVM_ARCH_REQ(12)
++/*
++ * 在以下使用KVM_REQ_MASTERCLOCK_UPDATE:
++ *   - arch/x86/kvm/hyperv.c|1398| <<kvm_hv_set_msr_pw>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/x86.c|2247| <<kvm_write_system_time>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/x86.c|2474| <<kvm_track_tsc_matching>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/x86.c|9104| <<pvclock_gtod_update_fn>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/x86.c|10312| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu))
++ *   - arch/x86/kvm/x86.c|11956| <<kvm_arch_hardware_enable>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/xen.c|58| <<kvm_xen_shared_info_init>> kvm_make_all_cpus_request(kvm, KVM_REQ_MASTERCLOCK_UPDATE);
++ *
++ * 处理的函数kvm_gen_update_masterclock().
++ */
+ #define KVM_REQ_MASTERCLOCK_UPDATE	KVM_ARCH_REQ(13)
+ #define KVM_REQ_MCLOCK_INPROGRESS \
+ 	KVM_ARCH_REQ_FLAGS(14, KVM_REQUEST_WAIT | KVM_REQUEST_NO_WAKEUP)
+ #define KVM_REQ_SCAN_IOAPIC \
+ 	KVM_ARCH_REQ_FLAGS(15, KVM_REQUEST_WAIT | KVM_REQUEST_NO_WAKEUP)
++/*
++ * 在以下使用KVM_REQ_GLOBAL_CLOCK_UPDATE:
++ *   - arch/x86/kvm/x86.c|2239| <<kvm_write_system_time>> kvm_make_request(KVM_REQ_GLOBAL_CLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/x86.c|4575| <<kvm_arch_vcpu_load>> if (!vcpu->kvm->arch.use_master_clock || vcpu->cpu == -1)
++ *                                      kvm_make_request(KVM_REQ_GLOBAL_CLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/x86.c|9992| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_GLOBAL_CLOCK_UPDATE, vcpu))
++ *
++ * 处理的函数kvm_gen_kvmclock_update().
++ */
+ #define KVM_REQ_GLOBAL_CLOCK_UPDATE	KVM_ARCH_REQ(16)
+ #define KVM_REQ_APIC_PAGE_RELOAD \
+ 	KVM_ARCH_REQ_FLAGS(17, KVM_REQUEST_WAIT | KVM_REQUEST_NO_WAKEUP)
+@@ -749,7 +790,22 @@ struct kvm_vcpu_arch {
+ 	struct pvclock_vcpu_time_info hv_clock;
+ 	unsigned int hw_tsc_khz;
+ 	struct gfn_to_hva_cache pv_time;
++	/*
++	 * 在以下使用kvm_vcpu_arch->pv_time_enabled:
++	 *   - arch/x86/kvm/x86.c|2242| <<kvm_write_system_time>> vcpu->arch.pv_time_enabled = false;
++	 *   - arch/x86/kvm/x86.c|2249| <<kvm_write_system_time>> vcpu->arch.pv_time_enabled = true;
++	 *   - arch/x86/kvm/x86.c|3088| <<kvm_guest_time_update>> if (vcpu->pv_time_enabled)
++	 *   - arch/x86/kvm/x86.c|3286| <<kvmclock_reset>> vcpu->arch.pv_time_enabled = false;
++	 *   - arch/x86/kvm/x86.c|5108| <<kvm_set_guest_paused>> if (!vcpu->arch.pv_time_enabled)
++	 *   - arch/x86/kvm/x86.c|6133| <<kvm_arch_suspend_notifier>> if (!vcpu->arch.pv_time_enabled)
++	 */
+ 	bool pv_time_enabled;
++	/*
++	 * 在以下使用kvm_vcou_arch->pvclock_set_guest_stopped_request:
++	 *   - arch/x86/kvm/x86.c|3033| <<kvm_setup_pvclock_page>> if (vcpu->pvclock_set_guest_stopped_request) {
++	 *   - arch/x86/kvm/x86.c|3035| <<kvm_setup_pvclock_page>> vcpu->pvclock_set_guest_stopped_request = false;
++	 *   - arch/x86/kvm/x86.c|5323| <<kvm_set_guest_paused>> vcpu->arch.pvclock_set_guest_stopped_request = true;
++	 */
+ 	/* set guest stopped flag in pvclock flags field */
+ 	bool pvclock_set_guest_stopped_request;
+ 
+@@ -1185,11 +1241,34 @@ struct kvm_arch {
+ 	u64 cur_tsc_generation;
+ 	int nr_vcpus_matched_tsc;
+ 
++	/*
++	 * 在以下使用kvm_arch->pvclock_gtod_sync_lock:
++	 *   - kvm_synchronize_tsc()
++	 *   - kvm_gen_update_masterclock()
++	 *   - get_kvmclock_ns()
++	 *   - kvm_arch_vm_ioctl(KVM_SET_CLOCK)
++	 *   - kvm_hyperv_tsc_notifier()
++	 *   - kvm_arch_init_vm()
++	 */
+ 	raw_spinlock_t pvclock_gtod_sync_lock;
+ 	bool use_master_clock;
+ 	u64 master_kernel_ns;
+ 	u64 master_cycle_now;
++	/*
++	 * 在以下使用kvm_arch->kvmclock_update_work:
++	 *   - arch/x86/kvm/x86.c|3136| <<kvm_gen_kvmclock_update>> schedule_delayed_work(&kvm->arch.kvmclock_update_work, KVMCLOCK_UPDATE_DELAY);
++	 *   - arch/x86/kvm/x86.c|3152| <<kvmclock_sync_fn>> schedule_delayed_work(&kvm->arch.kvmclock_update_work, 0);
++	 *   - arch/x86/kvm/x86.c|11789| <<kvm_arch_init_vm>> INIT_DELAYED_WORK(&kvm->arch.kvmclock_update_work, kvmclock_update_fn);
++	 *   - arch/x86/kvm/x86.c|11838| <<kvm_arch_sync_events>> cancel_delayed_work_sync(&kvm->arch.kvmclock_update_work);
++	 */
+ 	struct delayed_work kvmclock_update_work;
++	/*
++	 * 在以下使用kvm_arch->kvmclock_sync_work:
++	 *   - arch/x86/kvm/x86.c|3233| <<kvmclock_sync_fn>> schedule_delayed_work(&kvm->arch.kvmclock_sync_work, KVMCLOCK_SYNC_PERIOD);
++	 *   - arch/x86/kvm/x86.c|11489| <<kvm_arch_vcpu_postcreate>> schedule_delayed_work(&kvm->arch.kvmclock_sync_work, KVMCLOCK_SYNC_PERIOD);
++	 *   - arch/x86/kvm/x86.c|11913| <<kvm_arch_init_vm>> INIT_DELAYED_WORK(&kvm->arch.kvmclock_sync_work, kvmclock_sync_fn);
++	 *   - arch/x86/kvm/x86.c|11960| <<kvm_arch_sync_events>> cancel_delayed_work_sync(&kvm->arch.kvmclock_sync_work);
++	 */
+ 	struct delayed_work kvmclock_sync_work;
+ 
+ 	struct kvm_xen_hvm_config xen_hvm_config;
+diff --git a/arch/x86/include/asm/pvclock.h b/arch/x86/include/asm/pvclock.h
+index 19b695ff2c68..4bae4d7eab32 100644
+--- a/arch/x86/include/asm/pvclock.h
++++ b/arch/x86/include/asm/pvclock.h
+@@ -17,6 +17,13 @@ void pvclock_resume(void);
+ 
+ void pvclock_touch_watchdogs(void);
+ 
++/*
++ * 在以下使用pvclock_read_begin():
++ *   - arch/x86/include/asm/vdso/gettimeofday.h|226| <<vread_pvclock>> version = pvclock_read_begin(pvti);
++ *   - arch/x86/kernel/pvclock.c|60| <<pvclock_read_flags>> version = pvclock_read_begin(src);
++ *   - arch/x86/kernel/pvclock.c|75| <<pvclock_clocksource_read>> version = pvclock_read_begin(src);
++ *   - drivers/ptp/ptp_kvm_x86.c|112| <<kvm_arch_ptp_get_crosststamp>> version = pvclock_read_begin(src);
++ */
+ static __always_inline
+ unsigned pvclock_read_begin(const struct pvclock_vcpu_time_info *src)
+ {
+@@ -26,6 +33,13 @@ unsigned pvclock_read_begin(const struct pvclock_vcpu_time_info *src)
+ 	return version;
+ }
+ 
++/*
++ * 在以下使用pvclock_read_retry():
++ *   - arch/x86/include/asm/vdso/gettimeofday.h|232| <<vread_pvclock>> } while (pvclock_read_retry(pvti, version));
++ *   - arch/x86/kernel/pvclock.c|62| <<pvclock_read_flags>> } while (pvclock_read_retry(src, version));
++ *   - arch/x86/kernel/pvclock.c|78| <<pvclock_clocksource_read>> } while (pvclock_read_retry(src, version));
++ *   - drivers/ptp/ptp_kvm_x86.c|124| <<kvm_arch_ptp_get_crosststamp>> } while (pvclock_read_retry(src, version));
++ */
+ static __always_inline
+ bool pvclock_read_retry(const struct pvclock_vcpu_time_info *src,
+ 			unsigned version)
+@@ -39,6 +53,15 @@ bool pvclock_read_retry(const struct pvclock_vcpu_time_info *src,
+  * Scale a 64-bit delta by scaling and multiplying by a 32-bit fraction,
+  * yielding a 64-bit result.
+  */
++/*
++ * 在以下使用pvclock_scale_delta():
++ *   - arch/x86/include/asm/pvclock.h|85| <<__pvclock_read_cycles>> u64 offset = pvclock_scale_delta(delta,
++ *          src->tsc_to_system_mul, src->tsc_shift);
++ *   - arch/x86/kvm/x86.c|2375| <<compute_guest_tsc>> u64 tsc = pvclock_scale_delta(kernel_ns-vcpu->arch.this_tsc_nsec,
++ *          vcpu->arch.virtual_tsc_mult, vcpu->arch.virtual_tsc_shift);
++ *   - arch/x86/kvm/x86.h|354| <<nsec_to_cycles>> return pvclock_scale_delta(nsec,
++ *          vcpu->arch.virtual_tsc_mult, vcpu->arch.virtual_tsc_shift);
++ */
+ static inline u64 pvclock_scale_delta(u64 delta, u32 mul_frac, int shift)
+ {
+ 	u64 product;
+@@ -78,10 +101,26 @@ static inline u64 pvclock_scale_delta(u64 delta, u32 mul_frac, int shift)
+ 	return product;
+ }
+ 
++/*
++ * 在以下使用__pvclock_read_cycles():
++ *   - arch/x86/include/asm/vdso/gettimeofday.h|231| <<vread_pvclock>> ret = __pvclock_read_cycles(pvti, rdtsc_ordered());
++ *   - arch/x86/kernel/pvclock.c|76| <<pvclock_clocksource_read>> ret = __pvclock_read_cycles(src, rdtsc_ordered());
++ *   - arch/x86/kvm/x86.c|2904| <<get_kvmclock_ns>> ret = __pvclock_read_cycles(&hv_clock, rdtsc());
++ *   - drivers/ptp/ptp_kvm_x86.c|123| <<kvm_arch_ptp_get_crosststamp>> *cycle = __pvclock_read_cycles(src, clock_pair->tsc);
++ */
+ static __always_inline
+ u64 __pvclock_read_cycles(const struct pvclock_vcpu_time_info *src, u64 tsc)
+ {
+ 	u64 delta = tsc - src->tsc_timestamp;
++	/*
++	 * 在以下使用pvclock_scale_delta():
++	 *   - arch/x86/include/asm/pvclock.h|85| <<__pvclock_read_cycles>> u64 offset = pvclock_scale_delta(delta,
++	 *          src->tsc_to_system_mul, src->tsc_shift);
++	 *   - arch/x86/kvm/x86.c|2375| <<compute_guest_tsc>> u64 tsc = pvclock_scale_delta(kernel_ns-vcpu->arch.this_tsc_nsec,
++	 *          vcpu->arch.virtual_tsc_mult, vcpu->arch.virtual_tsc_shift);
++	 *   - arch/x86/kvm/x86.h|354| <<nsec_to_cycles>> return pvclock_scale_delta(nsec,
++	 *          vcpu->arch.virtual_tsc_mult, vcpu->arch.virtual_tsc_shift);
++	 */
+ 	u64 offset = pvclock_scale_delta(delta, src->tsc_to_system_mul,
+ 					     src->tsc_shift);
+ 	return src->system_time + offset;
+diff --git a/arch/x86/include/asm/vdso/gettimeofday.h b/arch/x86/include/asm/vdso/gettimeofday.h
+index 1936f21ed8cd..f903e6877340 100644
+--- a/arch/x86/include/asm/vdso/gettimeofday.h
++++ b/arch/x86/include/asm/vdso/gettimeofday.h
+@@ -194,6 +194,10 @@ long clock_getres32_fallback(clockid_t _clkid, struct old_timespec32 *_ts)
+ #endif
+ 
+ #ifdef CONFIG_PARAVIRT_CLOCK
++/*
++ * 在以下使用vread_pvclock():
++ *   - arch/x86/include/asm/vdso/gettimeofday.h|259| <<__arch_get_hw_counter>> return vread_pvclock();
++ */
+ static u64 vread_pvclock(void)
+ {
+ 	const struct pvclock_vcpu_time_info *pvti = &pvclock_page.pvti;
+@@ -223,6 +227,13 @@ static u64 vread_pvclock(void)
+ 	 */
+ 
+ 	do {
++		/*
++		 * 在以下使用pvclock_read_begin():
++		 *   - arch/x86/include/asm/vdso/gettimeofday.h|226| <<vread_pvclock>> version = pvclock_read_begin(pvti);
++		 *   - arch/x86/kernel/pvclock.c|60| <<pvclock_read_flags>> version = pvclock_read_begin(src);
++		 *   - arch/x86/kernel/pvclock.c|75| <<pvclock_clocksource_read>> version = pvclock_read_begin(src);
++		 *   - drivers/ptp/ptp_kvm_x86.c|112| <<kvm_arch_ptp_get_crosststamp>> version = pvclock_read_begin(src);
++		 */
+ 		version = pvclock_read_begin(pvti);
+ 
+ 		if (unlikely(!(pvti->flags & PVCLOCK_TSC_STABLE_BIT)))
+@@ -242,6 +253,11 @@ static u64 vread_hvclock(void)
+ }
+ #endif
+ 
++/*
++ * 在以下使用__arch_get_hw_counter():
++ *   - lib/vdso/gettimeofday.c|73| <<do_hres_timens>> cycles = __arch_get_hw_counter(vd->clock_mode, vd);
++ *   - lib/vdso/gettimeofday.c|144| <<do_hres>> cycles = __arch_get_hw_counter(vd->clock_mode, vd);
++ */
+ static inline u64 __arch_get_hw_counter(s32 clock_mode,
+ 					const struct vdso_data *vd)
+ {
+diff --git a/arch/x86/kernel/kvmclock.c b/arch/x86/kernel/kvmclock.c
+index 8e1cd291aed3..94c008e698ba 100644
+--- a/arch/x86/kernel/kvmclock.c
++++ b/arch/x86/kernel/kvmclock.c
+@@ -46,6 +46,15 @@ early_param("no-kvmclock-vsyscall", parse_no_kvmclock_vsyscall);
+ #define HVC_BOOT_ARRAY_SIZE \
+ 	(PAGE_SIZE / sizeof(struct pvclock_vsyscall_time_info))
+ 
++/*
++ * 在以下使用hv_clock_boot[HVC_BOOT_ARRAY_SIZE]:
++ *   - arch/x86/kernel/kvmclock.c|50| <<global>> hv_clock_boot[HVC_BOOT_ARRAY_SIZE] __bss_decrypted __aligned(PAGE_SIZE);
++ *   - arch/x86/kernel/kvmclock.c|267| <<kvm_setup_vsyscall_timeinfo>> flags = pvclock_read_flags(&hv_clock_boot[0].pvti);
++ *   - arch/x86/kernel/kvmclock.c|293| <<kvmclock_setup_percpu>> p = &hv_clock_boot[cpu];
++ *   - arch/x86/kernel/kvmclock.c|328| <<kvmclock_init>> this_cpu_write(hv_clock_per_cpu, &hv_clock_boot[0]);
++ *   - arch/x86/kernel/kvmclock.c|330| <<kvmclock_init>> pvclock_set_pvti_cpu0_va(hv_clock_boot);
++ *   - arch/x86/kernel/kvmclock.c|335| <<kvmclock_init>> flags = pvclock_read_flags(&hv_clock_boot[0].pvti);
++ */
+ static struct pvclock_vsyscall_time_info
+ 			hv_clock_boot[HVC_BOOT_ARRAY_SIZE] __bss_decrypted __aligned(PAGE_SIZE);
+ static struct pvclock_wall_clock wall_clock __bss_decrypted;
+@@ -76,6 +85,12 @@ static u64 kvm_clock_read(void)
+ 	u64 ret;
+ 
+ 	preempt_disable_notrace();
++	/*
++	 * 在以下使用pvclock_clocksource_read():
++	 *   - arch/x86/kernel/kvmclock.c|79| <<kvm_clock_read>> ret = pvclock_clocksource_read(this_cpu_pvti());
++	 *   - arch/x86/kernel/pvclock.c|161| <<pvclock_read_wallclock>> delta = pvclock_clocksource_read(vcpu_time);
++	 *   - arch/x86/xen/time.c|53| <<xen_clocksource_read>> ret = pvclock_clocksource_read(src);
++	 */
+ 	ret = pvclock_clocksource_read(this_cpu_pvti());
+ 	preempt_enable_notrace();
+ 	return ret;
+@@ -132,6 +147,13 @@ static void __init kvm_get_preset_lpj(void)
+ 	preset_lpj = lpj;
+ }
+ 
++/*
++ * 在以下使用kvm_check_and_clear_guest_paused():
++ *   - kernel/rcu/tree_stall.h|723| <<check_cpu_stall>> if (kvm_check_and_clear_guest_paused())
++ *   - kernel/rcu/tree_stall.h|741| <<check_cpu_stall>> if (kvm_check_and_clear_guest_paused())
++ *   - kernel/watchdog.c|395| <<watchdog_timer_fn>> kvm_check_and_clear_guest_paused();
++ *   - kernel/workqueue.c|5903| <<wq_watchdog_timer_fn>> kvm_check_and_clear_guest_paused();
++ */
+ bool kvm_check_and_clear_guest_paused(void)
+ {
+ 	struct pvclock_vsyscall_time_info *src = this_cpu_hvclock();
+@@ -142,6 +164,11 @@ bool kvm_check_and_clear_guest_paused(void)
+ 
+ 	if ((src->pvti.flags & PVCLOCK_GUEST_STOPPED) != 0) {
+ 		src->pvti.flags &= ~PVCLOCK_GUEST_STOPPED;
++		/*
++		 * 在以下使用pvclock_touch_watchdogs():
++		 *   - arch/x86/kernel/kvmclock.c|145| <<kvm_check_and_clear_guest_paused>> pvclock_touch_watchdogs();
++		 *   - arch/x86/kernel/pvclock.c|96| <<pvclock_clocksource_read>> pvclock_touch_watchdogs();
++		 */
+ 		pvclock_touch_watchdogs();
+ 		ret = true;
+ 	}
+diff --git a/arch/x86/kernel/pvclock.c b/arch/x86/kernel/pvclock.c
+index eda37df016f0..116aa5b77ff8 100644
+--- a/arch/x86/kernel/pvclock.c
++++ b/arch/x86/kernel/pvclock.c
+@@ -17,6 +17,11 @@
+ #include <asm/vgtod.h>
+ 
+ static u8 valid_flags __read_mostly = 0;
++/*
++ * 在以下使用pvti_cpu0_va:
++ *   - arch/x86/kernel/pvclock.c|192| <<pvclock_set_pvti_cpu0_va>> pvti_cpu0_va = pvti;
++ *   - arch/x86/kernel/pvclock.c|197| <<pvclock_get_pvti_cpu0_va>> return pvti_cpu0_va;
++ */
+ static struct pvclock_vsyscall_time_info *pvti_cpu0_va __read_mostly;
+ 
+ void pvclock_set_flags(u8 flags)
+@@ -36,6 +41,11 @@ unsigned long pvclock_tsc_khz(struct pvclock_vcpu_time_info *src)
+ 	return pv_tsc_khz;
+ }
+ 
++/*
++ * 在以下使用pvclock_touch_watchdogs():
++ *   - arch/x86/kernel/kvmclock.c|145| <<kvm_check_and_clear_guest_paused>> pvclock_touch_watchdogs();
++ *   - arch/x86/kernel/pvclock.c|96| <<pvclock_clocksource_read>> pvclock_touch_watchdogs();
++ */
+ void pvclock_touch_watchdogs(void)
+ {
+ 	touch_softlockup_watchdog_sync();
+@@ -44,6 +54,13 @@ void pvclock_touch_watchdogs(void)
+ 	reset_hung_task_detector();
+ }
+ 
++/*
++ * 在以下使用last_value:
++ *   - arch/x86/kernel/pvclock.c|52| <<global>> static atomic64_t last_value = ATOMIC64_INIT(0);
++ *   - arch/x86/kernel/pvclock.c|56| <<pvclock_resume>> atomic64_set(&last_value, 0);
++ *   - arch/x86/kernel/pvclock.c|133| <<pvclock_clocksource_read>> last = atomic64_read(&last_value);
++ *   - arch/x86/kernel/pvclock.c|137| <<pvclock_clocksource_read>> last = atomic64_cmpxchg(&last_value, last, ret);
++ */
+ static atomic64_t last_value = ATOMIC64_INIT(0);
+ 
+ void pvclock_resume(void)
+@@ -57,6 +74,13 @@ u8 pvclock_read_flags(struct pvclock_vcpu_time_info *src)
+ 	u8 flags;
+ 
+ 	do {
++		/*
++		 * 在以下使用pvclock_read_begin():
++		 *   - arch/x86/include/asm/vdso/gettimeofday.h|226| <<vread_pvclock>> version = pvclock_read_begin(pvti);
++		 *   - arch/x86/kernel/pvclock.c|60| <<pvclock_read_flags>> version = pvclock_read_begin(src);
++		 *   - arch/x86/kernel/pvclock.c|75| <<pvclock_clocksource_read>> version = pvclock_read_begin(src);
++		 *   - drivers/ptp/ptp_kvm_x86.c|112| <<kvm_arch_ptp_get_crosststamp>> version = pvclock_read_begin(src);
++		 */
+ 		version = pvclock_read_begin(src);
+ 		flags = src->flags;
+ 	} while (pvclock_read_retry(src, version));
+@@ -64,6 +88,12 @@ u8 pvclock_read_flags(struct pvclock_vcpu_time_info *src)
+ 	return flags & valid_flags;
+ }
+ 
++/*
++ * 在以下使用pvclock_clocksource_read():
++ *   - arch/x86/kernel/kvmclock.c|79| <<kvm_clock_read>> ret = pvclock_clocksource_read(this_cpu_pvti());
++ *   - arch/x86/kernel/pvclock.c|161| <<pvclock_read_wallclock>> delta = pvclock_clocksource_read(vcpu_time);
++ *   - arch/x86/xen/time.c|53| <<xen_clocksource_read>> ret = pvclock_clocksource_read(src);
++ */
+ u64 pvclock_clocksource_read(struct pvclock_vcpu_time_info *src)
+ {
+ 	unsigned version;
+@@ -72,6 +102,13 @@ u64 pvclock_clocksource_read(struct pvclock_vcpu_time_info *src)
+ 	u8 flags;
+ 
+ 	do {
++		/*
++		 * 在以下使用pvclock_read_begin():
++		 *   - arch/x86/include/asm/vdso/gettimeofday.h|226| <<vread_pvclock>> version = pvclock_read_begin(pvti);
++		 *   - arch/x86/kernel/pvclock.c|60| <<pvclock_read_flags>> version = pvclock_read_begin(src);
++		 *   - arch/x86/kernel/pvclock.c|75| <<pvclock_clocksource_read>> version = pvclock_read_begin(src);
++		 *   - drivers/ptp/ptp_kvm_x86.c|112| <<kvm_arch_ptp_get_crosststamp>> version = pvclock_read_begin(src);
++		 */
+ 		version = pvclock_read_begin(src);
+ 		ret = __pvclock_read_cycles(src, rdtsc_ordered());
+ 		flags = src->flags;
+@@ -79,6 +116,11 @@ u64 pvclock_clocksource_read(struct pvclock_vcpu_time_info *src)
+ 
+ 	if (unlikely((flags & PVCLOCK_GUEST_STOPPED) != 0)) {
+ 		src->flags &= ~PVCLOCK_GUEST_STOPPED;
++		/*
++		 * 在以下使用pvclock_touch_watchdogs():
++		 *   - arch/x86/kernel/kvmclock.c|145| <<kvm_check_and_clear_guest_paused>> pvclock_touch_watchdogs();
++		 *   - arch/x86/kernel/pvclock.c|96| <<pvclock_clocksource_read>> pvclock_touch_watchdogs();
++		 */
+ 		pvclock_touch_watchdogs();
+ 	}
+ 
+@@ -134,6 +176,12 @@ void pvclock_read_wallclock(struct pvclock_wall_clock *wall_clock,
+ 		rmb();		/* fetch time before checking version */
+ 	} while ((wall_clock->version & 1) || (version != wall_clock->version));
+ 
++	/*
++	 * 在以下使用pvclock_clocksource_read():
++	 *   - arch/x86/kernel/kvmclock.c|79| <<kvm_clock_read>> ret = pvclock_clocksource_read(this_cpu_pvti());
++	 *   - arch/x86/kernel/pvclock.c|161| <<pvclock_read_wallclock>> delta = pvclock_clocksource_read(vcpu_time);
++	 *   - arch/x86/xen/time.c|53| <<xen_clocksource_read>> ret = pvclock_clocksource_read(src);
++	 */
+ 	delta = pvclock_clocksource_read(vcpu_time);	/* time since system boot */
+ 	delta += now.tv_sec * NSEC_PER_SEC + now.tv_nsec;
+ 
+@@ -143,14 +191,34 @@ void pvclock_read_wallclock(struct pvclock_wall_clock *wall_clock,
+ 	set_normalized_timespec64(ts, now.tv_sec, now.tv_nsec);
+ }
+ 
++/*
++ * 在以下使用pvclock_set_pvti_cpu0_va():
++ *   - arch/x86/kernel/kvmclock.c|339| <<kvmclock_init>> pvclock_set_pvti_cpu0_va(hv_clock_boot);
++ *   - arch/x86/xen/time.c|478| <<xen_setup_vsyscall_time_info>> pvclock_set_pvti_cpu0_va(xen_clock);
++ */
+ void pvclock_set_pvti_cpu0_va(struct pvclock_vsyscall_time_info *pvti)
+ {
+ 	WARN_ON(vclock_was_used(VDSO_CLOCKMODE_PVCLOCK));
++	/*
++	 * 在以下使用pvti_cpu0_va:
++	 *   - arch/x86/kernel/pvclock.c|192| <<pvclock_set_pvti_cpu0_va>> pvti_cpu0_va = pvti;
++	 *   - arch/x86/kernel/pvclock.c|197| <<pvclock_get_pvti_cpu0_va>> return pvti_cpu0_va;
++	 */
+ 	pvti_cpu0_va = pvti;
+ }
+ 
++/*
++ * 在以下使用pvclock_get_pvti_cpu0_va():
++ *   - arch/x86/entry/vdso/vma.c|206| <<vvar_fault>> pvclock_get_pvti_cpu0_va();
++ *   - drivers/ptp/ptp_kvm_x86.c|48| <<kvm_arch_ptp_init>> if (!pvclock_get_pvti_cpu0_va()) {
++ */
+ struct pvclock_vsyscall_time_info *pvclock_get_pvti_cpu0_va(void)
+ {
++	/*
++	 * 在以下使用pvti_cpu0_va:
++	 *   - arch/x86/kernel/pvclock.c|192| <<pvclock_set_pvti_cpu0_va>> pvti_cpu0_va = pvti;
++	 *   - arch/x86/kernel/pvclock.c|197| <<pvclock_get_pvti_cpu0_va>> return pvti_cpu0_va;
++	 */
+ 	return pvti_cpu0_va;
+ }
+ EXPORT_SYMBOL_GPL(pvclock_get_pvti_cpu0_va);
+diff --git a/arch/x86/kvm/hyperv.c b/arch/x86/kvm/hyperv.c
+index d849b67a3f13..f4e406e0e83e 100644
+--- a/arch/x86/kvm/hyperv.c
++++ b/arch/x86/kvm/hyperv.c
+@@ -562,6 +562,15 @@ static u64 get_time_ref_counter(struct kvm *kvm)
+ 	 * Fall back to get_kvmclock_ns() when TSC page hasn't been set up,
+ 	 * is broken, disabled or being updated.
+ 	 */
++	/*
++	 * 在以下使用get_kvmclock_ns():
++	 *   - arch/x86/kvm/hyperv.c|566| <<get_time_ref_counter>> return div_u64(get_kvmclock_ns(kvm), 100);
++	 *   - arch/x86/kvm/x86.c|2208| <<kvm_write_wall_clock>> wall_nsec = ktime_get_real_ns() - get_kvmclock_ns(kvm);
++	 *   - arch/x86/kvm/x86.c|6554| <<kvm_arch_vm_ioctl(KVM_GET_CLOCK)>> now_ns = get_kvmclock_ns(kvm);
++	 *   - arch/x86/kvm/xen.c|68| <<kvm_xen_update_runstate>> u64 now = get_kvmclock_ns(v->kvm);
++	 *   - arch/x86/kvm/xen.c|455| <<kvm_xen_vcpu_set_attr>> if (get_kvmclock_ns(vcpu->kvm) <
++	 *   - arch/x86/kvm/xen.c|496| <<kvm_xen_vcpu_set_attr>> if (get_kvmclock_ns(vcpu->kvm) <
++	 */
+ 	if (hv->hv_tsc_page_status != HV_TSC_PAGE_SET)
+ 		return div_u64(get_kvmclock_ns(kvm), 100);
+ 
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 3e25192d41d0..ba0c18fc0c8e 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -724,6 +724,15 @@ int kvm_pv_send_ipi(struct kvm *kvm, unsigned long ipi_bitmap_low,
+ static int pv_eoi_put_user(struct kvm_vcpu *vcpu, u8 val)
+ {
+ 
++	/*
++	 * 在以下使用kvm_write_guest_cached():
++	 *   - arch/x86/kvm/lapic.c|727| <<pv_eoi_put_user>> return kvm_write_guest_cached(vcpu->kvm,
++	 *          &vcpu->arch.pv_eoi.data, &val, sizeof(val));
++	 *   - arch/x86/kvm/lapic.c|2922| <<kvm_lapic_sync_to_vapic>> kvm_write_guest_cached(vcpu->kvm,
++	 *          &vcpu->arch.apic->vapic_cache, &data, sizeof(u32));
++	 *   - arch/x86/kvm/x86.c|12454| <<apf_put_user_notpresent>> return kvm_write_guest_cached(vcpu->kvm,
++	 *          &vcpu->arch.apf.data, &reason, sizeof(reason));
++	 */
+ 	return kvm_write_guest_cached(vcpu->kvm, &vcpu->arch.pv_eoi.data, &val,
+ 				      sizeof(val));
+ }
+@@ -2919,6 +2928,15 @@ void kvm_lapic_sync_to_vapic(struct kvm_vcpu *vcpu)
+ 		max_isr = 0;
+ 	data = (tpr & 0xff) | ((max_isr & 0xf0) << 8) | (max_irr << 24);
+ 
++	/*
++	 * 在以下使用kvm_write_guest_cached():
++	 *   - arch/x86/kvm/lapic.c|727| <<pv_eoi_put_user>> return kvm_write_guest_cached(vcpu->kvm,
++	 *          &vcpu->arch.pv_eoi.data, &val, sizeof(val));
++	 *   - arch/x86/kvm/lapic.c|2922| <<kvm_lapic_sync_to_vapic>> kvm_write_guest_cached(vcpu->kvm,
++	 *          &vcpu->arch.apic->vapic_cache, &data, sizeof(u32));
++	 *   - arch/x86/kvm/x86.c|12454| <<apf_put_user_notpresent>> return kvm_write_guest_cached(vcpu->kvm,
++	 *          &vcpu->arch.apf.data, &reason, sizeof(reason));
++	 */
+ 	kvm_write_guest_cached(vcpu->kvm, &vcpu->arch.apic->vapic_cache, &data,
+ 				sizeof(u32));
+ }
+@@ -2926,6 +2944,27 @@ void kvm_lapic_sync_to_vapic(struct kvm_vcpu *vcpu)
+ int kvm_lapic_set_vapic_addr(struct kvm_vcpu *vcpu, gpa_t vapic_addr)
+ {
+ 	if (vapic_addr) {
++		/*
++		 * 在以下使用kvm_gfn_to_hva_cache_init():
++		 *   - arch/x86/kvm/lapic.c|2947| <<kvm_lapic_set_vapic_addr>> if (kvm_gfn_to_hva_cache_init(vcpu->kvm
++		 *            &vcpu->arch.apic->vapic_cache, vapic_addr, sizeof(u32)))
++		 *   - arch/x86/kvm/lapic.c|3063| <<kvm_lapic_enable_pv_eoi>> return kvm_gfn_to_hva_cache_init(vcpu->kvm,
++		 *            ghc, addr, new_len);
++		 *   - arch/x86/kvm/x86.c|2278| <<kvm_write_system_time>> if (!kvm_gfn_to_hva_cache_init(vcpu->kvm,
++		 *            &vcpu->arch.pv_time, system_time & ~1ULL, sizeof(struct pvclock_vcpu_time_info)))
++		 *   - arch/x86/kvm/x86.c|3442| <<kvm_pv_enable_async_pf>> if (kvm_gfn_to_hva_cache_init(vcpu->kvm,
++		 *            &vcpu->arch.apf.data, gpa, sizeof(u64)))
++		 *   - arch/x86/kvm/x86.c|3561| <<record_steal_time>> if (kvm_gfn_to_hva_cache_init(vcpu->kvm,
++		 *            ghc, gpa, sizeof(*st)) ||
++		 *   - arch/x86/kvm/xen.c|109| <<kvm_xen_update_runstate_guest>> kvm_gfn_to_hva_cache_init(v->kvm,
++		 *            ghc, ghc->gpa, ghc->len))
++		 *   - arch/x86/kvm/xen.c|365| <<kvm_xen_vcpu_set_attr>> r = kvm_gfn_to_hva_cache_init(vcpu->kvm,
++		 *            &vcpu->arch.xen.vcpu_info_cache, data->u.gpa, sizeof(struct vcpu_info));
++		 *   - arch/x86/kvm/xen.c|388| <<kvm_xen_vcpu_set_attr>> r = kvm_gfn_to_hva_cache_init(vcpu->kvm,
++		 *            &vcpu->arch.xen.vcpu_time_info_cache, data->u.gpa, sizeof(struct pvclock_vcpu_time_info));
++		 *   - arch/x86/kvm/xen.c|415| <<kvm_xen_vcpu_set_attr>> r = kvm_gfn_to_hva_cache_init(vcpu->kvm,
++		 *            &vcpu->arch.xen.runstate_cache, data->u.gpa, sizeof(struct vcpu_runstate_info));
++		 */
+ 		if (kvm_gfn_to_hva_cache_init(vcpu->kvm,
+ 					&vcpu->arch.apic->vapic_cache,
+ 					vapic_addr, sizeof(u32)))
+@@ -3042,6 +3081,27 @@ int kvm_lapic_enable_pv_eoi(struct kvm_vcpu *vcpu, u64 data, unsigned long len)
+ 	else
+ 		new_len = len;
+ 
++	/*
++	 * 在以下使用kvm_gfn_to_hva_cache_init():
++	 *   - arch/x86/kvm/lapic.c|2947| <<kvm_lapic_set_vapic_addr>> if (kvm_gfn_to_hva_cache_init(vcpu->kvm,
++	 *            &vcpu->arch.apic->vapic_cache, vapic_addr, sizeof(u32)))
++	 *   - arch/x86/kvm/lapic.c|3063| <<kvm_lapic_enable_pv_eoi>> return kvm_gfn_to_hva_cache_init(vcpu->kvm,
++	 *            ghc, addr, new_len);
++	 *   - arch/x86/kvm/x86.c|2278| <<kvm_write_system_time>> if (!kvm_gfn_to_hva_cache_init(vcpu->kvm,
++	 *            &vcpu->arch.pv_time, system_time & ~1ULL, sizeof(struct pvclock_vcpu_time_info)))
++	 *   - arch/x86/kvm/x86.c|3442| <<kvm_pv_enable_async_pf>> if (kvm_gfn_to_hva_cache_init(vcpu->kvm,
++	 *            &vcpu->arch.apf.data, gpa, sizeof(u64)))
++	 *   - arch/x86/kvm/x86.c|3561| <<record_steal_time>> if (kvm_gfn_to_hva_cache_init(vcpu->kvm,
++	 *            ghc, gpa, sizeof(*st)) ||
++	 *   - arch/x86/kvm/xen.c|109| <<kvm_xen_update_runstate_guest>> kvm_gfn_to_hva_cache_init(v->kvm,
++	 *            ghc, ghc->gpa, ghc->len))
++	 *   - arch/x86/kvm/xen.c|365| <<kvm_xen_vcpu_set_attr>> r = kvm_gfn_to_hva_cache_init(vcpu->kvm,
++	 *            &vcpu->arch.xen.vcpu_info_cache, data->u.gpa, sizeof(struct vcpu_info));
++	 *   - arch/x86/kvm/xen.c|388| <<kvm_xen_vcpu_set_attr>> r = kvm_gfn_to_hva_cache_init(vcpu->kvm,
++	 *            &vcpu->arch.xen.vcpu_time_info_cache, data->u.gpa, sizeof(struct pvclock_vcpu_time_info));
++	 *   - arch/x86/kvm/xen.c|415| <<kvm_xen_vcpu_set_attr>> r = kvm_gfn_to_hva_cache_init(vcpu->kvm,
++	 *            &vcpu->arch.xen.runstate_cache, data->u.gpa, sizeof(struct vcpu_runstate_info));
++	 */
+ 	return kvm_gfn_to_hva_cache_init(vcpu->kvm, ghc, addr, new_len);
+ }
+ 
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index a3563afb4e56..34c8b78579ed 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -895,6 +895,15 @@ gfn_to_memslot_dirty_bitmap(struct kvm_vcpu *vcpu, gfn_t gfn,
+ 	slot = kvm_vcpu_gfn_to_memslot(vcpu, gfn);
+ 	if (!slot || slot->flags & KVM_MEMSLOT_INVALID)
+ 		return NULL;
++	/*
++	 * 在以下使用kvm_dirty_log_pgtable():
++	 *   - arch/x86/kvm/mmu/mmu.c|899| <<gfn_to_memslot_dirty_bitmap>> !kvm_dirty_log_pgtable(vcpu->kvm))
++	 *   - arch/x86/kvm/mmu/mmu.c|1388| <<kvm_arch_mmu_enable_log_dirty_pt_masked>> !kvm_dirty_log_pgtable(kvm)) {
++	 *   - arch/x86/kvm/mmu/mmu.c|1401| <<kvm_arch_mmu_enable_log_dirty_pt_masked>> if (kvm_dirty_log_pgtable(kvm) &&
++	 *   - arch/x86/kvm/x86.c|6114| <<kvm_arch_sync_dirty_log>> if (kvm_dirty_log_pgtable(kvm)) {
++	 *   - arch/x86/kvm/x86.c|12631| <<kvm_mmu_slot_apply_flags>> if (!kvm_dirty_log_pgtable(kvm))
++	 *   - virt/kvm/kvm_main.c|2235| <<kvm_clear_dirty_log_protect>> if (!kvm_dirty_log_pgtable(kvm))
++	 */
+ 	if (no_dirty_log && kvm_slot_dirty_track_enabled(slot) &&
+             !kvm_dirty_log_pgtable(vcpu->kvm))
+ 		return NULL;
+@@ -1384,6 +1393,15 @@ void kvm_arch_mmu_enable_log_dirty_pt_masked(struct kvm *kvm,
+ 	 * of memslot has no such restriction, so the range can cross two large
+ 	 * pages.
+ 	 */
++	/*
++	 * 在以下使用kvm_dirty_log_pgtable():
++	 *   - arch/x86/kvm/mmu/mmu.c|899| <<gfn_to_memslot_dirty_bitmap>> !kvm_dirty_log_pgtable(vcpu->kvm))
++	 *   - arch/x86/kvm/mmu/mmu.c|1388| <<kvm_arch_mmu_enable_log_dirty_pt_masked>> !kvm_dirty_log_pgtable(kvm)) {
++	 *   - arch/x86/kvm/mmu/mmu.c|1401| <<kvm_arch_mmu_enable_log_dirty_pt_masked>> if (kvm_dirty_log_pgtable(kvm) &&
++	 *   - arch/x86/kvm/x86.c|6114| <<kvm_arch_sync_dirty_log>> if (kvm_dirty_log_pgtable(kvm)) {
++	 *   - arch/x86/kvm/x86.c|12631| <<kvm_mmu_slot_apply_flags>> if (!kvm_dirty_log_pgtable(kvm))
++	 *   - virt/kvm/kvm_main.c|2235| <<kvm_clear_dirty_log_protect>> if (!kvm_dirty_log_pgtable(kvm))
++	 */
+ 	if (kvm_dirty_log_manual_protect_and_init_set(kvm) &&
+ 	    !kvm_dirty_log_pgtable(kvm)) {
+ 		gfn_t start = slot->base_gfn + gfn_offset + __ffs(mask);
+@@ -1398,6 +1416,15 @@ void kvm_arch_mmu_enable_log_dirty_pt_masked(struct kvm *kvm,
+ 						       PG_LEVEL_2M);
+ 	}
+ 
++	/*
++	 * 在以下使用kvm_dirty_log_pgtable():
++	 *   - arch/x86/kvm/mmu/mmu.c|899| <<gfn_to_memslot_dirty_bitmap>> !kvm_dirty_log_pgtable(vcpu->kvm))
++	 *   - arch/x86/kvm/mmu/mmu.c|1388| <<kvm_arch_mmu_enable_log_dirty_pt_masked>> !kvm_dirty_log_pgtable(kvm)) {
++	 *   - arch/x86/kvm/mmu/mmu.c|1401| <<kvm_arch_mmu_enable_log_dirty_pt_masked>> if (kvm_dirty_log_pgtable(kvm) &&
++	 *   - arch/x86/kvm/x86.c|6114| <<kvm_arch_sync_dirty_log>> if (kvm_dirty_log_pgtable(kvm)) {
++	 *   - arch/x86/kvm/x86.c|12631| <<kvm_mmu_slot_apply_flags>> if (!kvm_dirty_log_pgtable(kvm))
++	 *   - virt/kvm/kvm_main.c|2235| <<kvm_clear_dirty_log_protect>> if (!kvm_dirty_log_pgtable(kvm))
++	 */
+ 	if (kvm_dirty_log_pgtable(kvm) &&
+ 	    !is_tdp_mmu_enabled(kvm)) {
+ 		return;
+@@ -1657,6 +1684,19 @@ static void rmap_add(struct kvm_vcpu *vcpu, struct kvm_memory_slot *slot,
+ 				vcpu->kvm, sp->gfn, KVM_PAGES_PER_HPAGE(sp->role.level));
+ 	}
+ 
++	/*
++	 * 在以下使用kvm_memory_slot->present_bitmap:
++	 *   - arch/x86/kvm/mmu/mmu.c|1661| <<rmap_add>> if (slot && slot->present_bitmap) {
++	 *   - arch/x86/kvm/mmu/mmu.c|1662| <<rmap_add>> bitmap_set(slot->present_bitmap, gfn - slot->base_gfn,
++	 *   - arch/x86/kvm/mmu/mmu.c|5880| <<kvm_rmap_walk_present>> atomic_long_t *p = (atomic_long_t *) &slot->present_bitmap[i];
++	 *   - virt/kvm/kvm_main.c|928| <<kvm_destroy_present_bitmap>> if (!memslot->present_bitmap)
++	 *   - virt/kvm/kvm_main.c|931| <<kvm_destroy_present_bitmap>> kvfree(memslot->present_bitmap);
++	 *   - virt/kvm/kvm_main.c|932| <<kvm_destroy_present_bitmap>> memslot->present_bitmap = NULL;
++	 *   - virt/kvm/kvm_main.c|1349| <<kvm_alloc_present_bitmap>> memslot->present_bitmap = __vcalloc(2, present_bytes, GFP_KERNEL_ACCOUNT);
++	 *   - virt/kvm/kvm_main.c|1350| <<kvm_alloc_present_bitmap>> if (!memslot->present_bitmap)
++	 *   - virt/kvm/kvm_main.c|1979| <<__kvm_set_memory_region>> new->present_bitmap = old->present_bitmap;
++	 *   - virt/kvm/kvm_main.c|1980| <<__kvm_set_memory_region>> if (!new->present_bitmap) {
++	 */
+ 	/* Page is present in RMAP */
+ 	if (slot && slot->present_bitmap) {
+ 		bitmap_set(slot->present_bitmap, gfn - slot->base_gfn,
+@@ -3111,6 +3151,11 @@ fast_pf_fix_direct_spte(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault,
+ 	if (cmpxchg64(sptep, old_spte, new_spte) != old_spte)
+ 		return false;
+ 
++	/*
++	 * 在以下使用mark_page_range_dirty_in_slot():
++	 *   - arch/x86/kvm/mmu/mmu.c|3115| <<fast_pf_fix_direct_spte>> mark_page_range_dirty_in_slot(vcpu->kvm, fault->slot, fault->gfn,
++	 *   - arch/x86/kvm/mmu/mmu.c|5912| <<rmap_test_dirty>> mark_page_range_dirty_in_slot(kvm, slot, pfn,
++	 */
+ 	if (is_writable_pte(new_spte) && !is_writable_pte(old_spte))
+ 		mark_page_range_dirty_in_slot(vcpu->kvm, fault->slot, fault->gfn,
+ 				KVM_PAGES_PER_HPAGE(sp->role.level));
+@@ -5865,6 +5910,10 @@ static bool kvm_rmap_walk_masked(struct kvm *kvm,
+ 	return flush;
+ }
+ 
++/*
++ * 在以下使用kvm_rmap_walk_present():
++ *   - arch/x86/kvm/mmu/mmu.c|5927| <<kvm_mmu_slot_test_dirty>> flush = kvm_rmap_walk_present(kvm, memslot,
++ */
+ static bool kvm_rmap_walk_present(struct kvm *kvm,
+ 				  const struct kvm_memory_slot *slot,
+ 				  int start_level, unsigned long dirty_mask,
+@@ -5877,6 +5926,19 @@ static bool kvm_rmap_walk_present(struct kvm *kvm,
+ 	for (offset = 0, i = offset / BITS_PER_LONG,
+ 		 n = DIV_ROUND_UP(slot->npages, BITS_PER_LONG); n--;
+ 	     i++, offset += BITS_PER_LONG) {
++		/*
++		 * 在以下使用kvm_memory_slot->present_bitmap:
++		 *   - arch/x86/kvm/mmu/mmu.c|1661| <<rmap_add>> if (slot && slot->present_bitmap) {
++		 *   - arch/x86/kvm/mmu/mmu.c|1662| <<rmap_add>> bitmap_set(slot->present_bitmap, gfn - slot->base_gfn,
++		 *   - arch/x86/kvm/mmu/mmu.c|5880| <<kvm_rmap_walk_present>> atomic_long_t *p = (atomic_long_t *) &slot->present_bitmap[i];
++		 *   - virt/kvm/kvm_main.c|928| <<kvm_destroy_present_bitmap>> if (!memslot->present_bitmap)
++		 *   - virt/kvm/kvm_main.c|931| <<kvm_destroy_present_bitmap>> kvfree(memslot->present_bitmap);
++		 *   - virt/kvm/kvm_main.c|932| <<kvm_destroy_present_bitmap>> memslot->present_bitmap = NULL;
++		 *   - virt/kvm/kvm_main.c|1349| <<kvm_alloc_present_bitmap>> memslot->present_bitmap = __vcalloc(2, present_bytes, GFP_KERNEL_ACCOUNT);
++		 *   - virt/kvm/kvm_main.c|1350| <<kvm_alloc_present_bitmap>> if (!memslot->present_bitmap)
++		 *   - virt/kvm/kvm_main.c|1979| <<__kvm_set_memory_region>> new->present_bitmap = old->present_bitmap;
++		 *   - virt/kvm/kvm_main.c|1980| <<__kvm_set_memory_region>> if (!new->present_bitmap) {
++		 */
+ 		atomic_long_t *p = (atomic_long_t *) &slot->present_bitmap[i];
+ 		unsigned long mask = atomic_long_read(p);
+ 		if (!mask)
+@@ -5909,6 +5971,11 @@ static bool rmap_test_dirty(struct kvm *kvm,
+ 		flush = true;
+ 		sp = sptep_to_sp(sptep);
+ 		pfn = kvm_mmu_page_get_gfn(sp, spte_index(sptep));
++		/*
++		 * 在以下使用mark_page_range_dirty_in_slot():
++		 *   - arch/x86/kvm/mmu/mmu.c|3115| <<fast_pf_fix_direct_spte>> mark_page_range_dirty_in_slot(vcpu->kvm, fault->slot, fault->gfn,
++		 *   - arch/x86/kvm/mmu/mmu.c|5912| <<rmap_test_dirty>> mark_page_range_dirty_in_slot(kvm, slot, pfn,
++		 */
+ 		mark_page_range_dirty_in_slot(kvm, slot, pfn,
+ 				KVM_PAGES_PER_HPAGE(sp->role.level));
+ 	}
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 2b29a85631bb..301eea0a8151 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -2205,6 +2205,15 @@ void kvm_write_wall_clock(struct kvm *kvm, gpa_t wall_clock, int sec_hi_ofs)
+ 	 * system time (updated by kvm_guest_time_update below) to the
+ 	 * wall clock specified here.  We do the reverse here.
+ 	 */
++	/*
++	 * 在以下使用get_kvmclock_ns():
++	 *   - arch/x86/kvm/hyperv.c|566| <<get_time_ref_counter>> return div_u64(get_kvmclock_ns(kvm), 100);
++	 *   - arch/x86/kvm/x86.c|2208| <<kvm_write_wall_clock>> wall_nsec = ktime_get_real_ns() - get_kvmclock_ns(kvm);
++	 *   - arch/x86/kvm/x86.c|6554| <<kvm_arch_vm_ioctl(KVM_GET_CLOCK)>> now_ns = get_kvmclock_ns(kvm);
++	 *   - arch/x86/kvm/xen.c|68| <<kvm_xen_update_runstate>> u64 now = get_kvmclock_ns(v->kvm);
++	 *   - arch/x86/kvm/xen.c|455| <<kvm_xen_vcpu_set_attr>> if (get_kvmclock_ns(vcpu->kvm) <
++	 *   - arch/x86/kvm/xen.c|496| <<kvm_xen_vcpu_set_attr>> if (get_kvmclock_ns(vcpu->kvm) <
++	 */
+ 	wall_nsec = ktime_get_real_ns() - get_kvmclock_ns(kvm);
+ 
+ 	wc.nsec = do_div(wall_nsec, 1000000000);
+@@ -2223,12 +2232,29 @@ void kvm_write_wall_clock(struct kvm *kvm, gpa_t wall_clock, int sec_hi_ofs)
+ 	kvm_write_guest(kvm, wall_clock, &version, sizeof(version));
+ }
+ 
++/*
++ * 在以下使用kvm_write_system_time():
++ *   - arch/x86/kvm/x86.c|3589| <<kvm_set_msr_common(MSR_KVM_SYSTEM_TIME_NEW)>> kvm_write_system_time(vcpu, data, false, msr_info->host_initiated);
++ *   - arch/x86/kvm/x86.c|3595| <<kvm_set_msr_common(MSR_KVM_SYSTEM_TIME)>> kvm_write_system_time(vcpu, data, true, msr_info->host_initiated);
++ */
+ static void kvm_write_system_time(struct kvm_vcpu *vcpu, gpa_t system_time,
+ 				  bool old_msr, bool host_initiated)
+ {
+ 	struct kvm_arch *ka = &vcpu->kvm->arch;
+ 
+ 	if (vcpu->vcpu_id == 0 && !host_initiated) {
++		/*
++		 * 在以下使用KVM_REQ_MASTERCLOCK_UPDATE:
++		 *   - arch/x86/kvm/hyperv.c|1398| <<kvm_hv_set_msr_pw>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++		 *   - arch/x86/kvm/x86.c|2247| <<kvm_write_system_time>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++		 *   - arch/x86/kvm/x86.c|2474| <<kvm_track_tsc_matching>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++		 *   - arch/x86/kvm/x86.c|9104| <<pvclock_gtod_update_fn>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++		 *   - arch/x86/kvm/x86.c|10312| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu))
++		 *   - arch/x86/kvm/x86.c|11956| <<kvm_arch_hardware_enable>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++		 *   - arch/x86/kvm/xen.c|58| <<kvm_xen_shared_info_init>> kvm_make_all_cpus_request(kvm, KVM_REQ_MASTERCLOCK_UPDATE);
++		 *
++		 * 处理的函数kvm_gen_update_masterclock().
++		 */
+ 		if (ka->boot_vcpu_runs_old_kvmclock != old_msr)
+ 			kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
+ 
+@@ -2236,13 +2262,52 @@ static void kvm_write_system_time(struct kvm_vcpu *vcpu, gpa_t system_time,
+ 	}
+ 
+ 	vcpu->arch.time = system_time;
++	/*
++	 * 在以下使用KVM_REQ_GLOBAL_CLOCK_UPDATE:
++	 *   - arch/x86/kvm/x86.c|2239| <<kvm_write_system_time>> kvm_make_request(KVM_REQ_GLOBAL_CLOCK_UPDATE, vcpu);
++	 *   - arch/x86/kvm/x86.c|4575| <<kvm_arch_vcpu_load>> if (!vcpu->kvm->arch.use_master_clock || vcpu->cpu == -1)
++	 *                                      kvm_make_request(KVM_REQ_GLOBAL_CLOCK_UPDATE, vcpu);
++	 *   - arch/x86/kvm/x86.c|9992| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_GLOBAL_CLOCK_UPDATE, vcpu))
++	 *
++	 * 处理的函数kvm_gen_kvmclock_update().
++	 */
+ 	kvm_make_request(KVM_REQ_GLOBAL_CLOCK_UPDATE, vcpu);
+ 
+ 	/* we verify if the enable bit is set... */
++	/*
++	 * 在以下使用kvm_vcpu_arch->pv_time_enabled:
++	 *   - arch/x86/kvm/x86.c|2242| <<kvm_write_system_time>> vcpu->arch.pv_time_enabled = false;
++	 *   - arch/x86/kvm/x86.c|2249| <<kvm_write_system_time>> vcpu->arch.pv_time_enabled = true;
++	 *   - arch/x86/kvm/x86.c|3088| <<kvm_guest_time_update>> if (vcpu->pv_time_enabled)
++	 *   - arch/x86/kvm/x86.c|3286| <<kvmclock_reset>> vcpu->arch.pv_time_enabled = false;
++	 *   - arch/x86/kvm/x86.c|5108| <<kvm_set_guest_paused>> if (!vcpu->arch.pv_time_enabled)
++	 *   - arch/x86/kvm/x86.c|6133| <<kvm_arch_suspend_notifier>> if (!vcpu->arch.pv_time_enabled)
++	 */
+ 	vcpu->arch.pv_time_enabled = false;
+ 	if (!(system_time & 1))
+ 		return;
+ 
++	/*
++	 * 在以下使用kvm_gfn_to_hva_cache_init():
++	 *   - arch/x86/kvm/lapic.c|2947| <<kvm_lapic_set_vapic_addr>> if (kvm_gfn_to_hva_cache_init(vcpu->kvm,
++	 *            &vcpu->arch.apic->vapic_cache, vapic_addr, sizeof(u32)))
++	 *   - arch/x86/kvm/lapic.c|3063| <<kvm_lapic_enable_pv_eoi>> return kvm_gfn_to_hva_cache_init(vcpu->kvm,
++	 *            ghc, addr, new_len);
++	 *   - arch/x86/kvm/x86.c|2278| <<kvm_write_system_time>> if (!kvm_gfn_to_hva_cache_init(vcpu->kvm,
++	 *            &vcpu->arch.pv_time, system_time & ~1ULL, sizeof(struct pvclock_vcpu_time_info)))
++	 *   - arch/x86/kvm/x86.c|3442| <<kvm_pv_enable_async_pf>> if (kvm_gfn_to_hva_cache_init(vcpu->kvm,
++	 *            &vcpu->arch.apf.data, gpa, sizeof(u64)))
++	 *   - arch/x86/kvm/x86.c|3561| <<record_steal_time>> if (kvm_gfn_to_hva_cache_init(vcpu->kvm,
++	 *            ghc, gpa, sizeof(*st)) ||
++	 *   - arch/x86/kvm/xen.c|109| <<kvm_xen_update_runstate_guest>> kvm_gfn_to_hva_cache_init(v->kvm,
++	 *            ghc, ghc->gpa, ghc->len))
++	 *   - arch/x86/kvm/xen.c|365| <<kvm_xen_vcpu_set_attr>> r = kvm_gfn_to_hva_cache_init(vcpu->kvm,
++	 *            &vcpu->arch.xen.vcpu_info_cache, data->u.gpa, sizeof(struct vcpu_info));
++	 *   - arch/x86/kvm/xen.c|388| <<kvm_xen_vcpu_set_attr>> r = kvm_gfn_to_hva_cache_init(vcpu->kvm,
++	 *            &vcpu->arch.xen.vcpu_time_info_cache, data->u.gpa, sizeof(struct pvclock_vcpu_time_info));
++	 *   - arch/x86/kvm/xen.c|415| <<kvm_xen_vcpu_set_attr>> r = kvm_gfn_to_hva_cache_init(vcpu->kvm,
++	 *            &vcpu->arch.xen.runstate_cache, data->u.gpa, sizeof(struct vcpu_runstate_info));
++	 */
+ 	if (!kvm_gfn_to_hva_cache_init(vcpu->kvm,
+ 				       &vcpu->arch.pv_time, system_time & ~1ULL,
+ 				       sizeof(struct pvclock_vcpu_time_info)))
+@@ -2372,6 +2437,15 @@ static int kvm_set_tsc_khz(struct kvm_vcpu *vcpu, u32 user_tsc_khz)
+ 
+ static u64 compute_guest_tsc(struct kvm_vcpu *vcpu, s64 kernel_ns)
+ {
++	/*
++	 * 在以下使用pvclock_scale_delta():
++	 *   - arch/x86/include/asm/pvclock.h|85| <<__pvclock_read_cycles>> u64 offset = pvclock_scale_delta(delta,
++	 *          src->tsc_to_system_mul, src->tsc_shift);
++	 *   - arch/x86/kvm/x86.c|2375| <<compute_guest_tsc>> u64 tsc = pvclock_scale_delta(kernel_ns-vcpu->arch.this_tsc_nsec,
++	 *          vcpu->arch.virtual_tsc_mult, vcpu->arch.virtual_tsc_shift);
++	 *   - arch/x86/kvm/x86.h|354| <<nsec_to_cycles>> return pvclock_scale_delta(nsec,
++	 *          vcpu->arch.virtual_tsc_mult, vcpu->arch.virtual_tsc_shift);
++	 */
+ 	u64 tsc = pvclock_scale_delta(kernel_ns-vcpu->arch.this_tsc_nsec,
+ 				      vcpu->arch.virtual_tsc_mult,
+ 				      vcpu->arch.virtual_tsc_shift);
+@@ -2407,6 +2481,18 @@ static void kvm_track_tsc_matching(struct kvm_vcpu *vcpu, bool new_generation)
+ 	 * enabled (compute_guest_tsc() requires the masterclock snapshot to be
+ 	 * taken _after_ the new generation is created).
+ 	 */
++	/*
++	 * 在以下使用KVM_REQ_MASTERCLOCK_UPDATE:
++	 *   - arch/x86/kvm/hyperv.c|1398| <<kvm_hv_set_msr_pw>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++	 *   - arch/x86/kvm/x86.c|2247| <<kvm_write_system_time>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++	 *   - arch/x86/kvm/x86.c|2474| <<kvm_track_tsc_matching>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++	 *   - arch/x86/kvm/x86.c|9104| <<pvclock_gtod_update_fn>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++	 *   - arch/x86/kvm/x86.c|10312| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu))
++	 *   - arch/x86/kvm/x86.c|11956| <<kvm_arch_hardware_enable>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++	 *   - arch/x86/kvm/xen.c|58| <<kvm_xen_shared_info_init>> kvm_make_all_cpus_request(kvm, KVM_REQ_MASTERCLOCK_UPDATE);
++	 *
++	 * 处理的函数kvm_gen_update_masterclock().
++	 */
+ 	if ((ka->use_master_clock && new_generation) ||
+ 	    (ka->use_master_clock != use_master_clock))
+ 		kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
+@@ -2626,6 +2712,15 @@ static void kvm_synchronize_tsc(struct kvm_vcpu *vcpu, u64 data)
+ 	kvm_vcpu_write_tsc_offset(vcpu, offset);
+ 	raw_spin_unlock_irqrestore(&kvm->arch.tsc_write_lock, flags);
+ 
++	/*
++	 *  在以下使用kvm_arch->pvclock_gtod_sync_lock:
++	 *   - kvm_synchronize_tsc()
++	 *   - kvm_gen_update_masterclock()
++	 *   - get_kvmclock_ns()
++	 *   - kvm_arch_vm_ioctl(KVM_SET_CLOCK)
++	 *   - kvm_hyperv_tsc_notifier()
++	 *   - kvm_arch_init_vm()
++	 */
+ 	raw_spin_lock_irqsave(&kvm->arch.pvclock_gtod_sync_lock, flags);
+ 	if (!matched) {
+ 		kvm->arch.nr_vcpus_matched_tsc = 0;
+@@ -2863,6 +2958,15 @@ static void kvm_gen_update_masterclock(struct kvm *kvm)
+ 
+ 	kvm_make_mclock_inprogress_request(kvm);
+ 
++	/*
++	 * 在以下使用kvm_arch->pvclock_gtod_sync_lock:
++	 *   - kvm_synchronize_tsc()
++	 *   - kvm_gen_update_masterclock()
++	 *   - get_kvmclock_ns()
++	 *   - kvm_arch_vm_ioctl(KVM_SET_CLOCK)
++	 *   - kvm_hyperv_tsc_notifier()
++	 *   - kvm_arch_init_vm()
++	 */
+ 	/* no guest entries from this point */
+ 	raw_spin_lock_irqsave(&ka->pvclock_gtod_sync_lock, flags);
+ 	pvclock_update_vm_gtod_copy(kvm);
+@@ -2877,6 +2981,15 @@ static void kvm_gen_update_masterclock(struct kvm *kvm)
+ #endif
+ }
+ 
++/*
++ * 在以下使用get_kvmclock_ns():
++ *   - arch/x86/kvm/hyperv.c|566| <<get_time_ref_counter>> return div_u64(get_kvmclock_ns(kvm), 100);
++ *   - arch/x86/kvm/x86.c|2208| <<kvm_write_wall_clock>> wall_nsec = ktime_get_real_ns() - get_kvmclock_ns(kvm);
++ *   - arch/x86/kvm/x86.c|6554| <<kvm_arch_vm_ioctl(KVM_GET_CLOCK)>> now_ns = get_kvmclock_ns(kvm);
++ *   - arch/x86/kvm/xen.c|68| <<kvm_xen_update_runstate>> u64 now = get_kvmclock_ns(v->kvm);
++ *   - arch/x86/kvm/xen.c|455| <<kvm_xen_vcpu_set_attr>> if (get_kvmclock_ns(vcpu->kvm) <
++ *   - arch/x86/kvm/xen.c|496| <<kvm_xen_vcpu_set_attr>> if (get_kvmclock_ns(vcpu->kvm) <
++ */
+ u64 get_kvmclock_ns(struct kvm *kvm)
+ {
+ 	struct kvm_arch *ka = &kvm->arch;
+@@ -2884,6 +2997,15 @@ u64 get_kvmclock_ns(struct kvm *kvm)
+ 	unsigned long flags;
+ 	u64 ret;
+ 
++	/*
++	 * 在以下使用kvm_arch->pvclock_gtod_sync_lock:
++	 *   - kvm_synchronize_tsc()
++	 *   - kvm_gen_update_masterclock()
++	 *   - get_kvmclock_ns()
++	 *   - kvm_arch_vm_ioctl(KVM_SET_CLOCK)
++	 *   - kvm_hyperv_tsc_notifier()
++	 *   - kvm_arch_init_vm()
++	 */
+ 	raw_spin_lock_irqsave(&ka->pvclock_gtod_sync_lock, flags);
+ 	if (!ka->use_master_clock) {
+ 		raw_spin_unlock_irqrestore(&ka->pvclock_gtod_sync_lock, flags);
+@@ -2910,13 +3032,43 @@ u64 get_kvmclock_ns(struct kvm *kvm)
+ 	return ret;
+ }
+ 
++/*
++ * 在以下使用kvm_setup_pvclock_page():
++ *   - arch/x86/kvm/x86.c|3057| <<kvm_guest_time_update>> kvm_setup_pvclock_page(v, &vcpu->pv_time, 0);
++ *   - arch/x86/kvm/x86.c|3059| <<kvm_guest_time_update>> kvm_setup_pvclock_page(v, &vcpu->xen.vcpu_info_cache,
++ *                offsetof(struct compat_vcpu_info, time));
++ *   - arch/x86/kvm/x86.c|3062| <<kvm_guest_time_update>> kvm_setup_pvclock_page(v, &vcpu->xen.vcpu_time_info_cache, 0);
++ */
+ static void kvm_setup_pvclock_page(struct kvm_vcpu *v,
+ 				   struct gfn_to_hva_cache *cache,
+ 				   unsigned int offset)
+ {
+ 	struct kvm_vcpu_arch *vcpu = &v->arch;
++	/*
++	 * struct pvclock_vcpu_time_info {
++	 *     u32   version;
++	 *     u32   pad0;
++	 *     u64   tsc_timestamp;
++	 *     u64   system_time;
++	 *     u32   tsc_to_system_mul;
++	 *     s8    tsc_shift;
++	 *     u8    flags;
++	 *     u8    pad[2];
++	 * } __attribute__((__packed__));
++	 */
+ 	struct pvclock_vcpu_time_info guest_hv_clock;
+ 
++	/*
++	 * 在以下使用kvm_read_guest_offset_cached():
++	 *   - arch/x86/kvm/x86.c|2989| <<kvm_setup_pvclock_page>> if (unlikely(kvm_read_guest_offset_cached(v->kvm,
++	 *          cache, &guest_hv_clock, offset, sizeof(guest_hv_clock))))
++	 *   - arch/x86/kvm/x86.c|12767| <<apf_pageready_slot_free>> if (kvm_read_guest_offset_cached(vcpu->kvm,
++	 *          &vcpu->arch.apf.data, &val, offset, sizeof(val)))
++	 *   - arch/x86/kvm/xen.c|259| <<__kvm_xen_has_interrupt>> kvm_read_guest_offset_cached(v->kvm,
++	 *          ghc, &rc, offset, sizeof(rc));
++	 *   - virt/kvm/kvm_main.c|3319| <<kvm_read_guest_cached>> return kvm_read_guest_offset_cached(kvm,
++	 *          ghc, data, 0, len);
++	 */
+ 	if (unlikely(kvm_read_guest_offset_cached(v->kvm, cache,
+ 		&guest_hv_clock, offset, sizeof(guest_hv_clock))))
+ 		return;
+@@ -2941,6 +3093,9 @@ static void kvm_setup_pvclock_page(struct kvm_vcpu *v,
+ 		++guest_hv_clock.version;  /* first time write, random junk */
+ 
+ 	vcpu->hv_clock.version = guest_hv_clock.version + 1;
++	/*
++	 * 第一次
++	 */
+ 	kvm_write_guest_offset_cached(v->kvm, cache,
+ 				      &vcpu->hv_clock, offset,
+ 				      sizeof(vcpu->hv_clock.version));
+@@ -2950,6 +3105,12 @@ static void kvm_setup_pvclock_page(struct kvm_vcpu *v,
+ 	/* retain PVCLOCK_GUEST_STOPPED if set in guest copy */
+ 	vcpu->hv_clock.flags |= (guest_hv_clock.flags & PVCLOCK_GUEST_STOPPED);
+ 
++	/*
++	 * 在以下使用kvm_vcou_arch->pvclock_set_guest_stopped_request:
++	 *   - arch/x86/kvm/x86.c|3033| <<kvm_setup_pvclock_page>> if (vcpu->pvclock_set_guest_stopped_request) {
++	 *   - arch/x86/kvm/x86.c|3035| <<kvm_setup_pvclock_page>> vcpu->pvclock_set_guest_stopped_request = false;
++	 *   - arch/x86/kvm/x86.c|5323| <<kvm_set_guest_paused>> vcpu->arch.pvclock_set_guest_stopped_request = true;
++	 */
+ 	if (vcpu->pvclock_set_guest_stopped_request) {
+ 		vcpu->hv_clock.flags |= PVCLOCK_GUEST_STOPPED;
+ 		vcpu->pvclock_set_guest_stopped_request = false;
+@@ -2957,6 +3118,9 @@ static void kvm_setup_pvclock_page(struct kvm_vcpu *v,
+ 
+ 	trace_kvm_pvclock_update(v->vcpu_id, &vcpu->hv_clock);
+ 
++	/*
++	 * 第二次
++	 */
+ 	kvm_write_guest_offset_cached(v->kvm, cache,
+ 				      &vcpu->hv_clock, offset,
+ 				      sizeof(vcpu->hv_clock));
+@@ -2964,11 +3128,36 @@ static void kvm_setup_pvclock_page(struct kvm_vcpu *v,
+ 	smp_wmb();
+ 
+ 	vcpu->hv_clock.version++;
++	/*
++	 * 第三次
++	 */
+ 	kvm_write_guest_offset_cached(v->kvm, cache,
+ 				     &vcpu->hv_clock, offset,
+ 				     sizeof(vcpu->hv_clock.version));
+ }
+ 
++/*
++ * 在以下使用KVM_REQ_CLOCK_UPDATE:
++ *   - arch/x86/kvm/x86.c|2881| <<kvm_gen_update_masterclock>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/x86.c|3030| <<kvm_guest_time_update>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, v);
++ *   - arch/x86/kvm/x86.c|3122| <<kvmclock_update_fn>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/x86.c|3131| <<kvm_gen_kvmclock_update>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, v);
++ *   - arch/x86/kvm/x86.c|3515| <<kvm_set_msr_common(MSR_IA32_TSC_ADJUST)>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/x86.c|4547| <<kvm_arch_vcpu_load>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/x86.c|5107| <<kvm_set_guest_paused>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/x86.c|6436| <<kvm_arch_vm_ioctl(KVM_SET_CLOCK)>> kvm_make_all_cpus_request(kvm, KVM_REQ_CLOCK_UPDATE);
++ *   - arch/x86/kvm/x86.c|8594| <<kvm_hyperv_tsc_notifier>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/x86.c|8655| <<__kvmclock_cpufreq_notifier>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/x86.c|9990| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_CLOCK_UPDATE, vcpu)) {
++ *   - arch/x86/kvm/x86.c|10312| <<vcpu_enter_guest>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/x86.c|11569| <<kvm_arch_hardware_enable>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/xen.c|371| <<kvm_xen_vcpu_set_attr>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/xen.c|394| <<kvm_xen_vcpu_set_attr>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++ *
++ *
++ * 处理KVM_REQ_CLOCK_UPDATE:
++ *   - arch/x86/kvm/x86.c|9991| <<vcpu_enter_guest(KVM_REQ_CLOCK_UPDATE)>> r = kvm_guest_time_update(vcpu);
++ */
+ static int kvm_guest_time_update(struct kvm_vcpu *v)
+ {
+ 	unsigned long flags, tgt_tsc_khz;
+@@ -2982,6 +3171,15 @@ static int kvm_guest_time_update(struct kvm_vcpu *v)
+ 	kernel_ns = 0;
+ 	host_tsc = 0;
+ 
++	/*
++	 * 在以下使用kvm_arch->pvclock_gtod_sync_lock:
++	 *   - kvm_synchronize_tsc()
++	 *   - kvm_gen_update_masterclock()
++	 *   - get_kvmclock_ns()
++	 *   - kvm_arch_vm_ioctl(KVM_SET_CLOCK)
++	 *   - kvm_hyperv_tsc_notifier()
++	 *   - kvm_arch_init_vm()
++	 */
+ 	/*
+ 	 * If the host uses TSC clock, then passthrough TSC as stable
+ 	 * to the guest.
+@@ -3053,6 +3251,15 @@ static int kvm_guest_time_update(struct kvm_vcpu *v)
+ 
+ 	vcpu->hv_clock.flags = pvclock_flags;
+ 
++	/*
++	 * 在以下使用kvm_vcpu_arch->pv_time_enabled:
++	 *   - arch/x86/kvm/x86.c|2242| <<kvm_write_system_time>> vcpu->arch.pv_time_enabled = false;
++	 *   - arch/x86/kvm/x86.c|2249| <<kvm_write_system_time>> vcpu->arch.pv_time_enabled = true;
++	 *   - arch/x86/kvm/x86.c|3088| <<kvm_guest_time_update>> if (vcpu->pv_time_enabled)
++	 *   - arch/x86/kvm/x86.c|3286| <<kvmclock_reset>> vcpu->arch.pv_time_enabled = false;
++	 *   - arch/x86/kvm/x86.c|5108| <<kvm_set_guest_paused>> if (!vcpu->arch.pv_time_enabled)
++	 *   - arch/x86/kvm/x86.c|6133| <<kvm_arch_suspend_notifier>> if (!vcpu->arch.pv_time_enabled)
++	 */
+ 	if (vcpu->pv_time_enabled)
+ 		kvm_setup_pvclock_page(v, &vcpu->pv_time, 0);
+ 	if (vcpu->xen.vcpu_info_set)
+@@ -3079,8 +3286,24 @@ static int kvm_guest_time_update(struct kvm_vcpu *v)
+  * by the delay we use to rate-limit the updates.
+  */
+ 
++/*
++ * 在以下使用KVMCLOCK_UPDATE_DELAY:
++ *   - arch/x86/kvm/x86.c|3137| <<kvm_gen_kvmclock_update>> schedule_delayed_work(&kvm->arch.kvmclock_update_work,
++ *                                                     KVMCLOCK_UPDATE_DELAY);
++ */
+ #define KVMCLOCK_UPDATE_DELAY msecs_to_jiffies(100)
+ 
++/*
++ * 在以下使用kvm_arch->kvmclock_update_work:
++ *   - arch/x86/kvm/x86.c|3136| <<kvm_gen_kvmclock_update>> schedule_delayed_work(&kvm->arch.kvmclock_update_work, KVMCLOCK_UPDATE_DELAY);
++ *   - arch/x86/kvm/x86.c|3152| <<kvmclock_sync_fn>> schedule_delayed_work(&kvm->arch.kvmclock_update_work, 0);
++ *   - arch/x86/kvm/x86.c|11789| <<kvm_arch_init_vm>> INIT_DELAYED_WORK(&kvm->arch.kvmclock_update_work, kvmclock_update_fn);
++ *   - arch/x86/kvm/x86.c|11838| <<kvm_arch_sync_events>> cancel_delayed_work_sync(&kvm->arch.kvmclock_update_work);
++ *
++ *
++ * 在以下使用kvmclock_update_fn():
++ *   - arch/x86/kvm/x86.c|11789| <<kvm_arch_init_vm>> INIT_DELAYED_WORK(&kvm->arch.kvmclock_update_work, kvmclock_update_fn);
++ */
+ static void kvmclock_update_fn(struct work_struct *work)
+ {
+ 	int i;
+@@ -3091,22 +3314,101 @@ static void kvmclock_update_fn(struct work_struct *work)
+ 	struct kvm_vcpu *vcpu;
+ 
+ 	kvm_for_each_vcpu(i, vcpu, kvm) {
++		/*
++		 * 在以下使用KVM_REQ_CLOCK_UPDATE:
++		 *   - arch/x86/kvm/x86.c|2881| <<kvm_gen_update_masterclock>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++		 *   - arch/x86/kvm/x86.c|3030| <<kvm_guest_time_update>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, v);
++		 *   - arch/x86/kvm/x86.c|3122| <<kvmclock_update_fn>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++		 *   - arch/x86/kvm/x86.c|3131| <<kvm_gen_kvmclock_update>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, v);
++		 *   - arch/x86/kvm/x86.c|3515| <<kvm_set_msr_common(MSR_IA32_TSC_ADJUST)>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++		 *   - arch/x86/kvm/x86.c|4547| <<kvm_arch_vcpu_load>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++		 *   - arch/x86/kvm/x86.c|5107| <<kvm_set_guest_paused>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++		 *   - arch/x86/kvm/x86.c|6436| <<kvm_arch_vm_ioctl(KVM_SET_CLOCK)>> kvm_make_all_cpus_request(kvm, KVM_REQ_CLOCK_UPDATE);
++		 *   - arch/x86/kvm/x86.c|8594| <<kvm_hyperv_tsc_notifier>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++		 *   - arch/x86/kvm/x86.c|8655| <<__kvmclock_cpufreq_notifier>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++		 *   - arch/x86/kvm/x86.c|9990| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_CLOCK_UPDATE, vcpu)) {
++		 *   - arch/x86/kvm/x86.c|10312| <<vcpu_enter_guest>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++		 *   - arch/x86/kvm/x86.c|11569| <<kvm_arch_hardware_enable>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++		 *   - arch/x86/kvm/xen.c|371| <<kvm_xen_vcpu_set_attr>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++		 *   - arch/x86/kvm/xen.c|394| <<kvm_xen_vcpu_set_attr>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++		 *
++		 * 处理的函数kvm_guest_time_update()
++		 */
+ 		kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
+ 		kvm_vcpu_kick(vcpu);
+ 	}
+ }
+ 
++/*
++ * 在以下使用KVM_REQ_GLOBAL_CLOCK_UPDATE:
++ *   - arch/x86/kvm/x86.c|2239| <<kvm_write_system_time>> kvm_make_request(KVM_REQ_GLOBAL_CLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/x86.c|4575| <<kvm_arch_vcpu_load>> if (!vcpu->kvm->arch.use_master_clock || vcpu->cpu == -1)
++ *                                      kvm_make_request(KVM_REQ_GLOBAL_CLOCK_UPDATE, vcpu);
++ *   - arch/x86/kvm/x86.c|9992| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_GLOBAL_CLOCK_UPDATE, vcpu))
++ *       
++ * 处理的函数kvm_gen_kvmclock_update().
++ *
++ *
++ * 处理KVM_REQ_GLOBAL_CLOCK_UPDATE:
++ *   - arch/x86/kvm/x86.c|9993| <<vcpu_enter_guest(KVM_REQ_GLOBAL_CLOCK_UPDATE)>> kvm_gen_kvmclock_update(vcpu);
++ *
++ * 核心思想就是让所有的vCPU都KVM_REQ_CLOCK_UPDATE
++ */
+ static void kvm_gen_kvmclock_update(struct kvm_vcpu *v)
+ {
+ 	struct kvm *kvm = v->kvm;
+ 
++	/*
++	 * 在以下使用KVM_REQ_CLOCK_UPDATE:
++	 *   - arch/x86/kvm/x86.c|2881| <<kvm_gen_update_masterclock>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++	 *   - arch/x86/kvm/x86.c|3030| <<kvm_guest_time_update>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, v);
++	 *   - arch/x86/kvm/x86.c|3122| <<kvmclock_update_fn>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++	 *   - arch/x86/kvm/x86.c|3131| <<kvm_gen_kvmclock_update>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, v);
++	 *   - arch/x86/kvm/x86.c|3515| <<kvm_set_msr_common(MSR_IA32_TSC_ADJUST)>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++	 *   - arch/x86/kvm/x86.c|4547| <<kvm_arch_vcpu_load>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++	 *   - arch/x86/kvm/x86.c|5107| <<kvm_set_guest_paused>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++	 *   - arch/x86/kvm/x86.c|6436| <<kvm_arch_vm_ioctl(KVM_SET_CLOCK)>> kvm_make_all_cpus_request(kvm, KVM_REQ_CLOCK_UPDATE);
++	 *   - arch/x86/kvm/x86.c|8594| <<kvm_hyperv_tsc_notifier>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++	 *   - arch/x86/kvm/x86.c|8655| <<__kvmclock_cpufreq_notifier>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++	 *   - arch/x86/kvm/x86.c|9990| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_CLOCK_UPDATE, vcpu)) {
++	 *   - arch/x86/kvm/x86.c|10312| <<vcpu_enter_guest>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++	 *   - arch/x86/kvm/x86.c|11569| <<kvm_arch_hardware_enable>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++	 *   - arch/x86/kvm/xen.c|371| <<kvm_xen_vcpu_set_attr>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++	 *   - arch/x86/kvm/xen.c|394| <<kvm_xen_vcpu_set_attr>> kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
++	 *
++	 * 处理的函数kvm_guest_time_update()
++	 */
+ 	kvm_make_request(KVM_REQ_CLOCK_UPDATE, v);
++	/*
++	 * 在以下使用kvm_arch->kvmclock_update_work:
++	 *   - arch/x86/kvm/x86.c|3136| <<kvm_gen_kvmclock_update>> schedule_delayed_work(&kvm->arch.kvmclock_update_work, KVMCLOCK_UPDATE_DELAY);
++	 *   - arch/x86/kvm/x86.c|3152| <<kvmclock_sync_fn>> schedule_delayed_work(&kvm->arch.kvmclock_update_work, 0);
++	 *   - arch/x86/kvm/x86.c|11789| <<kvm_arch_init_vm>> INIT_DELAYED_WORK(&kvm->arch.kvmclock_update_work, kvmclock_update_fn);
++	 *   - arch/x86/kvm/x86.c|11838| <<kvm_arch_sync_events>> cancel_delayed_work_sync(&kvm->arch.kvmclock_update_work);
++	 *
++	 * 调用kvmclock_update_fn()
++	 */
+ 	schedule_delayed_work(&kvm->arch.kvmclock_update_work,
+ 					KVMCLOCK_UPDATE_DELAY);
+ }
+ 
++/*
++ * 在以下使用KVMCLOCK_SYNC_PERIOD:
++ *   - arch/x86/kvm/x86.c|3154| <<kvmclock_sync_fn>> schedule_delayed_work(&kvm->arch.kvmclock_sync_work, KVMCLOCK_SYNC_PERIOD);
++ *   - arch/x86/kvm/x86.c|11374| <<kvm_arch_vcpu_postcreate>> schedule_delayed_work(&kvm->arch.kvmclock_sync_work, KVMCLOCK_SYNC_PERIOD);
++ */
+ #define KVMCLOCK_SYNC_PERIOD (300 * HZ)
+ 
++/*
++ * 在以下使用kvm_arch->kvmclock_sync_work:
++ *   - arch/x86/kvm/x86.c|3233| <<kvmclock_sync_fn>> schedule_delayed_work(&kvm->arch.kvmclock_sync_work, KVMCLOCK_SYNC_PERIOD);
++ *   - arch/x86/kvm/x86.c|11489| <<kvm_arch_vcpu_postcreate>> schedule_delayed_work(&kvm->arch.kvmclock_sync_work, KVMCLOCK_SYNC_PERIOD);
++ *   - arch/x86/kvm/x86.c|11913| <<kvm_arch_init_vm>> INIT_DELAYED_WORK(&kvm->arch.kvmclock_sync_work, kvmclock_sync_fn);
++ *   - arch/x86/kvm/x86.c|11960| <<kvm_arch_sync_events>> cancel_delayed_work_sync(&kvm->arch.kvmclock_sync_work);
++ *
++ * 在以下使用kvmclock_sync_fn():
++ *   - arch/x86/kvm/x86.c|11913| <<kvm_arch_init_vm>> INIT_DELAYED_WORK(&kvm->arch.kvmclock_sync_work, kvmclock_sync_fn);
++ */
+ static void kvmclock_sync_fn(struct work_struct *work)
+ {
+ 	struct delayed_work *dwork = to_delayed_work(work);
+@@ -3117,7 +3419,21 @@ static void kvmclock_sync_fn(struct work_struct *work)
+ 	if (!kvmclock_periodic_sync)
+ 		return;
+ 
++	/*
++	 * 在以下使用kvm_arch->kvmclock_update_work:
++	 *   - arch/x86/kvm/x86.c|3136| <<kvm_gen_kvmclock_update>> schedule_delayed_work(&kvm->arch.kvmclock_update_work, KVMCLOCK_UPDATE_DELAY);
++	 *   - arch/x86/kvm/x86.c|3152| <<kvmclock_sync_fn>> schedule_delayed_work(&kvm->arch.kvmclock_update_work, 0);
++	 *   - arch/x86/kvm/x86.c|11789| <<kvm_arch_init_vm>> INIT_DELAYED_WORK(&kvm->arch.kvmclock_update_work, kvmclock_update_fn);
++	 *   - arch/x86/kvm/x86.c|11838| <<kvm_arch_sync_events>> cancel_delayed_work_sync(&kvm->arch.kvmclock_update_work);
++	 */
+ 	schedule_delayed_work(&kvm->arch.kvmclock_update_work, 0);
++	/*
++	 * 在以下使用kvm_arch->kvmclock_sync_work:
++	 *   - arch/x86/kvm/x86.c|3233| <<kvmclock_sync_fn>> schedule_delayed_work(&kvm->arch.kvmclock_sync_work, KVMCLOCK_SYNC_PERIOD);
++	 *   - arch/x86/kvm/x86.c|11489| <<kvm_arch_vcpu_postcreate>> schedule_delayed_work(&kvm->arch.kvmclock_sync_work, KVMCLOCK_SYNC_PERIOD);
++	 *   - arch/x86/kvm/x86.c|11913| <<kvm_arch_init_vm>> INIT_DELAYED_WORK(&kvm->arch.kvmclock_sync_work, kvmclock_sync_fn);
++	 *   - arch/x86/kvm/x86.c|11960| <<kvm_arch_sync_events>> cancel_delayed_work_sync(&kvm->arch.kvmclock_sync_work);
++	 */
+ 	schedule_delayed_work(&kvm->arch.kvmclock_sync_work,
+ 					KVMCLOCK_SYNC_PERIOD);
+ }
+@@ -3221,6 +3537,27 @@ static int kvm_pv_enable_async_pf(struct kvm_vcpu *vcpu, u64 data)
+ 		return 0;
+ 	}
+ 
++	/*
++	 * 在以下使用kvm_gfn_to_hva_cache_init():
++	 *   - arch/x86/kvm/lapic.c|2947| <<kvm_lapic_set_vapic_addr>> if (kvm_gfn_to_hva_cache_init(vcpu->kvm,
++	 *            &vcpu->arch.apic->vapic_cache, vapic_addr, sizeof(u32)))
++	 *   - arch/x86/kvm/lapic.c|3063| <<kvm_lapic_enable_pv_eoi>> return kvm_gfn_to_hva_cache_init(vcpu->kvm,
++	 *            ghc, addr, new_len);
++	 *   - arch/x86/kvm/x86.c|2278| <<kvm_write_system_time>> if (!kvm_gfn_to_hva_cache_init(vcpu->kvm,
++	 *            &vcpu->arch.pv_time, system_time & ~1ULL, sizeof(struct pvclock_vcpu_time_info)))
++	 *   - arch/x86/kvm/x86.c|3442| <<kvm_pv_enable_async_pf>> if (kvm_gfn_to_hva_cache_init(vcpu->kvm,
++	 *            &vcpu->arch.apf.data, gpa, sizeof(u64)))
++	 *   - arch/x86/kvm/x86.c|3561| <<record_steal_time>> if (kvm_gfn_to_hva_cache_init(vcpu->kvm,
++	 *            ghc, gpa, sizeof(*st)) ||
++	 *   - arch/x86/kvm/xen.c|109| <<kvm_xen_update_runstate_guest>> kvm_gfn_to_hva_cache_init(v->kvm,
++	 *            ghc, ghc->gpa, ghc->len))
++	 *   - arch/x86/kvm/xen.c|365| <<kvm_xen_vcpu_set_attr>> r = kvm_gfn_to_hva_cache_init(vcpu->kvm,
++	 *            &vcpu->arch.xen.vcpu_info_cache, data->u.gpa, sizeof(struct vcpu_info));
++	 *   - arch/x86/kvm/xen.c|388| <<kvm_xen_vcpu_set_attr>> r = kvm_gfn_to_hva_cache_init(vcpu->kvm,
++	 *            &vcpu->arch.xen.vcpu_time_info_cache, data->u.gpa, sizeof(struct pvclock_vcpu_time_info));
++	 *   - arch/x86/kvm/xen.c|415| <<kvm_xen_vcpu_set_attr>> r = kvm_gfn_to_hva_cache_init(vcpu->kvm,
++	 *            &vcpu->arch.xen.runstate_cache, data->u.gpa, sizeof(struct vcpu_runstate_info));
++	 */
+ 	if (kvm_gfn_to_hva_cache_init(vcpu->kvm, &vcpu->arch.apf.data, gpa,
+ 					sizeof(u64)))
+ 		return 1;
+@@ -3251,6 +3588,15 @@ static int kvm_pv_enable_async_pf_int(struct kvm_vcpu *vcpu, u64 data)
+ 
+ static void kvmclock_reset(struct kvm_vcpu *vcpu)
+ {
++	/*
++	 * 在以下使用kvm_vcpu_arch->pv_time_enabled:
++	 *   - arch/x86/kvm/x86.c|2242| <<kvm_write_system_time>> vcpu->arch.pv_time_enabled = false;
++	 *   - arch/x86/kvm/x86.c|2249| <<kvm_write_system_time>> vcpu->arch.pv_time_enabled = true;
++	 *   - arch/x86/kvm/x86.c|3088| <<kvm_guest_time_update>> if (vcpu->pv_time_enabled)
++	 *   - arch/x86/kvm/x86.c|3286| <<kvmclock_reset>> vcpu->arch.pv_time_enabled = false;
++	 *   - arch/x86/kvm/x86.c|5108| <<kvm_set_guest_paused>> if (!vcpu->arch.pv_time_enabled)
++	 *   - arch/x86/kvm/x86.c|6133| <<kvm_arch_suspend_notifier>> if (!vcpu->arch.pv_time_enabled)
++	 */
+ 	vcpu->arch.pv_time_enabled = false;
+ 	vcpu->arch.time = 0;
+ }
+@@ -3331,6 +3677,27 @@ static void record_steal_time(struct kvm_vcpu *vcpu)
+ 		/* We rely on the fact that it fits in a single page. */
+ 		BUILD_BUG_ON((sizeof(*st) - 1) & KVM_STEAL_VALID_BITS);
+ 
++		/*
++		 * 在以下使用kvm_gfn_to_hva_cache_init():
++		 *   - arch/x86/kvm/lapic.c|2947| <<kvm_lapic_set_vapic_addr>> if (kvm_gfn_to_hva_cache_init(vcpu->kvm,
++		 *            &vcpu->arch.apic->vapic_cache, vapic_addr, sizeof(u32)))
++		 *   - arch/x86/kvm/lapic.c|3063| <<kvm_lapic_enable_pv_eoi>> return kvm_gfn_to_hva_cache_init(vcpu->kvm,
++		 *            ghc, addr, new_len);
++		 *   - arch/x86/kvm/x86.c|2278| <<kvm_write_system_time>> if (!kvm_gfn_to_hva_cache_init(vcpu->kvm,
++		 *            &vcpu->arch.pv_time, system_time & ~1ULL, sizeof(struct pvclock_vcpu_time_info)))
++		 *   - arch/x86/kvm/x86.c|3442| <<kvm_pv_enable_async_pf>> if (kvm_gfn_to_hva_cache_init(vcpu->kvm,
++		 *            &vcpu->arch.apf.data, gpa, sizeof(u64)))
++		 *   - arch/x86/kvm/x86.c|3561| <<record_steal_time>> if (kvm_gfn_to_hva_cache_init(vcpu->kvm,
++		 *            ghc, gpa, sizeof(*st)) ||
++		 *   - arch/x86/kvm/xen.c|109| <<kvm_xen_update_runstate_guest>> kvm_gfn_to_hva_cache_init(v->kvm,
++		 *            ghc, ghc->gpa, ghc->len))
++		 *   - arch/x86/kvm/xen.c|365| <<kvm_xen_vcpu_set_attr>> r = kvm_gfn_to_hva_cache_init(vcpu->kvm,
++		 *            &vcpu->arch.xen.vcpu_info_cache, data->u.gpa, sizeof(struct vcpu_info));
++		 *   - arch/x86/kvm/xen.c|388| <<kvm_xen_vcpu_set_attr>> r = kvm_gfn_to_hva_cache_init(vcpu->kvm,
++		 *            &vcpu->arch.xen.vcpu_time_info_cache, data->u.gpa, sizeof(struct pvclock_vcpu_time_info));
++		 *   - arch/x86/kvm/xen.c|415| <<kvm_xen_vcpu_set_attr>> r = kvm_gfn_to_hva_cache_init(vcpu->kvm,
++		 *            &vcpu->arch.xen.runstate_cache, data->u.gpa, sizeof(struct vcpu_runstate_info));
++		 */
+ 		if (kvm_gfn_to_hva_cache_init(vcpu->kvm, ghc, gpa, sizeof(*st)) ||
+ 		    kvm_is_error_hva(ghc->hva) || !ghc->memslot)
+ 			return;
+@@ -4539,6 +4906,15 @@ void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+ 		 * On a host with synchronized TSC, there is no need to update
+ 		 * kvmclock on vcpu->cpu migration
+ 		 */
++		/*
++		 * 在以下使用KVM_REQ_GLOBAL_CLOCK_UPDATE:
++		 *   - arch/x86/kvm/x86.c|2239| <<kvm_write_system_time>> kvm_make_request(KVM_REQ_GLOBAL_CLOCK_UPDATE, vcpu);
++		 *   - arch/x86/kvm/x86.c|4575| <<kvm_arch_vcpu_load>> if (!vcpu->kvm->arch.use_master_clock || vcpu->cpu == -1)
++		 *                                      kvm_make_request(KVM_REQ_GLOBAL_CLOCK_UPDATE, vcpu);
++		 *   - arch/x86/kvm/x86.c|9992| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_GLOBAL_CLOCK_UPDATE, vcpu))
++		 *
++		 * 处理的函数kvm_gen_kvmclock_update().
++		 */
+ 		if (!vcpu->kvm->arch.use_master_clock || vcpu->cpu == -1)
+ 			kvm_make_request(KVM_REQ_GLOBAL_CLOCK_UPDATE, vcpu);
+ 		if (vcpu->cpu != cpu)
+@@ -5071,10 +5447,30 @@ static int kvm_vcpu_ioctl_x86_set_xcrs(struct kvm_vcpu *vcpu,
+  * EINVAL is returned when the host attempts to set the flag for a guest that
+  * does not support pv clocks.
+  */
++/*
++ * 在以下使用kvm_set_guest_paused():
++ *   - arch/x86/kvm/x86.c|5686| <<kvm_arch_vcpu_ioctl>> r = kvm_set_guest_paused(vcpu);
++ *   - arch/x86/kvm/x86.c|6349| <<kvm_arch_suspend_notifier>> ret = kvm_set_guest_paused(vcpu);
++ */
+ static int kvm_set_guest_paused(struct kvm_vcpu *vcpu)
+ {
++	/*
++	 * 在以下使用kvm_vcpu_arch->pv_time_enabled:
++	 *   - arch/x86/kvm/x86.c|2242| <<kvm_write_system_time>> vcpu->arch.pv_time_enabled = false;
++	 *   - arch/x86/kvm/x86.c|2249| <<kvm_write_system_time>> vcpu->arch.pv_time_enabled = true;
++	 *   - arch/x86/kvm/x86.c|3088| <<kvm_guest_time_update>> if (vcpu->pv_time_enabled)
++	 *   - arch/x86/kvm/x86.c|3286| <<kvmclock_reset>> vcpu->arch.pv_time_enabled = false;
++	 *   - arch/x86/kvm/x86.c|5108| <<kvm_set_guest_paused>> if (!vcpu->arch.pv_time_enabled)
++	 *   - arch/x86/kvm/x86.c|6133| <<kvm_arch_suspend_notifier>> if (!vcpu->arch.pv_time_enabled)
++	 */
+ 	if (!vcpu->arch.pv_time_enabled)
+ 		return -EINVAL;
++	/*
++	 * 在以下使用kvm_vcou_arch->pvclock_set_guest_stopped_request:
++	 *   - arch/x86/kvm/x86.c|3033| <<kvm_setup_pvclock_page>> if (vcpu->pvclock_set_guest_stopped_request) {
++	 *   - arch/x86/kvm/x86.c|3035| <<kvm_setup_pvclock_page>> vcpu->pvclock_set_guest_stopped_request = false;
++	 *   - arch/x86/kvm/x86.c|5323| <<kvm_set_guest_paused>> vcpu->arch.pvclock_set_guest_stopped_request = true;
++	 */
+ 	vcpu->arch.pvclock_set_guest_stopped_request = true;
+ 	kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
+ 	return 0;
+@@ -5751,6 +6147,15 @@ void kvm_arch_sync_dirty_log(struct kvm *kvm, struct kvm_memory_slot *memslot)
+ 	struct kvm_vcpu *vcpu;
+ 	int i;
+ 
++	/*
++	 * 在以下使用kvm_dirty_log_pgtable():
++	 *   - arch/x86/kvm/mmu/mmu.c|899| <<gfn_to_memslot_dirty_bitmap>> !kvm_dirty_log_pgtable(vcpu->kvm))
++	 *   - arch/x86/kvm/mmu/mmu.c|1388| <<kvm_arch_mmu_enable_log_dirty_pt_masked>> !kvm_dirty_log_pgtable(kvm)) {
++	 *   - arch/x86/kvm/mmu/mmu.c|1401| <<kvm_arch_mmu_enable_log_dirty_pt_masked>> if (kvm_dirty_log_pgtable(kvm) &&
++	 *   - arch/x86/kvm/x86.c|6114| <<kvm_arch_sync_dirty_log>> if (kvm_dirty_log_pgtable(kvm)) {
++	 *   - arch/x86/kvm/x86.c|12631| <<kvm_mmu_slot_apply_flags>> if (!kvm_dirty_log_pgtable(kvm))
++	 *   - virt/kvm/kvm_main.c|2235| <<kvm_clear_dirty_log_protect>> if (!kvm_dirty_log_pgtable(kvm))
++	 */
+ 	if (kvm_dirty_log_pgtable(kvm)) {
+ 		kvm_mmu_slot_test_dirty(kvm, memslot, PG_LEVEL_4K);
+ 		return;
+@@ -6397,6 +6802,15 @@ long kvm_arch_vm_ioctl(struct file *filp,
+ 		 * is slightly ahead) here we risk going negative on unsigned
+ 		 * 'system_time' when 'user_ns.clock' is very small.
+ 		 */
++		/*
++		 *  在以下使用kvm_arch->pvclock_gtod_sync_lock:
++		 *   - kvm_synchronize_tsc()
++		 *   - kvm_gen_update_masterclock()
++		 *   - get_kvmclock_ns()
++		 *   - kvm_arch_vm_ioctl(KVM_SET_CLOCK)
++		 *   - kvm_hyperv_tsc_notifier()
++		 *   - kvm_arch_init_vm()
++		 */
+ 		raw_spin_lock_irq(&ka->pvclock_gtod_sync_lock);
+ 		if (kvm->arch.use_master_clock)
+ 			now_ns = ka->master_kernel_ns;
+@@ -6412,6 +6826,15 @@ long kvm_arch_vm_ioctl(struct file *filp,
+ 		struct kvm_clock_data user_ns;
+ 		u64 now_ns;
+ 
++		/*
++		 * 在以下使用get_kvmclock_ns():
++		 *   - arch/x86/kvm/hyperv.c|566| <<get_time_ref_counter>> return div_u64(get_kvmclock_ns(kvm), 100);
++		 *   - arch/x86/kvm/x86.c|2208| <<kvm_write_wall_clock>> wall_nsec = ktime_get_real_ns() - get_kvmclock_ns(kvm);
++		 *   - arch/x86/kvm/x86.c|6554| <<kvm_arch_vm_ioctl(KVM_GET_CLOCK)>> now_ns = get_kvmclock_ns(kvm);
++		 *   - arch/x86/kvm/xen.c|68| <<kvm_xen_update_runstate>> u64 now = get_kvmclock_ns(v->kvm);
++		 *   - arch/x86/kvm/xen.c|455| <<kvm_xen_vcpu_set_attr>> if (get_kvmclock_ns(vcpu->kvm) <
++		 *   - arch/x86/kvm/xen.c|496| <<kvm_xen_vcpu_set_attr>> if (get_kvmclock_ns(vcpu->kvm) <
++		 */
+ 		now_ns = get_kvmclock_ns(kvm);
+ 		user_ns.clock = now_ns;
+ 		user_ns.flags = kvm->arch.use_master_clock ? KVM_CLOCK_TSC_STABLE : 0;
+@@ -8558,6 +8981,15 @@ static void kvm_hyperv_tsc_notifier(void)
+ 	list_for_each_entry(kvm, &vm_list, vm_list) {
+ 		struct kvm_arch *ka = &kvm->arch;
+ 
++		/*
++		 *  在以下使用kvm_arch->pvclock_gtod_sync_lock:
++		 *   - kvm_synchronize_tsc()
++		 *   - kvm_gen_update_masterclock()
++		 *   - get_kvmclock_ns()
++		 *   - kvm_arch_vm_ioctl(KVM_SET_CLOCK)
++		 *   - kvm_hyperv_tsc_notifier()
++		 *   - kvm_arch_init_vm()
++		 */
+ 		raw_spin_lock_irqsave(&ka->pvclock_gtod_sync_lock, flags);
+ 		pvclock_update_vm_gtod_copy(kvm);
+ 		raw_spin_unlock_irqrestore(&ka->pvclock_gtod_sync_lock, flags);
+@@ -8746,6 +9178,10 @@ static struct perf_guest_info_callbacks kvm_guest_cbs = {
+ };
+ 
+ #ifdef CONFIG_X86_64
++/*
++ * 在以下使用pvclock_gtod_update_fn():
++ *   - arch/x86/kvm/x86.c|9109| <<global>> static DECLARE_WORK(pvclock_gtod_work, pvclock_gtod_update_fn);
++ */
+ static void pvclock_gtod_update_fn(struct work_struct *work)
+ {
+ 	struct kvm *kvm;
+@@ -8754,6 +9190,18 @@ static void pvclock_gtod_update_fn(struct work_struct *work)
+ 	int i;
+ 
+ 	mutex_lock(&kvm_lock);
++	/*
++	 * 在以下使用KVM_REQ_MASTERCLOCK_UPDATE:
++	 *   - arch/x86/kvm/hyperv.c|1398| <<kvm_hv_set_msr_pw>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++	 *   - arch/x86/kvm/x86.c|2247| <<kvm_write_system_time>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++	 *   - arch/x86/kvm/x86.c|2474| <<kvm_track_tsc_matching>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++	 *   - arch/x86/kvm/x86.c|9104| <<pvclock_gtod_update_fn>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++	 *   - arch/x86/kvm/x86.c|10312| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu))
++	 *   - arch/x86/kvm/x86.c|11956| <<kvm_arch_hardware_enable>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++	 *   - arch/x86/kvm/xen.c|58| <<kvm_xen_shared_info_init>> kvm_make_all_cpus_request(kvm, KVM_REQ_MASTERCLOCK_UPDATE);
++	 *
++	 * 处理的函数kvm_gen_update_masterclock().
++	 */
+ 	list_for_each_entry(kvm, &vm_list, vm_list)
+ 		kvm_for_each_vcpu(i, vcpu, kvm)
+ 			kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
+@@ -9955,6 +10403,27 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 			kvm_mmu_unload(vcpu);
+ 		if (kvm_check_request(KVM_REQ_MIGRATE_TIMER, vcpu))
+ 			__kvm_migrate_timers(vcpu);
++		/*
++		 * 在以下使用KVM_REQ_MASTERCLOCK_UPDATE:
++		 *   - arch/x86/kvm/hyperv.c|1398| <<kvm_hv_set_msr_pw>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++		 *   - arch/x86/kvm/x86.c|2247| <<kvm_write_system_time>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++		 *   - arch/x86/kvm/x86.c|2474| <<kvm_track_tsc_matching>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++		 *   - arch/x86/kvm/x86.c|9104| <<pvclock_gtod_update_fn>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++		 *   - arch/x86/kvm/x86.c|10312| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu))
++		 *   - arch/x86/kvm/x86.c|11956| <<kvm_arch_hardware_enable>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++		 *   - arch/x86/kvm/xen.c|58| <<kvm_xen_shared_info_init>> kvm_make_all_cpus_request(kvm, KVM_REQ_MASTERCLOCK_UPDATE);
++		 *
++		 * 处理的函数kvm_gen_update_masterclock().
++		 *
++		 *
++		 * 在以下使用KVM_REQ_GLOBAL_CLOCK_UPDATE:
++		 *   - arch/x86/kvm/x86.c|2239| <<kvm_write_system_time>> kvm_make_request(KVM_REQ_GLOBAL_CLOCK_UPDATE, vcpu);
++		 *   - arch/x86/kvm/x86.c|4575| <<kvm_arch_vcpu_load>> if (!vcpu->kvm->arch.use_master_clock || vcpu->cpu == -1)
++		 *                                      kvm_make_request(KVM_REQ_GLOBAL_CLOCK_UPDATE, vcpu);
++		 *   - arch/x86/kvm/x86.c|9992| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_GLOBAL_CLOCK_UPDATE, vcpu))
++		 *
++		 * 处理的函数kvm_gen_kvmclock_update().
++		 */
+ 		if (kvm_check_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu))
+ 			kvm_gen_update_masterclock(vcpu->kvm);
+ 		if (kvm_check_request(KVM_REQ_GLOBAL_CLOCK_UPDATE, vcpu))
+@@ -11337,6 +11806,13 @@ void kvm_arch_vcpu_postcreate(struct kvm_vcpu *vcpu)
+ 
+ 	mutex_unlock(&vcpu->mutex);
+ 
++	/*
++	 * 在以下使用kvm_arch->kvmclock_sync_work:
++	 *   - arch/x86/kvm/x86.c|3233| <<kvmclock_sync_fn>> schedule_delayed_work(&kvm->arch.kvmclock_sync_work, KVMCLOCK_SYNC_PERIOD);
++	 *   - arch/x86/kvm/x86.c|11489| <<kvm_arch_vcpu_postcreate>> schedule_delayed_work(&kvm->arch.kvmclock_sync_work, KVMCLOCK_SYNC_PERIOD);
++	 *   - arch/x86/kvm/x86.c|11913| <<kvm_arch_init_vm>> INIT_DELAYED_WORK(&kvm->arch.kvmclock_sync_work, kvmclock_sync_fn);
++	 *   - arch/x86/kvm/x86.c|11960| <<kvm_arch_sync_events>> cancel_delayed_work_sync(&kvm->arch.kvmclock_sync_work);
++	 */
+ 	if (kvmclock_periodic_sync && vcpu->vcpu_idx == 0)
+ 		schedule_delayed_work(&kvm->arch.kvmclock_sync_work,
+ 						KVMCLOCK_SYNC_PERIOD);
+@@ -11592,6 +12068,18 @@ int kvm_arch_hardware_enable(void)
+ 			kvm_for_each_vcpu(i, vcpu, kvm) {
+ 				vcpu->arch.tsc_offset_adjustment += delta_cyc;
+ 				vcpu->arch.last_host_tsc = local_tsc;
++				/*
++				 * 在以下使用KVM_REQ_MASTERCLOCK_UPDATE:
++				 *   - arch/x86/kvm/hyperv.c|1398| <<kvm_hv_set_msr_pw>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++				 *   - arch/x86/kvm/x86.c|2247| <<kvm_write_system_time>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++				 *   - arch/x86/kvm/x86.c|2474| <<kvm_track_tsc_matching>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++				 *   - arch/x86/kvm/x86.c|9104| <<pvclock_gtod_update_fn>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++				 *   - arch/x86/kvm/x86.c|10312| <<vcpu_enter_guest>> if (kvm_check_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu))
++				 *   - arch/x86/kvm/x86.c|11956| <<kvm_arch_hardware_enable>> kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
++				 *   - arch/x86/kvm/xen.c|58| <<kvm_xen_shared_info_init>> kvm_make_all_cpus_request(kvm, KVM_REQ_MASTERCLOCK_UPDATE);
++				 *
++				 * 处理的函数kvm_gen_update_masterclock().
++				 */
+ 				kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
+ 			}
+ 
+@@ -11742,6 +12230,15 @@ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
+ 
+ 	raw_spin_lock_init(&kvm->arch.tsc_write_lock);
+ 	mutex_init(&kvm->arch.apic_map_lock);
++	/*
++	 *  在以下使用kvm_arch->pvclock_gtod_sync_lock:
++	 *   - kvm_synchronize_tsc()
++	 *   - kvm_gen_update_masterclock()
++	 *   - get_kvmclock_ns()
++	 *   - kvm_arch_vm_ioctl(KVM_SET_CLOCK)
++	 *   - kvm_hyperv_tsc_notifier()
++	 *   - kvm_arch_init_vm()
++	 */
+ 	raw_spin_lock_init(&kvm->arch.pvclock_gtod_sync_lock);
+ 
+ 	kvm->arch.kvmclock_offset = -get_kvmclock_base_ns();
+@@ -11754,7 +12251,21 @@ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
+ 	kvm->arch.hv_root_tdp = INVALID_PAGE;
+ #endif
+ 
++	/*
++	 * 在以下使用kvm_arch->kvmclock_update_work:
++	 *   - arch/x86/kvm/x86.c|3136| <<kvm_gen_kvmclock_update>> schedule_delayed_work(&kvm->arch.kvmclock_update_work, KVMCLOCK_UPDATE_DELAY);
++	 *   - arch/x86/kvm/x86.c|3152| <<kvmclock_sync_fn>> schedule_delayed_work(&kvm->arch.kvmclock_update_work, 0);
++	 *   - arch/x86/kvm/x86.c|11789| <<kvm_arch_init_vm>> INIT_DELAYED_WORK(&kvm->arch.kvmclock_update_work, kvmclock_update_fn);
++	 *   - arch/x86/kvm/x86.c|11838| <<kvm_arch_sync_events>> cancel_delayed_work_sync(&kvm->arch.kvmclock_update_work);
++	 */
+ 	INIT_DELAYED_WORK(&kvm->arch.kvmclock_update_work, kvmclock_update_fn);
++	/*
++	 * 在以下使用kvm_arch->kvmclock_sync_work:
++	 *   - arch/x86/kvm/x86.c|3233| <<kvmclock_sync_fn>> schedule_delayed_work(&kvm->arch.kvmclock_sync_work, KVMCLOCK_SYNC_PERIOD);
++	 *   - arch/x86/kvm/x86.c|11489| <<kvm_arch_vcpu_postcreate>> schedule_delayed_work(&kvm->arch.kvmclock_sync_work, KVMCLOCK_SYNC_PERIOD);
++	 *   - arch/x86/kvm/x86.c|11913| <<kvm_arch_init_vm>> INIT_DELAYED_WORK(&kvm->arch.kvmclock_sync_work, kvmclock_sync_fn);
++	 *   - arch/x86/kvm/x86.c|11960| <<kvm_arch_sync_events>> cancel_delayed_work_sync(&kvm->arch.kvmclock_sync_work);
++	 */
+ 	INIT_DELAYED_WORK(&kvm->arch.kvmclock_sync_work, kvmclock_sync_fn);
+ 
+ 	kvm_apicv_init(kvm);
+@@ -11802,7 +12313,21 @@ static void kvm_free_vcpus(struct kvm *kvm)
+ 
+ void kvm_arch_sync_events(struct kvm *kvm)
+ {
++	/*
++	 * 在以下使用kvm_arch->kvmclock_sync_work:
++	 *   - arch/x86/kvm/x86.c|3233| <<kvmclock_sync_fn>> schedule_delayed_work(&kvm->arch.kvmclock_sync_work, KVMCLOCK_SYNC_PERIOD);
++	 *   - arch/x86/kvm/x86.c|11489| <<kvm_arch_vcpu_postcreate>> schedule_delayed_work(&kvm->arch.kvmclock_sync_work, KVMCLOCK_SYNC_PERIOD);
++	 *   - arch/x86/kvm/x86.c|11913| <<kvm_arch_init_vm>> INIT_DELAYED_WORK(&kvm->arch.kvmclock_sync_work, kvmclock_sync_fn);
++	 *   - arch/x86/kvm/x86.c|11960| <<kvm_arch_sync_events>> cancel_delayed_work_sync(&kvm->arch.kvmclock_sync_work);
++	 */
+ 	cancel_delayed_work_sync(&kvm->arch.kvmclock_sync_work);
++	/*
++	 * 在以下使用kvm_arch->kvmclock_update_work:
++	 *   - arch/x86/kvm/x86.c|3136| <<kvm_gen_kvmclock_update>> schedule_delayed_work(&kvm->arch.kvmclock_update_work, KVMCLOCK_UPDATE_DELAY);
++	 *   - arch/x86/kvm/x86.c|3152| <<kvmclock_sync_fn>> schedule_delayed_work(&kvm->arch.kvmclock_update_work, 0);
++	 *   - arch/x86/kvm/x86.c|11789| <<kvm_arch_init_vm>> INIT_DELAYED_WORK(&kvm->arch.kvmclock_update_work, kvmclock_update_fn);
++	 *   - arch/x86/kvm/x86.c|11838| <<kvm_arch_sync_events>> cancel_delayed_work_sync(&kvm->arch.kvmclock_update_work);
++	 */
+ 	cancel_delayed_work_sync(&kvm->arch.kvmclock_update_work);
+ 	kvm_free_pit(kvm);
+ }
+@@ -12175,6 +12700,15 @@ static void kvm_mmu_slot_apply_flags(struct kvm *kvm,
+ 		 * which can be collapsed into a single large-page spte.  Later
+ 		 * page faults will create the large-page sptes.
+ 		 */
++		/*
++		 * 在以下使用kvm_dirty_log_pgtable():
++		 *   - arch/x86/kvm/mmu/mmu.c|899| <<gfn_to_memslot_dirty_bitmap>> !kvm_dirty_log_pgtable(vcpu->kvm))
++		 *   - arch/x86/kvm/mmu/mmu.c|1388| <<kvm_arch_mmu_enable_log_dirty_pt_masked>> !kvm_dirty_log_pgtable(kvm)) {
++		 *   - arch/x86/kvm/mmu/mmu.c|1401| <<kvm_arch_mmu_enable_log_dirty_pt_masked>> if (kvm_dirty_log_pgtable(kvm) &&
++		 *   - arch/x86/kvm/x86.c|6114| <<kvm_arch_sync_dirty_log>> if (kvm_dirty_log_pgtable(kvm)) {
++		 *   - arch/x86/kvm/x86.c|12631| <<kvm_mmu_slot_apply_flags>> if (!kvm_dirty_log_pgtable(kvm))
++		 *   - virt/kvm/kvm_main.c|2235| <<kvm_clear_dirty_log_protect>> if (!kvm_dirty_log_pgtable(kvm))
++		 */
+ 	        if (!kvm_dirty_log_pgtable(kvm))
+ 			kvm_mmu_zap_collapsible_sptes(kvm, new);
+ 	} else {
+@@ -12451,6 +12985,15 @@ static inline int apf_put_user_notpresent(struct kvm_vcpu *vcpu)
+ {
+ 	u32 reason = KVM_PV_REASON_PAGE_NOT_PRESENT;
+ 
++	/*
++	 * 在以下使用kvm_write_guest_cached():
++	 *   - arch/x86/kvm/lapic.c|727| <<pv_eoi_put_user>> return kvm_write_guest_cached(vcpu->kvm,
++	 *          &vcpu->arch.pv_eoi.data, &val, sizeof(val));
++	 *   - arch/x86/kvm/lapic.c|2922| <<kvm_lapic_sync_to_vapic>> kvm_write_guest_cached(vcpu->kvm,
++	 *          &vcpu->arch.apic->vapic_cache, &data, sizeof(u32));
++	 *   - arch/x86/kvm/x86.c|12454| <<apf_put_user_notpresent>> return kvm_write_guest_cached(vcpu->kvm,
++	 *          &vcpu->arch.apf.data, &reason, sizeof(reason));
++	 */
+ 	return kvm_write_guest_cached(vcpu->kvm, &vcpu->arch.apf.data, &reason,
+ 				      sizeof(reason));
+ }
+diff --git a/arch/x86/kvm/x86.h b/arch/x86/kvm/x86.h
+index f7854e742e8c..915e5cd9b22a 100644
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@ -351,6 +351,15 @@ extern bool report_ignored_msrs;
+ 
+ static inline u64 nsec_to_cycles(struct kvm_vcpu *vcpu, u64 nsec)
+ {
++	/*
++	 * 在以下使用pvclock_scale_delta():
++	 *   - arch/x86/include/asm/pvclock.h|85| <<__pvclock_read_cycles>> u64 offset = pvclock_scale_delta(delta,
++	 *          src->tsc_to_system_mul, src->tsc_shift);
++	 *   - arch/x86/kvm/x86.c|2375| <<compute_guest_tsc>> u64 tsc = pvclock_scale_delta(kernel_ns-vcpu->arch.this_tsc_nsec,
++	 *          vcpu->arch.virtual_tsc_mult, vcpu->arch.virtual_tsc_shift);
++	 *   - arch/x86/kvm/x86.h|354| <<nsec_to_cycles>> return pvclock_scale_delta(nsec,
++	 *          vcpu->arch.virtual_tsc_mult, vcpu->arch.virtual_tsc_shift);
++	 */
+ 	return pvclock_scale_delta(nsec, vcpu->arch.virtual_tsc_mult,
+ 				   vcpu->arch.virtual_tsc_shift);
+ }
+diff --git a/arch/x86/xen/time.c b/arch/x86/xen/time.c
+index 9ef0a5cca96e..f1e1a4bed402 100644
+--- a/arch/x86/xen/time.c
++++ b/arch/x86/xen/time.c
+@@ -50,6 +50,12 @@ static u64 xen_clocksource_read(void)
+ 
+ 	preempt_disable_notrace();
+ 	src = &__this_cpu_read(xen_vcpu)->time;
++	/*
++	 * 在以下使用pvclock_clocksource_read():
++	 *   - arch/x86/kernel/kvmclock.c|79| <<kvm_clock_read>> ret = pvclock_clocksource_read(this_cpu_pvti());
++	 *   - arch/x86/kernel/pvclock.c|161| <<pvclock_read_wallclock>> delta = pvclock_clocksource_read(vcpu_time);
++	 *   - arch/x86/xen/time.c|53| <<xen_clocksource_read>> ret = pvclock_clocksource_read(src);
++	 */
+ 	ret = pvclock_clocksource_read(src);
+ 	preempt_enable_notrace();
+ 	return ret;
+diff --git a/drivers/net/virtio_net.c b/drivers/net/virtio_net.c
+index 40c8bbd8b680..cbc40508037d 100644
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@ -191,6 +191,12 @@ struct virtnet_info {
+ 	/* Max # of queue pairs supported by the device */
+ 	u16 max_queue_pairs;
+ 
++	/*
++	 * 在以下修改virtnet_info->curr_queue_pairs:
++	 *   - drivers/net/virtio_net.c|2050| <<_virtnet_set_queues>> vi->curr_queue_pairs = queue_pairs;
++	 *   - drivers/net/virtio_net.c|3402| <<virtnet_probe>> vi->curr_queue_pairs = max_queue_pairs;
++	 *   - drivers/net/virtio_net.c|3404| <<virtnet_probe>> vi->curr_queue_pairs = num_online_cpus();
++	 */
+ 	/* # of queue pairs currently used by the driver */
+ 	u16 curr_queue_pairs;
+ 
+@@ -1668,6 +1674,12 @@ static int virtnet_open(struct net_device *dev)
+ 	enable_delayed_refill(vi);
+ 
+ 	for (i = 0; i < vi->max_queue_pairs; i++) {
++		/*
++		 * 在以下修改virtnet_info->curr_queue_pairs:
++		 *   - drivers/net/virtio_net.c|2050| <<_virtnet_set_queues>> vi->curr_queue_pairs = queue_pairs;
++		 *   - drivers/net/virtio_net.c|3402| <<virtnet_probe>> vi->curr_queue_pairs = max_queue_pairs;
++		 *   - drivers/net/virtio_net.c|3404| <<virtnet_probe>> vi->curr_queue_pairs = num_online_cpus();
++		 */
+ 		if (i < vi->curr_queue_pairs)
+ 			/* Make sure we have some buffers: if oom use wq. */
+ 			if (!try_fill_recv(vi, &vi->rq[i], GFP_KERNEL))
+@@ -2017,6 +2029,13 @@ static void virtnet_ack_link_announce(struct virtnet_info *vi)
+ 	rtnl_unlock();
+ }
+ 
++/*
++ * 在以下使用_virtnet_set_queues():
++ *   - drivers/net/virtio_net.c|2057| <<virtnet_set_queues>> err = _virtnet_set_queues(vi, queue_pairs);
++ *   - drivers/net/virtio_net.c|2344| <<virtnet_set_channels>> err = _virtnet_set_queues(vi, queue_pairs);
++ *   - drivers/net/virtio_net.c|2674| <<virtnet_xdp_set>> err = _virtnet_set_queues(vi, curr_qp + xdp_qp);
++ *   - drivers/net/virtio_net.c|3412| <<virtnet_probe>> _virtnet_set_queues(vi, vi->curr_queue_pairs);
++ */
+ static int _virtnet_set_queues(struct virtnet_info *vi, u16 queue_pairs)
+ {
+ 	struct scatterlist sg;
+@@ -2025,6 +2044,12 @@ static int _virtnet_set_queues(struct virtnet_info *vi, u16 queue_pairs)
+ 	if (!vi->has_cvq || !virtio_has_feature(vi->vdev, VIRTIO_NET_F_MQ))
+ 		return 0;
+ 
++	/*
++	 * struct virtnet_info *vi:
++	 * -> struct control_buf *ctrl;
++	 *    -> struct virtio_net_ctrl_mq mq;
++	 *       -> __virtio16 virtqueue_pairs;
++	 */
+ 	vi->ctrl->mq.virtqueue_pairs = cpu_to_virtio16(vi->vdev, queue_pairs);
+ 	sg_init_one(&sg, &vi->ctrl->mq, sizeof(vi->ctrl->mq));
+ 
+@@ -2034,6 +2059,12 @@ static int _virtnet_set_queues(struct virtnet_info *vi, u16 queue_pairs)
+ 			 queue_pairs);
+ 		return -EINVAL;
+ 	} else {
++		/*
++		 * 在以下修改virtnet_info->curr_queue_pairs:
++		 *   - drivers/net/virtio_net.c|2050| <<_virtnet_set_queues>> vi->curr_queue_pairs = queue_pairs;
++		 *   - drivers/net/virtio_net.c|3402| <<virtnet_probe>> vi->curr_queue_pairs = max_queue_pairs;
++		 *   - drivers/net/virtio_net.c|3404| <<virtnet_probe>> vi->curr_queue_pairs = num_online_cpus();
++		 */
+ 		vi->curr_queue_pairs = queue_pairs;
+ 		/* virtnet_open() will refill when device is going to up. */
+ 		if (dev->flags & IFF_UP)
+@@ -2043,11 +2074,22 @@ static int _virtnet_set_queues(struct virtnet_info *vi, u16 queue_pairs)
+ 	return 0;
+ }
+ 
++/*
++ * 在以下使用virtnet_set_queues():
++ *   - drivers/net/virtio_net.c|3509| <<virtnet_restore>> virtnet_set_queues(vi, vi->curr_queue_pairs);
++ */
+ static int virtnet_set_queues(struct virtnet_info *vi, u16 queue_pairs)
+ {
+ 	int err;
+ 
+ 	rtnl_lock();
++	/*
++	 * 在以下使用_virtnet_set_queues():
++	 *   - drivers/net/virtio_net.c|2057| <<virtnet_set_queues>> err = _virtnet_set_queues(vi, queue_pairs);
++	 *   - drivers/net/virtio_net.c|2344| <<virtnet_set_channels>> err = _virtnet_set_queues(vi, queue_pairs);
++	 *   - drivers/net/virtio_net.c|2674| <<virtnet_xdp_set>> err = _virtnet_set_queues(vi, curr_qp + xdp_qp);
++	 *   - drivers/net/virtio_net.c|3412| <<virtnet_probe>> _virtnet_set_queues(vi, vi->curr_queue_pairs);
++	 */
+ 	err = _virtnet_set_queues(vi, queue_pairs);
+ 	rtnl_unlock();
+ 	return err;
+@@ -2310,6 +2352,9 @@ static void virtnet_get_drvinfo(struct net_device *dev,
+ 
+ }
+ 
++/*
++ * struct ethtool_ops virtnet_ethtool_ops.set_channels = virtnet_set_channels()
++ */
+ /* TODO: Eliminate OOO packets during switching */
+ static int virtnet_set_channels(struct net_device *dev,
+ 				struct ethtool_channels *channels)
+@@ -2335,6 +2380,13 @@ static int virtnet_set_channels(struct net_device *dev,
+ 		return -EINVAL;
+ 
+ 	cpus_read_lock();
++	/*
++	 * 在以下使用_virtnet_set_queues():
++	 *   - drivers/net/virtio_net.c|2057| <<virtnet_set_queues>> err = _virtnet_set_queues(vi, queue_pairs);
++	 *   - drivers/net/virtio_net.c|2344| <<virtnet_set_channels>> err = _virtnet_set_queues(vi, queue_pairs);
++	 *   - drivers/net/virtio_net.c|2674| <<virtnet_xdp_set>> err = _virtnet_set_queues(vi, curr_qp + xdp_qp);
++	 *   - drivers/net/virtio_net.c|3412| <<virtnet_probe>> _virtnet_set_queues(vi, vi->curr_queue_pairs);
++	 */
+ 	err = _virtnet_set_queues(vi, queue_pairs);
+ 	if (err) {
+ 		cpus_read_unlock();
+@@ -2665,6 +2717,13 @@ static int virtnet_xdp_set(struct net_device *dev, struct bpf_prog *prog,
+ 		synchronize_net();
+ 	}
+ 
++	/*
++	 * 在以下使用_virtnet_set_queues():
++	 *   - drivers/net/virtio_net.c|2057| <<virtnet_set_queues>> err = _virtnet_set_queues(vi, queue_pairs);
++	 *   - drivers/net/virtio_net.c|2344| <<virtnet_set_channels>> err = _virtnet_set_queues(vi, queue_pairs);
++	 *   - drivers/net/virtio_net.c|2674| <<virtnet_xdp_set>> err = _virtnet_set_queues(vi, curr_qp + xdp_qp);
++	 *   - drivers/net/virtio_net.c|3412| <<virtnet_probe>> _virtnet_set_queues(vi, vi->curr_queue_pairs);
++	 */
+ 	err = _virtnet_set_queues(vi, curr_qp + xdp_qp);
+ 	if (err)
+ 		goto err;
+@@ -3359,6 +3418,12 @@ static int virtnet_probe(struct virtio_device *vdev)
+ 	if (vi->any_header_sg)
+ 		dev->needed_headroom = vi->hdr_len;
+ 
++	/*
++	 * 在以下修改virtnet_info->curr_queue_pairs:
++	 *   - drivers/net/virtio_net.c|2050| <<_virtnet_set_queues>> vi->curr_queue_pairs = queue_pairs;
++	 *   - drivers/net/virtio_net.c|3402| <<virtnet_probe>> vi->curr_queue_pairs = max_queue_pairs;
++	 *   - drivers/net/virtio_net.c|3404| <<virtnet_probe>> vi->curr_queue_pairs = num_online_cpus();
++	 */
+ 	/* Enable multiqueue by default */
+ 	if (num_online_cpus() >= max_queue_pairs)
+ 		vi->curr_queue_pairs = max_queue_pairs;
+@@ -3403,6 +3468,13 @@ static int virtnet_probe(struct virtio_device *vdev)
+ 
+ 	virtio_device_ready(vdev);
+ 
++	/*
++	 * 在以下使用_virtnet_set_queues():
++	 *   - drivers/net/virtio_net.c|2057| <<virtnet_set_queues>> err = _virtnet_set_queues(vi, queue_pairs);
++	 *   - drivers/net/virtio_net.c|2344| <<virtnet_set_channels>> err = _virtnet_set_queues(vi, queue_pairs);
++	 *   - drivers/net/virtio_net.c|2674| <<virtnet_xdp_set>> err = _virtnet_set_queues(vi, curr_qp + xdp_qp);
++	 *   - drivers/net/virtio_net.c|3412| <<virtnet_probe>> _virtnet_set_queues(vi, vi->curr_queue_pairs);
++	 */
+ 	_virtnet_set_queues(vi, vi->curr_queue_pairs);
+ 
+ 	/* Assume link up if device can't report link status,
+diff --git a/drivers/ptp/ptp_kvm_x86.c b/drivers/ptp/ptp_kvm_x86.c
+index 5e5b2ef78547..2184b7d2378b 100644
+--- a/drivers/ptp/ptp_kvm_x86.c
++++ b/drivers/ptp/ptp_kvm_x86.c
+@@ -45,6 +45,11 @@ int kvm_arch_ptp_init(void)
+ 	}
+ 
+ 	clock_pair_gpa = slow_virt_to_phys(clock_pair);
++	/*
++	 * 在以下使用pvclock_get_pvti_cpu0_va():
++	 *   - arch/x86/entry/vdso/vma.c|206| <<vvar_fault>> pvclock_get_pvti_cpu0_va();
++	 *   - drivers/ptp/ptp_kvm_x86.c|48| <<kvm_arch_ptp_init>> if (!pvclock_get_pvti_cpu0_va()) {
++	 */
+ 	if (!pvclock_get_pvti_cpu0_va()) {
+ 		ret = -EOPNOTSUPP;
+ 		goto err;
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 1b4b732a5caa..4dd6b687199c 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -559,6 +559,19 @@ struct kvm_memory_slot {
+ 	gfn_t base_gfn;
+ 	unsigned long npages;
+ 	unsigned long *dirty_bitmap;
++	/*
++	 * 在以下使用kvm_memory_slot->present_bitmap:
++	 *   - arch/x86/kvm/mmu/mmu.c|1661| <<rmap_add>> if (slot && slot->present_bitmap) {
++	 *   - arch/x86/kvm/mmu/mmu.c|1662| <<rmap_add>> bitmap_set(slot->present_bitmap, gfn - slot->base_gfn,
++	 *   - arch/x86/kvm/mmu/mmu.c|5880| <<kvm_rmap_walk_present>> atomic_long_t *p = (atomic_long_t *) &slot->present_bitmap[i];
++	 *   - virt/kvm/kvm_main.c|928| <<kvm_destroy_present_bitmap>> if (!memslot->present_bitmap)
++	 *   - virt/kvm/kvm_main.c|931| <<kvm_destroy_present_bitmap>> kvfree(memslot->present_bitmap);
++	 *   - virt/kvm/kvm_main.c|932| <<kvm_destroy_present_bitmap>> memslot->present_bitmap = NULL;
++	 *   - virt/kvm/kvm_main.c|1349| <<kvm_alloc_present_bitmap>> memslot->present_bitmap = __vcalloc(2, present_bytes, GFP_KERNEL_ACCOUNT);
++	 *   - virt/kvm/kvm_main.c|1350| <<kvm_alloc_present_bitmap>> if (!memslot->present_bitmap)
++	 *   - virt/kvm/kvm_main.c|1979| <<__kvm_set_memory_region>> new->present_bitmap = old->present_bitmap;
++	 *   - virt/kvm/kvm_main.c|1980| <<__kvm_set_memory_region>> if (!new->present_bitmap) {
++	 */
+ 	unsigned long *present_bitmap;
+ 	struct kvm_arch_memory_slot arch;
+ 	unsigned long userspace_addr;
+@@ -567,6 +580,13 @@ struct kvm_memory_slot {
+ 	u16 as_id;
+ };
+ 
++/*
++ * 在以下使用kvm_slot_dirty_track_enabled():
++ *   - arch/x86/kvm/mmu/mmu.c|898| <<gfn_to_memslot_dirty_bitmap>> if (no_dirty_log && kvm_slot_dirty_track_enabled(slot) &&
++ *   - arch/x86/kvm/mmu/mmu.c|2917| <<kvm_mmu_hugepage_adjust>> if (kvm_slot_dirty_track_enabled(slot))
++ *   - virt/kvm/kvm_main.c|3435| <<mark_page_dirty_in_slot>> if (memslot && kvm_slot_dirty_track_enabled(memslot)) {
++ *   - virt/kvm/kvm_main.c|3453| <<mark_page_range_dirty_in_slot>> kvm_slot_dirty_track_enabled((struct kvm_memory_slot *)memslot)) {
++ */
+ static inline bool kvm_slot_dirty_track_enabled(struct kvm_memory_slot *slot)
+ {
+ 	return slot->flags & KVM_MEM_LOG_DIRTY_PAGES;
+@@ -748,6 +768,11 @@ struct kvm {
+ #endif
+ 	struct list_head devices;
+ 	u64 manual_dirty_log_protect;
++	/*
++	 * 在以下使用kvm->dirty_log_pgtable:
++	 *   - include/linux/kvm_host.h|832| <<kvm_dirty_log_pgtable>> return !!(kvm->dirty_log_pgtable & KVM_DIRTY_LOG_PGTABLE);
++	 *   - virt/kvm/kvm_main.c|4674| <<kvm_vm_ioctl_enable_cap_generic>> kvm->dirty_log_pgtable = cap->args[0];
++	 */
+ 	u64 dirty_log_pgtable;
+ 	struct dentry *debugfs_dentry;
+ 	struct kvm_stat_data **debugfs_stat_data;
+@@ -827,8 +852,22 @@ static inline bool kvm_dirty_log_manual_protect_and_init_set(struct kvm *kvm)
+ 	return !!(kvm->manual_dirty_log_protect & KVM_DIRTY_LOG_INITIALLY_SET);
+ }
+ 
++/*
++ * 在以下使用kvm_dirty_log_pgtable():
++ *   - arch/x86/kvm/mmu/mmu.c|899| <<gfn_to_memslot_dirty_bitmap>> !kvm_dirty_log_pgtable(vcpu->kvm))
++ *   - arch/x86/kvm/mmu/mmu.c|1388| <<kvm_arch_mmu_enable_log_dirty_pt_masked>> !kvm_dirty_log_pgtable(kvm)) {
++ *   - arch/x86/kvm/mmu/mmu.c|1401| <<kvm_arch_mmu_enable_log_dirty_pt_masked>> if (kvm_dirty_log_pgtable(kvm) &&
++ *   - arch/x86/kvm/x86.c|6114| <<kvm_arch_sync_dirty_log>> if (kvm_dirty_log_pgtable(kvm)) {
++ *   - arch/x86/kvm/x86.c|12631| <<kvm_mmu_slot_apply_flags>> if (!kvm_dirty_log_pgtable(kvm))
++ *   - virt/kvm/kvm_main.c|2235| <<kvm_clear_dirty_log_protect>> if (!kvm_dirty_log_pgtable(kvm))
++ */
+ static inline bool kvm_dirty_log_pgtable(struct kvm *kvm)
+ {
++	/*
++	 * 在以下使用kvm->dirty_log_pgtable:
++	 *   - include/linux/kvm_host.h|832| <<kvm_dirty_log_pgtable>> return !!(kvm->dirty_log_pgtable & KVM_DIRTY_LOG_PGTABLE);
++	 *   - virt/kvm/kvm_main.c|4674| <<kvm_vm_ioctl_enable_cap_generic>> kvm->dirty_log_pgtable = cap->args[0];
++	 */
+ 	return !!(kvm->dirty_log_pgtable & KVM_DIRTY_LOG_PGTABLE);
+ }
+ 
+diff --git a/lib/vdso/gettimeofday.c b/lib/vdso/gettimeofday.c
+index ce2f69552003..0d8c6c10baba 100644
+--- a/lib/vdso/gettimeofday.c
++++ b/lib/vdso/gettimeofday.c
+@@ -107,6 +107,11 @@ static __always_inline int do_hres_timens(const struct vdso_data *vdns, clockid_
+ }
+ #endif
+ 
++/*
++ * 在以下使用do_hres():
++ *   - lib/vdso/gettimeofday.c|251| <<__cvdso_clock_gettime_common>> return do_hres(vd, clock, ts);
++ *   - lib/vdso/gettimeofday.c|306| <<__cvdso_gettimeofday_data>> if (do_hres(&vd[CS_HRES_COARSE], CLOCK_REALTIME, &ts))
++ */
+ static __always_inline int do_hres(const struct vdso_data *vd, clockid_t clk,
+ 				   struct __kernel_timespec *ts)
+ {
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 04f8fcaa82c7..67a1285dd563 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -925,6 +925,19 @@ static void kvm_destroy_dirty_bitmap(struct kvm_memory_slot *memslot)
+ 
+ static void kvm_destroy_present_bitmap(struct kvm_memory_slot *memslot)
+ {
++	/*
++	 * 在以下使用kvm_memory_slot->present_bitmap:
++	 *   - arch/x86/kvm/mmu/mmu.c|1661| <<rmap_add>> if (slot && slot->present_bitmap) {
++	 *   - arch/x86/kvm/mmu/mmu.c|1662| <<rmap_add>> bitmap_set(slot->present_bitmap, gfn - slot->base_gfn,
++	 *   - arch/x86/kvm/mmu/mmu.c|5880| <<kvm_rmap_walk_present>> atomic_long_t *p = (atomic_long_t *) &slot->present_bitmap[i];
++	 *   - virt/kvm/kvm_main.c|928| <<kvm_destroy_present_bitmap>> if (!memslot->present_bitmap)
++	 *   - virt/kvm/kvm_main.c|931| <<kvm_destroy_present_bitmap>> kvfree(memslot->present_bitmap);
++	 *   - virt/kvm/kvm_main.c|932| <<kvm_destroy_present_bitmap>> memslot->present_bitmap = NULL;
++	 *   - virt/kvm/kvm_main.c|1349| <<kvm_alloc_present_bitmap>> memslot->present_bitmap = __vcalloc(2, present_bytes, GFP_KERNEL_ACCOUNT);
++	 *   - virt/kvm/kvm_main.c|1350| <<kvm_alloc_present_bitmap>> if (!memslot->present_bitmap)
++	 *   - virt/kvm/kvm_main.c|1979| <<__kvm_set_memory_region>> new->present_bitmap = old->present_bitmap;
++	 *   - virt/kvm/kvm_main.c|1980| <<__kvm_set_memory_region>> if (!new->present_bitmap) {
++	 */
+ 	if (!memslot->present_bitmap)
+ 		return;
+ 
+@@ -1346,6 +1359,19 @@ static int kvm_alloc_present_bitmap(struct kvm_memory_slot *memslot)
+ {
+ 	unsigned long present_bytes = kvm_dirty_bitmap_bytes(memslot);
+ 
++	/*
++	 * 在以下使用kvm_memory_slot->present_bitmap:
++	 *   - arch/x86/kvm/mmu/mmu.c|1661| <<rmap_add>> if (slot && slot->present_bitmap) {
++	 *   - arch/x86/kvm/mmu/mmu.c|1662| <<rmap_add>> bitmap_set(slot->present_bitmap, gfn - slot->base_gfn,
++	 *   - arch/x86/kvm/mmu/mmu.c|5880| <<kvm_rmap_walk_present>> atomic_long_t *p = (atomic_long_t *) &slot->present_bitmap[i];
++	 *   - virt/kvm/kvm_main.c|928| <<kvm_destroy_present_bitmap>> if (!memslot->present_bitmap)
++	 *   - virt/kvm/kvm_main.c|931| <<kvm_destroy_present_bitmap>> kvfree(memslot->present_bitmap);
++	 *   - virt/kvm/kvm_main.c|932| <<kvm_destroy_present_bitmap>> memslot->present_bitmap = NULL;
++	 *   - virt/kvm/kvm_main.c|1349| <<kvm_alloc_present_bitmap>> memslot->present_bitmap = __vcalloc(2, present_bytes, GFP_KERNEL_ACCOUNT);
++	 *   - virt/kvm/kvm_main.c|1350| <<kvm_alloc_present_bitmap>> if (!memslot->present_bitmap)
++	 *   - virt/kvm/kvm_main.c|1979| <<__kvm_set_memory_region>> new->present_bitmap = old->present_bitmap;
++	 *   - virt/kvm/kvm_main.c|1980| <<__kvm_set_memory_region>> if (!new->present_bitmap) {
++	 */
+ 	memslot->present_bitmap = __vcalloc(2, present_bytes, GFP_KERNEL_ACCOUNT);
+ 	if (!memslot->present_bitmap)
+ 		return -ENOMEM;
+@@ -1975,6 +2001,19 @@ int __kvm_set_memory_region(struct kvm *kvm,
+ 	new->npages = npages;
+ 	new->flags = mem->flags;
+ 	new->userspace_addr = mem->userspace_addr;
++	/*
++	 * 在以下使用kvm_memory_slot->present_bitmap:
++	 *   - arch/x86/kvm/mmu/mmu.c|1661| <<rmap_add>> if (slot && slot->present_bitmap) {
++	 *   - arch/x86/kvm/mmu/mmu.c|1662| <<rmap_add>> bitmap_set(slot->present_bitmap, gfn - slot->base_gfn,
++	 *   - arch/x86/kvm/mmu/mmu.c|5880| <<kvm_rmap_walk_present>> atomic_long_t *p = (atomic_long_t *) &slot->present_bitmap[i];
++	 *   - virt/kvm/kvm_main.c|928| <<kvm_destroy_present_bitmap>> if (!memslot->present_bitmap)
++	 *   - virt/kvm/kvm_main.c|931| <<kvm_destroy_present_bitmap>> kvfree(memslot->present_bitmap);
++	 *   - virt/kvm/kvm_main.c|932| <<kvm_destroy_present_bitmap>> memslot->present_bitmap = NULL;
++	 *   - virt/kvm/kvm_main.c|1349| <<kvm_alloc_present_bitmap>> memslot->present_bitmap = __vcalloc(2, present_bytes, GFP_KERNEL_ACCOUNT);
++	 *   - virt/kvm/kvm_main.c|1350| <<kvm_alloc_present_bitmap>> if (!memslot->present_bitmap)
++	 *   - virt/kvm/kvm_main.c|1979| <<__kvm_set_memory_region>> new->present_bitmap = old->present_bitmap;
++	 *   - virt/kvm/kvm_main.c|1980| <<__kvm_set_memory_region>> if (!new->present_bitmap) {
++	 */
+ 	if (old)
+ 		new->present_bitmap = old->present_bitmap;
+ 	if (!new->present_bitmap) {
+@@ -2232,6 +2271,15 @@ static int kvm_clear_dirty_log_protect(struct kvm *kvm,
+ 	    (log->num_pages < memslot->npages - log->first_page && (log->num_pages & 63)))
+ 	    return -EINVAL;
+ 
++	/*
++	 * 在以下使用kvm_dirty_log_pgtable():
++	 *   - arch/x86/kvm/mmu/mmu.c|899| <<gfn_to_memslot_dirty_bitmap>> !kvm_dirty_log_pgtable(vcpu->kvm))
++	 *   - arch/x86/kvm/mmu/mmu.c|1388| <<kvm_arch_mmu_enable_log_dirty_pt_masked>> !kvm_dirty_log_pgtable(kvm)) {
++	 *   - arch/x86/kvm/mmu/mmu.c|1401| <<kvm_arch_mmu_enable_log_dirty_pt_masked>> if (kvm_dirty_log_pgtable(kvm) &&
++	 *   - arch/x86/kvm/x86.c|6114| <<kvm_arch_sync_dirty_log>> if (kvm_dirty_log_pgtable(kvm)) {
++	 *   - arch/x86/kvm/x86.c|12631| <<kvm_mmu_slot_apply_flags>> if (!kvm_dirty_log_pgtable(kvm))
++	 *   - virt/kvm/kvm_main.c|2235| <<kvm_clear_dirty_log_protect>> if (!kvm_dirty_log_pgtable(kvm))
++	 */
+ 	if (!kvm_dirty_log_pgtable(kvm))
+ 		kvm_arch_sync_dirty_log(kvm, memslot);
+ 
+@@ -3174,6 +3222,12 @@ int kvm_vcpu_write_guest(struct kvm_vcpu *vcpu, gpa_t gpa, const void *data,
+ }
+ EXPORT_SYMBOL_GPL(kvm_vcpu_write_guest);
+ 
++/*
++ * 在以下使用__kvm_gfn_to_hva_cache_init():
++ *   - virt/kvm/kvm_main.c|3222| <<kvm_gfn_to_hva_cache_init>> return __kvm_gfn_to_hva_cache_init(slots, ghc, gpa, len);
++ *   - virt/kvm/kvm_main.c|3251| <<kvm_write_guest_offset_cached>> if (__kvm_gfn_to_hva_cache_init(slots, ghc, ghc->gpa, ghc->len))
++ *   - virt/kvm/kvm_main.c|3309| <<kvm_read_guest_offset_cached>> if (__kvm_gfn_to_hva_cache_init(slots, ghc, ghc->gpa, ghc->len))
++ */
+ static int __kvm_gfn_to_hva_cache_init(struct kvm_memslots *slots,
+ 				       struct gfn_to_hva_cache *ghc,
+ 				       gpa_t gpa, unsigned long len)
+@@ -3215,14 +3269,62 @@ static int __kvm_gfn_to_hva_cache_init(struct kvm_memslots *slots,
+ 	return 0;
+ }
+ 
++/*
++ * 在以下使用kvm_gfn_to_hva_cache_init():
++ *   - arch/x86/kvm/lapic.c|2947| <<kvm_lapic_set_vapic_addr>> if (kvm_gfn_to_hva_cache_init(vcpu->kvm,
++ *            &vcpu->arch.apic->vapic_cache, vapic_addr, sizeof(u32)))
++ *   - arch/x86/kvm/lapic.c|3063| <<kvm_lapic_enable_pv_eoi>> return kvm_gfn_to_hva_cache_init(vcpu->kvm,
++ *            ghc, addr, new_len);
++ *   - arch/x86/kvm/x86.c|2278| <<kvm_write_system_time>> if (!kvm_gfn_to_hva_cache_init(vcpu->kvm,
++ *            &vcpu->arch.pv_time, system_time & ~1ULL, sizeof(struct pvclock_vcpu_time_info)))
++ *   - arch/x86/kvm/x86.c|3442| <<kvm_pv_enable_async_pf>> if (kvm_gfn_to_hva_cache_init(vcpu->kvm,
++ *            &vcpu->arch.apf.data, gpa, sizeof(u64)))
++ *   - arch/x86/kvm/x86.c|3561| <<record_steal_time>> if (kvm_gfn_to_hva_cache_init(vcpu->kvm,
++ *            ghc, gpa, sizeof(*st)) ||
++ *   - arch/x86/kvm/xen.c|109| <<kvm_xen_update_runstate_guest>> kvm_gfn_to_hva_cache_init(v->kvm,
++ *            ghc, ghc->gpa, ghc->len))
++ *   - arch/x86/kvm/xen.c|365| <<kvm_xen_vcpu_set_attr>> r = kvm_gfn_to_hva_cache_init(vcpu->kvm,
++ *            &vcpu->arch.xen.vcpu_info_cache, data->u.gpa, sizeof(struct vcpu_info));
++ *   - arch/x86/kvm/xen.c|388| <<kvm_xen_vcpu_set_attr>> r = kvm_gfn_to_hva_cache_init(vcpu->kvm,
++ *            &vcpu->arch.xen.vcpu_time_info_cache, data->u.gpa, sizeof(struct pvclock_vcpu_time_info));
++ *   - arch/x86/kvm/xen.c|415| <<kvm_xen_vcpu_set_attr>> r = kvm_gfn_to_hva_cache_init(vcpu->kvm,
++ *            &vcpu->arch.xen.runstate_cache, data->u.gpa, sizeof(struct vcpu_runstate_info));
++ */
+ int kvm_gfn_to_hva_cache_init(struct kvm *kvm, struct gfn_to_hva_cache *ghc,
+ 			      gpa_t gpa, unsigned long len)
+ {
+ 	struct kvm_memslots *slots = kvm_memslots(kvm);
++	/*
++	 * 在以下使用__kvm_gfn_to_hva_cache_init():
++	 *   - virt/kvm/kvm_main.c|3222| <<kvm_gfn_to_hva_cache_init>> return __kvm_gfn_to_hva_cache_init(slots, ghc, gpa, len);
++	 *   - virt/kvm/kvm_main.c|3251| <<kvm_write_guest_offset_cached>> if (__kvm_gfn_to_hva_cache_init(slots, ghc, ghc->gpa, ghc->len))
++	 *   - virt/kvm/kvm_main.c|3309| <<kvm_read_guest_offset_cached>> if (__kvm_gfn_to_hva_cache_init(slots, ghc, ghc->gpa, ghc->len))
++	 */
+ 	return __kvm_gfn_to_hva_cache_init(slots, ghc, gpa, len);
+ }
+ EXPORT_SYMBOL_GPL(kvm_gfn_to_hva_cache_init);
+ 
++/*
++ * 在以下使用kvm_write_guest_offset_cached():
++ *   - arch/x86/kvm/x86.c|2944| <<kvm_setup_pvclock_page>> kvm_write_guest_offset_cached(v->kvm,
++ *          cache, &vcpu->hv_clock, offset, sizeof(vcpu->hv_clock.version));
++ *   - arch/x86/kvm/x86.c|2960| <<kvm_setup_pvclock_page>> kvm_write_guest_offset_cached(v->kvm,
++ *          cache, &vcpu->hv_clock, offset, sizeof(vcpu->hv_clock));
++ *   - arch/x86/kvm/x86.c|2967| <<kvm_setup_pvclock_page>> kvm_write_guest_offset_cached(v->kvm,
++ *          cache, &vcpu->hv_clock, offset, sizeof(vcpu->hv_clock.version));
++ *   - arch/x86/kvm/x86.c|12462| <<apf_put_user_ready>> return kvm_write_guest_offset_cached(vcpu->kvm,
++ *          &vcpu->arch.apf.data, &token, offset, sizeof(token));
++ *   - virt/kvm/kvm_main.c|3260| <<kvm_write_guest_cached>> return kvm_write_guest_offset_cached(kvm,
++ *          ghc, data, 0, len);
++ *
++ * struct gfn_to_hva_cache {
++ *     u64 generation;
++ *     gpa_t gpa;
++ *     unsigned long hva;
++ *     unsigned long len;
++ *     struct kvm_memory_slot *memslot;
++ * };
++ */
+ int kvm_write_guest_offset_cached(struct kvm *kvm, struct gfn_to_hva_cache *ghc,
+ 				  void *data, unsigned int offset,
+ 				  unsigned long len)
+@@ -3235,6 +3337,12 @@ int kvm_write_guest_offset_cached(struct kvm *kvm, struct gfn_to_hva_cache *ghc,
+ 		return -EINVAL;
+ 
+ 	if (slots->generation != ghc->generation) {
++		/*
++		 * 在以下使用__kvm_gfn_to_hva_cache_init():
++		 *   - virt/kvm/kvm_main.c|3222| <<kvm_gfn_to_hva_cache_init>> return __kvm_gfn_to_hva_cache_init(slots, ghc, gpa, len);
++		 *   - virt/kvm/kvm_main.c|3251| <<kvm_write_guest_offset_cached>> if (__kvm_gfn_to_hva_cache_init(slots, ghc, ghc->gpa, ghc->len))
++		 *   - virt/kvm/kvm_main.c|3309| <<kvm_read_guest_offset_cached>> if (__kvm_gfn_to_hva_cache_init(slots, ghc, ghc->gpa, ghc->len))
++		 */
+ 		if (__kvm_gfn_to_hva_cache_init(slots, ghc, ghc->gpa, ghc->len))
+ 			return -EFAULT;
+ 	}
+@@ -3254,6 +3362,15 @@ int kvm_write_guest_offset_cached(struct kvm *kvm, struct gfn_to_hva_cache *ghc,
+ }
+ EXPORT_SYMBOL_GPL(kvm_write_guest_offset_cached);
+ 
++/*
++ * 在以下使用kvm_write_guest_cached():
++ *   - arch/x86/kvm/lapic.c|727| <<pv_eoi_put_user>> return kvm_write_guest_cached(vcpu->kvm,
++ *          &vcpu->arch.pv_eoi.data, &val, sizeof(val));
++ *   - arch/x86/kvm/lapic.c|2922| <<kvm_lapic_sync_to_vapic>> kvm_write_guest_cached(vcpu->kvm,
++ *          &vcpu->arch.apic->vapic_cache, &data, sizeof(u32));
++ *   - arch/x86/kvm/x86.c|12454| <<apf_put_user_notpresent>> return kvm_write_guest_cached(vcpu->kvm,
++ *          &vcpu->arch.apf.data, &reason, sizeof(reason));
++ */
+ int kvm_write_guest_cached(struct kvm *kvm, struct gfn_to_hva_cache *ghc,
+ 			   void *data, unsigned long len)
+ {
+@@ -3261,6 +3378,17 @@ int kvm_write_guest_cached(struct kvm *kvm, struct gfn_to_hva_cache *ghc,
+ }
+ EXPORT_SYMBOL_GPL(kvm_write_guest_cached);
+ 
++/*
++ * 在以下使用kvm_read_guest_offset_cached():
++ *   - arch/x86/kvm/x86.c|2989| <<kvm_setup_pvclock_page>> if (unlikely(kvm_read_guest_offset_cached(v->kvm,
++ *          cache, &guest_hv_clock, offset, sizeof(guest_hv_clock))))
++ *   - arch/x86/kvm/x86.c|12767| <<apf_pageready_slot_free>> if (kvm_read_guest_offset_cached(vcpu->kvm,
++ *          &vcpu->arch.apf.data, &val, offset, sizeof(val)))
++ *   - arch/x86/kvm/xen.c|259| <<__kvm_xen_has_interrupt>> kvm_read_guest_offset_cached(v->kvm,
++ *          ghc, &rc, offset, sizeof(rc));
++ *   - virt/kvm/kvm_main.c|3319| <<kvm_read_guest_cached>> return kvm_read_guest_offset_cached(kvm,
++ *          ghc, data, 0, len);
++ */
+ int kvm_read_guest_offset_cached(struct kvm *kvm, struct gfn_to_hva_cache *ghc,
+ 				 void *data, unsigned int offset,
+ 				 unsigned long len)
+@@ -3273,6 +3401,12 @@ int kvm_read_guest_offset_cached(struct kvm *kvm, struct gfn_to_hva_cache *ghc,
+ 		return -EINVAL;
+ 
+ 	if (slots->generation != ghc->generation) {
++		/*
++		 * 在以下使用__kvm_gfn_to_hva_cache_init():
++		 *   - virt/kvm/kvm_main.c|3222| <<kvm_gfn_to_hva_cache_init>> return __kvm_gfn_to_hva_cache_init(slots, ghc, gpa, len);
++		 *   - virt/kvm/kvm_main.c|3251| <<kvm_write_guest_offset_cached>> if (__kvm_gfn_to_hva_cache_init(slots, ghc, ghc->gpa, ghc->len))
++		 *   - virt/kvm/kvm_main.c|3309| <<kvm_read_guest_offset_cached>> if (__kvm_gfn_to_hva_cache_init(slots, ghc, ghc->gpa, ghc->len))
++		 */
+ 		if (__kvm_gfn_to_hva_cache_init(slots, ghc, ghc->gpa, ghc->len))
+ 			return -EFAULT;
+ 	}
+@@ -3294,6 +3428,17 @@ EXPORT_SYMBOL_GPL(kvm_read_guest_offset_cached);
+ int kvm_read_guest_cached(struct kvm *kvm, struct gfn_to_hva_cache *ghc,
+ 			  void *data, unsigned long len)
+ {
++	/*
++	 * 在以下使用kvm_read_guest_offset_cached():
++	 *   - arch/x86/kvm/x86.c|2989| <<kvm_setup_pvclock_page>> if (unlikely(kvm_read_guest_offset_cached(v->kvm,
++	 *          cache, &guest_hv_clock, offset, sizeof(guest_hv_clock))))
++	 *   - arch/x86/kvm/x86.c|12767| <<apf_pageready_slot_free>> if (kvm_read_guest_offset_cached(vcpu->kvm,
++	 *          &vcpu->arch.apf.data, &val, offset, sizeof(val)))
++	 *   - arch/x86/kvm/xen.c|259| <<__kvm_xen_has_interrupt>> kvm_read_guest_offset_cached(v->kvm,
++	 *          ghc, &rc, offset, sizeof(rc));
++	 *   - virt/kvm/kvm_main.c|3319| <<kvm_read_guest_cached>> return kvm_read_guest_offset_cached(kvm,
++	 *          ghc, data, 0, len);
++	 */
+ 	return kvm_read_guest_offset_cached(kvm, ghc, data, 0, len);
+ }
+ EXPORT_SYMBOL_GPL(kvm_read_guest_cached);
+@@ -3318,6 +3463,19 @@ int kvm_clear_guest(struct kvm *kvm, gpa_t gpa, unsigned long len)
+ }
+ EXPORT_SYMBOL_GPL(kvm_clear_guest);
+ 
++/*
++ * 在以下使用mark_page_dirty_in_slot():
++ *   - arch/arm64/kvm/mmu.c|1179| <<user_mem_abort>> mark_page_dirty_in_slot(kvm, memslot, gfn);
++ *   - arch/x86/kvm/mmu/tdp_mmu.c|267| <<handle_changed_spte_dirty_log>> mark_page_dirty_in_slot(kvm, slot, gfn);
++ *   - arch/x86/kvm/x86.c|3401| <<record_steal_time>> mark_page_dirty_in_slot(vcpu->kvm, ghc->memslot, gpa_to_gfn(ghc->gpa));
++ *   - arch/x86/kvm/x86.c|4596| <<kvm_steal_time_set_preempted>> mark_page_dirty_in_slot(vcpu->kvm, ghc->memslot, gpa_to_gfn(ghc->gpa));
++ *   - arch/x86/kvm/xen.c|204| <<kvm_xen_update_runstate_guest>> mark_page_dirty_in_slot(v->kvm, ghc->memslot, ghc->gpa >> PAGE_SHIFT);
++ *   - virt/kvm/kvm_main.c|2898| <<__kvm_unmap_gfn>> mark_page_dirty_in_slot(kvm, memslot, map->gfn);
++ *   - virt/kvm/kvm_main.c|3113| <<__kvm_write_guest_page>> mark_page_dirty_in_slot(kvm, memslot, gfn);
++ *   - virt/kvm/kvm_main.c|3251| <<kvm_write_guest_offset_cached>> mark_page_dirty_in_slot(kvm, ghc->memslot, gpa >> PAGE_SHIFT);
++ *   - virt/kvm/kvm_main.c|3358| <<mark_page_dirty>> mark_page_dirty_in_slot(kvm, memslot, gfn);
++ *   - virt/kvm/kvm_main.c|3367| <<kvm_vcpu_mark_page_dirty>> mark_page_dirty_in_slot(vcpu->kvm, memslot, gfn);
++ */
+ void mark_page_dirty_in_slot(struct kvm *kvm,
+ 			     struct kvm_memory_slot *memslot,
+ 		 	     gfn_t gfn)
+@@ -3335,6 +3493,11 @@ void mark_page_dirty_in_slot(struct kvm *kvm,
+ }
+ EXPORT_SYMBOL_GPL(mark_page_dirty_in_slot);
+ 
++/*
++ * 在以下使用mark_page_range_dirty_in_slot():
++ *   - arch/x86/kvm/mmu/mmu.c|3115| <<fast_pf_fix_direct_spte>> mark_page_range_dirty_in_slot(vcpu->kvm, fault->slot, fault->gfn,
++ *   - arch/x86/kvm/mmu/mmu.c|5912| <<rmap_test_dirty>> mark_page_range_dirty_in_slot(kvm, slot, pfn,
++ */
+ void mark_page_range_dirty_in_slot(struct kvm *kvm,
+ 				   const struct kvm_memory_slot *memslot,
+ 				   gfn_t gfn, unsigned long npages)
+@@ -4561,6 +4724,11 @@ static int kvm_vm_ioctl_enable_cap_generic(struct kvm *kvm,
+ 
+ 		if (cap->flags || (cap->args[0] & ~allowed_options))
+ 			return -EINVAL;
++		/*
++		 * 在以下使用kvm->dirty_log_pgtable:
++		 *   - include/linux/kvm_host.h|832| <<kvm_dirty_log_pgtable>> return !!(kvm->dirty_log_pgtable & KVM_DIRTY_LOG_PGTABLE);
++		 *   - virt/kvm/kvm_main.c|4674| <<kvm_vm_ioctl_enable_cap_generic>> kvm->dirty_log_pgtable = cap->args[0];
++		 */
+ 		kvm->dirty_log_pgtable = cap->args[0];
+ 		return 0;
+ 	}
+-- 
+2.39.5 (Apple Git-154)
+

@@ -1,0 +1,554 @@
+
+这里是关于lapic启动, reset和hotplug的分析. 主要是关于APIC state和APIC base.
+
+1. When to create vcpu: kvm_start_vcpu_thread() and kvm_create_vcpu().
+2. When to set sregs: kvm_arch_put_registers(), kvm_cpu_synchronize_post_reset, and kvm_cpu_synchronize_post_init()
+3. When to set lapic: kvm_apic_reset()
+
+
+(gdb) info b
+Num     Type           Disp Enb Address            What
+1       breakpoint     keep y   0x0000555555f0ff4e in kvm_start_vcpu_thread at ../accel/kvm/kvm-accel-ops.c:67
+	breakpoint already hit 4 times
+2       breakpoint     keep y   0x0000555555f05f7a in kvm_create_vcpu at ../accel/kvm/kvm-all.c:452
+	breakpoint already hit 4 times
+3       breakpoint     keep y   0x0000555555d32cc5 in kvm_arch_put_registers at ../target/i386/kvm/kvm.c:5252
+	breakpoint already hit 26 times
+4       breakpoint     keep y   0x0000555555f0bced in kvm_cpu_synchronize_post_reset at ../accel/kvm/kvm-all.c:2909
+	breakpoint already hit 8 times
+5       breakpoint     keep y   0x0000555555f0be0d in kvm_cpu_synchronize_post_init at ../accel/kvm/kvm-all.c:2931
+	breakpoint already hit 4 times
+6       breakpoint     keep y   0x0000555555d8c49d in kvm_apic_reset at ../hw/i386/kvm/apic.c:221
+
+------------
+
+启动的时候.
+
+(gdb) bt
+#0  kvm_start_vcpu_thread (cpu=0x5555577517f0) at ../accel/kvm/kvm-accel-ops.c:67
+#1  0x0000555555c1eb15 in qemu_init_vcpu (cpu=0x5555577517f0) at ../system/cpus.c:705
+#2  0x0000555555daaf90 in x86_cpu_realizefn (dev=0x5555577517f0, errp=0x7fffffffd520) at ../target/i386/cpu.c:8352
+#3  0x0000555555da3bf3 in max_x86_cpu_realize (dev=0x5555577517f0, errp=0x7fffffffd520) at ../target/i386/cpu.c:5689
+#4  0x0000555555f1e213 in device_set_realized (obj=0x5555577517f0, value=true, errp=0x7fffffffd630) at ../hw/core/qdev.c:494
+#5  0x0000555555f29192 in property_set_bool (obj=0x5555577517f0, v=0x55555775b570, name=0x5555563e9969 "realized", opaque=0x555557460d40, errp=0x7fffffffd630)
+    at ../qom/object.c:2374
+#6  0x0000555555f26c07 in object_property_set (obj=0x5555577517f0, name=0x5555563e9969 "realized", v=0x55555775b570, errp=0x7fffffffd630) at ../qom/object.c:1449
+#7  0x0000555555f2ba94 in object_property_set_qobject (obj=0x5555577517f0, name=0x5555563e9969 "realized", value=0x555557751500, errp=0x5555573a2120 <error_fatal>)
+    at ../qom/qom-qobject.c:28
+#8  0x0000555555f26fac in object_property_set_bool (obj=0x5555577517f0, name=0x5555563e9969 "realized", value=true, errp=0x5555573a2120 <error_fatal>) at ../qom/object.c:1519
+#9  0x0000555555f1d90b in qdev_realize (dev=0x5555577517f0, bus=0x0, errp=0x5555573a2120 <error_fatal>) at ../hw/core/qdev.c:276
+#10 0x0000555555d591ec in x86_cpu_new (x86ms=0x5555576d8c50, apic_id=0, errp=0x5555573a2120 <error_fatal>) at ../hw/i386/x86-common.c:63
+#11 0x0000555555d59366 in x86_cpus_init (x86ms=0x5555576d8c50, default_cpu_version=1) at ../hw/i386/x86-common.c:114
+#12 0x0000555555d612c5 in pc_q35_init (machine=0x5555576d8c50) at ../hw/i386/pc_q35.c:191
+#13 0x0000555555d61c95 in pc_q35_machine_10_0_init (machine=0x5555576d8c50) at ../hw/i386/pc_q35.c:369
+#14 0x000055555597d861 in machine_run_board_init (machine=0x5555576d8c50, mem_path=0x0, errp=0x7fffffffd900) at ../hw/core/machine.c:1682
+#15 0x0000555555c35477 in qemu_init_board () at ../system/vl.c:2711
+#16 0x0000555555c3581c in qmp_x_exit_preconfig (errp=0x5555573a2120 <error_fatal>) at ../system/vl.c:2807
+#17 0x0000555555c38346 in qemu_init (argc=21, argv=0x7fffffffdc28) at ../system/vl.c:3843
+#18 0x00005555560d2905 in main (argc=21, argv=0x7fffffffdc28) at ../system/main.c:71
+
+(gdb) bt
+#0  kvm_create_vcpu (cpu=0x5555577517f0) at ../accel/kvm/kvm-all.c:452
+#1  0x0000555555f06252 in kvm_init_vcpu (cpu=0x5555577517f0, errp=0x5555573a2120 <error_fatal>) at ../accel/kvm/kvm-all.c:543
+#2  0x0000555555f0fe83 in kvm_vcpu_thread_fn (arg=0x5555577517f0) at ../accel/kvm/kvm-accel-ops.c:42
+#3  0x00005555561ad4c6 in qemu_thread_start (args=0x55555775bc80) at ../util/qemu-thread-posix.c:541
+#4  0x00007ffff68a91da in start_thread () from /lib64/libpthread.so.0
+#5  0x00007ffff4bda8d3 in clone () from /lib64/libc.so.6
+
+调用kvm_arch_put_registers(), 来写sregs.
+sregs中有apicbase.
+
+(gdb) bt
+#0  kvm_cpu_synchronize_post_init (cpu=0x5555577517f0) at ../accel/kvm/kvm-all.c:2931
+#1  0x0000555555c1d8cc in cpu_synchronize_post_init (cpu=0x5555577517f0) at ../system/cpus.c:187
+#2  0x0000555555c1d747 in cpu_synchronize_all_post_init () at ../system/cpus.c:157
+#3  0x000055555597d969 in qdev_machine_creation_done () at ../hw/core/machine.c:1720
+#4  0x0000555555c356ee in qemu_machine_creation_done (errp=0x5555573a2120 <error_fatal>) at ../system/vl.c:2781
+#5  0x0000555555c3582d in qmp_x_exit_preconfig (errp=0x5555573a2120 <error_fatal>) at ../system/vl.c:2809
+#6  0x0000555555c38346 in qemu_init (argc=21, argv=0x7fffffffdc28) at ../system/vl.c:3843
+#7  0x00005555560d2905 in main (argc=21, argv=0x7fffffffdc28) at ../system/main.c:71
+
+(gdb) bt
+#0  kvm_arch_put_registers (cpu=0x5555577517f0, level=3, errp=0x7fffedb02580) at ../target/i386/kvm/kvm.c:5252
+#1  0x0000555555f0bd7b in do_kvm_cpu_synchronize_post_init (cpu=0x5555577517f0, arg=...) at ../accel/kvm/kvm-all.c:2916
+#2  0x000055555588e3ab in process_queued_cpu_work (cpu=0x5555577517f0) at ../cpu-common.c:374
+#3  0x0000555555c1e021 in qemu_wait_io_event_common (cpu=0x5555577517f0) at ../system/cpus.c:451
+#4  0x0000555555c1e0ba in qemu_wait_io_event (cpu=0x5555577517f0) at ../system/cpus.c:469
+#5  0x0000555555f0fef1 in kvm_vcpu_thread_fn (arg=0x5555577517f0) at ../accel/kvm/kvm-accel-ops.c:56
+#6  0x00005555561ad4c6 in qemu_thread_start (args=0x55555775bc80) at ../util/qemu-thread-posix.c:541
+#7  0x00007ffff68a91da in start_thread () from /lib64/libpthread.so.0
+#8  0x00007ffff4bda8d3 in clone () from /lib64/libc.so.6
+
+用kvm_apic_reset()写apicbase和apic state.
+
+kvm_apic_reset()
+-> kvm_apic_put()
+   -> kvm_put_apicbase()
+   -> kvm_put_apic_state()
+
+(gdb) bt
+#0  kvm_apic_reset (s=0x555557618000) at ../hw/i386/kvm/apic.c:221
+#1  0x0000555555e4b64b in apic_init_reset (dev=0x555557618000) at ../hw/intc/apic_common.c:232
+#2  0x0000555555e4b76a in apic_reset_common (dev=0x555557618000) at ../hw/intc/apic_common.c:265
+#3  0x0000555555f1eca5 in do_legacy_reset (obj=0x555557618000, type=RESET_TYPE_COLD) at ../hw/core/qdev.c:776
+#4  0x0000555555f20bad in resettable_phase_hold (obj=0x555557618000, opaque=0x0, type=RESET_TYPE_COLD) at ../hw/core/resettable.c:162
+#5  0x0000555555f207b1 in resettable_assert_reset (obj=0x555557618000, type=RESET_TYPE_COLD) at ../hw/core/resettable.c:58
+#6  0x0000555555f20709 in resettable_reset (obj=0x555557618000, type=RESET_TYPE_COLD) at ../hw/core/resettable.c:45
+#7  0x0000555555f1d762 in device_cold_reset (dev=0x555557618000) at ../hw/core/qdev.c:239
+#8  0x0000555555da9303 in x86_cpu_after_reset (cpu=0x5555577517f0) at ../target/i386/cpu.c:7621
+#9  0x0000555555d7ec7e in pc_machine_reset (machine=0x5555576d8c50, type=RESET_TYPE_COLD) at ../hw/i386/pc.c:1735
+#10 0x0000555555c2d38f in qemu_system_reset (reason=SHUTDOWN_CAUSE_NONE) at ../system/runstate.c:525
+#11 0x000055555597da2f in qdev_machine_creation_done () at ../hw/core/machine.c:1763
+#12 0x0000555555c356ee in qemu_machine_creation_done (errp=0x5555573a2120 <error_fatal>) at ../system/vl.c:2781
+#13 0x0000555555c3582d in qmp_x_exit_preconfig (errp=0x5555573a2120 <error_fatal>) at ../system/vl.c:2809
+#14 0x0000555555c38346 in qemu_init (argc=21, argv=0x7fffffffdc28) at ../system/vl.c:3843
+#15 0x00005555560d2905 in main (argc=21, argv=0x7fffffffdc28) at ../system/main.c:71
+
+调用kvm_arch_put_registers(), 来写sregs.
+sregs中有apicbase.
+
+(gdb) bt
+#0  kvm_cpu_synchronize_post_reset (cpu=0x5555577517f0) at ../accel/kvm/kvm-all.c:2909
+#1  0x0000555555c1d88d in cpu_synchronize_post_reset (cpu=0x5555577517f0) at ../system/cpus.c:180
+#2  0x0000555555c1d6ba in cpu_synchronize_all_post_reset () at ../system/cpus.c:148
+#3  0x0000555555c2d3d6 in qemu_system_reset (reason=SHUTDOWN_CAUSE_NONE) at ../system/runstate.c:546
+#4  0x000055555597da2f in qdev_machine_creation_done () at ../hw/core/machine.c:1763
+#5  0x0000555555c356ee in qemu_machine_creation_done (errp=0x5555573a2120 <error_fatal>) at ../system/vl.c:2781
+#6  0x0000555555c3582d in qmp_x_exit_preconfig (errp=0x5555573a2120 <error_fatal>) at ../system/vl.c:2809
+#7  0x0000555555c38346 in qemu_init (argc=21, argv=0x7fffffffdc28) at ../system/vl.c:3843
+#8  0x00005555560d2905 in main (argc=21, argv=0x7fffffffdc28) at ../system/main.c:71
+
+(gdb) bt
+#0  kvm_arch_put_registers (cpu=0x5555577517f0, level=2, errp=0x7fffedb02580) at ../target/i386/kvm/kvm.c:5252
+#1  0x0000555555f0bc3e in do_kvm_cpu_synchronize_post_reset (cpu=0x5555577517f0, arg=...) at ../accel/kvm/kvm-all.c:2893
+#2  0x000055555588e3ab in process_queued_cpu_work (cpu=0x5555577517f0) at ../cpu-common.c:374
+#3  0x0000555555c1e021 in qemu_wait_io_event_common (cpu=0x5555577517f0) at ../system/cpus.c:451
+#4  0x0000555555c1e0ba in qemu_wait_io_event (cpu=0x5555577517f0) at ../system/cpus.c:469
+#5  0x0000555555f0fef1 in kvm_vcpu_thread_fn (arg=0x5555577517f0) at ../accel/kvm/kvm-accel-ops.c:56
+#6  0x00005555561ad4c6 in qemu_thread_start (args=0x55555775bc80) at ../util/qemu-thread-posix.c:541
+#7  0x00007ffff68a91da in start_thread () from /lib64/libpthread.so.0
+#8  0x00007ffff4bda8d3 in clone () from /lib64/libc.so.6
+
+就算running过程中, 调用kvm_arch_put_registers(), 来写sregs.
+sregs中有apicbase.
+
+(gdb) bt
+#0  kvm_arch_put_registers (cpu=0x5555577517f0, level=1, errp=0x7fffedb02600) at ../target/i386/kvm/kvm.c:5252
+#1  0x0000555555f0c51d in kvm_cpu_exec (cpu=0x5555577517f0) at ../accel/kvm/kvm-all.c:3114
+#2  0x0000555555f0fecd in kvm_vcpu_thread_fn (arg=0x5555577517f0) at ../accel/kvm/kvm-accel-ops.c:51
+#3  0x00005555561ad4c6 in qemu_thread_start (args=0x55555775bc80) at ../util/qemu-thread-posix.c:541
+#4  0x00007ffff68a91da in start_thread () from /lib64/libpthread.so.0
+#5  0x00007ffff4bda8d3 in clone () from /lib64/libc.so.6
+
+------------------
+
+第一次hot-add一个vCPU.
+
+device_add host-x86_64-cpu,id=core2,socket-id=0,core-id=2,thread-id=0
+
+
+(gdb) bt
+#0  kvm_start_vcpu_thread (cpu=0x55555775f620) at ../accel/kvm/kvm-accel-ops.c:67
+#1  0x0000555555c1eb15 in qemu_init_vcpu (cpu=0x55555775f620) at ../system/cpus.c:705
+#2  0x0000555555daaf90 in x86_cpu_realizefn (dev=0x55555775f620, errp=0x7fffffffc3e0) at ../target/i386/cpu.c:8352
+#3  0x0000555555da3bf3 in max_x86_cpu_realize (dev=0x55555775f620, errp=0x7fffffffc3e0) at ../target/i386/cpu.c:5689
+#4  0x0000555555f1e213 in device_set_realized (obj=0x55555775f620, value=true, errp=0x7fffffffc700) at ../hw/core/qdev.c:494
+#5  0x0000555555f29192 in property_set_bool (obj=0x55555775f620, v=0x5555582e4a30, name=0x5555563e9969 "realized", opaque=0x555557460d40, errp=0x7fffffffc700)
+    at ../qom/object.c:2374
+#6  0x0000555555f26c07 in object_property_set (obj=0x55555775f620, name=0x5555563e9969 "realized", v=0x5555582e4a30, errp=0x7fffffffc700) at ../qom/object.c:1449
+#7  0x0000555555f2ba94 in object_property_set_qobject (obj=0x55555775f620, name=0x5555563e9969 "realized", value=0x5555576e9580, errp=0x7fffffffc700) at ../qom/qom-qobject.c:28
+#8  0x0000555555f26fac in object_property_set_bool (obj=0x55555775f620, name=0x5555563e9969 "realized", value=true, errp=0x7fffffffc700) at ../qom/object.c:1519
+#9  0x0000555555f1d90b in qdev_realize (dev=0x55555775f620, bus=0x0, errp=0x7fffffffc700) at ../hw/core/qdev.c:276
+#10 0x0000555555c26632 in qdev_device_add_from_qdict (opts=0x555557fd15d0, from_json=false, errp=0x7fffffffc700) at ../system/qdev-monitor.c:714
+#11 0x0000555555c266e6 in qdev_device_add (opts=0x5555580f96a0, errp=0x7fffffffc700) at ../system/qdev-monitor.c:733
+#12 0x0000555555c2730b in hmp_device_add (mon=0x5555576efc20, qdict=0x5555577b5400) at ../system/qdev-monitor.c:994
+#13 0x0000555555c9118f in handle_hmp_command_exec (mon=0x5555576efc20, cmd=0x5555572ac020 <hmp_cmds+1920>, qdict=0x5555577b5400) at ../monitor/hmp.c:1106
+#14 0x0000555555c913da in handle_hmp_command (mon=0x5555576efc20, cmdline=0x555557711d7c "host-x86_64-cpu,id=core2,socket-id=0,core-id=2,thread-id=0") at ../monitor/hmp.c:1158
+#15 0x0000555555c8e45f in monitor_command_cb (opaque=0x5555576efc20, cmdline=0x555557711d70 " device_add host-x86_64-cpu,id=core2,socket-id=0,core-id=2,thread-id=0", 
+    readline_opaque=0x0) at ../monitor/hmp.c:47
+#16 0x00005555561de895 in readline_handle_byte (rs=0x555557711d70, ch=13) at ../util/readline.c:427
+#17 0x0000555555c92031 in monitor_read (opaque=0x5555576efc20, buf=0x7fffffffc970 "\r", size=1) at ../monitor/hmp.c:1390
+#18 0x00005555560c7d61 in qemu_chr_be_write_impl (s=0x55555758df40, buf=0x7fffffffc970 "\r", len=1) at ../chardev/char.c:214
+#19 0x00005555560c7dd2 in qemu_chr_be_write (s=0x55555758df40, buf=0x7fffffffc970 "\r", len=1) at ../chardev/char.c:226
+#20 0x00005555560cadf1 in fd_chr_read (chan=0x5555576d6a00, cond=G_IO_IN, opaque=0x55555758df40) at ../chardev/char-fd.c:72
+#21 0x0000555555f8f8d0 in qio_channel_fd_source_dispatch (source=0x555557e71390, callback=0x5555560cac95 <fd_chr_read>, user_data=0x55555758df40) at ../io/channel-watch.c:84
+#22 0x00007ffff6fd3854 in g_main_dispatch (context=0x55555745e9e0) at ../glib/gmain.c:3325
+#23 g_main_context_dispatch (context=0x55555745e9e0) at ../glib/gmain.c:4043
+#24 0x00005555561ca939 in glib_pollfds_poll () at ../util/main-loop.c:287
+#25 0x00005555561ca9c7 in os_host_main_loop_wait (timeout=964283) at ../util/main-loop.c:310
+#26 0x00005555561caaf6 in main_loop_wait (nonblocking=0) at ../util/main-loop.c:589
+#27 0x0000555555c2dc8a in qemu_main_loop () at ../system/runstate.c:835
+#28 0x00005555560d28b5 in qemu_default_main (opaque=0x0) at ../system/main.c:50
+#29 0x00005555560d296f in main (argc=21, argv=0x7fffffffdc28) at ../system/main.c:80
+
+(gdb) bt
+#0  kvm_create_vcpu (cpu=0x55555775f620) at ../accel/kvm/kvm-all.c:452
+#1  0x0000555555f06252 in kvm_init_vcpu (cpu=0x55555775f620, errp=0x5555573a2120 <error_fatal>) at ../accel/kvm/kvm-all.c:543
+#2  0x0000555555f0fe83 in kvm_vcpu_thread_fn (arg=0x55555775f620) at ../accel/kvm/kvm-accel-ops.c:42
+#3  0x00005555561ad4c6 in qemu_thread_start (args=0x5555582f1b00) at ../util/qemu-thread-posix.c:541
+#4  0x00007ffff68a91da in start_thread () from /lib64/libpthread.so.0
+#5  0x00007ffff4bda8d3 in clone () from /lib64/libc.so.6
+
+
+用kvm_apic_reset()写apicbase和apic state.
+
+kvm_apic_reset()
+-> kvm_apic_put()
+   -> kvm_put_apicbase()
+   -> kvm_put_apic_state()
+
+(gdb) bt
+#0  kvm_apic_reset (s=0x555557549400) at ../hw/i386/kvm/apic.c:221
+#1  0x0000555555e4b64b in apic_init_reset (dev=0x555557549400) at ../hw/intc/apic_common.c:232
+#2  0x0000555555e4b76a in apic_reset_common (dev=0x555557549400) at ../hw/intc/apic_common.c:265
+#3  0x0000555555f1eca5 in do_legacy_reset (obj=0x555557549400, type=RESET_TYPE_COLD) at ../hw/core/qdev.c:776
+#4  0x0000555555f20bad in resettable_phase_hold (obj=0x555557549400, opaque=0x0, type=RESET_TYPE_COLD) at ../hw/core/resettable.c:162
+#5  0x0000555555f207b1 in resettable_assert_reset (obj=0x555557549400, type=RESET_TYPE_COLD) at ../hw/core/resettable.c:58
+#6  0x0000555555f1e3c6 in device_set_realized (obj=0x555557549400, value=true, errp=0x7fffffffc318) at ../hw/core/qdev.c:543
+#7  0x0000555555f29192 in property_set_bool (obj=0x555557549400, v=0x555557fd25f0, name=0x5555563e9969 "realized", opaque=0x555557460d40, errp=0x7fffffffc318)
+    at ../qom/object.c:2374
+#8  0x0000555555f26c07 in object_property_set (obj=0x555557549400, name=0x5555563e9969 "realized", v=0x555557fd25f0, errp=0x7fffffffc318) at ../qom/object.c:1449
+#9  0x0000555555f2ba94 in object_property_set_qobject (obj=0x555557549400, name=0x5555563e9969 "realized", value=0x5555582f1b20, errp=0x7fffffffc318) at ../qom/qom-qobject.c:28
+#10 0x0000555555f26fac in object_property_set_bool (obj=0x555557549400, name=0x5555563e9969 "realized", value=true, errp=0x7fffffffc318) at ../qom/object.c:1519
+#11 0x0000555555f1d90b in qdev_realize (dev=0x555557549400, bus=0x0, errp=0x7fffffffc318) at ../hw/core/qdev.c:276
+#12 0x0000555555d1a6b6 in x86_cpu_apic_realize (cpu=0x55555775f620, errp=0x7fffffffc318) at ../target/i386/cpu-apic.c:77
+#13 0x0000555555daafa3 in x86_cpu_realizefn (dev=0x55555775f620, errp=0x7fffffffc3e0) at ../target/i386/cpu.c:8355
+#14 0x0000555555da3bf3 in max_x86_cpu_realize (dev=0x55555775f620, errp=0x7fffffffc3e0) at ../target/i386/cpu.c:5689
+#15 0x0000555555f1e213 in device_set_realized (obj=0x55555775f620, value=true, errp=0x7fffffffc700) at ../hw/core/qdev.c:494
+#16 0x0000555555f29192 in property_set_bool (obj=0x55555775f620, v=0x5555582e4a30, name=0x5555563e9969 "realized", opaque=0x555557460d40, errp=0x7fffffffc700)
+    at ../qom/object.c:2374
+#17 0x0000555555f26c07 in object_property_set (obj=0x55555775f620, name=0x5555563e9969 "realized", v=0x5555582e4a30, errp=0x7fffffffc700) at ../qom/object.c:1449
+#18 0x0000555555f2ba94 in object_property_set_qobject (obj=0x55555775f620, name=0x5555563e9969 "realized", value=0x5555576e9580, errp=0x7fffffffc700) at ../qom/qom-qobject.c:28
+#19 0x0000555555f26fac in object_property_set_bool (obj=0x55555775f620, name=0x5555563e9969 "realized", value=true, errp=0x7fffffffc700) at ../qom/object.c:1519
+#20 0x0000555555f1d90b in qdev_realize (dev=0x55555775f620, bus=0x0, errp=0x7fffffffc700) at ../hw/core/qdev.c:276
+#21 0x0000555555c26632 in qdev_device_add_from_qdict (opts=0x555557fd15d0, from_json=false, errp=0x7fffffffc700) at ../system/qdev-monitor.c:714
+#22 0x0000555555c266e6 in qdev_device_add (opts=0x5555580f96a0, errp=0x7fffffffc700) at ../system/qdev-monitor.c:733
+#23 0x0000555555c2730b in hmp_device_add (mon=0x5555576efc20, qdict=0x5555577b5400) at ../system/qdev-monitor.c:994
+#24 0x0000555555c9118f in handle_hmp_command_exec (mon=0x5555576efc20, cmd=0x5555572ac020 <hmp_cmds+1920>, qdict=0x5555577b5400) at ../monitor/hmp.c:1106
+#25 0x0000555555c913da in handle_hmp_command (mon=0x5555576efc20, cmdline=0x555557711d7c "host-x86_64-cpu,id=core2,socket-id=0,core-id=2,thread-id=0") at ../monitor/hmp.c:1158
+#26 0x0000555555c8e45f in monitor_command_cb (opaque=0x5555576efc20, cmdline=0x555557711d70 " device_add host-x86_64-cpu,id=core2,socket-id=0,core-id=2,thread-id=0", 
+    readline_opaque=0x0) at ../monitor/hmp.c:47
+#27 0x00005555561de895 in readline_handle_byte (rs=0x555557711d70, ch=13) at ../util/readline.c:427
+#28 0x0000555555c92031 in monitor_read (opaque=0x5555576efc20, buf=0x7fffffffc970 "\r", size=1) at ../monitor/hmp.c:1390
+#29 0x00005555560c7d61 in qemu_chr_be_write_impl (s=0x55555758df40, buf=0x7fffffffc970 "\r", len=1) at ../chardev/char.c:214
+#30 0x00005555560c7dd2 in qemu_chr_be_write (s=0x55555758df40, buf=0x7fffffffc970 "\r", len=1) at ../chardev/char.c:226
+#31 0x00005555560cadf1 in fd_chr_read (chan=0x5555576d6a00, cond=G_IO_IN, opaque=0x55555758df40) at ../chardev/char-fd.c:72
+#32 0x0000555555f8f8d0 in qio_channel_fd_source_dispatch (source=0x555557e71390, callback=0x5555560cac95 <fd_chr_read>, user_data=0x55555758df40) at ../io/channel-watch.c:84
+#33 0x00007ffff6fd3854 in g_main_dispatch (context=0x55555745e9e0) at ../glib/gmain.c:3325
+#34 g_main_context_dispatch (context=0x55555745e9e0) at ../glib/gmain.c:4043
+#35 0x00005555561ca939 in glib_pollfds_poll () at ../util/main-loop.c:287
+#36 0x00005555561ca9c7 in os_host_main_loop_wait (timeout=964283) at ../util/main-loop.c:310
+#37 0x00005555561caaf6 in main_loop_wait (nonblocking=0) at ../util/main-loop.c:589
+#38 0x0000555555c2dc8a in qemu_main_loop () at ../system/runstate.c:835
+#39 0x00005555560d28b5 in qemu_default_main (opaque=0x0) at ../system/main.c:50
+#40 0x00005555560d296f in main (argc=21, argv=0x7fffffffdc28) at ../system/main.c:80
+
+调用kvm_arch_put_registers(), 来写sregs.
+sregs中有apicbase.
+
+(gdb) bt
+#0  kvm_cpu_synchronize_post_init (cpu=0x55555775f620) at ../accel/kvm/kvm-all.c:2931
+#1  0x0000555555c1d8cc in cpu_synchronize_post_init (cpu=0x55555775f620) at ../system/cpus.c:187
+#2  0x000055555588ba76 in cpu_common_realizefn (dev=0x55555775f620, errp=0x7fffffffc318) at ../hw/core/cpu-common.c:219
+#3  0x0000555555daafd3 in x86_cpu_realizefn (dev=0x55555775f620, errp=0x7fffffffc3e0) at ../target/i386/cpu.c:8362
+#4  0x0000555555da3bf3 in max_x86_cpu_realize (dev=0x55555775f620, errp=0x7fffffffc3e0) at ../target/i386/cpu.c:5689
+#5  0x0000555555f1e213 in device_set_realized (obj=0x55555775f620, value=true, errp=0x7fffffffc700) at ../hw/core/qdev.c:494
+#6  0x0000555555f29192 in property_set_bool (obj=0x55555775f620, v=0x5555582e4a30, name=0x5555563e9969 "realized", opaque=0x555557460d40, errp=0x7fffffffc700)
+    at ../qom/object.c:2374
+#7  0x0000555555f26c07 in object_property_set (obj=0x55555775f620, name=0x5555563e9969 "realized", v=0x5555582e4a30, errp=0x7fffffffc700) at ../qom/object.c:1449
+#8  0x0000555555f2ba94 in object_property_set_qobject (obj=0x55555775f620, name=0x5555563e9969 "realized", value=0x5555576e9580, errp=0x7fffffffc700) at ../qom/qom-qobject.c:28
+#9  0x0000555555f26fac in object_property_set_bool (obj=0x55555775f620, name=0x5555563e9969 "realized", value=true, errp=0x7fffffffc700) at ../qom/object.c:1519
+#10 0x0000555555f1d90b in qdev_realize (dev=0x55555775f620, bus=0x0, errp=0x7fffffffc700) at ../hw/core/qdev.c:276
+#11 0x0000555555c26632 in qdev_device_add_from_qdict (opts=0x555557fd15d0, from_json=false, errp=0x7fffffffc700) at ../system/qdev-monitor.c:714
+#12 0x0000555555c266e6 in qdev_device_add (opts=0x5555580f96a0, errp=0x7fffffffc700) at ../system/qdev-monitor.c:733
+#13 0x0000555555c2730b in hmp_device_add (mon=0x5555576efc20, qdict=0x5555577b5400) at ../system/qdev-monitor.c:994
+#14 0x0000555555c9118f in handle_hmp_command_exec (mon=0x5555576efc20, cmd=0x5555572ac020 <hmp_cmds+1920>, qdict=0x5555577b5400) at ../monitor/hmp.c:1106
+#15 0x0000555555c913da in handle_hmp_command (mon=0x5555576efc20, cmdline=0x555557711d7c "host-x86_64-cpu,id=core2,socket-id=0,core-id=2,thread-id=0") at ../monitor/hmp.c:1158
+#16 0x0000555555c8e45f in monitor_command_cb (opaque=0x5555576efc20, cmdline=0x555557711d70 " device_add host-x86_64-cpu,id=core2,socket-id=0,core-id=2,thread-id=0", 
+    readline_opaque=0x0) at ../monitor/hmp.c:47
+#17 0x00005555561de895 in readline_handle_byte (rs=0x555557711d70, ch=13) at ../util/readline.c:427
+#18 0x0000555555c92031 in monitor_read (opaque=0x5555576efc20, buf=0x7fffffffc970 "\r", size=1) at ../monitor/hmp.c:1390
+#19 0x00005555560c7d61 in qemu_chr_be_write_impl (s=0x55555758df40, buf=0x7fffffffc970 "\r", len=1) at ../chardev/char.c:214
+#20 0x00005555560c7dd2 in qemu_chr_be_write (s=0x55555758df40, buf=0x7fffffffc970 "\r", len=1) at ../chardev/char.c:226
+#21 0x00005555560cadf1 in fd_chr_read (chan=0x5555576d6a00, cond=G_IO_IN, opaque=0x55555758df40) at ../chardev/char-fd.c:72
+#22 0x0000555555f8f8d0 in qio_channel_fd_source_dispatch (source=0x555557e71390, callback=0x5555560cac95 <fd_chr_read>, user_data=0x55555758df40) at ../io/channel-watch.c:84
+#23 0x00007ffff6fd3854 in g_main_dispatch (context=0x55555745e9e0) at ../glib/gmain.c:3325
+#24 g_main_context_dispatch (context=0x55555745e9e0) at ../glib/gmain.c:4043
+#25 0x00005555561ca939 in glib_pollfds_poll () at ../util/main-loop.c:287
+#26 0x00005555561ca9c7 in os_host_main_loop_wait (timeout=964283) at ../util/main-loop.c:310
+#27 0x00005555561caaf6 in main_loop_wait (nonblocking=0) at ../util/main-loop.c:589
+#28 0x0000555555c2dc8a in qemu_main_loop () at ../system/runstate.c:835
+#29 0x00005555560d28b5 in qemu_default_main (opaque=0x0) at ../system/main.c:50
+#30 0x00005555560d296f in main (argc=21, argv=0x7fffffffdc28) at ../system/main.c:80
+
+(gdb) bt
+#0  kvm_arch_put_registers (cpu=0x55555775f620, level=3, errp=0x7ffe39aa1580) at ../target/i386/kvm/kvm.c:5252
+#1  0x0000555555f0bd7b in do_kvm_cpu_synchronize_post_init (cpu=0x55555775f620, arg=...) at ../accel/kvm/kvm-all.c:2916
+#2  0x000055555588e3ab in process_queued_cpu_work (cpu=0x55555775f620) at ../cpu-common.c:374
+#3  0x0000555555c1e021 in qemu_wait_io_event_common (cpu=0x55555775f620) at ../system/cpus.c:451
+#4  0x0000555555c1e0ba in qemu_wait_io_event (cpu=0x55555775f620) at ../system/cpus.c:469
+#5  0x0000555555f0fef1 in kvm_vcpu_thread_fn (arg=0x55555775f620) at ../accel/kvm/kvm-accel-ops.c:56
+#6  0x00005555561ad4c6 in qemu_thread_start (args=0x5555582f1b00) at ../util/qemu-thread-posix.c:541
+#7  0x00007ffff68a91da in start_thread () from /lib64/libpthread.so.0
+#8  0x00007ffff4bda8d3 in clone () from /lib64/libc.so.6
+
+--------------------
+
+hot-del什么也没发生.
+第二次hot-add一个vCPU.
+
+(gdb) bt
+#0  kvm_start_vcpu_thread (cpu=0x55555775f620) at ../accel/kvm/kvm-accel-ops.c:67
+#1  0x0000555555c1eb15 in qemu_init_vcpu (cpu=0x55555775f620) at ../system/cpus.c:705
+#2  0x0000555555daaf90 in x86_cpu_realizefn (dev=0x55555775f620, errp=0x7fffffffc3e0) at ../target/i386/cpu.c:8352
+#3  0x0000555555da3bf3 in max_x86_cpu_realize (dev=0x55555775f620, errp=0x7fffffffc3e0) at ../target/i386/cpu.c:5689
+#4  0x0000555555f1e213 in device_set_realized (obj=0x55555775f620, value=true, errp=0x7fffffffc700) at ../hw/core/qdev.c:494
+#5  0x0000555555f29192 in property_set_bool (obj=0x55555775f620, v=0x5555582cdbb0, name=0x5555563e9969 "realized", opaque=0x555557460d40, errp=0x7fffffffc700)
+    at ../qom/object.c:2374
+#6  0x0000555555f26c07 in object_property_set (obj=0x55555775f620, name=0x5555563e9969 "realized", v=0x5555582cdbb0, errp=0x7fffffffc700) at ../qom/object.c:1449
+#7  0x0000555555f2ba94 in object_property_set_qobject (obj=0x55555775f620, name=0x5555563e9969 "realized", value=0x5555581a7830, errp=0x7fffffffc700) at ../qom/qom-qobject.c:28
+#8  0x0000555555f26fac in object_property_set_bool (obj=0x55555775f620, name=0x5555563e9969 "realized", value=true, errp=0x7fffffffc700) at ../qom/object.c:1519
+#9  0x0000555555f1d90b in qdev_realize (dev=0x55555775f620, bus=0x0, errp=0x7fffffffc700) at ../hw/core/qdev.c:276
+#10 0x0000555555c26632 in qdev_device_add_from_qdict (opts=0x5555577b5400, from_json=false, errp=0x7fffffffc700) at ../system/qdev-monitor.c:714
+#11 0x0000555555c266e6 in qdev_device_add (opts=0x5555577a3620, errp=0x7fffffffc700) at ../system/qdev-monitor.c:733
+#12 0x0000555555c2730b in hmp_device_add (mon=0x5555576efc20, qdict=0x555557fd15d0) at ../system/qdev-monitor.c:994
+#13 0x0000555555c9118f in handle_hmp_command_exec (mon=0x5555576efc20, cmd=0x5555572ac020 <hmp_cmds+1920>, qdict=0x555557fd15d0) at ../monitor/hmp.c:1106
+#14 0x0000555555c913da in handle_hmp_command (mon=0x5555576efc20, cmdline=0x555557711d7c "host-x86_64-cpu,id=core2,socket-id=0,core-id=2,thread-id=0") at ../monitor/hmp.c:1158
+#15 0x0000555555c8e45f in monitor_command_cb (opaque=0x5555576efc20, cmdline=0x555557711d70 " device_add host-x86_64-cpu,id=core2,socket-id=0,core-id=2,thread-id=0", 
+    readline_opaque=0x0) at ../monitor/hmp.c:47
+#16 0x00005555561de895 in readline_handle_byte (rs=0x555557711d70, ch=13) at ../util/readline.c:427
+#17 0x0000555555c92031 in monitor_read (opaque=0x5555576efc20, buf=0x7fffffffc970 "\r", size=1) at ../monitor/hmp.c:1390
+#18 0x00005555560c7d61 in qemu_chr_be_write_impl (s=0x55555758df40, buf=0x7fffffffc970 "\r", len=1) at ../chardev/char.c:214
+#19 0x00005555560c7dd2 in qemu_chr_be_write (s=0x55555758df40, buf=0x7fffffffc970 "\r", len=1) at ../chardev/char.c:226
+#20 0x00005555560cadf1 in fd_chr_read (chan=0x5555576d6a00, cond=G_IO_IN, opaque=0x55555758df40) at ../chardev/char-fd.c:72
+#21 0x0000555555f8f8d0 in qio_channel_fd_source_dispatch (source=0x555557e71390, callback=0x5555560cac95 <fd_chr_read>, user_data=0x55555758df40) at ../io/channel-watch.c:84
+#22 0x00007ffff6fd3854 in g_main_dispatch (context=0x55555745e9e0) at ../glib/gmain.c:3325
+#23 g_main_context_dispatch (context=0x55555745e9e0) at ../glib/gmain.c:4043
+#24 0x00005555561ca939 in glib_pollfds_poll () at ../util/main-loop.c:287
+#25 0x00005555561ca9c7 in os_host_main_loop_wait (timeout=930966) at ../util/main-loop.c:310
+#26 0x00005555561caaf6 in main_loop_wait (nonblocking=0) at ../util/main-loop.c:589
+#27 0x0000555555c2dc8a in qemu_main_loop () at ../system/runstate.c:835
+#28 0x00005555560d28b5 in qemu_default_main (opaque=0x0) at ../system/main.c:50
+#29 0x00005555560d296f in main (argc=21, argv=0x7fffffffdc28) at ../system/main.c:80
+
+(gdb) bt
+#0  kvm_create_vcpu (cpu=0x55555775f620) at ../accel/kvm/kvm-all.c:452
+#1  0x0000555555f06252 in kvm_init_vcpu (cpu=0x55555775f620, errp=0x5555573a2120 <error_fatal>) at ../accel/kvm/kvm-all.c:543
+#2  0x0000555555f0fe83 in kvm_vcpu_thread_fn (arg=0x55555775f620) at ../accel/kvm/kvm-accel-ops.c:42
+#3  0x00005555561ad4c6 in qemu_thread_start (args=0x5555577b98e0) at ../util/qemu-thread-posix.c:541
+#4  0x00007ffff68a91da in start_thread () from /lib64/libpthread.so.0
+#5  0x00007ffff4bda8d3 in clone () from /lib64/libc.so.6
+
+用kvm_apic_reset()写apicbase和apic state.
+
+kvm_apic_reset()
+-> kvm_apic_put()
+   -> kvm_put_apicbase()
+   -> kvm_put_apic_state()
+
+(gdb) bt
+#0  kvm_apic_reset (s=0x5555574f1940) at ../hw/i386/kvm/apic.c:221
+#1  0x0000555555e4b64b in apic_init_reset (dev=0x5555574f1940) at ../hw/intc/apic_common.c:232
+#2  0x0000555555e4b76a in apic_reset_common (dev=0x5555574f1940) at ../hw/intc/apic_common.c:265
+#3  0x0000555555f1eca5 in do_legacy_reset (obj=0x5555574f1940, type=RESET_TYPE_COLD) at ../hw/core/qdev.c:776
+#4  0x0000555555f20bad in resettable_phase_hold (obj=0x5555574f1940, opaque=0x0, type=RESET_TYPE_COLD) at ../hw/core/resettable.c:162
+#5  0x0000555555f207b1 in resettable_assert_reset (obj=0x5555574f1940, type=RESET_TYPE_COLD) at ../hw/core/resettable.c:58
+#6  0x0000555555f1e3c6 in device_set_realized (obj=0x5555574f1940, value=true, errp=0x7fffffffc318) at ../hw/core/qdev.c:543
+#7  0x0000555555f29192 in property_set_bool (obj=0x5555574f1940, v=0x5555577b9900, name=0x5555563e9969 "realized", opaque=0x555557460d40, errp=0x7fffffffc318)
+    at ../qom/object.c:2374
+#8  0x0000555555f26c07 in object_property_set (obj=0x5555574f1940, name=0x5555563e9969 "realized", v=0x5555577b9900, errp=0x7fffffffc318) at ../qom/object.c:1449
+#9  0x0000555555f2ba94 in object_property_set_qobject (obj=0x5555574f1940, name=0x5555563e9969 "realized", value=0x555558137e60, errp=0x7fffffffc318) at ../qom/qom-qobject.c:28
+#10 0x0000555555f26fac in object_property_set_bool (obj=0x5555574f1940, name=0x5555563e9969 "realized", value=true, errp=0x7fffffffc318) at ../qom/object.c:1519
+#11 0x0000555555f1d90b in qdev_realize (dev=0x5555574f1940, bus=0x0, errp=0x7fffffffc318) at ../hw/core/qdev.c:276
+#12 0x0000555555d1a6b6 in x86_cpu_apic_realize (cpu=0x55555775f620, errp=0x7fffffffc318) at ../target/i386/cpu-apic.c:77
+#13 0x0000555555daafa3 in x86_cpu_realizefn (dev=0x55555775f620, errp=0x7fffffffc3e0) at ../target/i386/cpu.c:8355
+#14 0x0000555555da3bf3 in max_x86_cpu_realize (dev=0x55555775f620, errp=0x7fffffffc3e0) at ../target/i386/cpu.c:5689
+#15 0x0000555555f1e213 in device_set_realized (obj=0x55555775f620, value=true, errp=0x7fffffffc700) at ../hw/core/qdev.c:494
+#16 0x0000555555f29192 in property_set_bool (obj=0x55555775f620, v=0x5555582cdbb0, name=0x5555563e9969 "realized", opaque=0x555557460d40, errp=0x7fffffffc700)
+    at ../qom/object.c:2374
+#17 0x0000555555f26c07 in object_property_set (obj=0x55555775f620, name=0x5555563e9969 "realized", v=0x5555582cdbb0, errp=0x7fffffffc700) at ../qom/object.c:1449
+#18 0x0000555555f2ba94 in object_property_set_qobject (obj=0x55555775f620, name=0x5555563e9969 "realized", value=0x5555581a7830, errp=0x7fffffffc700) at ../qom/qom-qobject.c:28
+#19 0x0000555555f26fac in object_property_set_bool (obj=0x55555775f620, name=0x5555563e9969 "realized", value=true, errp=0x7fffffffc700) at ../qom/object.c:1519
+#20 0x0000555555f1d90b in qdev_realize (dev=0x55555775f620, bus=0x0, errp=0x7fffffffc700) at ../hw/core/qdev.c:276
+#21 0x0000555555c26632 in qdev_device_add_from_qdict (opts=0x5555577b5400, from_json=false, errp=0x7fffffffc700) at ../system/qdev-monitor.c:714
+#22 0x0000555555c266e6 in qdev_device_add (opts=0x5555577a3620, errp=0x7fffffffc700) at ../system/qdev-monitor.c:733
+#23 0x0000555555c2730b in hmp_device_add (mon=0x5555576efc20, qdict=0x555557fd15d0) at ../system/qdev-monitor.c:994
+#24 0x0000555555c9118f in handle_hmp_command_exec (mon=0x5555576efc20, cmd=0x5555572ac020 <hmp_cmds+1920>, qdict=0x555557fd15d0) at ../monitor/hmp.c:1106
+#25 0x0000555555c913da in handle_hmp_command (mon=0x5555576efc20, cmdline=0x555557711d7c "host-x86_64-cpu,id=core2,socket-id=0,core-id=2,thread-id=0") at ../monitor/hmp.c:1158
+#26 0x0000555555c8e45f in monitor_command_cb (opaque=0x5555576efc20, cmdline=0x555557711d70 " device_add host-x86_64-cpu,id=core2,socket-id=0,core-id=2,thread-id=0", 
+    readline_opaque=0x0) at ../monitor/hmp.c:47
+#27 0x00005555561de895 in readline_handle_byte (rs=0x555557711d70, ch=13) at ../util/readline.c:427
+#28 0x0000555555c92031 in monitor_read (opaque=0x5555576efc20, buf=0x7fffffffc970 "\r", size=1) at ../monitor/hmp.c:1390
+#29 0x00005555560c7d61 in qemu_chr_be_write_impl (s=0x55555758df40, buf=0x7fffffffc970 "\r", len=1) at ../chardev/char.c:214
+#30 0x00005555560c7dd2 in qemu_chr_be_write (s=0x55555758df40, buf=0x7fffffffc970 "\r", len=1) at ../chardev/char.c:226
+#31 0x00005555560cadf1 in fd_chr_read (chan=0x5555576d6a00, cond=G_IO_IN, opaque=0x55555758df40) at ../chardev/char-fd.c:72
+#32 0x0000555555f8f8d0 in qio_channel_fd_source_dispatch (source=0x555557e71390, callback=0x5555560cac95 <fd_chr_read>, user_data=0x55555758df40) at ../io/channel-watch.c:84
+#33 0x00007ffff6fd3854 in g_main_dispatch (context=0x55555745e9e0) at ../glib/gmain.c:3325
+#34 g_main_context_dispatch (context=0x55555745e9e0) at ../glib/gmain.c:4043
+#35 0x00005555561ca939 in glib_pollfds_poll () at ../util/main-loop.c:287
+#36 0x00005555561ca9c7 in os_host_main_loop_wait (timeout=930966) at ../util/main-loop.c:310
+#37 0x00005555561caaf6 in main_loop_wait (nonblocking=0) at ../util/main-loop.c:589
+#38 0x0000555555c2dc8a in qemu_main_loop () at ../system/runstate.c:835
+#39 0x00005555560d28b5 in qemu_default_main (opaque=0x0) at ../system/main.c:50
+#40 0x00005555560d296f in main (argc=21, argv=0x7fffffffdc28) at ../system/main.c:80
+
+
+调用kvm_arch_put_registers(), 来写sregs.
+sregs中有apicbase.
+
+(gdb) bt
+#0  kvm_cpu_synchronize_post_init (cpu=0x55555775f620) at ../accel/kvm/kvm-all.c:2931
+#1  0x0000555555c1d8cc in cpu_synchronize_post_init (cpu=0x55555775f620) at ../system/cpus.c:187
+#2  0x000055555588ba76 in cpu_common_realizefn (dev=0x55555775f620, errp=0x7fffffffc318) at ../hw/core/cpu-common.c:219
+#3  0x0000555555daafd3 in x86_cpu_realizefn (dev=0x55555775f620, errp=0x7fffffffc3e0) at ../target/i386/cpu.c:8362
+#4  0x0000555555da3bf3 in max_x86_cpu_realize (dev=0x55555775f620, errp=0x7fffffffc3e0) at ../target/i386/cpu.c:5689
+#5  0x0000555555f1e213 in device_set_realized (obj=0x55555775f620, value=true, errp=0x7fffffffc700) at ../hw/core/qdev.c:494
+#6  0x0000555555f29192 in property_set_bool (obj=0x55555775f620, v=0x5555582cdbb0, name=0x5555563e9969 "realized", opaque=0x555557460d40, errp=0x7fffffffc700)
+    at ../qom/object.c:2374
+#7  0x0000555555f26c07 in object_property_set (obj=0x55555775f620, name=0x5555563e9969 "realized", v=0x5555582cdbb0, errp=0x7fffffffc700) at ../qom/object.c:1449
+#8  0x0000555555f2ba94 in object_property_set_qobject (obj=0x55555775f620, name=0x5555563e9969 "realized", value=0x5555581a7830, errp=0x7fffffffc700) at ../qom/qom-qobject.c:28
+#9  0x0000555555f26fac in object_property_set_bool (obj=0x55555775f620, name=0x5555563e9969 "realized", value=true, errp=0x7fffffffc700) at ../qom/object.c:1519
+#10 0x0000555555f1d90b in qdev_realize (dev=0x55555775f620, bus=0x0, errp=0x7fffffffc700) at ../hw/core/qdev.c:276
+#11 0x0000555555c26632 in qdev_device_add_from_qdict (opts=0x5555577b5400, from_json=false, errp=0x7fffffffc700) at ../system/qdev-monitor.c:714
+#12 0x0000555555c266e6 in qdev_device_add (opts=0x5555577a3620, errp=0x7fffffffc700) at ../system/qdev-monitor.c:733
+#13 0x0000555555c2730b in hmp_device_add (mon=0x5555576efc20, qdict=0x555557fd15d0) at ../system/qdev-monitor.c:994
+#14 0x0000555555c9118f in handle_hmp_command_exec (mon=0x5555576efc20, cmd=0x5555572ac020 <hmp_cmds+1920>, qdict=0x555557fd15d0) at ../monitor/hmp.c:1106
+#15 0x0000555555c913da in handle_hmp_command (mon=0x5555576efc20, cmdline=0x555557711d7c "host-x86_64-cpu,id=core2,socket-id=0,core-id=2,thread-id=0") at ../monitor/hmp.c:1158
+#16 0x0000555555c8e45f in monitor_command_cb (opaque=0x5555576efc20, cmdline=0x555557711d70 " device_add host-x86_64-cpu,id=core2,socket-id=0,core-id=2,thread-id=0", 
+    readline_opaque=0x0) at ../monitor/hmp.c:47
+#17 0x00005555561de895 in readline_handle_byte (rs=0x555557711d70, ch=13) at ../util/readline.c:427
+#18 0x0000555555c92031 in monitor_read (opaque=0x5555576efc20, buf=0x7fffffffc970 "\r", size=1) at ../monitor/hmp.c:1390
+#19 0x00005555560c7d61 in qemu_chr_be_write_impl (s=0x55555758df40, buf=0x7fffffffc970 "\r", len=1) at ../chardev/char.c:214
+#20 0x00005555560c7dd2 in qemu_chr_be_write (s=0x55555758df40, buf=0x7fffffffc970 "\r", len=1) at ../chardev/char.c:226
+#21 0x00005555560cadf1 in fd_chr_read (chan=0x5555576d6a00, cond=G_IO_IN, opaque=0x55555758df40) at ../chardev/char-fd.c:72
+#22 0x0000555555f8f8d0 in qio_channel_fd_source_dispatch (source=0x555557e71390, callback=0x5555560cac95 <fd_chr_read>, user_data=0x55555758df40) at ../io/channel-watch.c:84
+#23 0x00007ffff6fd3854 in g_main_dispatch (context=0x55555745e9e0) at ../glib/gmain.c:3325
+#24 g_main_context_dispatch (context=0x55555745e9e0) at ../glib/gmain.c:4043
+#25 0x00005555561ca939 in glib_pollfds_poll () at ../util/main-loop.c:287
+#26 0x00005555561ca9c7 in os_host_main_loop_wait (timeout=930966) at ../util/main-loop.c:310
+#27 0x00005555561caaf6 in main_loop_wait (nonblocking=0) at ../util/main-loop.c:589
+#28 0x0000555555c2dc8a in qemu_main_loop () at ../system/runstate.c:835
+#29 0x00005555560d28b5 in qemu_default_main (opaque=0x0) at ../system/main.c:50
+#30 0x00005555560d296f in main (argc=21, argv=0x7fffffffdc28) at ../system/main.c:80
+
+(gdb) bt
+#0  kvm_arch_put_registers (cpu=0x55555775f620, level=3, errp=0x7ffe5e7fe580) at ../target/i386/kvm/kvm.c:5252
+#1  0x0000555555f0bd7b in do_kvm_cpu_synchronize_post_init (cpu=0x55555775f620, arg=...) at ../accel/kvm/kvm-all.c:2916
+#2  0x000055555588e3ab in process_queued_cpu_work (cpu=0x55555775f620) at ../cpu-common.c:374
+#3  0x0000555555c1e021 in qemu_wait_io_event_common (cpu=0x55555775f620) at ../system/cpus.c:451
+#4  0x0000555555c1e0ba in qemu_wait_io_event (cpu=0x55555775f620) at ../system/cpus.c:469
+#5  0x0000555555f0fef1 in kvm_vcpu_thread_fn (arg=0x55555775f620) at ../accel/kvm/kvm-accel-ops.c:56
+#6  0x00005555561ad4c6 in qemu_thread_start (args=0x5555577b98e0) at ../util/qemu-thread-posix.c:541
+#7  0x00007ffff68a91da in start_thread () from /lib64/libpthread.so.0
+#8  0x00007ffff4bda8d3 in clone () from /lib64/libc.so.6
+
+-------------------------------
+
+此时从VM内核reboot.
+
+用kvm_apic_reset()写apicbase和apic state.
+
+kvm_apic_reset()
+-> kvm_apic_put()
+   -> kvm_put_apicbase()
+   -> kvm_put_apic_state()
+
+(gdb) bt
+#0  kvm_apic_reset (s=0x555557618000) at ../hw/i386/kvm/apic.c:221
+#1  0x0000555555e4b64b in apic_init_reset (dev=0x555557618000) at ../hw/intc/apic_common.c:232
+#2  0x0000555555e4b76a in apic_reset_common (dev=0x555557618000) at ../hw/intc/apic_common.c:265
+#3  0x0000555555f1eca5 in do_legacy_reset (obj=0x555557618000, type=RESET_TYPE_COLD) at ../hw/core/qdev.c:776
+#4  0x0000555555f20bad in resettable_phase_hold (obj=0x555557618000, opaque=0x0, type=RESET_TYPE_COLD) at ../hw/core/resettable.c:162
+#5  0x0000555555f207b1 in resettable_assert_reset (obj=0x555557618000, type=RESET_TYPE_COLD) at ../hw/core/resettable.c:58
+#6  0x0000555555f20709 in resettable_reset (obj=0x555557618000, type=RESET_TYPE_COLD) at ../hw/core/resettable.c:45
+#7  0x0000555555f1d762 in device_cold_reset (dev=0x555557618000) at ../hw/core/qdev.c:239
+#8  0x0000555555da9303 in x86_cpu_after_reset (cpu=0x5555577517f0) at ../target/i386/cpu.c:7621
+#9  0x0000555555d7ec7e in pc_machine_reset (machine=0x5555576d8c50, type=RESET_TYPE_COLD) at ../hw/i386/pc.c:1735
+#10 0x0000555555c2d38f in qemu_system_reset (reason=SHUTDOWN_CAUSE_GUEST_RESET) at ../system/runstate.c:525
+#11 0x0000555555c2db95 in main_loop_should_exit (status=0x7fffffffdae4) at ../system/runstate.c:801
+#12 0x0000555555c2dc96 in qemu_main_loop () at ../system/runstate.c:834
+#13 0x00005555560d28b5 in qemu_default_main (opaque=0x0) at ../system/main.c:50
+#14 0x00005555560d296f in main (argc=21, argv=0x7fffffffdc28) at ../system/main.c:80
+
+调用kvm_arch_put_registers(), 来写sregs.
+sregs中有apicbase.
+
+(gdb) bt
+#0  kvm_cpu_synchronize_post_reset (cpu=0x5555577517f0) at ../accel/kvm/kvm-all.c:2909
+#1  0x0000555555c1d88d in cpu_synchronize_post_reset (cpu=0x5555577517f0) at ../system/cpus.c:180
+#2  0x0000555555c1d6ba in cpu_synchronize_all_post_reset () at ../system/cpus.c:148
+#3  0x0000555555c2d3d6 in qemu_system_reset (reason=SHUTDOWN_CAUSE_GUEST_RESET) at ../system/runstate.c:546
+#4  0x0000555555c2db95 in main_loop_should_exit (status=0x7fffffffdae4) at ../system/runstate.c:801
+#5  0x0000555555c2dc96 in qemu_main_loop () at ../system/runstate.c:834
+#6  0x00005555560d28b5 in qemu_default_main (opaque=0x0) at ../system/main.c:50
+#7  0x00005555560d296f in main (argc=21, argv=0x7fffffffdc28) at ../system/main.c:80
+
+(gdb) bt
+#0  kvm_arch_put_registers (cpu=0x5555577517f0, level=2, errp=0x7fffedb02580) at ../target/i386/kvm/kvm.c:5252
+#1  0x0000555555f0bc3e in do_kvm_cpu_synchronize_post_reset (cpu=0x5555577517f0, arg=...) at ../accel/kvm/kvm-all.c:2893
+#2  0x000055555588e3ab in process_queued_cpu_work (cpu=0x5555577517f0) at ../cpu-common.c:374
+#3  0x0000555555c1e021 in qemu_wait_io_event_common (cpu=0x5555577517f0) at ../system/cpus.c:451
+#4  0x0000555555c1e0ba in qemu_wait_io_event (cpu=0x5555577517f0) at ../system/cpus.c:469
+#5  0x0000555555f0fef1 in kvm_vcpu_thread_fn (arg=0x5555577517f0) at ../accel/kvm/kvm-accel-ops.c:56
+#6  0x00005555561ad4c6 in qemu_thread_start (args=0x55555775bc80) at ../util/qemu-thread-posix.c:541
+#7  0x00007ffff68a91da in start_thread () from /lib64/libpthread.so.0
+#8  0x00007ffff4bda8d3 in clone () from /lib64/libc.so.6
+
+
+用kvm_apic_reset()写apicbase和apic state.
+
+kvm_apic_reset()
+-> kvm_apic_put()
+   -> kvm_put_apicbase()
+   -> kvm_put_apic_state()
+
+(gdb) bt
+#0  kvm_apic_reset (s=0x555557618000) at ../hw/i386/kvm/apic.c:221
+#1  0x0000555555e4b64b in apic_init_reset (dev=0x555557618000) at ../hw/intc/apic_common.c:232
+#2  0x0000555555e4b76a in apic_reset_common (dev=0x555557618000) at ../hw/intc/apic_common.c:265
+#3  0x0000555555f1eca5 in do_legacy_reset (obj=0x555557618000, type=RESET_TYPE_COLD) at ../hw/core/qdev.c:776
+#4  0x0000555555f20bad in resettable_phase_hold (obj=0x555557618000, opaque=0x0, type=RESET_TYPE_COLD) at ../hw/core/resettable.c:162
+#5  0x0000555555f207b1 in resettable_assert_reset (obj=0x555557618000, type=RESET_TYPE_COLD) at ../hw/core/resettable.c:58
+#6  0x0000555555f20709 in resettable_reset (obj=0x555557618000, type=RESET_TYPE_COLD) at ../hw/core/resettable.c:45
+#7  0x0000555555f1d762 in device_cold_reset (dev=0x555557618000) at ../hw/core/qdev.c:239
+#8  0x0000555555da9303 in x86_cpu_after_reset (cpu=0x5555577517f0) at ../target/i386/cpu.c:7621
+#9  0x0000555555d7ec7e in pc_machine_reset (machine=0x5555576d8c50, type=RESET_TYPE_COLD) at ../hw/i386/pc.c:1735
+#10 0x0000555555c2d38f in qemu_system_reset (reason=SHUTDOWN_CAUSE_GUEST_RESET) at ../system/runstate.c:525
+#11 0x0000555555c2db95 in main_loop_should_exit (status=0x7fffffffdae4) at ../system/runstate.c:801
+#12 0x0000555555c2dc96 in qemu_main_loop () at ../system/runstate.c:834
+#13 0x00005555560d28b5 in qemu_default_main (opaque=0x0) at ../system/main.c:50
+#14 0x00005555560d296f in main (argc=21, argv=0x7fffffffdc28) at ../system/main.c:80
+
+调用kvm_arch_put_registers(), 来写sregs.
+sregs中有apicbase.
+
+(gdb) bt
+#0  kvm_cpu_synchronize_post_reset (cpu=0x5555577517f0) at ../accel/kvm/kvm-all.c:2909
+#1  0x0000555555c1d88d in cpu_synchronize_post_reset (cpu=0x5555577517f0) at ../system/cpus.c:180
+#2  0x0000555555c1d6ba in cpu_synchronize_all_post_reset () at ../system/cpus.c:148
+#3  0x0000555555c2d3d6 in qemu_system_reset (reason=SHUTDOWN_CAUSE_GUEST_RESET) at ../system/runstate.c:546
+#4  0x0000555555c2db95 in main_loop_should_exit (status=0x7fffffffdae4) at ../system/runstate.c:801
+#5  0x0000555555c2dc96 in qemu_main_loop () at ../system/runstate.c:834
+#6  0x00005555560d28b5 in qemu_default_main (opaque=0x0) at ../system/main.c:50
+#7  0x00005555560d296f in main (argc=21, argv=0x7fffffffdc28) at ../system/main.c:80
+
+(gdb) bt
+#0  kvm_arch_put_registers (cpu=0x5555577517f0, level=2, errp=0x7fffedb02580) at ../target/i386/kvm/kvm.c:5252
+#1  0x0000555555f0bc3e in do_kvm_cpu_synchronize_post_reset (cpu=0x5555577517f0, arg=...) at ../accel/kvm/kvm-all.c:2893
+#2  0x000055555588e3ab in process_queued_cpu_work (cpu=0x5555577517f0) at ../cpu-common.c:374
+#3  0x0000555555c1e021 in qemu_wait_io_event_common (cpu=0x5555577517f0) at ../system/cpus.c:451
+#4  0x0000555555c1e0ba in qemu_wait_io_event (cpu=0x5555577517f0) at ../system/cpus.c:469
+#5  0x0000555555f0fef1 in kvm_vcpu_thread_fn (arg=0x5555577517f0) at ../accel/kvm/kvm-accel-ops.c:56
+#6  0x00005555561ad4c6 in qemu_thread_start (args=0x55555775bc80) at ../util/qemu-thread-posix.c:541
+#7  0x00007ffff68a91da in start_thread () from /lib64/libpthread.so.0
+#8  0x00007ffff4bda8d3 in clone () from /lib64/libc.so.6
+
+执行过程中也可能调用kvm_arch_put_registers(), 来写sregs.
+
+(gdb) bt
+#0  kvm_arch_put_registers (cpu=0x55555775f620, level=1, errp=0x7ffe5e7fe600) at ../target/i386/kvm/kvm.c:5252
+#1  0x0000555555f0c51d in kvm_cpu_exec (cpu=0x55555775f620) at ../accel/kvm/kvm-all.c:3114
+#2  0x0000555555f0fecd in kvm_vcpu_thread_fn (arg=0x55555775f620) at ../accel/kvm/kvm-accel-ops.c:51
+#3  0x00005555561ad4c6 in qemu_thread_start (args=0x5555577b98e0) at ../util/qemu-thread-posix.c:541
+#4  0x00007ffff68a91da in start_thread () from /lib64/libpthread.so.0
+#5  0x00007ffff4bda8d3 in clone () from /lib64/libc.so.6

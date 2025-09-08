@@ -1,0 +1,2169 @@
+From 2aad292bce7cee2f2762509e8fbe5f6a8d8e5f77 Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Sun, 7 Sep 2025 18:30:35 -0700
+Subject: [PATCH 1/1] linux-v6.16
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ arch/x86/include/asm/kvm_host.h        |  25 ++
+ arch/x86/include/asm/nospec-branch.h   |  29 ++
+ arch/x86/kernel/alternative.c          |  58 +++
+ arch/x86/kernel/cpu/bugs.c             | 548 +++++++++++++++++++++++++
+ arch/x86/kernel/cpu/common.c           |  10 +
+ arch/x86/kvm/hyperv.c                  |   7 +
+ arch/x86/kvm/lapic.c                   |  13 +
+ arch/x86/kvm/x86.c                     | 241 +++++++++++
+ arch/x86/net/bpf_jit_comp.c            |  33 ++
+ drivers/infiniband/core/device.c       |  23 ++
+ drivers/nvme/host/fabrics.c            |   7 +
+ drivers/nvme/host/fc.c                 |   7 +
+ drivers/nvme/host/rdma.c               |  53 +++
+ drivers/nvme/host/tcp.c                |   7 +
+ drivers/nvme/target/loop.c             |   7 +
+ drivers/nvme/target/rdma.c             |  23 ++
+ drivers/target/target_core_iblock.c    |  84 ++++
+ drivers/target/target_core_transport.c |   7 +
+ include/linux/kvm_host.h               |  74 ++++
+ include/rdma/ib_verbs.h                |  47 +++
+ net/rds/ib.c                           |  23 ++
+ virt/kvm/kvm_main.c                    |  44 ++
+ 22 files changed, 1370 insertions(+)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index f7af967aa..c1f69933e 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1410,6 +1410,18 @@ struct kvm_arch {
+ 	 * This also protects nr_vcpus_matched_tsc which is read from a
+ 	 * preemption-disabled region, so it must be a raw spinlock.
+ 	 */
++	/*
++	 * 在以下使用kvm_arch->tsc_write_lock:
++	 *   - arch/x86/kvm/x86.c|2659| <<__kvm_synchronize_tsc>> lockdep_assert_held(&kvm->arch.tsc_write_lock);
++	 *   - arch/x86/kvm/x86.c|2716| <<kvm_synchronize_tsc>> raw_spin_lock_irqsave(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|2772| <<kvm_synchronize_tsc>> raw_spin_unlock_irqrestore(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|3017| <<pvclock_update_vm_gtod_copy>> lockdep_assert_held(&kvm->arch.tsc_write_lock);
++	 *   - arch/x86/kvm/x86.c|3049| <<__kvm_start_pvclock_update>> raw_spin_lock_irq(&kvm->arch.tsc_write_lock);
++	 *   - arch/x86/kvm/x86.c|3068| <<kvm_end_pvclock_update>> raw_spin_unlock_irq(&ka->tsc_write_lock)
++	 *   - arch/x86/kvm/x86.c|5799| <<kvm_arch_tsc_set_attr>> raw_spin_lock_irqsave(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|5809| <<kvm_arch_tsc_set_attr>> raw_spin_unlock_irqrestore(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|12820| <<kvm_arch_init_vm>> raw_spin_lock_init(&kvm->arch.tsc_write_lock);
++	 */
+ 	raw_spinlock_t tsc_write_lock;
+ 	u64 last_tsc_nsec;
+ 	u64 last_tsc_write;
+@@ -1425,6 +1437,19 @@ struct kvm_arch {
+ 	bool user_set_tsc;
+ 	u64 apic_bus_cycle_ns;
+ 
++	/*
++	 * 在以下使用kvm_arch->pvclock_sc:
++	 *   - arch/x86/kvm/x86.c|3050| <<__kvm_start_pvclock_update>> write_seqcount_begin(&kvm->arch.pvclock_sc);
++	 *   - arch/x86/kvm/x86.c|3067| <<kvm_end_pvclock_update>> write_seqcount_end(&ka->pvclock_sc);
++	 *   - arch/x86/kvm/x86.c|3143| <<get_kvmclock>> seq = read_seqcount_begin(&ka->pvclock_sc);
++	 *   - arch/x86/kvm/x86.c|3145| <<get_kvmclock>> } while (read_seqcount_retry(&ka->pvclock_sc, seq));
++	 *   - arch/x86/kvm/x86.c|3223| <<kvm_guest_time_update>> seq = read_seqcount_begin(&ka->pvclock_sc);
++	 *   - arch/x86/kvm/x86.c|3229| <<kvm_guest_time_update>> } while (read_seqcount_retry(&ka->pvclock_sc, seq));
++	 *   - arch/x86/kvm/x86.c|3359| <<kvm_get_wall_clock_epoch>> seq = read_seqcount_begin(&ka->pvclock_sc);
++	 *   - arch/x86/kvm/x86.c|3387| <<kvm_get_wall_clock_epoch>> } while (read_seqcount_retry(&ka->pvclock_sc, seq));
++	 *   - arch/x86/kvm/x86.c|12822| <<kvm_arch_init_vm>> seqcount_raw_spinlock_init(&kvm->arch.pvclock_sc,
++	 *        &kvm->arch.tsc_write_lock);
++	 */
+ 	seqcount_raw_spinlock_t pvclock_sc;
+ 	bool use_master_clock;
+ 	u64 master_kernel_ns;
+diff --git a/arch/x86/include/asm/nospec-branch.h b/arch/x86/include/asm/nospec-branch.h
+index 10f261678..8d953ccb5 100644
+--- a/arch/x86/include/asm/nospec-branch.h
++++ b/arch/x86/include/asm/nospec-branch.h
+@@ -328,10 +328,39 @@
+ 	__CLEAR_CPU_BUFFERS X86_FEATURE_CLEAR_CPU_BUF_VM
+ 
+ #ifdef CONFIG_X86_64
++/*
++ * 使用CLEAR_BRANCH_HISTORY和CLEAR_BRANCH_HISTORY_VMEXIT的地方:
++ *   - arch/x86/entry/entry_64_compat.S:	CLEAR_BRANCH_HISTORY
++ *   - arch/x86/entry/entry_64_compat.S:	CLEAR_BRANCH_HISTORY
++ *   - arch/x86/entry/entry_64_compat.S:	CLEAR_BRANCH_HISTORY
++ *   - arch/x86/entry/entry_64.S:	CLEAR_BRANCH_HISTORY
++ *   - arch/x86/kvm/vmx/vmenter.S:	CLEAR_BRANCH_HISTORY_VMEXIT
++ *
++ * 在以下使用X86_FEATURE_CLEAR_BHB_LOOP:
++ *   - arch/x86/include/asm/nospec-branch.h|332| <<CLEAR_BRANCH_HISTORY>> ALTERNATIVE "", "call clear_bhb_loop", X86_FEATURE_CLEAR_BHB_LOOP
++ *   - arch/x86/kernel/cpu/bugs.c|2141| <<bhi_apply_mitigation>> setup_force_cpu_cap(X86_FEATURE_CLEAR_BHB_LOOP);
++ *   - arch/x86/kernel/cpu/bugs.c|3307| <<spectre_bhi_state>> else if (boot_cpu_has(X86_FEATURE_CLEAR_BHB_LOOP))
++ *   - arch/x86/net/bpf_jit_comp.c|1516| <<emit_spectre_bhb_barrier>> if (cpu_feature_enabled(X86_FEATURE_CLEAR_BHB_LOOP)) {
++ *   - arch/x86/net/bpf_jit_comp.c|1531| <<emit_spectre_bhb_barrier>> if ((cpu_feature_enabled(X86_FEATURE_CLEAR_BHB_LOOP) &&
++ */
+ .macro CLEAR_BRANCH_HISTORY
+ 	ALTERNATIVE "", "call clear_bhb_loop", X86_FEATURE_CLEAR_BHB_LOOP
+ .endm
+ 
++/*
++ * 使用CLEAR_BRANCH_HISTORY和CLEAR_BRANCH_HISTORY_VMEXIT的地方:
++ *   - arch/x86/entry/entry_64_compat.S:        CLEAR_BRANCH_HISTORY
++ *   - arch/x86/entry/entry_64_compat.S:        CLEAR_BRANCH_HISTORY
++ *   - arch/x86/entry/entry_64_compat.S:        CLEAR_BRANCH_HISTORY
++ *   - arch/x86/entry/entry_64.S:       CLEAR_BRANCH_HISTORY
++ *   - arch/x86/kvm/vmx/vmenter.S:      CLEAR_BRANCH_HISTORY_VMEXIT
++ *
++ * 在以下使用X86_FEATURE_CLEAR_BHB_VMEXIT:
++ *   - arch/x86/include/asm/nospec-branch.h|336| <<CLEAR_BRANCH_HISTORY_VMEXIT>> ALTERNATIVE "", "call clear_bhb_loop", X86_FEATURE_CLEAR_BHB_VMEXIT
++ *   - arch/x86/kernel/cpu/bugs.c|2136| <<bhi_apply_mitigation>> setup_force_cpu_cap(X86_FEATURE_CLEAR_BHB_VMEXIT);
++ *   - arch/x86/kernel/cpu/bugs.c|2142| <<bhi_apply_mitigation>> setup_force_cpu_cap(X86_FEATURE_CLEAR_BHB_VMEXIT);
++ *   - arch/x86/kernel/cpu/bugs.c|3313| <<spectre_bhi_state>> else if (boot_cpu_has(X86_FEATURE_CLEAR_BHB_VMEXIT))
++ */
+ .macro CLEAR_BRANCH_HISTORY_VMEXIT
+ 	ALTERNATIVE "", "call clear_bhb_loop", X86_FEATURE_CLEAR_BHB_VMEXIT
+ .endm
+diff --git a/arch/x86/kernel/alternative.c b/arch/x86/kernel/alternative.c
+index ea1d98416..d188f2bb1 100644
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@ -852,6 +852,20 @@ static bool cpu_wants_indirect_its_thunk_at(unsigned long addr, int reg)
+  *
+  * It also tries to inline spectre_v2=retpoline,lfence when size permits.
+  */
++/*
++ * 在以下调用patch_retpoline():
++ *   - arch/x86/kernel/alternative.c|993| <<apply_retpolines>> len = patch_retpoline(addr, &insn, bytes);
++ *
++ * start_kernel()
++ * -> arch_cpu_finalize_init()
++ *    -> cpu_select_mitigations()
++ *    -> alternative_instructions()
++ *       -> __apply_fineibt(__retpoline_sites, __retpoline_sites_end,
++ *                          __cfi_sites, __cfi_sites_end, true);
++ *       -> apply_retpolines(__retpoline_sites, __retpoline_sites_end);
++ *          -> loop: patch_retpoline()
++ *       -> apply_returns(__return_sites, __return_sites_end);
++ */
+ static int patch_retpoline(void *addr, struct insn *insn, u8 *bytes)
+ {
+ 	retpoline_thunk_t *target;
+@@ -867,6 +881,18 @@ static int patch_retpoline(void *addr, struct insn *insn, u8 *bytes)
+ 	/* If anyone ever does: CALL/JMP *%rsp, we're in deep trouble. */
+ 	BUG_ON(reg == 4);
+ 
++	/*
++	 * 在以下使用X86_FEATURE_RETPOLINE_LFENCE:
++	 *   - arch/x86/include/asm/nospec-branch.h|514| <<CALL_NOSPEC(32位)>> X86_FEATURE_RETPOLINE_LFENCE)
++	 *   - arch/x86/kernel/alternative.c|871| <<patch_retpoline>> if (cpu_feature_enabled(X86_FEATURE_RETPOLINE) &&
++	 *                     !cpu_feature_enabled(X86_FEATURE_RETPOLINE_LFENCE)) {
++	 *   - arch/x86/kernel/alternative.c|907| <<patch_retpoline>> if (cpu_feature_enabled(X86_FEATURE_RETPOLINE_LFENCE)) {
++	 *   - arch/x86/kernel/cpu/bugs.c|2384| <<bhi_apply_mitigation>> if (boot_cpu_has(X86_FEATURE_RETPOLINE) &&
++	 *                     !boot_cpu_has(X86_FEATURE_RETPOLINE_LFENCE)) {
++	 *   - arch/x86/kernel/cpu/bugs.c|2556| <<spectre_v2_apply_mitigation>> setup_force_cpu_cap(X86_FEATURE_RETPOLINE_LFENCE);
++	 *   - arch/x86/kernel/cpu/bugs.c|3685| <<spectre_bhi_state>> !boot_cpu_has(X86_FEATURE_RETPOLINE_LFENCE) &&
++	 *   - arch/x86/net/bpf_jit_comp.c|669| <<emit_indirect_jump>> } else if (cpu_feature_enabled(X86_FEATURE_RETPOLINE_LFENCE)) {
++	 */
+ 	if (cpu_feature_enabled(X86_FEATURE_RETPOLINE) &&
+ 	    !cpu_feature_enabled(X86_FEATURE_RETPOLINE_LFENCE)) {
+ 		if (cpu_feature_enabled(X86_FEATURE_CALL_DEPTH))
+@@ -901,6 +927,18 @@ static int patch_retpoline(void *addr, struct insn *insn, u8 *bytes)
+ 		op = JMP32_INSN_OPCODE;
+ 	}
+ 
++	/*
++	 * 在以下使用X86_FEATURE_RETPOLINE_LFENCE:
++	 *   - arch/x86/include/asm/nospec-branch.h|514| <<CALL_NOSPEC(32位)>> X86_FEATURE_RETPOLINE_LFENCE)
++	 *   - arch/x86/kernel/alternative.c|871| <<patch_retpoline>> if (cpu_feature_enabled(X86_FEATURE_RETPOLINE) &&
++	 *                     !cpu_feature_enabled(X86_FEATURE_RETPOLINE_LFENCE)) {
++	 *   - arch/x86/kernel/alternative.c|907| <<patch_retpoline>> if (cpu_feature_enabled(X86_FEATURE_RETPOLINE_LFENCE)) {
++	 *   - arch/x86/kernel/cpu/bugs.c|2384| <<bhi_apply_mitigation>> if (boot_cpu_has(X86_FEATURE_RETPOLINE) &&
++	 *                     !boot_cpu_has(X86_FEATURE_RETPOLINE_LFENCE)) {
++	 *   - arch/x86/kernel/cpu/bugs.c|2556| <<spectre_v2_apply_mitigation>> setup_force_cpu_cap(X86_FEATURE_RETPOLINE_LFENCE);
++	 *   - arch/x86/kernel/cpu/bugs.c|3685| <<spectre_bhi_state>> !boot_cpu_has(X86_FEATURE_RETPOLINE_LFENCE) &&
++	 *   - arch/x86/net/bpf_jit_comp.c|669| <<emit_indirect_jump>> } else if (cpu_feature_enabled(X86_FEATURE_RETPOLINE_LFENCE)) {
++	 */
+ 	/*
+ 	 * For RETPOLINE_LFENCE: prepend the indirect CALL/JMP with an LFENCE.
+ 	 */
+@@ -942,6 +980,22 @@ static int patch_retpoline(void *addr, struct insn *insn, u8 *bytes)
+ /*
+  * Generated by 'objtool --retpoline'.
+  */
++/*
++ * start_kernel()
++ * -> arch_cpu_finalize_init()
++ *    -> cpu_select_mitigations()
++ *    -> alternative_instructions()
++ *       -> __apply_fineibt(__retpoline_sites, __retpoline_sites_end,
++ *                          __cfi_sites, __cfi_sites_end, true);
++ *       -> apply_retpolines(__retpoline_sites, __retpoline_sites_end);
++ *          -> loop: patch_retpoline()
++ *       -> apply_returns(__return_sites, __return_sites_end);
++ *
++ *
++ * 在以下使用:
++ *   - arch/x86/kernel/alternative.c|2367| <<alternative_instructions>> apply_retpolines(__retpoline_sites, __retpoline_sites_end);
++ *   - arch/x86/kernel/module.c|289| <<module_finalize>> apply_retpolines(rseg, rseg + retpolines->sh_size);
++ */
+ void __init_or_module noinline apply_retpolines(s32 *start, s32 *end)
+ {
+ 	s32 *s;
+@@ -2324,6 +2378,10 @@ static noinline void __init alt_reloc_selftest(void)
+ 	);
+ }
+ 
++/*
++ * 在以下使用alternative_instructions():
++ *   - arch/x86/kernel/cpu/common.c|2553| <<arch_cpu_finalize_init>> alternative_instructions();
++ */
+ void __init alternative_instructions(void)
+ {
+ 	u64 ibt;
+diff --git a/arch/x86/kernel/cpu/bugs.c b/arch/x86/kernel/cpu/bugs.c
+index f4d3abb12..683f7b94f 100644
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@ -34,6 +34,61 @@
+ 
+ #include "cpu.h"
+ 
++/*
++ * # SpectreV2原理:
++ *
++ * 利用CPU的分支目标预测器(BTB, Branch Target Buffer).
++ * 攻击者训练BTB,使得受害者进程中间接跳转(如 jmp *%rax)在投机执行阶
++ * 段跳到攻击者准备的gadget.
++ * 虽然真正跳转时CPU会发现错了,但投机执行期间的数据访问可泄露敏感
++ * 信息(通过cache timing等方式).
++ *
++ * # Retpoline的防御原理:
++ *
++ * 通过ret, 彻底避开了间接跳转预测的参与,使BTB被"绕过".
++ * BTB不再参与间接跳转的预测过程.
++ * CPU对ret指令的预测只能依赖于RSB(Return Stack Buffer),而RSB是按
++ * 调用-返回对维护的,攻击者很难污染.
++ * 投机跳转只能去trampoline,而非攻击者gadget.
++ * 所以:SpectreV2成立的关键是BTB被污染,Retpoline正好绕开了BTB.
++ *
++ * # 纯Retpoline为什么能防BHI?
++ *
++ * RRSBA是某些CPU的硬件行为特性,在RSB underflow时,不是停下来等待真正
++ * 返回地址,而是fallback到BTB/BHB来猜测返回地址.
++ *
++ * BHI利用的是BHB(Branch History Buffer),记录之前是否taken的分支路径.
++ *
++ * 在CPU 执行分支预测时,不仅仅依赖BTB,还会使用BHB中的历史信息做路径选择.
++ *
++ * 如果CPU的ret执行过程中发生fallback to BTB/BHB(RRSBA),那么BHB被攻击者
++ * 污染就可能影响投机路径.
++ * 在没有RRSBA行为的CPU上, ret 始终使用RSB预测跳转,而不是fallback到BTB/BHB.
++ * 此时, Retpoline构造的ret安全有效,不会受到BHB的污染影响.
++ * 因此在这些 CPU 上,Retpoline间接"顺带"也防住了BHI,即便不是设计目标.
++ * Again, Retpoline是一种"软件绕过硬件预测器"的技巧,不是阻止预测,而是从根本
++ * 不走那条路.
++ *
++ * # 假设CPU没有RRSBA, 为什么retpoline可以防BHI, 同时retpoline + lfence就不可以?
++ *
++ * 因为Retpoline+LFENCE在某些实现中,破坏了RSB的正常工作,使得CPU fallback
++ * 到其他预测路径(如BTB/BHB),从而导致BHI重新成为可能.
++ * 在没有RRSBA的CPU上,Retpoline单独使用时能保证RSB是有效的,所以防住了BHI.
++ * 加了LFENCE后,打乱了CPU对ret指令的正常处理方式(例如pipeline flush),
++ * 使得RSB不再被正确使用,可能导致fallback,反而引入了攻击面.
++ *
++ *
++ * start_kernel()
++ * -> arch_cpu_finalize_init()
++ *    -> cpu_select_mitigations()
++ *    -> alternative_instructions()
++ *       -> __apply_fineibt(__retpoline_sites, __retpoline_sites_end,
++ *                          __cfi_sites, __cfi_sites_end, true);
++ *       -> apply_retpolines(__retpoline_sites, __retpoline_sites_end);
++ *          -> loop: patch_retpoline()
++ *       -> apply_returns(__return_sites, __return_sites_end);
++ */
++
+ /*
+  * Speculation Vulnerability Handling
+  *
+@@ -97,10 +152,42 @@ static void __init its_apply_mitigation(void);
+ static void __init tsa_select_mitigation(void);
+ static void __init tsa_apply_mitigation(void);
+ 
++/*
++ * 在以下使用x86_spec_ctrl_base:
++ *   - arch/x86/kernel/cpu/bugs.c|201| <<cpu_select_mitigations>> rdmsrq(MSR_IA32_SPEC_CTRL, x86_spec_ctrl_base);
++ *   - arch/x86/kernel/cpu/bugs.c|208| <<cpu_select_mitigations>> x86_spec_ctrl_base &= ~SPEC_CTRL_MITIGATIONS_MASK;
++ *   - arch/x86/kernel/cpu/bugs.c|1996| <<spec_ctrl_disable_kernel_rrsba>> x86_spec_ctrl_base |= SPEC_CTRL_RRSBA_DIS_S;
++ *   - arch/x86/kernel/cpu/bugs.c|1997| <<spec_ctrl_disable_kernel_rrsba>> update_spec_ctrl(x86_spec_ctrl_base);
++ *   - arch/x86/kernel/cpu/bugs.c|2060| <<spec_ctrl_bhi_dis>> x86_spec_ctrl_base |= SPEC_CTRL_BHI_DIS_S;
++ *   - arch/x86/kernel/cpu/bugs.c|2061| <<spec_ctrl_bhi_dis>> update_spec_ctrl(x86_spec_ctrl_base);
++ *   - arch/x86/kernel/cpu/bugs.c|2225| <<spectre_v2_apply_mitigation>> x86_spec_ctrl_base |= SPEC_CTRL_IBRS;
++ *   - arch/x86/kernel/cpu/bugs.c|2226| <<spectre_v2_apply_mitigation>> update_spec_ctrl(x86_spec_ctrl_base);
++ *   - arch/x86/kernel/cpu/bugs.c|2296| <<update_stibp_msr>> u64 val = spec_ctrl_current() | (x86_spec_ctrl_base & SPEC_CTRL_STIBP);
++ *   - arch/x86/kernel/cpu/bugs.c|2303| <<update_stibp_strict>> u64 mask = x86_spec_ctrl_base & ~SPEC_CTRL_STIBP;
++ *   - arch/x86/kernel/cpu/bugs.c|2308| <<update_stibp_strict>> if (mask == x86_spec_ctrl_base)
++ *   - arch/x86/kernel/cpu/bugs.c|2313| <<update_stibp_strict>> x86_spec_ctrl_base = mask;
++ *   - arch/x86/kernel/cpu/bugs.c|2557| <<ssb_apply_mitigation>> x86_spec_ctrl_base |= SPEC_CTRL_SSBD;
++ *   - arch/x86/kernel/cpu/bugs.c|2558| <<ssb_apply_mitigation>> update_spec_ctrl(x86_spec_ctrl_base);
++ *   - arch/x86/kernel/cpu/bugs.c|2802| <<x86_spec_ctrl_setup_ap>> update_spec_ctrl(x86_spec_ctrl_base);
++ *   - arch/x86/kernel/process.c|624| <<__speculation_ctrl_update>> u64 msr = x86_spec_ctrl_base;
++ */
+ /* The base value of the SPEC_CTRL MSR without task-specific bits set */
+ u64 x86_spec_ctrl_base;
+ EXPORT_SYMBOL_GPL(x86_spec_ctrl_base);
+ 
++/*
++ * 在以下使用x86_spec_ctrl_current:
++ *   - arch/x86/entry/calling.h|323| <<IBRS_ENTER>> movq PER_CPU_VAR(x86_spec_ctrl_current), %rdx
++ *   - arch/x86/entry/calling.h|343| <<IBRS_EXIT>> movq PER_CPU_VAR(x86_spec_ctrl_current), %rdx
++ *   - arch/x86/include/asm/nospec-branch.h|542| <<global>> DECLARE_PER_CPU(u64, x86_spec_ctrl_current);
++ *   - arch/x86/kernel/cpu/bugs.c|105| <<global>> DEFINE_PER_CPU(u64, x86_spec_ctrl_current);
++ *   - arch/x86/include/asm/spec-ctrl.h|86| <<__update_spec_ctrl>> __this_cpu_write(x86_spec_ctrl_current, val);
++ *   - arch/x86/kernel/cpu/bugs.c|127| <<update_spec_ctrl>> this_cpu_write(x86_spec_ctrl_current, val);
++ *   - arch/x86/kernel/cpu/bugs.c|137| <<update_spec_ctrl_cond>> if (this_cpu_read(x86_spec_ctrl_current) == val)
++ *   - arch/x86/kernel/cpu/bugs.c|140| <<update_spec_ctrl_cond>> this_cpu_write(x86_spec_ctrl_current, val);
++ *   - arch/x86/kernel/cpu/bugs.c|152| <<spec_ctrl_current>> return this_cpu_read(x86_spec_ctrl_current);
++ *   - arch/x86/kvm/vmx/vmx.c|7214| <<vmx_spec_ctrl_restore_host>> u64 hostval = this_cpu_read(x86_spec_ctrl_current);
++ */
+ /* The current value of the SPEC_CTRL MSR with task-specific bits set */
+ DEFINE_PER_CPU(u64, x86_spec_ctrl_current);
+ EXPORT_PER_CPU_SYMBOL_GPL(x86_spec_ctrl_current);
+@@ -121,9 +208,34 @@ static void __init set_return_thunk(void *thunk)
+ 	x86_return_thunk = thunk;
+ }
+ 
++/*
++ * 在以下调用update_spec_ctrl():
++ *   - arch/x86/kernel/cpu/bugs.c|1997| <<spec_ctrl_disable_kernel_rrsba>> update_spec_ctrl(x86_spec_ctrl_base);
++ *   - arch/x86/kernel/cpu/bugs.c|2061| <<spec_ctrl_bhi_dis>> update_spec_ctrl(x86_spec_ctrl_base);
++ *   - arch/x86/kernel/cpu/bugs.c|2226| <<spectre_v2_apply_mitigation>> update_spec_ctrl(x86_spec_ctrl_base);
++ *   - arch/x86/kernel/cpu/bugs.c|2297| <<update_stibp_msr>> update_spec_ctrl(val);
++ *   - arch/x86/kernel/cpu/bugs.c|2558| <<ssb_apply_mitigation>> update_spec_ctrl(x86_spec_ctrl_base);
++ *   - arch/x86/kernel/cpu/bugs.c|2802| <<x86_spec_ctrl_setup_ap>> update_spec_ctrl(x86_spec_ctrl_base);
++ *
++ * this_cpu_write(x86_spec_ctrl_current, val);
++ * wrmsrq(MSR_IA32_SPEC_CTRL, val);
++ */
+ /* Update SPEC_CTRL MSR and its cached copy unconditionally */
+ static void update_spec_ctrl(u64 val)
+ {
++	/*
++	 * 在以下使用x86_spec_ctrl_current:
++	 *   - arch/x86/entry/calling.h|323| <<IBRS_ENTER>> movq PER_CPU_VAR(x86_spec_ctrl_current), %rdx
++	 *   - arch/x86/entry/calling.h|343| <<IBRS_EXIT>> movq PER_CPU_VAR(x86_spec_ctrl_current), %rdx
++	 *   - arch/x86/include/asm/nospec-branch.h|542| <<global>> DECLARE_PER_CPU(u64, x86_spec_ctrl_current);
++	 *   - arch/x86/kernel/cpu/bugs.c|105| <<global>> DEFINE_PER_CPU(u64, x86_spec_ctrl_current);
++	 *   - arch/x86/include/asm/spec-ctrl.h|86| <<__update_spec_ctrl>> __this_cpu_write(x86_spec_ctrl_current, val);
++	 *   - arch/x86/kernel/cpu/bugs.c|127| <<update_spec_ctrl>> this_cpu_write(x86_spec_ctrl_current, val);
++	 *   - arch/x86/kernel/cpu/bugs.c|137| <<update_spec_ctrl_cond>> if (this_cpu_read(x86_spec_ctrl_current) == val)
++	 *   - arch/x86/kernel/cpu/bugs.c|140| <<update_spec_ctrl_cond>> this_cpu_write(x86_spec_ctrl_current, val);
++	 *   - arch/x86/kernel/cpu/bugs.c|152| <<spec_ctrl_current>> return this_cpu_read(x86_spec_ctrl_current);
++	 *   - arch/x86/kvm/vmx/vmx.c|7214| <<vmx_spec_ctrl_restore_host>> u64 hostval = this_cpu_read(x86_spec_ctrl_current);
++	 */
+ 	this_cpu_write(x86_spec_ctrl_current, val);
+ 	wrmsrq(MSR_IA32_SPEC_CTRL, val);
+ }
+@@ -1883,6 +1995,10 @@ static void __init spec_v2_print_cond(const char *reason, bool secure)
+ 		pr_info("%s selected on command line.\n", reason);
+ }
+ 
++/*
++ * 在以下使用spectre_v2_parse_cmdline():
++ *   - arch/x86/kernel/cpu/bugs.c|2443| <<spectre_v2_select_mitigation>> spectre_v2_cmd = spectre_v2_parse_cmdline();
++ */
+ static enum spectre_v2_mitigation_cmd __init spectre_v2_parse_cmdline(void)
+ {
+ 	enum spectre_v2_mitigation_cmd cmd;
+@@ -1977,24 +2093,87 @@ static enum spectre_v2_mitigation __init spectre_v2_select_retpoline(void)
+ 	return SPECTRE_V2_RETPOLINE;
+ }
+ 
++/*
++ * 在以下使用rrsba_disabled:
++ *   - arch/x86/kernel/cpu/bugs.c|2042| <<spec_ctrl_disable_kernel_rrsba>> if (rrsba_disabled)
++ *   - arch/x86/kernel/cpu/bugs.c|2046| <<spec_ctrl_disable_kernel_rrsba>> rrsba_disabled = true;
++ *   - arch/x86/kernel/cpu/bugs.c|2067| <<spec_ctrl_disable_kernel_rrsba>> rrsba_disabled = true;
++ *   - arch/x86/kernel/cpu/bugs.c|2370| <<bhi_apply_mitigation>> if (rrsba_disabled)
++ *   - arch/x86/kernel/cpu/bugs.c|3659| <<spectre_bhi_state>> rrsba_disabled)
++ */
+ static bool __ro_after_init rrsba_disabled;
+ 
++/*
++ * 在以下使用spec_ctrl_disable_kernel_rrsba():
++ *   - arch/x86/kernel/cpu/bugs.c|2385| <<bhi_apply_mitigation>> spec_ctrl_disable_kernel_rrsba();
++ *   - arch/x86/kernel/cpu/bugs.c|2573| <<spectre_v2_apply_mitigation>> spec_ctrl_disable_kernel_rrsba();
++ */
+ /* Disable in-kernel use of non-RSB RET predictors */
+ static void __init spec_ctrl_disable_kernel_rrsba(void)
+ {
++	/*
++	 * 在以下使用rrsba_disabled:
++	 *   - arch/x86/kernel/cpu/bugs.c|2042| <<spec_ctrl_disable_kernel_rrsba>> if (rrsba_disabled)
++	 *   - arch/x86/kernel/cpu/bugs.c|2046| <<spec_ctrl_disable_kernel_rrsba>> rrsba_disabled = true;
++	 *   - arch/x86/kernel/cpu/bugs.c|2067| <<spec_ctrl_disable_kernel_rrsba>> rrsba_disabled = true;
++	 *   - arch/x86/kernel/cpu/bugs.c|2370| <<bhi_apply_mitigation>> if (rrsba_disabled)
++	 *   - arch/x86/kernel/cpu/bugs.c|3659| <<spectre_bhi_state>> rrsba_disabled)
++	 *
++	 * 在这里rrsba_disabled是true
++	 */
+ 	if (rrsba_disabled)
+ 		return;
+ 
++	/*
++	 * 在这里rrsba_disabled是true
++	 *
++	 * 注释:
++	 * Indicates RET may use predictors
++	 * other than the RSB. With eIBRS
++	 * enabled predictions in kernel mode
++	 * are restricted to targets 
++	 * kernel.
++	 */
+ 	if (!(x86_arch_cap_msr & ARCH_CAP_RRSBA)) {
+ 		rrsba_disabled = true;
+ 		return;
+ 	}
+ 
++	/*
++	 * icelake的结果:
++	 * $ cpuid -1 -l 0x7 -s 2
++         * CPU:
++         *       PSFD: fast store forwarding pred disable = true
++         *       IPRED_CTRL: IBP disable                  = false
++         *       RRSBA_CTRL: IBP bottomless RSB disable   = false
++         *       DDPD_U: data dep prefetcher disable      = false
++         *       BHI_CTRL: IBP BHB-focused disable        = false
++         *       MCDT_NO: MCDT mitigation not needed      = false
++         *       UC-lock disable                          = false
++	 *
++	 *
++	 * 在这里rrsba_disabled不好说!!!
++	 */
+ 	if (!boot_cpu_has(X86_FEATURE_RRSBA_CTRL))
+ 		return;
+ 
+ 	x86_spec_ctrl_base |= SPEC_CTRL_RRSBA_DIS_S;
++	/*
++	 * 在以下调用update_spec_ctrl():
++	 *   - arch/x86/kernel/cpu/bugs.c|1997| <<spec_ctrl_disable_kernel_rrsba>> update_spec_ctrl(x86_spec_ctrl_base);
++	 *   - arch/x86/kernel/cpu/bugs.c|2061| <<spec_ctrl_bhi_dis>> update_spec_ctrl(x86_spec_ctrl_base);
++	 *   - arch/x86/kernel/cpu/bugs.c|2226| <<spectre_v2_apply_mitigation>> update_spec_ctrl(x86_spec_ctrl_base);
++	 *   - arch/x86/kernel/cpu/bugs.c|2297| <<update_stibp_msr>> update_spec_ctrl(val);
++	 *   - arch/x86/kernel/cpu/bugs.c|2558| <<ssb_apply_mitigation>> update_spec_ctrl(x86_spec_ctrl_base);
++	 *   - arch/x86/kernel/cpu/bugs.c|2802| <<x86_spec_ctrl_setup_ap>> update_spec_ctrl(x86_spec_ctrl_base);
++	 *
++	 * this_cpu_write(x86_spec_ctrl_current, val);
++	 * wrmsrq(MSR_IA32_SPEC_CTRL, val);
++	 */
+ 	update_spec_ctrl(x86_spec_ctrl_base);
++	/*
++	 * 在这里rrsba_disabled是true
++	 */
+ 	rrsba_disabled = true;
+ }
+ 
+@@ -2052,13 +2231,46 @@ static void __init spectre_v2_select_rsb_mitigation(enum spectre_v2_mitigation m
+  * Set BHI_DIS_S to prevent indirect branches in kernel to be influenced by
+  * branch history in userspace. Not needed if BHI_NO is set.
+  */
++/*
++ * 在以下使用spec_ctrl_bhi_dis():
++ *   - arch/x86/kernel/cpu/bugs.c|2131| <<bhi_apply_mitigation>> if (spec_ctrl_bhi_dis())
++ */
+ static bool __init spec_ctrl_bhi_dis(void)
+ {
++	/*
++	 * $ cpuid -1 -l 0x7 -s 2
++         * CPU:
++         *       PSFD: fast store forwarding pred disable = true
++         *       IPRED_CTRL: IBP disable                  = false
++         *       RRSBA_CTRL: IBP bottomless RSB disable   = false
++         *       DDPD_U: data dep prefetcher disable      = false
++         *       BHI_CTRL: IBP BHB-focused disable        = false
++         *       MCDT_NO: MCDT mitigation not needed      = false
++         *       UC-lock disable                          = false
++	 */
+ 	if (!boot_cpu_has(X86_FEATURE_BHI_CTRL))
+ 		return false;
+ 
+ 	x86_spec_ctrl_base |= SPEC_CTRL_BHI_DIS_S;
++	/*
++	 * 在以下调用update_spec_ctrl():
++	 *   - arch/x86/kernel/cpu/bugs.c|1997| <<spec_ctrl_disable_kernel_rrsba>> update_spec_ctrl(x86_spec_ctrl_base);
++	 *   - arch/x86/kernel/cpu/bugs.c|2061| <<spec_ctrl_bhi_dis>> update_spec_ctrl(x86_spec_ctrl_base);
++	 *   - arch/x86/kernel/cpu/bugs.c|2226| <<spectre_v2_apply_mitigation>> update_spec_ctrl(x86_spec_ctrl_base);
++	 *   - arch/x86/kernel/cpu/bugs.c|2297| <<update_stibp_msr>> update_spec_ctrl(val);
++	 *   - arch/x86/kernel/cpu/bugs.c|2558| <<ssb_apply_mitigation>> update_spec_ctrl(x86_spec_ctrl_base);
++	 *   - arch/x86/kernel/cpu/bugs.c|2802| <<x86_spec_ctrl_setup_ap>> update_spec_ctrl(x86_spec_ctrl_base);
++	 *
++	 * this_cpu_write(x86_spec_ctrl_current, val);
++	 * wrmsrq(MSR_IA32_SPEC_CTRL, val);
++	 */
+ 	update_spec_ctrl(x86_spec_ctrl_base);
++	/*
++	 * 在以下使用X86_FEATURE_CLEAR_BHB_HW:
++	 *   - arch/x86/kernel/cpu/bugs.c|2062| <<spec_ctrl_bhi_dis>> setup_force_cpu_cap(X86_FEATURE_CLEAR_BHB_HW);
++	 *   - arch/x86/kernel/cpu/bugs.c|3305| <<spectre_bhi_state>> else if (boot_cpu_has(X86_FEATURE_CLEAR_BHB_HW))
++	 *   - arch/x86/net/bpf_jit_comp.c|1533| <<emit_spectre_bhb_barrier>> cpu_feature_enabled(X86_FEATURE_CLEAR_BHB_HW)) {
++	 */
+ 	setup_force_cpu_cap(X86_FEATURE_CLEAR_BHB_HW);
+ 
+ 	return true;
+@@ -2071,9 +2283,25 @@ enum bhi_mitigations {
+ 	BHI_MITIGATION_VMEXIT_ONLY,
+ };
+ 
++/*
++ * 在以下使用bhi_mitigation:
++ *   - arch/x86/kernel/cpu/bugs.c|2158| <<spectre_bhi_parse_cmdline>> bhi_mitigation = BHI_MITIGATION_OFF;
++ *   - arch/x86/kernel/cpu/bugs.c|2160| <<spectre_bhi_parse_cmdline>> bhi_mitigation = BHI_MITIGATION_ON;
++ *   - arch/x86/kernel/cpu/bugs.c|2162| <<spectre_bhi_parse_cmdline>> bhi_mitigation = BHI_MITIGATION_VMEXIT_ONLY;
++ *   - arch/x86/kernel/cpu/bugs.c|2179| <<bhi_select_mitigation>> bhi_mitigation = BHI_MITIGATION_OFF;
++ *   - arch/x86/kernel/cpu/bugs.c|2181| <<bhi_select_mitigation>> if (bhi_mitigation == BHI_MITIGATION_AUTO)
++ *   - arch/x86/kernel/cpu/bugs.c|2182| <<bhi_select_mitigation>> bhi_mitigation = BHI_MITIGATION_ON;
++ *   - arch/x86/kernel/cpu/bugs.c|2188| <<bhi_update_mitigation>> bhi_mitigation = BHI_MITIGATION_OFF;
++ *   - arch/x86/kernel/cpu/bugs.c|2192| <<bhi_update_mitigation>> bhi_mitigation = BHI_MITIGATION_OFF;
++ *   - arch/x86/kernel/cpu/bugs.c|2197| <<bhi_apply_mitigation>> if (bhi_mitigation == BHI_MITIGATION_OFF)
++ *   - arch/x86/kernel/cpu/bugs.c|2218| <<bhi_apply_mitigation>> if (bhi_mitigation == BHI_MITIGATION_VMEXIT_ONLY) {
++ */
+ static enum bhi_mitigations bhi_mitigation __ro_after_init =
+ 	IS_ENABLED(CONFIG_MITIGATION_SPECTRE_BHI) ? BHI_MITIGATION_AUTO : BHI_MITIGATION_OFF;
+ 
++/*
++ * 处理"spectre_bhi"
++ */
+ static int __init spectre_bhi_parse_cmdline(char *str)
+ {
+ 	if (!str)
+@@ -2092,8 +2320,30 @@ static int __init spectre_bhi_parse_cmdline(char *str)
+ }
+ early_param("spectre_bhi", spectre_bhi_parse_cmdline);
+ 
++/*
++ * 在以下使用bhi_select_mitigation():
++ *   - arch/x86/kernel/cpu/bugs.c|286| <<cpu_select_mitigations>> bhi_select_mitigation();
++ */
+ static void __init bhi_select_mitigation(void)
+ {
++	/*
++	 * 在以下使用bhi_mitigation:
++	 *   - arch/x86/kernel/cpu/bugs.c|2158| <<spectre_bhi_parse_cmdline>> bhi_mitigation = BHI_MITIGATION_OFF;
++	 *   - arch/x86/kernel/cpu/bugs.c|2160| <<spectre_bhi_parse_cmdline>> bhi_mitigation = BHI_MITIGATION_ON;
++	 *   - arch/x86/kernel/cpu/bugs.c|2162| <<spectre_bhi_parse_cmdline>> bhi_mitigation = BHI_MITIGATION_VMEXIT_ONLY;
++	 *   - arch/x86/kernel/cpu/bugs.c|2179| <<bhi_select_mitigation>> bhi_mitigation = BHI_MITIGATION_OFF;
++	 *   - arch/x86/kernel/cpu/bugs.c|2181| <<bhi_select_mitigation>> if (bhi_mitigation == BHI_MITIGATION_AUTO)
++	 *   - arch/x86/kernel/cpu/bugs.c|2182| <<bhi_select_mitigation>> bhi_mitigation = BHI_MITIGATION_ON;
++	 *   - arch/x86/kernel/cpu/bugs.c|2188| <<bhi_update_mitigation>> bhi_mitigation = BHI_MITIGATION_OFF;
++	 *   - arch/x86/kernel/cpu/bugs.c|2192| <<bhi_update_mitigation>> bhi_mitigation = BHI_MITIGATION_OFF;
++	 *   - arch/x86/kernel/cpu/bugs.c|2197| <<bhi_apply_mitigation>> if (bhi_mitigation == BHI_MITIGATION_OFF)
++	 *   - arch/x86/kernel/cpu/bugs.c|2218| <<bhi_apply_mitigation>> if (bhi_mitigation == BHI_MITIGATION_VMEXIT_ONLY) {
++	 *
++	 * 在以下使用X86_BUG_BHI:
++	 *   - arch/x86/kernel/cpu/bugs.c|2097| <<bhi_select_mitigation>> if (!boot_cpu_has(X86_BUG_BHI) || cpu_mitigations_off())
++	 *   - arch/x86/kernel/cpu/bugs.c|3303| <<spectre_bhi_state>> if (!boot_cpu_has_bug(X86_BUG_BHI))
++	 *   - arch/x86/kernel/cpu/common.c|1524| <<cpu_set_bug_bits>> setup_force_cpu_bug(X86_BUG_BHI);
++	 */
+ 	if (!boot_cpu_has(X86_BUG_BHI) || cpu_mitigations_off())
+ 		bhi_mitigation = BHI_MITIGATION_OFF;
+ 
+@@ -2101,6 +2351,14 @@ static void __init bhi_select_mitigation(void)
+ 		bhi_mitigation = BHI_MITIGATION_ON;
+ }
+ 
++/*
++ * 在以下调用bhi_update_mitigation():
++ *   - arch/x86/kernel/cpu/bugs.c|316| <<cpu_select_mitigations>> bhi_update_mitigation();
++ *
++ * cpu_select_mitigations()
++ * -> bhi_update_mitigation()
++ * -> bhi_apply_mitigation()
++ */
+ static void __init bhi_update_mitigation(void)
+ {
+ 	if (spectre_v2_cmd == SPECTRE_V2_CMD_NONE)
+@@ -2111,15 +2369,192 @@ static void __init bhi_update_mitigation(void)
+ 		bhi_mitigation = BHI_MITIGATION_OFF;
+ }
+ 
++/*
++ * commit 0cd01ac5dcb1e18eb18df0f0d05b5de76522a437
++ * Author: Josh Poimboeuf <jpoimboe@kernel.org>
++ * Date:   Fri Apr 5 11:14:13 2024 -0700
++ *
++ * x86/bugs: Change commas to semicolons in 'spectre_v2' sysfs file
++ *
++ *
++ * commit 7390db8aea0d64e9deb28b8e1ce716f5020c7ee5
++ * Author: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
++ * Date:   Mon Mar 11 08:56:58 2024 -0700
++ *
++ * x86/bhi: Add support for clearing branch history at syscall entry
++ *
++ *
++ * commit 0f4a837615ff925ba62648d280a861adf1582df7
++ * Author: Daniel Sneddon <daniel.sneddon@linux.intel.com>
++ * Date:   Wed Mar 13 09:47:57 2024 -0700
++ *
++ * x86/bhi: Define SPEC_CTRL_BHI_DIS_S
++ *
++ *
++ * commit be482ff9500999f56093738f9219bbabc729d163
++ * Author: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
++ * Date:   Mon Mar 11 08:57:03 2024 -0700
++ *
++ * x86/bhi: Enumerate Branch History Injection (BHI) bug
++ *
++ *
++ * commit ec9404e40e8f36421a2b66ecb76dc2209fe7f3ef
++ * Author: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
++ * Date:   Mon Mar 11 08:57:05 2024 -0700
++ *
++ * x86/bhi: Add BHI mitigation knob
++ *
++ *
++ * commit 95a6ccbdc7199a14b71ad8901cb788ba7fb5167b
++ * Author: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
++ * Date:   Mon Mar 11 08:57:09 2024 -0700
++ *
++ * x86/bhi: Mitigate KVM by default
++ *
++ *
++ * commit ed2e8d49b54d677f3123668a21a57822d679651f
++ * Author: Daniel Sneddon <daniel.sneddon@linux.intel.com>
++ * Date:   Wed Mar 13 09:49:17 2024 -0700
++ *
++ * KVM: x86: Add BHI_NO
++ *
++ *
++ * -----------------------
++ * commit ec9404e40e8f36421a2b66ecb76dc2209fe7f3ef
++ * Author: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
++ * Date:   Mon Mar 11 08:57:05 2024 -0700
++ *
++ * x86/bhi: Add BHI mitigation knob
++ *
++ * Branch history clearing software sequences and hardware control
++ * BHI_DIS_S were defined to mitigate Branch History Injection (BHI).
++ *
++ * Add cmdline spectre_bhi={on|off|auto} to control BHI mitigation:
++ *
++ *  auto - Deploy the hardware mitigation BHI_DIS_S, if available.
++ *  on   - Deploy the hardware mitigation BHI_DIS_S, if available,
++ *         otherwise deploy the software sequence at syscall entry and
++ *         VMexit.
++ *  off  - Turn off BHI mitigation.
++ *
++ * The default is auto mode which does not deploy the software sequence
++ * mitigation.  This is because of the hardening done in the syscall
++ * dispatch path, which is the likely target of BHI.
++ *
++ * Signed-off-by: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
++ * Signed-off-by: Daniel Sneddon <daniel.sneddon@linux.intel.com>
++ * Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
++ * Reviewed-by: Alexandre Chartre <alexandre.chartre@oracle.com>
++ * Reviewed-by: Josh Poimboeuf <jpoimboe@kernel.org>
++ *
++ *
++ * # SpectreV2原理:
++ *
++ * 利用CPU的分支目标预测器(BTB, Branch Target Buffer).
++ * 攻击者训练BTB,使得受害者进程中间接跳转(如 jmp *%rax)在投机执行阶
++ * 段跳到攻击者准备的gadget.
++ * 虽然真正跳转时CPU会发现错了,但投机执行期间的数据访问可泄露敏感
++ * 信息(通过cache timing等方式).
++ *
++ * # Retpoline的防御原理:
++ *
++ * 通过ret, 彻底避开了间接跳转预测的参与,使BTB被"绕过".
++ * BTB不再参与间接跳转的预测过程.
++ * CPU对ret指令的预测只能依赖于RSB(Return Stack Buffer),而RSB是按
++ * 调用-返回对维护的,攻击者很难污染.
++ * 投机跳转只能去trampoline,而非攻击者gadget.
++ * 所以:SpectreV2成立的关键是BTB被污染,Retpoline正好绕开了BTB.
++ *
++ * # 纯Retpoline为什么能防BHI?
++ *
++ * RRSBA是某些CPU的硬件行为特性,在RSB underflow时,不是停下来等待真正
++ * 返回地址,而是fallback到BTB/BHB来猜测返回地址.
++ *
++ * BHI利用的是BHB(Branch History Buffer),记录之前是否taken的分支路径.
++ *
++ * 在CPU 执行分支预测时,不仅仅依赖BTB,还会使用BHB中的历史信息做路径选择.
++ *
++ * 如果CPU的ret执行过程中发生fallback to BTB/BHB(RRSBA),那么BHB被攻击者
++ * 污染就可能影响投机路径.
++ * 在没有RRSBA行为的CPU上, ret 始终使用RSB预测跳转,而不是fallback到BTB/BHB.
++ * 此时, Retpoline构造的ret安全有效,不会受到BHB的污染影响.
++ * 因此在这些 CPU 上,Retpoline间接"顺带"也防住了BHI,即便不是设计目标.
++ * Again, Retpoline是一种"软件绕过硬件预测器"的技巧,不是阻止预测,而是从根本
++ * 不走那条路.
++ *
++ * # 假设CPU没有RRSBA, 为什么retpoline可以防BHI, 同时retpoline + lfence就不可以?
++ *
++ * 因为Retpoline+LFENCE在某些实现中,破坏了RSB的正常工作,使得CPU fallback
++ * 到其他预测路径(如BTB/BHB),从而导致BHI重新成为可能.
++ * 在没有RRSBA的CPU上,Retpoline单独使用时能保证RSB是有效的,所以防住了BHI.
++ * 加了LFENCE后,打乱了CPU对ret指令的正常处理方式(例如pipeline flush),
++ * 使得RSB不再被正确使用,可能导致fallback,反而引入了攻击面.
++ *
++ *
++ * 在以下调用bhi_apply_mitigation():
++ *   - arch/x86/kernel/cpu/bugs.c|331| <<cpu_select_mitigations>> bhi_apply_mitigation();
++ *
++ * start_kernel()
++ * -> arch_cpu_finalize_init()
++ *    -> cpu_select_mitigations()
++ *    -> alternative_instructions()
++ *       -> __apply_fineibt(__retpoline_sites, __retpoline_sites_end,
++ *                          __cfi_sites, __cfi_sites_end, true);
++ *       -> apply_retpolines(__retpoline_sites, __retpoline_sites_end);
++ *          -> loop: patch_retpoline()
++ *       -> apply_returns(__return_sites, __return_sites_end);
++ *
++ * cpu_select_mitigations()
++ * -> bhi_update_mitigation()
++ * -> bhi_apply_mitigation()
++ */
+ static void __init bhi_apply_mitigation(void)
+ {
++	/*
++	 * 在以下使用bhi_mitigation:
++	 *   - arch/x86/kernel/cpu/bugs.c|2158| <<spectre_bhi_parse_cmdline>> bhi_mitigation = BHI_MITIGATION_OFF;
++	 *   - arch/x86/kernel/cpu/bugs.c|2160| <<spectre_bhi_parse_cmdline>> bhi_mitigation = BHI_MITIGATION_ON;
++	 *   - arch/x86/kernel/cpu/bugs.c|2162| <<spectre_bhi_parse_cmdline>> bhi_mitigation = BHI_MITIGATION_VMEXIT_ONLY;
++	 *   - arch/x86/kernel/cpu/bugs.c|2179| <<bhi_select_mitigation>> bhi_mitigation = BHI_MITIGATION_OFF;
++	 *   - arch/x86/kernel/cpu/bugs.c|2181| <<bhi_select_mitigation>> if (bhi_mitigation == BHI_MITIGATION_AUTO)
++	 *   - arch/x86/kernel/cpu/bugs.c|2182| <<bhi_select_mitigation>> bhi_mitigation = BHI_MITIGATION_ON;
++	 *   - arch/x86/kernel/cpu/bugs.c|2188| <<bhi_update_mitigation>> bhi_mitigation = BHI_MITIGATION_OFF;
++	 *   - arch/x86/kernel/cpu/bugs.c|2192| <<bhi_update_mitigation>> bhi_mitigation = BHI_MITIGATION_OFF;
++	 *   - arch/x86/kernel/cpu/bugs.c|2197| <<bhi_apply_mitigation>> if (bhi_mitigation == BHI_MITIGATION_OFF)
++	 *   - arch/x86/kernel/cpu/bugs.c|2218| <<bhi_apply_mitigation>> if (bhi_mitigation == BHI_MITIGATION_VMEXIT_ONLY) {
++	 */
+ 	if (bhi_mitigation == BHI_MITIGATION_OFF)
+ 		return;
+ 
++	/*
++	 * 在以下使用X86_FEATURE_RETPOLINE_LFENCE:
++	 *   - arch/x86/include/asm/nospec-branch.h|514| <<CALL_NOSPEC(32位)>> X86_FEATURE_RETPOLINE_LFENCE)
++	 *   - arch/x86/kernel/alternative.c|871| <<patch_retpoline>> if (cpu_feature_enabled(X86_FEATURE_RETPOLINE) &&
++	 *                     !cpu_feature_enabled(X86_FEATURE_RETPOLINE_LFENCE)) {
++	 *   - arch/x86/kernel/alternative.c|907| <<patch_retpoline>> if (cpu_feature_enabled(X86_FEATURE_RETPOLINE_LFENCE)) {
++	 *   - arch/x86/kernel/cpu/bugs.c|2384| <<bhi_apply_mitigation>> if (boot_cpu_has(X86_FEATURE_RETPOLINE) &&
++	 *                     !boot_cpu_has(X86_FEATURE_RETPOLINE_LFENCE)) {
++	 *   - arch/x86/kernel/cpu/bugs.c|2556| <<spectre_v2_apply_mitigation>> setup_force_cpu_cap(X86_FEATURE_RETPOLINE_LFENCE);
++	 *   - arch/x86/kernel/cpu/bugs.c|3685| <<spectre_bhi_state>> !boot_cpu_has(X86_FEATURE_RETPOLINE_LFENCE) &&
++	 *   - arch/x86/net/bpf_jit_comp.c|669| <<emit_indirect_jump>> } else if (cpu_feature_enabled(X86_FEATURE_RETPOLINE_LFENCE)) {
++	 */
+ 	/* Retpoline mitigates against BHI unless the CPU has RRSBA behavior */
+ 	if (boot_cpu_has(X86_FEATURE_RETPOLINE) &&
+ 	    !boot_cpu_has(X86_FEATURE_RETPOLINE_LFENCE)) {
++		/*
++		 * 在以下使用spec_ctrl_disable_kernel_rrsba():
++		 *   - arch/x86/kernel/cpu/bugs.c|2385| <<bhi_apply_mitigation>> spec_ctrl_disable_kernel_rrsba();
++		 *   - arch/x86/kernel/cpu/bugs.c|2573| <<spectre_v2_apply_mitigation>> spec_ctrl_disable_kernel_rrsba();
++		 */
+ 		spec_ctrl_disable_kernel_rrsba();
++		/*
++		 * 在以下使用rrsba_disabled:
++		 *   - arch/x86/kernel/cpu/bugs.c|2042| <<spec_ctrl_disable_kernel_rrsba>> if (rrsba_disabled)
++		 *   - arch/x86/kernel/cpu/bugs.c|2046| <<spec_ctrl_disable_kernel_rrsba>> rrsba_disabled = true;
++		 *   - arch/x86/kernel/cpu/bugs.c|2067| <<spec_ctrl_disable_kernel_rrsba>> rrsba_disabled = true;
++		 *   - arch/x86/kernel/cpu/bugs.c|2370| <<bhi_apply_mitigation>> if (rrsba_disabled)
++		 *   - arch/x86/kernel/cpu/bugs.c|3659| <<spectre_bhi_state>> rrsba_disabled)
++		 */
+ 		if (rrsba_disabled)
+ 			return;
+ 	}
+@@ -2127,18 +2562,43 @@ static void __init bhi_apply_mitigation(void)
+ 	if (!IS_ENABLED(CONFIG_X86_64))
+ 		return;
+ 
++	/*
++	 * 只在这里使用spec_ctrl_bhi_dis()
++	 */
+ 	/* Mitigate in hardware if supported */
+ 	if (spec_ctrl_bhi_dis())
+ 		return;
+ 
+ 	if (bhi_mitigation == BHI_MITIGATION_VMEXIT_ONLY) {
+ 		pr_info("Spectre BHI mitigation: SW BHB clearing on VM exit only\n");
++		/*
++		 * 在以下使用X86_FEATURE_CLEAR_BHB_VMEXIT:
++		 *   - arch/x86/include/asm/nospec-branch.h|336| <<CLEAR_BRANCH_HISTORY_VMEXIT>> ALTERNATIVE "", "call clear_bhb_loop", X86_FEATURE_CLEAR_BHB_VMEXIT
++		 *   - arch/x86/kernel/cpu/bugs.c|2136| <<bhi_apply_mitigation>> setup_force_cpu_cap(X86_FEATURE_CLEAR_BHB_VMEXIT);
++		 *   - arch/x86/kernel/cpu/bugs.c|2142| <<bhi_apply_mitigation>> setup_force_cpu_cap(X86_FEATURE_CLEAR_BHB_VMEXIT);
++		 *   - arch/x86/kernel/cpu/bugs.c|3313| <<spectre_bhi_state>> else if (boot_cpu_has(X86_FEATURE_CLEAR_BHB_VMEXIT))
++		 */
+ 		setup_force_cpu_cap(X86_FEATURE_CLEAR_BHB_VMEXIT);
+ 		return;
+ 	}
+ 
+ 	pr_info("Spectre BHI mitigation: SW BHB clearing on syscall and VM exit\n");
++	/*
++	 * 在以下使用X86_FEATURE_CLEAR_BHB_LOOP:
++	 *   - arch/x86/include/asm/nospec-branch.h|332| <<CLEAR_BRANCH_HISTORY>> ALTERNATIVE "", "call clear_bhb_loop", X86_FEATURE_CLEAR_BHB_LOOP
++	 *   - arch/x86/kernel/cpu/bugs.c|2141| <<bhi_apply_mitigation>> setup_force_cpu_cap(X86_FEATURE_CLEAR_BHB_LOOP);
++	 *   - arch/x86/kernel/cpu/bugs.c|3307| <<spectre_bhi_state>> else if (boot_cpu_has(X86_FEATURE_CLEAR_BHB_LOOP))
++	 *   - arch/x86/net/bpf_jit_comp.c|1516| <<emit_spectre_bhb_barrier>> if (cpu_feature_enabled(X86_FEATURE_CLEAR_BHB_LOOP)) {
++	 *   - arch/x86/net/bpf_jit_comp.c|1531| <<emit_spectre_bhb_barrier>> if ((cpu_feature_enabled(X86_FEATURE_CLEAR_BHB_LOOP) &&
++	 */
+ 	setup_force_cpu_cap(X86_FEATURE_CLEAR_BHB_LOOP);
++	/*
++	 * 在以下使用X86_FEATURE_CLEAR_BHB_VMEXIT:
++	 *   - arch/x86/include/asm/nospec-branch.h|336| <<CLEAR_BRANCH_HISTORY_VMEXIT>> ALTERNATIVE "", "call clear_bhb_loop", X86_FEATURE_CLEAR_BHB_VMEXIT
++	 *   - arch/x86/kernel/cpu/bugs.c|2136| <<bhi_apply_mitigation>> setup_force_cpu_cap(X86_FEATURE_CLEAR_BHB_VMEXIT);
++	 *   - arch/x86/kernel/cpu/bugs.c|2142| <<bhi_apply_mitigation>> setup_force_cpu_cap(X86_FEATURE_CLEAR_BHB_VMEXIT);
++	 *   - arch/x86/kernel/cpu/bugs.c|3313| <<spectre_bhi_state>> else if (boot_cpu_has(X86_FEATURE_CLEAR_BHB_VMEXIT))
++	 */
+ 	setup_force_cpu_cap(X86_FEATURE_CLEAR_BHB_VMEXIT);
+ }
+ 
+@@ -2222,6 +2682,18 @@ static void __init spectre_v2_apply_mitigation(void)
+ 		if (boot_cpu_has(X86_FEATURE_AUTOIBRS)) {
+ 			msr_set_bit(MSR_EFER, _EFER_AUTOIBRS);
+ 		} else {
++			/*
++			 * 在以下调用update_spec_ctrl():
++			 *   - arch/x86/kernel/cpu/bugs.c|1997| <<spec_ctrl_disable_kernel_rrsba>> update_spec_ctrl(x86_spec_ctrl_base);
++			 *   - arch/x86/kernel/cpu/bugs.c|2061| <<spec_ctrl_bhi_dis>> update_spec_ctrl(x86_spec_ctrl_base);
++			 *   - arch/x86/kernel/cpu/bugs.c|2226| <<spectre_v2_apply_mitigation>> update_spec_ctrl(x86_spec_ctrl_base);
++			 *   - arch/x86/kernel/cpu/bugs.c|2297| <<update_stibp_msr>> update_spec_ctrl(val);
++			 *   - arch/x86/kernel/cpu/bugs.c|2558| <<ssb_apply_mitigation>> update_spec_ctrl(x86_spec_ctrl_base);
++			 *   - arch/x86/kernel/cpu/bugs.c|2802| <<x86_spec_ctrl_setup_ap>> update_spec_ctrl(x86_spec_ctrl_base);
++			 *
++			 * this_cpu_write(x86_spec_ctrl_current, val);
++			 * wrmsrq(MSR_IA32_SPEC_CTRL, val);
++			 */
+ 			x86_spec_ctrl_base |= SPEC_CTRL_IBRS;
+ 			update_spec_ctrl(x86_spec_ctrl_base);
+ 		}
+@@ -2242,6 +2714,18 @@ static void __init spectre_v2_apply_mitigation(void)
+ 
+ 	case SPECTRE_V2_LFENCE:
+ 	case SPECTRE_V2_EIBRS_LFENCE:
++		/*
++		 * 在以下使用X86_FEATURE_RETPOLINE_LFENCE:
++		 *   - arch/x86/include/asm/nospec-branch.h|514| <<CALL_NOSPEC(32位)>> X86_FEATURE_RETPOLINE_LFENCE)
++		 *   - arch/x86/kernel/alternative.c|871| <<patch_retpoline>> if (cpu_feature_enabled(X86_FEATURE_RETPOLINE) &&
++		 *                     !cpu_feature_enabled(X86_FEATURE_RETPOLINE_LFENCE)) {
++		 *   - arch/x86/kernel/alternative.c|907| <<patch_retpoline>> if (cpu_feature_enabled(X86_FEATURE_RETPOLINE_LFENCE)) {
++		 *   - arch/x86/kernel/cpu/bugs.c|2384| <<bhi_apply_mitigation>> if (boot_cpu_has(X86_FEATURE_RETPOLINE) &&
++		 *                     !boot_cpu_has(X86_FEATURE_RETPOLINE_LFENCE)) {
++		 *   - arch/x86/kernel/cpu/bugs.c|2556| <<spectre_v2_apply_mitigation>> setup_force_cpu_cap(X86_FEATURE_RETPOLINE_LFENCE);
++		 *   - arch/x86/kernel/cpu/bugs.c|3685| <<spectre_bhi_state>> !boot_cpu_has(X86_FEATURE_RETPOLINE_LFENCE) &&
++		 *   - arch/x86/net/bpf_jit_comp.c|669| <<emit_indirect_jump>> } else if (cpu_feature_enabled(X86_FEATURE_RETPOLINE_LFENCE)) {
++		 */
+ 		setup_force_cpu_cap(X86_FEATURE_RETPOLINE_LFENCE);
+ 		fallthrough;
+ 
+@@ -2294,6 +2778,18 @@ static void __init spectre_v2_apply_mitigation(void)
+ static void update_stibp_msr(void * __unused)
+ {
+ 	u64 val = spec_ctrl_current() | (x86_spec_ctrl_base & SPEC_CTRL_STIBP);
++	/*
++	 * 在以下调用update_spec_ctrl():
++	 *   - arch/x86/kernel/cpu/bugs.c|1997| <<spec_ctrl_disable_kernel_rrsba>> update_spec_ctrl(x86_spec_ctrl_base);
++	 *   - arch/x86/kernel/cpu/bugs.c|2061| <<spec_ctrl_bhi_dis>> update_spec_ctrl(x86_spec_ctrl_base);
++	 *   - arch/x86/kernel/cpu/bugs.c|2226| <<spectre_v2_apply_mitigation>> update_spec_ctrl(x86_spec_ctrl_base);
++	 *   - arch/x86/kernel/cpu/bugs.c|2297| <<update_stibp_msr>> update_spec_ctrl(val);
++	 *   - arch/x86/kernel/cpu/bugs.c|2558| <<ssb_apply_mitigation>> update_spec_ctrl(x86_spec_ctrl_base);
++	 *   - arch/x86/kernel/cpu/bugs.c|2802| <<x86_spec_ctrl_setup_ap>> update_spec_ctrl(x86_spec_ctrl_base);
++	 *
++	 * this_cpu_write(x86_spec_ctrl_current, val);
++	 * wrmsrq(MSR_IA32_SPEC_CTRL, val);
++	 */
+ 	update_spec_ctrl(val);
+ }
+ 
+@@ -2555,6 +3051,18 @@ static void __init ssb_apply_mitigation(void)
+ 			x86_amd_ssb_disable();
+ 		} else {
+ 			x86_spec_ctrl_base |= SPEC_CTRL_SSBD;
++			/*
++			 * 在以下调用update_spec_ctrl():
++			 *   - arch/x86/kernel/cpu/bugs.c|1997| <<spec_ctrl_disable_kernel_rrsba>> update_spec_ctrl(x86_spec_ctrl_base);
++			 *   - arch/x86/kernel/cpu/bugs.c|2061| <<spec_ctrl_bhi_dis>> update_spec_ctrl(x86_spec_ctrl_base);
++			 *   - arch/x86/kernel/cpu/bugs.c|2226| <<spectre_v2_apply_mitigation>> update_spec_ctrl(x86_spec_ctrl_base);
++			 *   - arch/x86/kernel/cpu/bugs.c|2297| <<update_stibp_msr>> update_spec_ctrl(val);
++			 *   - arch/x86/kernel/cpu/bugs.c|2558| <<ssb_apply_mitigation>> update_spec_ctrl(x86_spec_ctrl_base);
++			 *   - arch/x86/kernel/cpu/bugs.c|2802| <<x86_spec_ctrl_setup_ap>> update_spec_ctrl(x86_spec_ctrl_base);
++			 *
++			 * this_cpu_write(x86_spec_ctrl_current, val);
++			 * wrmsrq(MSR_IA32_SPEC_CTRL, val);
++			 */
+ 			update_spec_ctrl(x86_spec_ctrl_base);
+ 		}
+ 	}
+@@ -2798,6 +3306,18 @@ int arch_prctl_spec_ctrl_get(struct task_struct *task, unsigned long which)
+ 
+ void x86_spec_ctrl_setup_ap(void)
+ {
++	/*
++	 * 在以下调用update_spec_ctrl():
++	 *   - arch/x86/kernel/cpu/bugs.c|1997| <<spec_ctrl_disable_kernel_rrsba>> update_spec_ctrl(x86_spec_ctrl_base);
++	 *   - arch/x86/kernel/cpu/bugs.c|2061| <<spec_ctrl_bhi_dis>> update_spec_ctrl(x86_spec_ctrl_base);
++	 *   - arch/x86/kernel/cpu/bugs.c|2226| <<spectre_v2_apply_mitigation>> update_spec_ctrl(x86_spec_ctrl_base);
++	 *   - arch/x86/kernel/cpu/bugs.c|2297| <<update_stibp_msr>> update_spec_ctrl(val);
++	 *   - arch/x86/kernel/cpu/bugs.c|2558| <<ssb_apply_mitigation>> update_spec_ctrl(x86_spec_ctrl_base);
++	 *   - arch/x86/kernel/cpu/bugs.c|2802| <<x86_spec_ctrl_setup_ap>> update_spec_ctrl(x86_spec_ctrl_base);
++	 *
++	 * this_cpu_write(x86_spec_ctrl_current, val);
++	 * wrmsrq(MSR_IA32_SPEC_CTRL, val);
++	 */
+ 	if (boot_cpu_has(X86_FEATURE_MSR_SPEC_CTRL))
+ 		update_spec_ctrl(x86_spec_ctrl_base);
+ 
+@@ -3298,8 +3818,36 @@ static char *pbrsb_eibrs_state(void)
+ 	}
+ }
+ 
++/*
++ * 在以下使用spectre_bhi_state():
++ *   - arch/x86/kernel/cpu/bugs.c|3338| <<spectre_v2_show_state>> spectre_bhi_state(),
++ */
+ static const char *spectre_bhi_state(void)
+ {
++	/*
++	 * 在以下使用X86_BUG_BHI:
++	 *   - arch/x86/kernel/cpu/bugs.c|2097| <<bhi_select_mitigation>> if (!boot_cpu_has(X86_BUG_BHI) || cpu_mitigations_off())
++	 *   - arch/x86/kernel/cpu/bugs.c|3303| <<spectre_bhi_state>> if (!boot_cpu_has_bug(X86_BUG_BHI))
++	 *   - arch/x86/kernel/cpu/common.c|1524| <<cpu_set_bug_bits>> setup_force_cpu_bug(X86_BUG_BHI);
++	 *
++	 * 在以下使用X86_FEATURE_CLEAR_BHB_HW:
++	 *   - arch/x86/kernel/cpu/bugs.c|2062| <<spec_ctrl_bhi_dis>> setup_force_cpu_cap(X86_FEATURE_CLEAR_BHB_HW);
++	 *   - arch/x86/kernel/cpu/bugs.c|3305| <<spectre_bhi_state>> else if (boot_cpu_has(X86_FEATURE_CLEAR_BHB_HW))
++	 *   - arch/x86/net/bpf_jit_comp.c|1533| <<emit_spectre_bhb_barrier>> cpu_feature_enabled(X86_FEATURE_CLEAR_BHB_HW)) {
++	 *
++	 * 在以下使用X86_FEATURE_CLEAR_BHB_LOOP:
++	 *   - arch/x86/include/asm/nospec-branch.h|332| <<CLEAR_BRANCH_HISTORY>> ALTERNATIVE "", "call clear_bhb_loop", X86_FEATURE_CLEAR_BHB_LOOP
++	 *   - arch/x86/kernel/cpu/bugs.c|2141| <<bhi_apply_mitigation>> setup_force_cpu_cap(X86_FEATURE_CLEAR_BHB_LOOP);
++	 *   - arch/x86/kernel/cpu/bugs.c|3307| <<spectre_bhi_state>> else if (boot_cpu_has(X86_FEATURE_CLEAR_BHB_LOOP))
++	 *   - arch/x86/net/bpf_jit_comp.c|1516| <<emit_spectre_bhb_barrier>> if (cpu_feature_enabled(X86_FEATURE_CLEAR_BHB_LOOP)) {
++	 *   - arch/x86/net/bpf_jit_comp.c|1531| <<emit_spectre_bhb_barrier>> if ((cpu_feature_enabled(X86_FEATURE_CLEAR_BHB_LOOP) &&
++	 *
++	 * 在以下使用X86_FEATURE_CLEAR_BHB_VMEXIT:
++	 *   - arch/x86/include/asm/nospec-branch.h|336| <<CLEAR_BRANCH_HISTORY_VMEXIT>> ALTERNATIVE "", "call clear_bhb_loop", X86_FEATURE_CLEAR_BHB_VMEXIT
++	 *   - arch/x86/kernel/cpu/bugs.c|2136| <<bhi_apply_mitigation>> setup_force_cpu_cap(X86_FEATURE_CLEAR_BHB_VMEXIT);
++	 *   - arch/x86/kernel/cpu/bugs.c|2142| <<bhi_apply_mitigation>> setup_force_cpu_cap(X86_FEATURE_CLEAR_BHB_VMEXIT);
++	 *   - arch/x86/kernel/cpu/bugs.c|3313| <<spectre_bhi_state>> else if (boot_cpu_has(X86_FEATURE_CLEAR_BHB_VMEXIT))
++	 */
+ 	if (!boot_cpu_has_bug(X86_BUG_BHI))
+ 		return "; BHI: Not affected";
+ 	else if (boot_cpu_has(X86_FEATURE_CLEAR_BHB_HW))
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index fb50c1dd5..4d146b10c 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -1518,6 +1518,12 @@ static void __init cpu_set_bug_bits(struct cpuinfo_x86 *c)
+ 	 * BHI_NO still need to use the BHI mitigation to prevent Intra-mode
+ 	 * attacks.  When virtualized, eIBRS could be hidden, assume vulnerable.
+ 	 */
++	/*
++	 * 在以下使用X86_BUG_BHI:
++	 *   - arch/x86/kernel/cpu/bugs.c|2097| <<bhi_select_mitigation>> if (!boot_cpu_has(X86_BUG_BHI) || cpu_mitigations_off())
++	 *   - arch/x86/kernel/cpu/bugs.c|3303| <<spectre_bhi_state>> if (!boot_cpu_has_bug(X86_BUG_BHI))
++	 *   - arch/x86/kernel/cpu/common.c|1524| <<cpu_set_bug_bits>> setup_force_cpu_bug(X86_BUG_BHI);
++	 */
+ 	if (!cpu_matches(cpu_vuln_whitelist, NO_BHI) &&
+ 	    (boot_cpu_has(X86_FEATURE_IBRS_ENHANCED) ||
+ 	     boot_cpu_has(X86_FEATURE_HYPERVISOR)))
+@@ -2495,6 +2501,10 @@ void arch_smt_update(void)
+ 	apic_smt_update();
+ }
+ 
++/*
++ * 在以下使用arch_cpu_finalize_init():
++ *   - init/main.c|1067| <<start_kernel>> arch_cpu_finalize_init();
++ */
+ void __init arch_cpu_finalize_init(void)
+ {
+ 	struct cpuinfo_x86 *c = this_cpu_ptr(&cpu_info);
+diff --git a/arch/x86/kvm/hyperv.c b/arch/x86/kvm/hyperv.c
+index ee27064dd..95727ab36 100644
+--- a/arch/x86/kvm/hyperv.c
++++ b/arch/x86/kvm/hyperv.c
+@@ -565,6 +565,13 @@ static void synic_init(struct kvm_vcpu_hv_synic *synic)
+ 	}
+ }
+ 
++/*
++ * 在以下使用get_time_ref_counter():
++ *   - arch/x86/kvm/hyperv.c|635| <<stimer_start>> time_now = get_time_ref_counter(hv_stimer_to_vcpu(stimer)->kvm);
++ *   - arch/x86/kvm/hyperv.c|826| <<stimer_send_msg>> payload->delivery_time = get_time_ref_counter(vcpu->kvm);
++ *   - arch/x86/kvm/hyperv.c|881| <<kvm_hv_process_stimers>> get_time_ref_counter(vcpu->kvm);
++ *   - arch/x86/kvm/hyperv.c|1647| <<kvm_hv_get_msr_pw>> data = get_time_ref_counter(kvm);
++ */
+ static u64 get_time_ref_counter(struct kvm *kvm)
+ {
+ 	struct kvm_hv *hv = to_kvm_hv(kvm);
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 73418dc0e..7cc5bbcc3 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -221,6 +221,10 @@ static inline bool kvm_apic_map_get_logical_dest(struct kvm_apic_map *map,
+ 	}
+ }
+ 
++/*
++ * 在以下使用kvm_recalculate_phys_map():
++ *   - arch/x86/kvm/lapic.c|438| <<kvm_recalculate_apic_map>> r = kvm_recalculate_phys_map(new, vcpu, &xapic_id_mismatch);
++ */
+ static int kvm_recalculate_phys_map(struct kvm_apic_map *new,
+ 				    struct kvm_vcpu *vcpu,
+ 				    bool *xapic_id_mismatch)
+@@ -2597,6 +2601,11 @@ u64 kvm_lapic_get_cr8(struct kvm_vcpu *vcpu)
+ 	return (tpr & 0xf0) >> 4;
+ }
+ 
++/*
++ * 在以下使用__kvm_apic_set_base():
++ *   - arch/x86/kvm/lapic.c|2668| <<kvm_apic_set_base>> __kvm_apic_set_base(vcpu, value);
++ *   - arch/x86/kvm/lapic.c|2779| <<kvm_lapic_reset>> __kvm_apic_set_base(vcpu, msr_val);
++ */
+ static void __kvm_apic_set_base(struct kvm_vcpu *vcpu, u64 value)
+ {
+ 	u64 old_value = vcpu->arch.apic_base;
+@@ -2757,6 +2766,10 @@ void kvm_inhibit_apic_access_page(struct kvm_vcpu *vcpu)
+ 	kvm_vcpu_srcu_read_lock(vcpu);
+ }
+ 
++/*
++ * 在以下使用kvm_lapic_reset():
++ *   - arch/x86/kvm/x86.c|12507| <<kvm_vcpu_reset>> kvm_lapic_reset(vcpu, init_event);
++ */
+ void kvm_lapic_reset(struct kvm_vcpu *vcpu, bool init_event)
+ {
+ 	struct kvm_lapic *apic = vcpu->arch.apic;
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 93636f77c..912ae8eb0 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -2278,6 +2278,15 @@ static void update_pvclock_gtod(struct timekeeper *tk)
+ 	write_seqcount_end(&vdata->seq);
+ }
+ 
++/*
++ * 在以下使用get_kvmclock_base_ns():
++ *   - arch/x86/kvm/x86.c|2718| <<kvm_synchronize_tsc>> ns = get_kvmclock_base_ns();
++ *   - arch/x86/kvm/x86.c|3131| <<__get_kvmclock>> data->clock = get_kvmclock_base_ns() + ka->kvmclock_offset;
++ *   - arch/x86/kvm/x86.c|3241| <<kvm_guest_time_update>> kernel_ns = get_kvmclock_base_ns();
++ *   - arch/x86/kvm/x86.c|5806| <<kvm_arch_tsc_set_attr>> ns = get_kvmclock_base_ns();
++ *   - arch/x86/kvm/x86.c|7071| <<kvm_vm_ioctl_set_clock>> now_raw_ns = get_kvmclock_base_ns();
++ *   - arch/x86/kvm/x86.c|12823| <<kvm_arch_init_vm>> kvm->arch.kvmclock_offset = -get_kvmclock_base_ns();
++ */
+ static s64 get_kvmclock_base_ns(void)
+ {
+ 	/* Count up from boot time, but with the frequency of the raw clock.  */
+@@ -2656,6 +2665,18 @@ static void __kvm_synchronize_tsc(struct kvm_vcpu *vcpu, u64 offset, u64 tsc,
+ {
+ 	struct kvm *kvm = vcpu->kvm;
+ 
++	/*
++	 * 在以下使用kvm_arch->tsc_write_lock:
++	 *   - arch/x86/kvm/x86.c|2659| <<__kvm_synchronize_tsc>> lockdep_assert_held(&kvm->arch.tsc_write_lock);
++	 *   - arch/x86/kvm/x86.c|2716| <<kvm_synchronize_tsc>> raw_spin_lock_irqsave(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|2772| <<kvm_synchronize_tsc>> raw_spin_unlock_irqrestore(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|3017| <<pvclock_update_vm_gtod_copy>> lockdep_assert_held(&kvm->arch.tsc_write_lock);
++	 *   - arch/x86/kvm/x86.c|3049| <<__kvm_start_pvclock_update>> raw_spin_lock_irq(&kvm->arch.tsc_write_lock);
++	 *   - arch/x86/kvm/x86.c|3068| <<kvm_end_pvclock_update>> raw_spin_unlock_irq(&ka->tsc_write_lock)
++	 *   - arch/x86/kvm/x86.c|5799| <<kvm_arch_tsc_set_attr>> raw_spin_lock_irqsave(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|5809| <<kvm_arch_tsc_set_attr>> raw_spin_unlock_irqrestore(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|12820| <<kvm_arch_init_vm>> raw_spin_lock_init(&kvm->arch.tsc_write_lock);
++	 */
+ 	lockdep_assert_held(&kvm->arch.tsc_write_lock);
+ 
+ 	if (vcpu->arch.guest_tsc_protected)
+@@ -2713,8 +2734,29 @@ static void kvm_synchronize_tsc(struct kvm_vcpu *vcpu, u64 *user_value)
+ 	bool matched = false;
+ 	bool synchronizing = false;
+ 
++	/*
++	 * 在以下使用kvm_arch->tsc_write_lock:
++	 *   - arch/x86/kvm/x86.c|2659| <<__kvm_synchronize_tsc>> lockdep_assert_held(&kvm->arch.tsc_write_lock);
++	 *   - arch/x86/kvm/x86.c|2716| <<kvm_synchronize_tsc>> raw_spin_lock_irqsave(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|2772| <<kvm_synchronize_tsc>> raw_spin_unlock_irqrestore(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|3017| <<pvclock_update_vm_gtod_copy>> lockdep_assert_held(&kvm->arch.tsc_write_lock);
++	 *   - arch/x86/kvm/x86.c|3049| <<__kvm_start_pvclock_update>> raw_spin_lock_irq(&kvm->arch.tsc_write_lock);
++	 *   - arch/x86/kvm/x86.c|3068| <<kvm_end_pvclock_update>> raw_spin_unlock_irq(&ka->tsc_write_lock)
++	 *   - arch/x86/kvm/x86.c|5799| <<kvm_arch_tsc_set_attr>> raw_spin_lock_irqsave(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|5809| <<kvm_arch_tsc_set_attr>> raw_spin_unlock_irqrestore(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|12820| <<kvm_arch_init_vm>> raw_spin_lock_init(&kvm->arch.tsc_write_lock);
++	 */
+ 	raw_spin_lock_irqsave(&kvm->arch.tsc_write_lock, flags);
+ 	offset = kvm_compute_l1_tsc_offset(vcpu, data);
++	/*
++	 * 在以下使用get_kvmclock_base_ns():
++	 *   - arch/x86/kvm/x86.c|2718| <<kvm_synchronize_tsc>> ns = get_kvmclock_base_ns();
++	 *   - arch/x86/kvm/x86.c|3131| <<__get_kvmclock>> data->clock = get_kvmclock_base_ns() + ka->kvmclock_offset;
++	 *   - arch/x86/kvm/x86.c|3241| <<kvm_guest_time_update>> kernel_ns = get_kvmclock_base_ns();
++	 *   - arch/x86/kvm/x86.c|5806| <<kvm_arch_tsc_set_attr>> ns = get_kvmclock_base_ns();
++	 *   - arch/x86/kvm/x86.c|7071| <<kvm_vm_ioctl_set_clock>> now_raw_ns = get_kvmclock_base_ns();
++	 *   - arch/x86/kvm/x86.c|12823| <<kvm_arch_init_vm>> kvm->arch.kvmclock_offset = -get_kvmclock_base_ns();
++	 */
+ 	ns = get_kvmclock_base_ns();
+ 	elapsed = ns - kvm->arch.last_tsc_nsec;
+ 
+@@ -3000,6 +3042,13 @@ static bool kvm_get_walltime_and_clockread(struct timespec64 *ts,
+  *
+  */
+ 
++/*
++ * 在以下使用pvclock_update_vm_gtod_copy():
++ *   - arch/x86/kvm/x86.c|3074| <<kvm_update_masterclock>> pvclock_update_vm_gtod_copy(kvm);
++ *   - arch/x86/kvm/x86.c|7042| <<kvm_vm_ioctl_set_clock>> pvclock_update_vm_gtod_copy(kvm);
++ *   - arch/x86/kvm/x86.c|9520| <<kvm_hyperv_tsc_notifier>> pvclock_update_vm_gtod_copy(kvm);
++ *   - arch/x86/kvm/x86.c|12819| <<kvm_arch_init_vm>> pvclock_update_vm_gtod_copy(kvm);
++ */
+ static void pvclock_update_vm_gtod_copy(struct kvm *kvm)
+ {
+ #ifdef CONFIG_X86_64
+@@ -3007,6 +3056,18 @@ static void pvclock_update_vm_gtod_copy(struct kvm *kvm)
+ 	int vclock_mode;
+ 	bool host_tsc_clocksource, vcpus_matched;
+ 
++	/*
++	 * 在以下使用kvm_arch->tsc_write_lock:
++	 *   - arch/x86/kvm/x86.c|2659| <<__kvm_synchronize_tsc>> lockdep_assert_held(&kvm->arch.tsc_write_lock);
++	 *   - arch/x86/kvm/x86.c|2716| <<kvm_synchronize_tsc>> raw_spin_lock_irqsave(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|2772| <<kvm_synchronize_tsc>> raw_spin_unlock_irqrestore(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|3017| <<pvclock_update_vm_gtod_copy>> lockdep_assert_held(&kvm->arch.tsc_write_lock);
++	 *   - arch/x86/kvm/x86.c|3049| <<__kvm_start_pvclock_update>> raw_spin_lock_irq(&kvm->arch.tsc_write_lock);
++	 *   - arch/x86/kvm/x86.c|3068| <<kvm_end_pvclock_update>> raw_spin_unlock_irq(&ka->tsc_write_lock)
++	 *   - arch/x86/kvm/x86.c|5799| <<kvm_arch_tsc_set_attr>> raw_spin_lock_irqsave(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|5809| <<kvm_arch_tsc_set_attr>> raw_spin_unlock_irqrestore(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|12820| <<kvm_arch_init_vm>> raw_spin_lock_init(&kvm->arch.tsc_write_lock);
++	 */
+ 	lockdep_assert_held(&kvm->arch.tsc_write_lock);
+ 	vcpus_matched = (ka->nr_vcpus_matched_tsc + 1 ==
+ 			atomic_read(&kvm->online_vcpus));
+@@ -3039,7 +3100,32 @@ static void kvm_make_mclock_inprogress_request(struct kvm *kvm)
+ 
+ static void __kvm_start_pvclock_update(struct kvm *kvm)
+ {
++	/*
++	 * 在以下使用kvm_arch->tsc_write_lock:
++	 *   - arch/x86/kvm/x86.c|2659| <<__kvm_synchronize_tsc>> lockdep_assert_held(&kvm->arch.tsc_write_lock);
++	 *   - arch/x86/kvm/x86.c|2716| <<kvm_synchronize_tsc>> raw_spin_lock_irqsave(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|2772| <<kvm_synchronize_tsc>> raw_spin_unlock_irqrestore(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|3017| <<pvclock_update_vm_gtod_copy>> lockdep_assert_held(&kvm->arch.tsc_write_lock);
++	 *   - arch/x86/kvm/x86.c|3049| <<__kvm_start_pvclock_update>> raw_spin_lock_irq(&kvm->arch.tsc_write_lock);
++	 *   - arch/x86/kvm/x86.c|3068| <<kvm_end_pvclock_update>> raw_spin_unlock_irq(&ka->tsc_write_lock)
++	 *   - arch/x86/kvm/x86.c|5799| <<kvm_arch_tsc_set_attr>> raw_spin_lock_irqsave(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|5809| <<kvm_arch_tsc_set_attr>> raw_spin_unlock_irqrestore(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|12820| <<kvm_arch_init_vm>> raw_spin_lock_init(&kvm->arch.tsc_write_lock);
++	 */
+ 	raw_spin_lock_irq(&kvm->arch.tsc_write_lock);
++	/*
++	 * 在以下使用kvm_arch->pvclock_sc:
++	 *   - arch/x86/kvm/x86.c|3050| <<__kvm_start_pvclock_update>> write_seqcount_begin(&kvm->arch.pvclock_sc);
++	 *   - arch/x86/kvm/x86.c|3067| <<kvm_end_pvclock_update>> write_seqcount_end(&ka->pvclock_sc);
++	 *   - arch/x86/kvm/x86.c|3143| <<get_kvmclock>> seq = read_seqcount_begin(&ka->pvclock_sc);
++	 *   - arch/x86/kvm/x86.c|3145| <<get_kvmclock>> } while (read_seqcount_retry(&ka->pvclock_sc, seq));
++	 *   - arch/x86/kvm/x86.c|3223| <<kvm_guest_time_update>> seq = read_seqcount_begin(&ka->pvclock_sc);
++	 *   - arch/x86/kvm/x86.c|3229| <<kvm_guest_time_update>> } while (read_seqcount_retry(&ka->pvclock_sc, seq));
++	 *   - arch/x86/kvm/x86.c|3359| <<kvm_get_wall_clock_epoch>> seq = read_seqcount_begin(&ka->pvclock_sc);
++	 *   - arch/x86/kvm/x86.c|3387| <<kvm_get_wall_clock_epoch>> } while (read_seqcount_retry(&ka->pvclock_sc, seq));
++	 *   - arch/x86/kvm/x86.c|12822| <<kvm_arch_init_vm>> seqcount_raw_spinlock_init(&kvm->arch.pvclock_sc,
++	 *        &kvm->arch.tsc_write_lock);
++	 */
+ 	write_seqcount_begin(&kvm->arch.pvclock_sc);
+ }
+ 
+@@ -3057,7 +3143,32 @@ static void kvm_end_pvclock_update(struct kvm *kvm)
+ 	struct kvm_vcpu *vcpu;
+ 	unsigned long i;
+ 
++	/*
++	 * 在以下使用kvm_arch->pvclock_sc:
++	 *   - arch/x86/kvm/x86.c|3050| <<__kvm_start_pvclock_update>> write_seqcount_begin(&kvm->arch.pvclock_sc);
++	 *   - arch/x86/kvm/x86.c|3067| <<kvm_end_pvclock_update>> write_seqcount_end(&ka->pvclock_sc);
++	 *   - arch/x86/kvm/x86.c|3143| <<get_kvmclock>> seq = read_seqcount_begin(&ka->pvclock_sc);
++	 *   - arch/x86/kvm/x86.c|3145| <<get_kvmclock>> } while (read_seqcount_retry(&ka->pvclock_sc, seq));
++	 *   - arch/x86/kvm/x86.c|3223| <<kvm_guest_time_update>> seq = read_seqcount_begin(&ka->pvclock_sc);
++	 *   - arch/x86/kvm/x86.c|3229| <<kvm_guest_time_update>> } while (read_seqcount_retry(&ka->pvclock_sc, seq));
++	 *   - arch/x86/kvm/x86.c|3359| <<kvm_get_wall_clock_epoch>> seq = read_seqcount_begin(&ka->pvclock_sc);
++	 *   - arch/x86/kvm/x86.c|3387| <<kvm_get_wall_clock_epoch>> } while (read_seqcount_retry(&ka->pvclock_sc, seq));
++	 *   - arch/x86/kvm/x86.c|12822| <<kvm_arch_init_vm>> seqcount_raw_spinlock_init(&kvm->arch.pvclock_sc,
++	 *        &kvm->arch.tsc_write_lock);
++	 */
+ 	write_seqcount_end(&ka->pvclock_sc);
++	/*
++	 * 在以下使用kvm_arch->tsc_write_lock:
++	 *   - arch/x86/kvm/x86.c|2659| <<__kvm_synchronize_tsc>> lockdep_assert_held(&kvm->arch.tsc_write_lock);
++	 *   - arch/x86/kvm/x86.c|2716| <<kvm_synchronize_tsc>> raw_spin_lock_irqsave(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|2772| <<kvm_synchronize_tsc>> raw_spin_unlock_irqrestore(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|3017| <<pvclock_update_vm_gtod_copy>> lockdep_assert_held(&kvm->arch.tsc_write_lock);
++	 *   - arch/x86/kvm/x86.c|3049| <<__kvm_start_pvclock_update>> raw_spin_lock_irq(&kvm->arch.tsc_write_lock);
++	 *   - arch/x86/kvm/x86.c|3068| <<kvm_end_pvclock_update>> raw_spin_unlock_irq(&ka->tsc_write_lock)
++	 *   - arch/x86/kvm/x86.c|5799| <<kvm_arch_tsc_set_attr>> raw_spin_lock_irqsave(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|5809| <<kvm_arch_tsc_set_attr>> raw_spin_unlock_irqrestore(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|12820| <<kvm_arch_init_vm>> raw_spin_lock_init(&kvm->arch.tsc_write_lock);
++	 */
+ 	raw_spin_unlock_irq(&ka->tsc_write_lock);
+ 	kvm_for_each_vcpu(i, vcpu, kvm)
+ 		kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
+@@ -3121,6 +3232,15 @@ static void __get_kvmclock(struct kvm *kvm, struct kvm_clock_data *data)
+ 				   &hv_clock.tsc_to_system_mul);
+ 		data->clock = __pvclock_read_cycles(&hv_clock, data->host_tsc);
+ 	} else {
++		/*
++		 * 在以下使用get_kvmclock_base_ns():
++		 *   - arch/x86/kvm/x86.c|2718| <<kvm_synchronize_tsc>> ns = get_kvmclock_base_ns();
++		 *   - arch/x86/kvm/x86.c|3131| <<__get_kvmclock>> data->clock = get_kvmclock_base_ns() + ka->kvmclock_offset;
++		 *   - arch/x86/kvm/x86.c|3241| <<kvm_guest_time_update>> kernel_ns = get_kvmclock_base_ns();
++		 *   - arch/x86/kvm/x86.c|5806| <<kvm_arch_tsc_set_attr>> ns = get_kvmclock_base_ns();
++		 *   - arch/x86/kvm/x86.c|7071| <<kvm_vm_ioctl_set_clock>> now_raw_ns = get_kvmclock_base_ns();
++		 *   - arch/x86/kvm/x86.c|12823| <<kvm_arch_init_vm>> kvm->arch.kvmclock_offset = -get_kvmclock_base_ns();
++		 */
+ 		data->clock = get_kvmclock_base_ns() + ka->kvmclock_offset;
+ 	}
+ 
+@@ -3133,11 +3253,33 @@ static void get_kvmclock(struct kvm *kvm, struct kvm_clock_data *data)
+ 	unsigned seq;
+ 
+ 	do {
++		/*
++		 * 在以下使用kvm_arch->pvclock_sc:
++		 *   - arch/x86/kvm/x86.c|3050| <<__kvm_start_pvclock_update>> write_seqcount_begin(&kvm->arch.pvclock_sc);
++		 *   - arch/x86/kvm/x86.c|3067| <<kvm_end_pvclock_update>> write_seqcount_end(&ka->pvclock_sc);
++		 *   - arch/x86/kvm/x86.c|3143| <<get_kvmclock>> seq = read_seqcount_begin(&ka->pvclock_sc);
++		 *   - arch/x86/kvm/x86.c|3145| <<get_kvmclock>> } while (read_seqcount_retry(&ka->pvclock_sc, seq));
++		 *   - arch/x86/kvm/x86.c|3223| <<kvm_guest_time_update>> seq = read_seqcount_begin(&ka->pvclock_sc);
++		 *   - arch/x86/kvm/x86.c|3229| <<kvm_guest_time_update>> } while (read_seqcount_retry(&ka->pvclock_sc, seq));
++		 *   - arch/x86/kvm/x86.c|3359| <<kvm_get_wall_clock_epoch>> seq = read_seqcount_begin(&ka->pvclock_sc);
++		 *   - arch/x86/kvm/x86.c|3387| <<kvm_get_wall_clock_epoch>> } while (read_seqcount_retry(&ka->pvclock_sc, seq));
++		 *   - arch/x86/kvm/x86.c|12822| <<kvm_arch_init_vm>> seqcount_raw_spinlock_init(&kvm->arch.pvclock_sc,
++		 *        &kvm->arch.tsc_write_lock);
++		 */
+ 		seq = read_seqcount_begin(&ka->pvclock_sc);
+ 		__get_kvmclock(kvm, data);
+ 	} while (read_seqcount_retry(&ka->pvclock_sc, seq));
+ }
+ 
++/*
++ * 在以下使用get_kvmclock_ns():
++ *   - arch/x86/kvm/hyperv.c|579| <<get_time_ref_counter>> return div_u64(get_kvmclock_ns(kvm), 100);
++ *   - arch/x86/kvm/x86.c|3403| <<kvm_get_wall_clock_epoch>> return ktime_get_real_ns() - get_kvmclock_ns(kvm);
++ *   - arch/x86/kvm/xen.c|272| <<kvm_xen_start_timer>> guest_now = get_kvmclock_ns(vcpu->kvm);
++ *   - arch/x86/kvm/xen.c|590| <<kvm_xen_update_runstate>> u64 now = get_kvmclock_ns(v->kvm);
++ *   - arch/x86/kvm/xen.c|1039| <<kvm_xen_vcpu_set_attr>> if (get_kvmclock_ns(vcpu->kvm) <
++ *   - arch/x86/kvm/xen.c|1080| <<kvm_xen_vcpu_set_attr>> if (get_kvmclock_ns(vcpu->kvm) <
++ */
+ u64 get_kvmclock_ns(struct kvm *kvm)
+ {
+ 	struct kvm_clock_data data;
+@@ -3213,6 +3355,19 @@ int kvm_guest_time_update(struct kvm_vcpu *v)
+ 	 * to the guest.
+ 	 */
+ 	do {
++		/*
++		 * 在以下使用kvm_arch->pvclock_sc:
++		 *   - arch/x86/kvm/x86.c|3050| <<__kvm_start_pvclock_update>> write_seqcount_begin(&kvm->arch.pvclock_sc);
++		 *   - arch/x86/kvm/x86.c|3067| <<kvm_end_pvclock_update>> write_seqcount_end(&ka->pvclock_sc);
++		 *   - arch/x86/kvm/x86.c|3143| <<get_kvmclock>> seq = read_seqcount_begin(&ka->pvclock_sc);
++		 *   - arch/x86/kvm/x86.c|3145| <<get_kvmclock>> } while (read_seqcount_retry(&ka->pvclock_sc, seq));
++		 *   - arch/x86/kvm/x86.c|3223| <<kvm_guest_time_update>> seq = read_seqcount_begin(&ka->pvclock_sc);
++		 *   - arch/x86/kvm/x86.c|3229| <<kvm_guest_time_update>> } while (read_seqcount_retry(&ka->pvclock_sc, seq));
++		 *   - arch/x86/kvm/x86.c|3359| <<kvm_get_wall_clock_epoch>> seq = read_seqcount_begin(&ka->pvclock_sc);
++		 *   - arch/x86/kvm/x86.c|3387| <<kvm_get_wall_clock_epoch>> } while (read_seqcount_retry(&ka->pvclock_sc, seq));
++		 *   - arch/x86/kvm/x86.c|12822| <<kvm_arch_init_vm>> seqcount_raw_spinlock_init(&kvm->arch.pvclock_sc,
++		 *        &kvm->arch.tsc_write_lock);
++		 */
+ 		seq = read_seqcount_begin(&ka->pvclock_sc);
+ 		use_master_clock = ka->use_master_clock;
+ 		if (use_master_clock) {
+@@ -3231,6 +3386,15 @@ int kvm_guest_time_update(struct kvm_vcpu *v)
+ 	}
+ 	if (!use_master_clock) {
+ 		host_tsc = rdtsc();
++		/*
++		 * 在以下使用get_kvmclock_base_ns():
++		 *   - arch/x86/kvm/x86.c|2718| <<kvm_synchronize_tsc>> ns = get_kvmclock_base_ns();
++		 *   - arch/x86/kvm/x86.c|3131| <<__get_kvmclock>> data->clock = get_kvmclock_base_ns() + ka->kvmclock_offset;
++		 *   - arch/x86/kvm/x86.c|3241| <<kvm_guest_time_update>> kernel_ns = get_kvmclock_base_ns();
++		 *   - arch/x86/kvm/x86.c|5806| <<kvm_arch_tsc_set_attr>> ns = get_kvmclock_base_ns();
++		 *   - arch/x86/kvm/x86.c|7071| <<kvm_vm_ioctl_set_clock>> now_raw_ns = get_kvmclock_base_ns();
++		 *   - arch/x86/kvm/x86.c|12823| <<kvm_arch_init_vm>> kvm->arch.kvmclock_offset = -get_kvmclock_base_ns();
++		 */
+ 		kernel_ns = get_kvmclock_base_ns();
+ 	}
+ 
+@@ -3349,6 +3513,19 @@ uint64_t kvm_get_wall_clock_epoch(struct kvm *kvm)
+ 	uint64_t host_tsc;
+ 
+ 	do {
++		/*
++		 * 在以下使用kvm_arch->pvclock_sc:
++		 *   - arch/x86/kvm/x86.c|3050| <<__kvm_start_pvclock_update>> write_seqcount_begin(&kvm->arch.pvclock_sc);
++		 *   - arch/x86/kvm/x86.c|3067| <<kvm_end_pvclock_update>> write_seqcount_end(&ka->pvclock_sc);
++		 *   - arch/x86/kvm/x86.c|3143| <<get_kvmclock>> seq = read_seqcount_begin(&ka->pvclock_sc);
++		 *   - arch/x86/kvm/x86.c|3145| <<get_kvmclock>> } while (read_seqcount_retry(&ka->pvclock_sc, seq));
++		 *   - arch/x86/kvm/x86.c|3223| <<kvm_guest_time_update>> seq = read_seqcount_begin(&ka->pvclock_sc);
++		 *   - arch/x86/kvm/x86.c|3229| <<kvm_guest_time_update>> } while (read_seqcount_retry(&ka->pvclock_sc, seq));
++		 *   - arch/x86/kvm/x86.c|3359| <<kvm_get_wall_clock_epoch>> seq = read_seqcount_begin(&ka->pvclock_sc);
++		 *   - arch/x86/kvm/x86.c|3387| <<kvm_get_wall_clock_epoch>> } while (read_seqcount_retry(&ka->pvclock_sc, seq));
++		 *   - arch/x86/kvm/x86.c|12822| <<kvm_arch_init_vm>> seqcount_raw_spinlock_init(&kvm->arch.pvclock_sc,
++		 *        &kvm->arch.tsc_write_lock);
++		 */
+ 		seq = read_seqcount_begin(&ka->pvclock_sc);
+ 
+ 		local_tsc_khz = 0;
+@@ -5789,6 +5966,18 @@ static int kvm_arch_tsc_set_attr(struct kvm_vcpu *vcpu,
+ 		if (get_user(offset, uaddr))
+ 			break;
+ 
++		/*
++		 * 在以下使用kvm_arch->tsc_write_lock:
++		 *   - arch/x86/kvm/x86.c|2659| <<__kvm_synchronize_tsc>> lockdep_assert_held(&kvm->arch.tsc_write_lock);
++		 *   - arch/x86/kvm/x86.c|2716| <<kvm_synchronize_tsc>> raw_spin_lock_irqsave(&kvm->arch.tsc_write_lock, flags);
++		 *   - arch/x86/kvm/x86.c|2772| <<kvm_synchronize_tsc>> raw_spin_unlock_irqrestore(&kvm->arch.tsc_write_lock, flags);
++		 *   - arch/x86/kvm/x86.c|3017| <<pvclock_update_vm_gtod_copy>> lockdep_assert_held(&kvm->arch.tsc_write_lock);
++		 *   - arch/x86/kvm/x86.c|3049| <<__kvm_start_pvclock_update>> raw_spin_lock_irq(&kvm->arch.tsc_write_lock);
++		 *   - arch/x86/kvm/x86.c|3068| <<kvm_end_pvclock_update>> raw_spin_unlock_irq(&ka->tsc_write_lock)
++		 *   - arch/x86/kvm/x86.c|5799| <<kvm_arch_tsc_set_attr>> raw_spin_lock_irqsave(&kvm->arch.tsc_write_lock, flags);
++		 *   - arch/x86/kvm/x86.c|5809| <<kvm_arch_tsc_set_attr>> raw_spin_unlock_irqrestore(&kvm->arch.tsc_write_lock, flags);
++		 *   - arch/x86/kvm/x86.c|12820| <<kvm_arch_init_vm>> raw_spin_lock_init(&kvm->arch.tsc_write_lock);
++		 */
+ 		raw_spin_lock_irqsave(&kvm->arch.tsc_write_lock, flags);
+ 
+ 		matched = (vcpu->arch.virtual_tsc_khz &&
+@@ -5796,6 +5985,15 @@ static int kvm_arch_tsc_set_attr(struct kvm_vcpu *vcpu,
+ 			   kvm->arch.last_tsc_offset == offset);
+ 
+ 		tsc = kvm_scale_tsc(rdtsc(), vcpu->arch.l1_tsc_scaling_ratio) + offset;
++		/*
++		 * 在以下使用get_kvmclock_base_ns():
++		 *   - arch/x86/kvm/x86.c|2718| <<kvm_synchronize_tsc>> ns = get_kvmclock_base_ns();
++		 *   - arch/x86/kvm/x86.c|3131| <<__get_kvmclock>> data->clock = get_kvmclock_base_ns() + ka->kvmclock_offset;
++		 *   - arch/x86/kvm/x86.c|3241| <<kvm_guest_time_update>> kernel_ns = get_kvmclock_base_ns();
++		 *   - arch/x86/kvm/x86.c|5806| <<kvm_arch_tsc_set_attr>> ns = get_kvmclock_base_ns();
++		 *   - arch/x86/kvm/x86.c|7071| <<kvm_vm_ioctl_set_clock>> now_raw_ns = get_kvmclock_base_ns();
++		 *   - arch/x86/kvm/x86.c|12823| <<kvm_arch_init_vm>> kvm->arch.kvmclock_offset = -get_kvmclock_base_ns();
++		 */
+ 		ns = get_kvmclock_base_ns();
+ 
+ 		__kvm_synchronize_tsc(vcpu, offset, tsc, ns, matched, true);
+@@ -7058,6 +7256,15 @@ static int kvm_vm_ioctl_set_clock(struct kvm *kvm, void __user *argp)
+ 			data.clock += now_real_ns - data.realtime;
+ 	}
+ 
++	/*
++	 * 在以下使用get_kvmclock_base_ns():
++	 *   - arch/x86/kvm/x86.c|2718| <<kvm_synchronize_tsc>> ns = get_kvmclock_base_ns();
++	 *   - arch/x86/kvm/x86.c|3131| <<__get_kvmclock>> data->clock = get_kvmclock_base_ns() + ka->kvmclock_offset;
++	 *   - arch/x86/kvm/x86.c|3241| <<kvm_guest_time_update>> kernel_ns = get_kvmclock_base_ns();
++	 *   - arch/x86/kvm/x86.c|5806| <<kvm_arch_tsc_set_attr>> ns = get_kvmclock_base_ns();
++	 *   - arch/x86/kvm/x86.c|7071| <<kvm_vm_ioctl_set_clock>> now_raw_ns = get_kvmclock_base_ns();
++	 *   - arch/x86/kvm/x86.c|12823| <<kvm_arch_init_vm>> kvm->arch.kvmclock_offset = -get_kvmclock_base_ns();
++	 */
+ 	if (ka->use_master_clock)
+ 		now_raw_ns = ka->master_kernel_ns;
+ 	else
+@@ -12810,9 +13017,43 @@ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
+ 	set_bit(KVM_IRQFD_RESAMPLE_IRQ_SOURCE_ID,
+ 		&kvm->arch.irq_sources_bitmap);
+ 
++	/*
++	 * 在以下使用kvm_arch->tsc_write_lock:
++	 *   - arch/x86/kvm/x86.c|2659| <<__kvm_synchronize_tsc>> lockdep_assert_held(&kvm->arch.tsc_write_lock);
++	 *   - arch/x86/kvm/x86.c|2716| <<kvm_synchronize_tsc>> raw_spin_lock_irqsave(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|2772| <<kvm_synchronize_tsc>> raw_spin_unlock_irqrestore(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|3017| <<pvclock_update_vm_gtod_copy>> lockdep_assert_held(&kvm->arch.tsc_write_lock);
++	 *   - arch/x86/kvm/x86.c|3049| <<__kvm_start_pvclock_update>> raw_spin_lock_irq(&kvm->arch.tsc_write_lock);
++	 *   - arch/x86/kvm/x86.c|3068| <<kvm_end_pvclock_update>> raw_spin_unlock_irq(&ka->tsc_write_lock)
++	 *   - arch/x86/kvm/x86.c|5799| <<kvm_arch_tsc_set_attr>> raw_spin_lock_irqsave(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|5809| <<kvm_arch_tsc_set_attr>> raw_spin_unlock_irqrestore(&kvm->arch.tsc_write_lock, flags);
++	 *   - arch/x86/kvm/x86.c|12820| <<kvm_arch_init_vm>> raw_spin_lock_init(&kvm->arch.tsc_write_lock);
++	 */
+ 	raw_spin_lock_init(&kvm->arch.tsc_write_lock);
+ 	mutex_init(&kvm->arch.apic_map_lock);
++	/*
++	 * 在以下使用kvm_arch->pvclock_sc:
++	 *   - arch/x86/kvm/x86.c|3050| <<__kvm_start_pvclock_update>> write_seqcount_begin(&kvm->arch.pvclock_sc);
++	 *   - arch/x86/kvm/x86.c|3067| <<kvm_end_pvclock_update>> write_seqcount_end(&ka->pvclock_sc);
++	 *   - arch/x86/kvm/x86.c|3143| <<get_kvmclock>> seq = read_seqcount_begin(&ka->pvclock_sc);
++	 *   - arch/x86/kvm/x86.c|3145| <<get_kvmclock>> } while (read_seqcount_retry(&ka->pvclock_sc, seq));
++	 *   - arch/x86/kvm/x86.c|3223| <<kvm_guest_time_update>> seq = read_seqcount_begin(&ka->pvclock_sc);
++	 *   - arch/x86/kvm/x86.c|3229| <<kvm_guest_time_update>> } while (read_seqcount_retry(&ka->pvclock_sc, seq));
++	 *   - arch/x86/kvm/x86.c|3359| <<kvm_get_wall_clock_epoch>> seq = read_seqcount_begin(&ka->pvclock_sc);
++	 *   - arch/x86/kvm/x86.c|3387| <<kvm_get_wall_clock_epoch>> } while (read_seqcount_retry(&ka->pvclock_sc, seq));
++	 *   - arch/x86/kvm/x86.c|12822| <<kvm_arch_init_vm>> seqcount_raw_spinlock_init(&kvm->arch.pvclock_sc,
++	 *        &kvm->arch.tsc_write_lock);
++	 */
+ 	seqcount_raw_spinlock_init(&kvm->arch.pvclock_sc, &kvm->arch.tsc_write_lock);
++	/*
++	 * 在以下使用get_kvmclock_base_ns():
++	 *   - arch/x86/kvm/x86.c|2718| <<kvm_synchronize_tsc>> ns = get_kvmclock_base_ns();
++	 *   - arch/x86/kvm/x86.c|3131| <<__get_kvmclock>> data->clock = get_kvmclock_base_ns() + ka->kvmclock_offset;
++	 *   - arch/x86/kvm/x86.c|3241| <<kvm_guest_time_update>> kernel_ns = get_kvmclock_base_ns();
++	 *   - arch/x86/kvm/x86.c|5806| <<kvm_arch_tsc_set_attr>> ns = get_kvmclock_base_ns();
++	 *   - arch/x86/kvm/x86.c|7071| <<kvm_vm_ioctl_set_clock>> now_raw_ns = get_kvmclock_base_ns();
++	 *   - arch/x86/kvm/x86.c|12823| <<kvm_arch_init_vm>> kvm->arch.kvmclock_offset = -get_kvmclock_base_ns();
++	 */
+ 	kvm->arch.kvmclock_offset = -get_kvmclock_base_ns();
+ 
+ 	raw_spin_lock_irqsave(&kvm->arch.tsc_write_lock, flags);
+diff --git a/arch/x86/net/bpf_jit_comp.c b/arch/x86/net/bpf_jit_comp.c
+index 15672cb92..973544e81 100644
+--- a/arch/x86/net/bpf_jit_comp.c
++++ b/arch/x86/net/bpf_jit_comp.c
+@@ -667,6 +667,18 @@ static void emit_indirect_jump(u8 **pprog, int reg, u8 *ip)
+ 		OPTIMIZER_HIDE_VAR(reg);
+ 		emit_jump(&prog, its_static_thunk(reg), ip);
+ 	} else if (cpu_feature_enabled(X86_FEATURE_RETPOLINE_LFENCE)) {
++		/*
++		 * 在以下使用X86_FEATURE_RETPOLINE_LFENCE:
++		 *   - arch/x86/include/asm/nospec-branch.h|514| <<CALL_NOSPEC(32位)>> X86_FEATURE_RETPOLINE_LFENCE)
++		 *   - arch/x86/kernel/alternative.c|871| <<patch_retpoline>> if (cpu_feature_enabled(X86_FEATURE_RETPOLINE) &&
++		 *                     !cpu_feature_enabled(X86_FEATURE_RETPOLINE_LFENCE)) {
++		 *   - arch/x86/kernel/alternative.c|907| <<patch_retpoline>> if (cpu_feature_enabled(X86_FEATURE_RETPOLINE_LFENCE)) {
++		 *   - arch/x86/kernel/cpu/bugs.c|2384| <<bhi_apply_mitigation>> if (boot_cpu_has(X86_FEATURE_RETPOLINE) &&
++		 *                     !boot_cpu_has(X86_FEATURE_RETPOLINE_LFENCE)) {
++		 *   - arch/x86/kernel/cpu/bugs.c|2556| <<spectre_v2_apply_mitigation>> setup_force_cpu_cap(X86_FEATURE_RETPOLINE_LFENCE);
++		 *   - arch/x86/kernel/cpu/bugs.c|3685| <<spectre_bhi_state>> !boot_cpu_has(X86_FEATURE_RETPOLINE_LFENCE) &&
++		 *   - arch/x86/net/bpf_jit_comp.c|669| <<emit_indirect_jump>> } else if (cpu_feature_enabled(X86_FEATURE_RETPOLINE_LFENCE)) {
++		 */
+ 		EMIT_LFENCE();
+ 		EMIT2(0xFF, 0xE0 + reg);
+ 	} else if (cpu_feature_enabled(X86_FEATURE_RETPOLINE)) {
+@@ -1513,6 +1525,14 @@ static int emit_spectre_bhb_barrier(u8 **pprog, u8 *ip,
+ 	u8 *prog = *pprog;
+ 	u8 *func;
+ 
++	/*
++	 * 在以下使用X86_FEATURE_CLEAR_BHB_LOOP:
++	 *   - arch/x86/include/asm/nospec-branch.h|332| <<CLEAR_BRANCH_HISTORY>> ALTERNATIVE "", "call clear_bhb_loop", X86_FEATURE_CLEAR_BHB_LOOP
++	 *   - arch/x86/kernel/cpu/bugs.c|2141| <<bhi_apply_mitigation>> setup_force_cpu_cap(X86_FEATURE_CLEAR_BHB_LOOP);
++	 *   - arch/x86/kernel/cpu/bugs.c|3307| <<spectre_bhi_state>> else if (boot_cpu_has(X86_FEATURE_CLEAR_BHB_LOOP))
++	 *   - arch/x86/net/bpf_jit_comp.c|1516| <<emit_spectre_bhb_barrier>> if (cpu_feature_enabled(X86_FEATURE_CLEAR_BHB_LOOP)) {
++	 *   - arch/x86/net/bpf_jit_comp.c|1531| <<emit_spectre_bhb_barrier>> if ((cpu_feature_enabled(X86_FEATURE_CLEAR_BHB_LOOP) &&
++	 */
+ 	if (cpu_feature_enabled(X86_FEATURE_CLEAR_BHB_LOOP)) {
+ 		/* The clearing sequence clobbers eax and ecx. */
+ 		EMIT1(0x50); /* push rax */
+@@ -1527,6 +1547,19 @@ static int emit_spectre_bhb_barrier(u8 **pprog, u8 *ip,
+ 		EMIT1(0x59); /* pop rcx */
+ 		EMIT1(0x58); /* pop rax */
+ 	}
++	/*
++	 * 在以下使用X86_FEATURE_CLEAR_BHB_LOOP:
++	 *   - arch/x86/include/asm/nospec-branch.h|332| <<CLEAR_BRANCH_HISTORY>> ALTERNATIVE "", "call clear_bhb_loop", X86_FEATURE_CLEAR_BHB_LOOP
++	 *   - arch/x86/kernel/cpu/bugs.c|2141| <<bhi_apply_mitigation>> setup_force_cpu_cap(X86_FEATURE_CLEAR_BHB_LOOP);
++	 *   - arch/x86/kernel/cpu/bugs.c|3307| <<spectre_bhi_state>> else if (boot_cpu_has(X86_FEATURE_CLEAR_BHB_LOOP))
++	 *   - arch/x86/net/bpf_jit_comp.c|1516| <<emit_spectre_bhb_barrier>> if (cpu_feature_enabled(X86_FEATURE_CLEAR_BHB_LOOP)) {
++	 *   - arch/x86/net/bpf_jit_comp.c|1531| <<emit_spectre_bhb_barrier>> if ((cpu_feature_enabled(X86_FEATURE_CLEAR_BHB_LOOP) &&
++	 *
++	 * 在以下使用X86_FEATURE_CLEAR_BHB_HW:
++	 *   - arch/x86/kernel/cpu/bugs.c|2062| <<spec_ctrl_bhi_dis>> setup_force_cpu_cap(X86_FEATURE_CLEAR_BHB_HW);
++	 *   - arch/x86/kernel/cpu/bugs.c|3305| <<spectre_bhi_state>> else if (boot_cpu_has(X86_FEATURE_CLEAR_BHB_HW))
++	 *   - arch/x86/net/bpf_jit_comp.c|1533| <<emit_spectre_bhb_barrier>> cpu_feature_enabled(X86_FEATURE_CLEAR_BHB_HW)) {
++	 */
+ 	/* Insert IBHF instruction */
+ 	if ((cpu_feature_enabled(X86_FEATURE_CLEAR_BHB_LOOP) &&
+ 	     cpu_feature_enabled(X86_FEATURE_HYPERVISOR)) ||
+diff --git a/drivers/infiniband/core/device.c b/drivers/infiniband/core/device.c
+index d42633858..7a1fecc2f 100644
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@ -1813,6 +1813,29 @@ static void remove_client_id(struct ib_client *client)
+  * ib_register_client() is called, the client will receive an add
+  * callback for all devices already registered.
+  */
++/*
++ * 在以下使用ib_register_client():
++ *   - drivers/infiniband/core/cm.c|4492| <<ib_cm_init>> ret = ib_register_client(&cm_client);
++ *   - drivers/infiniband/core/cma.c|5474| <<cma_init>> ret = ib_register_client(&cma_client);
++ *   - drivers/infiniband/core/mad.c|3151| <<ib_mad_init>> if (ib_register_client(&mad_client)) {
++ *   - drivers/infiniband/core/multicast.c|890| <<mcast_init>> ret = ib_register_client(&mcast_client);
++ *   - drivers/infiniband/core/sa_query.c|2261| <<ib_sa_init>> ret = ib_register_client(&sa_client);
++ *   - drivers/infiniband/core/ucma.c|1866| <<ucma_init>> ret = ib_register_client(&rdma_cma_client);
++ *   - drivers/infiniband/core/user_mad.c|1477| <<ib_umad_init>> ret = ib_register_client(&umad_client);
++ *   - drivers/infiniband/core/user_mad.c|1481| <<ib_umad_init>> ret = ib_register_client(&issm_client);
++ *   - drivers/infiniband/core/uverbs_main.c|1318| <<ib_uverbs_init>> ret = ib_register_client(&uverbs_client);
++ *   - drivers/infiniband/ulp/ipoib/ipoib_main.c|2736| <<ipoib_init_module>> ret = ib_register_client(&ipoib_client);
++ *   - drivers/infiniband/ulp/opa_vnic/opa_vnic_vema.c|1040| <<opa_vnic_init>> rc = ib_register_client(&opa_vnic_client);
++ *   - drivers/infiniband/ulp/rtrs/rtrs-srv.c|2202| <<rtrs_srv_open>> err = ib_register_client(&rtrs_srv_client);
++ *   - drivers/infiniband/ulp/srp/ib_srp.c|4190| <<srp_init_module>> ret = ib_register_client(&srp_client);
++ *   - drivers/infiniband/ulp/srpt/ib_srpt.c|3965| <<srpt_init_module>> ret = ib_register_client(&srpt_client);
++ *   - drivers/nvme/host/rdma.c|2401| <<nvme_rdma_init_module>> ret = ib_register_client(&nvme_rdma_ib_client);
++ *   - drivers/nvme/target/rdma.c|2102| <<nvmet_rdma_init>> ret = ib_register_client(&nvmet_rdma_ib_client);
++ *   - fs/smb/server/transport_rdma.c|2195| <<ksmbd_rdma_init>> ret = ib_register_client(&smb_direct_ib_client);
++ *   - net/rds/ib.c|576| <<rds_ib_init>> ret = ib_register_client(&rds_ib_client);
++ *   - net/smc/smc_ib.c|1012| <<smc_ib_register_client>> return ib_register_client(&smc_ib_client);
++ *   - net/sunrpc/xprtrdma/ib_client.c|183| <<rpcrdma_ib_client_register>> return ib_register_client(&rpcrdma_ib_client);
++ */
+ int ib_register_client(struct ib_client *client)
+ {
+ 	struct ib_device *device;
+diff --git a/drivers/nvme/host/fabrics.c b/drivers/nvme/host/fabrics.c
+index 2e58a7ce1..dc40431d9 100644
+--- a/drivers/nvme/host/fabrics.c
++++ b/drivers/nvme/host/fabrics.c
+@@ -612,6 +612,13 @@ EXPORT_SYMBOL_GPL(nvmf_should_reconnect);
+  * being implemented to the common NVMe fabrics library. Part of
+  * the overall init sequence of starting up a fabrics driver.
+  */
++/*
++ * 在以下使用nvmf_register_transport():
++ *   - drivers/nvme/host/fc.c|3904| <<nvme_fc_init_module>> ret = nvmf_register_transport(&nvme_fc_transport);
++ *   - drivers/nvme/host/rdma.c|2405| <<nvme_rdma_init_module>> ret = nvmf_register_transport(&nvme_rdma_transport);
++ *   - drivers/nvme/host/tcp.c|3038| <<nvme_tcp_init_module>> nvmf_register_transport(&nvme_tcp_transport);
++ *   - drivers/nvme/target/loop.c|697| <<nvme_loop_init_module>> ret = nvmf_register_transport(&nvme_loop_transport);
++ */
+ int nvmf_register_transport(struct nvmf_transport_ops *ops)
+ {
+ 	if (!ops->create_ctrl)
+diff --git a/drivers/nvme/host/fc.c b/drivers/nvme/host/fc.c
+index 014b387f1..481aa6709 100644
+--- a/drivers/nvme/host/fc.c
++++ b/drivers/nvme/host/fc.c
+@@ -3901,6 +3901,13 @@ static int __init nvme_fc_init_module(void)
+ 		goto out_destroy_class;
+ 	}
+ 
++	/*
++	 * 在以下使用nvmf_register_transport():
++	 *   - drivers/nvme/host/fc.c|3904| <<nvme_fc_init_module>> ret = nvmf_register_transport(&nvme_fc_transport);
++	 *   - drivers/nvme/host/rdma.c|2405| <<nvme_rdma_init_module>> ret = nvmf_register_transport(&nvme_rdma_transport);
++	 *   - drivers/nvme/host/tcp.c|3038| <<nvme_tcp_init_module>> nvmf_register_transport(&nvme_tcp_transport);
++	 *   - drivers/nvme/target/loop.c|697| <<nvme_loop_init_module>> ret = nvmf_register_transport(&nvme_loop_transport);
++	 */
+ 	ret = nvmf_register_transport(&nvme_fc_transport);
+ 	if (ret)
+ 		goto out_destroy_device;
+diff --git a/drivers/nvme/host/rdma.c b/drivers/nvme/host/rdma.c
+index 9bd364656..a74abf61e 100644
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@ -1154,6 +1154,12 @@ static void nvme_rdma_error_recovery(struct nvme_rdma_ctrl *ctrl)
+ 	queue_work(nvme_reset_wq, &ctrl->err_work);
+ }
+ 
++/*
++ * 在以下使用nvme_rdma_end_request():
++ *   - drivers/nvme/host/rdma.c|1195| <<nvme_rdma_inv_rkey_done>> nvme_rdma_end_request(req);
++ *   - drivers/nvme/host/rdma.c|1588| <<nvme_rdma_send_done>> nvme_rdma_end_request(req);
++ *   - drivers/nvme/host/rdma.c|1731| <<nvme_rdma_process_nvme_rsp>> nvme_rdma_end_request(req);
++ */
+ static void nvme_rdma_end_request(struct nvme_rdma_request *req)
+ {
+ 	struct request *rq = blk_mq_rq_from_pdu(req);
+@@ -1619,6 +1625,11 @@ static int nvme_rdma_post_send(struct nvme_rdma_queue *queue,
+ 	return ret;
+ }
+ 
++/*
++ * 在以下使用nvme_rdma_post_recv():
++ *   - drivers/nvme/host/rdma.c|1771| <<nvme_rdma_recv_done>> nvme_rdma_post_recv(queue, qe);
++ *   - drivers/nvme/host/rdma.c|1779| <<nvme_rdma_conn_established>> ret = nvme_rdma_post_recv(queue, &queue->rsp_ring[i]);
++ */
+ static int nvme_rdma_post_recv(struct nvme_rdma_queue *queue,
+ 		struct nvme_rdma_qe *qe)
+ {
+@@ -1687,6 +1698,10 @@ static void nvme_rdma_submit_async_event(struct nvme_ctrl *arg)
+ 	WARN_ON_ONCE(ret);
+ }
+ 
++/*
++ * 在以下使用nvme_rdma_process_nvme_rsp():
++ *   - drivers/nvme/host/rdma.c|1768| <<nvme_rdma_recv_done>> nvme_rdma_process_nvme_rsp(queue, cqe, wc);
++ */
+ static void nvme_rdma_process_nvme_rsp(struct nvme_rdma_queue *queue,
+ 		struct nvme_completion *cqe, struct ib_wc *wc)
+ {
+@@ -1731,6 +1746,10 @@ static void nvme_rdma_process_nvme_rsp(struct nvme_rdma_queue *queue,
+ 	nvme_rdma_end_request(req);
+ }
+ 
++/*
++ * 在以下使用nvme_rdma_recv_done():
++ *   - drivers/nvme/host/rdma.c|1633| <<nvme_rdma_post_recv>> qe->cqe.done = nvme_rdma_recv_done;
++ */
+ static void nvme_rdma_recv_done(struct ib_cq *cq, struct ib_wc *wc)
+ {
+ 	struct nvme_rdma_qe *qe =
+@@ -1771,6 +1790,10 @@ static void nvme_rdma_recv_done(struct ib_cq *cq, struct ib_wc *wc)
+ 	nvme_rdma_post_recv(queue, qe);
+ }
+ 
++/*
++ * 在以下使用nvme_rdma_conn_established():
++ *   - drivers/nvme/host/rdma.c|1904| <<nvme_rdma_cm_handler>> queue->cm_error = nvme_rdma_conn_established(queue);
++ */
+ static int nvme_rdma_conn_established(struct nvme_rdma_queue *queue)
+ {
+ 	int ret, i;
+@@ -2398,10 +2421,40 @@ static int __init nvme_rdma_init_module(void)
+ {
+ 	int ret;
+ 
++	/*
++	 * 在以下使用ib_register_client():
++	 *   - drivers/infiniband/core/cm.c|4492| <<ib_cm_init>> ret = ib_register_client(&cm_client);
++	 *   - drivers/infiniband/core/cma.c|5474| <<cma_init>> ret = ib_register_client(&cma_client);
++	 *   - drivers/infiniband/core/mad.c|3151| <<ib_mad_init>> if (ib_register_client(&mad_client)) {
++	 *   - drivers/infiniband/core/multicast.c|890| <<mcast_init>> ret = ib_register_client(&mcast_client);
++	 *   - drivers/infiniband/core/sa_query.c|2261| <<ib_sa_init>> ret = ib_register_client(&sa_client);
++	 *   - drivers/infiniband/core/ucma.c|1866| <<ucma_init>> ret = ib_register_client(&rdma_cma_client);
++	 *   - drivers/infiniband/core/user_mad.c|1477| <<ib_umad_init>> ret = ib_register_client(&umad_client);
++	 *   - drivers/infiniband/core/user_mad.c|1481| <<ib_umad_init>> ret = ib_register_client(&issm_client);
++	 *   - drivers/infiniband/core/uverbs_main.c|1318| <<ib_uverbs_init>> ret = ib_register_client(&uverbs_client);
++	 *   - drivers/infiniband/ulp/ipoib/ipoib_main.c|2736| <<ipoib_init_module>> ret = ib_register_client(&ipoib_client);
++	 *   - drivers/infiniband/ulp/opa_vnic/opa_vnic_vema.c|1040| <<opa_vnic_init>> rc = ib_register_client(&opa_vnic_client);
++	 *   - drivers/infiniband/ulp/rtrs/rtrs-srv.c|2202| <<rtrs_srv_open>> err = ib_register_client(&rtrs_srv_client);
++	 *   - drivers/infiniband/ulp/srp/ib_srp.c|4190| <<srp_init_module>> ret = ib_register_client(&srp_client);
++	 *   - drivers/infiniband/ulp/srpt/ib_srpt.c|3965| <<srpt_init_module>> ret = ib_register_client(&srpt_client);
++	 *   - drivers/nvme/host/rdma.c|2401| <<nvme_rdma_init_module>> ret = ib_register_client(&nvme_rdma_ib_client);
++	 *   - drivers/nvme/target/rdma.c|2102| <<nvmet_rdma_init>> ret = ib_register_client(&nvmet_rdma_ib_client);
++	 *   - fs/smb/server/transport_rdma.c|2195| <<ksmbd_rdma_init>> ret = ib_register_client(&smb_direct_ib_client);
++	 *   - net/rds/ib.c|576| <<rds_ib_init>> ret = ib_register_client(&rds_ib_client);
++	 *   - net/smc/smc_ib.c|1012| <<smc_ib_register_client>> return ib_register_client(&smc_ib_client);
++	 *   - net/sunrpc/xprtrdma/ib_client.c|183| <<rpcrdma_ib_client_register>> return ib_register_client(&rpcrdma_ib_client);
++	 */
+ 	ret = ib_register_client(&nvme_rdma_ib_client);
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * 在以下使用nvmf_register_transport():
++	 *   - drivers/nvme/host/fc.c|3904| <<nvme_fc_init_module>> ret = nvmf_register_transport(&nvme_fc_transport);
++	 *   - drivers/nvme/host/rdma.c|2405| <<nvme_rdma_init_module>> ret = nvmf_register_transport(&nvme_rdma_transport);
++	 *   - drivers/nvme/host/tcp.c|3038| <<nvme_tcp_init_module>> nvmf_register_transport(&nvme_tcp_transport);
++	 *   - drivers/nvme/target/loop.c|697| <<nvme_loop_init_module>> ret = nvmf_register_transport(&nvme_loop_transport);
++	 */
+ 	ret = nvmf_register_transport(&nvme_rdma_transport);
+ 	if (ret)
+ 		goto err_unreg_client;
+diff --git a/drivers/nvme/host/tcp.c b/drivers/nvme/host/tcp.c
+index d924008c3..2392664c8 100644
+--- a/drivers/nvme/host/tcp.c
++++ b/drivers/nvme/host/tcp.c
+@@ -3035,6 +3035,13 @@ static int __init nvme_tcp_init_module(void)
+ 	for_each_possible_cpu(cpu)
+ 		atomic_set(&nvme_tcp_cpu_queues[cpu], 0);
+ 
++	/*
++	 * 在以下使用nvmf_register_transport():
++	 *   - drivers/nvme/host/fc.c|3904| <<nvme_fc_init_module>> ret = nvmf_register_transport(&nvme_fc_transport);
++	 *   - drivers/nvme/host/rdma.c|2405| <<nvme_rdma_init_module>> ret = nvmf_register_transport(&nvme_rdma_transport);
++	 *   - drivers/nvme/host/tcp.c|3038| <<nvme_tcp_init_module>> nvmf_register_transport(&nvme_tcp_transport);
++	 *   - drivers/nvme/target/loop.c|697| <<nvme_loop_init_module>> ret = nvmf_register_transport(&nvme_loop_transport);
++	 */
+ 	nvmf_register_transport(&nvme_tcp_transport);
+ 	return 0;
+ }
+diff --git a/drivers/nvme/target/loop.c b/drivers/nvme/target/loop.c
+index f85a8441b..dff5ec24c 100644
+--- a/drivers/nvme/target/loop.c
++++ b/drivers/nvme/target/loop.c
+@@ -694,6 +694,13 @@ static int __init nvme_loop_init_module(void)
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * 在以下使用nvmf_register_transport():
++	 *   - drivers/nvme/host/fc.c|3904| <<nvme_fc_init_module>> ret = nvmf_register_transport(&nvme_fc_transport);
++	 *   - drivers/nvme/host/rdma.c|2405| <<nvme_rdma_init_module>> ret = nvmf_register_transport(&nvme_rdma_transport);
++	 *   - drivers/nvme/host/tcp.c|3038| <<nvme_tcp_init_module>> nvmf_register_transport(&nvme_tcp_transport);
++	 *   - drivers/nvme/target/loop.c|697| <<nvme_loop_init_module>> ret = nvmf_register_transport(&nvme_loop_transport);
++	 */
+ 	ret = nvmf_register_transport(&nvme_loop_transport);
+ 	if (ret)
+ 		nvmet_unregister_transport(&nvme_loop_ops);
+diff --git a/drivers/nvme/target/rdma.c b/drivers/nvme/target/rdma.c
+index 67f61c67c..1f5d3fccd 100644
+--- a/drivers/nvme/target/rdma.c
++++ b/drivers/nvme/target/rdma.c
+@@ -2099,6 +2099,29 @@ static int __init nvmet_rdma_init(void)
+ {
+ 	int ret;
+ 
++	/*
++	 * 在以下使用ib_register_client():
++	 *   - drivers/infiniband/core/cm.c|4492| <<ib_cm_init>> ret = ib_register_client(&cm_client);
++	 *   - drivers/infiniband/core/cma.c|5474| <<cma_init>> ret = ib_register_client(&cma_client);
++	 *   - drivers/infiniband/core/mad.c|3151| <<ib_mad_init>> if (ib_register_client(&mad_client)) {
++	 *   - drivers/infiniband/core/multicast.c|890| <<mcast_init>> ret = ib_register_client(&mcast_client);
++	 *   - drivers/infiniband/core/sa_query.c|2261| <<ib_sa_init>> ret = ib_register_client(&sa_client);
++	 *   - drivers/infiniband/core/ucma.c|1866| <<ucma_init>> ret = ib_register_client(&rdma_cma_client);
++	 *   - drivers/infiniband/core/user_mad.c|1477| <<ib_umad_init>> ret = ib_register_client(&umad_client);
++	 *   - drivers/infiniband/core/user_mad.c|1481| <<ib_umad_init>> ret = ib_register_client(&issm_client);
++	 *   - drivers/infiniband/core/uverbs_main.c|1318| <<ib_uverbs_init>> ret = ib_register_client(&uverbs_client);
++	 *   - drivers/infiniband/ulp/ipoib/ipoib_main.c|2736| <<ipoib_init_module>> ret = ib_register_client(&ipoib_client);
++	 *   - drivers/infiniband/ulp/opa_vnic/opa_vnic_vema.c|1040| <<opa_vnic_init>> rc = ib_register_client(&opa_vnic_client);
++	 *   - drivers/infiniband/ulp/rtrs/rtrs-srv.c|2202| <<rtrs_srv_open>> err = ib_register_client(&rtrs_srv_client);
++	 *   - drivers/infiniband/ulp/srp/ib_srp.c|4190| <<srp_init_module>> ret = ib_register_client(&srp_client);
++	 *   - drivers/infiniband/ulp/srpt/ib_srpt.c|3965| <<srpt_init_module>> ret = ib_register_client(&srpt_client);
++	 *   - drivers/nvme/host/rdma.c|2401| <<nvme_rdma_init_module>> ret = ib_register_client(&nvme_rdma_ib_client);
++	 *   - drivers/nvme/target/rdma.c|2102| <<nvmet_rdma_init>> ret = ib_register_client(&nvmet_rdma_ib_client);
++	 *   - fs/smb/server/transport_rdma.c|2195| <<ksmbd_rdma_init>> ret = ib_register_client(&smb_direct_ib_client);
++	 *   - net/rds/ib.c|576| <<rds_ib_init>> ret = ib_register_client(&rds_ib_client);
++	 *   - net/smc/smc_ib.c|1012| <<smc_ib_register_client>> return ib_register_client(&smc_ib_client);
++	 *   - net/sunrpc/xprtrdma/ib_client.c|183| <<rpcrdma_ib_client_register>> return ib_register_client(&rpcrdma_ib_client);
++	 */
+ 	ret = ib_register_client(&nvmet_rdma_ib_client);
+ 	if (ret)
+ 		return ret;
+diff --git a/drivers/target/target_core_iblock.c b/drivers/target/target_core_iblock.c
+index 73564efd1..318820b45 100644
+--- a/drivers/target/target_core_iblock.c
++++ b/drivers/target/target_core_iblock.c
+@@ -306,11 +306,20 @@ static sector_t iblock_get_blocks(struct se_device *dev)
+ 	return blocks_long;
+ }
+ 
++/*
++ * 在以下使用iblock_complete_cmd():
++ *   - drivers/target/target_core_iblock.c|345| <<iblock_bio_done>> iblock_complete_cmd(cmd, blk_status);
++ *   - drivers/target/target_core_iblock.c|765| <<iblock_execute_rw>> iblock_complete_cmd(cmd, BLK_STS_OK);
++ *   - drivers/target/target_core_iblock.c|823| <<iblock_execute_rw>> iblock_complete_cmd(cmd, BLK_STS_OK);
++ */
+ static void iblock_complete_cmd(struct se_cmd *cmd, blk_status_t blk_status)
+ {
+ 	struct iblock_req *ibr = cmd->priv;
+ 	u8 status;
+ 
++	/*
++	 * 这里减少iblock_req->pending.
++	 */
+ 	if (!refcount_dec_and_test(&ibr->pending))
+ 		return;
+ 
+@@ -325,6 +334,10 @@ static void iblock_complete_cmd(struct se_cmd *cmd, blk_status_t blk_status)
+ 	kfree(ibr);
+ }
+ 
++/*
++ * 在以下使用iblock_bio_done():
++ *   - drivers/target/target_core_iblock.c|366| <<iblock_get_bio>> bio->bi_end_io = &iblock_bio_done;
++ */
+ static void iblock_bio_done(struct bio *bio)
+ {
+ 	struct se_cmd *cmd = bio->bi_private;
+@@ -342,9 +355,22 @@ static void iblock_bio_done(struct bio *bio)
+ 
+ 	bio_put(bio);
+ 
++	/*
++	 * 在以下使用iblock_complete_cmd():
++	 *   - drivers/target/target_core_iblock.c|345| <<iblock_bio_done>> iblock_complete_cmd(cmd, blk_status);
++	 *   - drivers/target/target_core_iblock.c|765| <<iblock_execute_rw>> iblock_complete_cmd(cmd, BLK_STS_OK);
++	 *   - drivers/target/target_core_iblock.c|823| <<iblock_execute_rw>> iblock_complete_cmd(cmd, BLK_STS_OK);
++	 */
+ 	iblock_complete_cmd(cmd, blk_status);
+ }
+ 
++/*
++ * 在以下使用iblock_get_bio():
++ *   - drivers/target/target_core_iblock.c|524| <<iblock_execute_write_same>> bio = iblock_get_bio(cmd, block_lba, 1, REQ_OP_WRITE);
++ *   - drivers/target/target_core_iblock.c|537| <<iblock_execute_write_same>> bio = iblock_get_bio(cmd, block_lba, 1, REQ_OP_WRITE);
++ *   - drivers/target/target_core_iblock.c|769| <<iblock_execute_rw>> bio = iblock_get_bio(cmd, block_lba, sgl_nents, opf);
++ *   - drivers/target/target_core_iblock.c|802| <<iblock_execute_rw>> bio = iblock_get_bio(cmd, block_lba, sg_num, opf);
++ */
+ static struct bio *iblock_get_bio(struct se_cmd *cmd, sector_t lba, u32 sg_num,
+ 				  blk_opf_t opf)
+ {
+@@ -369,6 +395,12 @@ static struct bio *iblock_get_bio(struct se_cmd *cmd, sector_t lba, u32 sg_num,
+ 	return bio;
+ }
+ 
++/*
++ * 在以下使用iblock_submit_bios():
++ *   - drivers/target/target_core_iblock.c|550| <<iblock_execute_write_same>> iblock_submit_bios(&list);
++ *   - drivers/target/target_core_iblock.c|798| <<iblock_execute_rw>> iblock_submit_bios(&list);
++ *   - drivers/target/target_core_iblock.c|822| <<iblock_execute_rw>> iblock_submit_bios(&list);
++ */
+ static void iblock_submit_bios(struct bio_list *list)
+ {
+ 	struct blk_plug plug;
+@@ -521,6 +553,13 @@ iblock_execute_write_same(struct se_cmd *cmd)
+ 		goto fail;
+ 	cmd->priv = ibr;
+ 
++	/*
++	 * 在以下使用iblock_get_bio():
++	 *   - drivers/target/target_core_iblock.c|524| <<iblock_execute_write_same>> bio = iblock_get_bio(cmd, block_lba, 1, REQ_OP_WRITE);
++	 *   - drivers/target/target_core_iblock.c|537| <<iblock_execute_write_same>> bio = iblock_get_bio(cmd, block_lba, 1, REQ_OP_WRITE);
++	 *   - drivers/target/target_core_iblock.c|769| <<iblock_execute_rw>> bio = iblock_get_bio(cmd, block_lba, sgl_nents, opf);
++	 *   - drivers/target/target_core_iblock.c|802| <<iblock_execute_rw>> bio = iblock_get_bio(cmd, block_lba, sg_num, opf);
++	 */
+ 	bio = iblock_get_bio(cmd, block_lba, 1, REQ_OP_WRITE);
+ 	if (!bio)
+ 		goto fail_free_ibr;
+@@ -534,6 +573,13 @@ iblock_execute_write_same(struct se_cmd *cmd)
+ 		while (bio_add_page(bio, sg_page(sg), sg->length, sg->offset)
+ 				!= sg->length) {
+ 
++			/*
++			 * 在以下使用iblock_get_bio():
++			 *   - drivers/target/target_core_iblock.c|524| <<iblock_execute_write_same>> bio = iblock_get_bio(cmd, block_lba, 1, REQ_OP_WRITE);
++			 *   - drivers/target/target_core_iblock.c|537| <<iblock_execute_write_same>> bio = iblock_get_bio(cmd, block_lba, 1, REQ_OP_WRITE);
++			 *   - drivers/target/target_core_iblock.c|769| <<iblock_execute_rw>> bio = iblock_get_bio(cmd, block_lba, sgl_nents, opf);
++			 *   - drivers/target/target_core_iblock.c|802| <<iblock_execute_rw>> bio = iblock_get_bio(cmd, block_lba, sg_num, opf);
++			 */
+ 			bio = iblock_get_bio(cmd, block_lba, 1, REQ_OP_WRITE);
+ 			if (!bio)
+ 				goto fail_put_bios;
+@@ -547,6 +593,12 @@ iblock_execute_write_same(struct se_cmd *cmd)
+ 		sectors -= sg->length >> SECTOR_SHIFT;
+ 	}
+ 
++	/*
++	 * 在以下使用iblock_submit_bios():
++	 *   - drivers/target/target_core_iblock.c|550| <<iblock_execute_write_same>> iblock_submit_bios(&list);
++	 *   - drivers/target/target_core_iblock.c|798| <<iblock_execute_rw>> iblock_submit_bios(&list);
++	 *   - drivers/target/target_core_iblock.c|822| <<iblock_execute_rw>> iblock_submit_bios(&list);
++	 */
+ 	iblock_submit_bios(&list);
+ 	return 0;
+ 
+@@ -766,6 +818,13 @@ iblock_execute_rw(struct se_cmd *cmd, struct scatterlist *sgl, u32 sgl_nents,
+ 		return 0;
+ 	}
+ 
++	/*
++	 * 在以下使用iblock_get_bio():
++	 *   - drivers/target/target_core_iblock.c|524| <<iblock_execute_write_same>> bio = iblock_get_bio(cmd, block_lba, 1, REQ_OP_WRITE);
++	 *   - drivers/target/target_core_iblock.c|537| <<iblock_execute_write_same>> bio = iblock_get_bio(cmd, block_lba, 1, REQ_OP_WRITE);
++	 *   - drivers/target/target_core_iblock.c|769| <<iblock_execute_rw>> bio = iblock_get_bio(cmd, block_lba, sgl_nents, opf);
++	 *   - drivers/target/target_core_iblock.c|802| <<iblock_execute_rw>> bio = iblock_get_bio(cmd, block_lba, sg_num, opf);
++	 */
+ 	bio = iblock_get_bio(cmd, block_lba, sgl_nents, opf);
+ 	if (!bio)
+ 		goto fail_free_ibr;
+@@ -795,10 +854,23 @@ iblock_execute_rw(struct se_cmd *cmd, struct scatterlist *sgl, u32 sgl_nents,
+ 			}
+ 
+ 			if (bio_cnt >= IBLOCK_MAX_BIO_PER_TASK) {
++				/*
++				 * 在以下使用iblock_submit_bios():
++				 *   - drivers/target/target_core_iblock.c|550| <<iblock_execute_write_same>> iblock_submit_bios(&list);
++				 *   - drivers/target/target_core_iblock.c|798| <<iblock_execute_rw>> iblock_submit_bios(&list);
++				 *   - drivers/target/target_core_iblock.c|822| <<iblock_execute_rw>> iblock_submit_bios(&list);
++				 */
+ 				iblock_submit_bios(&list);
+ 				bio_cnt = 0;
+ 			}
+ 
++			/*
++			 * 在以下使用iblock_get_bio():
++			 *   - drivers/target/target_core_iblock.c|524| <<iblock_execute_write_same>> bio = iblock_get_bio(cmd, block_lba, 1, REQ_OP_WRITE);
++			 *   - drivers/target/target_core_iblock.c|537| <<iblock_execute_write_same>> bio = iblock_get_bio(cmd, block_lba, 1, REQ_OP_WRITE);
++			 *   - drivers/target/target_core_iblock.c|769| <<iblock_execute_rw>> bio = iblock_get_bio(cmd, block_lba, sgl_nents, opf);
++			 *   - drivers/target/target_core_iblock.c|802| <<iblock_execute_rw>> bio = iblock_get_bio(cmd, block_lba, sg_num, opf);
++			 */
+ 			bio = iblock_get_bio(cmd, block_lba, sg_num, opf);
+ 			if (!bio)
+ 				goto fail_put_bios;
+@@ -819,7 +891,19 @@ iblock_execute_rw(struct se_cmd *cmd, struct scatterlist *sgl, u32 sgl_nents,
+ 			goto fail_put_bios;
+ 	}
+ 
++	/*
++	 * 在以下使用iblock_submit_bios():
++	 *   - drivers/target/target_core_iblock.c|550| <<iblock_execute_write_same>> iblock_submit_bios(&list);
++	 *   - drivers/target/target_core_iblock.c|798| <<iblock_execute_rw>> iblock_submit_bios(&list);
++	 *   - drivers/target/target_core_iblock.c|822| <<iblock_execute_rw>> iblock_submit_bios(&list);
++	 */
+ 	iblock_submit_bios(&list);
++	/*
++	 * 在以下使用iblock_complete_cmd():
++	 *   - drivers/target/target_core_iblock.c|345| <<iblock_bio_done>> iblock_complete_cmd(cmd, blk_status);
++	 *   - drivers/target/target_core_iblock.c|765| <<iblock_execute_rw>> iblock_complete_cmd(cmd, BLK_STS_OK);
++	 *   - drivers/target/target_core_iblock.c|823| <<iblock_execute_rw>> iblock_complete_cmd(cmd, BLK_STS_OK);
++	 */
+ 	iblock_complete_cmd(cmd, BLK_STS_OK);
+ 	return 0;
+ 
+diff --git a/drivers/target/target_core_transport.c b/drivers/target/target_core_transport.c
+index 0a76bdfe5..8d1400b19 100644
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@ -902,6 +902,13 @@ static bool target_cmd_interrupted(struct se_cmd *cmd)
+ 	return false;
+ }
+ 
++/*
++ * 在以下使用target_complete_cmd_with_sense():
++ *   - drivers/target/target_core_transport.c|950| <<target_complete_cmd>> target_complete_cmd_with_sense(cmd,
++ *             scsi_status, scsi_status ? TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE : TCM_NO_SENSE);
++ *   - drivers/target/target_core_xcopy.c|780| <<target_xcopy_do_work>> target_complete_cmd_with_sense(ec_cmd,
++ *             SAM_STAT_CHECK_CONDITION, sense_rc);
++ */
+ /* May be called from interrupt context so must not sleep. */
+ void target_complete_cmd_with_sense(struct se_cmd *cmd, u8 scsi_status,
+ 				    sense_reason_t sense_reason)
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 3bde4fb5c..b387a89ef 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -776,6 +776,17 @@ struct kvm {
+ 	struct kvm_memslots __memslots[KVM_MAX_NR_ADDRESS_SPACES][2];
+ 	/* The current active memslot set for each address space */
+ 	struct kvm_memslots __rcu *memslots[KVM_MAX_NR_ADDRESS_SPACES];
++	/*
++	 * 在以下使用kvm->vcpu_array:
++	 *   - include/linux/kvm_host.h|991| <<kvm_get_vcpu>> return xa_load(&kvm->vcpu_array, i);
++	 *   - include/linux/kvm_host.h|996| <<kvm_for_each_vcpu>> xa_for_each_range(&kvm->vcpu_array, idx, vcpup, 0, \
++	 *   - virt/kvm/kvm_main.c|489| <<kvm_destroy_vcpus>> xa_erase(&kvm->vcpu_array, i);
++	 *   - virt/kvm/kvm_main.c|497| <<kvm_destroy_vcpus>> WARN_ON_ONCE(xa_load(&kvm->vcpu_array, i) || kvm_get_vcpu(kvm, i));
++	 *   - virt/kvm/kvm_main.c|1125| <<kvm_create_vm>> xa_init(&kvm->vcpu_array);
++	 *   - virt/kvm/kvm_main.c|3995| <<kvm_vcpu_on_spin>> vcpu = xa_load(&kvm->vcpu_array, idx);
++	 *   - virt/kvm/kvm_main.c|4214| <<kvm_vm_ioctl_create_vcpu>> r = xa_insert(&kvm->vcpu_array, vcpu->vcpu_idx, vcpu, GFP_KERNEL_ACCOUNT);
++	 *   - virt/kvm/kvm_main.c|4249| <<kvm_vm_ioctl_create_vcpu>> xa_erase(&kvm->vcpu_array, vcpu->vcpu_idx);
++	 */
+ 	struct xarray vcpu_array;
+ 	/*
+ 	 * Protected by slots_lock, but can be read outside if an
+@@ -972,6 +983,41 @@ static inline struct kvm_io_bus *kvm_get_bus(struct kvm *kvm, enum kvm_bus idx)
+ 				      !refcount_read(&kvm->users_count));
+ }
+ 
++/*
++ * 在以下使用kvm_get_vcpu():
++ *   - arch/arm64/kvm/arm.c|2715| <<kvm_mpidr_to_vcpu>> vcpu = kvm_get_vcpu(kvm, data->cmpidr_to_idx[idx]);
++ *   - arch/arm64/kvm/vgic/vgic-debug.c|284| <<vgic_debug_show>> vcpu = kvm_get_vcpu(kvm, iter->vcpu_id);
++ *   - arch/arm64/kvm/vgic/vgic-init.c|184| <<kvm_vgic_dist_init>> struct kvm_vcpu *vcpu0 = kvm_get_vcpu(kvm, 0);
++ *   - arch/arm64/kvm/vgic/vgic-kvm-device.c|501| <<vgic_v3_parse_attr>> reg_attr->vcpu = kvm_get_vcpu(dev->kvm, 0);
++ *   - arch/arm64/kvm/vgic/vgic-mmio-v2.c|201| <<vgic_mmio_write_target>> irq->target_vcpu = kvm_get_vcpu(vcpu->kvm, target);
++ *   - arch/arm64/kvm/vgic/vgic-mmio-v3.c|836| <<vgic_register_all_redist_iodevs>> vcpu = kvm_get_vcpu(kvm, i);
++ *   - arch/arm64/kvm/vgic/vgic-v3.c|372| <<unmap_all_vpes>> free_irq(dist->its_vm.vpes[i]->irq, kvm_get_vcpu(kvm, i));
++ *   - arch/arm64/kvm/vgic/vgic-v3.c|381| <<map_all_vpes>> WARN_ON(vgic_v4_request_vpe_irq(kvm_get_vcpu(kvm, i),
++ *   - arch/arm64/kvm/vgic/vgic-v4.c|326| <<vgic_v4_teardown>> struct kvm_vcpu *vcpu = kvm_get_vcpu(kvm, i);
++ *   - arch/loongarch/kvm/intc/eiointc.c|50| <<eiointc_update_irq>> vcpu = kvm_get_vcpu(s->kvm, cpu);
++ *   - arch/loongarch/kvm/intc/ipi.c|321| <<kvm_ipi_regs_access>> vcpu = kvm_get_vcpu(dev->kvm, cpu);
++ *   - arch/mips/kvm/loongson_ipi.c|125| <<loongson_vipi_write>> kvm_vcpu_ioctl_interrupt(kvm_get_vcpu(kvm, id), &irq);
++ *   - arch/mips/kvm/loongson_ipi.c|133| <<loongson_vipi_write>> kvm_vcpu_ioctl_interrupt(kvm_get_vcpu(kvm, id), &irq);
++ *   - arch/mips/kvm/mips.c|495| <<kvm_vcpu_ioctl_interrupt>> dvcpu = kvm_get_vcpu(vcpu->kvm, irq->cpu);
++ *   - arch/powerpc/kvm/book3s_pr.c|1952| <<kvm_vm_ioctl_get_smmu_info_pr>> vcpu = kvm_get_vcpu(kvm, 0);
++ *   - arch/riscv/kvm/aia_device.c|166| <<aia_imsic_addr>> vcpu = kvm_get_vcpu(kvm, vcpu_idx);
++ *   - arch/riscv/kvm/aia_device.c|287| <<aia_init>> vcpu = kvm_get_vcpu(kvm, i);
++ *   - arch/s390/kvm/interrupt.c|1960| <<__floating_irq_kick>> } while (is_vcpu_stopped(kvm_get_vcpu(kvm, sigcpu)));
++ *   - arch/s390/kvm/interrupt.c|1962| <<__floating_irq_kick>> dst_vcpu = kvm_get_vcpu(kvm, sigcpu);
++ *   - arch/s390/kvm/interrupt.c|3076| <<__airqs_kick_single_vcpu>> vcpu = kvm_get_vcpu(kvm, vcpu_idx);
++ *   - arch/s390/kvm/kvm-s390.c|5481| <<kvm_s390_vcpu_start>> if (!is_vcpu_stopped(kvm_get_vcpu(vcpu->kvm, i)))
++ *   - arch/s390/kvm/kvm-s390.c|5548| <<kvm_s390_vcpu_stop>> struct kvm_vcpu *tmp = kvm_get_vcpu(vcpu->kvm, i);
++ *   - arch/x86/kvm/hyperv.c|198| <<get_vcpu_by_vpidx>> vcpu = kvm_get_vcpu(kvm, vpidx);
++ *   - arch/x86/kvm/hyperv.c|581| <<get_time_ref_counter>> vcpu = kvm_get_vcpu(kvm, 0);
++ *   - arch/x86/kvm/hyperv.c|2149| <<kvm_hv_flush_tlb>> v = kvm_get_vcpu(kvm, i);
++ *   - arch/x86/kvm/irq_comm.c|95| <<kvm_irq_delivery_to_apic>> lowest = kvm_get_vcpu(kvm, idx);
++ *   - arch/x86/kvm/svm/sev.c|1949| <<sev_migrate_from>> src_vcpu = kvm_get_vcpu(src_kvm, i);
++ *   - arch/x86/kvm/xen.c|1805| <<kvm_xen_set_evtchn_fast>> vcpu = kvm_get_vcpu(kvm, vcpu_idx);
++ *   - include/linux/kvm_host.h|1007| <<kvm_get_vcpu_by_id>> vcpu = kvm_get_vcpu(kvm, id);
++ *   - virt/kvm/kvm_main.c|258| <<kvm_make_vcpus_request_mask>> vcpu = kvm_get_vcpu(kvm, i);
++ *   - virt/kvm/kvm_main.c|497| <<kvm_destroy_vcpus>> WARN_ON_ONCE(xa_load(&kvm->vcpu_array, i) || kvm_get_vcpu(kvm, i));
++ *   - virt/kvm/kvm_main.c|4394| <<kvm_wait_for_vcpu_online>> if (WARN_ON_ONCE(!kvm_get_vcpu(kvm, vcpu->vcpu_idx)))
++ */
+ static inline struct kvm_vcpu *kvm_get_vcpu(struct kvm *kvm, int i)
+ {
+ 	int num_vcpus = atomic_read(&kvm->online_vcpus);
+@@ -986,16 +1032,44 @@ static inline struct kvm_vcpu *kvm_get_vcpu(struct kvm *kvm, int i)
+ 
+ 	i = array_index_nospec(i, num_vcpus);
+ 
++	/*
++	 * 在以下使用kvm->vcpu_array:
++	 *   - include/linux/kvm_host.h|991| <<kvm_get_vcpu>> return xa_load(&kvm->vcpu_array, i);
++	 *   - include/linux/kvm_host.h|996| <<kvm_for_each_vcpu>> xa_for_each_range(&kvm->vcpu_array, idx, vcpup, 0, \
++	 *   - virt/kvm/kvm_main.c|489| <<kvm_destroy_vcpus>> xa_erase(&kvm->vcpu_array, i);
++	 *   - virt/kvm/kvm_main.c|497| <<kvm_destroy_vcpus>> WARN_ON_ONCE(xa_load(&kvm->vcpu_array, i) || kvm_get_vcpu(kvm, i));
++	 *   - virt/kvm/kvm_main.c|1125| <<kvm_create_vm>> xa_init(&kvm->vcpu_array);
++	 *   - virt/kvm/kvm_main.c|3995| <<kvm_vcpu_on_spin>> vcpu = xa_load(&kvm->vcpu_array, idx);
++	 *   - virt/kvm/kvm_main.c|4214| <<kvm_vm_ioctl_create_vcpu>> r = xa_insert(&kvm->vcpu_array, vcpu->vcpu_idx, vcpu, GFP_KERNEL_ACCOUNT);
++	 *   - virt/kvm/kvm_main.c|4249| <<kvm_vm_ioctl_create_vcpu>> xa_erase(&kvm->vcpu_array, vcpu->vcpu_idx);
++	 */
+ 	/* Pairs with smp_wmb() in kvm_vm_ioctl_create_vcpu.  */
+ 	smp_rmb();
+ 	return xa_load(&kvm->vcpu_array, i);
+ }
+ 
++/*
++ * 在以下使用kvm->vcpu_array:
++ *   - include/linux/kvm_host.h|991| <<kvm_get_vcpu>> return xa_load(&kvm->vcpu_array, i);
++ *   - include/linux/kvm_host.h|996| <<kvm_for_each_vcpu>> xa_for_each_range(&kvm->vcpu_array, idx, vcpup, 0, \
++ *   - virt/kvm/kvm_main.c|489| <<kvm_destroy_vcpus>> xa_erase(&kvm->vcpu_array, i);
++ *   - virt/kvm/kvm_main.c|497| <<kvm_destroy_vcpus>> WARN_ON_ONCE(xa_load(&kvm->vcpu_array, i) || kvm_get_vcpu(kvm, i));
++ *   - virt/kvm/kvm_main.c|1125| <<kvm_create_vm>> xa_init(&kvm->vcpu_array);
++ *   - virt/kvm/kvm_main.c|3995| <<kvm_vcpu_on_spin>> vcpu = xa_load(&kvm->vcpu_array, idx);
++ *   - virt/kvm/kvm_main.c|4214| <<kvm_vm_ioctl_create_vcpu>> r = xa_insert(&kvm->vcpu_array, vcpu->vcpu_idx, vcpu, GFP_KERNEL_ACCOUNT);
++ *   - virt/kvm/kvm_main.c|4249| <<kvm_vm_ioctl_create_vcpu>> xa_erase(&kvm->vcpu_array, vcpu->vcpu_idx);
++ *
++ *
++ * 特别特别多的调用
++ */
+ #define kvm_for_each_vcpu(idx, vcpup, kvm)				\
+ 	if (atomic_read(&kvm->online_vcpus))				\
+ 		xa_for_each_range(&kvm->vcpu_array, idx, vcpup, 0,	\
+ 				  (atomic_read(&kvm->online_vcpus) - 1))
+ 
++/*
++ * 很多的调用
++ */
+ static inline struct kvm_vcpu *kvm_get_vcpu_by_id(struct kvm *kvm, int id)
+ {
+ 	struct kvm_vcpu *vcpu = NULL;
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index af43a8d2a..54b421162 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -4134,6 +4134,53 @@ static inline int ib_dma_mapping_error(struct ib_device *dev, u64 dma_addr)
+ 	return dma_mapping_error(dev->dma_device, dma_addr);
+ }
+ 
++/*
++ * 在以下调用ib_dma_map_single():
++ *   - drivers/infiniband/core/mad.c|1010| <<ib_send_mad>> sge[0].addr = ib_dma_map_single(mad_agent->device,
++ *   - drivers/infiniband/core/mad.c|1019| <<ib_send_mad>> sge[1].addr = ib_dma_map_single(mad_agent->device,
++ *   - drivers/infiniband/core/mad.c|2700| <<ib_mad_post_receive_mads>> sg_list.addr = ib_dma_map_single(qp_info->port_priv->device,
++ *   - drivers/infiniband/hw/mlx4/mad.c|1642| <<mlx4_ib_alloc_pv_bufs>> tun_qp->ring[i].map = ib_dma_map_single(ctx->ib_dev,
++ *   - drivers/infiniband/hw/mlx4/mad.c|1658| <<mlx4_ib_alloc_pv_bufs>> ib_dma_map_single(ctx->ib_dev,
++ *   - drivers/infiniband/hw/mlx4/qp.c|486| <<alloc_proxy_bufs>> ib_dma_map_single(dev, qp->sqp_proxy_rcv[i].addr,
++ *   - drivers/infiniband/ulp/ipoib/ipoib_cm.c|161| <<ipoib_cm_alloc_rx_skb>> mapping[0] = ib_dma_map_single(priv->ca, skb->data, IPOIB_CM_HEAD_SIZE,
++ *   - drivers/infiniband/ulp/ipoib/ipoib_ib.c|143| <<ipoib_alloc_rx_skb>> mapping[0] = ib_dma_map_single(priv->ca, skb->data, buf_size,
++ *   - drivers/infiniband/ulp/ipoib/ipoib_ib.c|284| <<ipoib_dma_map_tx>> mapping[0] = ib_dma_map_single(ca, skb->data, skb_headlen(skb),
++ *   - drivers/infiniband/ulp/iser/iscsi_iser.c|206| <<iser_initialize_task_headers>> dma_addr = ib_dma_map_single(device->ib_device, (void *)tx_desc,
++ *   - drivers/infiniband/ulp/iser/iser_initiator.c|191| <<iser_alloc_login_buf>> desc->req_dma = ib_dma_map_single(device->ib_device, desc->req,
++ *   - drivers/infiniband/ulp/iser/iser_initiator.c|202| <<iser_alloc_login_buf>> desc->rsp_dma = ib_dma_map_single(device->ib_device, desc->rsp,
++ *   - drivers/infiniband/ulp/iser/iser_initiator.c|252| <<iser_alloc_rx_descriptors>> dma_addr = ib_dma_map_single(device->ib_device, (void *)rx_desc,
++ *   - drivers/infiniband/ulp/isert/ib_isert.c|164| <<isert_alloc_rx_descriptors>> dma_addr = ib_dma_map_single(ib_dev, rx_desc->buf,
++ *   - drivers/infiniband/ulp/isert/ib_isert.c|341| <<isert_alloc_login_buf>> isert_conn->login_desc->dma_addr = ib_dma_map_single(ib_dev,
++ *   - drivers/infiniband/ulp/isert/ib_isert.c|357| <<isert_alloc_login_buf>> isert_conn->login_rsp_dma = ib_dma_map_single(ib_dev,
++ *   - drivers/infiniband/ulp/isert/ib_isert.c|843| <<isert_init_tx_hdrs>> dma_addr = ib_dma_map_single(ib_dev, (void *)tx_desc,
++ *   - drivers/infiniband/ulp/isert/ib_isert.c|1789| <<isert_put_response>> isert_cmd->pdu_buf_dma = ib_dma_map_single(ib_dev,
++ *   - drivers/infiniband/ulp/isert/ib_isert.c|1918| <<isert_put_reject>> isert_cmd->pdu_buf_dma = ib_dma_map_single(ib_dev,
++ *   - drivers/infiniband/ulp/isert/ib_isert.c|1961| <<isert_put_text_rsp>> isert_cmd->pdu_buf_dma = ib_dma_map_single(ib_dev,
++ *   - drivers/infiniband/ulp/rtrs/rtrs.c|39| <<isert_put_text_rsp>> iu->dma_addr = ib_dma_map_single(dma_dev, iu->buf, size, dir);
++ *   - drivers/infiniband/ulp/srp/ib_srp.c|235| <<srp_alloc_iu>> iu->dma = ib_dma_map_single(host->srp_dev->dev, iu->buf, size,
++ *   - drivers/infiniband/ulp/srp/ib_srp.c|1000| <<srp_init_cmd_priv>> dma_addr = ib_dma_map_single(ibdev, req->indirect_desc,
++ *   - drivers/infiniband/ulp/srpt/ib_srpt.c|735| <<srpt_alloc_ioctx>> ioctx->dma = ib_dma_map_single(sdev->device, ioctx->buf,
++ *   - drivers/nvme/host/rdma.c|190| <<nvme_rdma_alloc_qe>> qe->dma = ib_dma_map_single(ibdev, qe->data, capsule_size, dir);
++ *   - drivers/nvme/host/rdma.c|2013| <<nvme_rdma_queue_rq>> req->sqe.dma = ib_dma_map_single(dev, req->sqe.data,
++ *   - drivers/nvme/target/rdma.c|324| <<nvmet_rdma_alloc_cmd>> c->sge[0].addr = ib_dma_map_single(ndev->device, c->nvme_cmd,
++ *   - drivers/nvme/target/rdma.c|408| <<nvmet_rdma_alloc_rsp>> r->send_sge.addr = ib_dma_map_single(ndev->device, r->req.cqe,
++ *   - fs/smb/client/smbdirect.c|717| <<smbd_post_send_negotiate_req>> request->sge[0].addr = ib_dma_map_single(
++ *   - fs/smb/client/smbdirect.c|961| <<smbd_post_send_iter>> request->sge[0].addr = ib_dma_map_single(sc->ib.dev,
++ *   - fs/smb/client/smbdirect.c|1052| <<smbd_post_recv>> response->sge.addr = ib_dma_map_single(
++ *   - fs/smb/server/transport_rdma.c|652| <<smb_direct_post_recv>> recvmsg->sge.addr = ib_dma_map_single(t->cm_id->device,
++ *   - fs/smb/server/transport_rdma.c|1068| <<smb_direct_create_header>> sendmsg->sge[0].addr = ib_dma_map_single(t->cm_id->device,
++ *   - fs/smb/server/transport_rdma.c|1618| <<smb_direct_send_negotiate_response>> sendmsg->sge[0].addr = ib_dma_map_single(t->cm_id->device,
++ *   - net/9p/trans_rdma.c|390| <<post_recv>> c->busa = ib_dma_map_single(rdma->cm_id->device,
++ *   - net/9p/trans_rdma.c|485| <<rdma_request>> c->busa = ib_dma_map_single(rdma->cm_id->device,
++ *   - net/rds/ib_cm.c|425| <<rds_dma_hdr_alloc>> *dma_addr = ib_dma_map_single(dev, hdr, sizeof(*hdr),
++ *   - net/smc/smc_wr.c|872| <<smc_wr_create_link>> lnk->wr_rx_dma_addr = ib_dma_map_single(
++ *   - net/smc/smc_wr.c|883| <<smc_wr_create_link>> ib_dma_map_single(ibdev, lnk->lgr->wr_rx_buf_v2,
++ *   - net/smc/smc_wr.c|891| <<smc_wr_create_link>> lnk->wr_tx_v2_dma_addr = ib_dma_map_single(ibdev,
++ *   - net/smc/smc_wr.c|900| <<smc_wr_create_link>> lnk->wr_tx_dma_addr = ib_dma_map_single(
++ *   - net/sunrpc/xprtrdma/svc_rdma_recvfrom.c|136| <<svc_rdma_recv_ctxt_alloc>> addr = ib_dma_map_single(rdma->sc_pd->device, buffer,
++ *   - net/sunrpc/xprtrdma/svc_rdma_sendto.c|139| <<svc_rdma_send_ctxt_alloc>> addr = ib_dma_map_single(rdma->sc_pd->device, buffer,
++ *   - net/sunrpc/xprtrdma/verbs.c|1309| <<__rpcrdma_regbuf_dma_map>> rb->rg_iov.addr = ib_dma_map_single(device, rdmab_data(rb),
++ */
+ /**
+  * ib_dma_map_single - Map a kernel virtual address to DMA address
+  * @dev: The device for which the dma_addr is to be created
+diff --git a/net/rds/ib.c b/net/rds/ib.c
+index 9826fe7f9..df13e0249 100644
+--- a/net/rds/ib.c
++++ b/net/rds/ib.c
+@@ -573,6 +573,29 @@ int rds_ib_init(void)
+ 	if (ret)
+ 		goto out;
+ 
++	/*
++	 * 在以下使用ib_register_client():
++	 *   - drivers/infiniband/core/cm.c|4492| <<ib_cm_init>> ret = ib_register_client(&cm_client);
++	 *   - drivers/infiniband/core/cma.c|5474| <<cma_init>> ret = ib_register_client(&cma_client);
++	 *   - drivers/infiniband/core/mad.c|3151| <<ib_mad_init>> if (ib_register_client(&mad_client)) {
++	 *   - drivers/infiniband/core/multicast.c|890| <<mcast_init>> ret = ib_register_client(&mcast_client);
++	 *   - drivers/infiniband/core/sa_query.c|2261| <<ib_sa_init>> ret = ib_register_client(&sa_client);
++	 *   - drivers/infiniband/core/ucma.c|1866| <<ucma_init>> ret = ib_register_client(&rdma_cma_client);
++	 *   - drivers/infiniband/core/user_mad.c|1477| <<ib_umad_init>> ret = ib_register_client(&umad_client);
++	 *   - drivers/infiniband/core/user_mad.c|1481| <<ib_umad_init>> ret = ib_register_client(&issm_client);
++	 *   - drivers/infiniband/core/uverbs_main.c|1318| <<ib_uverbs_init>> ret = ib_register_client(&uverbs_client);
++	 *   - drivers/infiniband/ulp/ipoib/ipoib_main.c|2736| <<ipoib_init_module>> ret = ib_register_client(&ipoib_client);
++	 *   - drivers/infiniband/ulp/opa_vnic/opa_vnic_vema.c|1040| <<opa_vnic_init>> rc = ib_register_client(&opa_vnic_client);
++	 *   - drivers/infiniband/ulp/rtrs/rtrs-srv.c|2202| <<rtrs_srv_open>> err = ib_register_client(&rtrs_srv_client);
++	 *   - drivers/infiniband/ulp/srp/ib_srp.c|4190| <<srp_init_module>> ret = ib_register_client(&srp_client);
++	 *   - drivers/infiniband/ulp/srpt/ib_srpt.c|3965| <<srpt_init_module>> ret = ib_register_client(&srpt_client);
++	 *   - drivers/nvme/host/rdma.c|2401| <<nvme_rdma_init_module>> ret = ib_register_client(&nvme_rdma_ib_client);
++	 *   - drivers/nvme/target/rdma.c|2102| <<nvmet_rdma_init>> ret = ib_register_client(&nvmet_rdma_ib_client);
++	 *   - fs/smb/server/transport_rdma.c|2195| <<ksmbd_rdma_init>> ret = ib_register_client(&smb_direct_ib_client);
++	 *   - net/rds/ib.c|576| <<rds_ib_init>> ret = ib_register_client(&rds_ib_client);
++	 *   - net/smc/smc_ib.c|1012| <<smc_ib_register_client>> return ib_register_client(&smc_ib_client);
++	 *   - net/sunrpc/xprtrdma/ib_client.c|183| <<rpcrdma_ib_client_register>> return ib_register_client(&rpcrdma_ib_client);
++	 */
+ 	ret = ib_register_client(&rds_ib_client);
+ 	if (ret)
+ 		goto out_mr_exit;
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 222f0e894..69df5bc05 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -486,6 +486,17 @@ void kvm_destroy_vcpus(struct kvm *kvm)
+ 
+ 	kvm_for_each_vcpu(i, vcpu, kvm) {
+ 		kvm_vcpu_destroy(vcpu);
++		/*
++		 * 在以下使用kvm->vcpu_array:
++		 *   - include/linux/kvm_host.h|991| <<kvm_get_vcpu>> return xa_load(&kvm->vcpu_array, i);
++		 *   - include/linux/kvm_host.h|996| <<kvm_for_each_vcpu>> xa_for_each_range(&kvm->vcpu_array, idx, vcpup, 0, \
++		 *   - virt/kvm/kvm_main.c|489| <<kvm_destroy_vcpus>> xa_erase(&kvm->vcpu_array, i);
++		 *   - virt/kvm/kvm_main.c|497| <<kvm_destroy_vcpus>> WARN_ON_ONCE(xa_load(&kvm->vcpu_array, i) || kvm_get_vcpu(kvm, i));
++		 *   - virt/kvm/kvm_main.c|1125| <<kvm_create_vm>> xa_init(&kvm->vcpu_array);
++		 *   - virt/kvm/kvm_main.c|3995| <<kvm_vcpu_on_spin>> vcpu = xa_load(&kvm->vcpu_array, idx);
++		 *   - virt/kvm/kvm_main.c|4214| <<kvm_vm_ioctl_create_vcpu>> r = xa_insert(&kvm->vcpu_array, vcpu->vcpu_idx, vcpu, GFP_KERNEL_ACCOUNT);
++		 *   - virt/kvm/kvm_main.c|4249| <<kvm_vm_ioctl_create_vcpu>> xa_erase(&kvm->vcpu_array, vcpu->vcpu_idx);
++		 */
+ 		xa_erase(&kvm->vcpu_array, i);
+ 
+ 		/*
+@@ -1122,6 +1133,17 @@ static struct kvm *kvm_create_vm(unsigned long type, const char *fdname)
+ 	mutex_init(&kvm->slots_arch_lock);
+ 	spin_lock_init(&kvm->mn_invalidate_lock);
+ 	rcuwait_init(&kvm->mn_memslots_update_rcuwait);
++	/*
++	 * 在以下使用kvm->vcpu_array:
++	 *   - include/linux/kvm_host.h|991| <<kvm_get_vcpu>> return xa_load(&kvm->vcpu_array, i);
++	 *   - include/linux/kvm_host.h|996| <<kvm_for_each_vcpu>> xa_for_each_range(&kvm->vcpu_array, idx, vcpup, 0, \
++	 *   - virt/kvm/kvm_main.c|489| <<kvm_destroy_vcpus>> xa_erase(&kvm->vcpu_array, i);
++	 *   - virt/kvm/kvm_main.c|497| <<kvm_destroy_vcpus>> WARN_ON_ONCE(xa_load(&kvm->vcpu_array, i) || kvm_get_vcpu(kvm, i));
++	 *   - virt/kvm/kvm_main.c|1125| <<kvm_create_vm>> xa_init(&kvm->vcpu_array);
++	 *   - virt/kvm/kvm_main.c|3995| <<kvm_vcpu_on_spin>> vcpu = xa_load(&kvm->vcpu_array, idx);
++	 *   - virt/kvm/kvm_main.c|4214| <<kvm_vm_ioctl_create_vcpu>> r = xa_insert(&kvm->vcpu_array, vcpu->vcpu_idx, vcpu, GFP_KERNEL_ACCOUNT);
++	 *   - virt/kvm/kvm_main.c|4249| <<kvm_vm_ioctl_create_vcpu>> xa_erase(&kvm->vcpu_array, vcpu->vcpu_idx);
++	 */
+ 	xa_init(&kvm->vcpu_array);
+ #ifdef CONFIG_KVM_GENERIC_MEMORY_ATTRIBUTES
+ 	xa_init(&kvm->mem_attr_array);
+@@ -3992,6 +4014,17 @@ void kvm_vcpu_on_spin(struct kvm_vcpu *me, bool yield_to_kernel_mode)
+ 		if (idx == me->vcpu_idx)
+ 			continue;
+ 
++		/*
++		 * 在以下使用kvm->vcpu_array:
++		 *   - include/linux/kvm_host.h|991| <<kvm_get_vcpu>> return xa_load(&kvm->vcpu_array, i);
++		 *   - include/linux/kvm_host.h|996| <<kvm_for_each_vcpu>> xa_for_each_range(&kvm->vcpu_array, idx, vcpup, 0, \
++		 *   - virt/kvm/kvm_main.c|489| <<kvm_destroy_vcpus>> xa_erase(&kvm->vcpu_array, i);
++		 *   - virt/kvm/kvm_main.c|497| <<kvm_destroy_vcpus>> WARN_ON_ONCE(xa_load(&kvm->vcpu_array, i) || kvm_get_vcpu(kvm, i));
++		 *   - virt/kvm/kvm_main.c|1125| <<kvm_create_vm>> xa_init(&kvm->vcpu_array);
++		 *   - virt/kvm/kvm_main.c|3995| <<kvm_vcpu_on_spin>> vcpu = xa_load(&kvm->vcpu_array, idx);
++		 *   - virt/kvm/kvm_main.c|4214| <<kvm_vm_ioctl_create_vcpu>> r = xa_insert(&kvm->vcpu_array, vcpu->vcpu_idx, vcpu, GFP_KERNEL_ACCOUNT);
++		 *   - virt/kvm/kvm_main.c|4249| <<kvm_vm_ioctl_create_vcpu>> xa_erase(&kvm->vcpu_array, vcpu->vcpu_idx);
++		 */
+ 		vcpu = xa_load(&kvm->vcpu_array, idx);
+ 		if (!READ_ONCE(vcpu->ready))
+ 			continue;
+@@ -4211,6 +4244,17 @@ static int kvm_vm_ioctl_create_vcpu(struct kvm *kvm, unsigned long id)
+ 	}
+ 
+ 	vcpu->vcpu_idx = atomic_read(&kvm->online_vcpus);
++	/*
++	 * 在以下使用kvm->vcpu_array:
++	 *   - include/linux/kvm_host.h|991| <<kvm_get_vcpu>> return xa_load(&kvm->vcpu_array, i);
++	 *   - include/linux/kvm_host.h|996| <<kvm_for_each_vcpu>> xa_for_each_range(&kvm->vcpu_array, idx, vcpup, 0, \
++	 *   - virt/kvm/kvm_main.c|489| <<kvm_destroy_vcpus>> xa_erase(&kvm->vcpu_array, i);
++	 *   - virt/kvm/kvm_main.c|497| <<kvm_destroy_vcpus>> WARN_ON_ONCE(xa_load(&kvm->vcpu_array, i) || kvm_get_vcpu(kvm, i));
++	 *   - virt/kvm/kvm_main.c|1125| <<kvm_create_vm>> xa_init(&kvm->vcpu_array);
++	 *   - virt/kvm/kvm_main.c|3995| <<kvm_vcpu_on_spin>> vcpu = xa_load(&kvm->vcpu_array, idx);
++	 *   - virt/kvm/kvm_main.c|4214| <<kvm_vm_ioctl_create_vcpu>> r = xa_insert(&kvm->vcpu_array, vcpu->vcpu_idx, vcpu, GFP_KERNEL_ACCOUNT);
++	 *   - virt/kvm/kvm_main.c|4249| <<kvm_vm_ioctl_create_vcpu>> xa_erase(&kvm->vcpu_array, vcpu->vcpu_idx);
++	 */
+ 	r = xa_insert(&kvm->vcpu_array, vcpu->vcpu_idx, vcpu, GFP_KERNEL_ACCOUNT);
+ 	WARN_ON_ONCE(r == -EBUSY);
+ 	if (r)
+-- 
+2.39.5 (Apple Git-154)
+
