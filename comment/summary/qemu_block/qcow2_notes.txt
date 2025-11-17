@@ -1,0 +1,103 @@
+QCOW2的cluster可以分为:
+
+- Data cluster (数据 cluster)
+存储实际虚拟磁盘数据(文件内容)
+通过L1->L2->cluster offset映射访问
+
+- Refcount block cluster
+存储refcount block(每个cluster的引用计数)
+通过refcount table指向
+
+- L1 table cluster
+存储L1表(指向L2 tables)
+通常一个cluster存1个L1 table(如果L1 table太大,会有多个cluster)
+
+- L2 table cluster
+存储L2 table(指向 data clusters)
+L1 entry指向它
+
+- 其他metadata(header extension, snapshot metadata, bitmap)
+由QCOW2的header extension指向
+
+-----------------
+
+给一个cluster index, 怎样确认这个cluster是什么?
+
+1. 计算 cluster offset
+
+cluster_offset = cluster_index * cluster_size
+
+2. 检查cluster是否属于L1/L2/refcount table.
+
+2.1 Refcount block
+
+遍历refcount table: 每个entry指向一个refcount block cluster
+
+每个block占cluster_size(或多cluster）
+
+如果cluster_offset在refcount block所占区间内-->metadata(refcount)
+
+2.2 L1 table
+
+header中有L1 table offset和L1 table size(单位 cluster)
+
+如果cluster_offset在[L1_table_offset, L1_table_offset + L1_table_clusters*cluster_size)-->metadata(L1 table)
+
+2.3 L2 table
+
+遍历L1 table entries, 取每个L2 offset --> cluster_offset
+
+如果cluster_offset在某个L2 table cluster内 --> metadata(L2 table)
+
+3. 如果不属于任何metadata --> 数据cluster
+
+遍历L1-->L2 table映射
+
+如果cluster_index被某个L2 entry指向-->data cluster
+
+-----------------
+
+如果read的时候某个地址没有, 就要去base寻找, 
+比如 line 2461: bs->backing.
+
+2443 static int coroutine_fn GRAPH_RDLOCK
+2444 qcow2_co_preadv_task(BlockDriverState *bs, QCow2SubclusterType subc_type,
+2445                      uint64_t host_offset, uint64_t offset, uint64_t bytes,
+2446                      QEMUIOVector *qiov, size_t qiov_offset)
+2447 {
+2448     BDRVQcow2State *s = bs->opaque;
+2449
+2450     switch (subc_type) {
+2451     case QCOW2_SUBCLUSTER_ZERO_PLAIN:
+2452     case QCOW2_SUBCLUSTER_ZERO_ALLOC:
+2453         /* Both zero types are handled in qcow2_co_preadv_part */
+2454         g_assert_not_reached();
+2455
+2456     case QCOW2_SUBCLUSTER_UNALLOCATED_PLAIN:
+2457     case QCOW2_SUBCLUSTER_UNALLOCATED_ALLOC:
+2458         assert(bs->backing); /* otherwise handled in qcow2_co_preadv_part */
+2459
+2460         BLKDBG_CO_EVENT(bs->file, BLKDBG_READ_BACKING_AIO);
+2461         return bdrv_co_preadv_part(bs->backing, offset, bytes,
+2462                                    qiov, qiov_offset, 0);
+2463
+2464     case QCOW2_SUBCLUSTER_COMPRESSED:
+2465         return qcow2_co_preadv_compressed(bs, host_offset,
+2466                                           offset, bytes, qiov, qiov_offset);
+2467
+2468     case QCOW2_SUBCLUSTER_NORMAL:
+2469         if (bs->encrypted) {
+2470             return qcow2_co_preadv_encrypted(bs, host_offset,
+2471                                              offset, bytes, qiov, qiov_offset);
+2472         }
+2473
+2474         BLKDBG_CO_EVENT(bs->file, BLKDBG_READ_AIO);
+2475         return bdrv_co_preadv_part(s->data_file, host_offset,
+2476                                    bytes, qiov, qiov_offset, 0);
+2477
+2478     default:
+2479         g_assert_not_reached();
+2480     }
+2481
+2482     g_assert_not_reached();
+2483 }
