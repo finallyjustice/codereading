@@ -1,0 +1,2381 @@
+From 517c6e9abbf950e24af8d25f4a66768db574d572 Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang0129@gmail.com>
+Date: Sun, 18 Jan 2026 21:36:45 -0800
+Subject: [PATCH 1/1] linux v5.15.0-314.193.5.4
+
+Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
+---
+ drivers/virtio/virtio_balloon.c    | 656 +++++++++++++++++++++++++++++
+ include/linux/balloon_compaction.h |  60 +++
+ include/linux/fs.h                 |  16 +
+ include/linux/huge_mm.h            |  11 +
+ mm/balloon_compaction.c            | 138 ++++++
+ mm/compaction.c                    | 119 ++++++
+ mm/gup.c                           |  13 +
+ mm/huge_memory.c                   |  14 +
+ mm/memory-failure.c                |  13 +
+ mm/memory_hotplug.c                |  13 +
+ mm/mempolicy.c                     |  26 ++
+ mm/migrate.c                       | 143 +++++++
+ mm/oom_kill.c                      |   9 +
+ mm/page_alloc.c                    |  13 +
+ mm/vmscan.c                        |  29 ++
+ 15 files changed, 1273 insertions(+)
+
+diff --git a/drivers/virtio/virtio_balloon.c b/drivers/virtio/virtio_balloon.c
+index f94db1dbc36c..13afe1819645 100644
+--- a/drivers/virtio/virtio_balloon.c
++++ b/drivers/virtio/virtio_balloon.c
+@@ -29,6 +29,13 @@
+  */
+ #define VIRTIO_BALLOON_PAGES_PER_PAGE (unsigned int)(PAGE_SIZE >> VIRTIO_BALLOON_PFN_SHIFT)
+ #define VIRTIO_BALLOON_ARRAY_PFNS_MAX 256
++/*
++ * 在以下使用VIRTIO_BALLOON_OOM_NR_PAGES:
++ *   - drivers/virtio/virtio_balloon.c|999| <<virtio_balloon_oom_notify>> *freed += leak_balloon(vb, VIRTIO_BALLOON_OOM_NR_PAGES) /
++ *
++ * 在以下使用VIRTIO_BALLOON_OOM_NOTIFY_PRIORITY:
++ *   - drivers/virtio/virtio_balloon.c|1099| <<virtballoon_probe>> vb->oom_nb.priority = VIRTIO_BALLOON_OOM_NOTIFY_PRIORITY;
++ */
+ /* Maximum number of (4k) pages to deflate on OOM notifications. */
+ #define VIRTIO_BALLOON_OOM_NR_PAGES 256
+ #define VIRTIO_BALLOON_OOM_NOTIFY_PRIORITY 80
+@@ -43,6 +50,15 @@
+ #define VIRTIO_BALLOON_HINT_BLOCK_PAGES (1 << VIRTIO_BALLOON_HINT_BLOCK_ORDER)
+ 
+ #ifdef CONFIG_BALLOON_COMPACTION
++/*
++ * 在以下使用balloon_mnt:
++ *   - drivers/virtio/virtio_balloon.c|1051| <<virtballoon_probe>> balloon_mnt = kern_mount(&balloon_fs);
++ *   - drivers/virtio/virtio_balloon.c|1052| <<virtballoon_probe>> if (IS_ERR(balloon_mnt)) {
++ *   - drivers/virtio/virtio_balloon.c|1053| <<virtballoon_probe>> err = PTR_ERR(balloon_mnt);
++ *   - drivers/virtio/virtio_balloon.c|1058| <<virtballoon_probe>> vb->vb_dev_info.inode = alloc_anon_inode(balloon_mnt->mnt_sb);
++ *   - drivers/virtio/virtio_balloon.c|1176| <<virtballoon_probe>> kern_unmount(balloon_mnt);
++ *   - drivers/virtio/virtio_balloon.c|1229| <<virtballoon_remove>> kern_unmount(balloon_mnt);
++ */
+ static struct vfsmount *balloon_mnt;
+ #endif
+ 
+@@ -65,22 +81,58 @@ struct virtio_balloon {
+ 
+ 	/* Balloon's own wq for cpu-intensive work items */
+ 	struct workqueue_struct *balloon_wq;
++	/*
++	 * 在以下使用virtio_balloon->report_free_page_work:
++	 *   - drivers/virtio/virtio_balloon.c|666| <<virtio_balloon_queue_free_page_work>> queue_work(vb->balloon_wq, &vb->report_free_page_work);
++	 *   - drivers/virtio/virtio_balloon.c|1284| <<virtballoon_probe>> INIT_WORK(&vb->report_free_page_work, report_free_page_func);
++	 *   - drivers/virtio/virtio_balloon.c|1449| <<virtballoon_remove>> cancel_work_sync(&vb->report_free_page_work);
++	 */
+ 	/* The free page reporting work item submitted to the balloon wq */
+ 	struct work_struct report_free_page_work;
+ 
++	/*
++	 * 在以下使用virtio_balloon->update_balloon_stats_work:
++	 *   - drivers/virtio/virtio_balloon.c|500| <<stats_request>> queue_work(system_freezable_wq, &vb->update_balloon_stats_work);
++	 *   - drivers/virtio/virtio_balloon.c|1124| <<virtballoon_probe>> INIT_WORK(&vb->update_balloon_stats_work, update_balloon_stats_func);
++	 *   - drivers/virtio/virtio_balloon.c|1338| <<virtballoon_remove>> cancel_work_sync(&vb->update_balloon_stats_work);
++	 */
+ 	/* The balloon servicing is delegated to a freezable workqueue. */
+ 	struct work_struct update_balloon_stats_work;
++	/*
++	 * 在以下使用virtio_balloon->update_balloon_size_work:
++	 *   - drivers/virtio/virtio_balloon.c|550| <<virtballoon_changed>> queue_work(system_freezable_wq, &vb->update_balloon_size_work);
++	 *   - drivers/virtio/virtio_balloon.c|1038| <<virtballoon_probe>> INIT_WORK(&vb->update_balloon_size_work, update_balloon_size_func);
++	 *   - drivers/virtio/virtio_balloon.c|1216| <<virtballoon_remove>> cancel_work_sync(&vb->update_balloon_size_work);
++	 */
+ 	struct work_struct update_balloon_size_work;
+ 
+ 	/* Prevent updating balloon when it is being canceled. */
+ 	spinlock_t stop_update_lock;
++	/*
++	 * 在以下使用virtio_balloon->stop_update:
++	 *   - drivers/virtio/virtio_balloon.c|584| <<stats_request>> if (!vb->stop_update)
++	 *   - drivers/virtio/virtio_balloon.c|713| <<virtballoon_changed>> if (!vb->stop_update) {
++	 *   - drivers/virtio/virtio_balloon.c|1645| <<virtballoon_remove>> vb->stop_update = true;
++	 */
+ 	bool stop_update;
+ 	/* Bitmap to indicate if reading the related config fields are needed */
+ 	unsigned long config_read_bitmap;
+ 
++	/*
++	 * 在以下使用virtio_balloon->free_page_list:
++	 *   - drivers/virtio/virtio_balloon.c|517| <<return_free_pages_to_mm>> page = balloon_page_pop(&vb->free_page_list);
++	 *   - drivers/virtio/virtio_balloon.c|758| <<get_free_page_and_send>> balloon_page_push(&vb->free_page_list, page);
++	 *   - drivers/virtio/virtio_balloon.c|1087| <<virtballoon_probe>> INIT_LIST_HEAD(&vb->free_page_list);
++	 */
+ 	/* The list of allocated free pages, waiting to be given back to mm */
+ 	struct list_head free_page_list;
+ 	spinlock_t free_page_list_lock;
++	/*
++	 * 在以下使用virtio_balloon->num_free_page_blocks:
++	 *   - drivers/virtio/virtio_balloon.c|660| <<return_free_pages_to_mm>> vb->num_free_page_blocks -= num_returned;
++	 *   - drivers/virtio/virtio_balloon.c|1004| <<get_free_page_and_send>> vb->num_free_page_blocks++;
++	 *   - drivers/virtio/virtio_balloon.c|1288| <<virtio_balloon_shrinker_count>> return vb->num_free_page_blocks * VIRTIO_BALLOON_HINT_BLOCK_PAGES;
++	 */
+ 	/* The number of free page blocks on the above list */
+ 	unsigned long num_free_page_blocks;
+ 	/*
+@@ -133,6 +185,10 @@ static const struct virtio_device_id id_table[] = {
+ 	{ 0 },
+ };
+ 
++/*
++ * 在以下使用page_to_balloon_pfn():
++ *   - drivers/virtio/virtio_balloon.c|233| <<set_page_pfns>> page_to_balloon_pfn(page) + i);
++ */
+ static u32 page_to_balloon_pfn(struct page *page)
+ {
+ 	unsigned long pfn = page_to_pfn(page);
+@@ -142,18 +198,39 @@ static u32 page_to_balloon_pfn(struct page *page)
+ 	return pfn * VIRTIO_BALLOON_PAGES_PER_PAGE;
+ }
+ 
++/*
++ * 在以下使用balloon_ack():
++ *   - drivers/virtio/virtio_balloon.c|513| <<init_vqs>> callbacks[VIRTIO_BALLOON_VQ_INFLATE] = balloon_ack;
++ *   - drivers/virtio/virtio_balloon.c|515| <<init_vqs>> callbacks[VIRTIO_BALLOON_VQ_DEFLATE] = balloon_ack;
++ *   - drivers/virtio/virtio_balloon.c|535| <<init_vqs>> callbacks[VIRTIO_BALLOON_VQ_REPORTING] = balloon_ack;
++ */
+ static void balloon_ack(struct virtqueue *vq)
+ {
+ 	struct virtio_balloon *vb = vq->vdev->priv;
+ 
++	/*
++	 * 唤醒tell_host()或者virtballoon_free_page_report()
++	 */
+ 	wake_up(&vb->acked);
+ }
+ 
++/*
++ * 在以下使用tell_host():
++ *   - drivers/virtio/virtio_balloon.c|255| <<fill_balloon>> tell_host(vb, vb->inflate_vq);
++ *   - drivers/virtio/virtio_balloon.c|305| <<leak_balloon>> tell_host(vb, vb->deflate_vq);
++ *   - drivers/virtio/virtio_balloon.c|796| <<virtballoon_migratepage>> tell_host(vb, vb->inflate_vq);
++ *   - drivers/virtio/virtio_balloon.c|804| <<virtballoon_migratepage>> tell_host(vb, vb->deflate_vq);
++ */
+ static void tell_host(struct virtio_balloon *vb, struct virtqueue *vq)
+ {
+ 	struct scatterlist sg;
+ 	unsigned int len;
+ 
++	/*
++	 * struct virtio_balloon *vb:
++	 * -> unsigned int num_pfns;
++	 * -> __virtio32 pfns[VIRTIO_BALLOON_ARRAY_PFNS_MAX];
++	 */
+ 	sg_init_one(&sg, vb->pfns, sizeof(vb->pfns[0]) * vb->num_pfns);
+ 
+ 	/* We should always be able to add one buffer to an empty queue. */
+@@ -165,6 +242,10 @@ static void tell_host(struct virtio_balloon *vb, struct virtqueue *vq)
+ 
+ }
+ 
++/*
++ * 在以下使用virtballoon_free_page_report():
++ *   - drivers/virtio/virtio_balloon.c|1233| <<virtballoon_probe>> vb->pr_dev_info.report = virtballoon_free_page_report;
++ */
+ static int virtballoon_free_page_report(struct page_reporting_dev_info *pr_dev_info,
+ 				   struct scatterlist *sg, unsigned int nents)
+ {
+@@ -192,6 +273,13 @@ static int virtballoon_free_page_report(struct page_reporting_dev_info *pr_dev_i
+ 	return 0;
+ }
+ 
++/*
++ * 在以下使用set_page_pfns():
++ *   - drivers/virtio/virtio_balloon.c|244| <<fill_balloon>> set_page_pfns(vb, vb->pfns + vb->num_pfns, page);
++ *   - drivers/virtio/virtio_balloon.c|293| <<leak_balloon>> set_page_pfns(vb, vb->pfns + vb->num_pfns, page);
++ *   - drivers/virtio/virtio_balloon.c|795| <<virtballoon_migratepage>> set_page_pfns(vb, vb->pfns, newpage);
++ *   - drivers/virtio/virtio_balloon.c|803| <<virtballoon_migratepage>> set_page_pfns(vb, vb->pfns, page);
++ */
+ static void set_page_pfns(struct virtio_balloon *vb,
+ 			  __virtio32 pfns[], struct page *page)
+ {
+@@ -208,6 +296,10 @@ static void set_page_pfns(struct virtio_balloon *vb,
+ 					  page_to_balloon_pfn(page) + i);
+ }
+ 
++/*
++ * 只在以下使用fill_balloon():
++ *   - drivers/virtio/virtio_balloon.c|492| <<update_balloon_size_func>> diff -= fill_balloon(vb, diff);
++ */
+ static unsigned int fill_balloon(struct virtio_balloon *vb, size_t num)
+ {
+ 	unsigned int num_allocated_pages;
+@@ -215,6 +307,11 @@ static unsigned int fill_balloon(struct virtio_balloon *vb, size_t num)
+ 	struct page *page;
+ 	LIST_HEAD(pages);
+ 
++	/*
++	 * struct virtio_balloon *vb:
++	 * -> unsigned int num_pfns;
++	 * -> __virtio32 pfns[VIRTIO_BALLOON_ARRAY_PFNS_MAX];
++	 */
+ 	/* We can only do one array worth at a time. */
+ 	num = min(num, ARRAY_SIZE(vb->pfns));
+ 
+@@ -231,6 +328,13 @@ static unsigned int fill_balloon(struct virtio_balloon *vb, size_t num)
+ 			break;
+ 		}
+ 
++		/*
++		 * 在以下使用balloon_page_push():
++		 *   - drivers/virtio/virtio_balloon.c|234| <<fill_balloon>> balloon_page_push(&pages, page);
++		 *   - drivers/virtio/virtio_balloon.c|658| <<get_free_page_and_send>> balloon_page_push(&vb->free_page_list, page);
++		 *
++		 * 就是把page->lru加到pages
++		 */
+ 		balloon_page_push(&pages, page);
+ 	}
+ 
+@@ -239,8 +343,22 @@ static unsigned int fill_balloon(struct virtio_balloon *vb, size_t num)
+ 	vb->num_pfns = 0;
+ 
+ 	while ((page = balloon_page_pop(&pages))) {
++		/*
++		 * 对于virtio算是只在这里调用了
++		 */
+ 		balloon_page_enqueue(&vb->vb_dev_info, page);
+ 
++		/*
++		 * struct virtio_balloon *vb:
++		 * -> unsigned int num_pfns;
++		 * -> __virtio32 pfns[VIRTIO_BALLOON_ARRAY_PFNS_MAX];
++		 *
++		 * 在以下使用set_page_pfns():
++		 *   - drivers/virtio/virtio_balloon.c|244| <<fill_balloon>> set_page_pfns(vb, vb->pfns + vb->num_pfns, page);
++		 *   - drivers/virtio/virtio_balloon.c|293| <<leak_balloon>> set_page_pfns(vb, vb->pfns + vb->num_pfns, page);
++		 *   - drivers/virtio/virtio_balloon.c|795| <<virtballoon_migratepage>> set_page_pfns(vb, vb->pfns, newpage);
++		 *   - drivers/virtio/virtio_balloon.c|803| <<virtballoon_migratepage>> set_page_pfns(vb, vb->pfns, page);
++		 */
+ 		set_page_pfns(vb, vb->pfns + vb->num_pfns, page);
+ 		vb->num_pages += VIRTIO_BALLOON_PAGES_PER_PAGE;
+ 		if (!virtio_has_feature(vb->vdev,
+@@ -250,6 +368,13 @@ static unsigned int fill_balloon(struct virtio_balloon *vb, size_t num)
+ 	}
+ 
+ 	num_allocated_pages = vb->num_pfns;
++	/*
++	 * 在以下使用tell_host():
++	 *   - drivers/virtio/virtio_balloon.c|255| <<fill_balloon>> tell_host(vb, vb->inflate_vq);
++	 *   - drivers/virtio/virtio_balloon.c|305| <<leak_balloon>> tell_host(vb, vb->deflate_vq);
++	 *   - drivers/virtio/virtio_balloon.c|796| <<virtballoon_migratepage>> tell_host(vb, vb->inflate_vq);
++	 *   - drivers/virtio/virtio_balloon.c|804| <<virtballoon_migratepage>> tell_host(vb, vb->deflate_vq);
++	 */
+ 	/* Did we get any? */
+ 	if (vb->num_pfns != 0)
+ 		tell_host(vb, vb->inflate_vq);
+@@ -258,6 +383,10 @@ static unsigned int fill_balloon(struct virtio_balloon *vb, size_t num)
+ 	return num_allocated_pages;
+ }
+ 
++/*
++ * 在以下使用release_pages_balloon():
++ *   - drivers/virtio/virtio_balloon.c|306| <<leak_balloon>> release_pages_balloon(vb, &pages);
++ */
+ static void release_pages_balloon(struct virtio_balloon *vb,
+ 				 struct list_head *pages)
+ {
+@@ -272,6 +401,12 @@ static void release_pages_balloon(struct virtio_balloon *vb,
+ 	}
+ }
+ 
++/*
++ * 在以下使用leak_balloon():
++ *   - drivers/virtio/virtio_balloon.c|494| <<update_balloon_size_func>> diff += leak_balloon(vb, -diff);
++ *   - drivers/virtio/virtio_balloon.c|864| <<virtio_balloon_oom_notify>> *freed += leak_balloon(vb, VIRTIO_BALLOON_OOM_NR_PAGES) /
++ *   - drivers/virtio/virtio_balloon.c|1055| <<remove_common>> leak_balloon(vb, vb->num_pages);
++ */
+ static unsigned int leak_balloon(struct virtio_balloon *vb, size_t num)
+ {
+ 	unsigned int num_freed_pages;
+@@ -279,6 +414,11 @@ static unsigned int leak_balloon(struct virtio_balloon *vb, size_t num)
+ 	struct balloon_dev_info *vb_dev_info = &vb->vb_dev_info;
+ 	LIST_HEAD(pages);
+ 
++	/*
++	 * struct virtio_balloon *vb:
++	 * -> unsigned int num_pfns;
++	 * -> __virtio32 pfns[VIRTIO_BALLOON_ARRAY_PFNS_MAX];
++	 */
+ 	/* We can only do one array worth at a time. */
+ 	num = min(num, ARRAY_SIZE(vb->pfns));
+ 
+@@ -290,6 +430,13 @@ static unsigned int leak_balloon(struct virtio_balloon *vb, size_t num)
+ 		page = balloon_page_dequeue(vb_dev_info);
+ 		if (!page)
+ 			break;
++		/*
++		 * 在以下使用set_page_pfns():
++		 *   - drivers/virtio/virtio_balloon.c|244| <<fill_balloon>> set_page_pfns(vb, vb->pfns + vb->num_pfns, page);
++		 *   - drivers/virtio/virtio_balloon.c|293| <<leak_balloon>> set_page_pfns(vb, vb->pfns + vb->num_pfns, page);
++		 *   - drivers/virtio/virtio_balloon.c|795| <<virtballoon_migratepage>> set_page_pfns(vb, vb->pfns, newpage);
++		 *   - drivers/virtio/virtio_balloon.c|803| <<virtballoon_migratepage>> set_page_pfns(vb, vb->pfns, page);
++		 */
+ 		set_page_pfns(vb, vb->pfns + vb->num_pfns, page);
+ 		list_add(&page->lru, &pages);
+ 		vb->num_pages -= VIRTIO_BALLOON_PAGES_PER_PAGE;
+@@ -301,23 +448,81 @@ static unsigned int leak_balloon(struct virtio_balloon *vb, size_t num)
+ 	 * virtio_has_feature(vdev, VIRTIO_BALLOON_F_MUST_TELL_HOST);
+ 	 * is true, we *have* to do it in this order
+ 	 */
++	/*
++	 * 在以下使用tell_host():
++	 *   - drivers/virtio/virtio_balloon.c|255| <<fill_balloon>> tell_host(vb, vb->inflate_vq);
++	 *   - drivers/virtio/virtio_balloon.c|305| <<leak_balloon>> tell_host(vb, vb->deflate_vq);
++	 *   - drivers/virtio/virtio_balloon.c|796| <<virtballoon_migratepage>> tell_host(vb, vb->inflate_vq);
++	 *   - drivers/virtio/virtio_balloon.c|804| <<virtballoon_migratepage>> tell_host(vb, vb->deflate_vq);
++	 */
+ 	if (vb->num_pfns != 0)
+ 		tell_host(vb, vb->deflate_vq);
++	/*
++	 * 只在这里调用
++	 */
+ 	release_pages_balloon(vb, &pages);
+ 	mutex_unlock(&vb->balloon_lock);
+ 	return num_freed_pages;
+ }
+ 
++/*
++ * 64 #define VIRTIO_BALLOON_S_SWAP_IN  0   // Amount of memory swapped in
++ * 65 #define VIRTIO_BALLOON_S_SWAP_OUT 1   // Amount of memory swapped out
++ * 66 #define VIRTIO_BALLOON_S_MAJFLT   2   // Number of major faults
++ * 67 #define VIRTIO_BALLOON_S_MINFLT   3   // Number of minor faults
++ * 68 #define VIRTIO_BALLOON_S_MEMFREE  4   // Total amount of free memory
++ * 69 #define VIRTIO_BALLOON_S_MEMTOT   5   // Total amount of memory
++ * 70 #define VIRTIO_BALLOON_S_AVAIL    6   // Available memory as in /proc
++ * 71 #define VIRTIO_BALLOON_S_CACHES   7   // Disk caches
++ * 72 #define VIRTIO_BALLOON_S_HTLB_PGALLOC  8  // Hugetlb page allocations
++ * 73 #define VIRTIO_BALLOON_S_HTLB_PGFAIL   9  // Hugetlb page allocation failures
++ * 74 #define VIRTIO_BALLOON_S_NR       10
++ * 75
++ * 76 #define VIRTIO_BALLOON_S_NAMES_WITH_PREFIX(VIRTIO_BALLOON_S_NAMES_prefix) { \
++ * 77         VIRTIO_BALLOON_S_NAMES_prefix "swap-in", \
++ * 78         VIRTIO_BALLOON_S_NAMES_prefix "swap-out", \
++ * 79         VIRTIO_BALLOON_S_NAMES_prefix "major-faults", \
++ * 80         VIRTIO_BALLOON_S_NAMES_prefix "minor-faults", \
++ * 81         VIRTIO_BALLOON_S_NAMES_prefix "free-memory", \
++ * 82         VIRTIO_BALLOON_S_NAMES_prefix "total-memory", \
++ * 83         VIRTIO_BALLOON_S_NAMES_prefix "available-memory", \
++ * 84         VIRTIO_BALLOON_S_NAMES_prefix "disk-caches", \
++ * 85         VIRTIO_BALLOON_S_NAMES_prefix "hugetlb-allocations", \
++ * 86         VIRTIO_BALLOON_S_NAMES_prefix "hugetlb-failures" \
++ * 87 }
++ *
++ *
++ * 在以下使用update_stat():
++ *   - drivers/virtio/virtio_balloon.c|460| <<update_balloon_stats>> update_stat(vb, idx++, VIRTIO_BALLOON_S_SWAP_IN,
++ *   - drivers/virtio/virtio_balloon.c|462| <<update_balloon_stats>> update_stat(vb, idx++, VIRTIO_BALLOON_S_SWAP_OUT,
++ *   - drivers/virtio/virtio_balloon.c|464| <<update_balloon_stats>> update_stat(vb, idx++, VIRTIO_BALLOON_S_MAJFLT, events[PGMAJFAULT]);
++ *   - drivers/virtio/virtio_balloon.c|465| <<update_balloon_stats>> update_stat(vb, idx++, VIRTIO_BALLOON_S_MINFLT, events[PGFAULT]);
++ *   - drivers/virtio/virtio_balloon.c|467| <<update_balloon_stats>> update_stat(vb, idx++, VIRTIO_BALLOON_S_HTLB_PGALLOC,
++ *   - drivers/virtio/virtio_balloon.c|469| <<update_balloon_stats>> update_stat(vb, idx++, VIRTIO_BALLOON_S_HTLB_PGFAIL,
++ *   - drivers/virtio/virtio_balloon.c|473| <<update_balloon_stats>> update_stat(vb, idx++, VIRTIO_BALLOON_S_MEMFREE,
++ *   - drivers/virtio/virtio_balloon.c|475| <<update_balloon_stats>> update_stat(vb, idx++, VIRTIO_BALLOON_S_MEMTOT,
++ *   - drivers/virtio/virtio_balloon.c|477| <<update_balloon_stats>> update_stat(vb, idx++, VIRTIO_BALLOON_S_AVAIL,
++ *   - drivers/virtio/virtio_balloon.c|479| <<update_balloon_stats>> update_stat(vb, idx++, VIRTIO_BALLOON_S_CACHES,
++ */
+ static inline void update_stat(struct virtio_balloon *vb, int idx,
+ 			       u16 tag, u64 val)
+ {
+ 	BUG_ON(idx >= VIRTIO_BALLOON_S_NR);
++	/*
++	 * struct virtio_balloon *vb:
++	 * -> struct virtio_balloon_stat stats[VIRTIO_BALLOON_S_NR];
++	 */
+ 	vb->stats[idx].tag = cpu_to_virtio16(vb->vdev, tag);
+ 	vb->stats[idx].val = cpu_to_virtio64(vb->vdev, val);
+ }
+ 
+ #define pages_to_bytes(x) ((u64)(x) << PAGE_SHIFT)
+ 
++/*
++ * 在以下使用update_balloon_stats():
++ *   - drivers/virtio/virtio_balloon.c|510| <<stats_handle_request>> num_stats = update_balloon_stats(vb);
++ *   - drivers/virtio/virtio_balloon.c|718| <<init_vqs>> num_stats = update_balloon_stats(vb);
++ */
+ static unsigned int update_balloon_stats(struct virtio_balloon *vb)
+ {
+ 	unsigned long events[NR_VM_EVENT_ITEMS];
+@@ -367,22 +572,46 @@ static unsigned int update_balloon_stats(struct virtio_balloon *vb)
+  * we delegate the job to a freezable workqueue that will do the actual work via
+  * stats_handle_request().
+  */
++/*
++ * 在以下使用stats_request():
++ *   - drivers/virtio/virtio_balloon.c|689| <<init_vqs>> callbacks[VIRTIO_BALLOON_VQ_STATS] = stats_request;
++ */
+ static void stats_request(struct virtqueue *vq)
+ {
+ 	struct virtio_balloon *vb = vq->vdev->priv;
+ 
+ 	spin_lock(&vb->stop_update_lock);
++	/*
++	 * 在以下使用virtio_balloon->stop_update:
++	 *   - drivers/virtio/virtio_balloon.c|584| <<stats_request>> if (!vb->stop_update)
++	 *   - drivers/virtio/virtio_balloon.c|713| <<virtballoon_changed>> if (!vb->stop_update) {
++	 *   - drivers/virtio/virtio_balloon.c|1645| <<virtballoon_remove>> vb->stop_update = true;
++	 *
++	 * 在以下使用virtio_balloon->update_balloon_stats_work:
++	 *   - drivers/virtio/virtio_balloon.c|500| <<stats_request>> queue_work(system_freezable_wq, &vb->update_balloon_stats_work);
++	 *   - drivers/virtio/virtio_balloon.c|1124| <<virtballoon_probe>> INIT_WORK(&vb->update_balloon_stats_work, update_balloon_stats_func);
++	 *   - drivers/virtio/virtio_balloon.c|1338| <<virtballoon_remove>> cancel_work_sync(&vb->update_balloon_stats_work);
++	 */
+ 	if (!vb->stop_update)
+ 		queue_work(system_freezable_wq, &vb->update_balloon_stats_work);
+ 	spin_unlock(&vb->stop_update_lock);
+ }
+ 
++/*
++ * 在以下使用stats_handle_request():
++ *   - drivers/virtio/virtio_balloon.c|629| <<update_balloon_stats_func>> stats_handle_request(vb);
++ */
+ static void stats_handle_request(struct virtio_balloon *vb)
+ {
+ 	struct virtqueue *vq;
+ 	struct scatterlist sg;
+ 	unsigned int len, num_stats;
+ 
++	/*
++	 * 在以下使用update_balloon_stats():
++	 *   - drivers/virtio/virtio_balloon.c|510| <<stats_handle_request>> num_stats = update_balloon_stats(vb);
++	 *   - drivers/virtio/virtio_balloon.c|718| <<init_vqs>> num_stats = update_balloon_stats(vb);
++	 */
+ 	num_stats = update_balloon_stats(vb);
+ 
+ 	vq = vb->stats_vq;
+@@ -393,6 +622,12 @@ static void stats_handle_request(struct virtio_balloon *vb)
+ 	virtqueue_kick(vq);
+ }
+ 
++/*
++ * 在以下使用towards_target():
++ *   - drivers/virtio/virtio_balloon.c|486| <<update_balloon_size_func>> diff = towards_target(vb);
++ *   - drivers/virtio/virtio_balloon.c|1024| <<virtballoon_probe>> if (towards_target(vb))
++ *   - drivers/virtio/virtio_balloon.c|1123| <<virtballoon_restore>> if (towards_target(vb))
++ */
+ static inline s64 towards_target(struct virtio_balloon *vb)
+ {
+ 	s64 target;
+@@ -410,6 +645,12 @@ static inline s64 towards_target(struct virtio_balloon *vb)
+ 	return target - vb->num_pages;
+ }
+ 
++/*
++ * 在以下使用return_free_pages_to_mm():
++ *   - drivers/virtio/virtio_balloon.c|1000| <<report_free_page_func>> return_free_pages_to_mm(vb, ULONG_MAX);
++ *   - drivers/virtio/virtio_balloon.c|1139| <<shrink_free_pages>> blocks_freed = return_free_pages_to_mm(vb, blocks_to_free);
++ *   - drivers/virtio/virtio_balloon.c|1412| <<remove_common>> return_free_pages_to_mm(vb, ULONG_MAX);
++ */
+ /* Gives back @num_to_return blocks of free pages to mm. */
+ static unsigned long return_free_pages_to_mm(struct virtio_balloon *vb,
+ 					     unsigned long num_to_return)
+@@ -419,18 +660,36 @@ static unsigned long return_free_pages_to_mm(struct virtio_balloon *vb,
+ 
+ 	spin_lock_irq(&vb->free_page_list_lock);
+ 	for (num_returned = 0; num_returned < num_to_return; num_returned++) {
++		/*
++		 * 在以下使用virtio_balloon->free_page_list:
++		 *   - drivers/virtio/virtio_balloon.c|517| <<return_free_pages_to_mm>> page = balloon_page_pop(&vb->free_page_list);
++		 *   - drivers/virtio/virtio_balloon.c|758| <<get_free_page_and_send>> balloon_page_push(&vb->free_page_list, page);
++		 *   - drivers/virtio/virtio_balloon.c|1087| <<virtballoon_probe>> INIT_LIST_HEAD(&vb->free_page_list);
++		 *
++		 * 从链表里拿出来
++		 */
+ 		page = balloon_page_pop(&vb->free_page_list);
+ 		if (!page)
+ 			break;
+ 		free_pages((unsigned long)page_address(page),
+ 			   VIRTIO_BALLOON_HINT_BLOCK_ORDER);
+ 	}
++	/*
++	 * 在以下使用virtio_balloon->num_free_page_blocks:
++	 *   - drivers/virtio/virtio_balloon.c|660| <<return_free_pages_to_mm>> vb->num_free_page_blocks -= num_returned;
++	 *   - drivers/virtio/virtio_balloon.c|1004| <<get_free_page_and_send>> vb->num_free_page_blocks++;
++	 *   - drivers/virtio/virtio_balloon.c|1288| <<virtio_balloon_shrinker_count>> return vb->num_free_page_blocks * VIRTIO_BALLOON_HINT_BLOCK_PAGES;
++	 */
+ 	vb->num_free_page_blocks -= num_returned;
+ 	spin_unlock_irq(&vb->free_page_list_lock);
+ 
+ 	return num_returned;
+ }
+ 
++/*
++ * 在以下使用virtio_balloon_queue_free_page_work():
++ *   - drivers/virtio/virtio_balloon.c|551| <<virtballoon_changed>> virtio_balloon_queue_free_page_work(vb);
++ */
+ static void virtio_balloon_queue_free_page_work(struct virtio_balloon *vb)
+ {
+ 	if (!virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_FREE_PAGE_HINT))
+@@ -441,23 +700,88 @@ static void virtio_balloon_queue_free_page_work(struct virtio_balloon *vb)
+ 			     &vb->config_read_bitmap))
+ 		return;
+ 
++	/*
++	 * 在以下使用virtio_balloon->report_free_page_work:
++	 *   - drivers/virtio/virtio_balloon.c|666| <<virtio_balloon_queue_free_page_work>> queue_work(vb->balloon_wq, &vb->report_free_page_work);
++	 *   - drivers/virtio/virtio_balloon.c|1284| <<virtballoon_probe>> INIT_WORK(&vb->report_free_page_work, report_free_page_func);
++	 *   - drivers/virtio/virtio_balloon.c|1449| <<virtballoon_remove>> cancel_work_sync(&vb->report_free_page_work);
++	 */
+ 	queue_work(vb->balloon_wq, &vb->report_free_page_work);
+ }
+ 
++/*
++ * [0] virtballoon_changed
++ * [0] virtballoon_probe
++ * [0] virtio_dev_probe
++ * [0] really_probe
++ * [0] __driver_probe_device
++ * [0] driver_probe_device
++ * [0] __driver_attach
++ * [0] bus_for_each_dev
++ * [0] bus_add_driver
++ * [0] driver_register
++ * [0] do_one_initcall
++ * [0] kernel_init_freeable
++ * [0] kernel_init
++ * [0] ret_from_fork
++ *
++ * [0] virtballoon_changed
++ * [0] virtio_config_changed
++ * [0] vp_interrupt
++ * [0] __handle_irq_event_percpu
++ * [0] handle_irq_event
++ * [0] handle_fasteoi_irq
++ * [0] __common_interrupt
++ * [0] common_interrupt
++ *
++ *
++ * 在以下使用virtballoon_changed():
++ *   - drivers/virtio/virtio_balloon.c|1536| <<global>> struct virtio_driver virtio_balloon_driver.config_changed = virtballoon_changed,
++ *   - drivers/virtio/virtio_balloon.c|1370| <<virtballoon_probe>> virtballoon_changed(vdev);
++ *   - drivers/virtio/virtio_balloon.c|1488| <<virtballoon_restore>> virtballoon_changed(vdev);
++ */
+ static void virtballoon_changed(struct virtio_device *vdev)
+ {
+ 	struct virtio_balloon *vb = vdev->priv;
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&vb->stop_update_lock, flags);
++	/*
++	 * 在以下使用virtio_balloon->stop_update:
++	 *   - drivers/virtio/virtio_balloon.c|584| <<stats_request>> if (!vb->stop_update)
++	 *   - drivers/virtio/virtio_balloon.c|713| <<virtballoon_changed>> if (!vb->stop_update) {
++	 *   - drivers/virtio/virtio_balloon.c|1645| <<virtballoon_remove>> vb->stop_update = true;
++	 */
+ 	if (!vb->stop_update) {
++		/*
++		 * 在以下使用virtio_balloon->update_balloon_size_work:
++		 *   - drivers/virtio/virtio_balloon.c|550| <<virtballoon_changed>> queue_work(system_freezable_wq, &vb->update_balloon_size_work);
++		 *   - drivers/virtio/virtio_balloon.c|1038| <<virtballoon_probe>> INIT_WORK(&vb->update_balloon_size_work, update_balloon_size_func);
++		 *   - drivers/virtio/virtio_balloon.c|1216| <<virtballoon_remove>> cancel_work_sync(&vb->update_balloon_size_work);
++		 */
+ 		queue_work(system_freezable_wq,
+ 			   &vb->update_balloon_size_work);
++		/*
++		 * 1056 static const Property virtio_balloon_properties[] = {
++		 * 1057     DEFINE_PROP_BIT("deflate-on-oom", VirtIOBalloon, host_features,
++		 * 1058                     VIRTIO_BALLOON_F_DEFLATE_ON_OOM, false),
++		 * 1059     DEFINE_PROP_BIT("free-page-hint", VirtIOBalloon, host_features,
++		 * 1060                     VIRTIO_BALLOON_F_FREE_PAGE_HINT, false),
++		 *
++		 * VIRTIO_BALLOON_F_FREE_PAGE_HINT
++		 */
+ 		virtio_balloon_queue_free_page_work(vb);
+ 	}
+ 	spin_unlock_irqrestore(&vb->stop_update_lock, flags);
+ }
+ 
++/*
++ * 在以下使用update_balloon_size():
++ *   - drivers/virtio/virtio_balloon.c|590| <<update_balloon_size_func>> update_balloon_size(vb);
++ *   - drivers/virtio/virtio_balloon.c|1001| <<virtio_balloon_oom_notify>> update_balloon_size(vb);
++ *   - drivers/virtio/virtio_balloon.c|1191| <<remove_common>> update_balloon_size(vb);
++ *   - drivers/virtio/virtio_balloon.c|1260| <<virtballoon_restore>> update_balloon_size(vb);
++ */
+ static void update_balloon_size(struct virtio_balloon *vb)
+ {
+ 	u32 actual = vb->num_pages;
+@@ -467,15 +791,36 @@ static void update_balloon_size(struct virtio_balloon *vb)
+ 			 &actual);
+ }
+ 
++/*
++ * 在以下使用virtio_balloon->update_balloon_stats_work:
++ *   - drivers/virtio/virtio_balloon.c|500| <<stats_request>> queue_work(system_freezable_wq, &vb->update_balloon_stats_work);
++ *   - drivers/virtio/virtio_balloon.c|1124| <<virtballoon_probe>> INIT_WORK(&vb->update_balloon_stats_work, update_balloon_stats_func);
++ *   - drivers/virtio/virtio_balloon.c|1338| <<virtballoon_remove>> cancel_work_sync(&vb->update_balloon_stats_work);
++ *
++ * 在以下使用update_balloon_stats_func():
++ *   - drivers/virtio/virtio_balloon.c|1124| <<virtballoon_probe>> INIT_WORK(&vb->update_balloon_stats_work, update_balloon_stats_func);
++ */
+ static void update_balloon_stats_func(struct work_struct *work)
+ {
+ 	struct virtio_balloon *vb;
+ 
+ 	vb = container_of(work, struct virtio_balloon,
+ 			  update_balloon_stats_work);
++	/*
++	 * 只在这里调用
++	 */
+ 	stats_handle_request(vb);
+ }
+ 
++/*
++ * 在以下使用virtio_balloon->update_balloon_size_work:
++ *   - drivers/virtio/virtio_balloon.c|550| <<virtballoon_changed>> queue_work(system_freezable_wq, &vb->update_balloon_size_work);
++ *   - drivers/virtio/virtio_balloon.c|1038| <<virtballoon_probe>> INIT_WORK(&vb->update_balloon_size_work, update_balloon_size_func);
++ *   - drivers/virtio/virtio_balloon.c|1216| <<virtballoon_remove>> cancel_work_sync(&vb->update_balloon_size_work);
++ *
++ * 在以下使用update_balloon_size_func():
++ *   - drivers/virtio/virtio_balloon.c|1038| <<virtballoon_probe>> INIT_WORK(&vb->update_balloon_size_work, update_balloon_size_func);
++ */
+ static void update_balloon_size_func(struct work_struct *work)
+ {
+ 	struct virtio_balloon *vb;
+@@ -492,12 +837,32 @@ static void update_balloon_size_func(struct work_struct *work)
+ 		diff -= fill_balloon(vb, diff);
+ 	else
+ 		diff += leak_balloon(vb, -diff);
++	/*
++	 * 在以下使用update_balloon_size():
++	 *   - drivers/virtio/virtio_balloon.c|590| <<update_balloon_size_func>> update_balloon_size(vb);
++	 *   - drivers/virtio/virtio_balloon.c|1001| <<virtio_balloon_oom_notify>> update_balloon_size(vb);
++	 *   - drivers/virtio/virtio_balloon.c|1191| <<remove_common>> update_balloon_size(vb);
++	 *   - drivers/virtio/virtio_balloon.c|1260| <<virtballoon_restore>> update_balloon_size(vb);
++	 */
+ 	update_balloon_size(vb);
+ 
++	/*
++	 * 必须全部处理完才行
++	 */
+ 	if (diff)
+ 		queue_work(system_freezable_wq, work);
+ }
+ 
++/*
++ * 65 enum virtio_balloon_vq {
++ * 66         VIRTIO_BALLOON_VQ_INFLATE,
++ * 67         VIRTIO_BALLOON_VQ_DEFLATE,
++ * 68         VIRTIO_BALLOON_VQ_STATS,
++ * 69         VIRTIO_BALLOON_VQ_FREE_PAGE,
++ * 70         VIRTIO_BALLOON_VQ_REPORTING,
++ * 71         VIRTIO_BALLOON_VQ_MAX
++ * 72 };
++ */
+ static int init_vqs(struct virtio_balloon *vb)
+ {
+ 	struct virtqueue *vqs[VIRTIO_BALLOON_VQ_MAX];
+@@ -551,6 +916,11 @@ static int init_vqs(struct virtio_balloon *vb)
+ 		 * Prime this virtqueue with one buffer so the hypervisor can
+ 		 * use it to signal us later (it can't be broken yet!).
+ 		 */
++		/*
++		 * 在以下使用update_balloon_stats():
++		 *   - drivers/virtio/virtio_balloon.c|510| <<stats_handle_request>> num_stats = update_balloon_stats(vb);
++		 *   - drivers/virtio/virtio_balloon.c|718| <<init_vqs>> num_stats = update_balloon_stats(vb);
++		 */
+ 		num_stats = update_balloon_stats(vb);
+ 
+ 		sg_init_one(&sg, vb->stats, sizeof(vb->stats[0]) * num_stats);
+@@ -573,6 +943,12 @@ static int init_vqs(struct virtio_balloon *vb)
+ 	return 0;
+ }
+ 
++/*
++ * 在以下使用virtio_balloon_cmd_id_received():
++ *   - drivers/virtio/virtio_balloon.c|860| <<send_cmd_id_start>> virtio_balloon_cmd_id_received(vb));
++ *   - drivers/virtio/virtio_balloon.c|954| <<send_free_pages>> virtio_balloon_cmd_id_received(vb)))
++ *   - drivers/virtio/virtio_balloon.c|997| <<report_free_page_func>> cmd_id_received = virtio_balloon_cmd_id_received(vb);
++ */
+ static u32 virtio_balloon_cmd_id_received(struct virtio_balloon *vb)
+ {
+ 	if (test_and_clear_bit(VIRTIO_BALLOON_CONFIG_READ_CMD_ID,
+@@ -586,6 +962,10 @@ static u32 virtio_balloon_cmd_id_received(struct virtio_balloon *vb)
+ 	return vb->cmd_id_received_cache;
+ }
+ 
++/*
++ * 在以下使用send_cmd_id_start():
++ *   - drivers/virtio/virtio_balloon.c|977| <<virtio_balloon_report_free_page>> err = send_cmd_id_start(vb);
++ */
+ static int send_cmd_id_start(struct virtio_balloon *vb)
+ {
+ 	struct scatterlist sg;
+@@ -596,6 +976,12 @@ static int send_cmd_id_start(struct virtio_balloon *vb)
+ 	while (virtqueue_get_buf(vq, &unused))
+ 		;
+ 
++	/*
++	 * 在以下使用virtio_balloon_cmd_id_received():
++	 *   - drivers/virtio/virtio_balloon.c|860| <<send_cmd_id_start>> virtio_balloon_cmd_id_received(vb));
++	 *   - drivers/virtio/virtio_balloon.c|954| <<send_free_pages>> virtio_balloon_cmd_id_received(vb)))
++	 *   - drivers/virtio/virtio_balloon.c|997| <<report_free_page_func>> cmd_id_received = virtio_balloon_cmd_id_received(vb);
++	 */
+ 	vb->cmd_id_active = cpu_to_virtio32(vb->vdev,
+ 					virtio_balloon_cmd_id_received(vb));
+ 	sg_init_one(&sg, &vb->cmd_id_active, sizeof(vb->cmd_id_active));
+@@ -605,6 +991,10 @@ static int send_cmd_id_start(struct virtio_balloon *vb)
+ 	return err;
+ }
+ 
++/*
++ * 在以下使用send_cmd_id_stop():
++ *   - drivers/virtio/virtio_balloon.c|986| <<virtio_balloon_report_free_page>> err = send_cmd_id_stop(vb);
++ */
+ static int send_cmd_id_stop(struct virtio_balloon *vb)
+ {
+ 	struct scatterlist sg;
+@@ -622,6 +1012,10 @@ static int send_cmd_id_stop(struct virtio_balloon *vb)
+ 	return err;
+ }
+ 
++/*
++ * 在以下使用get_free_page_and_send():
++ *   - drivers/virtio/virtio_balloon.c|961| <<send_free_pages>> err = get_free_page_and_send(vb);
++ */
+ static int get_free_page_and_send(struct virtio_balloon *vb)
+ {
+ 	struct virtqueue *vq = vb->free_page_vq;
+@@ -655,7 +1049,23 @@ static int get_free_page_and_send(struct virtio_balloon *vb)
+ 		}
+ 		virtqueue_kick(vq);
+ 		spin_lock_irq(&vb->free_page_list_lock);
++		/*
++		 * 在以下使用virtio_balloon->free_page_list:
++		 *   - drivers/virtio/virtio_balloon.c|517| <<return_free_pages_to_mm>> page = balloon_page_pop(&vb->free_page_list);
++		 *   - drivers/virtio/virtio_balloon.c|758| <<get_free_page_and_send>> balloon_page_push(&vb->free_page_list, page);
++		 *   - drivers/virtio/virtio_balloon.c|1087| <<virtballoon_probe>> INIT_LIST_HEAD(&vb->free_page_list);
++		 *
++		 * 在以下使用balloon_page_push():
++		 *   - drivers/virtio/virtio_balloon.c|234| <<fill_balloon>> balloon_page_push(&pages, page);
++		 *   - drivers/virtio/virtio_balloon.c|658| <<get_free_page_and_send>> balloon_page_push(&vb->free_page_list, page);
++		 */
+ 		balloon_page_push(&vb->free_page_list, page);
++		/*
++		 * 在以下使用virtio_balloon->num_free_page_blocks:
++		 *   - drivers/virtio/virtio_balloon.c|660| <<return_free_pages_to_mm>> vb->num_free_page_blocks -= num_returned;
++		 *   - drivers/virtio/virtio_balloon.c|1004| <<get_free_page_and_send>> vb->num_free_page_blocks++;
++		 *   - drivers/virtio/virtio_balloon.c|1288| <<virtio_balloon_shrinker_count>> return vb->num_free_page_blocks * VIRTIO_BALLOON_HINT_BLOCK_PAGES;
++		 */
+ 		vb->num_free_page_blocks++;
+ 		spin_unlock_irq(&vb->free_page_list_lock);
+ 	} else {
+@@ -669,6 +1079,10 @@ static int get_free_page_and_send(struct virtio_balloon *vb)
+ 	return 0;
+ }
+ 
++/*
++ * 在以下使用send_free_pages():
++ *   - drivers/virtio/virtio_balloon.c|981| <<virtio_balloon_report_free_page>> err = send_free_pages(vb);
++ */
+ static int send_free_pages(struct virtio_balloon *vb)
+ {
+ 	int err;
+@@ -680,6 +1094,12 @@ static int send_free_pages(struct virtio_balloon *vb)
+ 		 * stop the reporting.
+ 		 */
+ 		cmd_id_active = virtio32_to_cpu(vb->vdev, vb->cmd_id_active);
++		/*
++		 * 在以下使用virtio_balloon_cmd_id_received():
++		 *   - drivers/virtio/virtio_balloon.c|860| <<send_cmd_id_start>> virtio_balloon_cmd_id_received(vb));
++		 *   - drivers/virtio/virtio_balloon.c|954| <<send_free_pages>> virtio_balloon_cmd_id_received(vb)))
++		 *   - drivers/virtio/virtio_balloon.c|997| <<report_free_page_func>> cmd_id_received = virtio_balloon_cmd_id_received(vb);
++		 */
+ 		if (unlikely(cmd_id_active !=
+ 			     virtio_balloon_cmd_id_received(vb)))
+ 			break;
+@@ -698,11 +1118,18 @@ static int send_free_pages(struct virtio_balloon *vb)
+ 	return 0;
+ }
+ 
++/*
++ * 在以下使用virtio_balloon_report_free_page():
++ *   - drivers/virtio/virtio_balloon.c|1004| <<report_free_page_func>> virtio_balloon_report_free_page(vb);
++ */
+ static void virtio_balloon_report_free_page(struct virtio_balloon *vb)
+ {
+ 	int err;
+ 	struct device *dev = &vb->vdev->dev;
+ 
++	/*
++	 * 只在这里调用
++	 */
+ 	/* Start by sending the received cmd id to host with an outbuf. */
+ 	err = send_cmd_id_start(vb);
+ 	if (unlikely(err))
+@@ -718,19 +1145,43 @@ static void virtio_balloon_report_free_page(struct virtio_balloon *vb)
+ 		dev_err(dev, "Failed to send a stop id, err = %d\n", err);
+ }
+ 
++/*
++ * 在以下使用virtio_balloon->report_free_page_work:
++ *   - drivers/virtio/virtio_balloon.c|666| <<virtio_balloon_queue_free_page_work>> queue_work(vb->balloon_wq, &vb->report_free_page_work);
++ *   - drivers/virtio/virtio_balloon.c|1284| <<virtballoon_probe>> INIT_WORK(&vb->report_free_page_work, report_free_page_func);
++ *   - drivers/virtio/virtio_balloon.c|1449| <<virtballoon_remove>> cancel_work_sync(&vb->report_free_page_work);
++ *
++ * 在以下使用report_free_page_func():
++ *   - drivers/virtio/virtio_balloon.c|1284| <<virtballoon_probe>> INIT_WORK(&vb->report_free_page_work, report_free_page_func);
++ */
+ static void report_free_page_func(struct work_struct *work)
+ {
+ 	struct virtio_balloon *vb = container_of(work, struct virtio_balloon,
+ 						 report_free_page_work);
+ 	u32 cmd_id_received;
+ 
++	/*
++	 * 在以下使用virtio_balloon_cmd_id_received():
++	 *   - drivers/virtio/virtio_balloon.c|860| <<send_cmd_id_start>> virtio_balloon_cmd_id_received(vb));
++	 *   - drivers/virtio/virtio_balloon.c|954| <<send_free_pages>> virtio_balloon_cmd_id_received(vb)))
++	 *   - drivers/virtio/virtio_balloon.c|997| <<report_free_page_func>> cmd_id_received = virtio_balloon_cmd_id_received(vb);
++	 */
+ 	cmd_id_received = virtio_balloon_cmd_id_received(vb);
+ 	if (cmd_id_received == VIRTIO_BALLOON_CMD_ID_DONE) {
++		/*
++		 * 在以下使用return_free_pages_to_mm():
++		 *   - drivers/virtio/virtio_balloon.c|1000| <<report_free_page_func>> return_free_pages_to_mm(vb, ULONG_MAX);
++		 *   - drivers/virtio/virtio_balloon.c|1139| <<shrink_free_pages>> blocks_freed = return_free_pages_to_mm(vb, blocks_to_free);
++		 *   - drivers/virtio/virtio_balloon.c|1412| <<remove_common>> return_free_pages_to_mm(vb, ULONG_MAX);
++		 */
+ 		/* Pass ULONG_MAX to give back all the free pages */
+ 		return_free_pages_to_mm(vb, ULONG_MAX);
+ 	} else if (cmd_id_received != VIRTIO_BALLOON_CMD_ID_STOP &&
+ 		   cmd_id_received !=
+ 		   virtio32_to_cpu(vb->vdev, vb->cmd_id_active)) {
++		/*
++		 * 只在这里使用
++		 */
+ 		virtio_balloon_report_free_page(vb);
+ 	}
+ }
+@@ -754,6 +1205,16 @@ static void report_free_page_func(struct work_struct *work)
+  * This function preforms the balloon page migration task.
+  * Called through balloon_mapping->a_ops->migratepage
+  */
++/*
++ * 关于migratepage方法的调用:
++ *   - mm/balloon_compaction.c|348| <<balloon_page_migrate>> return balloon->migratepage(balloon, newpage, page, mode);
++ *   - mm/migrate.c|959| <<move_to_new_page>> rc = mapping->a_ops->migratepage(mapping, newpage,
++ *   - mm/migrate.c|976| <<move_to_new_page>> rc = mapping->a_ops->migratepage(mapping, newpage,
++ *
++ *
++ * 在以下使用virtballoon_migratepage():
++ *   - drivers/virtio/virtio_balloon.c|1390| <<virtballoon_probe>> vb->vb_dev_info.migratepage = virtballoon_migratepage;
++ */
+ static int virtballoon_migratepage(struct balloon_dev_info *vb_dev_info,
+ 		struct page *newpage, struct page *page, enum migrate_mode mode)
+ {
+@@ -787,20 +1248,78 @@ static int virtballoon_migratepage(struct balloon_dev_info *vb_dev_info,
+ 
+ 	/* balloon's page migration 1st step  -- inflate "newpage" */
+ 	spin_lock_irqsave(&vb_dev_info->pages_lock, flags);
++	/*
++	 * 在以下使用balloon_page_insert():
++	 *   - arch/powerpc/platforms/pseries/cmm.c|552| <<cmm_migratepage>> balloon_page_insert(b_dev_info, newpage);
++	 *   - drivers/misc/vmw_balloon.c|1849| <<vmballoon_migratepage>> balloon_page_insert(&b->b_dev_info, newpage);
++	 *   - drivers/virtio/virtio_balloon.c|1060| <<virtballoon_migratepage>> balloon_page_insert(vb_dev_info, newpage);
++	 *   - mm/balloon_compaction.c|32| <<balloon_page_enqueue_one>> balloon_page_insert(b_dev_info, page);
++	 */
+ 	balloon_page_insert(vb_dev_info, newpage);
++	/*
++	 * 在以下使用balloon_dev_info->isolated_pages:
++	 *   - arch/powerpc/platforms/pseries/cmm.c|554| <<cmm_migratepage>> b_dev_info->isolated_pages--;
++	 *   - drivers/misc/vmw_balloon.c|1857| <<vmballoon_migratepage>> b->b_dev_info.isolated_pages--;
++	 *   - drivers/virtio/virtio_balloon.c|1061| <<virtballoon_migratepage>> vb_dev_info->isolated_pages--;
++	 *   - include/linux/balloon_compaction.h|74| <<balloon_devinfo_init>> balloon->isolated_pages = 0;
++	 *   - mm/balloon_compaction.c|223| <<balloon_page_dequeue>> if (... !b_dev_info->isolated_pages))
++	 *   - mm/balloon_compaction.c|242| <<balloon_page_isolate>> b_dev_info->isolated_pages++;
++	 *   - mm/balloon_compaction.c|255| <<balloon_page_putback>> b_dev_info->isolated_pages--;
++	 */
+ 	vb_dev_info->isolated_pages--;
++	/*
++	 * $ cat /proc/vmstat  | grep ball
++	 * balloon_inflate 0
++	 * balloon_deflate 0
++	 * balloon_migrate 0
++	 */
+ 	__count_vm_event(BALLOON_MIGRATE);
+ 	spin_unlock_irqrestore(&vb_dev_info->pages_lock, flags);
+ 	vb->num_pfns = VIRTIO_BALLOON_PAGES_PER_PAGE;
++	/*
++	 * 在以下使用set_page_pfns():
++	 *   - drivers/virtio/virtio_balloon.c|244| <<fill_balloon>> set_page_pfns(vb, vb->pfns + vb->num_pfns, page);
++	 *   - drivers/virtio/virtio_balloon.c|293| <<leak_balloon>> set_page_pfns(vb, vb->pfns + vb->num_pfns, page);
++	 *   - drivers/virtio/virtio_balloon.c|795| <<virtballoon_migratepage>> set_page_pfns(vb, vb->pfns, newpage);
++	 *   - drivers/virtio/virtio_balloon.c|803| <<virtballoon_migratepage>> set_page_pfns(vb, vb->pfns, page);
++	 */
+ 	set_page_pfns(vb, vb->pfns, newpage);
++	/*
++	 * 在以下使用tell_host():
++	 *   - drivers/virtio/virtio_balloon.c|255| <<fill_balloon>> tell_host(vb, vb->inflate_vq);
++	 *   - drivers/virtio/virtio_balloon.c|305| <<leak_balloon>> tell_host(vb, vb->deflate_vq);
++	 *   - drivers/virtio/virtio_balloon.c|796| <<virtballoon_migratepage>> tell_host(vb, vb->inflate_vq);
++	 *   - drivers/virtio/virtio_balloon.c|804| <<virtballoon_migratepage>> tell_host(vb, vb->deflate_vq);
++	 */
+ 	tell_host(vb, vb->inflate_vq);
+ 
+ 	/* balloon's page migration 2nd step -- deflate "page" */
+ 	spin_lock_irqsave(&vb_dev_info->pages_lock, flags);
++	/*
++	 * 在以下使用balloon_page_delete():
++	 *   - arch/powerpc/platforms/pseries/cmm.c|553| <<cmm_migratepage>> balloon_page_delete(page);
++	 *   - drivers/misc/vmw_balloon.c|1808| <<vmballoon_migratepage>> balloon_page_delete(page);
++	 *   - drivers/virtio/virtio_balloon.c|800| <<virtballoon_migratepage>> balloon_page_delete(page);
++	 *   - mm/balloon_compaction.c|102| <<balloon_page_list_dequeue>> balloon_page_delete(page);
++	 */
+ 	balloon_page_delete(page);
+ 	spin_unlock_irqrestore(&vb_dev_info->pages_lock, flags);
+ 	vb->num_pfns = VIRTIO_BALLOON_PAGES_PER_PAGE;
++	/*
++	 * 在以下使用set_page_pfns():
++	 *   - drivers/virtio/virtio_balloon.c|244| <<fill_balloon>> set_page_pfns(vb, vb->pfns + vb->num_pfns, page);
++	 *   - drivers/virtio/virtio_balloon.c|293| <<leak_balloon>> set_page_pfns(vb, vb->pfns + vb->num_pfns, page);
++	 *   - drivers/virtio/virtio_balloon.c|795| <<virtballoon_migratepage>> set_page_pfns(vb, vb->pfns, newpage);
++	 *   - drivers/virtio/virtio_balloon.c|803| <<virtballoon_migratepage>> set_page_pfns(vb, vb->pfns, page);
++	 */
+ 	set_page_pfns(vb, vb->pfns, page);
++	/*
++	 * 在以下使用tell_host():
++	 *   - drivers/virtio/virtio_balloon.c|255| <<fill_balloon>> tell_host(vb, vb->inflate_vq);
++	 *   - drivers/virtio/virtio_balloon.c|305| <<leak_balloon>> tell_host(vb, vb->deflate_vq);
++	 *   - drivers/virtio/virtio_balloon.c|796| <<virtballoon_migratepage>> tell_host(vb, vb->inflate_vq);
++	 *   - drivers/virtio/virtio_balloon.c|804| <<virtballoon_migratepage>> tell_host(vb, vb->deflate_vq);
++	 */
+ 	tell_host(vb, vb->deflate_vq);
+ 
+ 	mutex_unlock(&vb->balloon_lock);
+@@ -831,6 +1350,12 @@ static unsigned long shrink_free_pages(struct virtio_balloon *vb,
+ 	pages_to_free = round_up(pages_to_free,
+ 				 VIRTIO_BALLOON_HINT_BLOCK_PAGES);
+ 	blocks_to_free = pages_to_free / VIRTIO_BALLOON_HINT_BLOCK_PAGES;
++	/*
++	 * 在以下使用return_free_pages_to_mm():
++	 *   - drivers/virtio/virtio_balloon.c|1000| <<report_free_page_func>> return_free_pages_to_mm(vb, ULONG_MAX);
++	 *   - drivers/virtio/virtio_balloon.c|1139| <<shrink_free_pages>> blocks_freed = return_free_pages_to_mm(vb, blocks_to_free);
++	 *   - drivers/virtio/virtio_balloon.c|1412| <<remove_common>> return_free_pages_to_mm(vb, ULONG_MAX);
++	 */
+ 	blocks_freed = return_free_pages_to_mm(vb, blocks_to_free);
+ 
+ 	return blocks_freed * VIRTIO_BALLOON_HINT_BLOCK_PAGES;
+@@ -851,9 +1376,31 @@ static unsigned long virtio_balloon_shrinker_count(struct shrinker *shrinker,
+ 	struct virtio_balloon *vb = container_of(shrinker,
+ 					struct virtio_balloon, shrinker);
+ 
++	/*
++	 * 在以下使用virtio_balloon->num_free_page_blocks:
++	 *   - drivers/virtio/virtio_balloon.c|660| <<return_free_pages_to_mm>> vb->num_free_page_blocks -= num_returned;
++	 *   - drivers/virtio/virtio_balloon.c|1004| <<get_free_page_and_send>> vb->num_free_page_blocks++;
++	 *   - drivers/virtio/virtio_balloon.c|1288| <<virtio_balloon_shrinker_count>> return vb->num_free_page_blocks * VIRTIO_BALLOON_HINT_BLOCK_PAGES;
++	 */
+ 	return vb->num_free_page_blocks * VIRTIO_BALLOON_HINT_BLOCK_PAGES;
+ }
+ 
++/*
++ * [0] leak_balloon and update_balloon_size
++ * [0] virtio_balloon_oom_notify
++ * [0] blocking_notifier_call_chain
++ * [0] out_of_memory
++ * [0] __alloc_pages
++ * [0] alloc_pages_vma
++ * [0] __handle_mm_fault
++ * [0] handle_mm_fault
++ * [0] do_user_addr_fault
++ * [0] exc_page_fault
++ * [0] asm_exc_page_fault
++ *
++ * 在以下使用virtio_balloon_oom_notify():
++ *   - drivers/virtio/virtio_balloon.c|1443| <<virtballoon_probe>> vb->oom_nb.notifier_call = virtio_balloon_oom_notify;
++ */
+ static int virtio_balloon_oom_notify(struct notifier_block *nb,
+ 				     unsigned long dummy, void *parm)
+ {
+@@ -861,8 +1408,21 @@ static int virtio_balloon_oom_notify(struct notifier_block *nb,
+ 						 struct virtio_balloon, oom_nb);
+ 	unsigned long *freed = parm;
+ 
++	/*
++	 * 在以下使用leak_balloon():
++	 *   - drivers/virtio/virtio_balloon.c|494| <<update_balloon_size_func>> diff += leak_balloon(vb, -diff);
++	 *   - drivers/virtio/virtio_balloon.c|864| <<virtio_balloon_oom_notify>> *freed += leak_balloon(vb, VIRTIO_BALLOON_OOM_NR_PAGES) /
++	 *   - drivers/virtio/virtio_balloon.c|1055| <<remove_common>> leak_balloon(vb, vb->num_pages);
++	 */
+ 	*freed += leak_balloon(vb, VIRTIO_BALLOON_OOM_NR_PAGES) /
+ 		  VIRTIO_BALLOON_PAGES_PER_PAGE;
++	/*
++	 * 在以下使用update_balloon_size():
++	 *   - drivers/virtio/virtio_balloon.c|590| <<update_balloon_size_func>> update_balloon_size(vb);
++	 *   - drivers/virtio/virtio_balloon.c|1001| <<virtio_balloon_oom_notify>> update_balloon_size(vb);
++	 *   - drivers/virtio/virtio_balloon.c|1191| <<remove_common>> update_balloon_size(vb);
++	 *   - drivers/virtio/virtio_balloon.c|1260| <<virtballoon_restore>> update_balloon_size(vb);
++	 */
+ 	update_balloon_size(vb);
+ 
+ 	return NOTIFY_OK;
+@@ -873,12 +1433,19 @@ static void virtio_balloon_unregister_shrinker(struct virtio_balloon *vb)
+ 	unregister_shrinker(&vb->shrinker);
+ }
+ 
++/*
++ * 在以下使用virtio_balloon_register_shrinker():
++ *   - drivers/virtio/virtio_balloon.c|1437| <<virtballoon_probe>> err = virtio_balloon_register_shrinker(vb);
++ */
+ static int virtio_balloon_register_shrinker(struct virtio_balloon *vb)
+ {
+ 	vb->shrinker.scan_objects = virtio_balloon_shrinker_scan;
+ 	vb->shrinker.count_objects = virtio_balloon_shrinker_count;
+ 	vb->shrinker.seeks = DEFAULT_SEEKS;
+ 
++	/*
++	 * 注册一个 shrinker，等于告诉内核：当内存紧张时，可以来“找你要内存.
++	 */
+ 	return register_shrinker(&vb->shrinker);
+ }
+ 
+@@ -899,13 +1466,31 @@ static int virtballoon_probe(struct virtio_device *vdev)
+ 		goto out;
+ 	}
+ 
++	/*
++	 * 在以下使用virtio_balloon->update_balloon_stats_work:
++	 *   - drivers/virtio/virtio_balloon.c|500| <<stats_request>> queue_work(system_freezable_wq, &vb->update_balloon_stats_work);
++	 *   - drivers/virtio/virtio_balloon.c|1124| <<virtballoon_probe>> INIT_WORK(&vb->update_balloon_stats_work, update_balloon_stats_func);
++	 *   - drivers/virtio/virtio_balloon.c|1338| <<virtballoon_remove>> cancel_work_sync(&vb->update_balloon_stats_work);
++	 */
+ 	INIT_WORK(&vb->update_balloon_stats_work, update_balloon_stats_func);
++	/*
++	 * 在以下使用virtio_balloon->update_balloon_size_work:
++	 *   - drivers/virtio/virtio_balloon.c|550| <<virtballoon_changed>> queue_work(system_freezable_wq, &vb->update_balloon_size_work);
++	 *   - drivers/virtio/virtio_balloon.c|1038| <<virtballoon_probe>> INIT_WORK(&vb->update_balloon_size_work, update_balloon_size_func);
++	 *   - drivers/virtio/virtio_balloon.c|1216| <<virtballoon_remove>> cancel_work_sync(&vb->update_balloon_size_work);
++	 */
+ 	INIT_WORK(&vb->update_balloon_size_work, update_balloon_size_func);
+ 	spin_lock_init(&vb->stop_update_lock);
+ 	mutex_init(&vb->balloon_lock);
+ 	init_waitqueue_head(&vb->acked);
+ 	vb->vdev = vdev;
+ 
++	/*
++	 * 在以下使用balloon_devinfo_init():
++	 *   - arch/powerpc/platforms/pseries/cmm.c|573| <<cmm_balloon_compaction_init>> balloon_devinfo_init(&b_dev_info);
++	 *   - drivers/misc/vmw_balloon.c|1941| <<vmballoon_init>> balloon_devinfo_init(&balloon.b_dev_info);
++	 *   - drivers/virtio/virtio_balloon.c|1423| <<virtballoon_probe>> balloon_devinfo_init(&vb->vb_dev_info);
++	 */
+ 	balloon_devinfo_init(&vb->vb_dev_info);
+ 
+ 	err = init_vqs(vb);
+@@ -913,12 +1498,33 @@ static int virtballoon_probe(struct virtio_device *vdev)
+ 		goto out_free_vb;
+ 
+ #ifdef CONFIG_BALLOON_COMPACTION
++	/*
++	 * 在以下使用balloon_mnt:
++	 *   - drivers/virtio/virtio_balloon.c|1051| <<virtballoon_probe>> balloon_mnt = kern_mount(&balloon_fs);
++	 *   - drivers/virtio/virtio_balloon.c|1052| <<virtballoon_probe>> if (IS_ERR(balloon_mnt)) {
++	 *   - drivers/virtio/virtio_balloon.c|1053| <<virtballoon_probe>> err = PTR_ERR(balloon_mnt);
++	 *   - drivers/virtio/virtio_balloon.c|1058| <<virtballoon_probe>> vb->vb_dev_info.inode = alloc_anon_inode(balloon_mnt->mnt_sb);
++	 *   - drivers/virtio/virtio_balloon.c|1176| <<virtballoon_probe>> kern_unmount(balloon_mnt);
++	 *   - drivers/virtio/virtio_balloon.c|1229| <<virtballoon_remove>> kern_unmount(balloon_mnt);
++	 */
+ 	balloon_mnt = kern_mount(&balloon_fs);
+ 	if (IS_ERR(balloon_mnt)) {
+ 		err = PTR_ERR(balloon_mnt);
+ 		goto out_del_vqs;
+ 	}
+ 
++	/*
++	 * 关于i_mapping:
++	 *
++	 * 132 static inline void balloon_page_insert(struct balloon_dev_info *balloon,
++	 * 133                                        struct page *page)
++	 * 134 {
++	 * 135         __SetPageOffline(page);
++	 * 136         __SetPageMovable(page, balloon->inode->i_mapping);
++	 * 137         set_page_private(page, (unsigned long)balloon);
++	 * 138         list_add(&page->lru, &balloon->pages);
++	 * 139 }
++	 */
+ 	vb->vb_dev_info.migratepage = virtballoon_migratepage;
+ 	vb->vb_dev_info.inode = alloc_anon_inode(balloon_mnt->mnt_sb);
+ 	if (IS_ERR(vb->vb_dev_info.inode)) {
+@@ -942,6 +1548,12 @@ static int virtballoon_probe(struct virtio_device *vdev)
+ 			err = -ENOMEM;
+ 			goto out_iput;
+ 		}
++		/*
++		 * 在以下使用virtio_balloon->report_free_page_work:
++		 *   - drivers/virtio/virtio_balloon.c|666| <<virtio_balloon_queue_free_page_work>> queue_work(vb->balloon_wq, &vb->report_free_page_work);
++		 *   - drivers/virtio/virtio_balloon.c|1284| <<virtballoon_probe>> INIT_WORK(&vb->report_free_page_work, report_free_page_func);
++		 *   - drivers/virtio/virtio_balloon.c|1449| <<virtballoon_remove>> cancel_work_sync(&vb->report_free_page_work);
++		 */
+ 		INIT_WORK(&vb->report_free_page_work, report_free_page_func);
+ 		vb->cmd_id_received_cache = VIRTIO_BALLOON_CMD_ID_STOP;
+ 		vb->cmd_id_active = cpu_to_virtio32(vb->vdev,
+@@ -949,6 +1561,12 @@ static int virtballoon_probe(struct virtio_device *vdev)
+ 		vb->cmd_id_stop = cpu_to_virtio32(vb->vdev,
+ 						  VIRTIO_BALLOON_CMD_ID_STOP);
+ 		spin_lock_init(&vb->free_page_list_lock);
++		/*
++		 * 在以下使用virtio_balloon->free_page_list:
++		 *   - drivers/virtio/virtio_balloon.c|517| <<return_free_pages_to_mm>> page = balloon_page_pop(&vb->free_page_list);
++		 *   - drivers/virtio/virtio_balloon.c|758| <<get_free_page_and_send>> balloon_page_push(&vb->free_page_list, page);
++		 *   - drivers/virtio/virtio_balloon.c|1087| <<virtballoon_probe>> INIT_LIST_HEAD(&vb->free_page_list);
++		 */
+ 		INIT_LIST_HEAD(&vb->free_page_list);
+ 		/*
+ 		 * We're allowed to reuse any free pages, even if they are
+@@ -1053,6 +1671,13 @@ static void remove_common(struct virtio_balloon *vb)
+ 	/* There might be pages left in the balloon: free them. */
+ 	while (vb->num_pages)
+ 		leak_balloon(vb, vb->num_pages);
++	/*
++	 * 在以下使用update_balloon_size():
++	 *   - drivers/virtio/virtio_balloon.c|590| <<update_balloon_size_func>> update_balloon_size(vb);
++	 *   - drivers/virtio/virtio_balloon.c|1001| <<virtio_balloon_oom_notify>> update_balloon_size(vb);
++	 *   - drivers/virtio/virtio_balloon.c|1191| <<remove_common>> update_balloon_size(vb);
++	 *   - drivers/virtio/virtio_balloon.c|1260| <<virtballoon_restore>> update_balloon_size(vb);
++	 */
+ 	update_balloon_size(vb);
+ 
+ 	/* There might be free pages that are being reported: release them. */
+@@ -1076,12 +1701,36 @@ static void virtballoon_remove(struct virtio_device *vdev)
+ 	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_FREE_PAGE_HINT))
+ 		virtio_balloon_unregister_shrinker(vb);
+ 	spin_lock_irq(&vb->stop_update_lock);
++	/*
++	 * 在以下使用virtio_balloon->stop_update:
++	 *   - drivers/virtio/virtio_balloon.c|584| <<stats_request>> if (!vb->stop_update)
++	 *   - drivers/virtio/virtio_balloon.c|713| <<virtballoon_changed>> if (!vb->stop_update) {
++	 *   - drivers/virtio/virtio_balloon.c|1645| <<virtballoon_remove>> vb->stop_update = true;
++	 */
+ 	vb->stop_update = true;
+ 	spin_unlock_irq(&vb->stop_update_lock);
++	/*
++	 * 在以下使用virtio_balloon->update_balloon_size_work:
++	 *   - drivers/virtio/virtio_balloon.c|550| <<virtballoon_changed>> queue_work(system_freezable_wq, &vb->update_balloon_size_work);
++	 *   - drivers/virtio/virtio_balloon.c|1038| <<virtballoon_probe>> INIT_WORK(&vb->update_balloon_size_work, update_balloon_size_func);
++	 *   - drivers/virtio/virtio_balloon.c|1216| <<virtballoon_remove>> cancel_work_sync(&vb->update_balloon_size_work);
++	 */
+ 	cancel_work_sync(&vb->update_balloon_size_work);
++	/*
++	 * 在以下使用virtio_balloon->update_balloon_stats_work:
++	 *   - drivers/virtio/virtio_balloon.c|500| <<stats_request>> queue_work(system_freezable_wq, &vb->update_balloon_stats_work);
++	 *   - drivers/virtio/virtio_balloon.c|1124| <<virtballoon_probe>> INIT_WORK(&vb->update_balloon_stats_work, update_balloon_stats_func);
++	 *   - drivers/virtio/virtio_balloon.c|1338| <<virtballoon_remove>> cancel_work_sync(&vb->update_balloon_stats_work);
++	 */
+ 	cancel_work_sync(&vb->update_balloon_stats_work);
+ 
+ 	if (virtio_has_feature(vdev, VIRTIO_BALLOON_F_FREE_PAGE_HINT)) {
++		/*
++		 * 在以下使用virtio_balloon->report_free_page_work:
++		 *   - drivers/virtio/virtio_balloon.c|666| <<virtio_balloon_queue_free_page_work>> queue_work(vb->balloon_wq, &vb->report_free_page_work);
++		 *   - drivers/virtio/virtio_balloon.c|1284| <<virtballoon_probe>> INIT_WORK(&vb->report_free_page_work, report_free_page_func);
++		 *   - drivers/virtio/virtio_balloon.c|1449| <<virtballoon_remove>> cancel_work_sync(&vb->report_free_page_work);
++		 */
+ 		cancel_work_sync(&vb->report_free_page_work);
+ 		destroy_workqueue(vb->balloon_wq);
+ 	}
+@@ -1122,6 +1771,13 @@ static int virtballoon_restore(struct virtio_device *vdev)
+ 
+ 	if (towards_target(vb))
+ 		virtballoon_changed(vdev);
++	/*
++	 * 在以下使用update_balloon_size():
++	 *   - drivers/virtio/virtio_balloon.c|590| <<update_balloon_size_func>> update_balloon_size(vb);
++	 *   - drivers/virtio/virtio_balloon.c|1001| <<virtio_balloon_oom_notify>> update_balloon_size(vb);
++	 *   - drivers/virtio/virtio_balloon.c|1191| <<remove_common>> update_balloon_size(vb);
++	 *   - drivers/virtio/virtio_balloon.c|1260| <<virtballoon_restore>> update_balloon_size(vb);
++	 */
+ 	update_balloon_size(vb);
+ 	return 0;
+ }
+diff --git a/include/linux/balloon_compaction.h b/include/linux/balloon_compaction.h
+index 338aa27e4773..c052388975d6 100644
+--- a/include/linux/balloon_compaction.h
++++ b/include/linux/balloon_compaction.h
+@@ -52,6 +52,16 @@
+  * balloon driver as a page book-keeper for its registered balloon devices.
+  */
+ struct balloon_dev_info {
++	/*
++	 * 在以下使用balloon_dev_info->isolated_pages:
++	 *   - arch/powerpc/platforms/pseries/cmm.c|554| <<cmm_migratepage>> b_dev_info->isolated_pages--;
++	 *   - drivers/misc/vmw_balloon.c|1857| <<vmballoon_migratepage>> b->b_dev_info.isolated_pages--;
++	 *   - drivers/virtio/virtio_balloon.c|1061| <<virtballoon_migratepage>> vb_dev_info->isolated_pages--;
++	 *   - include/linux/balloon_compaction.h|74| <<balloon_devinfo_init>> balloon->isolated_pages = 0;
++	 *   - mm/balloon_compaction.c|223| <<balloon_page_dequeue>> if (... !b_dev_info->isolated_pages))
++	 *   - mm/balloon_compaction.c|242| <<balloon_page_isolate>> b_dev_info->isolated_pages++;
++	 *   - mm/balloon_compaction.c|255| <<balloon_page_putback>> b_dev_info->isolated_pages--;
++	 */
+ 	unsigned long isolated_pages;	/* # of isolated pages for migration */
+ 	spinlock_t pages_lock;		/* Protection to pages list */
+ 	struct list_head pages;		/* Pages enqueued & handled to Host */
+@@ -69,8 +79,24 @@ extern size_t balloon_page_list_enqueue(struct balloon_dev_info *b_dev_info,
+ extern size_t balloon_page_list_dequeue(struct balloon_dev_info *b_dev_info,
+ 				     struct list_head *pages, size_t n_req_pages);
+ 
++/*
++ * 在以下使用balloon_devinfo_init():
++ *   - arch/powerpc/platforms/pseries/cmm.c|573| <<cmm_balloon_compaction_init>> balloon_devinfo_init(&b_dev_info);
++ *   - drivers/misc/vmw_balloon.c|1941| <<vmballoon_init>> balloon_devinfo_init(&balloon.b_dev_info);
++ *   - drivers/virtio/virtio_balloon.c|1423| <<virtballoon_probe>> balloon_devinfo_init(&vb->vb_dev_info);
++ */
+ static inline void balloon_devinfo_init(struct balloon_dev_info *balloon)
+ {
++	/*
++	 * 在以下使用balloon_dev_info->isolated_pages:
++	 *   - arch/powerpc/platforms/pseries/cmm.c|554| <<cmm_migratepage>> b_dev_info->isolated_pages--;
++	 *   - drivers/misc/vmw_balloon.c|1857| <<vmballoon_migratepage>> b->b_dev_info.isolated_pages--;
++	 *   - drivers/virtio/virtio_balloon.c|1061| <<virtballoon_migratepage>> vb_dev_info->isolated_pages--;
++	 *   - include/linux/balloon_compaction.h|74| <<balloon_devinfo_init>> balloon->isolated_pages = 0;
++	 *   - mm/balloon_compaction.c|223| <<balloon_page_dequeue>> if (... !b_dev_info->isolated_pages))
++	 *   - mm/balloon_compaction.c|242| <<balloon_page_isolate>> b_dev_info->isolated_pages++;
++	 *   - mm/balloon_compaction.c|255| <<balloon_page_putback>> b_dev_info->isolated_pages--;
++	 */
+ 	balloon->isolated_pages = 0;
+ 	spin_lock_init(&balloon->pages_lock);
+ 	INIT_LIST_HEAD(&balloon->pages);
+@@ -96,6 +122,13 @@ extern int balloon_page_migrate(struct address_space *mapping,
+  * Caller must ensure the page is locked and the spin_lock protecting balloon
+  * pages list is held before inserting a page into the balloon device.
+  */
++/*
++ * 在以下使用balloon_page_insert():
++ *   - arch/powerpc/platforms/pseries/cmm.c|552| <<cmm_migratepage>> balloon_page_insert(b_dev_info, newpage);
++ *   - drivers/misc/vmw_balloon.c|1849| <<vmballoon_migratepage>> balloon_page_insert(&b->b_dev_info, newpage);
++ *   - drivers/virtio/virtio_balloon.c|1060| <<virtballoon_migratepage>> balloon_page_insert(vb_dev_info, newpage);
++ *   - mm/balloon_compaction.c|32| <<balloon_page_enqueue_one>> balloon_page_insert(b_dev_info, page);
++ */
+ static inline void balloon_page_insert(struct balloon_dev_info *balloon,
+ 				       struct page *page)
+ {
+@@ -113,6 +146,13 @@ static inline void balloon_page_insert(struct balloon_dev_info *balloon,
+  * Caller must ensure the page is locked and the spin_lock protecting balloon
+  * pages list is held before deleting a page from the balloon device.
+  */
++/*
++ * 在以下使用balloon_page_delete():
++ *   - arch/powerpc/platforms/pseries/cmm.c|553| <<cmm_migratepage>> balloon_page_delete(page);
++ *   - drivers/misc/vmw_balloon.c|1808| <<vmballoon_migratepage>> balloon_page_delete(page);
++ *   - drivers/virtio/virtio_balloon.c|800| <<virtballoon_migratepage>> balloon_page_delete(page);
++ *   - mm/balloon_compaction.c|102| <<balloon_page_list_dequeue>> balloon_page_delete(page);
++ */
+ static inline void balloon_page_delete(struct page *page)
+ {
+ 	__ClearPageOffline(page);
+@@ -130,6 +170,12 @@ static inline void balloon_page_delete(struct page *page)
+  * balloon_page_device - get the b_dev_info descriptor for the balloon device
+  *			 that enqueues the given page.
+  */
++/*
++ * 在以下使用balloon_page_device():
++ *   - mm/balloon_compaction.c|253| <<balloon_page_isolate>> struct balloon_dev_info *b_dev_info = balloon_page_device(page);
++ *   - mm/balloon_compaction.c|276| <<balloon_page_putback>> struct balloon_dev_info *b_dev_info = balloon_page_device(page);
++ *   - mm/balloon_compaction.c|301| <<balloon_page_migrate>> struct balloon_dev_info *balloon = balloon_page_device(page);
++ */
+ static inline struct balloon_dev_info *balloon_page_device(struct page *page)
+ {
+ 	return (struct balloon_dev_info *)page_private(page);
+@@ -185,6 +231,13 @@ static inline gfp_t balloon_mapping_gfp_mask(void)
+  *
+  * Caller must ensure the page is private and protect the list.
+  */
++/*
++ * 在以下使用balloon_page_push():
++ *   - drivers/virtio/virtio_balloon.c|234| <<fill_balloon>> balloon_page_push(&pages, page);
++ *   - drivers/virtio/virtio_balloon.c|658| <<get_free_page_and_send>> balloon_page_push(&vb->free_page_list, page);
++ *
++ * 就一行: list_add(&page->lru, pages);
++ */
+ static inline void balloon_page_push(struct list_head *pages, struct page *page)
+ {
+ 	list_add(&page->lru, pages);
+@@ -197,6 +250,13 @@ static inline void balloon_page_push(struct list_head *pages, struct page *page)
+  *
+  * Caller must ensure the page is private and protect the list.
+  */
++/*
++ * 在以下使用balloon_page_pop():
++ *   - drivers/virtio/virtio_balloon.c|315| <<fill_balloon>> while ((page = balloon_page_pop(&pages))) {
++ *   - drivers/virtio/virtio_balloon.c|558| <<return_free_pages_to_mm>> page = balloon_page_pop(&vb->free_page_list);
++ *
++ * 其实就是: 返回list第一个page, 然后list_del(&page->lru);
++ */
+ static inline struct page *balloon_page_pop(struct list_head *pages)
+ {
+ 	struct page *page = list_first_entry_or_null(pages, struct page, lru);
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 5c6e904871e3..b09161cdd813 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -412,7 +412,23 @@ struct address_space_operations {
+ 	 */
+ 	int (*migratepage) (struct address_space *,
+ 			struct page *, struct page *, enum migrate_mode);
++	/*
++	 * 在以下使用address_space_operations->isolate_page:
++	 *   - mm/balloon_compaction.c|334| <<global>> .isolate_page = balloon_page_isolate,
++	 *   - mm/secretmem.c|169| <<global>> .isolate_page = secretmem_isolate_page,
++	 *   - mm/z3fold.c|1691| <<global>> .isolate_page = z3fold_page_isolate,
++	 *   - mm/zsmalloc.c|2112| <<global>> .isolate_page = zs_page_isolate,
++	 *   - mm/compaction.c|123| <<PageMovable>> if (mapping && mapping->a_ops && mapping->a_ops->isolate_page)
++	 *   - mm/migrate.c|110| <<isolate_movable_page>> if (!mapping->a_ops->isolate_page(page, mode))
++	 */
+ 	bool (*isolate_page)(struct page *, isolate_mode_t);
++	/*
++	 * 在以下使用address_space_operations->putback_page:
++	 *   - mm/balloon_compaction.c|335| <<global>> .putback_page = balloon_page_putback,
++	 *   - mm/z3fold.c|1693| <<global>> .putback_page = z3fold_page_putback,
++	 *   - mm/zsmalloc.c|2114| <<global>> .putback_page = zs_page_putback,
++	 *   - mm/migrate.c|133| <<putback_movable_page>> mapping->a_ops->putback_page(page);
++	 */
+ 	void (*putback_page)(struct page *);
+ 	int (*launder_page) (struct page *);
+ 	int (*is_partially_uptodate) (struct page *, unsigned long,
+diff --git a/include/linux/huge_mm.h b/include/linux/huge_mm.h
+index 88ca900f5a80..34d021595fcd 100644
+--- a/include/linux/huge_mm.h
++++ b/include/linux/huge_mm.h
+@@ -197,6 +197,17 @@ void deferred_split_huge_page(struct page *page);
+ void __split_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
+ 		unsigned long address, bool freeze, struct page *page);
+ 
++/*
++ * 在以下使用split_huge_pmd():
++ *   - arch/powerpc/mm/book3s64/subpage_prot.c|140| <<subpage_walk_pmd_entry>> split_huge_pmd(vma, pmd, addr);
++ *   - arch/s390/mm/gmap.c|2500| <<thp_split_walk_pmd_entry>> split_huge_pmd(vma, pmd, addr);
++ *   - fs/dax.c|1623| <<dax_iomap_pmd_fault>> split_huge_pmd(vmf->vma, vmf->pmd, vmf->address);
++ *   - mm/gup.c|733| <<follow_pmd_mask>> split_huge_pmd(vma, pmd, address);
++ *   - mm/gup.c|738| <<follow_pmd_mask>> split_huge_pmd(vma, pmd, address);
++ *   - mm/migrate.c|2413| <<migrate_vma_collect_pmd>> split_huge_pmd(vma, pmdp, addr);
++ *   - mm/mremap.c|544| <<move_page_tables>> split_huge_pmd(vma, old_pmd, old_addr);
++ *   - mm/pagewalk.c|145| <<walk_pmd_range>> split_huge_pmd(walk->vma, pmd, addr);
++ */
+ #define split_huge_pmd(__vma, __pmd, __address)				\
+ 	do {								\
+ 		pmd_t *____pmd = (__pmd);				\
+diff --git a/mm/balloon_compaction.c b/mm/balloon_compaction.c
+index 907fefde2572..b86f15af1882 100644
+--- a/mm/balloon_compaction.c
++++ b/mm/balloon_compaction.c
+@@ -11,6 +11,11 @@
+ #include <linux/export.h>
+ #include <linux/balloon_compaction.h>
+ 
++/*
++ * 在以下使用balloon_page_enqueue_one():
++ *   - mm/balloon_compaction.c|50| <<balloon_page_list_enqueue>> balloon_page_enqueue_one(b_dev_info, page);
++ *   - mm/balloon_compaction.c|152| <<balloon_page_enqueue>> balloon_page_enqueue_one(b_dev_info, page);
++ */
+ static void balloon_page_enqueue_one(struct balloon_dev_info *b_dev_info,
+ 				     struct page *page)
+ {
+@@ -21,6 +26,19 @@ static void balloon_page_enqueue_one(struct balloon_dev_info *b_dev_info,
+ 	 * memory corruption is possible and we should stop execution.
+ 	 */
+ 	BUG_ON(!trylock_page(page));
++	/*
++	 * 在以下使用balloon_page_insert():
++	 *   - arch/powerpc/platforms/pseries/cmm.c|552| <<cmm_migratepage>> balloon_page_insert(b_dev_info, newpage);
++	 *   - drivers/misc/vmw_balloon.c|1849| <<vmballoon_migratepage>> balloon_page_insert(&b->b_dev_info, newpage);
++	 *   - drivers/virtio/virtio_balloon.c|1060| <<virtballoon_migratepage>> balloon_page_insert(vb_dev_info, newpage);
++	 *   - mm/balloon_compaction.c|32| <<balloon_page_enqueue_one>> balloon_page_insert(b_dev_info, page);
++	 *
++	 * 核心是把page->lru加入balloon_dev_info->pages
++	 * 135         __SetPageOffline(page);
++	 * 136         __SetPageMovable(page, balloon->inode->i_mapping);
++	 * 137         set_page_private(page, (unsigned long)balloon);
++	 * 138         list_add(&page->lru, &balloon->pages);
++	 */
+ 	balloon_page_insert(b_dev_info, page);
+ 	unlock_page(page);
+ 	__count_vm_event(BALLOON_INFLATE);
+@@ -37,6 +55,10 @@ static void balloon_page_enqueue_one(struct balloon_dev_info *b_dev_info,
+  *
+  * Return: number of pages that were enqueued.
+  */
++/*
++ * 在以下使用balloon_page_list_enqueue():
++ *   - drivers/misc/vmw_balloon.c|1005| <<vmballoon_enqueue_page_list>> balloon_page_list_enqueue(&b->b_dev_info, pages);
++ */
+ size_t balloon_page_list_enqueue(struct balloon_dev_info *b_dev_info,
+ 				 struct list_head *pages)
+ {
+@@ -47,6 +69,11 @@ size_t balloon_page_list_enqueue(struct balloon_dev_info *b_dev_info,
+ 	spin_lock_irqsave(&b_dev_info->pages_lock, flags);
+ 	list_for_each_entry_safe(page, tmp, pages, lru) {
+ 		list_del(&page->lru);
++		/*
++		 * 在以下使用balloon_page_enqueue_one():
++		 *   - mm/balloon_compaction.c|50| <<balloon_page_list_enqueue>> balloon_page_enqueue_one(b_dev_info, page);
++		 *   - mm/balloon_compaction.c|152| <<balloon_page_enqueue>> balloon_page_enqueue_one(b_dev_info, page);
++		 */
+ 		balloon_page_enqueue_one(b_dev_info, page);
+ 		n_pages++;
+ 	}
+@@ -73,6 +100,11 @@ EXPORT_SYMBOL_GPL(balloon_page_list_enqueue);
+  *
+  * Return: number of pages that were added to the @pages list.
+  */
++/*
++ * 在以下使用balloon_page_list_dequeue():
++ *   - drivers/misc/vmw_balloon.c|1051| <<vmballoon_dequeue_page_list>> *n_pages = balloon_page_list_dequeue(&b->b_dev_info, pages,
++ *   - mm/balloon_compaction.c|226| <<balloon_page_dequeue>> n_pages = balloon_page_list_dequeue(b_dev_info, &pages, 1);
++ */
+ size_t balloon_page_list_dequeue(struct balloon_dev_info *b_dev_info,
+ 				 struct list_head *pages, size_t n_req_pages)
+ {
+@@ -93,12 +125,22 @@ size_t balloon_page_list_dequeue(struct balloon_dev_info *b_dev_info,
+ 		if (!trylock_page(page))
+ 			continue;
+ 
++		/*
++		 * 只在isolate_movable_page()
++		 */
+ 		if (IS_ENABLED(CONFIG_BALLOON_COMPACTION) &&
+ 		    PageIsolated(page)) {
+ 			/* raced with isolation */
+ 			unlock_page(page);
+ 			continue;
+ 		}
++		/*
++		 * 在以下使用balloon_page_delete():
++		 *   - arch/powerpc/platforms/pseries/cmm.c|553| <<cmm_migratepage>> balloon_page_delete(page);
++		 *   - drivers/misc/vmw_balloon.c|1808| <<vmballoon_migratepage>> balloon_page_delete(page);
++		 *   - drivers/virtio/virtio_balloon.c|800| <<virtballoon_migratepage>> balloon_page_delete(page);
++		 *   - mm/balloon_compaction.c|102| <<balloon_page_list_dequeue>> balloon_page_delete(page);
++		 */
+ 		balloon_page_delete(page);
+ 		__count_vm_event(BALLOON_DEFLATE);
+ 		list_add(&page->lru, pages);
+@@ -121,6 +163,12 @@ EXPORT_SYMBOL_GPL(balloon_page_list_dequeue);
+  *
+  * Return: struct page for the allocated page or NULL on allocation failure.
+  */
++/*
++ * 在以下使用balloon_page_alloc():
++ *   - arch/powerpc/platforms/pseries/cmm.c|159| <<cmm_alloc_pages>> page = balloon_page_alloc();
++ *   - drivers/misc/vmw_balloon.c|683| <<vmballoon_alloc_page_list>> page = balloon_page_alloc();
++ *   - drivers/virtio/virtio_balloon.c|314| <<fill_balloon>> struct page *page = balloon_page_alloc();
++ */
+ struct page *balloon_page_alloc(void)
+ {
+ 	struct page *page = alloc_page(balloon_mapping_gfp_mask() |
+@@ -143,12 +191,22 @@ EXPORT_SYMBOL_GPL(balloon_page_alloc);
+  * a list with balloon_page_push before removing them with balloon_page_pop. To
+  * enqueue a list of pages, use balloon_page_list_enqueue instead.
+  */
++/*
++ * 在以下使用balloon_page_enqueue():
++ *   - arch/powerpc/platforms/pseries/cmm.c|169| <<cmm_alloc_pages>> balloon_page_enqueue(&b_dev_info, page);
++ *   - drivers/virtio/virtio_balloon.c|343| <<fill_balloon>> balloon_page_enqueue(&vb->vb_dev_info, page);
++ */
+ void balloon_page_enqueue(struct balloon_dev_info *b_dev_info,
+ 			  struct page *page)
+ {
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&b_dev_info->pages_lock, flags);
++	/*
++	 * 在以下使用balloon_page_enqueue_one():
++	 *   - mm/balloon_compaction.c|50| <<balloon_page_list_enqueue>> balloon_page_enqueue_one(b_dev_info, page);
++	 *   - mm/balloon_compaction.c|152| <<balloon_page_enqueue>> balloon_page_enqueue_one(b_dev_info, page);
++	 */
+ 	balloon_page_enqueue_one(b_dev_info, page);
+ 	spin_unlock_irqrestore(&b_dev_info->pages_lock, flags);
+ }
+@@ -174,12 +232,25 @@ EXPORT_SYMBOL_GPL(balloon_page_enqueue);
+  *
+  * Return: struct page for the dequeued page, or NULL if no page was dequeued.
+  */
++/*
++ * 在以下使用balloon_page_dequeue():
++ *   - arch/powerpc/platforms/pseries/cmm.c|192| <<cmm_free_pages>> page = balloon_page_dequeue(&b_dev_info);
++ *   - drivers/virtio/virtio_balloon.c|424| <<leak_balloon>> page = balloon_page_dequeue(vb_dev_info);
++ */
+ struct page *balloon_page_dequeue(struct balloon_dev_info *b_dev_info)
+ {
+ 	unsigned long flags;
++	/*
++	 * pages是本地变量!!!
++	 */
+ 	LIST_HEAD(pages);
+ 	int n_pages;
+ 
++	/*
++	 * 在以下使用balloon_page_list_dequeue():
++	 *   - drivers/misc/vmw_balloon.c|1051| <<vmballoon_dequeue_page_list>> *n_pages = balloon_page_list_dequeue(&b->b_dev_info, pages,
++	 *   - mm/balloon_compaction.c|226| <<balloon_page_dequeue>> n_pages = balloon_page_list_dequeue(b_dev_info, &pages, 1);
++	 */
+ 	n_pages = balloon_page_list_dequeue(b_dev_info, &pages, 1);
+ 
+ 	if (n_pages != 1) {
+@@ -191,6 +262,16 @@ struct page *balloon_page_dequeue(struct balloon_dev_info *b_dev_info)
+ 		 * an infinite loop while attempting to release all its pages.
+ 		 */
+ 		spin_lock_irqsave(&b_dev_info->pages_lock, flags);
++		/*
++		 * 在以下使用balloon_dev_info->isolated_pages:
++		 *   - arch/powerpc/platforms/pseries/cmm.c|554| <<cmm_migratepage>> b_dev_info->isolated_pages--;
++		 *   - drivers/misc/vmw_balloon.c|1857| <<vmballoon_migratepage>> b->b_dev_info.isolated_pages--;
++		 *   - drivers/virtio/virtio_balloon.c|1061| <<virtballoon_migratepage>> vb_dev_info->isolated_pages--;
++		 *   - include/linux/balloon_compaction.h|74| <<balloon_devinfo_init>> balloon->isolated_pages = 0;
++		 *   - mm/balloon_compaction.c|223| <<balloon_page_dequeue>> if (... !b_dev_info->isolated_pages))
++		 *   - mm/balloon_compaction.c|242| <<balloon_page_isolate>> b_dev_info->isolated_pages++;
++		 *   - mm/balloon_compaction.c|255| <<balloon_page_putback>> b_dev_info->isolated_pages--;
++		 */
+ 		if (unlikely(list_empty(&b_dev_info->pages) &&
+ 			     !b_dev_info->isolated_pages))
+ 			BUG();
+@@ -211,6 +292,16 @@ bool balloon_page_isolate(struct page *page, isolate_mode_t mode)
+ 
+ 	spin_lock_irqsave(&b_dev_info->pages_lock, flags);
+ 	list_del(&page->lru);
++	/*
++	 * 在以下使用balloon_dev_info->isolated_pages:
++	 *   - arch/powerpc/platforms/pseries/cmm.c|554| <<cmm_migratepage>> b_dev_info->isolated_pages--;
++	 *   - drivers/misc/vmw_balloon.c|1857| <<vmballoon_migratepage>> b->b_dev_info.isolated_pages--;
++	 *   - drivers/virtio/virtio_balloon.c|1061| <<virtballoon_migratepage>> vb_dev_info->isolated_pages--;
++	 *   - include/linux/balloon_compaction.h|74| <<balloon_devinfo_init>> balloon->isolated_pages = 0;
++	 *   - mm/balloon_compaction.c|223| <<balloon_page_dequeue>> if (... !b_dev_info->isolated_pages))
++	 *   - mm/balloon_compaction.c|242| <<balloon_page_isolate>> b_dev_info->isolated_pages++;
++	 *   - mm/balloon_compaction.c|255| <<balloon_page_putback>> b_dev_info->isolated_pages--;
++	 */
+ 	b_dev_info->isolated_pages++;
+ 	spin_unlock_irqrestore(&b_dev_info->pages_lock, flags);
+ 
+@@ -224,11 +315,27 @@ void balloon_page_putback(struct page *page)
+ 
+ 	spin_lock_irqsave(&b_dev_info->pages_lock, flags);
+ 	list_add(&page->lru, &b_dev_info->pages);
++	/*
++	 * 在以下使用balloon_dev_info->isolated_pages:
++	 *   - arch/powerpc/platforms/pseries/cmm.c|554| <<cmm_migratepage>> b_dev_info->isolated_pages--;
++	 *   - drivers/misc/vmw_balloon.c|1857| <<vmballoon_migratepage>> b->b_dev_info.isolated_pages--;
++	 *   - drivers/virtio/virtio_balloon.c|1061| <<virtballoon_migratepage>> vb_dev_info->isolated_pages--;
++	 *   - include/linux/balloon_compaction.h|74| <<balloon_devinfo_init>> balloon->isolated_pages = 0;
++	 *   - mm/balloon_compaction.c|223| <<balloon_page_dequeue>> if (... !b_dev_info->isolated_pages))
++	 *   - mm/balloon_compaction.c|242| <<balloon_page_isolate>> b_dev_info->isolated_pages++;
++	 *   - mm/balloon_compaction.c|255| <<balloon_page_putback>> b_dev_info->isolated_pages--;
++	 */
+ 	b_dev_info->isolated_pages--;
+ 	spin_unlock_irqrestore(&b_dev_info->pages_lock, flags);
+ }
+ 
+ 
++/*
++ * 关于migratepage方法的调用:
++ *   - mm/balloon_compaction.c|348| <<balloon_page_migrate>> return balloon->migratepage(balloon, newpage, page, mode);
++ *   - mm/migrate.c|959| <<move_to_new_page>> rc = mapping->a_ops->migratepage(mapping, newpage,
++ *   - mm/migrate.c|976| <<move_to_new_page>> rc = mapping->a_ops->migratepage(mapping, newpage,
++ */
+ /* move_to_new_page() counterpart for a ballooned page */
+ int balloon_page_migrate(struct address_space *mapping,
+ 		struct page *newpage, struct page *page,
+@@ -247,9 +354,40 @@ int balloon_page_migrate(struct address_space *mapping,
+ 	VM_BUG_ON_PAGE(!PageLocked(page), page);
+ 	VM_BUG_ON_PAGE(!PageLocked(newpage), newpage);
+ 
++	/*
++	 * 关于migratepage方法的调用:
++	 *   - mm/balloon_compaction.c|348| <<balloon_page_migrate>> return balloon->migratepage(balloon, newpage, page, mode);
++	 *   - mm/migrate.c|959| <<move_to_new_page>> rc = mapping->a_ops->migratepage(mapping, newpage,
++	 *   - mm/migrate.c|976| <<move_to_new_page>> rc = mapping->a_ops->migratepage(mapping, newpage,
++	 */
+ 	return balloon->migratepage(balloon, newpage, page, mode);
+ }
+ 
++/*
++ * 在以下调用address_space_operations->migratepage:
++ *   - mm/migrate.c|925| <<move_to_new_page>> rc = mapping->a_ops->migratepage(mapping, newpage,
++ *   - mm/migrate.c|942| <<move_to_new_page>> rc = mapping->a_ops->migratepage(mapping, newpage,
++ *
++ * 在以下使用address_space_operations->isolate_page:
++ *   - mm/balloon_compaction.c|334| <<global>> .isolate_page = balloon_page_isolate,
++ *   - mm/secretmem.c|169| <<global>> .isolate_page = secretmem_isolate_page,
++ *   - mm/z3fold.c|1691| <<global>> .isolate_page = z3fold_page_isolate,
++ *   - mm/zsmalloc.c|2112| <<global>> .isolate_page = zs_page_isolate,
++ *   - mm/compaction.c|123| <<PageMovable>> if (mapping && mapping->a_ops && mapping->a_ops->isolate_page)
++ *   - mm/migrate.c|110| <<isolate_movable_page>> if (!mapping->a_ops->isolate_page(page, mode))
++ *
++ * 在以下使用address_space_operations->putback_page:
++ *   - mm/balloon_compaction.c|335| <<global>> .putback_page = balloon_page_putback,
++ *   - mm/z3fold.c|1693| <<global>> .putback_page = z3fold_page_putback,
++ *   - mm/zsmalloc.c|2114| <<global>> .putback_page = zs_page_putback,
++ *   - mm/migrate.c|133| <<putback_movable_page>> mapping->a_ops->putback_page(page);
++ *
++ *
++ * 在以下使用balloon_aops:
++ *   - arch/powerpc/platforms/pseries/cmm.c|592| <<cmm_balloon_compaction_init>> b_dev_info.inode->i_mapping->a_ops = &balloon_aops;
++ *   - drivers/misc/vmw_balloon.c|1903| <<vmballoon_compaction_init>> b->b_dev_info.inode->i_mapping->a_ops = &balloon_aops;
++ *   - drivers/virtio/virtio_balloon.c|1451| <<virtballoon_probe>> vb->vb_dev_info.inode->i_mapping->a_ops = &balloon_aops;
++ */
+ const struct address_space_operations balloon_aops = {
+ 	.migratepage = balloon_page_migrate,
+ 	.isolate_page = balloon_page_isolate,
+diff --git a/mm/compaction.c b/mm/compaction.c
+index 0fd4aafa4fa9..f0ab3f3161cf 100644
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@ -26,11 +26,25 @@
+ #include "internal.h"
+ 
+ #ifdef CONFIG_COMPACTION
++/*
++ * 在以下使用count_compact_event():
++ *   - mm/compaction.c|2911| <<kcompactd_do_work>> count_compact_event(KCOMPACTD_WAKE);
++ */
+ static inline void count_compact_event(enum vm_event_item item)
+ {
+ 	count_vm_event(item);
+ }
+ 
++/*
++ * 在以下使用count_compact_events():
++ *   - mm/compaction.c|717| <<isolate_freepages_block>> count_compact_events(COMPACTISOLATED, total_isolated);
++ *   - mm/compaction.c|1244| <<isolate_migratepages_block>> count_compact_events(COMPACTISOLATED, nr_isolated);
++ *   - mm/compaction.c|1553| <<fast_isolate_freepages>> count_compact_events(COMPACTISOLATED, nr_isolated);
++ *   - mm/compaction.c|2574| <<compact_zone>> count_compact_events(COMPACTMIGRATE_SCANNED, cc->total_migrate_scanned);
++ *   - mm/compaction.c|2575| <<compact_zone>> count_compact_events(COMPACTFREE_SCANNED, cc->total_free_scanned);
++ *   - mm/compaction.c|2951| <<kcompactd_do_work>> count_compact_events(KCOMPACTD_MIGRATE_SCANNED,
++ *   - mm/compaction.c|2953| <<kcompactd_do_work>> count_compact_events(KCOMPACTD_FREE_SCANNED,
++ */
+ static inline void count_compact_events(enum vm_event_item item, long delta)
+ {
+ 	count_vm_events(item, delta);
+@@ -120,6 +134,15 @@ int PageMovable(struct page *page)
+ 		return 0;
+ 
+ 	mapping = page_mapping(page);
++	/*
++	 * 在以下使用address_space_operations->isolate_page:
++	 *   - mm/balloon_compaction.c|334| <<global>> .isolate_page = balloon_page_isolate,
++	 *   - mm/secretmem.c|169| <<global>> .isolate_page = secretmem_isolate_page,
++	 *   - mm/z3fold.c|1691| <<global>> .isolate_page = z3fold_page_isolate,
++	 *   - mm/zsmalloc.c|2112| <<global>> .isolate_page = zs_page_isolate,
++	 *   - mm/compaction.c|123| <<PageMovable>> if (mapping && mapping->a_ops && mapping->a_ops->isolate_page)
++	 *   - mm/migrate.c|110| <<isolate_movable_page>> if (!mapping->a_ops->isolate_page(page, mode))
++	 */
+ 	if (mapping && mapping->a_ops && mapping->a_ops->isolate_page)
+ 		return 1;
+ 
+@@ -822,6 +845,11 @@ static bool too_many_isolated(pg_data_t *pgdat)
+  * The pages are isolated on cc->migratepages list (not required to be empty),
+  * and cc->nr_migratepages is updated accordingly.
+  */
++/*
++ * 在以下使用isolate_migratepages_block():
++ *   - mm/compaction.c|1270| <<isolate_migratepages_range>> ret = isolate_migratepages_block(cc, pfn, block_end_pfn,
++ *   - mm/compaction.c|1985| <<isolate_migratepages>> if (isolate_migratepages_block(cc, low_pfn, block_end_pfn,
++ */
+ static int
+ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
+ 			unsigned long end_pfn, isolate_mode_t mode)
+@@ -1243,6 +1271,10 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
+  * Returns -EAGAIN when contented, -EINTR in case of a signal pending, -ENOMEM
+  * in case we could not allocate a page, or 0.
+  */
++/*
++ * 在以下使用isolate_migratepages_range():
++ *   - mm/page_alloc.c|6941| <<__alloc_contig_migrate_range>> ret = isolate_migratepages_range(cc, pfn, end);
++ */
+ int
+ isolate_migratepages_range(struct compact_control *cc, unsigned long start_pfn,
+ 							unsigned long end_pfn)
+@@ -1903,6 +1935,10 @@ static unsigned long fast_find_migrateblock(struct compact_control *cc)
+  * starting at the block pointed to by the migrate scanner pfn within
+  * compact_control.
+  */
++/*
++ * 在以下使用isolate_migratepages():
++ *   - mm/compaction.c|2436| <<compact_zone>> switch (isolate_migratepages(cc)) {
++ */
+ static isolate_migrate_t isolate_migratepages(struct compact_control *cc)
+ {
+ 	unsigned long block_start_pfn;
+@@ -2194,6 +2230,10 @@ static enum compact_result __compact_finished(struct compact_control *cc)
+ 	return ret;
+ }
+ 
++/*
++ * 在以下使用compact_finished():
++ *   - mm/compaction.c|2442| <<compact_zone>> while ((ret = compact_finished(cc)) == COMPACT_CONTINUE) {
++ */
+ static enum compact_result compact_finished(struct compact_control *cc)
+ {
+ 	int ret;
+@@ -2256,6 +2296,14 @@ static enum compact_result __compaction_suitable(struct zone *zone, int order,
+  *   COMPACT_SUCCESS  - If the allocation would succeed without compaction
+  *   COMPACT_CONTINUE - If compaction should run now
+  */
++/*
++ * 在以下使用compaction_suitable():
++ *   - mm/compaction.c|2380| <<compact_zone>> ret = compaction_suitable(cc->zone, cc->order, cc->alloc_flags,
++ *   - mm/compaction.c|2885| <<kcompactd_node_suitable>> if (compaction_suitable(zone, pgdat->kcompactd_max_order, 0,
++ *   - mm/compaction.c|2923| <<kcompactd_do_work>> if (compaction_suitable(zone, cc.order, 0, zoneid) !=
++ *   - mm/vmscan.c|2910| <<should_continue_reclaim>> switch (compaction_suitable(zone, sc->order, 0, sc->reclaim_idx)) {
++ *   - mm/vmscan.c|3200| <<compaction_ready>> suitable = compaction_suitable(zone, sc->order, 0, sc->reclaim_idx);
++ */
+ enum compact_result compaction_suitable(struct zone *zone, int order,
+ 					unsigned int alloc_flags,
+ 					int highest_zoneidx)
+@@ -2326,6 +2374,13 @@ bool compaction_zonelist_suitable(struct alloc_context *ac, int order,
+ 	return false;
+ }
+ 
++/*
++ * 在以下使用compact_zone():
++ *   - mm/compaction.c|2592| <<compact_zone_order>> ret = compact_zone(&cc, &capc);
++ *   - mm/compaction.c|2721| <<proactive_compact_node>> compact_zone(&cc, NULL);
++ *   - mm/compaction.c|2751| <<compact_node>> compact_zone(&cc, NULL);
++ *   - mm/compaction.c|2907| <<kcompactd_do_work>> status = compact_zone(&cc, NULL);
++ */
+ static enum compact_result
+ compact_zone(struct compact_control *cc, struct capture_control *capc)
+ {
+@@ -2348,6 +2403,14 @@ compact_zone(struct compact_control *cc, struct capture_control *capc)
+ 	INIT_LIST_HEAD(&cc->migratepages);
+ 
+ 	cc->migratetype = gfp_migratetype(cc->gfp_mask);
++	/*
++	 * 在以下使用compaction_suitable():
++	 *   - mm/compaction.c|2380| <<compact_zone>> ret = compaction_suitable(cc->zone, cc->order, cc->alloc_flags,
++	 *   - mm/compaction.c|2885| <<kcompactd_node_suitable>> if (compaction_suitable(zone, pgdat->kcompactd_max_order, 0,
++	 *   - mm/compaction.c|2923| <<kcompactd_do_work>> if (compaction_suitable(zone, cc.order, 0, zoneid) !=
++	 *   - mm/vmscan.c|2910| <<should_continue_reclaim>> switch (compaction_suitable(zone, sc->order, 0, sc->reclaim_idx)) {
++	 *   - mm/vmscan.c|3200| <<compaction_ready>> suitable = compaction_suitable(zone, sc->order, 0, sc->reclaim_idx);
++	 */
+ 	ret = compaction_suitable(cc->zone, cc->order, cc->alloc_flags,
+ 							cc->highest_zoneidx);
+ 	/* Compaction is likely to fail */
+@@ -2428,6 +2491,12 @@ compact_zone(struct compact_control *cc, struct capture_control *capc)
+ 			cc->rescan = true;
+ 		}
+ 
++		/*
++		 * 注释:
++		 * Isolate all pages that can be migrated from the first suitable block,
++		 * starting at the block pointed to by the migrate scanner pfn within
++		 * compact_control.
++		 */
+ 		switch (isolate_migratepages(cc)) {
+ 		case ISOLATE_ABORT:
+ 			ret = COMPACT_CONTENDED;
+@@ -2451,6 +2520,19 @@ compact_zone(struct compact_control *cc, struct capture_control *capc)
+ 			last_migrated_pfn = iteration_start_pfn;
+ 		}
+ 
++		/*
++		 * 在以下使用migrate_pages():
++		 *   - mm/compaction.c|2454| <<compact_zone>> err = migrate_pages(&cc->migratepages, compaction_alloc,
++		 *   - mm/gup.c|1915| <<check_and_migrate_movable_pages>> ret = migrate_pages(&movable_page_list, alloc_migration_target,
++		 *   - mm/memory-failure.c|2278| <<__soft_offline_page>> ret = migrate_pages(&pagelist, alloc_migration_target, NULL,
++		 *   - mm/memory_hotplug.c|1793| <<do_migrate_range>> ret = migrate_pages(&source, alloc_migration_target, NULL,
++		 *   - mm/mempolicy.c|1070| <<migrate_to_node>> err = migrate_pages(&pagelist, alloc_migration_target, NULL,
++		 *   - mm/mempolicy.c|1324| <<do_mbind>> nr_failed = migrate_pages(&pagelist, new_page, NULL,
++		 *   - mm/migrate.c|1681| <<do_move_pages_to_node>> err = migrate_pages(pagelist, alloc_migration_target, NULL,
++		 *   - mm/migrate.c|2210| <<migrate_misplaced_page>> nr_remaining = migrate_pages(&migratepages, *new, NULL, node,
++		 *   - mm/page_alloc.c|6955| <<__alloc_contig_migrate_range>> ret = migrate_pages(&cc->migratepages, alloc_migration_target,
++		 *   - mm/vmscan.c|1364| <<demote_page_list>> err = migrate_pages(demote_pages, alloc_demote_page, NULL,
++		 */
+ 		err = migrate_pages(&cc->migratepages, compaction_alloc,
+ 				compaction_free, (unsigned long)cc, cc->mode,
+ 				MR_COMPACTION, NULL);
+@@ -2461,6 +2543,20 @@ compact_zone(struct compact_control *cc, struct capture_control *capc)
+ 		/* All pages were either migrated or will be released */
+ 		cc->nr_migratepages = 0;
+ 		if (err) {
++			/*
++			 * 在以下使用putback_movable_pages():
++			 *   - mm/compaction.c|1180| <<isolate_migratepages_block>> putback_movable_pages(&cc->migratepages);
++			 *   - mm/compaction.c|2439| <<compact_zone>> putback_movable_pages(&cc->migratepages);
++			 *   - mm/compaction.c|2482| <<compact_zone>> putback_movable_pages(&cc->migratepages);
++			 *   - mm/gup.c|1932| <<check_and_migrate_movable_pages>> putback_movable_pages(&movable_page_list);
++			 *   - mm/memory-failure.c|2300| <<__soft_offline_page>> putback_movable_pages(&pagelist);
++			 *   - mm/memory_hotplug.c|1816| <<do_migrate_range>> putback_movable_pages(&source);
++			 *   - mm/mempolicy.c|1086| <<migrate_to_node>> putback_movable_pages(&pagelist);
++			 *   - mm/mempolicy.c|1353| <<do_mbind>> putback_movable_pages(&pagelist);
++			 *   - mm/mempolicy.c|1361| <<do_mbind>> putback_movable_pages(&pagelist);
++			 *   - mm/migrate.c|1744| <<do_move_pages_to_node>> putback_movable_pages(pagelist);
++			 *   - mm/page_alloc.c|6983| <<__alloc_contig_migrate_range>> putback_movable_pages(&cc->migratepages);
++			 */
+ 			putback_movable_pages(&cc->migratepages);
+ 			/*
+ 			 * migrate_pages() may return -ENOMEM when scanners meet
+@@ -2840,6 +2936,14 @@ static bool kcompactd_node_suitable(pg_data_t *pgdat)
+ 		if (!populated_zone(zone))
+ 			continue;
+ 
++		/*
++		 * 在以下使用compaction_suitable():
++		 *   - mm/compaction.c|2380| <<compact_zone>> ret = compaction_suitable(cc->zone, cc->order, cc->alloc_flags,
++		 *   - mm/compaction.c|2885| <<kcompactd_node_suitable>> if (compaction_suitable(zone, pgdat->kcompactd_max_order, 0,
++		 *   - mm/compaction.c|2923| <<kcompactd_do_work>> if (compaction_suitable(zone, cc.order, 0, zoneid) !=
++		 *   - mm/vmscan.c|2910| <<should_continue_reclaim>> switch (compaction_suitable(zone, sc->order, 0, sc->reclaim_idx)) {
++		 *   - mm/vmscan.c|3200| <<compaction_ready>> suitable = compaction_suitable(zone, sc->order, 0, sc->reclaim_idx);
++		 */
+ 		if (compaction_suitable(zone, pgdat->kcompactd_max_order, 0,
+ 					highest_zoneidx) == COMPACT_CONTINUE)
+ 			return true;
+@@ -2878,6 +2982,14 @@ static void kcompactd_do_work(pg_data_t *pgdat)
+ 		if (compaction_deferred(zone, cc.order))
+ 			continue;
+ 
++		/*
++		 * 在以下使用compaction_suitable():
++		 *   - mm/compaction.c|2380| <<compact_zone>> ret = compaction_suitable(cc->zone, cc->order, cc->alloc_flags,
++		 *   - mm/compaction.c|2885| <<kcompactd_node_suitable>> if (compaction_suitable(zone, pgdat->kcompactd_max_order, 0,
++		 *   - mm/compaction.c|2923| <<kcompactd_do_work>> if (compaction_suitable(zone, cc.order, 0, zoneid) !=
++		 *   - mm/vmscan.c|2910| <<should_continue_reclaim>> switch (compaction_suitable(zone, sc->order, 0, sc->reclaim_idx)) {
++		 *   - mm/vmscan.c|3200| <<compaction_ready>> suitable = compaction_suitable(zone, sc->order, 0, sc->reclaim_idx);
++		 */
+ 		if (compaction_suitable(zone, cc.order, 0, zoneid) !=
+ 							COMPACT_CONTINUE)
+ 			continue;
+@@ -2885,6 +2997,13 @@ static void kcompactd_do_work(pg_data_t *pgdat)
+ 		if (kthread_should_stop())
+ 			return;
+ 
++		/*
++		 * 在以下使用compact_zone():
++		 *   - mm/compaction.c|2592| <<compact_zone_order>> ret = compact_zone(&cc, &capc);
++		 *   - mm/compaction.c|2721| <<proactive_compact_node>> compact_zone(&cc, NULL);
++		 *   - mm/compaction.c|2751| <<compact_node>> compact_zone(&cc, NULL);
++		 *   - mm/compaction.c|2907| <<kcompactd_do_work>> status = compact_zone(&cc, NULL);
++		 */
+ 		cc.zone = zone;
+ 		status = compact_zone(&cc, NULL);
+ 
+diff --git a/mm/gup.c b/mm/gup.c
+index 118c47447185..ed3c875e7e7e 100644
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@ -1912,6 +1912,19 @@ static long check_and_migrate_movable_pages(unsigned long nr_pages,
+ 			put_page(pages[i]);
+ 	}
+ 	if (!list_empty(&movable_page_list)) {
++		/*
++		 * 在以下使用migrate_pages():
++		 *   - mm/compaction.c|2454| <<compact_zone>> err = migrate_pages(&cc->migratepages, compaction_alloc,
++		 *   - mm/gup.c|1915| <<check_and_migrate_movable_pages>> ret = migrate_pages(&movable_page_list, alloc_migration_target,
++		 *   - mm/memory-failure.c|2278| <<__soft_offline_page>> ret = migrate_pages(&pagelist, alloc_migration_target, NULL,
++		 *   - mm/memory_hotplug.c|1793| <<do_migrate_range>> ret = migrate_pages(&source, alloc_migration_target, NULL,
++		 *   - mm/mempolicy.c|1070| <<migrate_to_node>> err = migrate_pages(&pagelist, alloc_migration_target, NULL,
++		 *   - mm/mempolicy.c|1324| <<do_mbind>> nr_failed = migrate_pages(&pagelist, new_page, NULL,
++		 *   - mm/migrate.c|1681| <<do_move_pages_to_node>> err = migrate_pages(pagelist, alloc_migration_target, NULL,
++		 *   - mm/migrate.c|2210| <<migrate_misplaced_page>> nr_remaining = migrate_pages(&migratepages, *new, NULL, node,
++		 *   - mm/page_alloc.c|6955| <<__alloc_contig_migrate_range>> ret = migrate_pages(&cc->migratepages, alloc_migration_target,
++		 *   - mm/vmscan.c|1364| <<demote_page_list>> err = migrate_pages(demote_pages, alloc_demote_page, NULL,
++		 */
+ 		ret = migrate_pages(&movable_page_list, alloc_migration_target,
+ 				    NULL, (unsigned long)&mtc, MIGRATE_SYNC,
+ 				    MR_LONGTERM_PIN, NULL);
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index 0db85a05fc2b..7f430e326fd4 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -2067,6 +2067,10 @@ static void __split_huge_zero_page_pmd(struct vm_area_struct *vma,
+ 	pmd_populate(mm, pmd, pgtable);
+ }
+ 
++/*
++ * 在以下使用__split_huge_pmd_locked():
++ *   - mm/huge_memory.c|2315| <<__split_huge_pmd>> __split_huge_pmd_locked(vma, pmd, range.start, freeze);
++ */
+ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
+ 		unsigned long haddr, bool freeze)
+ {
+@@ -2254,6 +2258,16 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
+ 	}
+ }
+ 
++/*
++ * 在以下使用__split_huge_pmd();
++ *   - include/linux/huge_mm.h|205| <<split_huge_pmd>> __split_huge_pmd(__vma, __pmd, __address, \
++ *   - mm/huge_memory.c|1225| <<copy_huge_pmd>> __split_huge_pmd(src_vma, src_pmd, addr, false, NULL);
++ *   - mm/huge_memory.c|1453| <<do_huge_pmd_wp_page>> __split_huge_pmd(vma, vmf->pmd, vmf->address, false, NULL);
++ *   - mm/huge_memory.c|2358| <<split_huge_pmd_address>> __split_huge_pmd(vma, pmd, address, freeze, page);
++ *   - mm/memory.c|1548| <<zap_pmd_range>> __split_huge_pmd(vma, pmd, addr, false, NULL);
++ *   - mm/memory.c|4709| <<wp_huge_pmd>> __split_huge_pmd(vmf->vma, vmf->pmd, vmf->address, false, NULL);
++ *   - mm/mprotect.c|262| <<change_pmd_range>> __split_huge_pmd(vma, pmd, addr, false, NULL);
++ */
+ void __split_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
+ 		unsigned long address, bool freeze, struct page *page)
+ {
+diff --git a/mm/memory-failure.c b/mm/memory-failure.c
+index b57b7447b9e6..d565b9a846e2 100644
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@ -2275,6 +2275,19 @@ static int __soft_offline_page(struct page *page)
+ 	}
+ 
+ 	if (isolate_page(hpage, &pagelist)) {
++		/*
++		 * 在以下使用migrate_pages():
++		 *   - mm/compaction.c|2454| <<compact_zone>> err = migrate_pages(&cc->migratepages, compaction_alloc,
++		 *   - mm/gup.c|1915| <<check_and_migrate_movable_pages>> ret = migrate_pages(&movable_page_list, alloc_migration_target,
++		 *   - mm/memory-failure.c|2278| <<__soft_offline_page>> ret = migrate_pages(&pagelist, alloc_migration_target, NULL,
++		 *   - mm/memory_hotplug.c|1793| <<do_migrate_range>> ret = migrate_pages(&source, alloc_migration_target, NULL,
++		 *   - mm/mempolicy.c|1070| <<migrate_to_node>> err = migrate_pages(&pagelist, alloc_migration_target, NULL,
++		 *   - mm/mempolicy.c|1324| <<do_mbind>> nr_failed = migrate_pages(&pagelist, new_page, NULL,
++		 *   - mm/migrate.c|1681| <<do_move_pages_to_node>> err = migrate_pages(pagelist, alloc_migration_target, NULL,
++		 *   - mm/migrate.c|2210| <<migrate_misplaced_page>> nr_remaining = migrate_pages(&migratepages, *new, NULL, node,
++		 *   - mm/page_alloc.c|6955| <<__alloc_contig_migrate_range>> ret = migrate_pages(&cc->migratepages, alloc_migration_target,
++		 *   - mm/vmscan.c|1364| <<demote_page_list>> err = migrate_pages(demote_pages, alloc_demote_page, NULL,
++		 */
+ 		ret = migrate_pages(&pagelist, alloc_migration_target, NULL,
+ 			(unsigned long)&mtc, MIGRATE_SYNC, MR_MEMORY_FAILURE, NULL);
+ 		if (!ret) {
+diff --git a/mm/memory_hotplug.c b/mm/memory_hotplug.c
+index fcb0a0f0ef61..326b820fb241 100644
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@ -1790,6 +1790,19 @@ do_migrate_range(unsigned long start_pfn, unsigned long end_pfn)
+ 		node_clear(mtc.nid, nmask);
+ 		if (nodes_empty(nmask))
+ 			node_set(mtc.nid, nmask);
++		/*
++		 * 在以下使用migrate_pages():
++		 *   - mm/compaction.c|2454| <<compact_zone>> err = migrate_pages(&cc->migratepages, compaction_alloc,
++		 *   - mm/gup.c|1915| <<check_and_migrate_movable_pages>> ret = migrate_pages(&movable_page_list, alloc_migration_target,
++		 *   - mm/memory-failure.c|2278| <<__soft_offline_page>> ret = migrate_pages(&pagelist, alloc_migration_target, NULL,
++		 *   - mm/memory_hotplug.c|1793| <<do_migrate_range>> ret = migrate_pages(&source, alloc_migration_target, NULL,
++		 *   - mm/mempolicy.c|1070| <<migrate_to_node>> err = migrate_pages(&pagelist, alloc_migration_target, NULL,
++		 *   - mm/mempolicy.c|1324| <<do_mbind>> nr_failed = migrate_pages(&pagelist, new_page, NULL,
++		 *   - mm/migrate.c|1681| <<do_move_pages_to_node>> err = migrate_pages(pagelist, alloc_migration_target, NULL,
++		 *   - mm/migrate.c|2210| <<migrate_misplaced_page>> nr_remaining = migrate_pages(&migratepages, *new, NULL, node,
++		 *   - mm/page_alloc.c|6955| <<__alloc_contig_migrate_range>> ret = migrate_pages(&cc->migratepages, alloc_migration_target,
++		 *   - mm/vmscan.c|1364| <<demote_page_list>> err = migrate_pages(demote_pages, alloc_demote_page, NULL,
++		 */
+ 		ret = migrate_pages(&source, alloc_migration_target, NULL,
+ 			(unsigned long)&mtc, MIGRATE_SYNC, MR_MEMORY_HOTPLUG, NULL);
+ 		if (ret) {
+diff --git a/mm/mempolicy.c b/mm/mempolicy.c
+index d5224a8ec9c0..49ebad8d5389 100644
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@ -1067,6 +1067,19 @@ static int migrate_to_node(struct mm_struct *mm, int source, int dest,
+ 			flags | MPOL_MF_DISCONTIG_OK, &pagelist);
+ 
+ 	if (!list_empty(&pagelist)) {
++		/*
++		 * 在以下使用migrate_pages():
++		 *   - mm/compaction.c|2454| <<compact_zone>> err = migrate_pages(&cc->migratepages, compaction_alloc,
++		 *   - mm/gup.c|1915| <<check_and_migrate_movable_pages>> ret = migrate_pages(&movable_page_list, alloc_migration_target,
++		 *   - mm/memory-failure.c|2278| <<__soft_offline_page>> ret = migrate_pages(&pagelist, alloc_migration_target, NULL,
++		 *   - mm/memory_hotplug.c|1793| <<do_migrate_range>> ret = migrate_pages(&source, alloc_migration_target, NULL,
++		 *   - mm/mempolicy.c|1070| <<migrate_to_node>> err = migrate_pages(&pagelist, alloc_migration_target, NULL,
++		 *   - mm/mempolicy.c|1324| <<do_mbind>> nr_failed = migrate_pages(&pagelist, new_page, NULL,
++		 *   - mm/migrate.c|1681| <<do_move_pages_to_node>> err = migrate_pages(pagelist, alloc_migration_target, NULL,
++		 *   - mm/migrate.c|2210| <<migrate_misplaced_page>> nr_remaining = migrate_pages(&migratepages, *new, NULL, node,
++		 *   - mm/page_alloc.c|6955| <<__alloc_contig_migrate_range>> ret = migrate_pages(&cc->migratepages, alloc_migration_target,
++		 *   - mm/vmscan.c|1364| <<demote_page_list>> err = migrate_pages(demote_pages, alloc_demote_page, NULL,
++		 */
+ 		err = migrate_pages(&pagelist, alloc_migration_target, NULL,
+ 				(unsigned long)&mtc, MIGRATE_SYNC, MR_SYSCALL, NULL);
+ 		if (err)
+@@ -1321,6 +1334,19 @@ static long do_mbind(unsigned long start, unsigned long len,
+ 
+ 		if (!list_empty(&pagelist)) {
+ 			WARN_ON_ONCE(flags & MPOL_MF_LAZY);
++			/*
++			 * 在以下使用migrate_pages():
++			 *   - mm/compaction.c|2454| <<compact_zone>> err = migrate_pages(&cc->migratepages, compaction_alloc,
++			 *   - mm/gup.c|1915| <<check_and_migrate_movable_pages>> ret = migrate_pages(&movable_page_list, alloc_migration_target,
++			 *   - mm/memory-failure.c|2278| <<__soft_offline_page>> ret = migrate_pages(&pagelist, alloc_migration_target, NULL,
++			 *   - mm/memory_hotplug.c|1793| <<do_migrate_range>> ret = migrate_pages(&source, alloc_migration_target, NULL,
++			 *   - mm/mempolicy.c|1070| <<migrate_to_node>> err = migrate_pages(&pagelist, alloc_migration_target, NULL,
++			 *   - mm/mempolicy.c|1324| <<do_mbind>> nr_failed = migrate_pages(&pagelist, new_page, NULL,
++			 *   - mm/migrate.c|1681| <<do_move_pages_to_node>> err = migrate_pages(pagelist, alloc_migration_target, NULL,
++			 *   - mm/migrate.c|2210| <<migrate_misplaced_page>> nr_remaining = migrate_pages(&migratepages, *new, NULL, node,
++			 *   - mm/page_alloc.c|6955| <<__alloc_contig_migrate_range>> ret = migrate_pages(&cc->migratepages, alloc_migration_target,
++			 *   - mm/vmscan.c|1364| <<demote_page_list>> err = migrate_pages(demote_pages, alloc_demote_page, NULL,
++			 */
+ 			nr_failed = migrate_pages(&pagelist, new_page, NULL,
+ 				start, MIGRATE_SYNC, MR_MEMPOLICY_MBIND, NULL);
+ 			if (nr_failed)
+diff --git a/mm/migrate.c b/mm/migrate.c
+index d53108b83470..1dd50692d473 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -58,6 +58,12 @@
+ 
+ #include "internal.h"
+ 
++/*
++ * 在以下使用isolate_movable_page():
++ *   - mm/compaction.c|1020| <<isolate_migratepages_block>> if (!isolate_movable_page(page, mode))
++ *   - mm/memory-failure.c|2204| <<isolate_page>> isolated = !isolate_movable_page(page, ISOLATE_UNEVICTABLE);
++ *   - mm/memory_hotplug.c|1757| <<do_migrate_range>> ret = isolate_movable_page(page, ISOLATE_UNEVICTABLE);
++ */
+ int isolate_movable_page(struct page *page, isolate_mode_t mode)
+ {
+ 	struct address_space *mapping;
+@@ -101,6 +107,15 @@ int isolate_movable_page(struct page *page, isolate_mode_t mode)
+ 	mapping = page_mapping(page);
+ 	VM_BUG_ON_PAGE(!mapping, page);
+ 
++	/*
++	 * 在以下使用address_space_operations->isolate_page:
++	 *   - mm/balloon_compaction.c|334| <<global>> .isolate_page = balloon_page_isolate,
++	 *   - mm/secretmem.c|169| <<global>> .isolate_page = secretmem_isolate_page,
++	 *   - mm/z3fold.c|1691| <<global>> .isolate_page = z3fold_page_isolate,
++	 *   - mm/zsmalloc.c|2112| <<global>> .isolate_page = zs_page_isolate,
++	 *   - mm/compaction.c|123| <<PageMovable>> if (mapping && mapping->a_ops && mapping->a_ops->isolate_page)
++	 *   - mm/migrate.c|110| <<isolate_movable_page>> if (!mapping->a_ops->isolate_page(page, mode))
++	 */
+ 	if (!mapping->a_ops->isolate_page(page, mode))
+ 		goto out_no_isolated;
+ 
+@@ -119,11 +134,22 @@ int isolate_movable_page(struct page *page, isolate_mode_t mode)
+ 	return -EBUSY;
+ }
+ 
++/*
++ * 在以下使用putback_movable_page():
++ *   - mm/migrate.c|165| <<putback_movable_pages>> putback_movable_page(page);
++ */
+ static void putback_movable_page(struct page *page)
+ {
+ 	struct address_space *mapping;
+ 
+ 	mapping = page_mapping(page);
++	/*
++	 * 在以下使用address_space_operations->putback_page:
++	 *   - mm/balloon_compaction.c|335| <<global>> .putback_page = balloon_page_putback,
++	 *   - mm/z3fold.c|1693| <<global>> .putback_page = z3fold_page_putback,
++	 *   - mm/zsmalloc.c|2114| <<global>> .putback_page = zs_page_putback,
++	 *   - mm/migrate.c|133| <<putback_movable_page>> mapping->a_ops->putback_page(page);
++	 */
+ 	mapping->a_ops->putback_page(page);
+ 	__ClearPageIsolated(page);
+ }
+@@ -136,6 +162,20 @@ static void putback_movable_page(struct page *page)
+  * built from lru, balloon, hugetlbfs page. See isolate_migratepages_range()
+  * and isolate_hugetlb().
+  */
++/*
++ * 在以下使用putback_movable_pages():
++ *   - mm/compaction.c|1180| <<isolate_migratepages_block>> putback_movable_pages(&cc->migratepages);
++ *   - mm/compaction.c|2439| <<compact_zone>> putback_movable_pages(&cc->migratepages);
++ *   - mm/compaction.c|2482| <<compact_zone>> putback_movable_pages(&cc->migratepages);
++ *   - mm/gup.c|1932| <<check_and_migrate_movable_pages>> putback_movable_pages(&movable_page_list);
++ *   - mm/memory-failure.c|2300| <<__soft_offline_page>> putback_movable_pages(&pagelist);
++ *   - mm/memory_hotplug.c|1816| <<do_migrate_range>> putback_movable_pages(&source);
++ *   - mm/mempolicy.c|1086| <<migrate_to_node>> putback_movable_pages(&pagelist);
++ *   - mm/mempolicy.c|1353| <<do_mbind>> putback_movable_pages(&pagelist);
++ *   - mm/mempolicy.c|1361| <<do_mbind>> putback_movable_pages(&pagelist);
++ *   - mm/migrate.c|1744| <<do_move_pages_to_node>> putback_movable_pages(pagelist);
++ *   - mm/page_alloc.c|6983| <<__alloc_contig_migrate_range>> putback_movable_pages(&cc->migratepages);
++ */
+ void putback_movable_pages(struct list_head *l)
+ {
+ 	struct page *page;
+@@ -887,6 +927,12 @@ static int fallback_migrate_page(struct address_space *mapping,
+  *   < 0 - error code
+  *  MIGRATEPAGE_SUCCESS - success
+  */
++/*
++ * 在以下使用move_to_new_page():
++ *   - mm/migrate.c|1050| <<__unmap_and_move>> rc = move_to_new_page(newpage, page, mode);
++ *   - mm/migrate.c|1081| <<__unmap_and_move>> rc = move_to_new_page(newpage, page, mode);
++ *   - mm/migrate.c|1377| <<unmap_and_move_huge_page>> rc = move_to_new_page(new_hpage, hpage, mode);
++ */
+ static int move_to_new_page(struct page *newpage, struct page *page,
+ 				enum migrate_mode mode)
+ {
+@@ -910,6 +956,14 @@ static int move_to_new_page(struct page *newpage, struct page *page,
+ 			 * migratepage callback. This is the most common path
+ 			 * for page migration.
+ 			 */
++			/*
++			 * 关于migratepage方法的调用:
++			 *   - mm/balloon_compaction.c|348| <<balloon_page_migrate>> return balloon->migratepage(balloon, newpage, page, mode);
++			 *   - mm/migrate.c|959| <<move_to_new_page>> rc = mapping->a_ops->migratepage(mapping, newpage,
++			 *   - mm/migrate.c|976| <<move_to_new_page>> rc = mapping->a_ops->migratepage(mapping, newpage,
++			 *
++			 * balloon_page_migrate()
++			 */
+ 			rc = mapping->a_ops->migratepage(mapping, newpage,
+ 							page, mode);
+ 		else
+@@ -927,6 +981,14 @@ static int move_to_new_page(struct page *newpage, struct page *page,
+ 			goto out;
+ 		}
+ 
++		/*
++		 * 关于migratepage方法的调用:
++		 *   - mm/balloon_compaction.c|348| <<balloon_page_migrate>> return balloon->migratepage(balloon, newpage, page, mode);
++		 *   - mm/migrate.c|959| <<move_to_new_page>> rc = mapping->a_ops->migratepage(mapping, newpage,
++		 *   - mm/migrate.c|976| <<move_to_new_page>> rc = mapping->a_ops->migratepage(mapping, newpage,
++		 *
++		 * balloon_page_migrate()
++		 */
+ 		rc = mapping->a_ops->migratepage(mapping, newpage,
+ 						page, mode);
+ 		WARN_ON_ONCE(rc == MIGRATEPAGE_SUCCESS &&
+@@ -967,6 +1029,10 @@ static int move_to_new_page(struct page *newpage, struct page *page,
+ 	return rc;
+ }
+ 
++/*
++ * 在以下使用__unmap_and_move():
++ *   - mm/migrate.c|1246| <<unmap_and_move>> rc = __unmap_and_move(page, newpage, force, mode);
++ */
+ static int __unmap_and_move(struct page *page, struct page *newpage,
+ 				int force, enum migrate_mode mode)
+ {
+@@ -1047,6 +1113,12 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
+ 		goto out_unlock;
+ 
+ 	if (unlikely(!is_lru)) {
++		/*
++		 * 在以下使用move_to_new_page():
++		 *   - mm/migrate.c|1050| <<__unmap_and_move>> rc = move_to_new_page(newpage, page, mode);
++		 *   - mm/migrate.c|1081| <<__unmap_and_move>> rc = move_to_new_page(newpage, page, mode);
++		 *   - mm/migrate.c|1377| <<unmap_and_move_huge_page>> rc = move_to_new_page(new_hpage, hpage, mode);
++		 */
+ 		rc = move_to_new_page(newpage, page, mode);
+ 		goto out_unlock_both;
+ 	}
+@@ -1077,6 +1149,12 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
+ 		page_was_mapped = true;
+ 	}
+ 
++	/*
++	 * 在以下使用move_to_new_page():
++	 *   - mm/migrate.c|1050| <<__unmap_and_move>> rc = move_to_new_page(newpage, page, mode);
++	 *   - mm/migrate.c|1081| <<__unmap_and_move>> rc = move_to_new_page(newpage, page, mode);
++	 *   - mm/migrate.c|1377| <<unmap_and_move_huge_page>> rc = move_to_new_page(new_hpage, hpage, mode);
++	 */
+ 	if (!page_mapped(page))
+ 		rc = move_to_new_page(newpage, page, mode);
+ 
+@@ -1189,6 +1267,10 @@ int next_demotion_node(int node)
+  * Obtain the lock on page, remove all ptes and migrate the page
+  * to the newly allocated page in newpage.
+  */
++/*
++ * 在以下使用unmap_and_move():
++ *   - mm/migrate.c|1546| <<migrate_pages>> rc = unmap_and_move(get_new_page, put_new_page,
++ */
+ static int unmap_and_move(new_page_t get_new_page,
+ 				   free_page_t put_new_page,
+ 				   unsigned long private, struct page *page,
+@@ -1219,6 +1301,9 @@ static int unmap_and_move(new_page_t get_new_page,
+ 	if (!newpage)
+ 		return -ENOMEM;
+ 
++	/*
++	 * 只在这里调用
++	 */
+ 	rc = __unmap_and_move(page, newpage, force, mode);
+ 	if (rc == MIGRATEPAGE_SUCCESS)
+ 		set_page_owner_migrate_reason(newpage, reason);
+@@ -1284,6 +1369,10 @@ static int unmap_and_move(new_page_t get_new_page,
+  * because then pte is replaced with migration swap entry and direct I/O code
+  * will wait in the page fault for migration to complete.
+  */
++/*
++ * 在以下使用unmap_and_move_huge_page():
++ *   - mm/migrate.c|1494| <<migrate_pages>> rc = unmap_and_move_huge_page(get_new_page,
++ */
+ static int unmap_and_move_huge_page(new_page_t get_new_page,
+ 				free_page_t put_new_page, unsigned long private,
+ 				struct page *hpage, int force,
+@@ -1373,6 +1462,12 @@ static int unmap_and_move_huge_page(new_page_t get_new_page,
+ 			i_mmap_unlock_write(mapping);
+ 	}
+ 
++	/*
++	 * 在以下使用move_to_new_page():
++	 *   - mm/migrate.c|1050| <<__unmap_and_move>> rc = move_to_new_page(newpage, page, mode);
++	 *   - mm/migrate.c|1081| <<__unmap_and_move>> rc = move_to_new_page(newpage, page, mode);
++	 *   - mm/migrate.c|1377| <<unmap_and_move_huge_page>> rc = move_to_new_page(new_hpage, hpage, mode);
++	 */
+ 	if (!page_mapped(hpage))
+ 		rc = move_to_new_page(new_hpage, hpage, mode);
+ 
+@@ -1413,6 +1508,11 @@ static int unmap_and_move_huge_page(new_page_t get_new_page,
+ 	return rc;
+ }
+ 
++/*
++ * 在以下使用try_split_thp():
++ *   - mm/migrate.c|1615| <<migrate_pages>> if (!try_split_thp(page, &page2, from)) {
++ *   - mm/migrate.c|1635| <<migrate_pages>> if (!try_split_thp(page, &page2, from)) {
++ */
+ static inline int try_split_thp(struct page *page, struct page **page2,
+ 				struct list_head *from)
+ {
+@@ -1450,6 +1550,19 @@ static inline int try_split_thp(struct page *page, struct page **page2,
+  *
+  * Returns the number of pages that were not migrated, or an error code.
+  */
++/*
++ * 在以下使用migrate_pages():
++ *   - mm/compaction.c|2454| <<compact_zone>> err = migrate_pages(&cc->migratepages, compaction_alloc,
++ *   - mm/gup.c|1915| <<check_and_migrate_movable_pages>> ret = migrate_pages(&movable_page_list, alloc_migration_target,
++ *   - mm/memory-failure.c|2278| <<__soft_offline_page>> ret = migrate_pages(&pagelist, alloc_migration_target, NULL,
++ *   - mm/memory_hotplug.c|1793| <<do_migrate_range>> ret = migrate_pages(&source, alloc_migration_target, NULL,
++ *   - mm/mempolicy.c|1070| <<migrate_to_node>> err = migrate_pages(&pagelist, alloc_migration_target, NULL,
++ *   - mm/mempolicy.c|1324| <<do_mbind>> nr_failed = migrate_pages(&pagelist, new_page, NULL,
++ *   - mm/migrate.c|1681| <<do_move_pages_to_node>> err = migrate_pages(pagelist, alloc_migration_target, NULL,
++ *   - mm/migrate.c|2210| <<migrate_misplaced_page>> nr_remaining = migrate_pages(&migratepages, *new, NULL, node,
++ *   - mm/page_alloc.c|6955| <<__alloc_contig_migrate_range>> ret = migrate_pages(&cc->migratepages, alloc_migration_target,
++ *   - mm/vmscan.c|1364| <<demote_page_list>> err = migrate_pages(demote_pages, alloc_demote_page, NULL,
++ */
+ int migrate_pages(struct list_head *from, new_page_t get_new_page,
+ 		free_page_t put_new_page, unsigned long private,
+ 		enum migrate_mode mode, int reason, unsigned int *ret_succeeded)
+@@ -1490,6 +1603,10 @@ int migrate_pages(struct list_head *from, new_page_t get_new_page,
+ 			nr_subpages = thp_nr_pages(page);
+ 			cond_resched();
+ 
++			/*
++			 * unmap_and_move_huge_page()和unmap_and_move()
++			 * 都是只在这里调用
++			 */
+ 			if (PageHuge(page))
+ 				rc = unmap_and_move_huge_page(get_new_page,
+ 						put_new_page, private, page,
+@@ -1678,6 +1795,19 @@ static int do_move_pages_to_node(struct mm_struct *mm,
+ 		.gfp_mask = GFP_HIGHUSER_MOVABLE | __GFP_THISNODE,
+ 	};
+ 
++	/*
++	 * 在以下使用migrate_pages():
++	 *   - mm/compaction.c|2454| <<compact_zone>> err = migrate_pages(&cc->migratepages, compaction_alloc,
++	 *   - mm/gup.c|1915| <<check_and_migrate_movable_pages>> ret = migrate_pages(&movable_page_list, alloc_migration_target,
++	 *   - mm/memory-failure.c|2278| <<__soft_offline_page>> ret = migrate_pages(&pagelist, alloc_migration_target, NULL,
++	 *   - mm/memory_hotplug.c|1793| <<do_migrate_range>> ret = migrate_pages(&source, alloc_migration_target, NULL,
++	 *   - mm/mempolicy.c|1070| <<migrate_to_node>> err = migrate_pages(&pagelist, alloc_migration_target, NULL,
++	 *   - mm/mempolicy.c|1324| <<do_mbind>> nr_failed = migrate_pages(&pagelist, new_page, NULL,
++	 *   - mm/migrate.c|1681| <<do_move_pages_to_node>> err = migrate_pages(pagelist, alloc_migration_target, NULL,
++	 *   - mm/migrate.c|2210| <<migrate_misplaced_page>> nr_remaining = migrate_pages(&migratepages, *new, NULL, node,
++	 *   - mm/page_alloc.c|6955| <<__alloc_contig_migrate_range>> ret = migrate_pages(&cc->migratepages, alloc_migration_target,
++	 *   - mm/vmscan.c|1364| <<demote_page_list>> err = migrate_pages(demote_pages, alloc_demote_page, NULL,
++	 */
+ 	err = migrate_pages(pagelist, alloc_migration_target, NULL,
+ 		(unsigned long)&mtc, MIGRATE_SYNC, MR_SYSCALL, NULL);
+ 	if (err)
+@@ -2207,6 +2337,19 @@ int migrate_misplaced_page(struct page *page, struct vm_area_struct *vma,
+ 		goto out;
+ 
+ 	list_add(&page->lru, &migratepages);
++	/*
++	 * 在以下使用migrate_pages():
++	 *   - mm/compaction.c|2454| <<compact_zone>> err = migrate_pages(&cc->migratepages, compaction_alloc,
++	 *   - mm/gup.c|1915| <<check_and_migrate_movable_pages>> ret = migrate_pages(&movable_page_list, alloc_migration_target,
++	 *   - mm/memory-failure.c|2278| <<__soft_offline_page>> ret = migrate_pages(&pagelist, alloc_migration_target, NULL,
++	 *   - mm/memory_hotplug.c|1793| <<do_migrate_range>> ret = migrate_pages(&source, alloc_migration_target, NULL,
++	 *   - mm/mempolicy.c|1070| <<migrate_to_node>> err = migrate_pages(&pagelist, alloc_migration_target, NULL,
++	 *   - mm/mempolicy.c|1324| <<do_mbind>> nr_failed = migrate_pages(&pagelist, new_page, NULL,
++	 *   - mm/migrate.c|1681| <<do_move_pages_to_node>> err = migrate_pages(pagelist, alloc_migration_target, NULL,
++	 *   - mm/migrate.c|2210| <<migrate_misplaced_page>> nr_remaining = migrate_pages(&migratepages, *new, NULL, node,
++	 *   - mm/page_alloc.c|6955| <<__alloc_contig_migrate_range>> ret = migrate_pages(&cc->migratepages, alloc_migration_target,
++	 *   - mm/vmscan.c|1364| <<demote_page_list>> err = migrate_pages(demote_pages, alloc_demote_page, NULL,
++	 */
+ 	nr_remaining = migrate_pages(&migratepages, *new, NULL, node,
+ 				     MIGRATE_ASYNC, MR_NUMA_MISPLACED, NULL);
+ 	if (nr_remaining) {
+diff --git a/mm/oom_kill.c b/mm/oom_kill.c
+index 5fd826f3f3da..fb6aff300bca 100644
+--- a/mm/oom_kill.c
++++ b/mm/oom_kill.c
+@@ -1061,6 +1061,15 @@ static void check_panic_on_oom(struct oom_control *oc)
+ 
+ static BLOCKING_NOTIFIER_HEAD(oom_notify_list);
+ 
++/*
++ * 在以下使用register_oom_notifier():
++ *   - arch/powerpc/platforms/pseries/cmm.c|631| <<cmm_init>> rc = register_oom_notifier(&cmm_oom_nb);
++ *   - arch/s390/mm/cmm.c|425| <<cmm_init>> rc = register_oom_notifier(&cmm_oom_nb);
++ *   - drivers/gpu/drm/i915/gem/i915_gem_shrinker.c|429| <<i915_gem_driver_register__shrinker>>
++ *           drm_WARN_ON(&i915->drm, register_oom_notifier(&i915->mm.oom_notifier));
++ *   - drivers/virtio/virtio_balloon.c|1500| <<virtballoon_probe>> err = register_oom_notifier(&vb->oom_nb);
++ *   - kernel/rcu/rcutorture.c|2512| <<rcu_torture_fwd_prog_init>> register_oom_notifier(&rcutorture_oom_nb);
++ */
+ int register_oom_notifier(struct notifier_block *nb)
+ {
+ 	return blocking_notifier_chain_register(&oom_notify_list, nb);
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 1aa1b87860ce..53ab945382fa 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -6952,6 +6952,19 @@ static int __alloc_contig_migrate_range(struct compact_control *cc,
+ 							&cc->migratepages);
+ 		cc->nr_migratepages -= nr_reclaimed;
+ 
++		/*
++		 * 在以下使用migrate_pages():
++		 *   - mm/compaction.c|2454| <<compact_zone>> err = migrate_pages(&cc->migratepages, compaction_alloc,
++		 *   - mm/gup.c|1915| <<check_and_migrate_movable_pages>> ret = migrate_pages(&movable_page_list, alloc_migration_target,
++		 *   - mm/memory-failure.c|2278| <<__soft_offline_page>> ret = migrate_pages(&pagelist, alloc_migration_target, NULL,
++		 *   - mm/memory_hotplug.c|1793| <<do_migrate_range>> ret = migrate_pages(&source, alloc_migration_target, NULL,
++		 *   - mm/mempolicy.c|1070| <<migrate_to_node>> err = migrate_pages(&pagelist, alloc_migration_target, NULL,
++		 *   - mm/mempolicy.c|1324| <<do_mbind>> nr_failed = migrate_pages(&pagelist, new_page, NULL,
++		 *   - mm/migrate.c|1681| <<do_move_pages_to_node>> err = migrate_pages(pagelist, alloc_migration_target, NULL,
++		 *   - mm/migrate.c|2210| <<migrate_misplaced_page>> nr_remaining = migrate_pages(&migratepages, *new, NULL, node,
++		 *   - mm/page_alloc.c|6955| <<__alloc_contig_migrate_range>> ret = migrate_pages(&cc->migratepages, alloc_migration_target,
++		 *   - mm/vmscan.c|1364| <<demote_page_list>> err = migrate_pages(demote_pages, alloc_demote_page, NULL,
++		 */
+ 		ret = migrate_pages(&cc->migratepages, alloc_migration_target,
+ 			NULL, (unsigned long)&mtc, cc->mode, MR_CONTIG_RANGE, NULL);
+ 
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 245d507f688b..f5d030e688a3 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -1360,6 +1360,19 @@ static unsigned int demote_page_list(struct list_head *demote_pages,
+ 	if (target_nid == NUMA_NO_NODE)
+ 		return 0;
+ 
++	/*
++	 * 在以下使用migrate_pages():
++	 *   - mm/compaction.c|2454| <<compact_zone>> err = migrate_pages(&cc->migratepages, compaction_alloc,
++	 *   - mm/gup.c|1915| <<check_and_migrate_movable_pages>> ret = migrate_pages(&movable_page_list, alloc_migration_target,
++	 *   - mm/memory-failure.c|2278| <<__soft_offline_page>> ret = migrate_pages(&pagelist, alloc_migration_target, NULL,
++	 *   - mm/memory_hotplug.c|1793| <<do_migrate_range>> ret = migrate_pages(&source, alloc_migration_target, NULL,
++	 *   - mm/mempolicy.c|1070| <<migrate_to_node>> err = migrate_pages(&pagelist, alloc_migration_target, NULL,
++	 *   - mm/mempolicy.c|1324| <<do_mbind>> nr_failed = migrate_pages(&pagelist, new_page, NULL,
++	 *   - mm/migrate.c|1681| <<do_move_pages_to_node>> err = migrate_pages(pagelist, alloc_migration_target, NULL,
++	 *   - mm/migrate.c|2210| <<migrate_misplaced_page>> nr_remaining = migrate_pages(&migratepages, *new, NULL, node,
++	 *   - mm/page_alloc.c|6955| <<__alloc_contig_migrate_range>> ret = migrate_pages(&cc->migratepages, alloc_migration_target,
++	 *   - mm/vmscan.c|1364| <<demote_page_list>> err = migrate_pages(demote_pages, alloc_demote_page, NULL,
++	 */
+ 	/* Demotion ignores all cpuset and mempolicy settings */
+ 	err = migrate_pages(demote_pages, alloc_demote_page, NULL,
+ 			    target_nid, MIGRATE_ASYNC, MR_DEMOTION,
+@@ -2894,6 +2907,14 @@ static inline bool should_continue_reclaim(struct pglist_data *pgdat,
+ 		if (!managed_zone(zone))
+ 			continue;
+ 
++		/*
++		 * 在以下使用compaction_suitable():
++		 *   - mm/compaction.c|2380| <<compact_zone>> ret = compaction_suitable(cc->zone, cc->order, cc->alloc_flags,
++		 *   - mm/compaction.c|2885| <<kcompactd_node_suitable>> if (compaction_suitable(zone, pgdat->kcompactd_max_order, 0,
++		 *   - mm/compaction.c|2923| <<kcompactd_do_work>> if (compaction_suitable(zone, cc.order, 0, zoneid) !=
++		 *   - mm/vmscan.c|2910| <<should_continue_reclaim>> switch (compaction_suitable(zone, sc->order, 0, sc->reclaim_idx)) {
++		 *   - mm/vmscan.c|3200| <<compaction_ready>> suitable = compaction_suitable(zone, sc->order, 0, sc->reclaim_idx);
++		 */
+ 		switch (compaction_suitable(zone, sc->order, 0, sc->reclaim_idx)) {
+ 		case COMPACT_SUCCESS:
+ 		case COMPACT_CONTINUE:
+@@ -3184,6 +3205,14 @@ static inline bool compaction_ready(struct zone *zone, struct scan_control *sc)
+ 	if (!gfp_compaction_allowed(sc->gfp_mask))
+ 		return false;
+ 
++	/*
++	 * 在以下使用compaction_suitable():
++	 *   - mm/compaction.c|2380| <<compact_zone>> ret = compaction_suitable(cc->zone, cc->order, cc->alloc_flags,
++	 *   - mm/compaction.c|2885| <<kcompactd_node_suitable>> if (compaction_suitable(zone, pgdat->kcompactd_max_order, 0,
++	 *   - mm/compaction.c|2923| <<kcompactd_do_work>> if (compaction_suitable(zone, cc.order, 0, zoneid) !=
++	 *   - mm/vmscan.c|2910| <<should_continue_reclaim>> switch (compaction_suitable(zone, sc->order, 0, sc->reclaim_idx)) {
++	 *   - mm/vmscan.c|3200| <<compaction_ready>> suitable = compaction_suitable(zone, sc->order, 0, sc->reclaim_idx);
++	 */
+ 	suitable = compaction_suitable(zone, sc->order, 0, sc->reclaim_idx);
+ 	if (suitable == COMPACT_SUCCESS)
+ 		/* Allocation should succeed already. Don't reclaim. */
+-- 
+2.50.1 (Apple Git-155)
+
