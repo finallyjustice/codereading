@@ -1,6 +1,6 @@
-From fd94cebc697529e78d79ad014ac3783d5bd5f9f9 Mon Sep 17 00:00:00 2001
+From 2586d9ad6336e8cdab4f920e4e327b909008e789 Mon Sep 17 00:00:00 2001
 From: Dongli Zhang <dongli.zhang0129@gmail.com>
-Date: Thu, 5 Feb 2026 17:10:26 -0800
+Date: Wed, 11 Feb 2026 13:39:01 -0800
 Subject: [PATCH 1/1] linux-v6.18
 
 Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
@@ -21,10 +21,12 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  arch/arm64/kvm/sys_regs.c                     |   54 +
  arch/arm64/kvm/vgic/vgic-init.c               |   10 +
  arch/riscv/kvm/tlb.c                          |    7 +
+ arch/x86/events/core.c                        |    3 +
  arch/x86/include/asm/io_apic.h                |   26 +
  arch/x86/include/asm/kvm_host.h               |  372 +++
  arch/x86/include/asm/kvm_para.h               |   12 +
  arch/x86/include/asm/mpspec_def.h             |    8 +
+ arch/x86/include/asm/nmi.h                    |   21 +
  arch/x86/kernel/aperture_64.c                 |    9 +
  arch/x86/kernel/apic/apic.c                   |    7 +
  arch/x86/kernel/apic/io_apic.c                |  406 +++
@@ -36,6 +38,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  arch/x86/kernel/machine_kexec_32.c            |    8 +
  arch/x86/kernel/machine_kexec_64.c            |    8 +
  arch/x86/kernel/mpparse.c                     |   16 +
+ arch/x86/kernel/nmi.c                         |   11 +
  arch/x86/kernel/pci-dma.c                     |   15 +
  arch/x86/kernel/reboot.c                      |    8 +
  arch/x86/kvm/cpuid.c                          |   29 +
@@ -53,14 +56,14 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  arch/x86/kvm/svm/nested.c                     |  298 +-
  arch/x86/kvm/svm/pmu.c                        |   24 +
  arch/x86/kvm/svm/sev.c                        |    8 +
- arch/x86/kvm/svm/svm.c                        |  154 +
+ arch/x86/kvm/svm/svm.c                        |  161 +
  arch/x86/kvm/svm/svm.h                        |   31 +
  arch/x86/kvm/vmx/nested.c                     |   58 +
  arch/x86/kvm/vmx/posted_intr.c                |   47 +
- arch/x86/kvm/vmx/vmx.c                        |  125 +
+ arch/x86/kvm/vmx/vmx.c                        |  132 +
  arch/x86/kvm/vmx/vmx.h                        |   37 +
- arch/x86/kvm/x86.c                            | 2526 +++++++++++++++++
- arch/x86/kvm/x86.h                            |   52 +
+ arch/x86/kvm/x86.c                            | 2624 +++++++++++++++++
+ arch/x86/kvm/x86.h                            |   78 +
  arch/x86/kvm/xen.c                            |   17 +
  drivers/hv/hv_balloon.c                       |    9 +
  drivers/iommu/amd/amd_iommu_types.h           |   95 +
@@ -86,7 +89,7 @@ Signed-off-by: Dongli Zhang <dongli.zhang0129@gmail.com>
  virt/kvm/irqchip.c                            |   73 +
  virt/kvm/kvm_main.c                           |  192 ++
  virt/lib/irqbypass.c                          |   61 +
- 81 files changed, 7936 insertions(+), 1 deletion(-)
+ 84 files changed, 8109 insertions(+), 1 deletion(-)
 
 diff --git a/arch/arm64/include/asm/kvm_host.h b/arch/arm64/include/asm/kvm_host.h
 index 64302c438..e985014b9 100644
@@ -647,6 +650,20 @@ index 3c5a70a2b..6dbce5dc9 100644
 +	 */
  	kvm_make_vcpus_request_mask(kvm, actual_req, vcpu_mask);
  }
+ 
+diff --git a/arch/x86/events/core.c b/arch/x86/events/core.c
+index fa6c47b50..62ee2fe1a 100644
+--- a/arch/x86/events/core.c
++++ b/arch/x86/events/core.c
+@@ -1764,6 +1764,9 @@ perf_event_nmi_handler(unsigned int cmd, struct pt_regs *regs)
+ 		return NMI_DONE;
+ 
+ 	start_clock = sched_clock();
++	/*
++	 * amd_pmu_handle_irq()
++	 */
+ 	ret = static_call(x86_pmu_handle_irq)(regs);
+ 	finish_clock = sched_clock();
  
 diff --git a/arch/x86/include/asm/io_apic.h b/arch/x86/include/asm/io_apic.h
 index 0d806513c..df99b2e71 100644
@@ -1228,6 +1245,38 @@ index 6fb923a34..a426baa92 100644
  struct mpc_ioapic {
  	unsigned char type;
  	unsigned char apicid;
+diff --git a/arch/x86/include/asm/nmi.h b/arch/x86/include/asm/nmi.h
+index 79d88d12c..937c7e0fc 100644
+--- a/arch/x86/include/asm/nmi.h
++++ b/arch/x86/include/asm/nmi.h
+@@ -75,6 +75,27 @@ struct nmiaction {
+  *
+  * Return: 0 on success, or an error code on failure.
+  */
++/*
++ * 在以下使用register_nmi_handler():
++ *   - arch/x86/events/amd/ibs.c|1488| <<perf_event_ibs_init>> ret = register_nmi_handler(NMI_LOCAL, perf_ibs_nmi_handler, 0, "perf_ibs");
++ *   - arch/x86/events/core.c|2134| <<init_hw_perf_events>> register_nmi_handler(NMI_LOCAL, perf_event_nmi_handler, 0, "PMI");
++ *   - arch/x86/kernel/apic/hw_nmi.c|56| <<register_nmi_cpu_backtrace_handler>> register_nmi_handler(NMI_LOCAL, nmi_cpu_backtrace_handler,
++ *   - arch/x86/kernel/cpu/mce/inject.c|778| <<inject_init>> register_nmi_handler(NMI_LOCAL, mce_raise_notify, 0, "mce_notify");
++ *   - arch/x86/kernel/cpu/mshyperv.c|559| <<ms_hyperv_init_platform>> register_nmi_handler(NMI_UNKNOWN, hv_nmi_unknown, NMI_FLAG_FIRST,
++ *   - arch/x86/kernel/kgdb.c|605| <<kgdb_arch_init>> retval = register_nmi_handler(NMI_LOCAL, kgdb_nmi_handler,
++ *   - arch/x86/kernel/kgdb.c|610| <<kgdb_arch_init>> retval = register_nmi_handler(NMI_UNKNOWN, kgdb_nmi_handler,
++ *   - arch/x86/kernel/nmi_selftest.c|43| <<init_nmi_testsuite>> register_nmi_handler(NMI_UNKNOWN, nmi_unk_cb, 0, "nmi_selftest_unk",
++ *   - arch/x86/kernel/nmi_selftest.c|66| <<test_nmi_ipi>> if (register_nmi_handler(NMI_LOCAL, test_nmi_ipi_callback,
++ *   - arch/x86/kernel/smp.c|145| <<register_stop_handler>> return register_nmi_handler(NMI_LOCAL, smp_stop_nmi_callback,
++ *   - arch/x86/platform/uv/uv_nmi.c|1032| <<uv_register_nmi_notifier>> if (register_nmi_handler(NMI_UNKNOWN, uv_handle_nmi, 0, "uv"))
++ *   - arch/x86/platform/uv/uv_nmi.c|1035| <<uv_register_nmi_notifier>> if (register_nmi_handler(NMI_LOCAL, uv_handle_nmi_ping, 0, "uvping"))
++ *   - drivers/acpi/apei/ghes.c|1446| <<ghes_nmi_add>> register_nmi_handler(NMI_LOCAL, ghes_notify_nmi, 0, "ghes");
++ *   - drivers/char/ipmi/ipmi_watchdog.c|1255| <<check_parms>> rv = register_nmi_handler(NMI_UNKNOWN, ipmi_nmi, 0,
++ *   - drivers/edac/igen6_edac.c|1439| <<register_err_handler>> rc = register_nmi_handler(NMI_SERR, ecclog_nmi_handler,
++ *   - drivers/watchdog/hpwdt.c|245| <<hpwdt_init_nmi_decoding>> retval = register_nmi_handler(NMI_UNKNOWN, hpwdt_pretimeout, 0, "hpwdt");
++ *   - drivers/watchdog/hpwdt.c|248| <<hpwdt_init_nmi_decoding>> retval = register_nmi_handler(NMI_SERR, hpwdt_pretimeout, 0, "hpwdt");
++ *   - drivers/watchdog/hpwdt.c|251| <<hpwdt_init_nmi_decoding>> retval = register_nmi_handler(NMI_IO_CHECK, hpwdt_pretimeout, 0, "hpwdt");
++ */
+ #define register_nmi_handler(t, fn, fg, n, init...)	\
+ ({							\
+ 	static struct nmiaction init fn##_na = {	\
 diff --git a/arch/x86/kernel/aperture_64.c b/arch/x86/kernel/aperture_64.c
 index 769321185..0a0b2eb95 100644
 --- a/arch/x86/kernel/aperture_64.c
@@ -2292,6 +2341,35 @@ index 4a1b1b28a..9e0638cc2 100644
  	ioapic.apicaddr	= IO_APIC_DEFAULT_PHYS_BASE;
  	MP_ioapic_info(&ioapic);
  
+diff --git a/arch/x86/kernel/nmi.c b/arch/x86/kernel/nmi.c
+index be93ec725..141786c34 100644
+--- a/arch/x86/kernel/nmi.c
++++ b/arch/x86/kernel/nmi.c
+@@ -127,6 +127,13 @@ static void nmi_check_duration(struct nmiaction *action, u64 duration)
+ 			    action->handler, duration, decimal_msecs);
+ }
+ 
++/*
++ * 在以下使用nmi_handle():
++ *   - arch/x86/kernel/nmi.c|267| <<pci_serr_error>> if (nmi_handle(NMI_SERR, regs))
++ *   - arch/x86/kernel/nmi.c|290| <<io_check_error>> if (nmi_handle(NMI_IO_CHECK, regs))
++ *   - arch/x86/kernel/nmi.c|334| <<unknown_nmi_error>> handled = nmi_handle(NMI_UNKNOWN, regs);
++ *   - arch/x86/kernel/nmi.c|392| <<default_do_nmi>> handled = nmi_handle(NMI_LOCAL, regs);
++ */
+ static int nmi_handle(unsigned int type, struct pt_regs *regs)
+ {
+ 	struct nmi_desc *desc = nmi_to_desc(type);
+@@ -321,6 +328,10 @@ io_check_error(unsigned char reason, struct pt_regs *regs)
+ }
+ NOKPROBE_SYMBOL(io_check_error);
+ 
++/*
++ * 在以下使用unknown_nmi_error():
++ *   - arch/x86/kernel/nmi.c|475| <<default_do_nmi>> unknown_nmi_error(reason, regs);
++ */
+ static void
+ unknown_nmi_error(unsigned char reason, struct pt_regs *regs)
+ {
 diff --git a/arch/x86/kernel/pci-dma.c b/arch/x86/kernel/pci-dma.c
 index 6267363e0..cbdbe7bd4 100644
 --- a/arch/x86/kernel/pci-dma.c
@@ -3836,7 +3914,7 @@ index 0835c664f..6320b3f7b 100644
  
  	if (!VALID_PAGE(svm->sev_es.snp_vmsa_gpa))
 diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
-index 9d29b2e7e..b75ed0661 100644
+index 9d29b2e7e..67b4af242 100644
 --- a/arch/x86/kvm/svm/svm.c
 +++ b/arch/x86/kvm/svm/svm.c
 @@ -215,6 +215,16 @@ int svm_set_efer(struct kvm_vcpu *vcpu, u64 efer)
@@ -4130,6 +4208,20 @@ index 9d29b2e7e..b75ed0661 100644
  	ret = enter_svm_guest_mode(vcpu, smram64->svm_guest_vmcb_gpa, vmcb12, false);
  
  	if (ret)
+@@ -5298,6 +5452,13 @@ static __init int svm_hardware_setup(void)
+ 			kvm_caps.has_tsc_control = true;
+ 		}
+ 	}
++	/*
++	 * 在以下使用kvm_caps.max_tsc_scaling_ratio:
++	 *   - arch/x86/kvm/svm/svm.c|5455| <<svm_hardware_setup>> kvm_caps.max_tsc_scaling_ratio = SVM_TSC_RATIO_MAX;
++	 *   - arch/x86/kvm/vmx/vmx.c|8690| <<vmx_hardware_setup>> kvm_caps.max_tsc_scaling_ratio = KVM_VMX_TSC_MULTIPLIER_MAX;
++	 *   - arch/x86/kvm/x86.c|2748| <<set_tsc_khz>> if (ratio == 0 || ratio >= kvm_caps.max_tsc_scaling_ratio) {
++	 *   - arch/x86/kvm/x86.c|12116| <<kvm_x86_vendor_init>> __scale_tsc(kvm_caps.max_tsc_scaling_ratio, tsc_khz));
++	 */
+ 	kvm_caps.max_tsc_scaling_ratio = SVM_TSC_RATIO_MAX;
+ 	kvm_caps.tsc_scaling_ratio_frac_bits = 32;
+ 
 diff --git a/arch/x86/kvm/svm/svm.h b/arch/x86/kvm/svm/svm.h
 index dd78e6402..ad10649f6 100644
 --- a/arch/x86/kvm/svm/svm.h
@@ -4363,7 +4455,7 @@ index 4a6d9a17d..a16d364ac 100644
   * Maintain a per-CPU list of vCPUs that need to be awakened by wakeup_handler()
   * when a WAKEUP_VECTOR interrupted is posted.  vCPUs are added to the list when
 diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
-index 91b6f2f3e..051c2f493 100644
+index 91b6f2f3e..d165da53d 100644
 --- a/arch/x86/kvm/vmx/vmx.c
 +++ b/arch/x86/kvm/vmx/vmx.c
 @@ -1407,6 +1407,13 @@ static void shrink_ple_window(struct kvm_vcpu *vcpu)
@@ -4579,6 +4671,20 @@ index 91b6f2f3e..051c2f493 100644
  	/*
  	 * Note, nr_memslots_dirty_logging can be changed concurrent with this
  	 * code, but in that case another update request will be made and so
+@@ -8562,6 +8687,13 @@ __init int vmx_hardware_setup(void)
+ 	if (cpu_has_vmx_tsc_scaling())
+ 		kvm_caps.has_tsc_control = true;
+ 
++	/*
++	 * 在以下使用kvm_caps.max_tsc_scaling_ratio:
++	 *   - arch/x86/kvm/svm/svm.c|5455| <<svm_hardware_setup>> kvm_caps.max_tsc_scaling_ratio = SVM_TSC_RATIO_MAX;
++	 *   - arch/x86/kvm/vmx/vmx.c|8690| <<vmx_hardware_setup>> kvm_caps.max_tsc_scaling_ratio = KVM_VMX_TSC_MULTIPLIER_MAX;
++	 *   - arch/x86/kvm/x86.c|2748| <<set_tsc_khz>> if (ratio == 0 || ratio >= kvm_caps.max_tsc_scaling_ratio) {
++	 *   - arch/x86/kvm/x86.c|12116| <<kvm_x86_vendor_init>> __scale_tsc(kvm_caps.max_tsc_scaling_ratio, tsc_khz));
++	 */
+ 	kvm_caps.max_tsc_scaling_ratio = KVM_VMX_TSC_MULTIPLIER_MAX;
+ 	kvm_caps.tsc_scaling_ratio_frac_bits = 48;
+ 	kvm_caps.has_bus_lock_exit = cpu_has_vmx_bus_lock_detection();
 diff --git a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
 index ea9312102..68186c1b2 100644
 --- a/arch/x86/kvm/vmx/vmx.h
@@ -4639,7 +4745,7 @@ index ea9312102..68186c1b2 100644
  	int l1_tpr_threshold;
  
 diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
-index c9c2aa6f4..48b66e5f1 100644
+index c9c2aa6f4..d96dde3ef 100644
 --- a/arch/x86/kvm/x86.c
 +++ b/arch/x86/kvm/x86.c
 @@ -326,6 +326,13 @@ static struct kmem_cache *x86_emulator_cache;
@@ -4930,7 +5036,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static void kvm_get_time_scale(uint64_t scaled_hz, uint64_t base_hz,
  			       s8 *pshift, u32 *pmultiplier)
  {
-@@ -2498,6 +2648,13 @@ static void kvm_get_time_scale(uint64_t scaled_hz, uint64_t base_hz,
+@@ -2498,10 +2648,23 @@ static void kvm_get_time_scale(uint64_t scaled_hz, uint64_t base_hz,
  }
  
  #ifdef CONFIG_X86_64
@@ -4944,7 +5050,17 @@ index c9c2aa6f4..48b66e5f1 100644
  static atomic_t kvm_guest_has_master_clock = ATOMIC_INIT(0);
  #endif
  
-@@ -2513,20 +2670,69 @@ static u32 adjust_tsc_khz(u32 khz, s32 ppm)
+ static DEFINE_PER_CPU(unsigned long, cpu_tsc_khz);
++/*
++ * 在以下使用max_tsc_khz:
++ *   - arch/x86/kvm/x86.c|11786| <<kvm_timer_init>> max_tsc_khz = tsc_khz;
++ *   - arch/x86/kvm/x86.c|11796| <<kvm_timer_init>> max_tsc_khz = policy->cpuinfo.max_freq;
++ *   - arch/x86/kvm/x86.c|15440| <<kvm_arch_init_vm>> kvm->arch.default_tsc_khz = max_tsc_khz ? : tsc_khz;
++ */
+ static unsigned long max_tsc_khz;
+ 
+ static u32 adjust_tsc_khz(u32 khz, s32 ppm)
+@@ -2513,20 +2676,69 @@ static u32 adjust_tsc_khz(u32 khz, s32 ppm)
  
  static void kvm_vcpu_write_tsc_multiplier(struct kvm_vcpu *vcpu, u64 l1_multiplier);
  
@@ -5014,7 +5130,21 @@ index c9c2aa6f4..48b66e5f1 100644
  			vcpu->arch.tsc_always_catchup = 1;
  			return 0;
  		} else {
-@@ -2549,6 +2755,28 @@ static int set_tsc_khz(struct kvm_vcpu *vcpu, u32 user_tsc_khz, bool scale)
+@@ -2539,6 +2751,13 @@ static int set_tsc_khz(struct kvm_vcpu *vcpu, u32 user_tsc_khz, bool scale)
+ 	ratio = mul_u64_u32_div(1ULL << kvm_caps.tsc_scaling_ratio_frac_bits,
+ 				user_tsc_khz, tsc_khz);
+ 
++	/*
++	 * 在以下使用kvm_caps.max_tsc_scaling_ratio:
++	 *   - arch/x86/kvm/svm/svm.c|5455| <<svm_hardware_setup>> kvm_caps.max_tsc_scaling_ratio = SVM_TSC_RATIO_MAX;
++	 *   - arch/x86/kvm/vmx/vmx.c|8690| <<vmx_hardware_setup>> kvm_caps.max_tsc_scaling_ratio = KVM_VMX_TSC_MULTIPLIER_MAX;
++	 *   - arch/x86/kvm/x86.c|2748| <<set_tsc_khz>> if (ratio == 0 || ratio >= kvm_caps.max_tsc_scaling_ratio) {
++	 *   - arch/x86/kvm/x86.c|12116| <<kvm_x86_vendor_init>> __scale_tsc(kvm_caps.max_tsc_scaling_ratio, tsc_khz));
++	 */
+ 	if (ratio == 0 || ratio >= kvm_caps.max_tsc_scaling_ratio) {
+ 		pr_warn_ratelimited("Invalid TSC scaling ratio - virtual-tsc-khz=%u\n",
+ 			            user_tsc_khz);
+@@ -2549,6 +2768,28 @@ static int set_tsc_khz(struct kvm_vcpu *vcpu, u32 user_tsc_khz, bool scale)
  	return 0;
  }
  
@@ -5043,7 +5173,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static int kvm_set_tsc_khz(struct kvm_vcpu *vcpu, u32 user_tsc_khz)
  {
  	u32 thresh_lo, thresh_hi;
-@@ -2556,15 +2784,51 @@ static int kvm_set_tsc_khz(struct kvm_vcpu *vcpu, u32 user_tsc_khz)
+@@ -2556,15 +2797,55 @@ static int kvm_set_tsc_khz(struct kvm_vcpu *vcpu, u32 user_tsc_khz)
  
  	/* tsc_khz can be zero if TSC calibration fails */
  	if (user_tsc_khz == 0) {
@@ -5083,6 +5213,10 @@ index c9c2aa6f4..48b66e5f1 100644
 +	 *           vcpu->arch.virtual_tsc_mult, vcpu->arch.virtual_tsc_shift);
 +	 *   - arch/x86/kvm/x86.h|528| <<nsec_to_cycles>> return pvclock_scale_delta(nsec,
 +	 *           vcpu->arch.virtual_tsc_mult, vcpu->arch.virtual_tsc_shift);
++	 *
++	 * 在这里计算:
++	 * vcpu->arch.virtual_tsc_shift
++	 * vcpu->arch.virtual_tsc_mult
 +	 */
  	/* Compute a scale to convert nanoseconds in TSC cycles */
  	kvm_get_time_scale(user_tsc_khz * 1000LL, NSEC_PER_SEC,
@@ -5095,7 +5229,17 @@ index c9c2aa6f4..48b66e5f1 100644
  	vcpu->arch.virtual_tsc_khz = user_tsc_khz;
  
  	/*
-@@ -2580,14 +2844,77 @@ static int kvm_set_tsc_khz(struct kvm_vcpu *vcpu, u32 user_tsc_khz)
+@@ -2573,6 +2854,9 @@ static int kvm_set_tsc_khz(struct kvm_vcpu *vcpu, u32 user_tsc_khz)
+ 	 * rate being applied is within that bounds of the hardware
+ 	 * rate.  If so, no scaling or compensation need be done.
+ 	 */
++	/*
++	 * 这里用的是tsc_khz!
++	 */
+ 	thresh_lo = adjust_tsc_khz(tsc_khz, -tsc_tolerance_ppm);
+ 	thresh_hi = adjust_tsc_khz(tsc_khz, tsc_tolerance_ppm);
+ 	if (user_tsc_khz < thresh_lo || user_tsc_khz > thresh_hi) {
+@@ -2580,14 +2864,77 @@ static int kvm_set_tsc_khz(struct kvm_vcpu *vcpu, u32 user_tsc_khz)
  			 user_tsc_khz, thresh_lo, thresh_hi);
  		use_scaling = 1;
  	}
@@ -5173,7 +5317,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	tsc += vcpu->arch.this_tsc_write;
  	return tsc;
  }
-@@ -2599,6 +2926,10 @@ static inline bool gtod_is_based_on_tsc(int mode)
+@@ -2599,6 +2946,10 @@ static inline bool gtod_is_based_on_tsc(int mode)
  }
  #endif
  
@@ -5184,7 +5328,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static void kvm_track_tsc_matching(struct kvm_vcpu *vcpu, bool new_generation)
  {
  #ifdef CONFIG_X86_64
-@@ -2610,10 +2941,33 @@ static void kvm_track_tsc_matching(struct kvm_vcpu *vcpu, bool new_generation)
+@@ -2610,10 +2961,33 @@ static void kvm_track_tsc_matching(struct kvm_vcpu *vcpu, bool new_generation)
  	 * and all vCPUs must have matching TSCs.  Note, the count for matching
  	 * vCPUs doesn't include the reference vCPU, hence "+1".
  	 */
@@ -5218,7 +5362,19 @@ index c9c2aa6f4..48b66e5f1 100644
  	/*
  	 * Request a masterclock update if the masterclock needs to be toggled
  	 * on/off, or when starting a new generation and the masterclock is
-@@ -2649,12 +3003,34 @@ u64 kvm_scale_tsc(u64 tsc, u64 ratio)
+@@ -2640,6 +3014,11 @@ static void kvm_track_tsc_matching(struct kvm_vcpu *vcpu, bool new_generation)
+  *
+  * N equals to kvm_caps.tsc_scaling_ratio_frac_bits.
+  */
++/*
++ * 在以下使用__scale_tsc():
++ *   - arch/x86/kvm/x86.c|3026| <<kvm_scale_tsc>> _tsc = __scale_tsc(ratio, tsc);
++ *   - arch/x86/kvm/x86.c|12116| <<kvm_x86_vendor_init>> __scale_tsc(kvm_caps.max_tsc_scaling_ratio, tsc_khz));
++ */
+ static inline u64 __scale_tsc(u64 ratio, u64 tsc)
+ {
+ 	return mul_u64_u64_shr(tsc, ratio, kvm_caps.tsc_scaling_ratio_frac_bits);
+@@ -2649,12 +3028,34 @@ u64 kvm_scale_tsc(u64 tsc, u64 ratio)
  {
  	u64 _tsc = tsc;
  
@@ -5253,7 +5409,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static u64 kvm_compute_l1_tsc_offset(struct kvm_vcpu *vcpu, u64 target_tsc)
  {
  	u64 tsc;
-@@ -2675,6 +3051,21 @@ u64 kvm_calc_nested_tsc_offset(u64 l1_offset, u64 l2_offset, u64 l2_multiplier)
+@@ -2675,6 +3076,21 @@ u64 kvm_calc_nested_tsc_offset(u64 l1_offset, u64 l2_offset, u64 l2_multiplier)
  {
  	u64 nested_offset;
  
@@ -5275,7 +5431,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	if (l2_multiplier == kvm_caps.default_tsc_scaling_ratio)
  		nested_offset = l1_offset;
  	else
-@@ -2688,6 +3079,21 @@ EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_calc_nested_tsc_offset);
+@@ -2688,6 +3104,21 @@ EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_calc_nested_tsc_offset);
  
  u64 kvm_calc_nested_tsc_multiplier(u64 l1_multiplier, u64 l2_multiplier)
  {
@@ -5297,7 +5453,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	if (l2_multiplier != kvm_caps.default_tsc_scaling_ratio)
  		return mul_u64_u64_shr(l1_multiplier, l2_multiplier,
  				       kvm_caps.tsc_scaling_ratio_frac_bits);
-@@ -2696,6 +3102,12 @@ u64 kvm_calc_nested_tsc_multiplier(u64 l1_multiplier, u64 l2_multiplier)
+@@ -2696,6 +3127,12 @@ u64 kvm_calc_nested_tsc_multiplier(u64 l1_multiplier, u64 l2_multiplier)
  }
  EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_calc_nested_tsc_multiplier);
  
@@ -5310,7 +5466,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static void kvm_vcpu_write_tsc_offset(struct kvm_vcpu *vcpu, u64 l1_offset)
  {
  	if (vcpu->arch.guest_tsc_protected)
-@@ -2757,16 +3169,50 @@ static inline bool kvm_check_tsc_unstable(void)
+@@ -2757,16 +3194,50 @@ static inline bool kvm_check_tsc_unstable(void)
   * offset for the vcpu and tracks the TSC matching generation that the vcpu
   * participates in.
   */
@@ -5361,7 +5517,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	if (user_set_tsc)
  		vcpu->kvm->arch.user_set_tsc = true;
  
-@@ -2774,13 +3220,59 @@ static void __kvm_synchronize_tsc(struct kvm_vcpu *vcpu, u64 offset, u64 tsc,
+@@ -2774,13 +3245,59 @@ static void __kvm_synchronize_tsc(struct kvm_vcpu *vcpu, u64 offset, u64 tsc,
  	 * We also track th most recent recorded KHZ, write and time to
  	 * allow the matching interval to be extended at each write.
  	 */
@@ -5421,7 +5577,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	kvm_vcpu_write_tsc_offset(vcpu, offset);
  
  	if (!matched) {
-@@ -2793,23 +3285,125 @@ static void __kvm_synchronize_tsc(struct kvm_vcpu *vcpu, u64 offset, u64 tsc,
+@@ -2793,23 +3310,125 @@ static void __kvm_synchronize_tsc(struct kvm_vcpu *vcpu, u64 offset, u64 tsc,
  		 *
  		 * These values are tracked in kvm->arch.cur_xxx variables.
  		 */
@@ -5547,7 +5703,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static void kvm_synchronize_tsc(struct kvm_vcpu *vcpu, u64 *user_value)
  {
  	u64 data = user_value ? *user_value : 0;
-@@ -2819,9 +3413,30 @@ static void kvm_synchronize_tsc(struct kvm_vcpu *vcpu, u64 *user_value)
+@@ -2819,11 +3438,36 @@ static void kvm_synchronize_tsc(struct kvm_vcpu *vcpu, u64 *user_value)
  	bool matched = false;
  	bool synchronizing = false;
  
@@ -5577,8 +5733,14 @@ index c9c2aa6f4..48b66e5f1 100644
 +	 */
  	elapsed = ns - kvm->arch.last_tsc_nsec;
  
++	/*
++	 * 很多使用. 在以下设置kvm_vcpu_arch->virtual_tsc_khz:
++	 *   - arch/x86/kvm/x86.c|2593| <<kvm_set_tsc_khz>> vcpu->arch.virtual_tsc_khz = user_tsc_khz;
++	 */
  	if (vcpu->arch.virtual_tsc_khz) {
-@@ -2832,6 +3447,18 @@ static void kvm_synchronize_tsc(struct kvm_vcpu *vcpu, u64 *user_value)
+ 		if (data == 0) {
+ 			/*
+@@ -2832,6 +3476,18 @@ static void kvm_synchronize_tsc(struct kvm_vcpu *vcpu, u64 *user_value)
  			 */
  			synchronizing = true;
  		} else if (kvm->arch.user_set_tsc) {
@@ -5597,7 +5759,7 @@ index c9c2aa6f4..48b66e5f1 100644
  			u64 tsc_exp = kvm->arch.last_tsc_write +
  						nsec_to_cycles(vcpu, elapsed);
  			u64 tsc_hz = vcpu->arch.virtual_tsc_khz * 1000LL;
-@@ -2862,11 +3489,47 @@ static void kvm_synchronize_tsc(struct kvm_vcpu *vcpu, u64 *user_value)
+@@ -2862,11 +3518,47 @@ static void kvm_synchronize_tsc(struct kvm_vcpu *vcpu, u64 *user_value)
  	 * compensation code attempt to catch up if we fall behind, but
  	 * it's better to try to match offsets from the beginning.
           */
@@ -5645,7 +5807,7 @@ index c9c2aa6f4..48b66e5f1 100644
  			u64 delta = nsec_to_cycles(vcpu, elapsed);
  			data += delta;
  			offset = kvm_compute_l1_tsc_offset(vcpu, data);
-@@ -2874,28 +3537,79 @@ static void kvm_synchronize_tsc(struct kvm_vcpu *vcpu, u64 *user_value)
+@@ -2874,28 +3566,79 @@ static void kvm_synchronize_tsc(struct kvm_vcpu *vcpu, u64 *user_value)
  		matched = true;
  	}
  
@@ -5725,7 +5887,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static u64 read_tsc(void)
  {
  	u64 ret = (u64)rdtsc_ordered();
-@@ -2916,6 +3630,12 @@ static u64 read_tsc(void)
+@@ -2916,6 +3659,12 @@ static u64 read_tsc(void)
  	return last;
  }
  
@@ -5738,7 +5900,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static inline u64 vgettsc(struct pvclock_clock *clock, u64 *tsc_timestamp,
  			  int *mode)
  {
-@@ -2937,6 +3657,9 @@ static inline u64 vgettsc(struct pvclock_clock *clock, u64 *tsc_timestamp,
+@@ -2937,6 +3686,9 @@ static inline u64 vgettsc(struct pvclock_clock *clock, u64 *tsc_timestamp,
  		break;
  	case VDSO_CLOCKMODE_TSC:
  		*mode = VDSO_CLOCKMODE_TSC;
@@ -5748,7 +5910,7 @@ index c9c2aa6f4..48b66e5f1 100644
  		*tsc_timestamp = read_tsc();
  		v = (*tsc_timestamp - clock->cycle_last) &
  			clock->mask;
-@@ -2965,6 +3688,12 @@ static int do_kvmclock_base(s64 *t, u64 *tsc_timestamp)
+@@ -2965,6 +3717,12 @@ static int do_kvmclock_base(s64 *t, u64 *tsc_timestamp)
  	do {
  		seq = read_seqcount_begin(&gtod->seq);
  		ns = gtod->raw_clock.base_cycles;
@@ -5761,7 +5923,7 @@ index c9c2aa6f4..48b66e5f1 100644
  		ns += vgettsc(&gtod->raw_clock, tsc_timestamp, &mode);
  		ns >>= gtod->raw_clock.shift;
  		ns += ktime_to_ns(ktime_add(gtod->raw_clock.offset, gtod->offs_boot));
-@@ -2978,6 +3707,10 @@ static int do_kvmclock_base(s64 *t, u64 *tsc_timestamp)
+@@ -2978,6 +3736,10 @@ static int do_kvmclock_base(s64 *t, u64 *tsc_timestamp)
   * This calculates CLOCK_MONOTONIC at the time of the TSC snapshot, with
   * no boot time offset.
   */
@@ -5772,7 +5934,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static int do_monotonic(s64 *t, u64 *tsc_timestamp)
  {
  	struct pvclock_gtod_data *gtod = &pvclock_gtod_data;
-@@ -2988,6 +3721,12 @@ static int do_monotonic(s64 *t, u64 *tsc_timestamp)
+@@ -2988,6 +3750,12 @@ static int do_monotonic(s64 *t, u64 *tsc_timestamp)
  	do {
  		seq = read_seqcount_begin(&gtod->seq);
  		ns = gtod->clock.base_cycles;
@@ -5785,7 +5947,7 @@ index c9c2aa6f4..48b66e5f1 100644
  		ns += vgettsc(&gtod->clock, tsc_timestamp, &mode);
  		ns >>= gtod->clock.shift;
  		ns += ktime_to_ns(gtod->clock.offset);
-@@ -2997,6 +3736,10 @@ static int do_monotonic(s64 *t, u64 *tsc_timestamp)
+@@ -2997,6 +3765,10 @@ static int do_monotonic(s64 *t, u64 *tsc_timestamp)
  	return mode;
  }
  
@@ -5796,7 +5958,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static int do_realtime(struct timespec64 *ts, u64 *tsc_timestamp)
  {
  	struct pvclock_gtod_data *gtod = &pvclock_gtod_data;
-@@ -3008,6 +3751,12 @@ static int do_realtime(struct timespec64 *ts, u64 *tsc_timestamp)
+@@ -3008,6 +3780,12 @@ static int do_realtime(struct timespec64 *ts, u64 *tsc_timestamp)
  		seq = read_seqcount_begin(&gtod->seq);
  		ts->tv_sec = gtod->wall_time_sec;
  		ns = gtod->clock.base_cycles;
@@ -5809,7 +5971,7 @@ index c9c2aa6f4..48b66e5f1 100644
  		ns += vgettsc(&gtod->clock, tsc_timestamp, &mode);
  		ns >>= gtod->clock.shift;
  	} while (unlikely(read_seqcount_retry(&gtod->seq, seq)));
-@@ -3023,6 +3772,10 @@ static int do_realtime(struct timespec64 *ts, u64 *tsc_timestamp)
+@@ -3023,6 +3801,10 @@ static int do_realtime(struct timespec64 *ts, u64 *tsc_timestamp)
   * reports the TSC value from which it do so. Returns true if host is
   * using TSC based clocksource.
   */
@@ -5820,7 +5982,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static bool kvm_get_time_and_clockread(s64 *kernel_ns, u64 *tsc_timestamp)
  {
  	/* checked again under seqlock below */
-@@ -3037,12 +3790,19 @@ static bool kvm_get_time_and_clockread(s64 *kernel_ns, u64 *tsc_timestamp)
+@@ -3037,12 +3819,19 @@ static bool kvm_get_time_and_clockread(s64 *kernel_ns, u64 *tsc_timestamp)
   * Calculates CLOCK_MONOTONIC and reports the TSC value from which it did
   * so. Returns true if host is using TSC based clocksource.
   */
@@ -5840,7 +6002,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	return gtod_is_based_on_tsc(do_monotonic(kernel_ns,
  						 tsc_timestamp));
  }
-@@ -3054,6 +3814,12 @@ bool kvm_get_monotonic_and_clockread(s64 *kernel_ns, u64 *tsc_timestamp)
+@@ -3054,6 +3843,12 @@ bool kvm_get_monotonic_and_clockread(s64 *kernel_ns, u64 *tsc_timestamp)
   * DO NOT USE this for anything related to migration. You want CLOCK_TAI
   * for that.
   */
@@ -5853,7 +6015,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static bool kvm_get_walltime_and_clockread(struct timespec64 *ts,
  					   u64 *tsc_timestamp)
  {
-@@ -3061,6 +3827,9 @@ static bool kvm_get_walltime_and_clockread(struct timespec64 *ts,
+@@ -3061,6 +3856,9 @@ static bool kvm_get_walltime_and_clockread(struct timespec64 *ts,
  	if (!gtod_is_based_on_tsc(pvclock_gtod_data.clock.vclock_mode))
  		return false;
  
@@ -5863,7 +6025,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	return gtod_is_based_on_tsc(do_realtime(ts, tsc_timestamp));
  }
  #endif
-@@ -3106,6 +3875,13 @@ static bool kvm_get_walltime_and_clockread(struct timespec64 *ts,
+@@ -3106,6 +3904,13 @@ static bool kvm_get_walltime_and_clockread(struct timespec64 *ts,
   *
   */
  
@@ -5877,7 +6039,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static void pvclock_update_vm_gtod_copy(struct kvm *kvm)
  {
  #ifdef CONFIG_X86_64
-@@ -3113,10 +3889,52 @@ static void pvclock_update_vm_gtod_copy(struct kvm *kvm)
+@@ -3113,10 +3918,52 @@ static void pvclock_update_vm_gtod_copy(struct kvm *kvm)
  	int vclock_mode;
  	bool host_tsc_clocksource, vcpus_matched;
  
@@ -5930,7 +6092,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	/*
  	 * If the host uses TSC clock, then passthrough TSC as stable
  	 * to the guest.
-@@ -3125,10 +3943,23 @@ static void pvclock_update_vm_gtod_copy(struct kvm *kvm)
+@@ -3125,10 +3972,23 @@ static void pvclock_update_vm_gtod_copy(struct kvm *kvm)
  					&ka->master_kernel_ns,
  					&ka->master_cycle_now);
  
@@ -5954,7 +6116,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	if (ka->use_master_clock)
  		atomic_set(&kvm_guest_has_master_clock, 1);
  
-@@ -3138,46 +3969,186 @@ static void pvclock_update_vm_gtod_copy(struct kvm *kvm)
+@@ -3138,46 +3998,186 @@ static void pvclock_update_vm_gtod_copy(struct kvm *kvm)
  #endif
  }
  
@@ -6141,7 +6303,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	kvm_end_pvclock_update(kvm);
  }
  
-@@ -3189,6 +4160,12 @@ static void kvm_update_masterclock(struct kvm *kvm)
+@@ -3189,6 +4189,12 @@ static void kvm_update_masterclock(struct kvm *kvm)
   * notification when calibration completes, but practically speaking calibration
   * will complete before userspace is alive enough to create VMs.
   */
@@ -6154,7 +6316,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static unsigned long get_cpu_tsc_khz(void)
  {
  	if (static_cpu_has(X86_FEATURE_CONSTANT_TSC))
-@@ -3197,6 +4174,27 @@ static unsigned long get_cpu_tsc_khz(void)
+@@ -3197,6 +4203,27 @@ static unsigned long get_cpu_tsc_khz(void)
  		return __this_cpu_read(cpu_tsc_khz);
  }
  
@@ -6182,7 +6344,7 @@ index c9c2aa6f4..48b66e5f1 100644
  /* Called within read_seqcount_begin/retry for kvm->pvclock_sc.  */
  static void __get_kvmclock(struct kvm *kvm, struct kvm_clock_data *data)
  {
-@@ -3212,6 +4210,14 @@ static void __get_kvmclock(struct kvm *kvm, struct kvm_clock_data *data)
+@@ -3212,6 +4239,14 @@ static void __get_kvmclock(struct kvm *kvm, struct kvm_clock_data *data)
  #ifdef CONFIG_X86_64
  		struct timespec64 ts;
  
@@ -6197,7 +6359,7 @@ index c9c2aa6f4..48b66e5f1 100644
  		if (kvm_get_walltime_and_clockread(&ts, &data->host_tsc)) {
  			data->realtime = ts.tv_nsec + NSEC_PER_SEC * ts.tv_sec;
  			data->flags |= KVM_CLOCK_REALTIME | KVM_CLOCK_HOST_TSC;
-@@ -3220,38 +4226,140 @@ static void __get_kvmclock(struct kvm *kvm, struct kvm_clock_data *data)
+@@ -3220,38 +4255,140 @@ static void __get_kvmclock(struct kvm *kvm, struct kvm_clock_data *data)
  		data->host_tsc = rdtsc();
  
  		data->flags |= KVM_CLOCK_TSC_STABLE;
@@ -6338,7 +6500,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static void kvm_setup_guest_pvclock(struct pvclock_vcpu_time_info *ref_hv_clock,
  				    struct kvm_vcpu *vcpu,
  				    struct gfn_to_pfn_cache *gpc,
-@@ -3300,6 +4408,66 @@ static void kvm_setup_guest_pvclock(struct pvclock_vcpu_time_info *ref_hv_clock,
+@@ -3300,6 +4437,66 @@ static void kvm_setup_guest_pvclock(struct pvclock_vcpu_time_info *ref_hv_clock,
  	trace_kvm_pvclock_update(vcpu->vcpu_id, &hv_clock);
  }
  
@@ -6405,7 +6567,7 @@ index c9c2aa6f4..48b66e5f1 100644
  int kvm_guest_time_update(struct kvm_vcpu *v)
  {
  	struct pvclock_vcpu_time_info hv_clock = {};
-@@ -3319,22 +4487,94 @@ int kvm_guest_time_update(struct kvm_vcpu *v)
+@@ -3319,22 +4516,94 @@ int kvm_guest_time_update(struct kvm_vcpu *v)
  	 * to the guest.
  	 */
  	do {
@@ -6500,7 +6662,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	if (!use_master_clock) {
  		host_tsc = rdtsc();
  		kernel_ns = get_kvmclock_base_ns();
-@@ -3352,9 +4592,71 @@ int kvm_guest_time_update(struct kvm_vcpu *v)
+@@ -3352,9 +4621,71 @@ int kvm_guest_time_update(struct kvm_vcpu *v)
  	 *      time to disappear, and the guest to stand still or run
  	 *	very slowly.
  	 */
@@ -6572,7 +6734,7 @@ index c9c2aa6f4..48b66e5f1 100644
  			adjust_tsc_offset_guest(v, tsc - tsc_timestamp);
  			tsc_timestamp = tsc;
  		}
-@@ -3365,6 +4667,9 @@ int kvm_guest_time_update(struct kvm_vcpu *v)
+@@ -3365,6 +4696,9 @@ int kvm_guest_time_update(struct kvm_vcpu *v)
  	/* With all the info we got, fill in the values */
  
  	if (kvm_caps.has_tsc_control) {
@@ -6582,7 +6744,7 @@ index c9c2aa6f4..48b66e5f1 100644
  		tgt_tsc_khz = kvm_scale_tsc(tgt_tsc_khz,
  					    v->arch.l1_tsc_scaling_ratio);
  		tgt_tsc_khz = tgt_tsc_khz ? : 1;
-@@ -3380,7 +4685,25 @@ int kvm_guest_time_update(struct kvm_vcpu *v)
+@@ -3380,7 +4714,25 @@ int kvm_guest_time_update(struct kvm_vcpu *v)
  	hv_clock.tsc_shift = vcpu->pvclock_tsc_shift;
  	hv_clock.tsc_to_system_mul = vcpu->pvclock_tsc_mul;
  	hv_clock.tsc_timestamp = tsc_timestamp;
@@ -6608,7 +6770,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	vcpu->last_guest_tsc = tsc_timestamp;
  
  	/* If the host uses TSC clocksource, then it is stable */
-@@ -3398,6 +4721,12 @@ int kvm_guest_time_update(struct kvm_vcpu *v)
+@@ -3398,6 +4750,12 @@ int kvm_guest_time_update(struct kvm_vcpu *v)
  			hv_clock.flags |= PVCLOCK_GUEST_STOPPED;
  			vcpu->pvclock_set_guest_stopped_request = false;
  		}
@@ -6621,7 +6783,7 @@ index c9c2aa6f4..48b66e5f1 100644
  		kvm_setup_guest_pvclock(&hv_clock, v, &vcpu->pv_time, 0);
  
  		hv_clock.flags &= ~PVCLOCK_GUEST_STOPPED;
-@@ -3417,9 +4746,21 @@ int kvm_guest_time_update(struct kvm_vcpu *v)
+@@ -3417,9 +4775,21 @@ int kvm_guest_time_update(struct kvm_vcpu *v)
  	if (ka->xen.hvm_config.flags & KVM_XEN_HVM_CONFIG_PVCLOCK_TSC_UNSTABLE)
  		hv_clock.flags &= ~PVCLOCK_TSC_STABLE_BIT;
  
@@ -6643,7 +6805,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	if (vcpu->xen.vcpu_time_info_cache.active)
  		kvm_setup_guest_pvclock(&hv_clock, v, &vcpu->xen.vcpu_time_info_cache, 0);
  #endif
-@@ -3445,6 +4786,17 @@ int kvm_guest_time_update(struct kvm_vcpu *v)
+@@ -3445,6 +4815,17 @@ int kvm_guest_time_update(struct kvm_vcpu *v)
   * Fall back to using their values at slightly different moments by
   * calling ktime_get_real_ns() and get_kvmclock_ns() separately.
   */
@@ -6661,7 +6823,7 @@ index c9c2aa6f4..48b66e5f1 100644
  uint64_t kvm_get_wall_clock_epoch(struct kvm *kvm)
  {
  #ifdef CONFIG_X86_64
-@@ -3455,6 +4807,18 @@ uint64_t kvm_get_wall_clock_epoch(struct kvm *kvm)
+@@ -3455,6 +4836,18 @@ uint64_t kvm_get_wall_clock_epoch(struct kvm *kvm)
  	uint64_t host_tsc;
  
  	do {
@@ -6680,7 +6842,7 @@ index c9c2aa6f4..48b66e5f1 100644
  		seq = read_seqcount_begin(&ka->pvclock_sc);
  
  		local_tsc_khz = 0;
-@@ -3467,8 +4831,20 @@ uint64_t kvm_get_wall_clock_epoch(struct kvm *kvm)
+@@ -3467,8 +4860,20 @@ uint64_t kvm_get_wall_clock_epoch(struct kvm *kvm)
  		 */
  		get_cpu();
  
@@ -6701,7 +6863,7 @@ index c9c2aa6f4..48b66e5f1 100644
  		if (local_tsc_khz &&
  		    !kvm_get_walltime_and_clockread(&ts, &host_tsc))
  			local_tsc_khz = 0; /* Fall back to old method */
-@@ -3480,7 +4856,33 @@ uint64_t kvm_get_wall_clock_epoch(struct kvm *kvm)
+@@ -3480,7 +4885,33 @@ uint64_t kvm_get_wall_clock_epoch(struct kvm *kvm)
  		 * After that, it's just mathematics which can happen on any
  		 * CPU at any time.
  		 */
@@ -6735,7 +6897,7 @@ index c9c2aa6f4..48b66e5f1 100644
  		hv_clock.system_time = ka->master_kernel_ns + ka->kvmclock_offset;
  
  	} while (read_seqcount_retry(&ka->pvclock_sc, seq));
-@@ -3492,13 +4894,37 @@ uint64_t kvm_get_wall_clock_epoch(struct kvm *kvm)
+@@ -3492,13 +4923,37 @@ uint64_t kvm_get_wall_clock_epoch(struct kvm *kvm)
  	 * since 1970-01-01.
  	 */
  	if (local_tsc_khz) {
@@ -6773,7 +6935,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	return ktime_get_real_ns() - get_kvmclock_ns(kvm);
  }
  
-@@ -3518,6 +4944,19 @@ uint64_t kvm_get_wall_clock_epoch(struct kvm *kvm)
+@@ -3518,6 +4973,19 @@ uint64_t kvm_get_wall_clock_epoch(struct kvm *kvm)
  
  #define KVMCLOCK_UPDATE_DELAY msecs_to_jiffies(100)
  
@@ -6793,7 +6955,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static void kvmclock_update_fn(struct work_struct *work)
  {
  	unsigned long i;
-@@ -3528,22 +4967,91 @@ static void kvmclock_update_fn(struct work_struct *work)
+@@ -3528,22 +4996,91 @@ static void kvmclock_update_fn(struct work_struct *work)
  	struct kvm_vcpu *vcpu;
  
  	kvm_for_each_vcpu(i, vcpu, kvm) {
@@ -6885,7 +7047,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static void kvmclock_sync_fn(struct work_struct *work)
  {
  	struct delayed_work *dwork = to_delayed_work(work);
-@@ -3551,7 +5059,21 @@ static void kvmclock_sync_fn(struct work_struct *work)
+@@ -3551,7 +5088,21 @@ static void kvmclock_sync_fn(struct work_struct *work)
  					   kvmclock_sync_work);
  	struct kvm *kvm = container_of(ka, struct kvm, arch);
  
@@ -6907,7 +7069,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	schedule_delayed_work(&kvm->arch.kvmclock_sync_work,
  					KVMCLOCK_SYNC_PERIOD);
  }
-@@ -3650,13 +5172,31 @@ static int set_msr_mce(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+@@ -3650,13 +5201,31 @@ static int set_msr_mce(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
  	return 0;
  }
  
@@ -6939,7 +7101,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static int kvm_pv_enable_async_pf(struct kvm_vcpu *vcpu, u64 data)
  {
  	gpa_t gpa = data & ~0x3f;
-@@ -3676,6 +5216,13 @@ static int kvm_pv_enable_async_pf(struct kvm_vcpu *vcpu, u64 data)
+@@ -3676,6 +5245,13 @@ static int kvm_pv_enable_async_pf(struct kvm_vcpu *vcpu, u64 data)
  	if (!lapic_in_kernel(vcpu))
  		return data ? 1 : 0;
  
@@ -6953,7 +7115,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	vcpu->arch.apf.msr_en_val = data;
  
  	if (!kvm_pv_async_pf_enabled(vcpu)) {
-@@ -3689,6 +5236,11 @@ static int kvm_pv_enable_async_pf(struct kvm_vcpu *vcpu, u64 data)
+@@ -3689,6 +5265,11 @@ static int kvm_pv_enable_async_pf(struct kvm_vcpu *vcpu, u64 data)
  		return 1;
  
  	vcpu->arch.apf.send_always = (data & KVM_ASYNC_PF_SEND_ALWAYS);
@@ -6965,7 +7127,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	vcpu->arch.apf.delivery_as_pf_vmexit = data & KVM_ASYNC_PF_DELIVERY_AS_PF_VMEXIT;
  
  	kvm_async_pf_wakeup_all(vcpu);
-@@ -3696,6 +5248,10 @@ static int kvm_pv_enable_async_pf(struct kvm_vcpu *vcpu, u64 data)
+@@ -3696,6 +5277,10 @@ static int kvm_pv_enable_async_pf(struct kvm_vcpu *vcpu, u64 data)
  	return 0;
  }
  
@@ -6976,7 +7138,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static int kvm_pv_enable_async_pf_int(struct kvm_vcpu *vcpu, u64 data)
  {
  	/* Bits 8-63 are reserved */
-@@ -3705,6 +5261,12 @@ static int kvm_pv_enable_async_pf_int(struct kvm_vcpu *vcpu, u64 data)
+@@ -3705,6 +5290,12 @@ static int kvm_pv_enable_async_pf_int(struct kvm_vcpu *vcpu, u64 data)
  	if (!lapic_in_kernel(vcpu))
  		return 1;
  
@@ -6989,7 +7151,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	vcpu->arch.apf.msr_int_val = data;
  
  	vcpu->arch.apf.vec = data & KVM_ASYNC_PF_VEC_MASK;
-@@ -4072,6 +5634,13 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+@@ -4072,6 +5663,13 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
  		if (guest_cpu_cap_has(vcpu, X86_FEATURE_TSC_ADJUST)) {
  			if (!msr_info->host_initiated) {
  				s64 adj = data - vcpu->arch.ia32_tsc_adjust_msr;
@@ -7003,7 +7165,7 @@ index c9c2aa6f4..48b66e5f1 100644
  				adjust_tsc_offset_guest(vcpu, adj);
  				/* Before back to guest, tsc_timestamp must be adjusted
  				 * as well, otherwise guest's percpu pvclock time could jump.
-@@ -4115,9 +5684,21 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+@@ -4115,9 +5713,21 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
  		break;
  	case MSR_IA32_TSC:
  		if (msr_info->host_initiated) {
@@ -7025,7 +7187,7 @@ index c9c2aa6f4..48b66e5f1 100644
  			adjust_tsc_offset_guest(vcpu, adj);
  			vcpu->arch.ia32_tsc_adjust_msr += adj;
  		}
-@@ -4183,6 +5764,12 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+@@ -4183,6 +5793,12 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
  			return 1;
  		if (data & 0x1) {
  			vcpu->arch.apf.pageready_pending = false;
@@ -7038,7 +7200,7 @@ index c9c2aa6f4..48b66e5f1 100644
  			kvm_check_async_pf_completion(vcpu);
  		}
  		break;
-@@ -4541,12 +6128,25 @@ int kvm_get_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+@@ -4541,12 +6157,25 @@ int kvm_get_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
  		if (!guest_pv_has(vcpu, KVM_FEATURE_ASYNC_PF))
  			return 1;
  
@@ -7064,7 +7226,7 @@ index c9c2aa6f4..48b66e5f1 100644
  		msr_info->data = vcpu->arch.apf.msr_int_val;
  		break;
  	case MSR_KVM_ASYNC_PF_ACK:
-@@ -5184,6 +6784,11 @@ static bool need_emulate_wbinvd(struct kvm_vcpu *vcpu)
+@@ -5184,6 +6813,11 @@ static bool need_emulate_wbinvd(struct kvm_vcpu *vcpu)
  
  static DEFINE_PER_CPU(struct kvm_vcpu *, last_vcpu);
  
@@ -7076,7 +7238,7 @@ index c9c2aa6f4..48b66e5f1 100644
  void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
  {
  	struct kvm_pmu *pmu = vcpu_to_pmu(vcpu);
-@@ -5203,6 +6808,11 @@ void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+@@ -5203,6 +6837,11 @@ void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
  			wbinvd_on_cpu(vcpu->cpu);
  	}
  
@@ -7088,7 +7250,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	kvm_x86_call(vcpu_load)(vcpu, cpu);
  
  	if (vcpu != per_cpu(last_vcpu, cpu)) {
-@@ -5221,23 +6831,65 @@ void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+@@ -5221,23 +6860,65 @@ void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
  	/* Save host pkru register if supported */
  	vcpu->arch.host_pkru = read_pkru();
  
@@ -7154,7 +7316,7 @@ index c9c2aa6f4..48b66e5f1 100644
  			if (!vcpu->arch.guest_tsc_protected)
  				vcpu->arch.tsc_catchup = 1;
  		}
-@@ -5245,6 +6897,13 @@ void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+@@ -5245,6 +6926,13 @@ void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
  		if (kvm_lapic_hv_timer_in_use(vcpu))
  			kvm_lapic_restart_hv_timer(vcpu);
  
@@ -7168,7 +7330,7 @@ index c9c2aa6f4..48b66e5f1 100644
  		/*
  		 * On a host with synchronized TSC, there is no need to update
  		 * kvmclock on vcpu->cpu migration
-@@ -5332,6 +6991,18 @@ void kvm_arch_vcpu_put(struct kvm_vcpu *vcpu)
+@@ -5332,6 +7020,18 @@ void kvm_arch_vcpu_put(struct kvm_vcpu *vcpu)
  	}
  
  	kvm_x86_call(vcpu_put)(vcpu);
@@ -7187,7 +7349,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	vcpu->arch.last_host_tsc = rdtsc();
  }
  
-@@ -5346,6 +7017,10 @@ static int kvm_vcpu_ioctl_get_lapic(struct kvm_vcpu *vcpu,
+@@ -5346,6 +7046,10 @@ static int kvm_vcpu_ioctl_get_lapic(struct kvm_vcpu *vcpu,
  	return kvm_apic_get_state(vcpu, s);
  }
  
@@ -7198,7 +7360,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static int kvm_vcpu_ioctl_set_lapic(struct kvm_vcpu *vcpu,
  				    struct kvm_lapic_state *s)
  {
-@@ -5907,11 +7582,36 @@ static int kvm_vcpu_ioctl_x86_set_xcrs(struct kvm_vcpu *vcpu,
+@@ -5907,11 +7611,36 @@ static int kvm_vcpu_ioctl_x86_set_xcrs(struct kvm_vcpu *vcpu,
   * EINVAL is returned when the host attempts to set the flag for a guest that
   * does not support pv clocks.
   */
@@ -7235,7 +7397,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
  	return 0;
  }
-@@ -5952,6 +7652,15 @@ static int kvm_arch_tsc_get_attr(struct kvm_vcpu *vcpu,
+@@ -5952,6 +7681,15 @@ static int kvm_arch_tsc_get_attr(struct kvm_vcpu *vcpu,
  	return r;
  }
  
@@ -7251,7 +7413,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static int kvm_arch_tsc_set_attr(struct kvm_vcpu *vcpu,
  				 struct kvm_device_attr *attr)
  {
-@@ -5969,8 +7678,41 @@ static int kvm_arch_tsc_set_attr(struct kvm_vcpu *vcpu,
+@@ -5969,8 +7707,41 @@ static int kvm_arch_tsc_set_attr(struct kvm_vcpu *vcpu,
  		if (get_user(offset, uaddr))
  			break;
  
@@ -7293,7 +7455,7 @@ index c9c2aa6f4..48b66e5f1 100644
  		matched = (vcpu->arch.virtual_tsc_khz &&
  			   kvm->arch.last_tsc_khz == vcpu->arch.virtual_tsc_khz &&
  			   kvm->arch.last_tsc_offset == offset);
-@@ -5978,6 +7720,11 @@ static int kvm_arch_tsc_set_attr(struct kvm_vcpu *vcpu,
+@@ -5978,6 +7749,11 @@ static int kvm_arch_tsc_set_attr(struct kvm_vcpu *vcpu,
  		tsc = kvm_scale_tsc(rdtsc(), vcpu->arch.l1_tsc_scaling_ratio) + offset;
  		ns = get_kvmclock_base_ns();
  
@@ -7305,7 +7467,38 @@ index c9c2aa6f4..48b66e5f1 100644
  		__kvm_synchronize_tsc(vcpu, offset, tsc, ns, matched, true);
  		raw_spin_unlock_irqrestore(&kvm->arch.tsc_write_lock, flags);
  
-@@ -6516,12 +8263,21 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
+@@ -6504,11 +8280,30 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
+ 
+ 		r = -EINVAL;
+ 
++		/*
++		 * 在以下使用kvm_vcpu_arch->guest_tsc_protected:
++		 *   - arch/x86/kvm/svm/sev.c|4671| <<sev_vcpu_create>> vcpu->arch.guest_tsc_protected = snp_is_secure_tsc_enabled(vcpu->kvm);
++		 *   - arch/x86/kvm/vmx/tdx.c|689| <<tdx_vcpu_create>> vcpu->arch.guest_tsc_protected = true;
++		 *   - arch/x86/kvm/x86.c|3106| <<kvm_vcpu_write_tsc_offset>> if (vcpu->arch.guest_tsc_protected)
++		 *   - arch/x86/kvm/x86.c|3186| <<__kvm_synchronize_tsc>> if (vcpu->arch.guest_tsc_protected)
++		 *   - arch/x86/kvm/x86.c|5488| <<kvm_set_msr_common(MSR_IA32_TSC)>> } else if (!vcpu->arch.guest_tsc_protected) {
++		 *   - arch/x86/kvm/x86.c|6688| <<kvm_arch_vcpu_load>> if (!vcpu->arch.guest_tsc_protected)
++		 *   - arch/x86/kvm/x86.c|8009| <<kvm_arch_vcpu_ioctl(KVM_SET_TSC_KHZ)>> if (vcpu->arch.guest_tsc_protected)
++		 */
+ 		if (vcpu->arch.guest_tsc_protected)
+ 			goto out;
+ 
+ 		user_tsc_khz = (u32)arg;
+ 
++		/*
++		 * 在以下使用kvm_caps.max_guest_tsc_khz:
++		 *   - arch/x86/kvm/x86.c|8268| <<kvm_arch_vcpu_ioctl>> if (kvm_caps.has_tsc_control &&
++		 *                                             user_tsc_khz >= kvm_caps.max_guest_tsc_khz)
++		 *   - arch/x86/kvm/x86.c|9390| <<kvm_arch_vm_ioctl>> if (kvm_caps.has_tsc_control &&
++		 *                                             user_tsc_khz >= kvm_caps.max_guest_tsc_khz)
++		 *   - arch/x86/kvm/x86.c|11649| <<kvm_hyperv_tsc_notifier>> kvm_caps.max_guest_tsc_khz = tsc_khz;
++		 *   - arch/x86/kvm/x86.c|12117| <<kvm_x86_vendor_init>> kvm_caps.max_guest_tsc_khz = max;
++		 */
+ 		if (kvm_caps.has_tsc_control &&
+ 		    user_tsc_khz >= kvm_caps.max_guest_tsc_khz)
+ 			goto out;
+@@ -6516,12 +8311,22 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
  		if (user_tsc_khz == 0)
  			user_tsc_khz = tsc_khz;
  
@@ -7322,12 +7515,13 @@ index c9c2aa6f4..48b66e5f1 100644
  	case KVM_GET_TSC_KHZ: {
 +		/*
 +		 * 很多使用
-+		 * 只在这里设置
++		 * 只在这里设置:
++		 *   - arch/x86/kvm/x86.c|2593| <<kvm_set_tsc_khz>> vcpu->arch.virtual_tsc_khz = user_tsc_khz;
 +		 */
  		r = vcpu->arch.virtual_tsc_khz;
  		goto out;
  	}
-@@ -6763,6 +8519,14 @@ int kvm_vm_ioctl_enable_cap(struct kvm *kvm,
+@@ -6763,6 +8568,14 @@ int kvm_vm_ioctl_enable_cap(struct kvm *kvm,
  			goto split_irqchip_unlock;
  		if (kvm->created_vcpus)
  			goto split_irqchip_unlock;
@@ -7342,7 +7536,7 @@ index c9c2aa6f4..48b66e5f1 100644
  		/* Pairs with irqchip_in_kernel. */
  		smp_wmb();
  		kvm->arch.irqchip_mode = KVM_IRQCHIP_SPLIT;
-@@ -7182,10 +8946,22 @@ int kvm_arch_pm_notifier(struct kvm *kvm, unsigned long state)
+@@ -7182,10 +8995,22 @@ int kvm_arch_pm_notifier(struct kvm *kvm, unsigned long state)
  }
  #endif /* CONFIG_HAVE_KVM_PM_NOTIFIER */
  
@@ -7365,7 +7559,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	get_kvmclock(kvm, &data);
  	if (copy_to_user(argp, &data, sizeof(data)))
  		return -EFAULT;
-@@ -7193,6 +8969,10 @@ static int kvm_vm_ioctl_get_clock(struct kvm *kvm, void __user *argp)
+@@ -7193,6 +9018,10 @@ static int kvm_vm_ioctl_get_clock(struct kvm *kvm, void __user *argp)
  	return 0;
  }
  
@@ -7376,7 +7570,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static int kvm_vm_ioctl_set_clock(struct kvm *kvm, void __user *argp)
  {
  	struct kvm_arch *ka = &kvm->arch;
-@@ -7209,8 +8989,25 @@ static int kvm_vm_ioctl_set_clock(struct kvm *kvm, void __user *argp)
+@@ -7209,8 +9038,25 @@ static int kvm_vm_ioctl_set_clock(struct kvm *kvm, void __user *argp)
  	if (data.flags & ~KVM_CLOCK_VALID_FLAGS)
  		return -EINVAL;
  
@@ -7402,7 +7596,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	pvclock_update_vm_gtod_copy(kvm);
  
  	/*
-@@ -7230,11 +9027,52 @@ static int kvm_vm_ioctl_set_clock(struct kvm *kvm, void __user *argp)
+@@ -7230,11 +9076,52 @@ static int kvm_vm_ioctl_set_clock(struct kvm *kvm, void __user *argp)
  			data.clock += now_real_ns - data.realtime;
  	}
  
@@ -7455,7 +7649,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	kvm_end_pvclock_update(kvm);
  	return 0;
  }
-@@ -7317,6 +9155,19 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
+@@ -7317,6 +9204,19 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
  			kvm_pic_destroy(kvm);
  			goto create_irqchip_unlock;
  		}
@@ -7475,7 +7669,7 @@ index c9c2aa6f4..48b66e5f1 100644
  		/* Write kvm->irq_routing before enabling irqchip_in_kernel. */
  		smp_wmb();
  		kvm->arch.irqchip_mode = KVM_IRQCHIP_KERNEL;
-@@ -7509,9 +9360,15 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
+@@ -7509,9 +9409,15 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
  	}
  #endif
  	case KVM_SET_CLOCK:
@@ -7491,7 +7685,23 @@ index c9c2aa6f4..48b66e5f1 100644
  		r = kvm_vm_ioctl_get_clock(kvm, argp);
  		break;
  	case KVM_SET_TSC_KHZ: {
-@@ -7529,6 +9386,16 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
+@@ -7520,6 +9426,15 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
+ 		r = -EINVAL;
+ 		user_tsc_khz = (u32)arg;
+ 
++		/*
++		 * 在以下使用kvm_caps.max_guest_tsc_khz:
++		 *   - arch/x86/kvm/x86.c|8268| <<kvm_arch_vcpu_ioctl>> if (kvm_caps.has_tsc_control &&
++		 *                                             user_tsc_khz >= kvm_caps.max_guest_tsc_khz)
++		 *   - arch/x86/kvm/x86.c|9390| <<kvm_arch_vm_ioctl>> if (kvm_caps.has_tsc_control &&
++		 *                                             user_tsc_khz >= kvm_caps.max_guest_tsc_khz)
++		 *   - arch/x86/kvm/x86.c|11649| <<kvm_hyperv_tsc_notifier>> kvm_caps.max_guest_tsc_khz = tsc_khz;
++		 *   - arch/x86/kvm/x86.c|12117| <<kvm_x86_vendor_init>> kvm_caps.max_guest_tsc_khz = max;
++		 */
+ 		if (kvm_caps.has_tsc_control &&
+ 		    user_tsc_khz >= kvm_caps.max_guest_tsc_khz)
+ 			goto out;
+@@ -7529,6 +9444,16 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
  
  		mutex_lock(&kvm->lock);
  		if (!kvm->created_vcpus) {
@@ -7508,7 +7718,7 @@ index c9c2aa6f4..48b66e5f1 100644
  			WRITE_ONCE(kvm->arch.default_tsc_khz, user_tsc_khz);
  			r = 0;
  		}
-@@ -7536,6 +9403,16 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
+@@ -7536,6 +9461,16 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
  		goto out;
  	}
  	case KVM_GET_TSC_KHZ: {
@@ -7525,7 +7735,7 @@ index c9c2aa6f4..48b66e5f1 100644
  		r = READ_ONCE(kvm->arch.default_tsc_khz);
  		goto out;
  	}
-@@ -7615,6 +9492,11 @@ static void kvm_probe_feature_msr(u32 msr_index)
+@@ -7615,6 +9550,11 @@ static void kvm_probe_feature_msr(u32 msr_index)
  	msr_based_features[num_msr_based_features++] = msr_index;
  }
  
@@ -7537,7 +7747,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static void kvm_probe_msr_to_save(u32 msr_index)
  {
  	u32 dummy[2];
-@@ -7722,6 +9604,10 @@ static void kvm_probe_msr_to_save(u32 msr_index)
+@@ -7722,6 +9662,10 @@ static void kvm_probe_msr_to_save(u32 msr_index)
  	msrs_to_save[num_msrs_to_save++] = msr_index;
  }
  
@@ -7548,7 +7758,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static void kvm_init_msr_lists(void)
  {
  	unsigned i;
-@@ -7733,10 +9619,26 @@ static void kvm_init_msr_lists(void)
+@@ -7733,10 +9677,26 @@ static void kvm_init_msr_lists(void)
  	num_emulated_msrs = 0;
  	num_msr_based_features = 0;
  
@@ -7575,7 +7785,7 @@ index c9c2aa6f4..48b66e5f1 100644
  		for (i = 0; i < ARRAY_SIZE(msrs_to_save_pmu); i++)
  			kvm_probe_msr_to_save(msrs_to_save_pmu[i]);
  	}
-@@ -9719,6 +11621,11 @@ static void kvm_hyperv_tsc_notifier(void)
+@@ -9719,6 +11679,11 @@ static void kvm_hyperv_tsc_notifier(void)
  	int cpu;
  
  	mutex_lock(&kvm_lock);
@@ -7587,7 +7797,19 @@ index c9c2aa6f4..48b66e5f1 100644
  	list_for_each_entry(kvm, &vm_list, vm_list)
  		kvm_make_mclock_inprogress_request(kvm);
  
-@@ -9733,8 +11640,26 @@ static void kvm_hyperv_tsc_notifier(void)
+@@ -9730,11 +11695,38 @@ static void kvm_hyperv_tsc_notifier(void)
+ 		for_each_present_cpu(cpu)
+ 			per_cpu(cpu_tsc_khz, cpu) = tsc_khz;
+ 	}
++	/*
++	 * 在以下使用kvm_caps.max_guest_tsc_khz:
++	 *   - arch/x86/kvm/x86.c|8268| <<kvm_arch_vcpu_ioctl>> if (kvm_caps.has_tsc_control &&
++	 *                                             user_tsc_khz >= kvm_caps.max_guest_tsc_khz)
++	 *   - arch/x86/kvm/x86.c|9390| <<kvm_arch_vm_ioctl>> if (kvm_caps.has_tsc_control &&
++	 *                                             user_tsc_khz >= kvm_caps.max_guest_tsc_khz)
++	 *   - arch/x86/kvm/x86.c|11649| <<kvm_hyperv_tsc_notifier>> kvm_caps.max_guest_tsc_khz = tsc_khz;
++	 *   - arch/x86/kvm/x86.c|12117| <<kvm_x86_vendor_init>> kvm_caps.max_guest_tsc_khz = max;
++	 */
  	kvm_caps.max_guest_tsc_khz = tsc_khz;
  
  	list_for_each_entry(kvm, &vm_list, vm_list) {
@@ -7614,7 +7836,20 @@ index c9c2aa6f4..48b66e5f1 100644
  		kvm_end_pvclock_update(kvm);
  	}
  
-@@ -9873,20 +11798,51 @@ static void kvm_timer_init(void)
+@@ -9849,6 +11841,12 @@ static int kvmclock_cpu_online(unsigned int cpu)
+ static void kvm_timer_init(void)
+ {
+ 	if (!boot_cpu_has(X86_FEATURE_CONSTANT_TSC)) {
++		/*
++		 * 在以下使用max_tsc_khz:
++		 *   - arch/x86/kvm/x86.c|11786| <<kvm_timer_init>> max_tsc_khz = tsc_khz;
++		 *   - arch/x86/kvm/x86.c|11796| <<kvm_timer_init>> max_tsc_khz = policy->cpuinfo.max_freq;
++		 *   - arch/x86/kvm/x86.c|15440| <<kvm_arch_init_vm>> kvm->arch.default_tsc_khz = max_tsc_khz ? : tsc_khz;
++		 */
+ 		max_tsc_khz = tsc_khz;
+ 
+ 		if (IS_ENABLED(CONFIG_CPU_FREQ)) {
+@@ -9873,20 +11871,51 @@ static void kvm_timer_init(void)
  }
  
  #ifdef CONFIG_X86_64
@@ -7666,7 +7901,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static DECLARE_WORK(pvclock_gtod_work, pvclock_gtod_update_fn);
  
  /*
-@@ -9894,6 +11850,12 @@ static DECLARE_WORK(pvclock_gtod_work, pvclock_gtod_update_fn);
+@@ -9894,6 +11923,12 @@ static DECLARE_WORK(pvclock_gtod_work, pvclock_gtod_update_fn);
   * region to prevent possible deadlocks against time accessors which
   * are invoked with work related locks held.
   */
@@ -7679,7 +7914,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static void pvclock_irq_work_fn(struct irq_work *w)
  {
  	queue_work(system_long_wq, &pvclock_gtod_work);
-@@ -9912,17 +11874,32 @@ static int pvclock_gtod_notify(struct notifier_block *nb, unsigned long unused,
+@@ -9912,17 +11947,32 @@ static int pvclock_gtod_notify(struct notifier_block *nb, unsigned long unused,
  
  	update_pvclock_gtod(tk);
  
@@ -7712,8 +7947,33 @@ index c9c2aa6f4..48b66e5f1 100644
  static struct notifier_block pvclock_gtod_notifier = {
  	.notifier_call = pvclock_gtod_notify,
  };
-@@ -10130,6 +12107,21 @@ int kvm_x86_vendor_init(struct kvm_x86_init_ops *ops)
+@@ -10120,6 +12170,13 @@ int kvm_x86_vendor_init(struct kvm_x86_init_ops *ops)
+ 	}
+ 
+ 	if (kvm_caps.has_tsc_control) {
++		/*
++		 * 在以下使用kvm_caps.max_tsc_scaling_ratio:
++		 *   - arch/x86/kvm/svm/svm.c|5455| <<svm_hardware_setup>> kvm_caps.max_tsc_scaling_ratio = SVM_TSC_RATIO_MAX;
++		 *   - arch/x86/kvm/vmx/vmx.c|8690| <<vmx_hardware_setup>> kvm_caps.max_tsc_scaling_ratio = KVM_VMX_TSC_MULTIPLIER_MAX;
++		 *   - arch/x86/kvm/x86.c|2748| <<set_tsc_khz>> if (ratio == 0 || ratio >= kvm_caps.max_tsc_scaling_ratio) {
++		 *   - arch/x86/kvm/x86.c|12116| <<kvm_x86_vendor_init>> __scale_tsc(kvm_caps.max_tsc_scaling_ratio, tsc_khz));
++		 */
+ 		/*
+ 		 * Make sure the user can only configure tsc_khz values that
+ 		 * fit into a signed integer.
+@@ -10128,8 +12185,32 @@ int kvm_x86_vendor_init(struct kvm_x86_init_ops *ops)
+ 		 */
+ 		u64 max = min(0x7fffffffULL,
  			      __scale_tsc(kvm_caps.max_tsc_scaling_ratio, tsc_khz));
++		/*
++		 * 在以下使用kvm_caps.max_guest_tsc_khz:
++		 *   - arch/x86/kvm/x86.c|8268| <<kvm_arch_vcpu_ioctl>> if (kvm_caps.has_tsc_control &&
++		 *                                             user_tsc_khz >= kvm_caps.max_guest_tsc_khz)
++		 *   - arch/x86/kvm/x86.c|9390| <<kvm_arch_vm_ioctl>> if (kvm_caps.has_tsc_control &&
++		 *                                             user_tsc_khz >= kvm_caps.max_guest_tsc_khz)
++		 *   - arch/x86/kvm/x86.c|11649| <<kvm_hyperv_tsc_notifier>> kvm_caps.max_guest_tsc_khz = tsc_khz;
++		 *   - arch/x86/kvm/x86.c|12117| <<kvm_x86_vendor_init>> kvm_caps.max_guest_tsc_khz = max;
++		 */
  		kvm_caps.max_guest_tsc_khz = max;
  	}
 +	/*
@@ -7734,7 +7994,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	kvm_caps.default_tsc_scaling_ratio = 1ULL << kvm_caps.tsc_scaling_ratio_frac_bits;
  	kvm_init_msr_lists();
  	return 0;
-@@ -10197,9 +12189,21 @@ static int kvm_pv_clock_pairing(struct kvm_vcpu *vcpu, gpa_t paddr,
+@@ -10197,9 +12278,21 @@ static int kvm_pv_clock_pairing(struct kvm_vcpu *vcpu, gpa_t paddr,
  	 * When tsc is in permanent catchup mode guests won't be able to use
  	 * pvclock_read_retry loop to get consistent view of pvclock
  	 */
@@ -7756,7 +8016,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	if (!kvm_get_walltime_and_clockread(&ts, &cycle))
  		return -KVM_EOPNOTSUPP;
  
-@@ -10842,6 +12846,13 @@ int kvm_get_nr_pending_nmis(struct kvm_vcpu *vcpu)
+@@ -10842,6 +12935,13 @@ int kvm_get_nr_pending_nmis(struct kvm_vcpu *vcpu)
  void kvm_make_scan_ioapic_request_mask(struct kvm *kvm,
  				       unsigned long *vcpu_bitmap)
  {
@@ -7770,7 +8030,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	kvm_make_vcpus_request_mask(kvm, KVM_REQ_SCAN_IOAPIC, vcpu_bitmap);
  }
  
-@@ -11057,11 +13068,54 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+@@ -11057,11 +13157,54 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
  			kvm_mmu_free_obsolete_roots(vcpu);
  		if (kvm_check_request(KVM_REQ_MIGRATE_TIMER, vcpu))
  			__kvm_migrate_timers(vcpu);
@@ -7825,7 +8085,7 @@ index c9c2aa6f4..48b66e5f1 100644
  			r = kvm_guest_time_update(vcpu);
  			if (unlikely(r))
  				goto out;
-@@ -11109,6 +13163,24 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+@@ -11109,6 +13252,24 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
  				goto out;
  			}
  		}
@@ -7850,7 +8110,7 @@ index c9c2aa6f4..48b66e5f1 100644
  		if (kvm_check_request(KVM_REQ_APF_HALT, vcpu)) {
  			/* Page is swapped out. Do synthetic halt */
  			vcpu->arch.apf.halted = true;
-@@ -11178,6 +13250,20 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+@@ -11178,6 +13339,20 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
  #endif
  		if (kvm_check_request(KVM_REQ_APICV_UPDATE, vcpu))
  			kvm_vcpu_update_apicv(vcpu);
@@ -7871,7 +8131,7 @@ index c9c2aa6f4..48b66e5f1 100644
  		if (kvm_check_request(KVM_REQ_APF_READY, vcpu))
  			kvm_check_async_pf_completion(vcpu);
  
-@@ -11372,6 +13458,14 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+@@ -11372,6 +13547,14 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
  		hw_breakpoint_restore();
  
  	vcpu->arch.last_vmentry_cpu = vcpu->cpu;
@@ -7886,7 +8146,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	vcpu->arch.last_guest_tsc = kvm_read_l1_tsc(vcpu, rdtsc());
  
  	vcpu->mode = OUTSIDE_GUEST_MODE;
-@@ -11441,6 +13535,12 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+@@ -11441,6 +13624,12 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
  		profile_hit(KVM_PROFILING, (void *)rip);
  	}
  
@@ -7899,7 +8159,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	if (unlikely(vcpu->arch.tsc_always_catchup))
  		kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
  
-@@ -11465,6 +13565,15 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+@@ -11465,6 +13654,15 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
  
  static bool kvm_vcpu_running(struct kvm_vcpu *vcpu)
  {
@@ -7915,7 +8175,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	return (vcpu->arch.mp_state == KVM_MP_STATE_RUNNABLE &&
  		!vcpu->arch.apf.halted);
  }
-@@ -11581,6 +13690,15 @@ static inline int vcpu_block(struct kvm_vcpu *vcpu)
+@@ -11581,6 +13779,15 @@ static inline int vcpu_block(struct kvm_vcpu *vcpu)
  		kvm_set_mp_state(vcpu, KVM_MP_STATE_RUNNABLE);
  		fallthrough;
  	case KVM_MP_STATE_RUNNABLE:
@@ -7931,7 +8191,7 @@ index c9c2aa6f4..48b66e5f1 100644
  		vcpu->arch.apf.halted = false;
  		break;
  	case KVM_MP_STATE_INIT_RECEIVED:
-@@ -11925,6 +14043,12 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
+@@ -11925,6 +14132,12 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
  	if (vcpu->arch.exception_from_userspace && is_guest_mode(vcpu) &&
  	    kvm_x86_ops.nested_ops->is_exception_vmexit(vcpu, ex->vector,
  							ex->error_code)) {
@@ -7944,7 +8204,18 @@ index c9c2aa6f4..48b66e5f1 100644
  		kvm_queue_exception_vmexit(vcpu, ex->vector,
  					   ex->has_error_code, ex->error_code,
  					   ex->has_payload, ex->payload);
-@@ -12709,6 +14833,20 @@ int kvm_arch_vcpu_create(struct kvm_vcpu *vcpu)
+@@ -12635,6 +14848,10 @@ int kvm_arch_vcpu_precreate(struct kvm *kvm, unsigned int id)
+ 	return kvm_x86_call(vcpu_precreate)(kvm);
+ }
+ 
++/*
++ * 在以下使用kvm_arch_vcpu_create():
++ *   - virt/kvm/kvm_main.c|4372| <<kvm_vm_ioctl_create_vcpu>> r = kvm_arch_vcpu_create(vcpu);
++ */
+ int kvm_arch_vcpu_create(struct kvm_vcpu *vcpu)
+ {
+ 	struct page *page;
+@@ -12709,6 +14926,20 @@ int kvm_arch_vcpu_create(struct kvm_vcpu *vcpu)
  	kvm_xen_init_vcpu(vcpu);
  	vcpu_load(vcpu);
  	kvm_vcpu_after_set_cpuid(vcpu);
@@ -7965,7 +8236,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	kvm_set_tsc_khz(vcpu, vcpu->kvm->arch.default_tsc_khz);
  	kvm_vcpu_reset(vcpu, false);
  	kvm_init_mmu(vcpu);
-@@ -12739,6 +14877,11 @@ void kvm_arch_vcpu_postcreate(struct kvm_vcpu *vcpu)
+@@ -12739,6 +14970,11 @@ void kvm_arch_vcpu_postcreate(struct kvm_vcpu *vcpu)
  	if (mutex_lock_killable(&vcpu->mutex))
  		return;
  	vcpu_load(vcpu);
@@ -7977,7 +8248,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	kvm_synchronize_tsc(vcpu, NULL);
  	vcpu_put(vcpu);
  
-@@ -12747,6 +14890,13 @@ void kvm_arch_vcpu_postcreate(struct kvm_vcpu *vcpu)
+@@ -12747,6 +14983,13 @@ void kvm_arch_vcpu_postcreate(struct kvm_vcpu *vcpu)
  
  	mutex_unlock(&vcpu->mutex);
  
@@ -7991,7 +8262,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	if (kvmclock_periodic_sync && vcpu->vcpu_idx == 0)
  		schedule_delayed_work(&kvm->arch.kvmclock_sync_work,
  						KVMCLOCK_SYNC_PERIOD);
-@@ -12877,7 +15027,20 @@ void kvm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
+@@ -12877,7 +15120,20 @@ void kvm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
  	vcpu->arch.cr2 = 0;
  
  	kvm_make_request(KVM_REQ_EVENT, vcpu);
@@ -8012,7 +8283,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	vcpu->arch.apf.msr_int_val = 0;
  	vcpu->arch.st.msr_val = 0;
  
-@@ -12885,6 +15048,15 @@ void kvm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
+@@ -12885,6 +15141,15 @@ void kvm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
  
  	kvm_clear_async_pf_completion_queue(vcpu);
  	kvm_async_pf_hash_reset(vcpu);
@@ -8028,7 +8299,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	vcpu->arch.apf.halted = false;
  
  	kvm_xstate_reset(vcpu, init_event);
-@@ -13015,6 +15187,18 @@ int kvm_arch_enable_virtualization_cpu(void)
+@@ -13015,6 +15280,18 @@ int kvm_arch_enable_virtualization_cpu(void)
  		kvm_for_each_vcpu(i, vcpu, kvm) {
  			if (!stable && vcpu->cpu == smp_processor_id())
  				kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
@@ -8047,7 +8318,7 @@ index c9c2aa6f4..48b66e5f1 100644
  			if (stable && vcpu->arch.last_host_tsc > local_tsc) {
  				backwards_tsc = true;
  				if (vcpu->arch.last_host_tsc > max_tsc)
-@@ -13066,8 +15250,27 @@ int kvm_arch_enable_virtualization_cpu(void)
+@@ -13066,8 +15343,27 @@ int kvm_arch_enable_virtualization_cpu(void)
  		list_for_each_entry(kvm, &vm_list, vm_list) {
  			kvm->arch.backwards_tsc_observed = true;
  			kvm_for_each_vcpu(i, vcpu, kvm) {
@@ -8075,7 +8346,7 @@ index c9c2aa6f4..48b66e5f1 100644
  				kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
  			}
  
-@@ -13077,7 +15280,20 @@ int kvm_arch_enable_virtualization_cpu(void)
+@@ -13077,7 +15373,20 @@ int kvm_arch_enable_virtualization_cpu(void)
  			 * you may have some problem.  Solving this issue is
  			 * left as an exercise to the reader.
  			 */
@@ -8096,7 +8367,7 @@ index c9c2aa6f4..48b66e5f1 100644
  			kvm->arch.last_tsc_write = 0;
  		}
  
-@@ -13111,6 +15327,10 @@ void kvm_arch_free_vm(struct kvm *kvm)
+@@ -13111,6 +15420,10 @@ void kvm_arch_free_vm(struct kvm *kvm)
  }
  
  
@@ -8107,7 +8378,7 @@ index c9c2aa6f4..48b66e5f1 100644
  int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
  {
  	int ret;
-@@ -13141,15 +15361,69 @@ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
+@@ -13141,15 +15454,74 @@ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
  
  	atomic_set(&kvm->arch.noncoherent_dma_count, 0);
  
@@ -8173,11 +8444,16 @@ index c9c2aa6f4..48b66e5f1 100644
 +	 *   - arch/x86/kvm/x86.c|9111| <<kvm_arch_vm_ioctl(KVM_GET_TSC_KHZ)>> r = READ_ONCE(kvm->arch.default_tsc_khz);
 +	 *   - arch/x86/kvm/x86.c|14512| <<kvm_arch_vcpu_create>> kvm_set_tsc_khz(vcpu, vcpu->kvm->arch.default_tsc_khz);
 +	 *   - arch/x86/kvm/x86.c|15048| <<kvm_arch_init_vm>> kvm->arch.default_tsc_khz = max_tsc_khz ? : tsc_khz;
++	 *
++	 * 在以下使用max_tsc_khz:
++	 *   - arch/x86/kvm/x86.c|11786| <<kvm_timer_init>> max_tsc_khz = tsc_khz;
++	 *   - arch/x86/kvm/x86.c|11796| <<kvm_timer_init>> max_tsc_khz = policy->cpuinfo.max_freq;
++	 *   - arch/x86/kvm/x86.c|15440| <<kvm_arch_init_vm>> kvm->arch.default_tsc_khz = max_tsc_khz ? : tsc_khz;
 +	 */
  	kvm->arch.default_tsc_khz = max_tsc_khz ? : tsc_khz;
  	kvm->arch.apic_bus_cycle_ns = APIC_BUS_CYCLE_NS_DEFAULT;
  	kvm->arch.guest_can_read_msr_platform_info = true;
-@@ -13160,7 +15434,21 @@ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
+@@ -13160,7 +15532,21 @@ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
  	kvm->arch.hv_root_tdp = INVALID_PAGE;
  #endif
  
@@ -8199,7 +8475,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	INIT_DELAYED_WORK(&kvm->arch.kvmclock_sync_work, kvmclock_sync_fn);
  
  	kvm_apicv_init(kvm);
-@@ -13269,7 +15557,21 @@ void kvm_arch_pre_destroy_vm(struct kvm *kvm)
+@@ -13269,7 +15655,21 @@ void kvm_arch_pre_destroy_vm(struct kvm *kvm)
  	 * is unsafe, i.e. will lead to use-after-free.  The PIT also needs to
  	 * be stopped before IRQ routing is freed.
  	 */
@@ -8221,7 +8497,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	cancel_delayed_work_sync(&kvm->arch.kvmclock_update_work);
  
  #ifdef CONFIG_KVM_IOAPIC
-@@ -13280,6 +15582,11 @@ void kvm_arch_pre_destroy_vm(struct kvm *kvm)
+@@ -13280,6 +15680,11 @@ void kvm_arch_pre_destroy_vm(struct kvm *kvm)
  	static_call_cond(kvm_x86_vm_pre_destroy)(kvm);
  }
  
@@ -8233,7 +8509,7 @@ index c9c2aa6f4..48b66e5f1 100644
  void kvm_arch_destroy_vm(struct kvm *kvm)
  {
  	if (current->mm == kvm->mm) {
-@@ -13296,6 +15603,16 @@ void kvm_arch_destroy_vm(struct kvm *kvm)
+@@ -13296,6 +15701,16 @@ void kvm_arch_destroy_vm(struct kvm *kvm)
  		__x86_set_memory_region(kvm, TSS_PRIVATE_MEMSLOT, 0, 0);
  		mutex_unlock(&kvm->slots_lock);
  	}
@@ -8250,7 +8526,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	kvm_destroy_vcpus(kvm);
  	kvm_free_msr_filter(srcu_dereference_check(kvm->arch.msr_filter, &kvm->srcu, 1));
  #ifdef CONFIG_KVM_IOAPIC
-@@ -13480,6 +15797,18 @@ static void kvm_mmu_update_cpu_dirty_logging(struct kvm *kvm, bool enable)
+@@ -13480,6 +15895,18 @@ static void kvm_mmu_update_cpu_dirty_logging(struct kvm *kvm, bool enable)
  	if (!kvm->arch.cpu_dirty_log_size)
  		return;
  
@@ -8269,7 +8545,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	nr_slots = atomic_read(&kvm->nr_memslots_dirty_logging);
  	if ((enable && nr_slots == 1) || !nr_slots)
  		kvm_make_all_cpus_request(kvm, KVM_REQ_UPDATE_CPU_DIRTY_LOGGING);
-@@ -13701,6 +16030,12 @@ void kvm_set_rflags(struct kvm_vcpu *vcpu, unsigned long rflags)
+@@ -13701,6 +16128,12 @@ void kvm_set_rflags(struct kvm_vcpu *vcpu, unsigned long rflags)
  }
  EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_set_rflags);
  
@@ -8282,7 +8558,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static inline u32 kvm_async_pf_hash_fn(gfn_t gfn)
  {
  	BUILD_BUG_ON(!is_power_of_2(ASYNC_PF_PER_VCPU));
-@@ -13708,26 +16043,81 @@ static inline u32 kvm_async_pf_hash_fn(gfn_t gfn)
+@@ -13708,26 +16141,81 @@ static inline u32 kvm_async_pf_hash_fn(gfn_t gfn)
  	return hash_32(gfn & 0xffffffff, order_base_2(ASYNC_PF_PER_VCPU));
  }
  
@@ -8364,7 +8640,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	for (i = 0; i < ASYNC_PF_PER_VCPU &&
  		     (vcpu->arch.apf.gfns[key] != gfn &&
  		      vcpu->arch.apf.gfns[key] != ~0); i++)
-@@ -13736,15 +16126,33 @@ static u32 kvm_async_pf_gfn_slot(struct kvm_vcpu *vcpu, gfn_t gfn)
+@@ -13736,15 +16224,33 @@ static u32 kvm_async_pf_gfn_slot(struct kvm_vcpu *vcpu, gfn_t gfn)
  	return key;
  }
  
@@ -8398,7 +8674,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	i = j = kvm_async_pf_gfn_slot(vcpu, gfn);
  
  	if (WARN_ON_ONCE(vcpu->arch.apf.gfns[i] != gfn))
-@@ -13753,9 +16161,21 @@ static void kvm_del_async_pf_gfn(struct kvm_vcpu *vcpu, gfn_t gfn)
+@@ -13753,9 +16259,21 @@ static void kvm_del_async_pf_gfn(struct kvm_vcpu *vcpu, gfn_t gfn)
  	while (true) {
  		vcpu->arch.apf.gfns[i] = ~0;
  		do {
@@ -8420,7 +8696,7 @@ index c9c2aa6f4..48b66e5f1 100644
  			k = kvm_async_pf_hash_fn(vcpu->arch.apf.gfns[j]);
  			/*
  			 * k lies cyclically in ]i,j]
-@@ -13768,14 +16188,44 @@ static void kvm_del_async_pf_gfn(struct kvm_vcpu *vcpu, gfn_t gfn)
+@@ -13768,14 +16286,44 @@ static void kvm_del_async_pf_gfn(struct kvm_vcpu *vcpu, gfn_t gfn)
  	}
  }
  
@@ -8465,7 +8741,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static inline int apf_put_user_ready(struct kvm_vcpu *vcpu, u32 token)
  {
  	unsigned int offset = offsetof(struct kvm_vcpu_pv_apf_data, token);
-@@ -13784,6 +16234,10 @@ static inline int apf_put_user_ready(struct kvm_vcpu *vcpu, u32 token)
+@@ -13784,6 +16332,10 @@ static inline int apf_put_user_ready(struct kvm_vcpu *vcpu, u32 token)
  					     &token, offset, sizeof(token));
  }
  
@@ -8476,7 +8752,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static inline bool apf_pageready_slot_free(struct kvm_vcpu *vcpu)
  {
  	unsigned int offset = offsetof(struct kvm_vcpu_pv_apf_data, token);
-@@ -13796,6 +16250,11 @@ static inline bool apf_pageready_slot_free(struct kvm_vcpu *vcpu)
+@@ -13796,6 +16348,11 @@ static inline bool apf_pageready_slot_free(struct kvm_vcpu *vcpu)
  	return !val;
  }
  
@@ -8488,7 +8764,7 @@ index c9c2aa6f4..48b66e5f1 100644
  static bool kvm_can_deliver_async_pf(struct kvm_vcpu *vcpu)
  {
  
-@@ -13811,6 +16270,11 @@ static bool kvm_can_deliver_async_pf(struct kvm_vcpu *vcpu)
+@@ -13811,6 +16368,11 @@ static bool kvm_can_deliver_async_pf(struct kvm_vcpu *vcpu)
  		 * L1 needs to opt into the special #PF vmexits that are
  		 * used to deliver async page faults.
  		 */
@@ -8500,7 +8776,7 @@ index c9c2aa6f4..48b66e5f1 100644
  		return vcpu->arch.apf.delivery_as_pf_vmexit;
  	} else {
  		/*
-@@ -13822,6 +16286,10 @@ static bool kvm_can_deliver_async_pf(struct kvm_vcpu *vcpu)
+@@ -13822,6 +16384,10 @@ static bool kvm_can_deliver_async_pf(struct kvm_vcpu *vcpu)
  	}
  }
  
@@ -8511,7 +8787,7 @@ index c9c2aa6f4..48b66e5f1 100644
  bool kvm_can_do_async_pf(struct kvm_vcpu *vcpu)
  {
  	if (unlikely(!lapic_in_kernel(vcpu) ||
-@@ -13839,14 +16307,29 @@ bool kvm_can_do_async_pf(struct kvm_vcpu *vcpu)
+@@ -13839,14 +16405,29 @@ bool kvm_can_do_async_pf(struct kvm_vcpu *vcpu)
  	return kvm_arch_interrupt_allowed(vcpu);
  }
  
@@ -8541,7 +8817,7 @@ index c9c2aa6f4..48b66e5f1 100644
  	if (kvm_can_deliver_async_pf(vcpu) &&
  	    !apf_put_user_notpresent(vcpu)) {
  		fault.vector = PF_VECTOR;
-@@ -13866,11 +16349,34 @@ bool kvm_arch_async_page_not_present(struct kvm_vcpu *vcpu,
+@@ -13866,11 +16447,34 @@ bool kvm_arch_async_page_not_present(struct kvm_vcpu *vcpu,
  		 * another process.  When the instruction that triggered a page
  		 * fault is retried, hopefully the page will be ready in the host.
  		 */
@@ -8576,7 +8852,7 @@ index c9c2aa6f4..48b66e5f1 100644
  void kvm_arch_async_page_present(struct kvm_vcpu *vcpu,
  				 struct kvm_async_pf *work)
  {
-@@ -13896,13 +16402,33 @@ void kvm_arch_async_page_present(struct kvm_vcpu *vcpu,
+@@ -13896,13 +16500,33 @@ void kvm_arch_async_page_present(struct kvm_vcpu *vcpu,
  	kvm_set_mp_state(vcpu, KVM_MP_STATE_RUNNABLE);
  }
  
@@ -8611,11 +8887,45 @@ index c9c2aa6f4..48b66e5f1 100644
  {
  	if (!kvm_pv_async_pf_enabled(vcpu))
 diff --git a/arch/x86/kvm/x86.h b/arch/x86/kvm/x86.h
-index f3dc77f00..3ac53346d 100644
+index f3dc77f00..c9fd852dc 100644
 --- a/arch/x86/kvm/x86.h
 +++ b/arch/x86/kvm/x86.h
-@@ -21,6 +21,21 @@ struct kvm_caps {
+@@ -13,14 +13,55 @@
+ #define KVM_MAX_MCE_BANKS 32
+ 
+ struct kvm_caps {
++	/*
++	 * 在以下设置kvm_caps.has_tsc_control:
++	 *   - arch/x86/kvm/svm/svm.c|5452| <<svm_hardware_setup>> kvm_caps.has_tsc_control = true;
++	 *   - arch/x86/kvm/vmx/vmx.c|8688| <<vmx_hardware_setup>> kvm_caps.has_tsc_control = true;
++	 */
+ 	/* control of guest tsc rate supported? */
+ 	bool has_tsc_control;
++	/*
++	 * 在以下使用kvm_caps.max_guest_tsc_khz:
++	 *   - arch/x86/kvm/x86.c|8268| <<kvm_arch_vcpu_ioctl>> if (kvm_caps.has_tsc_control &&
++	 *                                             user_tsc_khz >= kvm_caps.max_guest_tsc_khz)
++	 *   - arch/x86/kvm/x86.c|9390| <<kvm_arch_vm_ioctl>> if (kvm_caps.has_tsc_control &&
++	 *                                             user_tsc_khz >= kvm_caps.max_guest_tsc_khz)
++	 *   - arch/x86/kvm/x86.c|11649| <<kvm_hyperv_tsc_notifier>> kvm_caps.max_guest_tsc_khz = tsc_khz;
++	 *   - arch/x86/kvm/x86.c|12117| <<kvm_x86_vendor_init>> kvm_caps.max_guest_tsc_khz = max;
++	 */
+ 	/* maximum supported tsc_khz for guests */
+ 	u32  max_guest_tsc_khz;
++	/*
++	 * 在以下设置kvm_caps.tsc_scaling_ratio_frac_bits:
++	 *   - arch/x86/kvm/svm/svm.c|5456| <<svm_hardware_setup>> kvm_caps.tsc_scaling_ratio_frac_bits = 32;
++	 *   - arch/x86/kvm/vmx/vmx.c|8691| <<vmx_hardware_setup>> kvm_caps.tsc_scaling_ratio_frac_bits = 48;
++	 */
+ 	/* number of bits of the fractional part of the TSC scaling ratio */
  	u8   tsc_scaling_ratio_frac_bits;
++	/*
++	 * 在以下使用kvm_caps.max_tsc_scaling_ratio:
++	 *   - arch/x86/kvm/svm/svm.c|5455| <<svm_hardware_setup>> kvm_caps.max_tsc_scaling_ratio = SVM_TSC_RATIO_MAX;
++	 *   - arch/x86/kvm/vmx/vmx.c|8690| <<vmx_hardware_setup>> kvm_caps.max_tsc_scaling_ratio = KVM_VMX_TSC_MULTIPLIER_MAX;
++	 *   - arch/x86/kvm/x86.c|2748| <<set_tsc_khz>> if (ratio == 0 || ratio >= kvm_caps.max_tsc_scaling_ratio) {
++	 *   - arch/x86/kvm/x86.c|12116| <<kvm_x86_vendor_init>> __scale_tsc(kvm_caps.max_tsc_scaling_ratio, tsc_khz));
++	 */
  	/* maximum allowed value of TSC scaling ratio */
  	u64  max_tsc_scaling_ratio;
 +	/*
@@ -8636,7 +8946,7 @@ index f3dc77f00..3ac53346d 100644
  	/* 1ull << kvm_caps.tsc_scaling_ratio_frac_bits */
  	u64  default_tsc_scaling_ratio;
  	/* bus lock detection supported? */
-@@ -513,8 +528,45 @@ static inline void kvm_pr_unimpl_rdmsr(struct kvm_vcpu *vcpu, u32 msr)
+@@ -513,8 +554,45 @@ static inline void kvm_pr_unimpl_rdmsr(struct kvm_vcpu *vcpu, u32 msr)
  		vcpu_unimpl(vcpu, "Unhandled RDMSR(0x%x)\n", msr);
  }
  
